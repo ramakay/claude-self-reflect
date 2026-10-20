@@ -155,7 +155,7 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
         &paths.keep.join("usage/sess-now.json"),
         &json!({"at":NOW,"context":{"tokens":ctx,"window":1000000},
         "rateLimits":[{"kind":"five_hour","percentUsed":if empty{3}else if state=="07-away"{0}else{2},"resetsAt":"2026-10-18T14:08:00Z"},
-        {"kind":"seven_day","percentUsed":if state=="07-away"{54}else{52},"resetsAt":"2026-10-18T19:00:00Z"}]}),
+        {"kind":"seven_day","percentUsed":if state=="07-away"{54}else{52},"resetsAt":"2026-10-22T09:00:00Z"}]}),
     );
     // The transcript, usage status, dream log, agent feed and database are the real frame's inputs.
     let values = [
@@ -409,4 +409,66 @@ fn text_fallback_rows_fit_narrow_terminals() {
             assert!(text::len(&text::plain(&row)) <= cols, "{cols}: {row:?}");
         }
     }
+}
+
+#[test]
+fn narrow_pixels_use_a_short_bottom_strip_and_native_text() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let (_home, paths) = state_home("02-running");
+        let mut pane = Pane::new(paths, &args("main", "sess-now", 30, 40));
+        pane.theme = theme;
+        pane.pixels = true;
+        pane.enable_cards();
+        let rows = pane.frame(30, 40, NOW);
+        assert_eq!(pane.placed.len(), 1);
+        let strip = &pane.placed[0];
+        assert!(strip.rows <= 7);
+        assert_eq!(strip.row + strip.rows, 39);
+        assert!(rows
+            .iter()
+            .take(strip.row)
+            .any(|line| text::plain(line).contains("What if")));
+        assert!(
+            !rows.iter().any(|line| text::plain(line).contains("CTX ")),
+            "figure facts were repeated beside the strip"
+        );
+    }
+}
+
+#[test]
+fn agent_rings_open_real_details_in_place() {
+    let (_home, paths) = state_home("03-agents");
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+    pane.pixels = true;
+    pane.enable_cards();
+    pane.frame(76, 67, NOW);
+    let row = *pane
+        .acts
+        .iter()
+        .find(|(_, a)| a["key"] == "instrument:agents")
+        .unwrap()
+        .0;
+    pane.click(row, 20, NOW);
+    assert!(pane.instrument_open.agents);
+    assert_eq!(pane.view, "main");
+    pane.pixels = false;
+    assert!(pane
+        .frame(76, 67, NOW)
+        .iter()
+        .any(|line| text::plain(line).contains("tools")));
+}
+
+#[test]
+fn fresh_session_does_not_inherit_another_sessions_empty_look() {
+    let (_home, paths) = state_home("01-empty");
+    fs::write(
+        paths.keep.join("dreams.jsonl"),
+        json!({"kind":"look","session":"another","at":NOW-1.,"outcome":"none"}).to_string() + "\n",
+    )
+    .unwrap();
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+    pane.pixels = false;
+    let text = pane.frame(76, 67, NOW).join("\n");
+    assert!(text.contains("Press d."));
+    assert!(!text.contains("last look found nothing"));
 }

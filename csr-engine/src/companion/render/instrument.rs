@@ -20,6 +20,7 @@ pub enum Batch {
 pub struct DreamCard {
     pub state: Batch,
     pub allowance: (usize, usize),
+    pub handed: usize,
     pub top: Value,
     pub queue: Vec<Value>,
     pub answered: Vec<Value>,
@@ -50,6 +51,7 @@ pub struct Composition {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Open {
     pub scroll: usize,
+    pub agents: bool,
     pub figure: bool,
     pub changes: bool,
     pub threads: bool,
@@ -67,7 +69,12 @@ impl Composition {
     pub fn build(data: &Value, s: &Value, now: f64) -> Self {
         let fed = dreams::feed(array(&data["dreams"]), &data["chapter"], string(&s["id"]));
         let top = fed["star"].clone();
-        let look = &data["look"];
+        let missing = Value::Null;
+        let look = if data["look"]["session"] == s["id"] {
+            &data["look"]
+        } else {
+            &missing
+        };
         let state = if !top.is_null() {
             Batch::Ready
         } else if matches!(string(&look["outcome"]), "dreaming" | "started") {
@@ -215,6 +222,13 @@ impl Composition {
             codex_week: data["codex"]["week"].clone(),
             dream: DreamCard {
                 state,
+                handed: array(&data["dreams"])
+                    .iter()
+                    .filter(|d| {
+                        d["session"] == s["id"]
+                            && matches!(string(&d["answer"]), "ask_claude" | "sent")
+                    })
+                    .count(),
                 allowance: (
                     fed["left"].as_u64().unwrap_or(0) as usize,
                     fed["of"].as_u64().unwrap_or(0) as usize,
@@ -375,6 +389,9 @@ fn meta(c: &Composition) -> String {
     if let Some(b) = budget(&d.budget) {
         bits.push(b);
     }
+    if d.handed > 0 {
+        bits.push(format!("{} asked Claude", d.handed));
+    }
     if d.carried {
         bits.push("carried".into());
     }
@@ -413,9 +430,19 @@ fn extras(c: &Composition, counts: bool) -> Vec<String> {
 }
 /// Semantic text rows, also retained beneath pixel placements for accessibility and exports.
 pub fn text_rows(c: &Composition, cols: usize, rows: usize, open: Open) -> Vec<String> {
+    rows_with_figure(c, cols, rows, open, true)
+}
+pub fn rows_with_figure(
+    c: &Composition,
+    cols: usize,
+    rows: usize,
+    open: Open,
+    show_figure: bool,
+) -> Vec<String> {
     let mut out = vec![];
     let cap = rows * 3 / 10;
     let wrap = |s: &str| text::wrap(s, cols.max(1), 1000);
+    let mut collapsed_hero = false;
     let mut hero = wrap(&format!("☾ {}", c.question()));
     if hero.len() > cap.saturating_sub(2) {
         hero = wrap(&c.question());
@@ -436,6 +463,7 @@ pub fn text_rows(c: &Composition, cols: usize, rows: usize, open: Open) -> Vec<S
     }
     // Tiny terminals show the complete question in its drill-down. Never cut a rendered line.
     if hero.len() > cap {
+        collapsed_hero = true;
         hero = wrap("☾ what-if · d");
         for line in extras(c, true) {
             hero.extend(wrap(&line));
@@ -477,6 +505,7 @@ pub fn text_rows(c: &Composition, cols: usize, rows: usize, open: Open) -> Vec<S
             first_sentence(&c.story)
         )));
     }
+    let mut details_start = out.len();
     for v in c
         .shifts
         .iter()
@@ -487,6 +516,9 @@ pub fn text_rows(c: &Composition, cols: usize, rows: usize, open: Open) -> Vec<S
             out.extend(wrap(&format!("Was: {}", string(&v["was"]))));
         }
     }
+    if !open.changes {
+        details_start = out.len();
+    }
     if open.threads {
         for (at, line) in &c.river {
             out.extend(wrap(&format!(
@@ -496,12 +528,66 @@ pub fn text_rows(c: &Composition, cols: usize, rows: usize, open: Open) -> Vec<S
         }
     }
     if open.dreams {
+        if collapsed_hero {
+            out.extend(wrap(&c.question()));
+        }
+        out.extend(wrap(string(&c.dream.top["text"])));
+        for line in extras(c, false) {
+            out.extend(wrap(&line));
+        }
         for d in &c.dream.queue {
             out.extend(wrap(string(&d["line"])));
         }
     }
-    for line in figure_lines(c) {
-        out.extend(wrap(&line));
+    if open.agents {
+        for line in agent_lines(c) {
+            out.extend(wrap(&line));
+        }
+    }
+    if open.changes || open.threads || open.dreams || open.agents {
+        let details = out.drain(details_start..).collect::<Vec<_>>();
+        let figure_rows = if show_figure {
+            figure_lines(c).iter().flat_map(|line| wrap(line)).count()
+        } else {
+            4
+        };
+        let reserved = figure_rows
+            + 1
+            + if show_figure { 0 } else { 7 }
+            + usize::from(c.agents.agents.iter().any(agents::is_active));
+        let room = rows.saturating_sub(out.len() + reserved);
+        out.extend(details.into_iter().skip(open.scroll).take(room));
+    }
+    if show_figure {
+        for line in figure_lines(c) {
+            out.extend(wrap(&line));
+        }
+    } else {
+        let mut extra = vec![];
+        if let Some(n) = c.codex_week["percent"].as_f64() {
+            extra.push(format!("Codex {n:.0}%"));
+        }
+        if let Some(sev) = c.figure["sts"]["sev"].as_str().filter(|s| !s.is_empty()) {
+            extra.push(format!("STS {sev}"));
+        }
+        if let Some(n) = c.tally["payback"].as_f64().filter(|n| *n > 0.) {
+            extra.push(format!("Saved ~{}", short(n)));
+        }
+        if c.figure["cache"]["cold"] == true {
+            let line = string(&c.figure["cache"]["long"]);
+            if let Some(line) = line.strip_prefix("COLD · ") {
+                extra.push(line.into());
+            }
+        }
+        if let Some(alternate) = array(&c.figure["payback"]["forms"])
+            .get(1)
+            .and_then(Value::as_str)
+        {
+            extra.push(alternate.strip_prefix("♻ ").unwrap_or(alternate).into());
+        }
+        if !extra.is_empty() {
+            out.extend(wrap(&extra.join(" · ")));
+        }
     }
     let active: Vec<_> = c
         .agents
@@ -517,6 +603,28 @@ pub fn text_rows(c: &Composition, cols: usize, rows: usize, open: Open) -> Vec<S
         )));
     }
     out
+}
+fn agent_lines(c: &Composition) -> Vec<String> {
+    c.agents
+        .agents
+        .iter()
+        .map(|a| {
+            let minutes = a
+                .started
+                .map(|s| format!(" · {:.0}m", ((c.now * 1000. - s) / 60000.).max(0.)))
+                .unwrap_or_default();
+            format!(
+                "○ {} · {}{minutes} · {} tools",
+                a.description,
+                if agents::stalled(a, c.now) {
+                    "stalled"
+                } else {
+                    &a.status
+                },
+                a.tools
+            )
+        })
+        .collect()
 }
 fn first_sentence(s: &str) -> &str {
     s.find(". ").map_or(s, |i| &s[..=i])
@@ -622,6 +730,7 @@ pub struct Metrics {
     pub answer_spans: Vec<(f32, f32, String)>,
     pub story_region: Option<(f32, f32)>,
     pub shift_hits: Vec<f32>,
+    pub agents_region: Option<(f32, f32)>,
     pub figure_region: (f32, f32),
     pub height: f32,
     pub question_lines: Vec<String>,
@@ -641,6 +750,11 @@ fn question_layout(f: &Fonts, q: &str, limit: f32, t: &Tokens) -> (St, Vec<Strin
         }
     }
 }
+fn fonts() -> Option<std::sync::MutexGuard<'static, Fonts>> {
+    static FONTS: std::sync::LazyLock<std::sync::Mutex<Fonts>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Fonts::load()));
+    FONTS.lock().ok()
+}
 /// Draw one actual pane image. No fixture-only renderer or invented data enters this path.
 pub fn draw(
     c: &Composition,
@@ -653,9 +767,7 @@ pub fn draw(
     if width < 160 || available_height < 120 {
         return None;
     }
-    static FONTS: std::sync::LazyLock<std::sync::Mutex<Fonts>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(Fonts::load()));
-    let fonts = FONTS.lock().ok()?;
+    let fonts = fonts()?;
     let f = &*fonts;
     let t = theme.tokens();
     let ratio = width as f32 / (W * S);
@@ -762,6 +874,10 @@ pub fn draw(
                     IW,
                 ));
             }
+        }
+    } else if open.agents {
+        for line in agent_lines(c) {
+            drill_lines.extend(f.wrap(&line, sans(11.5, t.regular), IW));
         }
     } else if open.dreams {
         drill_lines.extend(f.wrap(string(&c.dream.top["text"]), sans(11.5, t.regular), IW));
@@ -1119,7 +1235,7 @@ pub fn draw(
     if extra_h > 0. {
         panel(&mut canvas, y, extra_h, t);
         let mut b = y + P;
-        if open.changes || open.dreams {
+        if open.changes || open.dreams || open.agents {
             for line in drill_lines
                 .iter()
                 .skip(open.scroll)
@@ -1188,6 +1304,7 @@ pub fn draw(
     let figure_region = (y, figure_h);
     figure(&mut canvas, f, c, y, figure_h, t, open.figure, narrow);
     y += figure_h + 12.;
+    let agents_region = active.then_some((y, agents_h));
     if active {
         panel(&mut canvas, y, agents_h, t);
         let mut x = IX + 8.;
@@ -1288,6 +1405,7 @@ pub fn draw(
             answer_spans,
             story_region,
             shift_hits,
+            agents_region,
             figure_region,
             height,
             question_lines: question,
@@ -1362,7 +1480,7 @@ fn figure(
                 80. * (num(&q["used"]) / 100.).clamp(0., 1.) as f32,
                 3.,
                 1.5,
-                if q["code"] == "7D" { t.sky } else { t.mint },
+                t.sky,
             );
         }
         return;
@@ -1572,10 +1690,11 @@ fn figure(
             A::M,
         );
     }
-    let satellites: Vec<_> = array(&g["quotas"])
+    let mut satellites: Vec<_> = array(&g["quotas"])
         .iter()
         .filter(|q| q["used"].is_number())
         .collect();
+    satellites.sort_by_key(|q| if q["code"] == "5H" { 0 } else { 1 });
     let count = satellites.len()
         + usize::from(g["cache"]["left"].is_number() || g["cache"]["cold"] == true);
     let step = IW / (count + 1) as f32;
@@ -1583,7 +1702,7 @@ fn figure(
         let x = IX + step * (i + 1) as f32;
         let cy = y + h - 53.;
         let v = num(&q["used"]);
-        let col = if q["code"] == "7D" { t.sky } else { t.mint };
+        let col = t.sky;
         c.ring(
             x,
             cy,
@@ -1685,4 +1804,185 @@ pub fn acts(c: &Composition, cols: usize) -> BTreeMap<usize, Value> {
             "spans":[[0,cols/4,"helpful"],[cols/4,cols/2,"thought_of_it"],[cols/2,cols*3/4,"not_relevant"],[cols*3/4,cols,"ask_claude"]]}));
     }
     out
+}
+
+/// A's bottom instrument strip at the terminal's actual width. Body text stays in native cells.
+pub fn strip(
+    data: &Composition,
+    width: u32,
+    theme: Theme,
+    expanded: bool,
+) -> Option<tiny_skia::Pixmap> {
+    let w = width as f32 / S;
+    if w < 220. {
+        return None;
+    }
+    let fonts = fonts()?;
+    let f = &*fonts;
+    let t = theme.tokens();
+    let g = &data.figure;
+    let h = 104.;
+    let mut c = Canvas::new(w, h);
+    c.pm.fill(tiny_skia::Color::from_rgba8(
+        t.ground[0],
+        t.ground[1],
+        t.ground[2],
+        t.ground[3],
+    ));
+    c.glass(
+        0.,
+        0.,
+        w,
+        h,
+        16.,
+        lin(
+            0.,
+            0.,
+            0.,
+            h,
+            &[(t.linear_at[0], t.glass[0]), (t.linear_at[1], t.glass[1])],
+        ),
+    );
+    let ctx = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
+    if let (Some(n), Some(size)) = (ctx, g["ctx"]["size"].as_f64().filter(|n| *n > 0.)) {
+        if expanded && !data.requests.is_empty() {
+            let max = data.requests.iter().map(|(a, b)| a + b).fold(1., f64::max);
+            let bw = 48. / data.requests.len() as f32;
+            for (i, (a, b)) in data.requests.iter().enumerate() {
+                let bar = ((a + b) / max * 28.) as f32;
+                c.rect(12. + i as f32 * bw, 58. - bar, bw * 0.7, bar, t.sky);
+            }
+        } else {
+            let mut segs = vec![];
+            if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64())
+            {
+                segs.push(((low / size) as f32, (high / size) as f32, t.band));
+            }
+            segs.push((0., (n / size).clamp(0., 1.) as f32, t.mint));
+            c.ring(36., 45., 24., t.ring, t.track, &segs);
+        }
+        c.text(f, &short(n), 36., 49., serif(14., t.medium), t.ink, A::M);
+        c.text(
+            f,
+            &format!("of {}", short(size)),
+            36.,
+            if expanded { 95. } else { 65. },
+            sans(8., t.regular),
+            t.quiet,
+            A::M,
+        );
+        if let Some(trend) = g["trend"].as_f64() {
+            c.text(
+                f,
+                &format!(
+                    "{}{}/turn",
+                    if trend >= 0. { "+" } else { "−" },
+                    short(trend.abs())
+                ),
+                76.,
+                18.,
+                sans(9., t.regular),
+                t.quiet,
+                A::L,
+            );
+        }
+    }
+    if let Some(n) = data.tally["by_csr"].as_u64().filter(|n| *n > 0) {
+        c.text(
+            f,
+            &format!("{n} by CSR"),
+            w - 10.,
+            18.,
+            sans(9., t.medium),
+            t.ink,
+            A::R,
+        );
+    }
+    let pay = if g["compacting"].is_object() {
+        masthead::compacting_slot(&g["compacting"], false, true).0
+    } else if ctx.is_some() {
+        string(&g["payback"]["text"]).into()
+    } else {
+        String::new()
+    };
+    if !pay.is_empty() {
+        let st = sans(10., t.medium);
+        c.text(f, &f.fit(&pay, st, w - 86.), 76., 37., st, t.mint, A::L);
+    }
+    let mut quotas = array(&g["quotas"])
+        .iter()
+        .filter(|q| q["used"].is_number())
+        .collect::<Vec<_>>();
+    quotas.sort_by_key(|q| if q["code"] == "5H" { 0 } else { 1 });
+    let cache = g["cache"]["left"].is_number() || g["cache"]["cold"] == true;
+    let count = quotas.len() + usize::from(cache);
+    let step = (w - 76. - 10.) / count.max(1) as f32;
+    for (i, q) in quotas.iter().enumerate() {
+        let x = 76. + step * (i as f32 + 0.5);
+        let used = num(&q["used"]);
+        let accent = t.sky;
+        c.ring(
+            x,
+            69.,
+            16.,
+            t.ring,
+            t.track,
+            &[(0., (used / 100.).clamp(0., 1.) as f32, accent)],
+        );
+        c.text(
+            f,
+            &format!("{used:.0}%"),
+            x,
+            73.,
+            serif(10., t.medium),
+            t.ink,
+            A::M,
+        );
+        let pace = q["pace"].as_f64().is_some_and(|p| used / 100. > p);
+        c.text(
+            f,
+            &format!("{}{}", string(&q["code"]), if pace { " »" } else { "" }),
+            x,
+            97.,
+            sans(8., t.medium),
+            t.quiet,
+            A::M,
+        );
+    }
+    if cache {
+        let x = 76. + step * (count as f32 - 0.5);
+        let cold = g["cache"]["cold"] == true;
+        let left = num(&g["cache"]["left"]);
+        let ttl = g["cache"]["ttl"]
+            .as_f64()
+            .filter(|t| *t > 0.)
+            .unwrap_or(3600.);
+        c.ring(
+            x,
+            69.,
+            16.,
+            t.ring,
+            t.track,
+            &[(
+                0.,
+                (left / ttl).clamp(0., 1.) as f32,
+                if cold { t.amber } else { t.mint },
+            )],
+        );
+        c.text(
+            f,
+            &if cold {
+                "COLD".into()
+            } else {
+                masthead::span(left)
+            },
+            x,
+            73.,
+            serif(10., t.medium),
+            t.ink,
+            A::M,
+        );
+        c.text(f, "◷", x, 97., sans(8., t.medium), t.quiet, A::M);
+    }
+    Some(c.pm)
 }

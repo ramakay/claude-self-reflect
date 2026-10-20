@@ -796,7 +796,24 @@ impl Pane {
     ) -> Vec<String> {
         use super::render::{instrument, raster, text};
         self.instrument_metrics = None;
-        let semantic = instrument::text_rows(composition, cols, rows, self.instrument_open);
+        let cell = super::render::kitty::cell_size();
+        let strip = if self.pixels && self.cards && cols < 46 {
+            instrument::strip(
+                composition,
+                cols as u32 * cell.0,
+                self.theme,
+                self.instrument_open.figure,
+            )
+        } else {
+            None
+        };
+        let semantic = instrument::rows_with_figure(
+            composition,
+            cols,
+            rows,
+            self.instrument_open,
+            strip.is_none(),
+        );
         self.acts = instrument::acts(composition, cols);
         self.pill = None;
         for (row, line) in semantic.iter().enumerate() {
@@ -804,12 +821,30 @@ impl Pane {
                 self.acts.insert(row, json!({"key":"instrument:threads"}));
             } else if ["! ", "+ ", "~ ", "- "].iter().any(|s| line.starts_with(s)) {
                 self.acts.insert(row, json!({"key":"instrument:changes"}));
+            } else if line.contains(" in flight · ") {
+                self.acts.insert(row, json!({"key":"instrument:agents"}));
             } else if line.starts_with("CTX ") {
                 self.acts.insert(row, json!({"key":"instrument:figure"}));
             }
         }
         let mut out = semantic;
-        if self.pixels && self.cards {
+        if let Some(strip) = strip {
+            if let Ok(png) = raster::png(&strip) {
+                let count = strip.height().div_ceil(cell.1) as usize;
+                let row = rows.saturating_sub(1 + count);
+                out.truncate(row);
+                self.placed = vec![super::render::kitty::Placement {
+                    row,
+                    col: 0,
+                    cols,
+                    rows: count,
+                    png: png.into(),
+                }];
+                for r in row..row + count {
+                    self.acts.insert(r, json!({"key":"instrument:figure"}));
+                }
+            }
+        } else if self.pixels && self.cards && cols >= 46 {
             let cell = super::render::kitty::cell_size();
             if let Some((pm, metrics)) = instrument::draw(
                 composition,
@@ -843,6 +878,11 @@ impl Pane {
                     if let Some((start, height)) = metrics.story_region {
                         for row in to_row(start)..=to_row(start + height) {
                             self.acts.insert(row, json!({"key":"instrument:threads"}));
+                        }
+                    }
+                    if let Some((start, height)) = metrics.agents_region {
+                        for row in to_row(start)..=to_row(start + height) {
+                            self.acts.insert(row, json!({"key":"instrument:agents"}));
                         }
                     }
                     for y in &metrics.shift_hits {
@@ -1030,6 +1070,14 @@ impl Pane {
     }
     pub fn key(&mut self, key: &str) -> bool {
         match key {
+            "a" if self.view == "main" => {
+                self.instrument_open.agents = !self.instrument_open.agents;
+                self.instrument_open.changes = false;
+                self.instrument_open.threads = false;
+                self.instrument_open.dreams = false;
+                self.instrument_open.scroll = 0;
+                return true;
+            }
             "b" => {
                 self.theme.toggle();
                 return true;
@@ -1044,6 +1092,7 @@ impl Pane {
                 self.instrument_open.threads = false;
                 self.instrument_open.dreams = false;
                 self.instrument_open.scroll = 0;
+                self.instrument_open.agents = false;
                 self.view = "main".into();
                 return true;
             }
@@ -1052,6 +1101,7 @@ impl Pane {
                 self.instrument_open.changes = false;
                 self.instrument_open.dreams = false;
                 self.instrument_open.scroll = 0;
+                self.instrument_open.agents = false;
                 self.view = "main".into();
                 return true;
             }
@@ -1060,6 +1110,7 @@ impl Pane {
                 self.instrument_open.changes = false;
                 self.instrument_open.threads = false;
                 self.instrument_open.scroll = 0;
+                self.instrument_open.agents = false;
                 self.view = "main".into();
                 return true;
             }
@@ -1148,7 +1199,8 @@ impl Pane {
     }
     pub fn scroll(&mut self, step: isize) {
         if self.view == "main"
-            && (self.instrument_open.changes
+            && (self.instrument_open.agents
+                || self.instrument_open.changes
                 || self.instrument_open.threads
                 || self.instrument_open.dreams)
         {
@@ -1247,6 +1299,7 @@ impl Pane {
                 "threads" => "t",
                 "figure" => "i",
                 "changes" => "l",
+                "agents" => "a",
                 _ => "escape",
             });
         }
