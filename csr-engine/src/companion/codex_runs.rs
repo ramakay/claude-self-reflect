@@ -15,7 +15,8 @@
 //!
 //! Files are read incrementally: each remembers where its last read stopped, only whole lines are
 //! taken (a line still being written waits for its newline), a file that shrank or changed is read
-//! again from its start, and a line that is not JSON is skipped.
+//! again from its start, and a line that is not JSON is skipped. One scan reads at most about
+//! `READ_BUDGET` bytes, newest file first, and the rest waits for the next scan.
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use regex::Regex;
 use serde_json::{json, Value};
@@ -42,6 +43,8 @@ const EVERY: f64 = 2.;
 const MAX_LINE: usize = 1 << 20;
 /// Characters of a line looked at to tell whether it is a record worth parsing.
 const HEAD: usize = 400;
+/// Bytes one scan reads at most, newest file first; a line that crosses it is finished.
+const READ_BUDGET: u64 = 32 << 20;
 
 static KINDS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#""type"\s*:\s*"(session_meta|turn_context|event_msg)""#).unwrap()
@@ -174,6 +177,7 @@ pub struct CodexRolloutIndex {
     sessions: PathBuf,
     runs: BTreeMap<PathBuf, Run>,
     checked: Option<f64>,
+    budget: u64,
 }
 impl CodexRolloutIndex {
     pub fn new(home: &Path) -> Self {
@@ -183,6 +187,14 @@ impl CodexRolloutIndex {
             root,
             runs: BTreeMap::new(),
             checked: None,
+            budget: READ_BUDGET,
+        }
+    }
+    #[cfg(test)]
+    fn with_budget(home: &Path, budget: u64) -> Self {
+        Self {
+            budget,
+            ..Self::new(home)
         }
     }
     pub fn present(&self) -> bool {
@@ -234,8 +246,9 @@ impl CodexRolloutIndex {
         }
         found
     }
-    /// New whole lines of one rollout into its Run.
-    fn read(&mut self, path: &Path, info: &fs::Metadata) {
+    /// New whole lines of one rollout into its Run, as far as the scan's `budget` allows; with
+    /// the budget spent the file is recorded and left unread.
+    fn read(&mut self, path: &Path, info: &fs::Metadata, budget: &mut u64) {
         let mtime = info.mtime() as f64 + info.mtime_nsec() as f64 / 1e9;
         let run = self.runs.remove(path);
         let mut run = match run {
@@ -245,8 +258,8 @@ impl CodexRolloutIndex {
         };
         run.inode = Some(info.ino());
         run.mtime = mtime;
-        if info.len() != run.offset {
-            read_lines(path, &mut run);
+        if info.len() != run.offset && *budget > 0 {
+            read_lines(path, &mut run, budget);
         }
         self.runs.insert(path.to_path_buf(), run);
     }
@@ -260,8 +273,17 @@ impl CodexRolloutIndex {
         }
         self.checked = Some(now);
         let mut seen = std::collections::BTreeSet::new();
-        for (path, info) in self.paths(now) {
-            self.read(&path, &info);
+        let mut found = self.paths(now);
+        // newest first, so a spent budget leaves the oldest files for the next scan
+        found.sort_by(|a, b| {
+            let stamp = |i: &fs::Metadata| i.mtime() as f64 + i.mtime_nsec() as f64 / 1e9;
+            stamp(&b.1)
+                .total_cmp(&stamp(&a.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut budget = self.budget;
+        for (path, info) in found {
+            self.read(&path, &info, &mut budget);
             seen.insert(path);
         }
         // a file gone is forgotten
@@ -350,7 +372,9 @@ fn old(chain: &[String], name: &str, floor: NaiveDate) -> bool {
     ];
     key[..] < bound[..key.len()]
 }
-fn read_lines(path: &Path, run: &mut Run) {
+/// Reads whole lines from the run's offset, taking their size from `budget`; stops at the first
+/// line boundary at or past it, so the line that crosses it is finished.
+fn read_lines(path: &Path, run: &mut Run, budget: &mut u64) {
     let Ok(file) = File::open(path) else {
         return;
     };
@@ -359,7 +383,7 @@ fn read_lines(path: &Path, run: &mut Run) {
         return;
     }
     let mut line = Vec::new();
-    loop {
+    while *budget > 0 {
         line.clear();
         let got = (&mut reader)
             .take(MAX_LINE as u64 + 1)
@@ -387,6 +411,7 @@ fn read_lines(path: &Path, run: &mut Run) {
                 }
             }
             run.offset += taken as u64;
+            *budget = budget.saturating_sub(taken as u64);
             continue;
         }
         if !line.ends_with(b"\n") {
@@ -394,6 +419,7 @@ fn read_lines(path: &Path, run: &mut Run) {
             return;
         }
         run.offset += taken as u64;
+        *budget = budget.saturating_sub(taken as u64);
         let head = String::from_utf8_lossy(&line[..line.len().min(HEAD)]).into_owned();
         let Some(found) = KINDS.captures(&head) else {
             continue;
@@ -556,5 +582,100 @@ mod tests {
         assert!(old(&chain(&["2026", "10"]), "09", floor));
         assert!(!old(&chain(&["2026", "10"]), "10", floor));
         assert!(!old(&chain(&["2026", "10"]), "notes", floor));
+    }
+    /// Three rollouts, newest first by mtime: run-new, run-mid, run-old (not live).
+    fn three(home: &Path) -> [PathBuf; 3] {
+        let lines = |id: &str, base: f64, used: f64| {
+            vec![
+                meta(id, base - 600.),
+                tokens(base - 30., 100, used - 2., NOW + 86400.),
+                tokens(base - 20., 200, used - 1., NOW + 86400.),
+                tokens(base - 10., 300, used, NOW + 86400.),
+            ]
+        };
+        [
+            write(
+                home,
+                "rollout-new.jsonl",
+                &lines("run-new", NOW, 41.),
+                NOW - 5.,
+            ),
+            write(
+                home,
+                "rollout-mid.jsonl",
+                &lines("run-mid", NOW - 3., 30.),
+                NOW - 8.,
+            ),
+            write(
+                home,
+                "rollout-old.jsonl",
+                &lines("run-old", NOW - 5000., 10.),
+                NOW - 5000.,
+            ),
+        ]
+    }
+    #[test]
+    fn test_a_small_budget_reads_the_newest_file_first_and_later_scans_finish_the_rest() {
+        let d = tempfile::tempdir().unwrap();
+        let [new, mid, old] = three(d.path());
+        let size = |p: &Path| fs::metadata(p).unwrap().len();
+        let mut index = CodexRolloutIndex::with_budget(d.path(), size(&new));
+        let first = index.refresh(NOW);
+        // the newest file is whole, the others are recorded and not read
+        assert_eq!(index.runs[&new].offset, size(&new));
+        assert_eq!(index.runs[&mid].offset, 0);
+        assert_eq!(index.runs[&old].offset, 0);
+        assert_eq!(index.runs.len(), 3);
+        assert_eq!(first["week"]["percent"], 41.);
+        let rows = first["rows"].as_array().unwrap();
+        let known: Vec<&Value> = rows.iter().filter(|r| r["identity"] == "run-new").collect();
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0]["tokens"], 300);
+        assert!(rows.iter().all(|r| r["identity"] != "run-mid"));
+        // each later scan takes a little more, from the newest unfinished file
+        let mut now = NOW;
+        let mut last = first;
+        for _ in 0..12 {
+            now += 2.5;
+            last = index.refresh(now);
+        }
+        assert_eq!(index.runs[&mid].offset, size(&mid));
+        assert_eq!(index.runs[&old].offset, size(&old));
+        let mut whole = CodexRolloutIndex::new(d.path());
+        assert_eq!(last, whole.refresh(now));
+    }
+    #[test]
+    fn test_a_file_left_unread_by_the_budget_is_kept_and_read_on_a_later_scan() {
+        let d = tempfile::tempdir().unwrap();
+        let [new, mid, _old] = three(d.path());
+        let mut index = CodexRolloutIndex::with_budget(d.path(), 1);
+        index.refresh(NOW);
+        // one line of the newest file, nothing of the others
+        assert!(index.runs[&new].offset > 0);
+        assert!(index.runs[&new].offset < fs::metadata(&new).unwrap().len());
+        assert_eq!(index.runs[&mid].offset, 0);
+        assert_eq!(
+            index.runs[&mid].inode,
+            Some(fs::metadata(&mid).unwrap().ino())
+        );
+        let mut now = NOW;
+        for _ in 0..12 {
+            now += 2.5;
+            index.refresh(now);
+        }
+        assert_eq!(index.runs[&mid].offset, fs::metadata(&mid).unwrap().len());
+        assert_eq!(index.runs[&mid].identity.as_deref(), Some("run-mid"));
+    }
+    #[test]
+    fn test_a_file_with_nothing_new_costs_no_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let [new, mid, _old] = three(d.path());
+        let size = |p: &Path| fs::metadata(p).unwrap().len();
+        let mut index = CodexRolloutIndex::with_budget(d.path(), size(&new));
+        index.refresh(NOW);
+        index.refresh(NOW + 3.);
+        // the newest file is whole and free, so the budget goes to the next file
+        assert_eq!(index.runs[&new].offset, size(&new));
+        assert!(index.runs[&mid].offset > 0);
     }
 }
