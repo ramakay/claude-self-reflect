@@ -1,4 +1,5 @@
-//! The text agents.ts keeps: cut by code points, cleaned of terminal control, and redacted.
+//! The text the removed `agents.ts` keeps: cut by code points, cleaned of terminal control, and
+//! redacted.
 //!
 //! Every character class here is JavaScript's, not Rust's: `\s` and `trim` have a different set of
 //! white space, `\b` and `i` are ASCII in a pattern with no `u` flag, and `.` stops at four line

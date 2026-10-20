@@ -334,16 +334,6 @@ fn plugin_agents_production_fixture_digest_matches() {
             "agents-v1.json {name} is not what the Rust formatter writes now"
         );
     }
-    // While the plugin is beside the crate, its copy of the fixture is the same file.
-    let copy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../plugins/csr-companion/tests/fixtures/emissions/agents-v1.json");
-    if let Ok(plugin_text) = std::fs::read_to_string(&copy) {
-        assert_eq!(
-            plugin_text,
-            include_str!("../../../tests/fixtures/contamination/agents-v1.json"),
-            "the engine's copy of agents-v1.json differs from the plugin's"
-        );
-    }
 }
 
 #[test]

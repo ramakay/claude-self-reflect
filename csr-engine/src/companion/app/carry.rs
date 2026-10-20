@@ -1,7 +1,7 @@
 //! Prep-compact: before a compaction, the threads you set aside for later ("later" in the pane's
 //! Lost and found) are handed to the summarizer as reminders, in a section of their own. Never
 //! into Pending Tasks: that list is how Lost and found sees a thread go quiet, and Claude reads
-//! it as its to-do list. Port of `hooks/carry.ts` and of the `carry` hook (register.tsx 2436-2457).
+//! it as its to-do list. Port of the removed `carry.ts` and of the `carry` hook.
 //!
 //! The hook is a Gate on `session.compact` that rewrites `instructions` and nothing else. A
 //! failure, or a source that takes over two seconds, lets the compaction run as it was. Lengths

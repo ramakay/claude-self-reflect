@@ -1,5 +1,5 @@
-//! The compaction rules, apart from the hooks that use them: port of `hooks/compact.ts`. Nothing
-//! here asks Claude Code or the machine for anything.
+//! The compaction rules, apart from the hooks that use them: port of the removed `compact.ts`.
+//! Nothing here asks Claude Code or the machine for anything.
 //!
 //! The numbers are one person's habit, mined from 249 typed `/compact`s (2026-10-12): they compact
 //! from 181k (p10) to 269k (p50). The turn before a `/compact` had nothing running in the
@@ -78,7 +78,7 @@ pub(crate) fn prefix_units(text: &str, units: usize) -> String {
     out
 }
 
-/// `text` in at most `room` units, the cut marked by an ellipsis (compact.ts `cut`).
+/// `text` in at most `room` units, the cut marked by an ellipsis (the removed `compact.ts` `cut`).
 pub(crate) fn cut(text: &str, room: i64) -> String {
     if width(text) as i64 <= room {
         return text.to_string();
@@ -494,7 +494,7 @@ pub struct Payback {
 /// What the pane answered of the payback.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Pay {
-    /// Pane.py did not answer.
+    /// The removed `pane.py` did not answer.
     Unanswered,
     /// It never would pay back.
     Never,

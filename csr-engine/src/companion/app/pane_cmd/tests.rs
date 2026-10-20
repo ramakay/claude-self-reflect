@@ -1,5 +1,5 @@
-//! The pane_cmd tests: the TypeScript ones of `companion.test.ts` that are about `/csr`, the pane,
-//! its refresh and the pane opened, on a fake Claude Code and a fake `Outside`.
+//! The pane_cmd tests: the TypeScript ones of the removed `companion.test.ts` that are about
+//! `/csr`, the pane, its refresh and the pane opened, on a fake Claude Code and a fake `Outside`.
 
 use super::*;
 use crate::companion::relay::{

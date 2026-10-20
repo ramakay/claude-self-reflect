@@ -6,8 +6,8 @@
 //! the wrapper has no job left. This module puts the original command back in the
 //! settings value `hook install` is already rewriting, then deletes the leftovers.
 //!
-//! The parsing is a port of `unwrapCommand` / `unquote` in the companion's
-//! `hooks/register.tsx`, the code that wrote the wrapped form and read it back.
+//! The parsing is a port of `unwrapCommand` / `unquote` in the removed TypeScript companion, the
+//! code that wrote the wrapped form and read it back.
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +33,7 @@ fn companion_dir(home: &Path) -> PathBuf {
     home.join(".claude-self-reflect").join("csr-companion")
 }
 
-/// True for a command that runs the CSR wrapper (`IS_WRAPPED` in register.tsx:
+/// True for a command that runs the CSR wrapper (`IS_WRAPPED` in the TypeScript companion:
 /// `csr-companion/statusline.cjs`, `csr-companion/statusline.js` or
 /// `csr-pane-statusline.js`).
 pub fn is_wrapped(command: &str) -> bool {
@@ -242,7 +242,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// What `/csr statusline on` wrote: `wrapCommand` in register.tsx.
+    /// What `/csr statusline on` wrote: `wrapCommand` in the TypeScript companion.
     fn wrap(wrapper: &str, original: &str) -> String {
         format!(
             "node \"{wrapper}\" --sh '{}'",

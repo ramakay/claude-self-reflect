@@ -1,6 +1,6 @@
 //! The first run's walkthrough: each setting a person should choose, one step at a time above the
-//! prompt. Port of `hooks/setup.ts` and of register.tsx's `STEPS`/`startSetup`/`setAside`/
-//! `answerStep` (lines 941-983) with the press and command wiring they have there.
+//! prompt. Port of the removed `setup.ts` and of the TypeScript companion's
+//! `STEPS`/`startSetup`/`setAside`/`answerStep` with the press and command wiring they have there.
 //!
 //! The band draws the walkthrough (a later package's); `walk` hands it what to draw as data. The
 //! view is the session's `setup` row, `{ steps, done, aside, message? }`; each answer is the
@@ -399,7 +399,7 @@ fn on_press() -> Handler {
 }
 
 /// The walkthrough's entries, each where the TypeScript runs its group:
-/// `start` (register.tsx 2393), `edit` (1965), `digit` (2141) and the buttons' presses.
+/// `start`, `edit`, `digit` and the buttons' presses.
 pub fn register(t: &mut Table) {
     t.on("start", "setup_walk", on_start());
     t.on("edit", "setup_walk", on_edit());

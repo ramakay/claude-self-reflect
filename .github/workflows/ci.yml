@@ -33,9 +33,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Prepare home
-        # The plugin's tests write under $HOME/.claude-self-reflect; keep that off the runner's real home. The
-        # `runner` context is not available in a job-level `env:`, so HOME is set for the steps below from here.
-        # `claude plugin test` and cargo both resolve under it.
+        # Everything below runs under a throwaway HOME: the install writes under
+        # $HOME/.claude-self-reflect and `claude plugin` under $HOME/.claude. The `runner` context is not
+        # available in a job-level `env:`, so HOME is set for the steps below from here. cargo resolves under it too.
         run: |
           mkdir -p "$RUNNER_TEMP/plugin-home"
           echo "HOME=$RUNNER_TEMP/plugin-home" >> "$GITHUB_ENV"
@@ -43,23 +43,29 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - name: Plugin TypeScript tests
-        run: |
-          npm install -g @anthropic-ai/claude-code
-          claude plugin test "$GITHUB_WORKSPACE/plugins/csr-companion"
-      - name: Validate plugin and marketplace manifests
-        run: |
-          claude plugin validate "$GITHUB_WORKSPACE/plugins/csr-companion"
-          claude plugin validate "$GITHUB_WORKSPACE/.claude-plugin/marketplace.json"
+      - name: Install Claude Code
+        # Claude Code is the host the generated plugin runs in, so it is the thing that tests and validates it.
+        run: npm install -g @anthropic-ai/claude-code
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: csr-engine
-      - name: Validate the plugin the binary writes
-        # `csr-engine companion plugin emit` writes the relay plugin (plugin.json, hooks.json, register.js)
-        # that `csr-engine companion plugin install` hands to Claude Code. Claude validates what the binary
-        # emits, with the claude CLI the TypeScript step above installed.
+      - name: Build the binary
+        run: cargo build --manifest-path "$GITHUB_WORKSPACE/csr-engine/Cargo.toml" --locked --bin csr-engine
+      - name: Relay test cases on a fresh emit
+        # The binary writes the relay plugin (plugin.json, hooks.json, register.js); the fixture's cases run
+        # against it under `claude plugin test`, with the engine scripted behind it.
         run: |
-          cargo run --manifest-path "$GITHUB_WORKSPACE/csr-engine/Cargo.toml" --locked -- \
-            companion plugin emit "$RUNNER_TEMP/emitted-plugin"
-          claude plugin validate "$RUNNER_TEMP/emitted-plugin"
+          "$GITHUB_WORKSPACE/csr-engine/target/debug/csr-engine" companion plugin emit "$RUNNER_TEMP/relay-under-test"
+          mkdir "$RUNNER_TEMP/relay-under-test/tests"
+          cp "$GITHUB_WORKSPACE/csr-engine/tests/fixtures/relay/relay.test.ts" "$RUNNER_TEMP/relay-under-test/tests/"
+          claude plugin test "$RUNNER_TEMP/relay-under-test"
+      - name: Install the plugin the binary writes, and validate it
+        # `companion plugin install` is what `csr-engine setup` runs: it writes the local marketplace and has
+        # Claude Code install the plugin from it.
+        run: |
+          "$GITHUB_WORKSPACE/csr-engine/target/debug/csr-engine" companion plugin install
+          market="$HOME/.claude-self-reflect/csr-companion/marketplace"
+          claude plugin validate "$market/plugins/csr-companion"
+          claude plugin validate "$market/.claude-plugin/marketplace.json"
+          claude plugin list --json | grep -q '"csr-companion@claude-self-reflect"'

@@ -261,8 +261,8 @@ fn every_send_the_panes_own_formatters_write_is_detected_whole() {
 }
 
 /// SHA-256 of `tests/fixtures/contamination/pane-v1.json`, the 66 sends the Python pane wrote
-/// from invented inputs. `bin/pane.py` and the exporter's inputs are gone, so no code in the
-/// tree can write this file again; it is frozen, and any edit to it must be on purpose.
+/// from invented inputs. the removed `pane.py` and the exporter's inputs are gone, so no code in
+/// the tree can write this file again; it is frozen, and any edit to it must be on purpose.
 /// The Rust producers (`companion::send::closed_send` and the page and action code in
 /// `companion::pane`) are what later packages hold these sends to; re-pin then.
 const PANE_FIXTURE_SHA256: &str =
@@ -287,16 +287,10 @@ fn the_pane_fixture_is_the_frozen_file_the_grammar_was_written_from() {
     assert_eq!(document.cases.len(), 66);
     // the digest of the Python source the sends came from, as recorded
     assert_eq!(document.source.sha256.len(), 64);
-    // While the plugin is beside the crate, its copy of the fixture is the same file.
-    let plugin_copy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../plugins/csr-companion/tests/fixtures/emissions/pane-v1.json");
-    if let Ok(copy) = std::fs::read(plugin_copy) {
-        assert_eq!(hex(&copy), PANE_FIXTURE_SHA256);
-    }
 }
 
-/// The handoff of a shift note (hooks/register.tsx `handoff()`), with the
-/// `What changed:` sentence pane.py adds to the note's line and text. The
+/// The handoff of a shift note (the TypeScript companion's `handoff()`), with the
+/// `What changed:` sentence the removed `pane.py` adds to the note's line and text. The
 /// grammar is the opener and the quote block under it, so the sentence rides
 /// along inside it: nothing of the note may survive into the corpus.
 #[test]
@@ -589,7 +583,7 @@ fn a_long_quote_prefix_with_many_candidates_is_linear() {
     assert_unlabeled("> CSR's compaction card (compacting), quoted: “One.”");
 }
 
-/// The companion's agents envelope (bin/agents.py): an opening marker line, one
+/// The companion's agents envelope (the removed `bin/agents.py`): an opening marker line, one
 /// JSON line, a closing marker line. All three lines are one hit; a marker line
 /// without that shape is still a hit on its own.
 #[test]

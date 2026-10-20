@@ -431,7 +431,7 @@ pub fn picture_fonts() -> &'static super::render::raster::Fonts {
             [
                 ("/System/Library/Fonts/Menlo.ttc", u32::from(bold)),
                 ("/System/Library/Fonts/SFNSMono.ttf", 0),
-                // Linux has no Menlo; pane.py falls back to Pillow's own font there.
+                // Linux has no Menlo; the removed `pane.py` falls back to Pillow's own font there.
                 if bold {
                     (
                         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",

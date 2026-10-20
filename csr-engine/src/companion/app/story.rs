@@ -1,12 +1,12 @@
-//! The Shift Map's own refresh after a turn: port of `refreshStory` (register.tsx 1301-1328) and
-//! of its call at the end of a turn (1922). `hooks/story.ts`, which decides when, is already
+//! The Shift Map's own refresh after a turn: port of `refreshStory` and
+//! of its call at the end of a turn. The removed `story.ts`, which decides when, is already
 //! ported as `companion::story::decide`.
 //!
 //! Only with `CSR_STORY_REWRITES=1` (one Haiku call each time) and not under the map's kill switch
-//! `CSR_NO_STORY_MAP=1`. What `pane.py --story-news` read is the pane's `story_news` here, run in
-//! this process on a blocking thread: it is SQLite and file reads, no embedder. One refresh at a
-//! time, never awaited by the turn: the decision is made at the turn's end, the work is a task of
-//! its own.
+//! `CSR_NO_STORY_MAP=1`. What the removed `pane.py --story-news` read is the pane's `story_news`
+//! here, run in this process on a blocking thread: it is SQLite and file reads, no embedder. One
+//! refresh at a time, never awaited by the turn: the decision is made at the turn's end, the work
+//! is a task of its own.
 //!
 //! The telling itself, which the TypeScript started as `csr-engine generate-story --rewrite`, is
 //! run the same way here: this binary, spawned again. This is the one deliberate exception to
@@ -121,7 +121,7 @@ pub async fn run_program(program: &Path, args: &[String], limit: Duration) -> Ra
     }
 }
 
-/// `pane.py --story-news`: the same as the pane's `--story-news` mode.
+/// The removed `pane.py --story-news`: the same as the pane's `--story-news` mode.
 fn read_news(paths: &Paths, cwd: &str, sid: &str, now: f64) -> Told {
     let news = match Db::open(paths).ok() {
         Some(db) => {
@@ -201,7 +201,7 @@ async fn decide_and_start(cx: &Ctx, seams: &Seams) -> (Option<Refresh>, bool) {
     (Some(Refresh::Why(Why::Go)), true)
 }
 
-/// Tell the story again if the news earns it (register.tsx `refreshStory`).
+/// Tell the story again if the news earns it (the TypeScript companion's `refreshStory`).
 pub async fn refresh_story(cx: &Ctx, seams: &Seams) -> Option<Refresh> {
     if cx.kept(|s: &mut Refreshing| s.0) {
         return Some(Refresh::Busy);
@@ -222,7 +222,7 @@ pub async fn refresh_story(cx: &Ctx, seams: &Seams) -> Option<Refresh> {
     done
 }
 
-/// `turn_complete` (register.tsx 1922): on an answer of the person's own session.
+/// `turn_complete`: on an answer of the person's own session.
 fn on_turn_complete(seams: Seams) -> Handler {
     handler(move |cx, e| {
         let seams = seams.clone();

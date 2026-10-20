@@ -1,4 +1,4 @@
-//! Git as the push guard reads it: port of the git half of `hooks/coach.ts` (git's own option
+//! Git as the push guard reads it: port of the git half of the removed `coach.ts` (git's own option
 //! tables, `gitOptions`, `gitCall`, `gitEnv`). Like the shell half it is a literal port: an option
 //! git would refuse is skipped, not guessed at.
 

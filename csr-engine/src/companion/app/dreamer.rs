@@ -1,20 +1,20 @@
-//! dreamer.ts: looks and dreams, the side-question fork, answers and the dreams seen. Port of
-//! `hooks/dreamer.ts` and of the dreamer's parts of `register.tsx`.
+//! The removed `dreamer.ts`: looks and dreams, the side-question fork, answers and the dreams seen.
+//! Port of the removed `dreamer.ts` and of the dreamer's parts of the TypeScript companion.
 //!
 //! The entries, where the TypeScript runs each group:
-//! - `step` (Stream `/after`, 1988-2004): a step the pace counted, once the chapter's step is due,
+//! - `step` (Stream `/after`): a step the pace counted, once the chapter's step is due,
 //!   starts a look (one at a time, whoever started it); any other counted step lets the fleet offer
 //!   the reports that wait.
-//! - `fork` (Gate, 2013-2040): You should know's forks get CSR's facts and a `ysk` record; any
+//! - `fork` (Gate): You should know's forks get CSR's facts and a `ysk` record; any
 //!   other plugin's fork is noted and passes.
 //! - `chapter` (Gate): a dream still open at a compaction is carried once, then expires. The next
 //!   chapter itself is pace's.
-//! - `digit` (Gate, 2144-2147): a dream answered in the pane, a dream on its way to Claude, and
+//! - `digit` (Gate): a dream answered in the pane, a dream on its way to Claude, and
 //!   the person's last three prompts.
 //! - `start`: the fleet's `Dream` seam, and the 15 s look at the dream log.
 //!
-//! What the TypeScript ran as processes (`lease.py`, `pane.py`, `git`) is `outside::Outside`, so
-//! the engine never spawns itself and a test puts a stand-in in its place.
+//! What the TypeScript ran as processes (the removed `lease.py`, the removed `pane.py`, `git`) is
+//! `outside::Outside`, so the engine never spawns itself and a test puts a stand-in in its place.
 
 mod answers;
 mod look;
@@ -133,7 +133,7 @@ pub(crate) fn seam(outside: Arc<dyn Outside>) -> fleet::Dream {
     })
 }
 
-/// `step` (register.tsx 1988-2004): `told` is `{ e, result }`. Only a step the pace counted gets
+/// `step`: `told` is `{ e, result }`. Only a step the pace counted gets
 /// here with anything to do.
 fn on_step(outside: Arc<dyn Outside>) -> Handler {
     handler(move |cx, told| {
@@ -196,7 +196,7 @@ async fn ysk_facts_for(cx: &Ctx) -> String {
     facts
 }
 
-/// `model.fork`, before it runs (register.tsx 2013-2029): what only the event knows.
+/// `model.fork`, before it runs: what only the event knows.
 fn on_fork_event(outside: Arc<dyn Outside>) -> Handler {
     handler(move |cx, e| {
         let outside = outside.clone();
@@ -317,7 +317,7 @@ fn on_compact_event() -> Handler {
     })
 }
 
-/// `chapter`, after it (register.tsx 2050-2062): a dream still open is carried into the next
+/// `chapter`, after it: a dream still open is carried into the next
 /// chapter once, marked "still open", with two prompts again to answer it; one already carried
 /// expires. The chapter itself starts in pace's entry, which ran first.
 fn on_compact_after(outside: Arc<dyn Outside>) -> Handler {
@@ -363,7 +363,7 @@ fn on_compact_after(outside: Arc<dyn Outside>) -> Handler {
 
 // ---------------------------------------------------------------- digit
 
-/// `prompt.submit` (register.tsx 2144-2147): a dream answered in the pane is never counted as
+/// `prompt.submit`: a dream answered in the pane is never counted as
 /// typed past; a dream on its way to Claude is logged; the person's last three prompts are kept.
 fn on_digit(outside: Arc<dyn Outside>) -> Handler {
     handler(move |cx, e| {
@@ -394,7 +394,7 @@ fn on_digit(outside: Arc<dyn Outside>) -> Handler {
 
 // ---------------------------------------------------------------- start
 
-/// `start` (register.tsx 2393-2405): the fleet's seam, then the look at the dream log every 15 s.
+/// `start`: the fleet's seam, then the look at the dream log every 15 s.
 fn on_start(outside: Arc<dyn Outside>) -> Handler {
     handler(move |cx, e| {
         let outside = outside.clone();

@@ -1,4 +1,4 @@
-//! What `/csr dreams` says about the dreamer's pacing: `dreamsText` (register.tsx 848-852) over
+//! What `/csr dreams` says about the dreamer's pacing: `dreamsText` over
 //! pace's `pace_text`, read from the session's `pace` and `chapter` rows.
 //!
 //! Only the reading is here; the numbers, the words and the writes are pace's. A chapter that is

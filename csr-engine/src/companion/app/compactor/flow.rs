@@ -1,5 +1,5 @@
 //! The plan, the countdown, the offer and the compaction itself: `showPlan` to `turnStarted` of
-//! register.tsx (1342-1790). Every step takes the plan operation it began under; a newer one
+//! the TypeScript companion. Every step takes the plan operation it began under; a newer one
 //! (the setting changed, a cancel) overtakes the older one, which then writes nothing.
 
 use super::{
@@ -223,8 +223,8 @@ pub fn press_compact(cx: &Ctx, out: &Out) {
     }));
 }
 
-/// How many threads wait on you in Lost and found (`pane.py --lost`, as prep-compact reads it),
-/// for the notice: 0 when it does not answer within two seconds.
+/// How many threads wait on you in Lost and found (the removed `pane.py --lost`, as prep-compact
+/// reads it), for the notice: 0 when it does not answer within two seconds.
 async fn lost_waiting(cx: &Ctx, out: &Out) -> usize {
     let asked = out.lost(&cx.cwd, &cx.sid);
     match tokio::time::timeout(LOST_LIMIT, asked).await {
@@ -607,7 +607,7 @@ async fn start_countdown(cx: &Ctx, out: &Out, at: Arc<Armed>, op: PlanOp) -> Res
     Ok(())
 }
 
-/// What `pane.py --compact-plan` gave, as the decision reads it.
+/// What the removed `pane.py --compact-plan` gave, as the decision reads it.
 fn payback_of(plan: Option<&Value>) -> Pay {
     let Some(plan) = plan else {
         return Pay::Unanswered;

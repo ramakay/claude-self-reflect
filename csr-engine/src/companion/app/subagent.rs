@@ -1,5 +1,6 @@
-//! A compacting subagent keeps its brief and its progress: port of `hooks/subagent.ts` and of the
-//! `keep` hook of `hooks/register.tsx` (2458-2473).
+//! A compacting subagent keeps its brief and its progress: port of the removed `subagent.ts` and of
+//! the
+//! `keep` hook of the TypeScript companion.
 //!
 //! The stock summarizer can drop the task a subagent was given and where it had got to. The
 //! companion hears of every subagent compaction as `session.compact` with the subagent's own

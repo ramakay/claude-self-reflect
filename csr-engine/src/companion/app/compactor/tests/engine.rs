@@ -1,5 +1,5 @@
-//! The hooks against the scripted Claude Code: `tests/compact.test.ts` from "the hooks, against the
-//! engine" on, and the three marker tests of `tests/companion.test.ts`.
+//! The hooks against the scripted Claude Code: the removed `compact.test.ts` from "the hooks,
+//! against the engine" on, and the three marker tests of the removed `companion.test.ts`.
 
 use super::kit::{
     agent, forward, has, same, strings, usual_plan, width, Kit, Point, Setup, GO_ON, KEEP_GOING,
@@ -800,7 +800,7 @@ async fn a_session_start_in_the_middle_of_a_countdown_leaves_it_running_one_comp
 
 // ---------------------------------------------------------------- the compaction marker
 
-/// `Date.UTC(2026, 9, 9, 12)`, the clock of `tests/companion.test.ts`.
+/// `Date.UTC(2026, 9, 9, 12)`, the clock of the removed `companion.test.ts`.
 const MARKER_NOW: f64 = 1_791_547_200_000.;
 
 fn conversation() -> Value {

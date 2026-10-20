@@ -7,9 +7,9 @@ title: Installation
 - **macOS** (Apple Silicon) or **Linux** (x86_64 / ARM64)
 - **Claude Code** CLI installed
 - ~78 MB disk for the binary, ~87 MB for the embedding model (downloaded on first run); the database grows with your history
-- For the optional companion pane: Claude Code 2.1.296 or later, and `python3` 3.9 or later on your PATH (the macOS system `python3` is 3.9)
+- For the optional companion pane: Claude Code 2.1.296 or later
 
-No Docker and no API keys. The engine needs no Python. Only the companion pane runs `python3`.
+No Docker, no API keys, and no Node, TypeScript or Python at run time: the companion pane runs inside the `csr-engine` binary.
 
 ## Install
 
@@ -37,17 +37,10 @@ By default `npm install` only downloads the checksummed binary — it does not m
 
 ### The companion plugin
 
-After the other steps succeed, setup installs csr-companion (the pane beside the session) through Claude Code's own plugin CLI, under the same consent as the rest of setup. Then run `/reload-plugins` in Claude Code, or restart it.
+After the other steps succeed, setup installs csr-companion (the pane beside the session), under the same consent as the rest of setup. The binary writes the plugin as a local marketplace under `~/.claude-self-reflect/csr-companion/marketplace`, and Claude Code's own plugin CLI installs it from there, so the plugin's version is always the engine's. The plugin is one generated file that starts `csr-engine companion serve`. Then run `/reload-plugins` in Claude Code, or restart it.
 
 - `csr-engine setup --no-companion` skips the plugin.
-- If the install fails or is skipped, setup prints the reason and the two lines to run yourself in Claude Code:
-
-```
-/plugin marketplace add ramakay/claude-self-reflect
-/plugin install csr-companion@claude-self-reflect
-```
-
-- `CSR_COMPANION_MARKETPLACE` overrides the marketplace source setup passes to the plugin CLI (default `ramakay/claude-self-reflect`).
+- If the install fails or is skipped, setup prints the reason and the command that retries it: `csr-engine companion plugin install`.
 - A failed plugin install never fails setup.
 
 ## Verify

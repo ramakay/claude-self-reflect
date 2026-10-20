@@ -1,6 +1,7 @@
-//! Compact at the right moment: port of the compactor of `hooks/register.tsx` (`CS`, `atTurnEnd`,
+//! Compact at the right moment: port of the compactor of the TypeScript companion (`CS`,
+//! `atTurnEnd`,
 //! `compactNow`, the countdown, the compaction marker and the band's data) and of
-//! `hooks/compact.ts` (the rules, in `rules`).
+//! the removed `compact.ts` (the rules, in `rules`).
 //!
 //! The entries, on the keys `app::table()` names: `stop`, `watched`, `seen`, `turn_start`,
 //! `turn_complete`, `edit`, `marker`, `config` and `start`. The TypeScript registers the first

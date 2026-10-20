@@ -1,4 +1,4 @@
-//! The pane's cards, drawn in the herdr pane's paper (register.tsx 2485-2675): a dark bar for the
+//! The pane's cards, drawn in the herdr pane's paper: a dark bar for the
 //! counts, then a card per section, each in its own ink. The tree is plain data (`{ type, props,
 //! children }`); the relay builds elements from it and wires each Button to `/press`.
 //!
@@ -50,7 +50,7 @@ const CHANGED: Look = Look {
     glyph: "~",
 };
 
-/// Where the dreams offer stands (register.tsx `turnedOn`).
+/// Where the dreams offer stands (the TypeScript companion's `turnedOn`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TurnedOn {
     Asked,

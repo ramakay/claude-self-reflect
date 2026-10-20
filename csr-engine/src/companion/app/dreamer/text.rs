@@ -1,4 +1,4 @@
-//! `hooks/dreamer.ts`, the part that is only text: the prompt, the reply's parser, the dreams
+//! The removed `dreamer.ts`, the part that is only text: the prompt, the reply's parser, the dreams
 //! seen and known, what the person forwarded, and what You should know is given.
 //!
 //! Every character class here is JavaScript's, as `app::fleet::text` has it: `\s` and `trim` hold
@@ -739,9 +739,9 @@ pub fn clean_for_draft(text: &str) -> String {
 //
 // What CSR or a side agent writes into the prompt box for the person to send, read by the
 // grammar that writes it: forward grammar v2, the same in csr-engine (src/extraction/provenance.rs,
-// strip_csr_forwards) and the pane (bin/pane.py strip_forwards). v2 says `quoted` in its header,
-// and every " and " inside a question, reasoning or body is a straight ", so the first " after an
-// opening " closes it. See the TypeScript for the shapes: the pane's dream, the compaction
+// strip_csr_forwards) and the pane (the removed `pane.py` strip_forwards). v2 says `quoted` in its
+// header, and every " and " inside a question, reasoning or body is a straight ", so the first "
+// after an opening " closes it. See the TypeScript for the shapes: the pane's dream, the compaction
 // card's draft, the session story's, the band's dream (`ask_claude`), a side agent's note.
 
 const BAND_SAID: [&str; 2] = [

@@ -1,6 +1,6 @@
 //! What became of a dream: the answers kept across sessions (`answered`), a dream answered in
 //! the pane (`settledInThePane`), one that reached Claude as a prompt (`sentToClaude`) and one the
-//! person said no to (`reject`). Register.tsx 280-391.
+//! person said no to (`reject`).
 //!
 //! The dream log is the pane's file: a dream's answer buttons write it, and these read it only
 //! while a dream is up (`settled_in_the_pane`) or a prompt may carry one (`sent_to_claude`).
@@ -20,7 +20,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 /// The answers that take a dream up: it gives its place in the chapter back (`ADOPTED` in
-/// register.tsx, which leaves `sent` to `sent_to_claude`).
+/// the TypeScript companion, which leaves `sent` to `sent_to_claude`).
 pub const ADOPTED: [&str; 2] = ["helpful", "ask_claude"];
 /// A prompt is a reply to the dream sent before it only within this long.
 pub const REPLY_MS: f64 = 30. * 60. * 1000.;

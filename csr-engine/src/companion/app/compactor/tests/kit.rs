@@ -1,5 +1,5 @@
 //! The scripted Claude Code and the fake outside: the twin of `world()` in
-//! `tests/compact.test.ts`. `TestHost` answers `$` (usage, config, compaction, append, log),
+//! the removed `compact.test.ts`. `TestHost` answers `$` (usage, config, compaction, append, log),
 //! `FakeOutside` what the TypeScript asked of `process.run`, `fs` and `env`, and `Kit` drives the
 //! compactor's entries the way the relay does.
 
@@ -67,8 +67,8 @@ pub fn task_row(task: &Running) -> Value {
         "description": task.description })
 }
 
-/// `askClaude` of hooks/dreamer.ts (the band's fill, forward grammar v2): the question in its
-/// quotes, the attribution, the reasoning quoted. Its `cleanForDraft` changes nothing in the
+/// `askClaude` of the removed `dreamer.ts` (the band's fill, forward grammar v2): the question in
+/// its quotes, the attribution, the reasoning quoted. Its `cleanForDraft` changes nothing in the
 /// texts these tests send (no stray surrogate, invisible character, `@`, paste marker or
 /// `ultra` word), so it is left out; the dreamer's own port is not in this module.
 pub fn ask_claude(line: &str, title: &str, text: &str) -> String {
@@ -134,7 +134,8 @@ pub struct Setup {
     /// The `/config` row's value: `auto`, `suggest`, `off`; none for a person who never chose.
     pub setting: Option<&'static str>,
     pub headless: bool,
-    /// What `pane.py --compact-plan` prints: none for the usual plan, null for no answer.
+    /// What the removed `pane.py --compact-plan` prints: none for the usual plan, null for no
+    /// answer.
     pub plan: Option<Value>,
     pub lost: Vec<Value>,
     /// What `git -C dir <args>` prints, by the args.
@@ -308,7 +309,7 @@ impl Hold {
 pub struct FakeOutside {
     setup: Setup,
     pub kept: Mutex<Vec<Value>>,
-    /// `(sid, ctx)` of each `pane.py --compact-plan`.
+    /// `(sid, ctx)` of each call of the removed `pane.py --compact-plan`.
     pub plans: Mutex<Vec<(String, usize)>>,
     pub lost_asked: Mutex<Vec<(String, String)>>,
     /// The args of each `git`.

@@ -64,13 +64,9 @@ enum Commands {
         /// Anthropic API key for AI narrative enrichment (optional)
         #[arg(long)]
         anthropic_key: Option<String>,
-        /// Do not install the csr-companion plugin through Claude Code's plugin CLI
+        /// Do not install the csr-companion plugin this binary writes
         #[arg(long)]
         no_companion: bool,
-        /// Install the companion plugin this binary writes (a local marketplace) instead of
-        /// the one on GitHub
-        #[arg(long)]
-        relay: bool,
     },
     /// Show system status (JSON by default, --compact for statusline, --swiftbar for menu bar)
     Status {
@@ -915,7 +911,6 @@ async fn run(
     if let Some(Commands::Setup {
         anthropic_key,
         no_companion,
-        relay,
     }) = args.command
     {
         return csr_engine::setup::handle(
@@ -923,7 +918,6 @@ async fn run(
             &args.projects_dir,
             anthropic_key,
             !no_companion,
-            relay,
         )
         .await;
     }

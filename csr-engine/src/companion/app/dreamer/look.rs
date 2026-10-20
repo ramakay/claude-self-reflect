@@ -1,4 +1,4 @@
-//! One look: a fork of the session asking for one "what if...?" (register.tsx 592-829), the lease
+//! One look: a fork of the session asking for one "what if...?", the lease
 //! it runs under, and what came of it.
 //!
 //! One dreamer per session: the lease says which copy of the plugin dreams. It is taken before a

@@ -1,4 +1,4 @@
-//! The guard's tests: the 23 of `companion.test.ts` (1754-2244), on a pretend machine. The three
+//! The guard's tests: the 23 of the removed `companion.test.ts`, on a pretend machine. The three
 //! that press a band button (1772, 1794, 2235) are ported at the function the press calls
 //! (`coach_note`, `add_to_claude_md`); the button itself is the band's.
 
@@ -73,7 +73,8 @@ fn push_to(dir: Option<&str>, remote: Option<&str>, implicit: bool) -> GitPush {
 
 // ---------------------------------------------------------------- a pretend machine
 
-/// What is on the disk and what git answers (companion.test.ts's `host`: `files`, `unreadable`,
+/// What is on the disk and what git answers (the removed `companion.test.ts`'s `host`: `files`,
+/// `unreadable`,
 /// `git`, `gitIn`, `gitExit`, `noRepo`, `hostEnv`, `coach`).
 #[derive(Default)]
 struct Disk {

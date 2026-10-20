@@ -1,6 +1,6 @@
-//! The compactor's tests: 1:1 ports of `tests/compact.test.ts` (the rules without an engine, the
-//! hooks against a scripted Claude Code), `tests/r5.test.ts` and the three marker tests of
-//! `tests/companion.test.ts`. The Rust name of each is the TypeScript name, snake-cased.
+//! The compactor's tests: 1:1 ports of the removed `compact.test.ts` (the rules without an engine,
+//! the hooks against a scripted Claude Code), the removed `r5.test.ts` and the three marker tests
+//! of the removed `companion.test.ts`. The Rust name of each is the TypeScript name, snake-cased.
 //!
 //! This file holds the rules, which need no engine. `kit` is the scripted Claude Code and the
 //! fake outside the TypeScript's `world()` was (it answered `process.run`, `fs.*` and `env.get`),
@@ -306,8 +306,8 @@ fn decide_nothing_below_the_band_or_when_it_would_not_pay_back_a_plan_until_a_se
         }),
         Act::None
     );
-    // pane.py did not answer: in the band nothing acts; past the high edge the owner's own limit
-    // is enough
+    // The removed `pane.py` did not answer: in the band nothing acts; past the high edge the
+    // owner's own limit is enough
     assert_eq!(
         act(Ask {
             ctx: 214_000.,
@@ -538,8 +538,8 @@ fn what_csr_or_a_side_agent_wrote_and_the_person_forwarded_is_never_one_of_the()
 
 // Codex r2 #6 #7 #8: a sentence about the card or opening with the dreamer's words is the
 // person's, and every forward in a prompt goes while the words between and after them stay. The
-// forms are the ones pane.py and dreamer.ts write (compact_section, dream_send, askClaude), as
-// csr-engine reads them (strip_csr_forwards).
+// forms are the ones the removed `pane.py` and the removed `dreamer.ts` write (compact_section,
+// dream_send, askClaude), as csr-engine reads them (strip_csr_forwards).
 #[test]
 fn forwards_are_read_by_the_grammar_that_writes_them_talk_about_them_is_the_owner_s() {
     let own = "CSR's compaction card (compacted by csr) is wrong; never drop my pending task.";
@@ -632,10 +632,10 @@ fn a_send_is_a_span_of_its_line_and_a_band_forward_goes_line_by_line() {
     );
 }
 
-// Forward grammar v2, its required tests on this side; test_pane.py emits the same forms from
-// pane.py's real emitters. astra r3 #5: a closing quote was searched past a known cut; #6: a v1
-// body opening on a quoted phrase read as a closed envelope; #7: the band's question took the
-// person's words on its line.
+// Forward grammar v2, its required tests on this side; the removed `test_pane.py` emits the same
+// forms from the removed `pane.py`'s real emitters. astra r3 #5: a closing quote was searched past
+// a known cut; #6: a v1 body opening on a quoted phrase read as a closed envelope; #7: the band's
+// question took the person's words on its line.
 #[test]
 fn forward_grammar_v2_each_kind_round_trips_to_exactly_the_reply_v1_is_never() {
     let pane = "CSR's dreamer asked this while you worked, quoted: “What if the pane said \

@@ -1,4 +1,4 @@
-//! The subagent feature's tests: the nine of `tests/companion.test.ts` (2316-2484), 1:1 by name,
+//! The subagent feature's tests: the nine of the removed `companion.test.ts`, 1:1 by name,
 //! then the ones the transcript fallback adds. The TypeScript ran a compaction through the whole
 //! plugin; here the `keep` entry is run on its own, through the relay's chain, on the scripted
 //! host. Nothing reads or writes the real HOME: the fallback reads a temp one.

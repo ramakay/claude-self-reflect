@@ -295,7 +295,7 @@ pub fn story_news_in(db: &Db, paths: &Paths, root: Option<&Path>, sid: &str, now
     })
 }
 
-// ---- When the story may be told again on its own (port of `hooks/story.ts`) ----
+// ---- When the story may be told again on its own (port of the removed `story.ts`) ----
 //
 // The Shift Map's automatic refresh, off unless CSR_STORY_REWRITES=1. One model call each time, so
 // four gates, each decided without a model call from what `story_news` reads:

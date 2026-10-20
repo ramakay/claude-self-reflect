@@ -400,16 +400,25 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 
 ### Companion plugin
 
-- **`plugins/csr-companion` ships in the repo** (marketplace `claude-self-reflect`, `.claude-plugin/marketplace.json`,
-  relative source path). Install with `/plugin marketplace add ramakay/claude-self-reflect` then
-  `/plugin install csr-companion@claude-self-reflect`. The npm package does not install it by itself; `csr-engine
-  setup` does (next bullet, 4ecae9c5) and prints those two lines only when it skips or cannot install (7e697466).
-- **`csr-engine setup` now installs the companion** through Claude Code's plugin CLI
-  (`claude plugin install csr-companion --marketplace ramakay/claude-self-reflect`), under the same single consent that
-  runs setup. It skips a plugin that is already installed, `csr-engine setup --no-companion` skips it, and a missing
-  `claude`, a nonzero exit, a 120 s timeout or an unreadable result prints the reason plus the two `/plugin` lines
-  and still exits 0. `CSR_COMPANION_MARKETPLACE` overrides the source. The default GitHub marketplace works only
-  after this release merges to `main`, because `.claude-plugin/marketplace.json` is not on `main` yet.
+- **The companion runs inside the engine, and the TypeScript plugin is gone.** The pane, the dreamer, the
+  compaction coach, the git guard, the agents and Codex runs, the Shift Map refresh and the first-run walkthrough are
+  Rust in `csr-engine` (`csr-engine companion serve`). What Claude Code loads is one generated relay,
+  `hooks/register.js`, with its `plugin.json` and `hooks.json`, written by the binary at the engine's own version
+  (`csr-engine companion plugin emit`); the relay holds no logic and starts only `csr-engine companion serve`. No
+  Node, TypeScript or Python runs at run time. `plugins/csr-companion/`, the repo's `.claude-plugin/` marketplace
+  and the pre-commit pytest branch are removed; the CI plugin job now runs `claude plugin test` on the relay
+  fixture and `claude plugin validate` on what the binary installs. The status line wrapper (`/csr statusline on`)
+  is retired: `csr-engine hook install --apply` puts the original `statusLine.command` back and deletes the
+  wrapper files. At this change (private HOME): lib 4379, `companion` 95, `companion_plugin` 5,
+  `hooks_integration` 75, `integration` 75, and the relay's 20 `claude plugin test` cases, all passing.
+- **`csr-engine setup` installs the generated relay.** It writes a local marketplace under
+  `~/.claude-self-reflect/csr-companion/marketplace` and installs the plugin from it through `claude plugin` (the same
+  steps as `csr-engine companion plugin install`: register the marketplace, install, or update when the engine's
+  version or relay text changed; a plugin the user switched off stays off and its options are kept). `--no-companion`
+  skips it, and a missing `claude`, a failed step or a 120 s timeout prints the reason plus
+  `csr-engine companion plugin install` and still exits 0. The GitHub marketplace source,
+  `CSR_COMPANION_MARKETPLACE`, the `/plugin marketplace add` lines and the `setup --relay` flag are gone; a machine
+  that registered the GitHub marketplace is moved to the local one.
 - **Pane** beside the session: what the memory handed Claude, code that changed since your past sessions,
   "Lost and found" (threads a compaction summary carried once and then dropped), and the session story as csr-engine
   last told it. It reads the csr-engine database read-only
@@ -422,10 +431,10 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   from it is matched by the engine's provenance guard, so it is not read back as your words.
 - **Compaction coach:** `suggest` (default) offers to compact at a quiet turn end between 181k and 269k tokens,
   `auto` compacts on its own, `off` never does.
-- **Git guard** is off unless a `csr-guard.json` exists (`README.md` in the plugin).
+- **Git guard** is off unless a `csr-guard.json` exists.
 - **Private by default:** the plugin's folder `~/.claude-self-reflect/csr-companion/` is `0700` and its files `0600`
   under any umask (looser ones are tightened on first write), and API keys, bearer tokens, `password=`/`token=`
-  values and PEM blocks are redacted from the transcript text it keeps (`bin/private.py`).
+  values and PEM blocks are redacted from the transcript text it keeps.
 - **Agents, Codex and handoffs** (merge 65d4f56d). The pane tracks a session's agents from typed events and shows
   them In flight (a1f386fb, 01c1c611). A finished agent with a report gets one look (a644eb87). Subagent tokens are
   not added to the Claude spend that the dreamer's share is measured against (f53ea3cc). Codex runs and the Codex
@@ -444,7 +453,7 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   bf7ca8d9). `hook install` no longer registers SubagentStop and removes CSR's entry from an older
   `settings.json`; `csr-engine setup` runs that same install step, so re-running `csr-engine setup` or
   `csr-engine hook install --apply` after upgrading clears it (4adf32ee, 06af27e2, 34f5648c). Setup ends by
-  installing the companion plugin through `claude plugin`, or with its two install lines when it cannot (7e697466,
+  installing the companion plugin through `claude plugin`, or with the command that retries it when it cannot (7e697466,
   4ecae9c5).
 - Windows (unpublished until now): hook commands use forward slashes (86afb4a3, #273); three Windows-only
   prompt-submit failures fixed, stdin reads bounded to 2 s (2c9bdb3b, #285).

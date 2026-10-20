@@ -279,7 +279,7 @@ pub fn parse_results(body: &Value) -> Results {
 }
 
 /// A scripted stand-in for Claude Code, the twin of `host()` in
-/// `plugins/csr-companion/tests/companion.test.ts`.
+/// the removed `companion.test.ts`.
 #[cfg(test)]
 pub mod fake {
     use super::*;

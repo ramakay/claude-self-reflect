@@ -291,25 +291,11 @@ mod tests {
     }
 
     #[test]
-    fn plugin_json_keeps_the_ts_plugins_fields_and_drops_types() {
+    fn plugin_json_carries_the_engine_version_and_no_types() {
         let got: serde_json::Value = serde_json::from_str(&plugin_json("1.2.3")).unwrap();
         assert_eq!(got["version"], "1.2.3");
+        assert_eq!(got["name"], PLUGIN_NAME);
         assert!(got.get("types").is_none());
-        // The TS plugin's manifest goes at the cutover; until then every other field must match.
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../plugins/csr-companion/.claude-plugin/plugin.json"
-        );
-        let Ok(ts) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let mut ts: serde_json::Value = serde_json::from_str(&ts).unwrap();
-        let ts = ts.as_object_mut().unwrap();
-        ts.remove("types");
-        ts.remove("version");
-        let mut got = got;
-        got.as_object_mut().unwrap().remove("version");
-        assert_eq!(&got, &serde_json::Value::Object(ts.clone()));
     }
 
     #[test]

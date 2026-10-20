@@ -8,8 +8,10 @@
 //! this tree, their registered header constants). Nothing here copies an output
 //! string, so a formatter that changes its wording turns the canary red until
 //! the registry's grammar follows. The companion's sends come from
-//! `plugins/csr-companion/tests/export-emissions.py`, which calls the pane's
-//! own formatters; the plugin's TypeScript emitters appear as synthetic cases.
+//! the removed `export-emissions.py` of the removed Python pane, which called the pane's
+//! own formatters (its generator is gone with the Python pane; the file is frozen data, kept
+//! because old transcripts still carry those sends); the removed TypeScript plugin's emitters
+//! appear as synthetic cases.
 //!
 //! A detected hit is a label, never an edit: every row in `cases.jsonl` expects
 //! the input back byte for byte, with the reason the detector gives it.
@@ -31,14 +33,16 @@ use crate::provenance::Speaker;
 
 const CASES_JSONL: &str = include_str!("../../tests/fixtures/contamination/cases.jsonl");
 
-/// What the companion's pane types into the prompt, written by the pane's own
-/// formatters (`plugins/csr-companion/tests/export-emissions.py`). The plugin
-/// keeps an identical copy; this one keeps the crate self-contained.
+/// What the companion's pane typed into the prompt, written by the Python pane's own
+/// formatters. Frozen data: its generator (the removed `export-emissions.py`) was removed with the
+/// Python pane, but old transcripts still carry these sends, so the detectors keep
+/// recognising them.
 const PANE_JSON: &str = include_str!("../../tests/fixtures/contamination/pane-v1.json");
 
-/// The companion's agents envelopes (context and handoff), written by the real
-/// Python formatter (`plugins/csr-companion/tests/export-agent-emissions.py`).
-/// Identical to the plugin's copy; this one keeps the crate self-contained.
+/// The companion's agents envelopes (context and handoff), first written by the Python
+/// formatter. Frozen data: that generator (the removed `export-agent-emissions.py`) was removed
+/// with the TypeScript plugin; the Rust formatter now reproduces every fixture (see
+/// `plugin_agents_production_fixture_digest_matches`).
 const AGENTS_JSON: &str = include_str!("../../tests/fixtures/contamination/agents-v1.json");
 
 /// Prefix of the generated rows in `cases.jsonl`.

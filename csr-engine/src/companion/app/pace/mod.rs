@@ -1,6 +1,6 @@
 //! How often the dreamer looks: a feed with a limit, not a fixed number a day and not unlimited.
-//! Port of `hooks/pace.ts` and of the dreamer's bookkeeping in `register.tsx`: `paceOf` and
-//! `changePace` (486-506), the chapters (526-593) and the per-session key sweep (881-907).
+//! Port of the removed `pace.ts` and of the dreamer's bookkeeping in the TypeScript companion:
+//! `paceOf` and `changePace`, the chapters and the per-session key sweep.
 //!
 //! Four rules, each decided without a model call:
 //!  1. A chapter holds five dreams. A chapter runs from the session's start, or its last
@@ -39,7 +39,8 @@
 //!   needed, as `state::Options` does.
 //! - `isPerson` is `state::is_person`, the one every feature asks: the session's `interactive` from
 //!   its start, else where it draws (`session.surfaces`), asked once.
-//! - The `--keep` calls of pane.py are `Keep`, the in-process twin of the pane's `--keep` mode.
+//! - The `--keep` calls of the removed `pane.py` are `Keep`, the in-process twin of the
+//!   pane's `--keep` mode.
 //! - A pace's `turns` is kept as a list of `[key, receipt]` pairs: the store's JSON objects have
 //!   no order here, and the order is what the trimming of old turns goes by. A row written as an
 //!   object is read as it comes.
@@ -84,7 +85,7 @@ pub const SESSIONS_KEPT: usize = 20;
 /// `Number.MAX_SAFE_INTEGER`).
 pub const NEVER: f64 = 9_007_199_254_740_991.;
 
-/// The keys that belong to one session (`PER_SESSION`, register.tsx 101).
+/// The keys that belong to one session (`PER_SESSION`).
 const PER_SESSION: [&str; 9] = [
     "pace",
     "chapter",
@@ -196,7 +197,7 @@ impl<'de> Deserialize<'de> for Turns {
     }
 }
 
-/// The session's pace, row `(sid, "pace")` (pace.ts `Pace`).
+/// The session's pace, row `(sid, "pace")` (the removed `pace.ts` `Pace`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PaceRow {
     pub session: String,
@@ -231,7 +232,7 @@ pub struct PaceRow {
 }
 
 impl PaceRow {
-    /// pace.ts `freshPace`.
+    /// The removed `pace.ts` `freshPace`.
     pub fn fresh(session: &str) -> Self {
         Self {
             session: session.to_string(),
@@ -247,7 +248,7 @@ impl PaceRow {
     }
 }
 
-/// The key a turn's receipt goes by (pace.ts `turnKey`): `["session","turn"]`.
+/// The key a turn's receipt goes by (the removed `pace.ts` `turnKey`): `["session","turn"]`.
 pub fn turn_key(session: &str, turn: &str) -> String {
     json!([session, turn]).to_string()
 }
@@ -318,7 +319,7 @@ pub fn close_turn(pace: PaceRow, turn: &str) -> PaceRow {
 
 // ---------------------------------------------------------------- chapter
 
-/// A chapter of the session, row `(sid, "chapter")` (pace.ts `Chapter`).
+/// A chapter of the session, row `(sid, "chapter")` (the removed `pace.ts` `Chapter`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Chapter {
     pub session: String,
@@ -350,7 +351,7 @@ pub struct Chapter {
 }
 
 impl Chapter {
-    /// pace.ts `freshChapter`.
+    /// The removed `pace.ts` `freshChapter`.
     pub fn fresh(session: &str, started: f64) -> Self {
         Self {
             session: session.to_string(),
@@ -546,7 +547,7 @@ pub fn sides_of(pace: &PaceRow, last_step: f64) -> Value {
     })
 }
 
-/// The four counts of a usage (register.tsx `tokensOf`).
+/// The four counts of a usage (the TypeScript companion's `tokensOf`).
 pub fn tokens_of(usage: &Value) -> f64 {
     [
         "input_tokens",
@@ -561,7 +562,7 @@ pub fn tokens_of(usage: &Value) -> f64 {
 
 // ---------------------------------------------------------------- the process's state
 
-/// Where `--keep` records go: `(cwd, record)`, as pane.py's `--repo cwd --keep JSON`.
+/// Where `--keep` records go: `(cwd, record)`, as the removed `pane.py`'s `--repo cwd --keep JSON`.
 pub type Keep = Arc<dyn Fn(String, Value) -> BoxFuture<()> + Send + Sync>;
 
 /// What pace keeps for the life of the process (`cx.kept`), and what the dreamer's `step` entry
@@ -638,7 +639,7 @@ async fn write_keep(cx: &Ctx, record: Value) {
 
 // ---------------------------------------------------------------- pace changes
 
-/// This session's pace (register.tsx `paceOf`): its row, or a fresh one.
+/// This session's pace (the TypeScript companion's `paceOf`): its row, or a fresh one.
 pub fn pace_of(cx: &Ctx) -> PaceRow {
     let fresh = PaceRow::fresh(&cx.sid);
     let Some(Value::Object(row)) = cx.store.get(&cx.sid, "pace").ok().flatten() else {
@@ -661,10 +662,10 @@ pub fn pace_of(cx: &Ctx) -> PaceRow {
 /// A check on whether a change is still wanted, made after the pace is read (`held`).
 pub type Held<'a> = Option<&'a (dyn Fn() -> bool + Send + Sync)>;
 
-/// Change the pace as one step (register.tsx `changePace`). Every change goes through one queue:
-/// Claude's steps count what they spend while a look writes what it spent, and a change that read
-/// the pace before the other wrote it would drop the other's tokens. `held` false: the pace is
-/// returned as it is.
+/// Change the pace as one step (the TypeScript companion's `changePace`). Every change goes through
+/// one queue: Claude's steps count what they spend while a look writes what it spent, and a change
+/// that read the pace before the other wrote it would drop the other's tokens. `held` false: the
+/// pace is returned as it is.
 pub async fn change_pace(
     cx: &Ctx,
     change: impl FnOnce(PaceRow) -> PaceRow + Send,
@@ -688,8 +689,8 @@ fn chapter_row(cx: &Ctx) -> Option<Value> {
     cx.store.get(&cx.sid, "chapter").ok().flatten()
 }
 
-/// This chapter of the session (register.tsx `chapterOf`): a fresh one for a new session, and
-/// after two hours without a compaction.
+/// This chapter of the session (the TypeScript companion's `chapterOf`): a fresh one for a new
+/// session, and after two hours without a compaction.
 pub async fn chapter_of(cx: &Ctx) -> Result<Chapter> {
     let value = chapter_row(cx);
     let now = cx.clock.now();
@@ -748,14 +749,16 @@ pub async fn new_chapter(cx: &Ctx, why: &str) -> Result<Chapter> {
     Ok(chapter)
 }
 
-/// `new_chapter` through the chapter's queue (register.tsx `serially(() => newChapter(..))`).
+/// `new_chapter` through the chapter's queue (the TypeScript companion's `serially(() =>
+/// newChapter(..))`).
 pub async fn new_chapter_serially(cx: &Ctx, why: &str) -> Result<Chapter> {
     let queue = cx.kept(|p: &mut Pace| p.chapter_queue.clone());
     let _turn = queue.lock().await;
     new_chapter(cx, why).await
 }
 
-/// The chapter as it is now, changed: read fresh inside the queue (register.tsx `changeChapter`).
+/// The chapter as it is now, changed: read fresh inside the queue (the TypeScript companion's
+/// `changeChapter`).
 pub async fn change_chapter(
     cx: &Ctx,
     change: impl FnOnce(Chapter) -> Chapter + Send,
@@ -808,9 +811,9 @@ fn session_chapters(cx: &Ctx) -> Result<Vec<(String, f64)>> {
 }
 
 /// The per-session keys of all but the newest sessions go, and the unkeyed ones every process once
-/// shared (register.tsx `sweepSessions`). Only a session whose chapter is known and past the
-/// newest `SESSIONS_KEPT` goes: one with no chapter yet may be live in another window, its first
-/// look not taken.
+/// shared (the TypeScript companion's `sweepSessions`). Only a session whose chapter is known and
+/// past the newest `SESSIONS_KEPT` goes: one with no chapter yet may be live in another window, its
+/// first look not taken.
 pub fn sweep_sessions(cx: &Ctx) -> Result<()> {
     for key in PER_SESSION {
         cx.store.delete(MACHINE, key)?;
@@ -841,7 +844,7 @@ fn has_agent(e: &Value) -> bool {
     !e["agentId"].is_null()
 }
 
-/// `turn_complete` (register.tsx 1918): the turn ends, its receipt may now be trimmed.
+/// `turn_complete`: the turn ends, its receipt may now be trimmed.
 fn on_turn_complete(keep: Keep) -> Handler {
     handler(move |cx, e| {
         let keep = keep.clone();
@@ -860,7 +863,7 @@ fn on_turn_complete(keep: Keep) -> Handler {
     })
 }
 
-/// `step` (register.tsx 1988-2000): `e` is `{ e, result }`. A step is one index of one turn,
+/// `step`: `e` is `{ e, result }`. A step is one index of one turn,
 /// counted once in the pace's receipts: a replay of it adds no usage and is no step of the
 /// chapter.
 fn on_step(keep: Keep) -> Handler {
@@ -927,7 +930,7 @@ fn on_step(keep: Keep) -> Handler {
     })
 }
 
-/// `chapter`, before the compaction (register.tsx 2047): what only the event knows.
+/// `chapter`, before the compaction: what only the event knows.
 fn on_compact_event() -> Handler {
     handler(|_cx, e| async move {
         let skip = has_agent(&e) || e["trigger"] == "precompute";
@@ -938,7 +941,7 @@ fn on_compact_event() -> Handler {
     })
 }
 
-/// `chapter`, after it (register.tsx 2047-2070): a compaction that went through starts the next
+/// `chapter`, after it: a compaction that went through starts the next
 /// chapter. `e` is what the compaction returned.
 fn on_compact_after(keep: Keep) -> Handler {
     handler(move |cx, result| {
@@ -958,7 +961,7 @@ fn on_compact_after(keep: Keep) -> Handler {
     })
 }
 
-/// `start` (register.tsx 2394): a start that is not a person's does nothing here.
+/// `start`: a start that is not a person's does nothing here.
 fn on_start(keep: Keep) -> Handler {
     handler(move |cx, e| {
         let keep = keep.clone();

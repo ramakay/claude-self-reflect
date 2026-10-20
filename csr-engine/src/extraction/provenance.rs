@@ -65,8 +65,8 @@ pub const AGENT_PROMPT_SIGNATURES: [&str; 4] = [
 /// - UserPromptSubmit context blocks (injection/formatter.rs)
 /// - agent prompts (AGENT_PROMPT_SIGNATURES, included via EMISSION_HEADERS)
 /// - the csr-companion compaction's keep list (the summarizer's instructions, which a summary
-///   may echo) and the one-line notice it leaves after compacting (plugins/csr-companion/hooks/
-///   compact.ts `KEEP_HEADER`, `NOTICE_HEADER`)
+///   may echo) and the one-line notice it leaves after compacting
+///   (the removed `compact.ts` `KEEP_HEADER`, `NOTICE_HEADER`)
 ///
 /// The companion's forwarded dream and compaction card draft are NOT headers here: the person
 /// talks about both in their own words ("Please change CSR's compaction card (the one in the
@@ -88,8 +88,8 @@ const EMISSION_HEADERS: [&str; 16] = [
     "You are CSR Episode Analyst",
     "You are summarizing a coding session",
     "# Ratification Dialog-Act Extraction",
-    // The companion's keep list and notice (hooks/compact.ts KEEP_HEADER, NOTICE_HEADER): the plugin's
-    // test_compact.py reads these two as literals, so they stay literals.
+    // The companion's keep list and notice (the removed `compact.ts` KEEP_HEADER, NOTICE_HEADER): old
+    // transcripts carry these two exact strings, so they stay literals.
     "CSR COMPACT KEEP —",
     "CSR compacted at",
 ];
@@ -325,7 +325,7 @@ pub(crate) const DREAMER_ATTRIBUTION: &str = "CSR's dreamer asked this while you
 
 /// The band's attribution paragraph, word for word. Forward grammar v2 (`.plans/release-10.1/forward-grammar.md`)
 /// marks its own with `quoted`: [`DREAMER_BAND_QUOTED`]. Legacy (v1) forms already sit in transcripts:
-/// `askClaude` (plugins/csr-companion/hooks/dreamer.ts) wrote the first, the recap fixtures in hooks/stop.rs
+/// `askClaude` (the removed `dreamer.ts`) wrote the first, the recap fixtures in hooks/stop.rs
 /// (1d23d675) carry the second. A paragraph that only opens with the attribution's words is the person's: "...
 /// while you worked yesterday, but I wrote today's question myself." (Codex review r2, #7).
 const DREAMER_BAND_QUOTED: &str =
@@ -344,19 +344,19 @@ fn is_band_attribution(line: &str) -> bool {
 /// emitter makes every ” inside a body a straight quote, so the first ” after the opening “ closes it.
 const QUOTED_OPEN: &str = ", quoted: \u{201c}";
 
-/// The pane's one-line send of a dream (plugins/csr-companion/bin/pane.py `dream_send`), at most 700 characters:
+/// The pane's one-line send of a dream (the removed `pane.py` `dream_send`), at most 700 characters:
 /// - v2: `CSR's dreamer asked this while you worked, quoted: “<question>” Its reasoning: “<reasoning>”`, ending at
 ///   the reasoning's closing ”.
 /// - v1: `CSR's dreamer asked this while you worked: “<question>” Its reasoning: <title>. <reasons>`. Never
 ///   searched for a closing quote: it ends at `one_line`'s cut (`…` as its 700th character), else at the end of
-///   its line. A question is at most 240 characters (dreamer.ts `parseDream`), so a cut never falls before "Its
+///   its line. A question is at most 240 characters (the removed `dreamer.ts` `parseDream`), so a cut never falls before "Its
 ///   reasoning:".
 const DREAMER_PANE_LEGACY_OPEN: &str = ": \u{201c}";
 const DREAMER_PANE_LEGACY_REASONING: &str = "\u{201d} Its reasoning:";
 const DREAMER_PANE_QUOTED_REASONING: &str = " Its reasoning: \u{201c}";
 const DREAMER_PANE_SEND_CHARS: usize = 700;
 
-/// The companion's compaction card draft a click puts in the prompt (pane.py `compact_section`), the stage its
+/// The companion's compaction card draft a click puts in the prompt (the removed `pane.py` `compact_section`), the stage its
 /// heading lowercased, at most 1,200 characters. v2: `CSR's compaction card (<stage>), quoted: “<body>”`. v1:
 /// `CSR's compaction card (<stage>): <title>. <rows>.`, ending at its cut or the end of its line.
 const COMPACTION_CARD_OPEN: &str = "CSR's compaction card (";
@@ -368,14 +368,14 @@ const COMPACTION_CARD_STAGES: [&str; 4] = [
 ];
 const COMPACTION_CARD_SEND_CHARS: usize = 1200;
 
-/// The session story's draft (pane.py), at most 700 characters. v2: `CSR's story of this session, rev <n>, quoted:
+/// The session story's draft (the removed `pane.py`), at most 700 characters. v2: `CSR's story of this session, rev <n>, quoted:
 /// “<body>”`. v1: `CSR's story of this session, rev <n>: <body>`, ending at its cut or the end of its line.
 const STORY_OPEN: &str = "CSR's story of this session, rev ";
 const STORY_SEND_CHARS: usize = 700;
 
 /// True when the WHOLE of `text` is the companion dreamer's "ask Claude"
-/// message, in the exact grammar `askClaude` (plugins/csr-companion/hooks/
-/// dreamer.ts) writes: an optional one-line question, a blank line, the
+/// message, in the exact grammar `askClaude`
+/// (the removed `dreamer.ts`) writes: an optional one-line question, a blank line, the
 /// attribution paragraph (v2 or legacy), a blank line, then the dreamer's
 /// reasoning as a blockquote. Every word of it is the dreamer's, not the
 /// person's, so a caller must drop the message as a whole: paragraph scrubbing
@@ -442,7 +442,7 @@ struct Forwards {
     first: usize,
 }
 
-/// Byte offset just past the `…` pane.py's `one_line(text, chars)` appends when it cut a send that starts at
+/// Byte offset just past the `…` the removed `pane.py`'s `one_line(text, chars)` appends when it cut a send that starts at
 /// `start` (it keeps `chars - 1` characters), if it did.
 fn send_truncation_end(line: &str, start: usize, chars: usize) -> Option<usize> {
     let (offset, c) = line[start..].char_indices().nth(chars - 1)?;
@@ -880,13 +880,13 @@ pub fn is_substantive(text: &str) -> bool {
 }
 
 /// Send texts the CSR companion pane types into Claude's prompt for the person
-/// (`plugins/csr-companion/bin/pane.py`, every `send=one_line(...)` that
+/// (the removed `pane.py`, every `send=one_line(...)` that
 /// restates memory CSR already handed). Pasted back as a prompt, the words are
 /// CSR's: retrieving on them returns the very items they list. Live failure
 /// 2026-10-10: a pasted hand-off list drew back its own "When claude is killed"
 /// note at cosine 0.855, plus a duplicate of it, as fresh PAST CONTEXT.
 const PANE_HANDED: &str = "CSR handed you these this session: ";
-/// pane.py `lost_asks`: `Lost and found: “<thread>” went quiet after HH:MM.`
+/// The removed `pane.py` `lost_asks`: `Lost and found: “<thread>” went quiet after HH:MM.`
 /// then one of two fixed asks, all CSR's words.
 const PANE_LOST: &str = "Lost and found: “";
 /// The fixed closing words of the two `lost_asks` send forms.
@@ -897,7 +897,7 @@ const PANE_LOST_ENDINGS: [&str; 2] = [
 const PANE_REMEMBERED: &str = "CSR remembered: “";
 const PANE_REMEMBERED_SESSION: &str = "CSR remembered a past session: “";
 
-/// `one_line(text, most=700)` in pane.py cuts at 699 characters and appends
+/// `one_line(text, most=700)` in the removed `pane.py` cuts at 699 characters and appends
 /// `…`: an ellipsis exactly there ends the send text, whatever follows is the
 /// person's.
 const PANE_SEND_WIDTH: usize = 699;
@@ -920,7 +920,7 @@ const INJECTED_BLOCK_OPENINGS: [&str; 12] = [
     contamination::CONTINUITY_HEADER_PREFIX,
 ];
 
-/// Where a hand-off item came from, as pane.py's `from_when` + project +
+/// Where a hand-off item came from, as the removed `pane.py`'s `from_when` + project +
 /// `N×` render it (" · 2 weeks ago · csr-engine · 5×"). The last match in a
 /// pasted hand-off list ends the list.
 static HANDED_WHERE_TAIL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -1210,7 +1210,8 @@ mod tests {
         let mine = "Look at this one.\n\nWhy is the payback so slow?";
         assert_eq!(extractable(&around).as_deref(), Some(mine));
         assert_eq!(strip_csr_emissions(&around), mine);
-        // pane.py's one_line puts the draft on one line: the next line is the person's.
+        // The removed `pane.py`'s one_line puts the draft on one line: the next line is the
+        // person's.
         assert_eq!(
             extractable(&format!("{card}\nthat payback is wrong")).as_deref(),
             Some("that payback is wrong")
@@ -1350,7 +1351,7 @@ mod tests {
 
     #[test]
     fn astra_4_words_after_a_truncated_legacy_send_are_the_persons() {
-        // pane.py one_line(.., 700) cut the send at 699 characters and added an ellipsis: the send ended there.
+        // The removed `pane.py` one_line(.., 700) cut the send at 699 characters and added an ellipsis: the send ended there.
         let head =
             "CSR's dreamer asked this while you worked: \u{201c}What if?\u{201d} Its reasoning: ";
         let sent = format!("{head}{}\u{2026}", "x".repeat(699 - head.chars().count()));
@@ -2095,7 +2096,7 @@ mod tests {
         );
     }
 
-    /// pane.py `lost_asks`: both send forms, as typed into the prompt. The
+    /// The removed `pane.py` `lost_asks`: both send forms, as typed into the prompt. The
     /// thread text is from session 3002ab28 (anukriti-website).
     const LOST_SIDE: &str = "Lost and found: “The IG post time is a soft follow-up. Then ask for the release go-ahead (allowed, since publishing needs approval). For example: on \"ship\", I'll pull the coda from the hub (or keep it if the app is updated first), merge PR #30, run IndexNo…” went quiet after 19:38. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.";
 

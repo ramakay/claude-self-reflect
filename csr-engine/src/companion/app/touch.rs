@@ -1,6 +1,6 @@
 //! What a file tool call touches, and the note about the file it may bring: port of
-//! `hooks/touch.ts` and of register.tsx's `claimOffer`/`offerFor` (lines 443-465, called from the
-//! `tool.call` hook at 2096-2105).
+//! the removed `touch.ts` and of the TypeScript companion's `claimOffer`/`offerFor` (called from the
+//! `tool.call` hook).
 //!
 //! A note about a symbol fires only when the symbol's current span meets a line the call touches,
 //! so the note mode is given the call's own words (an Edit's `old_string`, a Write's content, a

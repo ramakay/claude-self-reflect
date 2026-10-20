@@ -1,4 +1,4 @@
-//! The dreamer's prompt text, copied from the template literals of `hooks/dreamer.ts`
+//! The dreamer's prompt text, copied from the template literals of the removed `dreamer.ts`
 //! (`SIDE_FRAME`, `AGENT_RULES` and the body of `dreamPrompt`) by a script, not typed. The
 //! body is cut at its five `${..}` slots; `text::dream_prompt` fills them in order.
 

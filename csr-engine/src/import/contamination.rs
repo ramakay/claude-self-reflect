@@ -1093,7 +1093,7 @@ const AGENTS_CLOSE: &str = "[[/CSR:AGENTS:v1]]";
 
 /// How many lines of `lines` an agents envelope takes, from the first: three
 /// when an opening marker line is followed by exactly one JSON-object line and
-/// the closing marker line (what bin/agents.py writes), one for a marker line
+/// the closing marker line (what the removed `bin/agents.py` wrote), one for a marker line
 /// without that shape, `None` when the first line is not a marker line.
 /// `lenient` ignores surrounding whitespace (the query-side strip); the
 /// detector compares exactly.
@@ -1119,7 +1119,7 @@ pub(crate) fn agents_envelope_len(lines: &[&str], lenient: bool) -> Option<usize
     (first == AGENTS_CLOSE).then_some(1)
 }
 
-/// An agents envelope (bin/agents.py writes three lines: an opening marker
+/// An agents envelope (the removed `bin/agents.py` wrote three lines: an opening marker
 /// line, one JSON-object line, a closing marker line). The whole envelope is
 /// the hit, so derived text does not keep the JSON the markers wrap; a marker
 /// line without that shape is still a hit on its own.

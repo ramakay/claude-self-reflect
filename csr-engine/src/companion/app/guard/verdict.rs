@@ -1,4 +1,4 @@
-//! What a git command comes to under a guard: port of `hooks/coach.ts` from `parseGuard` to
+//! What a git command comes to under a guard: port of the removed `coach.ts` from `parseGuard` to
 //! `protectedFromGit` (the guard file, the tripwire over the raw text, the parse, the verdict).
 //!
 //! The guard is opt-in: a repository says what it protects in `<git toplevel>/.claude/

@@ -1,6 +1,6 @@
 //! The agents of a session, as the typed events of Claude Code tell them: port of
-//! `hooks/agents.ts`. A lifecycle reducer, a reconciler for `agent.list`, the completion ledger,
-//! the bounded file the pane reads, the machine envelope, and the handoff of a thread to a
+//! the removed `agents.ts`. A lifecycle reducer, a reconciler for `agent.list`, the completion
+//! ledger, the bounded file the pane reads, the machine envelope, and the handoff of a thread to a
 //! background agent. Pure: the handlers in `fleet.rs` hand it events and keep what it changes.
 //!
 //! The TypeScript never changes a state in place and returns a new one; here a state is changed

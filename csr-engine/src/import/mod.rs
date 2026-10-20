@@ -2533,7 +2533,7 @@ mod tests {
         assert!(!content.contains("SIDECHAIN CSR RESULT SECRET"));
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
     }
-    /// The text `askClaude` (plugins/csr-companion/hooks/dreamer.ts) sends: the
+    /// The text `askClaude` (the removed `dreamer.ts`) sends: the
     /// question, a blank line, the attribution, a blank line, the quoted reasoning.
     const DREAMER_MESSAGE: &str = "What if the pane took its colours from pigment's nyt inks?\n\nCSR's dreamer asked this while you worked. Its reasoning:\n\n> **Share the palette**\n>\n> Two surfaces already read the same inks.";
 

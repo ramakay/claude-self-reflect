@@ -1,6 +1,6 @@
 //! What the compactor needs that Claude Code cannot give it through the relay. The TypeScript ran
-//! `process.run` (`git`, `bin/pane.py`, `rm`, the engine's private writer), `fs.*` and `env.get`;
-//! the engine does these itself, and a test replaces them with a fake.
+//! `process.run` (`git`, the removed `pane.py`, `rm`, the engine's private writer), `fs.*` and
+//! `env.get`; the engine does these itself, and a test replaces them with a fake.
 //!
 //! Each call that can wait has its own limit, as the TypeScript's `timeoutMs` had it: a failure or
 //! a timeout reads as no answer.
@@ -33,18 +33,19 @@ pub enum Redact {
     Json,
 }
 
-/// `bin/pane.py` ran within this; one that overran read as no answer.
+/// The removed `pane.py` ran within this; one that overran read as no answer.
 const PANE_LIMIT: Duration = Duration::from_secs(20);
 /// A `git` run for the keep list.
 const GIT_LIMIT: Duration = Duration::from_secs(2);
 
 #[async_trait]
 pub trait Outside: Send + Sync {
-    /// `pane.py --compact-plan --sid SID --ctx CTX`: the plan as JSON; none when it gave no answer.
+    /// The removed `pane.py --compact-plan --sid SID --ctx CTX`: the plan as JSON; none when it
+    /// gave no answer.
     async fn plan(&self, sid: &str, ctx: usize) -> Option<Value>;
-    /// `pane.py --repo CWD --keep RECORD`: one row of the dream log.
+    /// The removed `pane.py --repo CWD --keep RECORD`: one row of the dream log.
     async fn keep(&self, cwd: &str, record: Value);
-    /// `pane.py --repo CWD --lost --sid SID`: the threads of Lost and found, as JSON.
+    /// The removed `pane.py --repo CWD --lost --sid SID`: the threads of Lost and found, as JSON.
     async fn lost(&self, cwd: &str, sid: &str) -> Option<Value>;
     /// `git -C CWD ARGS`: what it printed (the end trimmed, a leading space kept) when it exited 0.
     async fn git(&self, cwd: &str, args: &[&str]) -> Option<String>;

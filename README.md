@@ -265,14 +265,11 @@ csr-engine setup
 
 ### The companion pane (optional)
 
-A Claude Code plugin that sits beside the session: what your memory handed Claude, the agents and Codex runs in flight, the dreamer's "what if...?", and a compaction coach. It needs Claude Code 2.1.296 or later and `python3` 3.9 or later on your PATH; the engine itself needs no Python. Setup installs it after the same consent, through Claude Code's own plugin CLI. `csr-engine setup --no-companion` skips it. If setup cannot install it, it prints why, and you can add it yourself in Claude Code:
+A Claude Code plugin that sits beside the session: what your memory handed Claude, the agents and Codex runs in flight, the dreamer's "what if...?", and a compaction coach. It needs Claude Code 2.1.296 or later. It runs inside `csr-engine` itself: the plugin is one generated file that starts `csr-engine companion serve`, so it needs no Node, TypeScript or Python. `csr-engine setup` writes that plugin and installs it through Claude Code's own plugin CLI, after the same consent. `csr-engine setup --no-companion` skips it. If setup cannot install it, it prints why, and you can retry with one command:
 
+```bash
+csr-engine companion plugin install
 ```
-/plugin marketplace add ramakay/claude-self-reflect
-/plugin install csr-companion@claude-self-reflect
-```
-
-`csr-engine setup` ends by printing these two lines.
 
 <details>
 <summary><strong>What You'll Ask</strong> — after install, just ask Claude naturally</summary>

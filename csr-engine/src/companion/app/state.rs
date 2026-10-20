@@ -1,6 +1,7 @@
 //! What the features share: the store rows they all read the same way, the options, `show`.
 //!
-//! The TypeScript plugin keeps these in `register.tsx` (`strings`, `count`, `remember`, `answered`,
+//! The TypeScript plugin kept these in its main hooks file (`strings`, `count`, `remember`,
+//! `answered`,
 //! `show`, `update`, `configRow`) and its `options`. A feature that is the only one to use a helper
 //! keeps it; what two or more use lives here.
 //!
@@ -13,14 +14,14 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::sync::Mutex;
 
-/// How many ids and answers a list row keeps (register.tsx `KEPT`).
+/// How many ids and answers a list row keeps (the TypeScript companion's `KEPT`).
 pub const KEPT: usize = 200;
 
-/// The edges of the band where CSR compacts (compact.ts `BAND`, low and high).
+/// The edges of the band where CSR compacts (the removed `compact.ts` `BAND`, low and high).
 pub const BAND_LOW: f64 = 180_589.;
 pub const BAND_HIGH: f64 = 269_178.;
 
-/// Tokens as the plugin writes them: `181k`, `1.2M` (compact.ts `k`).
+/// Tokens as the plugin writes them: `181k`, `1.2M` (the removed `compact.ts` `k`).
 pub fn k(tokens: f64) -> String {
     if tokens < 1e6 {
         return format!("{}k", (tokens / 1000.).round());
@@ -32,7 +33,7 @@ pub fn k(tokens: f64) -> String {
     format!("{:.1}M", if tie { millions + 0.01 } else { millions })
 }
 
-/// What one `/config` write of `autoCompact` came to (compact.ts `settingOf`).
+/// What one `/config` write of `autoCompact` came to (the removed `compact.ts` `settingOf`).
 pub fn setting_of(value: &Value) -> &'static str {
     match value.as_str() {
         Some("off") => "off",
@@ -145,7 +146,7 @@ fn is_row(key: &str, name: &str) -> bool {
     rest == name
 }
 
-/// The key of the plugin's `/config` row `name` (register.tsx `configRow`).
+/// The key of the plugin's `/config` row `name` (the TypeScript companion's `configRow`).
 pub fn config_row(rows: &[Value], name: &str) -> String {
     rows.iter()
         .filter_map(|row| row["key"].as_str())
@@ -157,8 +158,7 @@ pub fn config_row(rows: &[Value], name: &str) -> String {
 #[derive(Default)]
 struct Surfaced(Option<bool>);
 
-/// Whether a person is at this session (register.tsx `isPerson`, `person` at 875-876 and
-/// 2386-2387): the session's start said so (`Session.interactive`, set from `e.isInteractive`
+/// Whether a person is at this session (the TypeScript companion's `isPerson`, `person`): the session's start said so (`Session.interactive`, set from `e.isInteractive`
 /// when that was a boolean), else it draws somewhere (`session.surfaces` is not empty), asked
 /// once and kept. Every feature that acts only for a person calls this one.
 pub async fn is_person(cx: &Ctx) -> bool {

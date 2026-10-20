@@ -1,5 +1,5 @@
-//! The `/csr` command, the pane, its refresh, and the pane opened beside Claude (register.tsx
-//! 2384-2431, 2485-2739).
+//! The `/csr` command, the pane, its refresh, and the pane opened beside Claude (the TypeScript
+//! companion).
 //!
 //! - `start` has two entries. The first (`register`) clears the status line and registers the
 //!   command, for a person's session only (`isInteractive` true). The late one (`register_late`)
@@ -37,9 +37,9 @@ use pane::TurnedOn;
 use serde_json::{json, Value};
 use std::{path::Path, sync::Arc, time::Duration};
 
-/// How often the shifts data is read again (register.tsx `REFRESH_MS`).
+/// How often the shifts data is read again (the TypeScript companion's `REFRESH_MS`).
 pub const REFRESH_MS: f64 = 10. * 60. * 1000.;
-/// What a read of the shifts data may take (the TypeScript gave `pane.py` 20 s).
+/// What a read of the shifts data may take (the TypeScript gave the removed `pane.py` 20 s).
 const SHIFTS_LIMIT: Duration = Duration::from_secs(20);
 /// What one herdr command may take.
 const HERDR_LIMIT: Duration = Duration::from_secs(10);
@@ -50,7 +50,7 @@ const RETIRED: &str = "The status line wrapper is gone: the pane's masthead show
 /// The pane's module state.
 #[derive(Default)]
 struct PaneState {
-    /// Where the dreams offer stands (register.tsx `turnedOn`).
+    /// Where the dreams offer stands (the TypeScript companion's `turnedOn`).
     turned_on: Option<TurnedOn>,
 }
 
@@ -130,7 +130,8 @@ fn starts_a_person(e: &Value) -> bool {
     e["isInteractive"] == true
 }
 
-/// Read the shifts data again and keep it as the session's `data` row (register.tsx `refresh`).
+/// Read the shifts data again and keep it as the session's `data` row (the TypeScript companion's
+/// `refresh`).
 async fn refresh(cx: &Ctx, outside: &dyn Outside, cwd: &str) -> Option<Value> {
     let fresh = outside.shifts(cwd, &cx.sid).await;
     let _ = update(cx, "data", |_| fresh.clone());

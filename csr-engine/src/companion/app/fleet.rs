@@ -1,14 +1,17 @@
-//! agents.ts and the fleet groups of register.tsx: the agents of a session, tracked from the typed
-//! events; their poll (`$.agent.list`), the completion ledger and the claim, the agents file the
-//! pane draws from, and what became of a thread handed to a background agent.
+//! The removed `agents.ts` and the fleet groups of the TypeScript companion: the agents of a
+//! session, tracked from the typed events; their poll (`$.agent.list`), the completion ledger and
+//! the claim, the agents file the pane draws from, and what became of a thread handed to a
+//! background agent.
 //!
-//! `model` is agents.ts (pure: a reducer, a reconciler, the ledger, the file's projection); this
-//! file is the part of register.tsx that keeps it: the store rows, the files, the timers and the
-//! hooks. Every observer here changes nothing for the call it watches: a failure is swallowed
-//! where it happens, and no handler replies with an `answer` or a `next`.
+//! `model` is the removed `agents.ts` (pure: a reducer, a reconciler, the ledger, the file's
+//! projection); this file is the part of the TypeScript companion that keeps it: the store rows,
+//! the files, the timers and the hooks. Every observer here changes nothing for the call it
+//! watches: a failure is swallowed where it happens, and no handler replies with an `answer` or a
+//! `next`.
 //!
-//! The dreamer is another package. Where register.tsx's `completions` calls `dream`, this file
-//! calls the `Dream` the dreamer put in `Fleet::dream`; with none there, no completion is claimed.
+//! The dreamer is another package. Where the TypeScript companion's `completions` calls `dream`,
+//! this file calls the `Dream` the dreamer put in `Fleet::dream`; with none there, no completion is
+//! claimed.
 
 pub mod model;
 #[cfg(test)]
@@ -46,7 +49,8 @@ const TASK_OWNERS: &str = "taskOwners";
 
 /// An agent's report waits for the main session's next step, or this long if it is idle.
 pub const COMPLETION_WAIT_MS: f64 = 20_000.;
-/// A chapter's steps, until there are chapters of the person's own to learn from (pace.ts).
+/// A chapter's steps, until there are chapters of the person's own to learn from (the removed
+/// `pace.ts`).
 const USUAL_STEPS: f64 = 120.;
 
 /// What one completion look is asked to do: the cost a look is guessed at, the chapter's steps,
@@ -62,10 +66,10 @@ pub struct DreamCall {
 /// puts it in `Fleet::dream`; the look ends the claim itself (`settled`).
 pub type Dream = Arc<dyn Fn(Ctx, DreamCall) -> BoxFuture<Result<()>> + Send + Sync>;
 
-/// register.tsx's `fleet` object, shared by the fleet and the dreamer: whether a look runs (one
-/// at a time, whoever started it), whether the main loop is mid-turn, when it last stepped and
-/// what that step cost (a completion's look waits for a quiet main loop and borrows the cost for
-/// its budget check), and whether a timer waits to offer the reports that came in.
+/// The TypeScript companion's `fleet` object, shared by the fleet and the dreamer: whether a look
+/// runs (one at a time, whoever started it), whether the main loop is mid-turn, when it last
+/// stepped and what that step cost (a completion's look waits for a quiet main loop and borrows the
+/// cost for its budget check), and whether a timer waits to offer the reports that came in.
 #[derive(Default)]
 pub struct Fleet {
     pub dreaming: bool,
@@ -284,7 +288,8 @@ fn paths_of(cx: &Ctx) -> Option<Paths> {
     (!paths.home.as_os_str().is_empty()).then_some(paths)
 }
 
-/// `bin/private.py write PATH --redact-json`: the strings redacted again, then serialized, 0600.
+/// The removed `private.py write PATH --redact-json`: the strings redacted again, then serialized,
+/// 0600.
 fn keep_write(paths: &Paths, folder: &str, session: &str, value: &Value) -> Result<()> {
     let mut value = value.clone();
     private::redact_value(&mut value);

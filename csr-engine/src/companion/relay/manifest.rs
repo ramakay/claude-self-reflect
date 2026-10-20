@@ -1,6 +1,6 @@
 //! The hooks the relay declares: one row per `on(...)` line in `register.js`.
 //!
-//! The rows follow `plugins/csr-companion/hooks/register.tsx` in its own order (so the hook
+//! The rows follow the TypeScript companion in its own order (so the hook
 //! chain Claude Code builds is the one the TypeScript plugin builds), plus one Notify row for
 //! `session.measure`. A matcher is JavaScript source, copied verbatim, so that
 //! `claude plugin validate` can read it.
@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(of(Shape::Start), 1);
         assert_eq!(of(Shape::Answer), 1);
         assert_eq!(of(Shape::Stream), 1);
-        // 21 `on(` rows in register.tsx, plus session.measure.
+        // 21 `on(` rows in the TypeScript companion, plus session.measure.
         assert_eq!(HOOKS.len(), 22);
     }
 

@@ -1,5 +1,5 @@
-//! The shell, as the push guard reads it: port of the shell half of `hooks/coach.ts` (heredocs,
-//! substitutions, the word splitter, wrappers that run the command after them).
+//! The shell, as the push guard reads it: port of the shell half of the removed `coach.ts`
+//! (heredocs, substitutions, the word splitter, wrappers that run the command after them).
 //!
 //! This is a safety parser, so it is a literal port: where the TypeScript refuses to guess, so does
 //! this. JavaScript's `\s` and `\w` are not the regex crate's (`\s` has U+FEFF and not U+0085; `\w`
@@ -85,7 +85,7 @@ fn text_of(chars: &[char]) -> String {
 const NONE: &[&str] = &[];
 
 /// Words that run the command after them, each with its options that take the next word as their
-/// value, short and long (coach.ts `LEADERS`).
+/// value, short and long (the removed `coach.ts` `LEADERS`).
 fn leader(word: &str) -> Option<&'static [&'static str]> {
     Some(match word {
         "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "!" | "time" | "command"
@@ -156,7 +156,7 @@ fn starts_assignment(word: &str) -> bool {
 }
 
 /// Where a command's own words start: past `if`, `sudo -u x`, `env -i A=1`, `nohup` and the like
-/// (coach.ts `headAt`). May be past the end.
+/// (the removed `coach.ts` `headAt`). May be past the end.
 pub fn head_at<S: AsRef<str>>(words: &[S]) -> usize {
     let mut i = 0;
     let mut takes: Option<&[&str]> = None; // the options of the last leader, once there is one

@@ -2978,7 +2978,7 @@ mod statusline_unwrap {
 
     const ORIGINAL: &str = "bash -c 'echo \"a b\" | tr a A'";
 
-    /// What `/csr statusline on` wrote: `wrapCommand` in the companion's register.tsx.
+    /// What `/csr statusline on` wrote: `wrapCommand` in the TypeScript companion.
     fn wrapped(home: &Path, original: &str) -> String {
         let wrapper = home.join(".claude-self-reflect/csr-companion/statusline.cjs");
         format!(

@@ -1,6 +1,6 @@
-//! The push guard and the coaching note: port of `hooks/coach.ts` and of register.tsx's `guardOf`
-//! (212-246), `landsOnRelease` (160-210), the `tool.call` guard hook (2077-2093), `coachNote` and
-//! `addToClaudeMd` (825-857).
+//! The push guard and the coaching note: port of the removed `coach.ts` and of the TypeScript
+//! companion's `guardOf`, `landsOnRelease`, the `tool.call` guard hook, `coachNote` and
+//! `addToClaudeMd`.
 //!
 //! The rules (the shell, git's options, the verdict) are in `guard/`; this file is what touches the
 //! machine: the guard files, `git` itself, the person's CLAUDE.md. All of that goes through
@@ -186,7 +186,8 @@ async fn off<T: Send + 'static>(
 
 // ---------------------------------------------------------------- the guard of a session
 
-/// The bad guard files said in the error log since this engine started (register.tsx `told`).
+/// The bad guard files said in the error log since this engine started (the TypeScript companion's
+/// `told`).
 #[derive(Default)]
 struct Told(HashSet<String>);
 

@@ -1,6 +1,6 @@
 //! What the hooks read of the session's tools, and what the keep list reads of the repository:
 //! `commitDir`, the patterns that find a task's id and a commit in a tool's answer, and
-//! `keepOf` / `workOf` of register.tsx.
+//! `keepOf` / `workOf` of the TypeScript companion.
 
 use super::{
     outside::Outside,

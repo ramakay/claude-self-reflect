@@ -1,8 +1,8 @@
 //! What the dreamer asks of the machine around the engine, as one seam.
 //!
-//! The TypeScript ran `bin/lease.py`, `bin/pane.py` (`--brief`, `--keep`) and `git` as processes
-//! and read the dream log with `$.fs.read`. The engine never spawns itself, so `Here` calls what
-//! those modes ran: `lease::step_under_lock`, `brief::brief`, the pane's `--keep`
+//! The TypeScript ran the removed `lease.py`, the removed `pane.py` (`--brief`, `--keep`) and `git`
+//! as processes and read the dream log with `$.fs.read`. The engine never spawns itself, so `Here`
+//! calls what those modes ran: `lease::step_under_lock`, `brief::brief`, the pane's `--keep`
 //! (`pace::real_keep`), and `git cat-file`. A test puts `fake::Fake` in its place and so touches
 //! no HOME, no database and no repository.
 
@@ -26,7 +26,7 @@ use std::{
 
 /// A lease step, a brief and a `git cat-file` each get two seconds, as `process.run` did.
 const STEP_LIMIT: Duration = Duration::from_secs(2);
-/// Where the lease files live, under the pane's folder (`LEASES` in register.tsx).
+/// Where the lease files live, under the pane's folder (`LEASES` in the TypeScript companion).
 const LEASES: &str = "dreamer-lease";
 
 #[async_trait]
@@ -34,7 +34,7 @@ pub trait Outside: Send + Sync {
     /// One lease step for `session`: whether this copy holds the lease afterwards (`lease`).
     async fn lease(&self, session: &str, step: Step, busy: bool, now: f64) -> bool;
 
-    /// What `pane.py --brief` printed for the session, or none when it failed (`run`).
+    /// What the removed `pane.py --brief` printed for the session, or none when it failed (`run`).
     async fn brief(&self, cwd: &str, session: &str, now: f64) -> Option<String>;
 
     /// Where `--keep` records go.
@@ -59,7 +59,7 @@ pub fn rank_of(root: &str) -> i64 {
     }
 }
 
-/// The arguments of `companion lease STEP` for this copy (`lease` in register.tsx).
+/// The arguments of `companion lease STEP` for this copy (`lease` in the TypeScript companion).
 pub fn lease_args(
     paths: &Paths,
     root: &str,
@@ -149,8 +149,8 @@ impl Outside for Here {
     }
 }
 
-/// `pane.py --brief --sid SID` run for `cwd`: its text and a newline, or nothing when it failed,
-/// and an empty text where there is no repository to read.
+/// The removed `pane.py --brief --sid SID` run for `cwd`: its text and a newline, or nothing when
+/// it failed, and an empty text where there is no repository to read.
 fn brief_of(cwd: &str, session: &str, now: f64) -> Option<String> {
     let paths = Paths::from_env();
     if session.is_empty() {
@@ -219,7 +219,7 @@ pub mod fake {
     pub struct Fake {
         keep: Keep,
         pub root: Mutex<String>,
-        /// The lease files, by session: what `lease.py` read and wrote.
+        /// The lease files, by session: what the removed `lease.py` read and wrote.
         pub files: Mutex<HashMap<String, Value>>,
         pub asked: Mutex<Vec<Asked>>,
         /// The dream log's text; none: there is no HOME.
@@ -293,7 +293,8 @@ pub mod fake {
             if self.lease_fails.load(Ordering::SeqCst) {
                 return lease_held(&Err(anyhow::anyhow!("the lease step did not run")));
             }
-            // What `lease.py` did on its file, with the decision the engine's own code makes.
+            // What the removed `lease.py` did on its file, with the decision the engine's own code
+            // makes.
             let mut files = self.files.lock().unwrap();
             let held = files.get(session).cloned().unwrap_or(Value::Null);
             let (mine, write) = lease::decide(&args, &held);
