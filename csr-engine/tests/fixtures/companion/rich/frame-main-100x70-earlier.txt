@@ -57,10 +57,10 @@
 [48;2;240;240;238m      [38;2;94;94;89mWhat if… · waits on you · 1m · What if a frame failed while the agent was busy?[0m[48;2;240;240;238m[K[0m
 [48;2;240;240;238m      [38;2;94;94;89mLost and found · waits on you · 14m · Rebase the importer branch, awaiting your go.[0m[48;2;240;240;238m[K[0m
 
-
-
-
-
+      [38;2;136;135;129mAsk about past work. CSR finds it.[0m
+      [38;2;136;135;129mCode changed? CSR warns Claude.[0m
+      [38;2;136;135;129mCSR keeps quiet threads. Press f.[0m
+      [38;2;136;135;129mPress l for changes. Press i for info.[0m
 
 
 

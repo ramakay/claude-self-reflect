@@ -39,8 +39,8 @@
 [48;2;247;238;235m      [38;2;23;25;28mUpdate the changelog entry.[0m[48;2;247;238;235m[K[0m
 [48;2;247;238;235m      [38;2;136;135;129mfrom sess-pre · 1×[0m[48;2;247;238;235m                                                                          [24m[38;2;136;135;129m♡[0m[48;2;247;238;235m[K[0m
 
-
-
+      [38;2;136;135;129mCode changed? CSR warns Claude.[0m
+      [38;2;136;135;129mPress l for changes. Press i for info.[0m
 
 
 

@@ -46,11 +46,14 @@ fn copy_tree(from: &Path, to: &Path, home: &str) {
     }
 }
 /// The goldens carry local times, so the clock is UTC; and a second click must never reach a real
-/// herdr pane, so the pane's own id is dropped from this process.
+/// herdr pane, so the pane's own id is dropped from this process. The goldens are text frames:
+/// `TERM_PROGRAM=herdr` (or kitty, ghostty, WezTerm) would turn pictures on, reserve rows for them,
+/// and push the In flight rows and their fold row off the page, so pictures are switched off.
 fn quiet_env() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         std::env::set_var("TZ", "UTC");
+        std::env::set_var("CSR_COMPANION_PIXELS", "0");
         for name in [
             "HERDR_PANE_ID",
             "HERDR_ENV",
