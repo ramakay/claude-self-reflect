@@ -32,12 +32,6 @@ pub struct Placement {
     pub rows: usize,
     pub png: Arc<[u8]>,
 }
-/// A picture's id follows its bytes, so an unchanged picture keeps its id across frames.
-pub fn image_id(png: &[u8]) -> u32 {
-    let hash = blake3::hash(png);
-    let bytes = hash.as_bytes();
-    (u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x7fff_ffff).max(1)
-}
 pub fn kitty(png: &[u8], row: usize, col: usize, cols: usize, rows: usize) -> String {
     let mut out = format!("\x1b[{};{}H", row + 1, col + 1);
     let data = STANDARD.encode(png);
@@ -46,10 +40,7 @@ pub fn kitty(png: &[u8], row: usize, col: usize, cols: usize, rows: usize) -> St
     for (index, chunk) in chunks.enumerate() {
         let more = usize::from(index + 1 < count);
         let ctrl = if index == 0 {
-            format!(
-                "a=T,f=100,q=2,C=1,i={},c={cols},r={rows},m={more}",
-                image_id(png)
-            )
+            format!("a=T,f=100,q=2,C=1,c={cols},r={rows},m={more}")
         } else {
             format!("m={more}")
         };
@@ -100,23 +91,17 @@ pub fn repaint_pictures(
                 .chain(placed)
                 .any(|p| *i >= p.row && *i < p.row + p.rows)
         });
+    if again && !shown.is_empty() {
+        out.push_str(DELETE_ALL);
+    }
     for (i, line) in written.iter().enumerate() {
         if same.and_then(|d| d.written.get(i)) != Some(line) {
             out.push_str(&format!("\x1b[{};1H\x1b[0m\x1b[2K{line}", i + 1));
         }
     }
     if again {
-        // Place the new picture before freeing the old one: herdr draws the gap between a
-        // delete and the next upload as a blank frame.
         for p in placed {
             out.push_str(&kitty(&p.png, p.row, p.col, p.cols, p.rows));
-        }
-        let kept: Vec<_> = placed.iter().map(|p| image_id(&p.png)).collect();
-        for p in shown {
-            let id = image_id(&p.png);
-            if !kept.contains(&id) {
-                out.push_str(&format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\"));
-            }
         }
     }
     out.push_str(&format!("\x1b[{rows};{cols}H{SYNC_OFF}"));
@@ -196,50 +181,18 @@ mod picture_tests {
         next = drawn.written.clone();
         next[2] = "C".into();
         let under = repaint_pictures(Some(&drawn), 10, 4, &next, std::slice::from_ref(&picture));
-        assert!(!under.contains(DELETE_ALL) && under.contains("a=T"));
+        assert!(under.contains(DELETE_ALL) && under.contains("a=T"));
         let gone = repaint_pictures(Some(&drawn), 10, 4, &drawn.written, &[]);
-        assert!(gone.contains("a=d,d=I") && !gone.contains("a=T"));
+        assert!(gone.contains(DELETE_ALL) && !gone.contains("a=T"));
         let mut changed = picture;
         changed.png = Arc::from(b"new".as_slice());
         assert!(repaint_pictures(Some(&drawn), 10, 4, &drawn.written, &[changed]).contains("a=T"));
     }
     #[test]
-    fn a_changed_picture_is_placed_before_the_old_one_is_deleted() {
-        let picture = |png: &'static [u8]| Placement {
-            row: 0,
-            col: 0,
-            cols: 4,
-            rows: 3,
-            png: Arc::from(png),
-        };
-        let written = vec![String::new(); 4];
-        let drawn = Drawn {
-            cols: 4,
-            rows: 4,
-            written: written.clone(),
-            placed: vec![picture(b"old")],
-        };
-        let out = repaint_pictures(Some(&drawn), 4, 4, &written, &[picture(b"new")]);
-        // herdr shows the gap between a delete and the next upload as a blank frame.
-        assert!(!out.contains(DELETE_ALL));
-        let new = out
-            .find(&format!("i={}", image_id(b"new")))
-            .expect("new picture sent");
-        let old = out
-            .find(&format!("a=d,d=I,i={}", image_id(b"old")))
-            .expect("old picture freed");
-        assert!(new < old);
-        let gone = repaint_pictures(Some(&drawn), 4, 4, &written, &[]);
-        assert!(gone.contains(&format!("a=d,d=I,i={}", image_id(b"old"))));
-    }
-    #[test]
     fn kitty_chunks_transmit_png_and_place_without_moving_the_cursor() {
         let png = vec![42; 7000];
         let output = kitty(&png, 2, 3, 40, 5);
-        assert!(output.starts_with(&format!(
-            "\x1b[3;4H\x1b_Ga=T,f=100,q=2,C=1,i={},c=40,r=5,m=1;",
-            image_id(&png)
-        )));
+        assert!(output.starts_with("\x1b[3;4H\x1b_Ga=T,f=100,q=2,C=1,c=40,r=5,m=1;"));
         let mut encoded = String::new();
         let mut lengths = vec![];
         for packet in output.split("\x1b_G").skip(1) {
