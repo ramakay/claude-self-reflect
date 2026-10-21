@@ -3,7 +3,6 @@
 // rounded rects, gradients, glass, thin rings with round caps, dotted rings,
 // antialiased text with baseline snapping, ink measurement, wrapping, contact sheet.
 #![allow(dead_code, clippy::too_many_arguments)]
-use super::theme;
 use ab_glyph::{point, Font, FontVec, GlyphId, ScaleFont, VariableFont};
 use image::{codecs::png::PngEncoder, ImageEncoder};
 use std::cell::RefCell;
@@ -40,6 +39,7 @@ pub enum Fam {
     Sans,
     Serif,
     Mono,
+    Icon,
 }
 
 #[derive(Clone, Copy)]
@@ -73,6 +73,15 @@ pub fn mono(size: f32, wght: f32) -> St {
         track: 0.,
     }
 }
+pub fn icon(size: f32) -> St {
+    St {
+        fam: Fam::Icon,
+        size,
+        wght: 400.,
+        track: 0.,
+    }
+}
+
 impl St {
     pub fn tr(mut self, t: f32) -> St {
         self.track = t;
@@ -87,6 +96,7 @@ struct Face {
     wght: f32,
     opsz: f32,
     font: FontVec,
+    digits: [GlyphId; 10],
 }
 pub struct Fonts {
     faces: Vec<Face>,
@@ -120,100 +130,124 @@ fn axes(f: &FontVec) -> String {
         .join(", ")
 }
 
+const BUNDLED_FACES: [(Fam, &str, &[u8]); 4] = [
+    (
+        Fam::Sans,
+        "Inter Variable",
+        include_bytes!("../../../assets/fonts/InterVariable-subset.ttf"),
+    ),
+    (
+        Fam::Serif,
+        "Source Serif 4 Variable",
+        include_bytes!("../../../assets/fonts/SourceSerif4Variable-subset.ttf"),
+    ),
+    (
+        Fam::Mono,
+        "JetBrains Mono",
+        include_bytes!("../../../assets/fonts/JetBrainsMono-Regular-subset.ttf"),
+    ),
+    (
+        Fam::Icon,
+        "Lucide",
+        include_bytes!("../../../assets/fonts/lucide-subset.ttf"),
+    ),
+];
+
+/// ab_glyph rasterizes outlines but does not shape GSUB features. Resolve the bundled fonts'
+/// single substitutions for lining/tabular figures explicitly, preserving their real advances.
+fn tabular_digits(bytes: &[u8]) -> [GlyphId; 10] {
+    use ttf_parser::{
+        gsub::{SingleSubstitution, SubstitutionSubtable},
+        Tag,
+    };
+    let face = ttf_parser::Face::parse(bytes, 0).expect("bundled font tables");
+    let mut digits = std::array::from_fn(|i| {
+        face.glyph_index(char::from(b'0' + i as u8))
+            .unwrap_or(ttf_parser::GlyphId(0))
+    });
+    if let Some(gsub) = face.tables().gsub {
+        for tag in [b"lnum", b"tnum"] {
+            if let Some(feature) = gsub.features.find(Tag::from_bytes(tag)) {
+                for index in feature.lookup_indices {
+                    if let Some(lookup) = gsub.lookups.get(index) {
+                        for table in lookup.subtables.into_iter::<SubstitutionSubtable<'_>>() {
+                            if let SubstitutionSubtable::Single(single) = table {
+                                for glyph in &mut digits {
+                                    if let Some(index) = single.coverage().get(*glyph) {
+                                        *glyph = match single {
+                                            SingleSubstitution::Format1 { delta, .. } => {
+                                                ttf_parser::GlyphId(
+                                                    glyph.0.wrapping_add(delta as u16),
+                                                )
+                                            }
+                                            SingleSubstitution::Format2 { substitutes, .. } => {
+                                                substitutes.get(index).unwrap_or(*glyph)
+                                            }
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    digits.map(|g| GlyphId(g.0))
+}
+
 impl Fonts {
-    pub fn load() -> Fonts {
+    /// The complete primary font set. This path never reads the filesystem.
+    pub fn bundled() -> Fonts {
         let mut notes = vec![];
         let mut names = BTreeMap::new();
         let mut faces = vec![];
-        let mut add = |fam: Fam,
-                       paths: &[&str],
-                       weights: &[f32],
-                       opszs: &[f32],
-                       notes: &mut Vec<String>|
-         -> String {
-            for p in paths {
-                let Ok(bytes) = std::fs::read(p) else {
-                    continue;
-                };
-                let Ok(probe) = FontVec::try_from_vec(bytes.clone()) else {
-                    continue;
-                };
-                notes.push(format!("{p} axes: {}", axes(&probe)));
-                for &w in weights {
-                    for &o in opszs {
-                        let mut font = FontVec::try_from_vec(bytes.clone()).unwrap();
-                        let ok_w = font.set_variation(b"wght", w);
-                        let ok_o = font.set_variation(b"opsz", o);
-                        if !ok_w || !ok_o {
-                            notes.push(format!("{p}: wght {w} -> {ok_w}, opsz {o} -> {ok_o}"));
-                        }
-                        faces.push(Face {
-                            fam,
-                            wght: w,
-                            opsz: o,
-                            font,
-                        });
+        for (fam, name, bytes) in BUNDLED_FACES {
+            let probe = FontVec::try_from_vec(bytes.to_vec()).expect("bundled font");
+            notes.push(format!("{name} axes: {}", axes(&probe)));
+            names.insert(
+                match fam {
+                    Fam::Sans => "sans",
+                    Fam::Serif => "serif",
+                    Fam::Mono => "mono",
+                    Fam::Icon => "icon",
+                },
+                name.to_string(),
+            );
+            let digits = tabular_digits(bytes);
+            let weights: &[f32] = if matches!(fam, Fam::Mono | Fam::Icon) {
+                &[400.]
+            } else {
+                &[400., 500., 600.]
+            };
+            let sizes: &[f32] = if matches!(fam, Fam::Mono | Fam::Icon) {
+                &[14.]
+            } else {
+                &[
+                    8., 9., 10., 10.5, 11., 11.5, 12., 12.5, 13., 14., 16., 18., 20., 24., 28.,
+                    30., 32., 36., 40., 44., 48., 60.,
+                ]
+            };
+            for &wght in weights {
+                for &opsz in sizes {
+                    let mut font = FontVec::try_from_vec(bytes.to_vec()).expect("bundled font");
+                    if !matches!(fam, Fam::Mono | Fam::Icon) {
+                        assert!(font.set_variation(b"wght", wght));
+                        assert!(font.set_variation(b"opsz", opsz));
                     }
-                }
-                return p.to_string();
-            }
-            panic!("no font for {fam:?}");
-        };
-        let mut weights = theme::SETS
-            .iter()
-            .flat_map(|(_, t)| [t.regular, t.medium, t.bold])
-            .collect::<Vec<_>>();
-        weights.sort_by(f32::total_cmp);
-        weights.dedup();
-        let sn = add(
-            Fam::Sans,
-            &[
-                "/System/Library/Fonts/SFNS.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            ],
-            &weights,
-            &[17., 28.],
-            &mut notes,
-        );
-        let se = add(
-            Fam::Serif,
-            &[
-                "/System/Library/Fonts/NewYork.ttf",
-                "/System/Library/Fonts/Supplemental/Georgia.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-            ],
-            &weights,
-            &[17., 28.],
-            &mut notes,
-        );
-        let mo = add(
-            Fam::Mono,
-            &[
-                "/System/Library/Fonts/SFNSMono.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-            ],
-            &weights,
-            &[17.],
-            &mut notes,
-        );
-        names.insert("sans", sn);
-        names.insert("serif", se);
-        names.insert("mono", mo);
-        let mut fallback = vec![];
-        for p in [
-            "/System/Library/Fonts/Apple Symbols.ttf",
-            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-        ] {
-            if let Ok(b) = std::fs::read(p) {
-                if let Ok(f) = FontVec::try_from_vec(b) {
-                    fallback.push((p.to_string(), f));
+                    faces.push(Face {
+                        fam,
+                        wght,
+                        opsz,
+                        font,
+                        digits,
+                    });
                 }
             }
         }
         Fonts {
             faces,
-            fallback,
+            fallback: vec![],
             used: RefCell::new(BTreeMap::new()),
             notes,
             names,
@@ -221,30 +255,70 @@ impl Fonts {
         }
     }
 
-    fn face(&self, st: St) -> &FontVec {
-        let want_o = if st.size >= 20. { 28. } else { 17. };
-        let mut best: Option<&Face> = None;
-        for f in self.faces.iter().filter(|f| f.fam == st.fam) {
-            let score = (f.wght - st.wght).abs() * 10. + (f.opsz - want_o).abs();
-            if best
-                .map(|b| score < (b.wght - st.wght).abs() * 10. + (b.opsz - want_o).abs())
-                .unwrap_or(true)
-            {
-                best = Some(f);
+    pub fn load() -> Fonts {
+        let mut fonts = Self::bundled();
+        // System faces are used only if none of the bundled faces covers a character.
+        for p in [
+            "/System/Library/Fonts/SFNS.ttf",
+            "/System/Library/Fonts/NewYork.ttf",
+            "/System/Library/Fonts/SFNSMono.ttf",
+            "/System/Library/Fonts/Apple Symbols.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ] {
+            if let Ok(b) = std::fs::read(p) {
+                if let Ok(f) = FontVec::try_from_vec(b) {
+                    fonts.fallback.push((p.to_string(), f));
+                }
             }
         }
-        &best.unwrap().font
+        fonts
+    }
+
+    fn face(&self, st: St) -> &Face {
+        let want_o = if st.fam == Fam::Serif && st.wght >= 600. {
+            st.size.clamp(32., 48.)
+        } else {
+            st.size
+        };
+        self.faces
+            .iter()
+            .filter(|f| f.fam == st.fam)
+            .min_by(|a, b| {
+                let score = |f: &Face| (f.wght - st.wght).abs() * 10. + (f.opsz - want_o).abs();
+                score(a).total_cmp(&score(b))
+            })
+            .expect("font family")
+    }
+
+    pub fn bundled_has(&self, ch: char) -> bool {
+        ch.is_whitespace() || self.faces.iter().any(|f| f.font.glyph_id(ch).0 != 0)
     }
 
     fn place(&self, s: &str, st: St, mult: f32) -> (Vec<Placed<'_>>, f32) {
-        let main = self.face(st);
+        let primary = self.face(st);
+        let main = &primary.font;
         let size_px = st.size * S * mult;
         let mut out = vec![];
         let mut x = 0.;
         let mut prev: Option<(*const FontVec, GlyphId)> = None;
         for ch in s.chars() {
             let mut font = main;
-            let mut id = font.glyph_id(ch);
+            let mut id = if ch.is_ascii_digit() && primary.digits[ch as usize - '0' as usize].0 != 0
+            {
+                primary.digits[ch as usize - '0' as usize]
+            } else {
+                font.glyph_id(ch)
+            };
+            if id.0 == 0 && !ch.is_whitespace() {
+                if let Some(face) = self.faces.iter().find(|face| face.font.glyph_id(ch).0 != 0) {
+                    font = &face.font;
+                    id = font.glyph_id(ch);
+                }
+            }
             if id.0 == 0 && !ch.is_whitespace() {
                 let mut found = false;
                 for (name, f) in &self.fallback {
@@ -264,13 +338,13 @@ impl Fonts {
             let scale = px_scale(font, size_px);
             let sf = font.as_scaled(scale);
             if let Some((pf, pid)) = prev {
-                if std::ptr::eq(pf, font) {
+                if std::ptr::eq(pf, font) && !ch.is_ascii_digit() {
                     x += sf.kern(pid, id);
                 }
             }
             out.push(Placed { font, scale, id, x });
             x += sf.h_advance(id) + st.track * S * mult;
-            prev = Some((font as *const FontVec, id));
+            prev = (!ch.is_ascii_digit()).then_some((font as *const FontVec, id));
         }
         (out, x)
     }
@@ -907,5 +981,62 @@ impl Split {
             p(self.story),
             other
         )
+    }
+}
+
+#[cfg(test)]
+mod bundled_font_tests {
+    use super::*;
+
+    #[test]
+    fn four_primary_faces_load_without_filesystem_access() {
+        let fonts = Fonts::bundled();
+        assert_eq!(fonts.names.len(), 4);
+        assert!(fonts.fallback.is_empty());
+        for fam in [Fam::Sans, Fam::Serif, Fam::Mono] {
+            assert!(
+                fonts
+                    .face(St {
+                        fam,
+                        size: 14.,
+                        wght: 500.,
+                        track: 0.
+                    })
+                    .font
+                    .glyph_id('A')
+                    .0
+                    > 0
+            );
+        }
+        assert!(fonts.face(icon(18.)).font.glyph_id('\u{e410}').0 > 0);
+        for name in fonts.names.values() {
+            assert!(!name.starts_with('/'));
+        }
+    }
+
+    #[test]
+    fn changing_digits_use_tabular_figures_at_every_weight_and_size() {
+        let fonts = Fonts::bundled();
+        for fam in [Fam::Sans, Fam::Serif, Fam::Mono] {
+            for size in [10., 12.5, 24., 30., 48.] {
+                for wght in [400., 500., 600.] {
+                    let st = St {
+                        fam,
+                        size,
+                        wght,
+                        track: 0.,
+                    };
+                    let width = fonts.width("0000", st);
+                    for digit in '1'..='9' {
+                        let value = digit.to_string().repeat(4);
+                        assert!(
+                            (fonts.width(&value, st) - width).abs() < 0.01,
+                            "{fam:?} {size} {wght}: {value}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(fonts.used.borrow().is_empty());
     }
 }

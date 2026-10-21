@@ -988,6 +988,8 @@ pub fn request_bar_y(base: f32, value: f64, max: f64, chart_h: f32) -> f32 {
 
 #[derive(Clone, Debug)]
 pub struct Metrics {
+    /// Only missing or system-fallback glyphs; bundled cross-family coverage is primary.
+    pub font_fallbacks: BTreeMap<char, String>,
     pub content_left: f32,
     pub content_width: f32,
     pub dream: f32,
@@ -1020,7 +1022,7 @@ pub struct Metrics {
 fn question_layout(f: &Fonts, q: &str, limit: f32, t: &Tokens) -> (St, Vec<String>) {
     let mut size = 24.;
     loop {
-        let st = serif(size, t.medium);
+        let st = serif(size, t.bold);
         let lines = f.wrap(q, st, IW);
         if lines.len() <= 3 && (lines.len() as f32 * size * 1.28) <= limit {
             return (st, lines);
@@ -1050,6 +1052,7 @@ pub fn draw(
     }
     let fonts = fonts()?;
     let f = &*fonts;
+    f.used.borrow_mut().clear();
     let t = theme.tokens();
     let ratio = width as f32 / (W * S);
     // Lay out the complete instrument before fitting both dimensions. Wide, short panes get
@@ -1767,9 +1770,11 @@ pub fn draw(
         output.into_raw(),
         tiny_skia::IntSize::from_wh(width, fitted_height)?,
     )?;
+    let font_fallbacks = f.used.borrow().clone();
     Some((
         pm,
         Metrics {
+            font_fallbacks,
             content_left: left as f32 / width as f32,
             content_width: fitted_width as f32 / width as f32,
             dream: hero_h,
