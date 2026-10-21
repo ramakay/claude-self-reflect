@@ -326,7 +326,7 @@ impl Composition {
                 now,
                 &data["limits"],
                 &data["sts"],
-                &data["compacting"],
+                &drawn_compaction(&data["compacting"]),
             ),
             tally: if notice
                 .as_deref()
@@ -564,6 +564,15 @@ fn csr_status(g: &Value) -> Option<(String, &str)> {
         },
         sev,
     ))
+}
+/// The compaction timer the picture shows, in ten-second steps: every repaint re-uploads the
+/// whole picture, so a seconds counter would blank the pane once a second.
+fn drawn_compaction(compacting: &Value) -> Value {
+    let mut info = compacting.clone();
+    if info.is_object() {
+        info["elapsed"] = json!((num(&compacting["elapsed"]) / 10.).floor() * 10.);
+    }
+    info
 }
 fn payback(g: &Value) -> String {
     if g["compacting"].is_object() {
@@ -3542,5 +3551,19 @@ mod tests {
         // Both read "59m": a second's sweep must not repaint the whole picture.
         assert!(draw_at(3599.).data() == draw_at(3540.).data());
         assert!(draw_at(3540.).data() != draw_at(3539.).data());
+    }
+
+    #[test]
+    fn a_running_compaction_redraws_every_ten_seconds_not_every_second() {
+        let draw_at = |elapsed: f64| {
+            let data = json!({"compacting": {"elapsed": elapsed, "usual": {"high": 120}}});
+            let c = Composition::build(&data, &json!({"id":"compacting"}), 1000.);
+            draw(&c, 704, 986, Theme::Light, Open::default(), false)
+                .expect("instrument draws")
+                .0
+        };
+        // Each repaint re-uploads the whole picture, and the terminal blanks it meanwhile.
+        assert!(draw_at(41.).data() == draw_at(49.).data());
+        assert!(draw_at(49.).data() != draw_at(50.).data());
     }
 }
