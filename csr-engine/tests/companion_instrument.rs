@@ -206,6 +206,34 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
             "recap_evidence_version":1,"anchor_request":"Make the companion readable",
             "completions":[{"claim":"Restore footer labels","receipt":"abcdef1"}]});
         con.execute("INSERT INTO reflections VALUES('prior-pane-session',?1,'[\"session_episode\",\"project_pane-wp2\"]','2026-10-18T09:00:00Z')",[episode.to_string()]).unwrap();
+        con.execute_batch("CREATE INDEX idx_chunks_conversation ON chunks(conversation_id);
+            CREATE INDEX idx_chunk_provenance_source_conv ON chunk_provenance(source_conv_id);
+            CREATE INDEX idx_resolution_open_recent ON resolution_ledger(status,source,id);
+            INSERT INTO chunks VALUES('prior-settled','prior-pane-session','2026-10-18T09:00:00Z',NULL,'pane-wp2','fixture');
+            INSERT INTO chunks VALUES('prior-open','prior-pane-session','2026-10-18T09:00:00Z',NULL,'pane-wp2','fixture');
+            INSERT INTO resolution_ledger VALUES(11,'prior-settled','Keep one layout owner','commit fedcba9','resolved','user_confirmed',NULL);
+            INSERT INTO resolution_ledger VALUES(12,'prior-open','Check device readability','commit acdc123','still_open','user_confirmed',NULL);").unwrap();
+        for i in 0..60 {
+            let sid = format!("earlier-{i:02}");
+            let at = chrono::DateTime::from_timestamp((NOW - 7200. - i as f64 * 3600.) as i64, 0)
+                .unwrap()
+                .to_rfc3339();
+            let intent = format!("Verify companion history case {}", i + 1);
+            con.execute(
+                "INSERT INTO session_registry VALUES(?1,'pane-wp2',?2,?3,?3)",
+                rusqlite::params![sid, intent, at],
+            )
+            .unwrap();
+            if i % 3 != 2 {
+                let ep = json!({"schema":"v2","session_id":sid,"project":"pane-wp2","timestamp":at,
+                    "request":"An unrelated first prompt","investigated":[],"completed":"",
+                    "next_steps":if i%3==1{json!("Check the live pane")}else{Value::Null},
+                    "blockers":null,"outcome":"unknown","error_signatures":[],"tools_used":[],"files_modified":[],
+                    "message_count":8,"duration_minutes":30,"recap_evidence_version":1,"anchor_request":intent,
+                    "completions":if i%3==0{json!([{"claim":"Keep history readable","receipt":format!("abc{i:04x}")}])}else{json!([])}});
+                con.execute("INSERT INTO reflections VALUES(?1,?2,'[\"session_episode\",\"project_pane-wp2\"]',?3)",rusqlite::params![sid,ep.to_string(),at]).unwrap();
+            }
+        }
     }
     let ctx = match state {
         "01-empty" | "11-last-time" => 0,
@@ -529,6 +557,11 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
                 "region":[format!("{:.3}",p.region.0),format!("{:.3}",p.region.1),format!("{:.3}",p.region.2),format!("{:.3}",p.region.3)],
                 "heights":p.heights.iter().map(|h|format!("{h:.3}")).collect::<Vec<_>>(),"compactions":p.compactions})).collect::<Vec<_>>(),
             "layout_height":format!("{:.3}",metrics.height),
+            "history_rows":metrics.history_rows,
+            "history_bottom":metrics.history_bottom.map(|n|format!("{n:.3}")),
+            "figure_region":[format!("{:.3}",metrics.figure_region.0),format!("{:.3}",metrics.figure_region.1)],
+            "help_region":metrics.help_region.map(|(y,h)|[format!("{y:.3}"),format!("{h:.3}")]),
+            "dream_height":format!("{:.3}",metrics.dream),
             "csr_cost":{"share":metrics.csr_cost.share_label(),"usd":metrics.csr_cost.usd,"calls":metrics.csr_cost.calls}}),
         // Cell-grid export for contact sheets; placement hash stays in the golden JSON.
         {
@@ -895,14 +928,36 @@ fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() 
                     .filter(|line| !line.is_empty())
                     .collect::<Vec<_>>()
             };
-            assert_eq!(
-                content(shorter),
-                lines[..66]
-                    .iter()
-                    .filter(|line| !line.is_empty())
-                    .cloned()
-                    .collect::<Vec<_>>()
-            );
+            let short_content = content(shorter);
+            let long_content = lines[..66]
+                .iter()
+                .filter(|line| !line.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            if state == "11-last-time" {
+                // More height adds older history while keeping the recap and quota facts whole.
+                let is_history = |line: &&String| {
+                    ["✓ ", "→ ", "? "]
+                        .iter()
+                        .any(|prefix| line.starts_with(prefix))
+                };
+                assert_eq!(
+                    short_content
+                        .iter()
+                        .filter(|line| !is_history(line))
+                        .collect::<Vec<_>>(),
+                    long_content
+                        .iter()
+                        .filter(|line| !is_history(line))
+                        .collect::<Vec<_>>()
+                );
+                let short_history = short_content.iter().filter(is_history).collect::<Vec<_>>();
+                let long_history = long_content.iter().filter(is_history).collect::<Vec<_>>();
+                assert!(!short_history.is_empty() && long_history.len() > short_history.len());
+                assert_eq!(short_history, long_history[..short_history.len()]);
+            } else {
+                assert_eq!(short_content, long_content);
+            }
         }
         if !matches!(state, "01-empty" | "11-last-time" | "08b-nothing") {
             assert!(golden.contains("Text parity is ready for review."));
@@ -1710,11 +1765,11 @@ fn weekly_caption_names_only_csrs_percentage_points() {
     let mut data = Composition::build(&json!({"value":week}), &json!({"id":"sess-now"}), NOW);
     let q = json!({"code":"7D", "used":57});
     data.csr_cost.share = Some(0.9);
-    assert_eq!(quota_caption(&data, &q), "CSR 0.9 pts");
+    assert_eq!(quota_caption(&data, &q), "7D · CSR 0.9 pts");
     data.csr_cost.share = Some(0.);
-    assert_eq!(quota_caption(&data, &q), "CSR 0 pts");
+    assert_eq!(quota_caption(&data, &q), "7D · CSR 0 pts");
     data.csr_cost.share = None;
-    assert_eq!(quota_caption(&data, &q), "CSR — pts");
+    assert_eq!(quota_caption(&data, &q), "7D · CSR — pts");
 }
 
 #[test]
@@ -1846,6 +1901,49 @@ fn narrow_footer_keeps_every_key_labeled() {
                 content.contains("Last time here") && content.contains("abcdef1"),
                 "{content}"
             );
+        }
+    }
+}
+
+#[test]
+fn repository_history_fills_the_last_card_without_expanding_card_gaps() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (cols, rows) in [(38, 30), (44, 30), (60, 40), (76, 67)] {
+            let (_home, paths) = state_home("11-last-time");
+            let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+            pane.pixels = true;
+            pane.enable_cards();
+            pane.theme = theme;
+            pane.frame(cols, rows, NOW);
+            let m = pane.instrument_metrics.as_ref().unwrap();
+            assert!((m.figure_region.0 - (16. + m.dream) - 12.).abs() < 0.1);
+            let (help_y, help_h) = m.help_region.unwrap();
+            assert!((help_y - (m.figure_region.0 + m.figure_region.1) - 12.).abs() < 0.1);
+            assert!(m.history_rows >= 5, "{cols}x{rows}: {}", m.history_rows);
+            let slack = help_y + help_h - 16. - m.history_bottom.unwrap();
+            assert!(
+                (0. ..18.1).contains(&slack),
+                "{cols}x{rows}: unused content height {slack}"
+            );
+            assert!((m.last_card_gap_px - 12.).abs() <= 2.);
+        }
+    }
+}
+
+#[test]
+fn native_weekly_quota_keeps_7d_and_magenta_csr_points() {
+    for state in ["01-empty", "02-running"] {
+        for theme in [Theme::Dark, Theme::Light] {
+            let (_home, paths) = state_home(state);
+            let mut pane = Pane::new(paths, &args("main", "sess-now", 38, 30));
+            pane.pixels = false;
+            pane.theme = theme;
+            let shown = pane.frame(38, 30, NOW).join("\n");
+            let t = theme.tokens();
+            let colour = text::fg([t.csr_share[0], t.csr_share[1], t.csr_share[2]]);
+            assert!(shown.contains(&format!("{colour}CSR ")), "{shown}");
+            let plain = text::plain(&shown);
+            assert!(plain.contains("7D ") && plain.contains(" pts"), "{plain}");
         }
     }
 }

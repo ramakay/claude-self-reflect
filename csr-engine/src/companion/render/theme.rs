@@ -188,7 +188,8 @@ pub const SETS: &[(&str, Tokens)] = &[
             },
             top_highlight: [255, 255, 255, 191],
             linear_at: [0., 1.],
-            glass: [[255, 255, 255, 160], [249, 249, 249, 160]],
+            // Limit aurora leakage to 7/255; the background mesh keeps its full strength.
+            glass: [[255, 255, 255, 248], [249, 249, 249, 248]],
             hair: [23, 25, 28, 35],
             mint: [26, 109, 78, 255],
             sky: [32, 91, 147, 255],
@@ -287,7 +288,8 @@ mod instrument_tests {
     }
     #[test]
     fn text_meets_aa_on_every_glass_stop_over_every_aurora_stop() {
-        for (_, t) in SETS {
+        for (name, t) in SETS {
+            let mut minimum = f64::INFINITY;
             let composite = |a: [u8; 4], b: [u8; 4]| {
                 let mut out = b;
                 for i in 0..3 {
@@ -317,18 +319,28 @@ mod instrument_tests {
                     }
                     for ink in [
                         // Dream-section bodies use ink; their short labels use dream amber.
-                        t.ink, t.dream, t.quiet, t.faint, t.mint, t.sky, t.amber, t.warn, t.risk,
+                        t.ink,
+                        t.dream,
+                        t.quiet,
+                        t.faint,
+                        t.mint,
+                        t.sky,
+                        t.amber,
+                        t.warn,
+                        t.risk,
                         t.asked,
+                        t.csr_share,
+                        t.fresh,
                     ] {
                         let a = luminance(card);
                         let b = luminance(ink);
-                        assert!(
-                            (a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5,
-                            "{ink:?} on {card:?}"
-                        );
+                        let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                        minimum = minimum.min(contrast);
+                        assert!(contrast >= 4.5, "{ink:?} on {card:?}: {contrast:.3}");
                     }
                 }
             }
+            println!("{name}: minimum text contrast {minimum:.3}:1, including CSR magenta");
         }
     }
     // D65 sRGB -> CIELAB, then Sharma/Wu/Dalal CIEDE2000 (unit weights).
@@ -419,9 +431,15 @@ mod instrument_tests {
     #[test]
     fn light_mesh_anchor_colours_survive_raster_and_card_compositing() {
         use super::super::instrument_gfx::{lin, Canvas, S};
-        // All three radial centres are outside the pane. Measure their nearest in-pane
-        // pixel centres: top-left, right edge at 45% height, bottom edge at 45% width.
-        for (w, h) in [(605., 800.), (605., 1135.), (605., 400.), (304., 500.)] {
+        // All three radial centres are outside the pane. Their nearest in-pane
+        // pixel centres must keep the existing strong mesh colour in the gaps.
+        for (w, h) in [
+            (605., 800.),
+            (605., 1135.),
+            (605., 400.),
+            (304., 500.),
+            (608., 986.), // 38 columns x 29 content rows at the fallback cell size.
+        ] {
             let mut canvas = Canvas::new(w, h);
             canvas.background(&LIGHT);
             let points = [
@@ -433,36 +451,70 @@ mod instrument_tests {
                 let p = pm.pixel(x, y).unwrap().demultiply();
                 [p.red(), p.green(), p.blue(), p.alpha()]
             };
-            let mesh: Vec<_> = points
-                .iter()
-                .map(|&(x, y)| sample(&canvas.pm, x, y))
-                .collect();
-            // The same glass shader as the cards, over the actual mesh, without text/shadows.
-            canvas.glass(
-                0.,
-                0.,
-                w,
-                h,
-                0.,
-                lin(
-                    0.,
-                    0.,
-                    0.,
-                    h,
-                    &[
-                        (LIGHT.linear_at[0], LIGHT.glass[0]),
-                        (LIGHT.linear_at[1], LIGHT.glass[1]),
-                    ],
-                ),
-            );
+            let mut mesh_min = f64::INFINITY;
             for (i, &(x, y)) in points.iter().enumerate() {
-                let card = sample(&canvas.pm, x, y);
-                let mesh_delta = delta_e_2000(lab(mesh[i]), lab(LIGHT.ground));
-                let card_delta = delta_e_2000(lab(card), lab(LIGHT.ground));
-                println!("{w}x{h} anchor {i}: mesh {mesh_delta:.3}, card {card_delta:.3}, mesh RGB {:?}, card RGB {card:?}", mesh[i]);
-                assert!(mesh_delta >= 6., "anchor {i}: mesh {mesh_delta}");
-                assert!(card_delta >= 6., "anchor {i}: card {card_delta}");
+                let mesh = sample(&canvas.pm, x, y);
+                let delta = delta_e_2000(lab(mesh), lab(LIGHT.ground));
+                mesh_min = mesh_min.min(delta);
+                assert!(delta >= 6., "{w}x{h} anchor {i}: mesh {delta}");
             }
+            // Compare the real glass raster over the actual mesh to the same RGB
+            // gradient made opaque. No text/shadows; inset pixels exclude edge AA.
+            let mut reference = Canvas::new(w, h);
+            let stops = [
+                (LIGHT.linear_at[0], LIGHT.glass[0]),
+                (LIGHT.linear_at[1], LIGHT.glass[1]),
+            ];
+            let opaque = stops.map(|(at, mut rgba)| {
+                rgba[3] = 255;
+                (at, rgba)
+            });
+            canvas.glass(0., 0., w, h, 0., lin(0., 0., 0., h, &stops));
+            reference.glass(0., 0., w, h, 0., lin(0., 0., 0., h, &opaque));
+            let mut colours = std::collections::HashMap::new();
+            let mut max_delta = 0_f64;
+            let mut minimum_contrast = f64::INFINITY;
+            let mut checked = 0;
+            for y in 2..canvas.pm.height() - 2 {
+                for x in 2..canvas.pm.width() - 2 {
+                    let card = sample(&canvas.pm, x, y);
+                    let token = sample(&reference.pm, x, y);
+                    let (delta, contrast) = *colours.entry((card, token)).or_insert_with(|| {
+                        let delta = delta_e_2000(lab(card), lab(token));
+                        let a = luminance(card);
+                        let contrast = [
+                            LIGHT.ink,
+                            LIGHT.quiet,
+                            LIGHT.faint,
+                            LIGHT.mint,
+                            LIGHT.sky,
+                            LIGHT.dream,
+                            LIGHT.amber,
+                            LIGHT.warn,
+                            LIGHT.risk,
+                            LIGHT.asked,
+                            LIGHT.csr_share,
+                            LIGHT.fresh,
+                        ]
+                        .into_iter()
+                        .map(|ink| {
+                            let b = luminance(ink);
+                            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                        (delta, contrast)
+                    });
+                    max_delta = max_delta.max(delta);
+                    minimum_contrast = minimum_contrast.min(contrast);
+                    checked += 1;
+                }
+            }
+            println!("{w}x{h}: {checked} interior pixels, gap mesh min ΔE2000 {mesh_min:.3}, card max ΔE2000 {max_delta:.3}, min text contrast {minimum_contrast:.3}:1");
+            assert!(max_delta <= 4., "{w}x{h}: card tint ΔE2000 {max_delta}");
+            assert!(
+                minimum_contrast >= 4.5,
+                "{w}x{h}: contrast {minimum_contrast}"
+            );
         }
     }
     #[test]

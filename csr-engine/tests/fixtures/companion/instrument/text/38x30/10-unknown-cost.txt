@@ -25,6 +25,6 @@ Text parity is ready for review.
 unverified
 CTX 192k/1M · +6k/turn · ♻ >15 prompts
 1 by CSR
-7D 52%» · CSR — · 5H 2% · ◷ 59m
+7D 52%» · CSR — pts · 5H 2% · ◷ 59m
 Codex 7D 41%
  d q l chg t thr i fig b thm q close

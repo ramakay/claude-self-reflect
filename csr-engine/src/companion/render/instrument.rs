@@ -631,6 +631,8 @@ pub fn rows_with_figure(
     show_figure: bool,
 ) -> Vec<String> {
     let mut out = vec![];
+    let mut history_insert = None;
+    let mut pitch_insert = None;
     let cap = rows * 3 / 10;
     let wrap = |s: &str| text::wrap(s, cols.max(1), 1000);
     let mut collapsed_hero = false;
@@ -699,9 +701,13 @@ pub fn rows_with_figure(
         for line in recap.text.lines() {
             out.extend(wrap(line));
         }
+        history_insert = Some(out.len());
     } else if c.empty_session || c.offer {
         for line in sells() {
             out.extend(wrap(line));
+        }
+        if c.empty_session {
+            pitch_insert = Some(out.len());
         }
     }
     if !c.story.is_empty() {
@@ -816,7 +822,87 @@ pub fn rows_with_figure(
             active.iter().filter(|a| agents::stalled(a, c.now)).count()
         )));
     }
+    if let (Some(at), Some(recap)) = (history_insert, &c.repo_recap) {
+        let room = rows.saturating_sub(1 + out.len());
+        if room > 1 && !recap.history.is_empty() {
+            let mut history = vec!["Earlier here".into()];
+            history.extend(recap.history.iter().take(room - 1).map(|prior| {
+                text::fit(
+                    &format!(
+                        "{} {} · {}",
+                        history_mark(&prior.outcome),
+                        prior.age,
+                        prior.intent
+                    ),
+                    cols,
+                )
+            }));
+            out.splice(at..at, history);
+        }
+    }
+    if let Some(at) = pitch_insert {
+        let mut room = rows.saturating_sub(1 + out.len());
+        let mut examples = vec![];
+        if room > 2 {
+            examples.push("Try a question".into());
+            room -= 1;
+            for (question, hint) in starter_questions() {
+                let lines = wrap(&format!("{question} {hint}"));
+                if lines.len() > room {
+                    break;
+                }
+                room -= lines.len();
+                examples.extend(lines);
+            }
+            if examples.len() > 1 {
+                out.splice(at..at, examples);
+            }
+        }
+    }
     out
+}
+fn starter_questions() -> [(&'static str, &'static str); 8] {
+    [
+        (
+            "What did we decide about this repo?",
+            "Find a decision and its source session.",
+        ),
+        (
+            "What was unfinished last time?",
+            "Recover the next steps from earlier work.",
+        ),
+        (
+            "Why did we change this file?",
+            "Follow the conversation behind the code.",
+        ),
+        (
+            "Where did we fix this bug before?",
+            "Find earlier attempts and the final fix.",
+        ),
+        (
+            "What did I ask Claude to remember?",
+            "Look up saved instructions and preferences.",
+        ),
+        (
+            "Show the history of this function.",
+            "Find prior edits and their context.",
+        ),
+        (
+            "What changed in the last session?",
+            "Review the session's evidenced work.",
+        ),
+        (
+            "Which approach did we reject?",
+            "Retrieve alternatives and their reasons.",
+        ),
+    ]
+}
+fn history_mark(outcome: &str) -> &'static str {
+    match outcome {
+        "done" => "✓",
+        "open" => "→",
+        _ => "?",
+    }
 }
 fn agent_lines(c: &Composition) -> Vec<String> {
     c.agents
@@ -876,7 +962,7 @@ fn figure_lines(c: &Composition) -> Vec<String> {
         .map(|q| {
             let line = text::paced(q);
             if q["code"] == "7D" {
-                format!("{line} · CSR {}", c.csr_cost.share_label())
+                format!("{line} · CSR {} pts", c.csr_cost.share_label())
             } else {
                 line
             }
@@ -917,7 +1003,7 @@ fn has_week(data: &Composition) -> bool {
 /// The same caption is used by every pixel quota layout.
 pub fn quota_caption(data: &Composition, q: &Value) -> String {
     if q["code"] == "7D" {
-        format!("CSR {} pts", data.csr_cost.share_label())
+        format!("7D · CSR {} pts", data.csr_cost.share_label())
     } else {
         let pace = q["pace"]
             .as_f64()
@@ -982,6 +1068,38 @@ fn fitted_caption_ink(
     let st = sans(size, t.medium);
     let size = (size * width / f.width(line, st).max(width)).min(size);
     c.text(f, line, x, y, sans(size, t.medium), ink, A::M);
+}
+
+/// Weekly identity and CSR attribution keep separate inks on the same measured line.
+fn weekly_caption(
+    c: &mut Canvas,
+    f: &Fonts,
+    data: &Composition,
+    q: &Value,
+    x: f32,
+    y: f32,
+    width: f32,
+    size: f32,
+    t: &Tokens,
+) {
+    let line = quota_caption(data, q);
+    let st = sans(size, t.medium);
+    let st = sans(
+        (size * width / f.width(&line, st).max(width)).min(size),
+        t.medium,
+    );
+    let prefix = "7D · ";
+    let left = x - f.width(&line, st) / 2.;
+    let prefix_w = c.text(f, prefix, left, y, st, t.quiet, A::L);
+    c.text(
+        f,
+        line.strip_prefix(prefix).unwrap_or(&line),
+        left + prefix_w,
+        y,
+        st,
+        t.csr_share,
+        A::L,
+    );
 }
 
 fn quota_money_caption(f: &Fonts, line: &str, width: f32, size: f32, t: &Tokens) -> String {
@@ -1061,22 +1179,8 @@ fn quota_row(
             t.ink,
             A::M,
         );
-        let ahead = q["pace"]
-            .as_f64()
-            .is_some_and(|p| num(&q["used"]) / 100. > p);
         if weekly {
-            // The short CSR points label owns one row; money owns the following row.
-            fitted_caption_ink(
-                c,
-                f,
-                &quota_caption(data, q),
-                x,
-                label_y,
-                slot - S2,
-                caption_size,
-                if ahead { t.warn } else { t.quiet },
-                t,
-            );
+            weekly_caption(c, f, data, q, x, label_y, slot - S2, caption_size, t);
         } else {
             quota_label(
                 c,
@@ -1466,6 +1570,8 @@ pub struct Metrics {
     pub agents_region: Option<(f32, f32)>,
     pub figure_region: (f32, f32),
     pub help_region: Option<(f32, f32)>,
+    pub history_rows: usize,
+    pub history_bottom: Option<f32>,
     /// Context-window ceiling hairline Y in layout pt, when the expanded bars are drawn.
     pub ceiling_y: Option<f32>,
     /// Collapsed context ring: (cx, cy, radius). Absent when expanded, quotas-only, or compact fallback.
@@ -1736,18 +1842,12 @@ pub fn draw(
         }
     };
     let top_core = top_core + extra_h + if extra_h > 0. { S3 } else { 0. };
-    let mut card_gap = S3;
+    let card_gap = S3;
     let (figure_h, help_h) = if quotas_only && empty_help > 0. {
         let available = maxh - top_core - tail_core - key_gap;
         let figure_h = available.min(empty_quota_height(c)).max(figure_min);
-        let gaps = 1
-            + usize::from(story_h > 0.)
-            + usize::from(notice_h > 0.)
-            + usize::from(extra_h > 0.)
-            + usize::from(active)
-            + usize::from(empty_help > 0.);
-        card_gap += (available - figure_h).max(0.) / gaps as f32;
-        (figure_h, empty_help)
+        // Cards always stack from the top. The final card owns surplus height.
+        (figure_h, empty_help + (available - figure_h).max(0.))
     } else {
         (maxh - top_core - tail_core - key_gap, empty_help)
     };
@@ -2218,6 +2318,8 @@ pub fn draw(
             y += card_gap;
         }
     }
+    let mut history_rows = 0;
+    let mut history_bottom = None;
     let help_region = (help_h > 0.).then_some((y, help_h));
     if let Some((help_y, help_draw_h)) = help_region {
         panel(&mut canvas, help_y, help_draw_h, t);
@@ -2262,10 +2364,55 @@ pub fn draw(
                 );
                 cursor += theme::BODY_LINE;
             }
+            let bottom = help_y + help_draw_h - P;
+            let available_rows = ((bottom - cursor - S4 - theme::TITLE_LINE - S2)
+                / theme::BODY_LINE)
+                .floor()
+                .max(0.) as usize;
+            if available_rows > 0 && !recap.history.is_empty() {
+                cursor += S4;
+                label(
+                    &mut canvas,
+                    f,
+                    "Earlier here",
+                    IX,
+                    cursor + f.cap(title),
+                    theme::TITLE_SIZE,
+                    t.ink,
+                    t.bold,
+                );
+                cursor += theme::TITLE_LINE + S2;
+                for prior in recap.history.iter().take(available_rows) {
+                    let age = format!("{}  {}", history_mark(&prior.outcome), prior.age);
+                    let age_w = f.width(&age, caption).max(88.);
+                    label(
+                        &mut canvas,
+                        f,
+                        &age,
+                        IX,
+                        cursor + f.cap(body),
+                        theme::CAPTION_SIZE,
+                        t.quiet,
+                        t.regular,
+                    );
+                    single(
+                        &mut canvas,
+                        f,
+                        &prior.intent,
+                        IX + age_w + S3,
+                        cursor + f.cap(body),
+                        IW - age_w - S3,
+                        theme::BODY_SIZE,
+                        t.ink,
+                        t,
+                    );
+                    cursor += theme::BODY_LINE;
+                    history_rows += 1;
+                }
+                history_bottom = Some(cursor);
+            }
         } else {
-            let content_h =
-                theme::TITLE_LINE + S3 + 3. * (theme::BODY_LINE + theme::CAPTION_LINE) + 2. * S4;
-            let mut cursor = help_y + (help_draw_h - content_h) / 2.;
+            let mut cursor = help_y + P;
             label(
                 &mut canvas,
                 f,
@@ -2316,6 +2463,51 @@ pub fn draw(
                     t.regular,
                 );
                 cursor += theme::BODY_LINE + theme::CAPTION_LINE + S4;
+            }
+            let bottom = help_y + help_draw_h - P;
+            if c.empty_session
+                && bottom - cursor
+                    >= theme::TITLE_LINE + S3 + theme::BODY_LINE + theme::CAPTION_LINE
+            {
+                label(
+                    &mut canvas,
+                    f,
+                    "Try a question",
+                    IX,
+                    cursor + f.cap(title),
+                    theme::TITLE_SIZE,
+                    t.ink,
+                    t.bold,
+                );
+                cursor += theme::TITLE_LINE + S3;
+                for (question, hint) in starter_questions() {
+                    if cursor + theme::BODY_LINE + theme::CAPTION_LINE > bottom {
+                        break;
+                    }
+                    single(
+                        &mut canvas,
+                        f,
+                        question,
+                        IX,
+                        cursor + f.cap(body),
+                        IW,
+                        theme::BODY_SIZE,
+                        t.ink,
+                        t,
+                    );
+                    single(
+                        &mut canvas,
+                        f,
+                        hint,
+                        IX,
+                        cursor + theme::BODY_LINE + f.cap(caption),
+                        IW,
+                        theme::CAPTION_SIZE,
+                        t.quiet,
+                        t,
+                    );
+                    cursor += theme::BODY_LINE + theme::CAPTION_LINE + S3;
+                }
             }
         }
         y = help_y + help_draw_h;
@@ -2373,6 +2565,8 @@ pub fn draw(
             agents_region,
             figure_region,
             help_region,
+            history_rows,
+            history_bottom,
             ceiling_y,
             ring_bounds,
             ring_group,
@@ -3216,6 +3410,32 @@ pub fn strip(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn weekly_caption_raster_uses_label_and_csr_inks_on_one_line() {
+        let f = Fonts::load();
+        let mut data = Composition::build(&json!({}), &json!({"id":"caption"}), 1000.);
+        data.csr_cost.share = Some(0.9);
+        let q = json!({"code":"7D","used":57});
+        assert_eq!(quota_caption(&data, &q), "7D · CSR 0.9 pts");
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let mut c = Canvas::new(240., 60.);
+            c.background(t);
+            weekly_caption(&mut c, &f, &data, &q, 120., 30., 200., 12., t);
+            for ink in [t.quiet, t.csr_share] {
+                let pixels = c
+                    .pm
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|p| (0..3).all(|i| (i16::from(p[i]) - i16::from(ink[i])).abs() < 20))
+                    .count();
+                assert!(pixels > 3, "{theme:?}: missing caption ink {ink:?}");
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

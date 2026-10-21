@@ -62,6 +62,6 @@ Text parity is ready for review.
 + render/instrument.rs · meta ⌗7625eed7
 ! render/instrument.rs · draw unverified
 CTX 190k/1M · +0/turn · ♻ >15 prompts · 1 by CSR
-7D 52%» · CSR 1.1 · 5H 2% · ◷ 59m · Codex 7D 41%
+7D 52%» · CSR 1.1 pts · 5H 2% · ◷ 59m · Codex 7D 41%
 5¢ this week
  d queue  l changes  t threads  i figure  b theme  q close

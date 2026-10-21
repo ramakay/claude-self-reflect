@@ -1,30 +1,30 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 ☾ The dreamer looks as you work.
 dreamer 0 of 40k
 It asks a what-if from your past sessions.
 Last time here · 1h ago · prior-pa
 Make the companion readable: Restore footer
 labels (abcdef1).
+Settled: Keep one layout owner (fedcba9).
+Now: Check device readability (commit
+acdc123).
 Next: Check the live narrow pane.
-7D 52%» · CSR 0 · 5H 3% · Codex 7D 41%
+Earlier here
+✓ 2h ago · Verify companion history case 1
+→ 3h ago · Verify companion history case 2
+? 4h ago · you asked: Verify companion hist…
+✓ 5h ago · Verify companion history case 4
+→ 6h ago · Verify companion history case 5
+? 7h ago · you asked: Verify companion hist…
+✓ 8h ago · Verify companion history case 7
+→ 9h ago · Verify companion history case 8
+? 10h ago · you asked: Verify companion his…
+✓ 11h ago · Verify companion history case 10
+→ 12h ago · Verify companion history case 11
+? 13h ago · you asked: Verify companion his…
+✓ 14h ago · Verify companion history case 13
+→ 15h ago · Verify companion history case 14
+? 16h ago · you asked: Verify companion his…
+✓ 17h ago · Verify companion history case 16
+7D 52%» · CSR 0 pts · 5H 3% · Codex 7D 41%
 $0 this week
  l changes t threads i fig b theme q close

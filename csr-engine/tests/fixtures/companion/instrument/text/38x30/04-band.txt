@@ -24,7 +24,7 @@ Text parity is ready for review.
 unverified
 CTX 189k/1M · +18k/turn · ♻ ~1 prompt
 28 calls · 1 by CSR
-7D 52%» · CSR 0.2 · 5H 2% · ◷ 59m
+7D 52%» · CSR 0.2 pts · 5H 2% · ◷ 59m
 Codex 7D 41%
 5¢ this week
  d q l chg t thr i fig b thm q close

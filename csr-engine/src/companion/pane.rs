@@ -952,8 +952,19 @@ impl Pane {
         let rgb = [token.quiet[0], token.quiet[1], token.quiet[2]];
         let ground = [token.ground[0], token.ground[1], token.ground[2]];
         let ink = [token.ink[0], token.ink[1], token.ink[2]];
+        let weekly_csr = format!("CSR {} pts", composition.csr_cost.share_label());
         for line in &mut out {
             let padding = " ".repeat(cols.saturating_sub(text::len(line)));
+            if line.contains(&weekly_csr) {
+                let csr_ink =
+                    text::fg([token.csr_share[0], token.csr_share[1], token.csr_share[2]]);
+                *line = line
+                    .replace("7D", &format!("{}7D{}", text::fg(rgb), text::fg(ink)))
+                    .replace(
+                        &weekly_csr,
+                        &format!("{csr_ink}{weekly_csr}{}", text::fg(ink)),
+                    );
+            }
             *line = format!(
                 "{}{}{line}{padding}{}",
                 text::bg(ground),

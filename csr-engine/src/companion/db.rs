@@ -47,6 +47,9 @@ impl Db {
                 if let Some(value) = &mut recap {
                     // Rebuild age through the composer on the next cache refresh.
                     value.age = super::repo_recap::age_label((now - value.at).max(0.));
+                    for entry in &mut value.history {
+                        entry.age = super::repo_recap::age_label((now - entry.at).max(0.));
+                    }
                 }
                 return recap;
             }

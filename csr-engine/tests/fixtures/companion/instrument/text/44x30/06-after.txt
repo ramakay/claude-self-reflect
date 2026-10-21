@@ -24,7 +24,7 @@ Text parity is ready for review.
 + render/instrument.rs · meta ⌗7625eed7
 ! render/instrument.rs · draw unverified
 CTX 65k/1M
-7D 52%» · CSR 0.8 · 5H 2% · ◷ 59m
+7D 52%» · CSR 0.8 pts · 5H 2% · ◷ 59m
 Codex 7D 41%
 5¢ this week
  d l changes t threads i fig b thm q close
