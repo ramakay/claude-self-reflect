@@ -463,6 +463,8 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
         panics.fetch_add(1, Ordering::Release);
     }));
     let mut drawn = None;
+    // The pane's pictures and the bands last cut from them.
+    let mut cut: (Vec<kitty::Placement>, Vec<kitty::Placement>) = (vec![], vec![]);
     let mut boundary = Boundary::default();
     let mut pressed = true;
     let mut last = Instant::now();
@@ -528,9 +530,13 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                     if drawn.is_none() {
                         print!("\x1b]0;CSR\x07\x1b[?25l\x1b]11;rgb:fb/fb/f9\x1b\\");
                     }
-                    if terminal.raw {
+                    // Only on a full repaint: any byte, even an unchanged mode, makes herdr place every picture again.
+                    if terminal.raw && drawn.is_none() {
                         terminal::enable_raw_mode()?;
                         execute!(io::stdout(), EnableMouseCapture)?;
+                    }
+                    if cut.0 != pane.placed {
+                        cut = (pane.placed.clone(), kitty::bands(&pane.placed));
                     }
                     print!(
                         "{}",
@@ -539,14 +545,14 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                             cols as usize,
                             rows as usize,
                             &written,
-                            &pane.placed
+                            &cut.1
                         )
                     );
                     drawn = Some(Drawn {
                         cols: cols as usize,
                         rows: rows as usize,
                         written,
-                        placed: pane.placed.clone(),
+                        placed: cut.1.clone(),
                     });
                 } else {
                     drawn = None;

@@ -33,14 +33,27 @@ pub struct Placement {
     pub png: Arc<[u8]>,
 }
 pub fn kitty(png: &[u8], row: usize, col: usize, cols: usize, rows: usize) -> String {
+    transmit(png, row, col, cols, rows, None)
+}
+/// `kitty` under image id `id`: sent again under the same id, a picture replaces the old one in
+/// place, with no delete first.
+fn transmit(
+    png: &[u8],
+    row: usize,
+    col: usize,
+    cols: usize,
+    rows: usize,
+    id: Option<usize>,
+) -> String {
     let mut out = format!("\x1b[{};{}H", row + 1, col + 1);
+    let id = id.map(|id| format!("i={id},")).unwrap_or_default();
     let data = STANDARD.encode(png);
     let chunks = data.as_bytes().chunks(4096);
     let count = chunks.len();
     for (index, chunk) in chunks.enumerate() {
         let more = usize::from(index + 1 < count);
         let ctrl = if index == 0 {
-            format!("a=T,f=100,q=2,C=1,c={cols},r={rows},m={more}")
+            format!("a=T,f=100,q=2,C=1,{id}c={cols},r={rows},m={more}")
         } else {
             format!("m={more}")
         };
@@ -54,6 +67,41 @@ pub fn kitty(png: &[u8], row: usize, col: usize, cols: usize, rows: usize) -> St
 pub const SYNC_ON: &str = "\x1b[?2026h";
 pub const SYNC_OFF: &str = "\x1b[?2026l";
 pub const DELETE_ALL: &str = "\x1b_Ga=d,d=A\x1b\\";
+/// `pictures` cut into one band per cell row. herdr sends a changed picture to the terminal as
+/// raw pixels after deleting the old one, and the pane stays blank until they arrive: a whole
+/// pane is about 2.7 MB. A band is one row of that, and an unchanged band is not sent at all.
+pub fn bands(pictures: &[Placement]) -> Vec<Placement> {
+    let mut out = vec![];
+    for p in pictures {
+        let Ok(img) = image::load_from_memory_with_format(&p.png, image::ImageFormat::Png) else {
+            out.push(p.clone());
+            continue;
+        };
+        let img = img.to_rgba8();
+        let (width, height) = img.dimensions();
+        if p.rows < 2 || height < p.rows as u32 {
+            out.push(p.clone());
+            continue;
+        }
+        let edge = |i: usize| (height as u64 * i as u64 / p.rows as u64) as u32;
+        for i in 0..p.rows {
+            let (top, bottom) = (edge(i), edge(i + 1));
+            let band = image::imageops::crop_imm(&img, 0, top, width, bottom - top).to_image();
+            let mut png = std::io::Cursor::new(Vec::new());
+            if band.write_to(&mut png, image::ImageFormat::Png).is_err() {
+                return pictures.to_vec();
+            }
+            out.push(Placement {
+                row: p.row + i,
+                col: p.col,
+                cols: p.cols,
+                rows: 1,
+                png: Arc::from(png.into_inner()),
+            });
+        }
+    }
+    out
+}
 #[derive(Clone)]
 pub struct Drawn {
     pub cols: usize,
@@ -73,6 +121,7 @@ pub fn repaint_pictures(
 ) -> String {
     let same = drawn.filter(|d| d.cols == cols && d.rows == rows);
     let mut out = SYNC_ON.to_owned();
+    let start = out.len();
     if same.is_none() {
         out.push_str(DELETE_ALL);
         out.push_str("\x1b[H\x1b[2J");
@@ -84,25 +133,28 @@ pub fn repaint_pictures(
         .filter(|(i, l)| same.and_then(|d| d.written.get(*i)) != Some(*l))
         .map(|(i, _)| i)
         .collect();
-    let again = placed != shown
-        || changed.iter().any(|i| {
-            shown
-                .iter()
-                .chain(placed)
-                .any(|p| *i >= p.row && *i < p.row + p.rows)
-        });
-    if again && !shown.is_empty() {
-        out.push_str(DELETE_ALL);
+    let under = |p: &Placement| changed.iter().any(|i| *i >= p.row && *i < p.row + p.rows);
+    // Picture `i` keeps image id `i + 1`. A slot that moved, or is no longer drawn, is deleted.
+    let place = |p: &Placement| (p.row, p.col, p.cols, p.rows);
+    for (i, old) in shown.iter().enumerate() {
+        if placed.get(i).is_none_or(|p| place(p) != place(old)) {
+            out.push_str(&format!("\x1b_Ga=d,d=I,i={},q=2;\x1b\\", i + 1));
+        }
     }
     for (i, line) in written.iter().enumerate() {
         if same.and_then(|d| d.written.get(i)) != Some(line) {
             out.push_str(&format!("\x1b[{};1H\x1b[0m\x1b[2K{line}", i + 1));
         }
     }
-    if again {
-        for p in placed {
-            out.push_str(&kitty(&p.png, p.row, p.col, p.cols, p.rows));
+    for (i, p) in placed.iter().enumerate() {
+        let old = shown.get(i);
+        if old != Some(p) || under(p) || old.is_some_and(under) {
+            out.push_str(&transmit(&p.png, p.row, p.col, p.cols, p.rows, Some(i + 1)));
         }
+    }
+    if out.len() == start {
+        // Nothing changed. Any output at all makes herdr place every picture again.
+        return String::new();
     }
     out.push_str(&format!("\x1b[{rows};{cols}H{SYNC_OFF}"));
     out
@@ -143,10 +195,7 @@ mod picture_tests {
             written,
             placed: vec![],
         };
-        assert_eq!(
-            repaint(Some(&drawn), 10, 4, &drawn.written),
-            format!("{SYNC_ON}\x1b[4;10H{SYNC_OFF}")
-        );
+        assert_eq!(repaint(Some(&drawn), 10, 4, &drawn.written), "");
         let mut next = drawn.written.clone();
         next[1] = "B".into();
         let moved = repaint(Some(&drawn), 10, 4, &next);
@@ -181,12 +230,73 @@ mod picture_tests {
         next = drawn.written.clone();
         next[2] = "C".into();
         let under = repaint_pictures(Some(&drawn), 10, 4, &next, std::slice::from_ref(&picture));
-        assert!(under.contains(DELETE_ALL) && under.contains("a=T"));
+        assert!(!under.contains("a=d") && under.contains("a=T,f=100,q=2,C=1,i=1,"));
         let gone = repaint_pictures(Some(&drawn), 10, 4, &drawn.written, &[]);
-        assert!(gone.contains(DELETE_ALL) && !gone.contains("a=T"));
+        assert!(gone.contains("a=d,d=I,i=1,q=2;") && !gone.contains("a=T"));
         let mut changed = picture;
         changed.png = Arc::from(b"new".as_slice());
         assert!(repaint_pictures(Some(&drawn), 10, 4, &drawn.written, &[changed]).contains("a=T"));
+    }
+    fn solid(width: u32, height: u32, bands: impl Fn(usize) -> u8, count: usize) -> Arc<[u8]> {
+        let mut img = image::RgbaImage::new(width, height);
+        for (y, row) in img.rows_mut().enumerate() {
+            let level = bands(y * count / height as usize);
+            row.for_each(|p| *p = image::Rgba([level, level, level, u8::MAX]));
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        Arc::from(out.into_inner())
+    }
+    #[test]
+    fn a_picture_is_cut_into_one_band_per_cell_row() {
+        let whole = Placement {
+            row: 2,
+            col: 1,
+            cols: 4,
+            rows: 3,
+            png: solid(8, 6, |i| 1 + 3 * i as u8, 3),
+        };
+        let cut = bands(std::slice::from_ref(&whole));
+        assert_eq!(cut.len(), 3);
+        for (i, band) in cut.iter().enumerate() {
+            assert_eq!((band.row, band.col, band.cols, band.rows), (2 + i, 1, 4, 1));
+            let img = image::load_from_memory(&band.png).unwrap().to_rgba8();
+            assert_eq!(img.dimensions(), (8, 2));
+            assert_eq!(img.get_pixel(0, 0).0[0], 1 + 3 * i as u8);
+        }
+    }
+    #[test]
+    fn only_the_band_that_changed_is_sent_again_and_nothing_is_deleted_first() {
+        let before = bands(&[Placement {
+            row: 0,
+            col: 0,
+            cols: 4,
+            rows: 3,
+            png: solid(8, 6, |i| i as u8, 3),
+        }]);
+        let after = bands(&[Placement {
+            row: 0,
+            col: 0,
+            cols: 4,
+            rows: 3,
+            png: solid(8, 6, |i| if i == 1 { 9 } else { i as u8 }, 3),
+        }]);
+        let written = vec![String::new(); 4];
+        let drawn = Drawn {
+            cols: 4,
+            rows: 4,
+            written: written.clone(),
+            placed: before.clone(),
+        };
+        let out = repaint_pictures(Some(&drawn), 4, 4, &written, &after);
+        // herdr draws the gap between a delete and the next upload as a blank pane.
+        assert!(!out.contains("a=d"));
+        assert_eq!(out.matches("a=T").count(), 1);
+        assert!(out.contains("a=T,f=100,q=2,C=1,i=2,"));
+        assert_eq!(repaint_pictures(Some(&drawn), 4, 4, &written, &before), "");
+        let gone = repaint_pictures(Some(&drawn), 4, 4, &written, &after[..1]);
+        assert!(gone.contains("a=d,d=I,i=2,q=2;") && gone.contains("a=d,d=I,i=3,q=2;"));
+        assert!(!gone.contains(DELETE_ALL));
     }
     #[test]
     fn kitty_chunks_transmit_png_and_place_without_moving_the_cursor() {
