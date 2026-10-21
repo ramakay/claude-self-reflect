@@ -1055,7 +1055,9 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
                 "2 findings confirmed",
                 "1 fact retired",
                 "unverified",
-                "Should be a hook:",
+                "Confused Claude",
+                "Should be a skill / memory / tool",
+                "hook: Check the card height after each layout edit.",
                 "turns 4, 8",
             ],
         ),
@@ -1118,7 +1120,9 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
                 .0;
             assert!(pane.click(row, 0, NOW));
             let detail = pane.frame(76, 67, NOW).join("\n");
-            assert!(detail.contains("at most 30%"));
+            // The findings live in their own cards now; the dreamer's drill-down holds dreams only.
+            assert!(detail.contains("You asked to make the question the star"));
+            assert!(!detail.contains("at most 30%"));
         }
     }
 }

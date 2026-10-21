@@ -31,8 +31,6 @@ pub struct DreamCard {
     pub looks: usize,
     pub none: usize,
     pub carried: bool,
-    pub confusing: Vec<Value>,
-    pub should_be: Vec<Value>,
 }
 /// What a threads-timeline row is about. Set where the row is built, never parsed from its text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +109,10 @@ pub struct Composition {
     pub codex_week: Value,
     pub csr_cost: InstrumentCost,
     pub dream: DreamCard,
+    /// What confused Claude, across every look of this session, newest first.
+    pub confusing: Vec<Value>,
+    /// What should be a skill, memory or tool, across every look of this session.
+    pub should_be: Vec<Value>,
     pub story: String,
     pub story_age: String,
     pub shifts: Vec<Value>,
@@ -131,13 +133,28 @@ pub struct Open {
     pub threads: bool,
     pub dreams: bool,
 }
-fn observation(v: &Value) -> Vec<Value> {
-    array(v)
+/// How many confused-Claude or should-be items a card keeps.
+const OBSERVATION_CAP: usize = 5;
+/// Every look of this session that carries `key`, newest first, one item per `line`. A later look
+/// with an empty list never erases what an earlier one found.
+fn observations(data: &Value, session: &Value, key: &str) -> Vec<Value> {
+    let mut sources: Vec<&Value> = array(&data["dreams"])
         .iter()
-        .filter(|x| !string(&x["line"]).is_empty() && !string(&x["evidence"]).is_empty())
-        .take(2)
-        .cloned()
-        .collect()
+        .chain(array(&data["dream_records"]))
+        .filter(|r| &r["session"] == session && r[key].is_array())
+        .collect();
+    sources.sort_by(|a, b| num(&b["at"]).total_cmp(&num(&a["at"])));
+    let mut out: Vec<Value> = vec![];
+    for item in sources.iter().flat_map(|r| array(&r[key])) {
+        if !string(&item["line"]).is_empty()
+            && !string(&item["evidence"]).is_empty()
+            && !out.iter().any(|o| o["line"] == item["line"])
+        {
+            out.push(item.clone());
+        }
+    }
+    out.truncate(OBSERVATION_CAP);
+    out
 }
 impl Composition {
     pub fn build(data: &Value, s: &Value, now: f64) -> Self {
@@ -184,7 +201,6 @@ impl Composition {
             .iter()
             .filter(|r| r["session"] == s["id"] && r["kind"] == "look" && r["outcome"] == "none")
             .count();
-        let source = if top.is_null() { look } else { &top };
         let mut river: Vec<_> = array(&data["dreams"])
             .iter()
             .filter(|d| d["session"] == s["id"])
@@ -394,9 +410,9 @@ impl Composition {
                 look: look.clone(),
                 looks,
                 none,
-                confusing: observation(&source["confusing_claude"]),
-                should_be: observation(&source["should_be"]),
             },
+            confusing: observations(data, &s["id"], "confusing_claude"),
+            should_be: observations(data, &s["id"], "should_be"),
             story,
             story_age: age,
             shifts,
@@ -611,18 +627,21 @@ fn meta(c: &Composition) -> String {
     }
     bits.join(" · ")
 }
-fn observation_title(item: &Value, should: bool) -> String {
-    if !should {
-        return "Confusing Claude".into();
-    }
+/// A card of `rows` one-line observations under its title.
+fn observation_card_h(rows: usize) -> f32 {
+    P * 2. + theme::TITLE_LINE + S2 + rows as f32 * theme::BODY_LINE
+}
+const CONFUSED_TITLE: &str = "Confused Claude";
+const SHOULD_BE_TITLE: &str = "Should be a skill / memory / tool";
+/// The short label a should-be item carries on its row.
+fn should_be_kind(item: &Value) -> &'static str {
     match string(&item["kind"]) {
-        "skill" => "Should be a skill",
-        "memory" => "Should be a memory",
-        "hook" => "Should be a hook",
-        "CLAUDE.md" | "CLAUDE.md rule" | "claude_md" | "rule" => "Should be a CLAUDE.md rule",
-        _ => "Should be kept",
+        "skill" => "skill",
+        "memory" => "memory",
+        "hook" => "hook",
+        "CLAUDE.md" | "CLAUDE.md rule" | "claude_md" | "rule" => "CLAUDE.md rule",
+        _ => "tool",
     }
-    .into()
 }
 fn evidence_receipt(item: &Value) -> String {
     let evidence = string(&item["evidence"]);
@@ -640,27 +659,6 @@ fn evidence_receipt(item: &Value) -> String {
             turns.join(", ")
         )
     }
-}
-fn extras(c: &Composition, counts: bool) -> Vec<String> {
-    [(false, &c.dream.confusing), (true, &c.dream.should_be)]
-        .into_iter()
-        .filter(|(_, v)| !v.is_empty())
-        .map(|(should, items)| {
-            let title = observation_title(&items[0], should);
-            if counts {
-                format!("{title} · {}", items.len())
-            } else {
-                format!(
-                    "{title}: {}",
-                    items
-                        .iter()
-                        .map(|i| format!("{} · {}", string(&i["line"]), evidence_receipt(i)))
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                )
-            }
-        })
-        .collect()
 }
 fn csr_status(g: &Value) -> Option<(String, &str)> {
     let sev = g["sts"]["sev"]
@@ -781,30 +779,37 @@ pub fn rows_with_figure(
             cols,
         ));
     }
-    let details = extras(c, false);
-    let details_count = details.iter().flat_map(|s| wrap(s)).count();
-    for line in extras(c, hero.len() + details_count > cap) {
-        hero.extend(wrap(&line));
-    }
     // Tiny terminals show the complete question in its drill-down. Never cut a rendered line.
     if hero.len() > cap {
         collapsed_hero = true;
         hero = wrap("☾ what-if · d");
-        for line in extras(c, true) {
-            hero.extend(wrap(&line));
-        }
         if hero.len() > cap {
             hero = wrap("☾ d");
-            if !c.dream.confusing.is_empty() {
-                hero.push(format!("! {}", c.dream.confusing.len()));
-            }
-            if !c.dream.should_be.is_empty() {
-                hero.push(format!("↳ {}", c.dream.should_be.len()));
-            }
             hero.truncate(cap);
         }
     }
     out.extend(hero);
+    for (title, items, should) in [
+        (CONFUSED_TITLE, &c.confusing, false),
+        (SHOULD_BE_TITLE, &c.should_be, true),
+    ] {
+        if items.is_empty() {
+            continue;
+        }
+        out.extend(wrap(title));
+        for item in items {
+            out.extend(wrap(&format!(
+                "{}{} · {}",
+                if should {
+                    format!("{}: ", should_be_kind(item))
+                } else {
+                    String::new()
+                },
+                string(&item["line"]),
+                evidence_receipt(item)
+            )));
+        }
+    }
     if c.offer {
         out.extend(wrap("Press 1 to turn dreams on in all your sessions."));
     }
@@ -870,12 +875,6 @@ pub fn rows_with_figure(
             out.extend(wrap(&c.question()));
         }
         out.extend(wrap(string(&c.dream.top["text"])));
-        for line in extras(c, false) {
-            out.extend(wrap(&line));
-        }
-        for item in c.dream.confusing.iter().chain(&c.dream.should_be) {
-            out.extend(wrap(string(&item["evidence"])));
-        }
         for d in &c.dream.queue {
             out.extend(wrap(string(&d["line"])));
         }
@@ -1571,6 +1570,8 @@ fn label(c: &mut Canvas, f: &Fonts, s: &str, x: f32, y: f32, size: f32, col: Rgb
         "Context" => Some(Icon::Gauge),
         "Quotas" => Some(Icon::Hourglass),
         "Where the work stands" | "This session" => Some(Icon::ScrollText),
+        CONFUSED_TITLE => Some(Icon::CircleHelp),
+        SHOULD_BE_TITLE => Some(Icon::Lightbulb),
         _ => None,
     };
     let x = if let Some(glyph) = title_icon {
@@ -1780,7 +1781,6 @@ pub struct Metrics {
     pub last_card_gap_px: f32,
     pub height: f32,
     pub question_lines: Vec<String>,
-    pub sections_collapsed: bool,
 }
 fn question_layout(f: &Fonts, q: &str, width: u32, t: &Tokens) -> (St, Vec<String>) {
     let size = (24. + (width as f32 - 704.) / 256. * 6.).clamp(22., 30.);
@@ -1842,30 +1842,6 @@ pub fn draw(
                 S3 + c.shifts.len().min(3) as f32 * theme::CAPTION_LINE
             }
     };
-    let full_extras = extras(c, false);
-    let collapsed = full_extras
-        .iter()
-        .any(|line| f.width(line, caption) > IW * 2.);
-    let extra_lines = extras(c, collapsed);
-    let extra_layout = extra_lines
-        .iter()
-        .map(|line| {
-            let (name, body) = line.split_once(": ").unwrap_or((line, ""));
-            let glyph = if name.starts_with("Confusing") {
-                Icon::CircleHelp
-            } else {
-                Icon::Sparkles
-            };
-            let name = format!("{} {name}:", glyph.glyph());
-            let tw = f.width(&name, sans(theme::CAPTION_SIZE, t.medium)) + f.width(" ", caption);
-            let rows = f.wrap(body, caption, IW - tw);
-            (name, tw, rows)
-        })
-        .collect::<Vec<_>>();
-    let extras_h = extra_layout
-        .iter()
-        .map(|(_, _, lines)| lines.len() as f32 * theme::CAPTION_LINE)
-        .sum::<f32>();
     let metadata = meta(c);
     let mut meta_rows: Vec<Vec<&str>> = vec![];
     let mut row = vec![];
@@ -1922,8 +1898,7 @@ pub fn draw(
             0.
         } else {
             S2 + status_lines.len() as f32 * theme::CAPTION_LINE
-        }
-        + if extras_h > 0. { S3 + extras_h } else { 0. };
+        };
     // Keep the full specified headline size and the hero's 30% budget together in short panes.
     maxh = maxh.max((hero_h / 0.30).ceil());
     let active = c.agents.agents.iter().any(agents::is_active);
@@ -1983,12 +1958,6 @@ pub fn draw(
         }
     } else if open.dreams {
         drill_lines.extend(f.wrap(string(&c.dream.top["text"]), sans(11.5, t.regular), IW));
-        for s in extras(c, false) {
-            drill_lines.extend(f.wrap(&s, sans(11.5, t.regular), IW));
-        }
-        for item in c.dream.confusing.iter().chain(&c.dream.should_be) {
-            drill_lines.extend(f.wrap(string(&item["evidence"]), sans(11.5, t.regular), IW));
-        }
         for d in &c.dream.queue {
             drill_lines.extend(f.wrap(string(&d["line"]), sans(11.5, t.regular), IW));
         }
@@ -2008,8 +1977,23 @@ pub fn draw(
     } else {
         110.
     };
-    let top_core =
-        M + hero_h + S3 + story_h + if story_h > 0. { S3 } else { 0. } + notice_h + notice_gap;
+    let observed = [
+        (CONFUSED_TITLE, &c.confusing, false),
+        (SHOULD_BE_TITLE, &c.should_be, true),
+    ];
+    let observed_h: f32 = observed
+        .iter()
+        .filter(|(_, items, _)| !items.is_empty())
+        .map(|(_, items, _)| observation_card_h(items.len()) + S3)
+        .sum();
+    let top_core = M
+        + hero_h
+        + S3
+        + observed_h
+        + story_h
+        + if story_h > 0. { S3 } else { 0. }
+        + notice_h
+        + notice_gap;
     let tail_core = agents_h
         + if active { S3 } else { 0. }
         + empty_help
@@ -2225,53 +2209,57 @@ pub fn draw(
             cursor += theme::CAPTION_LINE;
         }
     }
-    if extras_h > 0. {
-        cursor += S3;
-    }
-    for (title_text, tw, lines) in &extra_layout {
-        let b = cursor + f.cap(caption);
+    y += hero_h + card_gap;
+    for (title_text, items, should) in observed {
+        if items.is_empty() {
+            continue;
+        }
+        let h = observation_card_h(items.len());
+        panel(&mut canvas, y, h, t);
         label(
             &mut canvas,
             f,
             title_text,
             IX,
-            b,
-            theme::CAPTION_SIZE,
-            t.dream,
-            t.medium,
+            y + P + f.cap(title),
+            theme::TITLE_SIZE,
+            t.ink,
+            t.bold,
         );
-        for (i, row) in lines.iter().enumerate() {
-            let b = cursor + f.cap(caption);
-            let (body_text, receipt) = row.split_once(" · ").unwrap_or((row, ""));
-            let x = IX + if i == 0 { *tw } else { 0. };
-            label(
+        let mut row_y = y + P + theme::TITLE_LINE + S2;
+        for item in items {
+            let base = row_y + f.cap(body);
+            let receipt = evidence_receipt(item);
+            let receipt_w = f.width(&receipt, caption);
+            let kind_w = if should { 78. } else { 0. };
+            if should {
+                label(
+                    &mut canvas,
+                    f,
+                    should_be_kind(item),
+                    IX,
+                    base,
+                    theme::CAPTION_SIZE,
+                    t.dream,
+                    t.medium,
+                );
+            }
+            single(
                 &mut canvas,
                 f,
-                body_text,
-                x,
-                b,
-                theme::CAPTION_SIZE,
+                string(&item["line"]),
+                IX + kind_w,
+                base,
+                IW - kind_w - receipt_w - S3,
+                theme::BODY_SIZE,
                 t.ink,
-                t.regular,
+                t,
             );
-            if !receipt.is_empty() {
-                let x = x + f.width(body_text, caption) + ICON_GAP;
-                let st = mono(theme::CHIP_SIZE, t.regular);
-                let rw = f.width(receipt, st);
-                canvas.rrect(
-                    x - S1,
-                    b - f.cap(st) - S1 / 2.,
-                    rw + S2,
-                    theme::CHIP_LINE,
-                    S1,
-                    t.chip,
-                );
-                canvas.text(f, receipt, x, b, st, t.quiet, A::L);
-            }
-            cursor += theme::CAPTION_LINE;
+            canvas.text(f, &receipt, IX + IW, base, caption, t.quiet, A::R);
+            row_y += theme::BODY_LINE;
         }
+        y += h + card_gap;
     }
-    y += hero_h + card_gap;
     if let Some(notice) = &c.notice {
         panel(&mut canvas, y, notice_h, t);
         single(
@@ -2742,7 +2730,6 @@ pub fn draw(
                 - last_card_bottom * content_h as f32 / height,
             height,
             question_lines: question,
-            sections_collapsed: collapsed,
         },
     ))
 }
@@ -3729,6 +3716,93 @@ mod tests {
             let c = fresh_with_history(n);
             let (pm, _) = draw(&c, 1210, 1700, Theme::Dark, Open::default(), false).expect("draws");
             if let Some(dir) = &png {
+                save(&format!("{}/{name}.png", dir.to_string_lossy()), &pm);
+            }
+        }
+    }
+
+    fn observed_data() -> Value {
+        let item = |line: &str, evidence: &str| json!({"line":line,"evidence":evidence});
+        let should = |kind: &str, line: &str| json!({"kind":kind,"line":line,"evidence":"Turns 4 and 8: 'x'"});
+        json!({
+            "dreams": [{"id":"d1","session":"o","at":100.,"line":"What if?",
+                "confusing_claude":[item("Misread the pane.","Turn 4: 'pane'")],
+                "should_be":[should("hook","Check formatting before commits.")]}],
+            "dream_records": [
+                {"kind":"look","session":"o","at":300.,"outcome":"none",
+                    "confusing_claude":[],"should_be":[]},
+                {"kind":"look","session":"o","at":200.,"outcome":"none",
+                    "confusing_claude":[item("Repeated a rejected approach.","Turn 12"),
+                        item("Misread the pane.","Turn 15")],
+                    "should_be":[should("skill","Bump the version in both files.")]},
+                {"kind":"look","session":"other","at":400.,"outcome":"none",
+                    "confusing_claude":[item("Not this session.","Turn 1")]},
+            ],
+        })
+    }
+
+    #[test]
+    fn confused_and_should_be_come_from_every_look_not_just_the_newest() {
+        let c = Composition::build(&observed_data(), &json!({"id":"o"}), 1000.);
+        let lines = |v: &[Value]| {
+            v.iter()
+                .map(|i| string(&i["line"]).to_owned())
+                .collect::<Vec<_>>()
+        };
+        // The newest look found nothing; the earlier ones still count, deduped by line.
+        assert_eq!(
+            lines(&c.confusing),
+            ["Repeated a rejected approach.", "Misread the pane."]
+        );
+        assert_eq!(
+            lines(&c.should_be),
+            [
+                "Bump the version in both files.",
+                "Check formatting before commits."
+            ]
+        );
+        let mut many = observed_data();
+        many["dream_records"][1]["confusing_claude"] = json!((0..9)
+            .map(|i| json!({"line":format!("Line {i}"),"evidence":"Turn 1"}))
+            .collect::<Vec<_>>());
+        let c = Composition::build(&many, &json!({"id":"o"}), 1000.);
+        assert_eq!(c.confusing.len(), OBSERVATION_CAP);
+    }
+
+    #[test]
+    fn the_two_observation_cards_are_separate_and_leave_the_dreamer_alone() {
+        let c = Composition::build(&observed_data(), &json!({"id":"o"}), 1000.);
+        let open = Open {
+            dreams: true,
+            ..Open::default()
+        };
+        let text = text_rows(&c, 100, 60, open);
+        let at = |needle: &str| text.iter().position(|l| l == needle);
+        let confused = at(CONFUSED_TITLE).expect("confused card");
+        let should = at(SHOULD_BE_TITLE).expect("should-be card");
+        assert!(confused < should);
+        assert_eq!(
+            text[confused + 1],
+            "Repeated a rejected approach. · turn 12"
+        );
+        assert!(
+            text.contains(&"skill: Bump the version in both files. · turns 4, 8".to_owned()),
+            "{text:?}"
+        );
+        assert!(text.contains(&"hook: Check formatting before commits. · turns 4, 8".to_owned()));
+        // The dreamer's own lines carry no counts and no folded-in findings.
+        assert!(text[..confused]
+            .iter()
+            .all(|l| !l.contains("Confusing Claude") && !l.starts_with("! ")));
+        let quiet = Composition::build(&json!({}), &json!({"id":"o"}), 1000.);
+        let text = text_rows(&quiet, 100, 60, Open::default());
+        assert!(!text
+            .iter()
+            .any(|l| l == CONFUSED_TITLE || l == SHOULD_BE_TITLE));
+        if let Some(dir) = std::env::var_os("CSR_OBS_PNG") {
+            for (name, c) in [("observed", &c), ("quiet", &quiet)] {
+                let (pm, _) =
+                    draw(c, 1210, 1700, Theme::Dark, Open::default(), false).expect("draws");
                 save(&format!("{}/{name}.png", dir.to_string_lossy()), &pm);
             }
         }
