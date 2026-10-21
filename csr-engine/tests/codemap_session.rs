@@ -269,8 +269,10 @@ fn an_edit_in_a_protected_repo_is_queued_drained_by_a_detached_child_and_the_loc
         }),
     );
     assert!(out.status.success(), "{}", text(&out));
+    // The drain is a detached child: under load it may not hold its lock yet when the hook returns.
     assert!(
-        !f.session_locks().is_empty() || !f.query("beta_marker").is_empty(),
+        f.wait_for(40, |f| !f.session_locks().is_empty()
+            || !f.query("beta_marker").is_empty()),
         "the hook took a lock for the drain it started (or the drain already finished)"
     );
     assert!(
