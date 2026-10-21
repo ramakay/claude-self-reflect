@@ -936,11 +936,17 @@ fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() 
                 .collect::<Vec<_>>();
             if state == "11-last-time" {
                 // More height adds older history while keeping the recap and quota facts whole.
-                let is_history = |line: &&String| {
-                    ["✓ ", "→ ", "? "]
-                        .iter()
-                        .any(|prefix| line.starts_with(prefix))
-                };
+                let is_history = |line: &&String| line.contains(" ago · Verify companion history");
+                // Spare height past the last history row holds the starter questions.
+                let mut starters = false;
+                let long_content = long_content
+                    .into_iter()
+                    .filter(|line| {
+                        starters |= line.as_str() == "Try a question";
+                        starters &= !line.starts_with("7D ");
+                        !starters
+                    })
+                    .collect::<Vec<_>>();
                 assert_eq!(
                     short_content
                         .iter()

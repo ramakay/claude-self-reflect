@@ -824,11 +824,7 @@ pub fn rows_with_figure(
         out.extend(wrap(n));
     }
     if let Some(recap) = &c.repo_recap {
-        out.extend(wrap(&format!(
-            "Last time here · {} · {}",
-            recap.age,
-            recap.session.chars().take(8).collect::<String>()
-        )));
+        out.extend(wrap(&format!("Last time here · {}", recap.age)));
         for line in recap.text.lines() {
             out.extend(wrap(line));
         }
@@ -962,15 +958,23 @@ pub fn rows_with_figure(
             history.extend(recap.history.iter().take(room - 1).map(|prior| {
                 text::fit(
                     &format!(
-                        "{} {} · {}",
-                        history_mark(&prior.outcome),
+                        "{}{} · {}",
+                        history_mark(&prior.outcome)
+                            .map(|m| format!("{m} "))
+                            .unwrap_or_default(),
                         prior.age,
-                        prior.intent
+                        earlier_intent(&prior.intent)
                     ),
                     cols,
                 )
             }));
+            // Starter questions follow the list when the pane has room left over.
+            if c.empty_session {
+                pitch_insert = Some(at + history.len());
+            }
             out.splice(at..at, history);
+        } else if c.empty_session {
+            pitch_insert = Some(at);
         }
     }
     if let Some(at) = pitch_insert {
@@ -1030,12 +1034,65 @@ fn starter_questions() -> [(&'static str, &'static str); 8] {
         ),
     ]
 }
-fn history_mark(outcome: &str) -> &'static str {
-    match outcome {
-        "done" => "✓",
-        "open" => "→",
-        _ => "?",
+/// "Try a question" with as many starter questions as fit between `cursor` and `bottom`.
+fn starter_cards(canvas: &mut Canvas, f: &Fonts, mut cursor: f32, bottom: f32, t: &Tokens) {
+    let title = sans(theme::TITLE_SIZE, t.bold);
+    let body = sans(theme::BODY_SIZE, t.regular);
+    let caption = sans(theme::CAPTION_SIZE, t.regular);
+    if bottom - cursor < theme::TITLE_LINE + S3 + theme::BODY_LINE + theme::CAPTION_LINE {
+        return;
     }
+    label(
+        canvas,
+        f,
+        "Try a question",
+        IX,
+        cursor + f.cap(title),
+        theme::TITLE_SIZE,
+        t.ink,
+        t.bold,
+    );
+    cursor += theme::TITLE_LINE + S3;
+    for (question, hint) in starter_questions() {
+        if cursor + theme::BODY_LINE + theme::CAPTION_LINE > bottom {
+            break;
+        }
+        single(
+            canvas,
+            f,
+            question,
+            IX,
+            cursor + f.cap(body),
+            IW,
+            theme::BODY_SIZE,
+            t.ink,
+            t,
+        );
+        single(
+            canvas,
+            f,
+            hint,
+            IX,
+            cursor + theme::BODY_LINE + f.cap(caption),
+            IW,
+            theme::CAPTION_SIZE,
+            t.quiet,
+            t,
+        );
+        cursor += theme::BODY_LINE + theme::CAPTION_LINE + S3;
+    }
+}
+/// A mark only where the outcome is known; an unknown outcome says nothing.
+fn history_mark(outcome: &str) -> Option<&'static str> {
+    match outcome {
+        "done" => Some("✓"),
+        "open" => Some("→"),
+        _ => None,
+    }
+}
+/// Under an "Earlier here" heading every row was asked, so the lead-in is noise.
+fn earlier_intent(intent: &str) -> &str {
+    intent.strip_prefix("you asked: ").unwrap_or(intent)
 }
 fn agent_lines(c: &Composition) -> Vec<String> {
     c.agents
@@ -2466,11 +2523,7 @@ pub fn draw(
             label(
                 &mut canvas,
                 f,
-                &format!(
-                    "{} · session {}",
-                    recap.age,
-                    recap.session.chars().take(8).collect::<String>()
-                ),
+                &recap.age,
                 IX,
                 cursor + f.cap(caption),
                 theme::CAPTION_SIZE,
@@ -2509,14 +2562,37 @@ pub fn draw(
                     t.bold,
                 );
                 cursor += theme::TITLE_LINE + S2;
+                // Marks sit in their own gutter, only when some row has one.
+                let gutter = if recap
+                    .history
+                    .iter()
+                    .take(available_rows)
+                    .any(|prior| history_mark(&prior.outcome).is_some())
+                {
+                    16.
+                } else {
+                    0.
+                };
                 for prior in recap.history.iter().take(available_rows) {
-                    let age = format!("{}  {}", history_mark(&prior.outcome), prior.age);
-                    let age_w = f.width(&age, caption).max(88.);
+                    if let Some(mark) = history_mark(&prior.outcome) {
+                        label(
+                            &mut canvas,
+                            f,
+                            mark,
+                            IX,
+                            cursor + f.cap(body),
+                            theme::CAPTION_SIZE,
+                            t.quiet,
+                            t.regular,
+                        );
+                    }
+                    let age = &prior.age;
+                    let age_w = (f.width(age, caption) + gutter).max(88.);
                     label(
                         &mut canvas,
                         f,
-                        &age,
-                        IX,
+                        age,
+                        IX + gutter,
                         cursor + f.cap(body),
                         theme::CAPTION_SIZE,
                         t.quiet,
@@ -2525,7 +2601,7 @@ pub fn draw(
                     single(
                         &mut canvas,
                         f,
-                        &prior.intent,
+                        earlier_intent(&prior.intent),
                         IX + age_w + S3,
                         cursor + f.cap(body),
                         IW - age_w - S3,
@@ -2537,6 +2613,9 @@ pub fn draw(
                     history_rows += 1;
                 }
                 history_bottom = Some(cursor);
+            }
+            if c.empty_session {
+                starter_cards(&mut canvas, f, cursor + S4, help_y + help_draw_h - P, t);
             }
         } else {
             let mut cursor = help_y + P;
@@ -2591,50 +2670,8 @@ pub fn draw(
                 );
                 cursor += theme::BODY_LINE + theme::CAPTION_LINE + S4;
             }
-            let bottom = help_y + help_draw_h - P;
-            if c.empty_session
-                && bottom - cursor
-                    >= theme::TITLE_LINE + S3 + theme::BODY_LINE + theme::CAPTION_LINE
-            {
-                label(
-                    &mut canvas,
-                    f,
-                    "Try a question",
-                    IX,
-                    cursor + f.cap(title),
-                    theme::TITLE_SIZE,
-                    t.ink,
-                    t.bold,
-                );
-                cursor += theme::TITLE_LINE + S3;
-                for (question, hint) in starter_questions() {
-                    if cursor + theme::BODY_LINE + theme::CAPTION_LINE > bottom {
-                        break;
-                    }
-                    single(
-                        &mut canvas,
-                        f,
-                        question,
-                        IX,
-                        cursor + f.cap(body),
-                        IW,
-                        theme::BODY_SIZE,
-                        t.ink,
-                        t,
-                    );
-                    single(
-                        &mut canvas,
-                        f,
-                        hint,
-                        IX,
-                        cursor + theme::BODY_LINE + f.cap(caption),
-                        IW,
-                        theme::CAPTION_SIZE,
-                        t.quiet,
-                        t,
-                    );
-                    cursor += theme::BODY_LINE + theme::CAPTION_LINE + S3;
-                }
+            if c.empty_session {
+                starter_cards(&mut canvas, f, cursor, help_y + help_draw_h - P, t);
             }
         }
         y = help_y + help_draw_h;
@@ -3647,6 +3684,52 @@ mod tests {
             if let Some(dir) = &png {
                 let name = format!("{}/threads-{theme:?}.png", dir.to_string_lossy());
                 save(&name, &pm);
+            }
+        }
+    }
+
+    fn fresh_with_history(prior: usize) -> Composition {
+        let mut c = Composition::build(&json!({}), &json!({"id":"fresh"}), 1_800_000_000.);
+        assert!(c.empty_session);
+        c.repo_recap = Some(crate::companion::repo_recap::RepoRecap {
+            session: "64f9b5b9aaaa".into(),
+            at: 1_799_900_000.,
+            age: "1d ago".into(),
+            text: "you asked: Fix the footer".into(),
+            history: (0..prior)
+                .map(|i| crate::companion::repo_recap::RepoSessionSummary {
+                    session: format!("s{i}"),
+                    at: 1_799_000_000. - i as f64,
+                    age: format!("{}d ago", i + 2),
+                    intent: format!("you asked: Question number {i}"),
+                    outcome: if i == 1 { "done" } else { "unknown" }.into(),
+                })
+                .collect(),
+        });
+        c
+    }
+
+    #[test]
+    fn earlier_here_drops_noise_and_fills_spare_room_with_starter_questions() {
+        let c = fresh_with_history(4);
+        let text = text_rows(&c, 100, 60, Open::default()).join("\n");
+        assert!(text.contains("Last time here · 1d ago"), "{text}");
+        assert!(!text.contains("64f9b5b9"), "{text}");
+        assert!(text.contains("2d ago · Question number 0"), "{text}");
+        assert!(text.contains("✓ 3d ago · Question number 1"), "{text}");
+        assert!(!text.lines().any(|l| l.starts_with("? ")), "{text}");
+        assert!(!text.contains("Question number 0 ·"), "{text}");
+        let after = text.split("Earlier here").nth(1).unwrap();
+        assert!(after.contains("Try a question"), "{text}");
+        assert_eq!(earlier_intent("you asked: x"), "x");
+        assert_eq!(earlier_intent("something"), "something");
+        assert_eq!(history_mark("unknown"), None);
+        let png = std::env::var_os("CSR_FRESH_PNG");
+        for (name, n) in [("fresh-session", 19), ("fresh-few", 4)] {
+            let c = fresh_with_history(n);
+            let (pm, _) = draw(&c, 1210, 1700, Theme::Dark, Open::default(), false).expect("draws");
+            if let Some(dir) = &png {
+                save(&format!("{}/{name}.png", dir.to_string_lossy()), &pm);
             }
         }
     }
