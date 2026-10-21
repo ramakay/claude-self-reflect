@@ -8,12 +8,10 @@
 
 
 
-
-
 ☾ Turn dreams on.
 dreamer 9k of 40k
-1 Turn dreams on
-Press 1: dreams on in all your sessions.
+Press 1 to turn dreams on in all your
+sessions.
 3 notes kept · 2 findings confirmed
 1 fact retired
 Ask about past work. CSR finds it.
@@ -26,5 +24,7 @@ Text parity is ready for review.
 ! render/instrument.rs · draw unverified
 CTX 192k/1M · +6k/turn · ♻ >15 prompts
 1 by CSR
-7D 52%» · 5H 2% · ◷ 59m · Codex 7D 41%
- l chg t threads i figure b theme q close
+7D 52%» · CSR 1.2 pts · 5H 2% · ◷ 59m
+Codex 7D 41%
+5¢ this week
+ l changes t threads i fig b theme q close

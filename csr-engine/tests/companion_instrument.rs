@@ -119,7 +119,7 @@ use csr_engine::companion::render::{text, theme::Theme};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 const NOW: f64 = 1792320000.;
-const STATES: [&str; 9] = [
+const STATES: [&str; 14] = [
     "01-empty",
     "02-running",
     "03-agents",
@@ -129,6 +129,11 @@ const STATES: [&str; 9] = [
     "07-away",
     "08-offer",
     "08b-nothing",
+    "09-api-cost",
+    "10-unknown-cost",
+    "11-last-time",
+    "12-fresh",
+    "13-flat",
 ];
 const QUESTION:&str="What if one of Fable's three prototypes made the what-if question the star of the pane, as you wanted on 10-09?";
 fn write_json(path: &Path, value: &Value) {
@@ -137,7 +142,7 @@ fn write_json(path: &Path, value: &Value) {
 }
 fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
     let (home, paths) = rich_home();
-    let empty = state == "01-empty";
+    let empty = matches!(state, "01-empty" | "11-last-time");
     let con = rusqlite::Connection::open(&paths.db).unwrap();
     // These are the existing learnt feed schemas, absent from the old minimal oracle DB.
     con.execute_batch("ALTER TABLE memory_registry ADD COLUMN file_path TEXT;
@@ -182,14 +187,57 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
         .unwrap();
     }
     if empty {
+        con.execute(
+            "DELETE FROM session_registry WHERE project='pane-wp2' AND session_id!='sess-now'",
+            [],
+        )
+        .unwrap();
         con.execute("delete from witness_verdicts", []).unwrap();
         con.execute("delete from reflections where id='story'", [])
             .unwrap();
         con.execute("delete from meta where key like 'story_map:%'", [])
             .unwrap();
     }
+    if state == "11-last-time" {
+        let episode = json!({"schema":"v2","session_id":"prior-pane-session","project":"pane-wp2",
+            "timestamp":"2026-10-18T09:00:00Z","request":"Make the companion readable","investigated":[],
+            "completed":"","next_steps":"Check the live narrow pane","blockers":null,"outcome":"done",
+            "error_signatures":[],"tools_used":[],"files_modified":[],"message_count":8,"duration_minutes":30,
+            "recap_evidence_version":1,"anchor_request":"Make the companion readable",
+            "completions":[{"claim":"Restore footer labels","receipt":"abcdef1"}]});
+        con.execute("INSERT INTO reflections VALUES('prior-pane-session',?1,'[\"session_episode\",\"project_pane-wp2\"]','2026-10-18T09:00:00Z')",[episode.to_string()]).unwrap();
+        con.execute_batch("CREATE INDEX idx_chunks_conversation ON chunks(conversation_id);
+            CREATE INDEX idx_chunk_provenance_source_conv ON chunk_provenance(source_conv_id);
+            CREATE INDEX idx_resolution_open_recent ON resolution_ledger(status,source,id);
+            INSERT INTO chunks VALUES('prior-settled','prior-pane-session','2026-10-18T09:00:00Z',NULL,'pane-wp2','fixture');
+            INSERT INTO chunks VALUES('prior-open','prior-pane-session','2026-10-18T09:00:00Z',NULL,'pane-wp2','fixture');
+            INSERT INTO resolution_ledger VALUES(11,'prior-settled','Keep one layout owner','commit fedcba9','resolved','user_confirmed',NULL);
+            INSERT INTO resolution_ledger VALUES(12,'prior-open','Check device readability','commit acdc123','still_open','user_confirmed',NULL);").unwrap();
+        for i in 0..60 {
+            let sid = format!("earlier-{i:02}");
+            let at = chrono::DateTime::from_timestamp((NOW - 7200. - i as f64 * 3600.) as i64, 0)
+                .unwrap()
+                .to_rfc3339();
+            let intent = format!("Verify companion history case {}", i + 1);
+            con.execute(
+                "INSERT INTO session_registry VALUES(?1,'pane-wp2',?2,?3,?3)",
+                rusqlite::params![sid, intent, at],
+            )
+            .unwrap();
+            if i % 3 != 2 {
+                let ep = json!({"schema":"v2","session_id":sid,"project":"pane-wp2","timestamp":at,
+                    "request":"An unrelated first prompt","investigated":[],"completed":"",
+                    "next_steps":if i%3==1{json!("Check the live pane")}else{Value::Null},
+                    "blockers":null,"outcome":"unknown","error_signatures":[],"tools_used":[],"files_modified":[],
+                    "message_count":8,"duration_minutes":30,"recap_evidence_version":1,"anchor_request":intent,
+                    "completions":if i%3==0{json!([{"claim":"Keep history readable","receipt":format!("abc{i:04x}")}])}else{json!([])}});
+                con.execute("INSERT INTO reflections VALUES(?1,?2,'[\"session_episode\",\"project_pane-wp2\"]',?3)",rusqlite::params![sid,ep.to_string(),at]).unwrap();
+            }
+        }
+    }
     let ctx = match state {
-        "01-empty" => 0,
+        "01-empty" | "11-last-time" => 0,
+        "12-fresh" | "13-flat" => 190000,
         "04-band" | "05-compacting" => 189000,
         "06-after" => 65000,
         _ => 192000,
@@ -225,6 +273,16 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
                 lines.push(json!({"type":"user","timestamp":stamp,"message":{"role":"user","content":"Keep the question first."}}));
             }
             lines.push(json!({"type":"assistant","timestamp":stamp,"message":{"id":format!("b-{i}"),"role":"assistant","model":"claude-sonnet-5","stop_reason":"end_turn","usage":{"input_tokens":value*if i==12{550}else{10},"cache_read_input_tokens":value*if i==12{450}else{990},"cache_creation":{"ephemeral_1h_input_tokens":value*990},"output_tokens":400},"content":[{"type":"text","text":"Working on the pane."}]}}));
+            if matches!(state, "12-fresh" | "13-flat") {
+                let fresh = if state == "13-flat" {
+                    2000
+                } else {
+                    2000 + i as i64 * 38000 / 23
+                };
+                lines.last_mut().unwrap()["message"]["usage"] = json!({"input_tokens":1000,
+                    "cache_creation_input_tokens":fresh-1000,"cache_read_input_tokens":190000-fresh,
+                    "cache_creation":{"ephemeral_1h_input_tokens":fresh-1000},"output_tokens":400});
+            }
             if state == "04-band" {
                 let last = lines.last().unwrap().clone();
                 for call in 1..15 {
@@ -363,6 +421,30 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
         fs::create_dir_all(lock.parent().unwrap()).unwrap();
         fs::write(&lock, std::process::id().to_string()).unwrap();
     }
+    if empty {
+        con.execute("DELETE FROM narrative_usage", []).unwrap();
+    }
+    if state == "09-api-cost" {
+        fs::remove_dir_all(paths.keep.join("usage")).unwrap();
+        write_json(
+            &paths.keep.join("usage/sess-now.json"),
+            &json!({
+                "at":NOW,"context":{"tokens":ctx,"window":1000000},
+                "rateLimits":[{"kind":"five_hour","percentUsed":2,"resetsAt":"2026-10-18T14:08:00Z"}]
+            }),
+        );
+        con.execute("DELETE FROM narrative_usage", []).unwrap();
+        let rate =
+            csr_engine::companion::value::cost_of("claude-haiku-4-5", [1_000_000, 0, 0, 0, 0])
+                .unwrap();
+        for call in 0..37 {
+            con.execute("INSERT INTO narrative_usage(ts,call_site,model,input_tokens) VALUES('2026-10-18T10:38:00','story','claude-haiku-4-5',?)",
+                [if call == 0 { (1.20 / rate * 1e6).round() as i64 } else { 0 }]).unwrap();
+        }
+    }
+    if state == "10-unknown-cost" {
+        con.execute("DROP TABLE narrative_usage", []).unwrap();
+    }
     (home, paths)
 }
 fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<u8>) {
@@ -408,11 +490,22 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
     );
     let metrics = pane.instrument_metrics.as_ref().unwrap();
     assert!(
+        metrics.font_fallbacks.is_empty(),
+        "{state} {cols}x{rows}: font fallback {:?}",
+        metrics.font_fallbacks
+    );
+    let expected_size = (24. + (cols as f32 * 16. - 704.) / 256. * 6.).clamp(22., 30.);
+    assert!((metrics.question_size - expected_size).abs() < 0.01);
+    assert_eq!(metrics.question_line_height, (expected_size * 1.25).round());
+    assert!(
         metrics.dream / metrics.height <= 0.30,
         "{state}: {}",
         metrics.dream / metrics.height
     );
-    if !matches!(state, "01-empty" | "08-offer" | "08b-nothing") {
+    if !matches!(
+        state,
+        "01-empty" | "11-last-time" | "08-offer" | "08b-nothing"
+    ) {
         assert_eq!(
             metrics.question_lines.join(" "),
             QUESTION,
@@ -423,7 +516,19 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
     if state == "08-offer" {
         assert_eq!(metrics.question_lines.join(" "), "Turn dreams on.");
         assert!(text.iter().any(|l| l.contains("Ask about past work.")));
-        assert!(text
+        let cta = "Press 1 to turn dreams on in all your sessions.";
+        assert_eq!(
+            text.iter()
+                .flat_map(|l| l.split_whitespace())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .matches(cta)
+                .count(),
+            1,
+            "{state}: CTA must appear once: {text:?}"
+        );
+        assert!(!text.iter().any(|l| l.contains("1 Turn dreams on")));
+        assert!(!text
             .iter()
             .any(|l| l.contains("Press 1: dreams on in all your sessions.")));
     }
@@ -447,7 +552,17 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
         100. * metrics.dream / metrics.height
     );
     (
-        json!({"text":text,"png_sha256":hash,"acts":pane.acts,"dream_percent":format!("{:.2}",100.*metrics.dream/metrics.height)}),
+        json!({"text":text,"png_sha256":hash,"key_gap_px":format!("{:.2}",metrics.last_card_gap_px),"acts":pane.acts,"dream_percent":format!("{:.2}",100.*metrics.dream/metrics.height),
+            "fresh_plots":metrics.fresh_plots.iter().map(|p| json!({
+                "region":[format!("{:.3}",p.region.0),format!("{:.3}",p.region.1),format!("{:.3}",p.region.2),format!("{:.3}",p.region.3)],
+                "heights":p.heights.iter().map(|h|format!("{h:.3}")).collect::<Vec<_>>(),"compactions":p.compactions})).collect::<Vec<_>>(),
+            "layout_height":format!("{:.3}",metrics.height),
+            "history_rows":metrics.history_rows,
+            "history_bottom":metrics.history_bottom.map(|n|format!("{n:.3}")),
+            "figure_region":[format!("{:.3}",metrics.figure_region.0),format!("{:.3}",metrics.figure_region.1)],
+            "help_region":metrics.help_region.map(|(y,h)|[format!("{y:.3}"),format!("{h:.3}")]),
+            "dream_height":format!("{:.3}",metrics.dream),
+            "csr_cost":{"share":metrics.csr_cost.share_label(),"usd":metrics.csr_cost.usd,"calls":metrics.csr_cost.calls}}),
         // Cell-grid export for contact sheets; placement hash stays in the golden JSON.
         {
             let mut out = Vec::new();
@@ -461,7 +576,7 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
 }
 #[test]
 fn all_nine_states_and_both_themes_have_honest_top_frame_goldens() {
-    for (cols, rows) in [(76, 67), (44, 30), (60, 40)] {
+    for (cols, rows) in [(76, 67), (38, 30), (44, 30), (60, 40)] {
         for theme in [Theme::Dark, Theme::Light] {
             for state in STATES {
                 let (value, png) = snapshot(state, theme, cols, rows);
@@ -629,7 +744,7 @@ fn live_context_without_transcript_or_open_dream_is_not_an_empty_session() {
             pane.enable_cards();
             pane.frame(cols, 30, NOW);
             assert_eq!(pane.placed.len(), 1, "{cols}");
-            if cols >= 40 {
+            if cols >= 32 {
                 let metrics = pane.instrument_metrics.as_ref().expect("whole Instrument");
                 assert!(metrics.dream / metrics.height <= 0.3);
                 assert!(metrics.story_region.is_some());
@@ -637,7 +752,7 @@ fn live_context_without_transcript_or_open_dream_is_not_an_empty_session() {
                 assert!(pane.placed[0].rows <= 29);
             } else {
                 assert!(pane.instrument_metrics.is_none());
-                assert_eq!(pane.placed[0].row + pane.placed[0].rows, 29);
+                assert!(pane.placed[0].row + pane.placed[0].rows <= 29);
             }
         }
     }
@@ -673,10 +788,10 @@ fn turns_alone_are_active_and_the_newest_open_what_if_wins() {
 }
 
 #[test]
-fn all_states_draw_the_whole_instrument_from_40_columns_in_short_panes() {
+fn all_states_draw_the_whole_instrument_from_32_columns_in_short_panes() {
     for state in STATES {
         let (_home, paths) = state_home(state);
-        for cols in [40, 41, 42, 43, 44, 45, 60, 76, 100] {
+        for cols in [32, 38, 40, 41, 42, 43, 44, 45, 60, 76, 100] {
             let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", cols, 30));
             pane.pixels = true;
             pane.enable_cards();
@@ -739,12 +854,15 @@ fn scaled_instrument_answer_click_uses_the_centered_pixel_coordinates() {
 #[test]
 fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() {
     for state in STATES {
-        let golden = fs::read_to_string(
-            fixture()
-                .join("instrument/text")
-                .join(format!("{state}.txt")),
-        )
-        .unwrap();
+        let (_home, paths) = state_home(state);
+        let mut source = Pane::new(paths, &args("main", "sess-now", 76, 67));
+        source.pixels = false;
+        let golden = source
+            .frame(76, 67, NOW)
+            .iter()
+            .map(|row| text::plain(row).trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
         let facts: Vec<_> = golden
             .lines()
             .filter(|line| {
@@ -810,16 +928,38 @@ fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() 
                     .filter(|line| !line.is_empty())
                     .collect::<Vec<_>>()
             };
-            assert_eq!(
-                content(shorter),
-                lines[..66]
-                    .iter()
-                    .filter(|line| !line.is_empty())
-                    .cloned()
-                    .collect::<Vec<_>>()
-            );
+            let short_content = content(shorter);
+            let long_content = lines[..66]
+                .iter()
+                .filter(|line| !line.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            if state == "11-last-time" {
+                // More height adds older history while keeping the recap and quota facts whole.
+                let is_history = |line: &&String| {
+                    ["✓ ", "→ ", "? "]
+                        .iter()
+                        .any(|prefix| line.starts_with(prefix))
+                };
+                assert_eq!(
+                    short_content
+                        .iter()
+                        .filter(|line| !is_history(line))
+                        .collect::<Vec<_>>(),
+                    long_content
+                        .iter()
+                        .filter(|line| !is_history(line))
+                        .collect::<Vec<_>>()
+                );
+                let short_history = short_content.iter().filter(is_history).collect::<Vec<_>>();
+                let long_history = long_content.iter().filter(is_history).collect::<Vec<_>>();
+                assert!(!short_history.is_empty() && long_history.len() > short_history.len());
+                assert_eq!(short_history, long_history[..short_history.len()]);
+            } else {
+                assert_eq!(short_content, long_content);
+            }
         }
-        if !matches!(state, "01-empty" | "08b-nothing") {
+        if !matches!(state, "01-empty" | "11-last-time" | "08b-nothing") {
             assert!(golden.contains("Text parity is ready for review."));
         }
         assert!(!golden.contains("Claude:Misread") && !golden.contains("hook:Check"));
@@ -828,7 +968,7 @@ fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() 
 }
 
 #[test]
-fn narrow_pixels_use_a_short_bottom_strip_and_native_text() {
+fn narrow_pixels_keep_native_text_and_strip_contiguous() {
     for theme in [Theme::Dark, Theme::Light] {
         let (_home, paths) = state_home("02-running");
         let mut pane = Pane::new(paths, &args("main", "sess-now", 30, 40));
@@ -839,7 +979,12 @@ fn narrow_pixels_use_a_short_bottom_strip_and_native_text() {
         assert_eq!(pane.placed.len(), 1);
         let strip = &pane.placed[0];
         assert!(strip.rows <= 7);
-        assert_eq!(strip.row + strip.rows, 39);
+        assert!(strip.row + strip.rows <= 39);
+        assert!(strip.row > 0);
+        assert!(
+            !text::plain(&rows[strip.row - 1]).trim().is_empty(),
+            "blank band before strip"
+        );
         assert!(rows
             .iter()
             .take(strip.row)
@@ -925,8 +1070,7 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
             "08-offer",
             vec![
                 "Turn dreams on.",
-                "1 Turn dreams on",
-                "Press 1: dreams on in all your sessions.",
+                "Press 1 to turn dreams on in all your sessions.",
                 "Ask about past work. CSR finds it.",
                 "dreamer 9k of 40k",
             ],
@@ -952,7 +1096,7 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
             assert!(shown.contains(phrase), "{state}: missing {phrase}: {shown}");
         }
         assert!(!shown.contains("STS") && !shown.contains("♻A") && !shown.contains("d dream"));
-        if matches!(state, "01-empty" | "08b-nothing") {
+        if matches!(state, "01-empty" | "11-last-time" | "08b-nothing") {
             let before = fs::read(paths.keep.join("dreams.jsonl")).unwrap();
             pane.key("d");
             pane.frame(76, 67, NOW);
@@ -995,7 +1139,20 @@ fn offer_hotkey_enables_dreams_on_one_press_in_private_home() {
         .map(|l| text::plain(l))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(shown.contains("1 Turn dreams on"), "{shown}");
+    let shown = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        shown.contains("Press 1 to turn dreams on in all your sessions."),
+        "{shown}"
+    );
+    assert!(!shown.contains("1 Turn dreams on"), "{shown}");
+    assert!(!shown.contains("Press 1: dreams on"), "{shown}");
+    assert_eq!(
+        shown
+            .matches("Press 1 to turn dreams on in all your sessions.")
+            .count(),
+        1,
+        "CTA once: {shown}"
+    );
     assert!(pane
         .acts
         .values()
@@ -1091,7 +1248,7 @@ fn daemon_down_is_only_the_08b_fixture_state() {
 }
 
 #[test]
-fn expanded_bars_report_a_ceiling_on_the_chart_and_quotas_stay_compact() {
+fn expanded_fresh_bars_use_their_own_scale_and_empty_quotas_grow() {
     use csr_engine::companion::render::instrument::{self, Composition};
     let (_home, paths) = state_home("03-agents");
     let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
@@ -1100,12 +1257,12 @@ fn expanded_bars_report_a_ceiling_on_the_chart_and_quotas_stay_compact() {
     pane.key("i");
     pane.frame(76, 67, NOW);
     let metrics = pane.instrument_metrics.as_ref().unwrap();
-    let ceiling = metrics.ceiling_y.expect("expanded ceiling");
-    let (fig_y, fig_h) = metrics.figure_region;
     assert!(
-        ceiling >= fig_y + 90. && ceiling <= fig_y + 200.,
-        "ceiling {ceiling} outside figure {fig_y}+{fig_h}"
+        metrics.ceiling_y.is_none(),
+        "context ceiling has different units from fresh input"
     );
+    assert_eq!(metrics.fresh_plots.len(), 1);
+    assert_eq!(metrics.fresh_plots[0].compactions, [12]);
 
     let empty = Composition::build(
         &json!({
@@ -1125,15 +1282,15 @@ fn expanded_bars_report_a_ceiling_on_the_chart_and_quotas_stay_compact() {
         false,
     )
     .unwrap();
-    // Content height must clear gauge label baseline (P+52+46) plus descent, without growing.
+    // Reserve a second caption line for CSR's weekly cost below the quota label.
     assert!(
-        empty_metrics.figure_region.1 >= 138. && empty_metrics.figure_region.1 <= 140.,
-        "quotas card height {}: want 138..=140 so labels fit and stay compact",
+        empty_metrics.figure_region.1 > 154. && empty_metrics.figure_region.1 < 300.,
+        "quotas card height {}: want natural enlarged quota gauges with their labels",
         empty_metrics.figure_region.1
     );
     let help = empty_metrics.help_region.expect("help card");
     assert!(
-        empty_metrics.last_card_bottom_pad >= 10.,
+        (empty_metrics.last_card_gap_px - 12.).abs() <= 2.,
         "last card pad {}: want >= 10pt above keys",
         empty_metrics.last_card_bottom_pad
     );
@@ -1152,6 +1309,10 @@ fn footer_abbreviates_only_what_must_fit_and_keeps_q_close() {
     pane.pixels = false;
     let footer = text::plain(&pane.frame(44, 30, NOW)[29]);
     assert!(footer.contains("q close"), "{footer}");
+    assert!(
+        footer.contains("l changes") && footer.contains("t threads"),
+        "{footer}"
+    );
     assert!(!footer.contains("q quit"), "{footer}");
     assert!(
         footer.starts_with(' '),
@@ -1167,17 +1328,21 @@ fn footer_abbreviates_only_what_must_fit_and_keeps_q_close() {
         spans.last().unwrap()[1].as_u64().unwrap() <= 43,
         "keys fit cols-2: {spans:?}"
     );
-    // 48-wide fits full words with a single-space join.
-    let wide = text::plain(&pane.frame(48, 30, NOW)[29]);
-    assert!(wide.contains("changes") || wide.contains("chg"), "{wide}");
-    if wide.contains("changes") {
-        assert!(wide.contains("threads") && wide.contains("figure") && wide.contains("theme"));
+    for cols in [48, 60] {
+        let wide = text::plain(&pane.frame(cols, 30, NOW)[29]);
+        assert!(
+            wide.contains("l changes") && wide.contains("t threads") && wide.contains("q close"),
+            "{wide}"
+        );
+        if cols == 60 {
+            assert!(wide.contains("figure") && wide.contains("theme"), "{wide}");
+        }
     }
 }
 
 #[test]
-fn collapsed_context_centres_exact_group_with_bottom_clearance() {
-    for (cols, rows) in [(44, 30), (60, 40)] {
+fn collapsed_context_hugs_exact_group_with_bottom_clearance() {
+    for (cols, rows) in [(44, 40), (60, 54)] {
         let (_home, paths) = state_home("02-running");
         // Drop request history so collapsed layout is independent of per-turn bars.
         let usage = paths.keep.join("usage/sess-now.json");
@@ -1206,16 +1371,11 @@ fn collapsed_context_centres_exact_group_with_bottom_clearance() {
         let (fig_y, fig_h) = metrics.figure_region;
         let card_bottom = fig_y + fig_h;
         assert!(
-            group_bottom <= card_bottom - 24. + 0.5,
-            "{cols}x{rows}: group_bottom {group_bottom} needs >=24pt above card bottom {card_bottom}"
+            group_bottom <= card_bottom - 16. + 0.5,
+            "{cols}x{rows}: group_bottom {group_bottom} needs >=16pt above card bottom {card_bottom}"
         );
-        let title_band = fig_y + 40.;
-        let avail_mid = (title_band + card_bottom - 24.) / 2.;
-        let group_mid = (group_top + group_bottom) / 2.;
-        assert!(
-            (group_mid - avail_mid).abs() < 12.,
-            "{cols}x{rows}: group not centred: mid={group_mid} avail_mid={avail_mid}"
-        );
+        let title_band = fig_y + 16. + 18. + 8. + 14. + 12.;
+        assert!(group_top >= title_band - 0.5);
         assert!(
             cy > group_top && cy < group_bottom,
             "{cols}x{rows}: ring centre outside group"
@@ -1225,9 +1385,100 @@ fn collapsed_context_centres_exact_group_with_bottom_clearance() {
             rows.saturating_sub(1),
             "picture ends one row above keys"
         );
-        assert!(metrics.last_card_bottom_pad >= 10.);
+        assert!((metrics.last_card_gap_px - 12.).abs() <= 2.);
         let _ = cx;
     }
+}
+
+#[test]
+fn mid_height_context_uses_side_ring_and_small_gauges() {
+    for state in ["06-after", "07-away"] {
+        for (cols, rows) in [(44, 30), (60, 40)] {
+            for theme in [Theme::Dark, Theme::Light] {
+                let (_home, paths) = state_home(state);
+                let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+                pane.pixels = true;
+                pane.enable_cards();
+                pane.theme = theme;
+                pane.frame(cols, rows, NOW);
+                let metrics = pane.instrument_metrics.as_ref().unwrap();
+                let mid = metrics
+                    .mid_layout
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{state} {cols}x{rows} {theme:?}: expected mid layout, got ring={:?} fig={:?}", metrics.ring_bounds, metrics.figure_region));
+                assert!(
+                    metrics.ring_bounds.is_none(),
+                    "{state} {cols}x{rows}: mid must not use full scaled ring"
+                );
+                let (fig_y, fig_h) = metrics.figure_region;
+                assert!(
+                    fig_h > 110.5,
+                    "{state} {cols}x{rows}: card {fig_h} should be above strip height"
+                );
+                let (_, _, r) = mid.ring;
+                let expected = mid.radius_inner.clamp(25., mid.radius_max);
+                assert!(
+                    (r - expected).abs() < 0.05,
+                    "{state} {cols}x{rows}: r={r} != clamp(25, {}, 64)={expected}",
+                    mid.radius_inner
+                );
+                assert!(
+                    mid.gauge_r >= 16. - 0.01 && mid.gauge_r <= 30. + 0.01,
+                    "{state}: gauge_r {}",
+                    mid.gauge_r
+                );
+                let (gt, gb) = mid.group;
+                let title_bottom = fig_y + 16. + 18. + 8.; // padding + title line + gap
+                let card_bottom = fig_y + fig_h;
+                let top_band = gt - title_bottom;
+                let bottom_band = (card_bottom - 16.) - gb;
+                assert!(
+                    top_band <= 24. + 0.5 && bottom_band <= 24. + 0.5,
+                    "{state} {cols}x{rows}: empty bands top={top_band} bottom={bottom_band}"
+                );
+                assert!(
+                    gb <= card_bottom - 16. + 0.5,
+                    "{state}: group bottom {gb} vs card {card_bottom}"
+                );
+                let ring_right = mid.ring.0 + mid.ring.2;
+                assert!(
+                    mid.gauges_left >= ring_right + 8. - 0.5,
+                    "{state}: gauges overlap ring: left={} ring_right={ring_right}",
+                    mid.gauges_left
+                );
+                assert!(
+                    mid.gauge_label_y + 2. <= mid.details_y,
+                    "{state}: gauge labels overlap details"
+                );
+                assert!(mid.details_y <= gb + 0.5, "{state}: details below group");
+                let slot = (card_bottom - 16. - title_bottom).max(0.);
+                let group_h = gb - gt;
+                assert!(
+                    group_h >= slot * 0.45 || group_h >= 2. * r - 0.5,
+                    "{state} {cols}x{rows}: mid group underuses card: group_h={group_h} slot={slot}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn offer_cta_appears_once_without_legacy_phrases() {
+    let (_home, paths) = state_home("08-offer");
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 44, 30));
+    pane.pixels = false;
+    let shown = pane
+        .frame(44, 30, NOW)
+        .iter()
+        .map(|l| text::plain(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let shown = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cta = "Press 1 to turn dreams on in all your sessions.";
+    assert_eq!(shown.matches(cta).count(), 1, "{shown}");
+    assert!(shown.contains("Turn dreams on."), "{shown}");
+    assert!(!shown.contains("1 Turn dreams on"), "{shown}");
+    assert!(!shown.contains("Press 1: dreams on"), "{shown}");
 }
 
 #[test]
@@ -1252,7 +1503,7 @@ fn collapsed_ring_formula_holds_for_all_token_fixtures() {
                 );
                 let card_bottom = metrics.figure_region.0 + metrics.figure_region.1;
                 assert!(
-                    gb <= card_bottom - 24. + 0.5,
+                    gb <= card_bottom - 16. + 0.5,
                     "{state} {cols}x{rows}: group bottom {gb} vs card {card_bottom}"
                 );
                 assert!(gt < gb, "{state}: empty group");
@@ -1262,37 +1513,47 @@ fn collapsed_ring_formula_holds_for_all_token_fixtures() {
 }
 
 #[test]
-fn last_card_padding_holds_for_all_fixtures_and_expanded_or_help_tails() {
+fn every_fixture_ends_one_s3_gap_above_the_key_row() {
+    let mut measurements = Vec::new();
     for state in STATES {
-        for (cols, rows) in [(44, 30), (60, 40)] {
-            let (_home, paths) = state_home(state);
-            let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
-            pane.pixels = true;
-            pane.enable_cards();
-            if state == "03-agents" {
-                pane.key("i");
-            }
-            pane.frame(cols, rows, NOW);
-            let metrics = pane.instrument_metrics.as_ref().unwrap();
-            assert!(
-                metrics.last_card_bottom_pad >= 10.,
-                "{state} {cols}x{rows}: pad {}",
-                metrics.last_card_bottom_pad
-            );
-            if let Some((hy, hh)) = metrics.help_region {
+        for (cols, rows) in [(76, 67), (38, 30), (44, 30), (60, 40)] {
+            for theme in [Theme::Dark, Theme::Light] {
+                let (_home, paths) = state_home(state);
+                let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+                pane.pixels = true;
+                pane.enable_cards();
+                pane.theme = theme;
+                if state == "03-agents" {
+                    pane.key("i");
+                }
+                pane.frame(cols, rows, NOW);
+                let metrics = pane.instrument_metrics.as_ref().unwrap();
+                let placement = &pane.placed[0];
+                let png = image::load_from_memory(&placement.png).unwrap();
+                let (y, h) = metrics
+                    .help_region
+                    .or(metrics.agents_region)
+                    .unwrap_or(metrics.figure_region);
+                // Convert the actual final card's logical bottom through the encoded PNG's
+                // scale, then measure against the terminal key row's pixel origin.
+                let card_bottom =
+                    placement.row as f32 * 34. + (y + h) * png.height() as f32 / metrics.height;
+                let key_top = (rows - 1) as f32 * 34.;
+                let gap = key_top - card_bottom;
                 assert!(
-                    hy + hh + metrics.last_card_bottom_pad <= metrics.height + 0.5,
-                    "{state}: help overrun"
+                    (gap - 12.).abs() <= 2.,
+                    "{state} {cols}x{rows} {theme:?}: key gap {gap}px"
                 );
-            }
-            let (fy, fh) = metrics.figure_region;
-            if metrics.help_region.is_none() && metrics.agents_region.is_none() {
-                assert!(
-                    fy + fh + metrics.last_card_bottom_pad <= metrics.height + 0.5,
-                    "{state}: figure overrun"
-                );
+                assert!((metrics.last_card_gap_px - gap).abs() <= 0.1);
+                println!("key gap {state} {cols}x{rows} {theme:?}: {gap:.3}px");
+                measurements.push(json!({"state":state,"cols":cols,"rows":rows,"theme":format!("{theme:?}"),"gap_px":gap}));
             }
         }
+    }
+    if let Some(dir) = std::env::var_os("CSR_INSTRUMENT_PNG") {
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir).unwrap();
+        write_json(&dir.join("key-gaps.json"), &json!(measurements));
     }
 }
 
@@ -1338,4 +1599,351 @@ fn long_story_cuts_only_on_a_clause_boundary_with_ellipsis() {
         "story lines {}",
         metrics.story_line_count
     );
+}
+
+#[test]
+fn empty_38_column_pane_is_a_complete_instrument() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let (_home, paths) = state_home("01-empty");
+        let mut pane = Pane::new(paths, &args("main", "sess-now", 38, 30));
+        pane.pixels = true;
+        pane.enable_cards();
+        pane.theme = theme;
+        let rows = pane.frame(38, 30, NOW);
+        let metrics = pane
+            .instrument_metrics
+            .as_ref()
+            .expect("full Instrument at 38 columns");
+        assert_eq!(pane.placed.len(), 1);
+        assert_eq!(pane.placed[0].row, 0);
+        assert_eq!(pane.placed[0].rows, 29);
+        assert!(metrics.help_region.is_some());
+        assert!(metrics.figure_region.1 > 100.);
+        assert!(rows
+            .iter()
+            .take(29)
+            .all(|line| text::plain(line).trim().is_empty()));
+        assert!(
+            metrics.font_fallbacks.is_empty(),
+            "{:?}",
+            metrics.font_fallbacks
+        );
+    }
+}
+
+fn fixture_week(paths: &Paths) -> Value {
+    use csr_engine::companion::{db::Db, masthead, value};
+    let fields = masthead::kept_status(paths, "sess-now", NOW);
+    let plan = value::plan_of(
+        &fields["fields"],
+        &masthead::account_limits(paths, NOW),
+        NOW,
+    );
+    let db = Db::open(paths).unwrap();
+    let narrative = value::narrative_week(&db, plan["start"].as_f64().unwrap());
+    let mut spent = Value::Null;
+    if plan["mode"] == "plan" {
+        let mut spend = value::Spend::new(paths, false);
+        assert!(spend.step(
+            plan["start"].as_f64().unwrap(),
+            NOW,
+            Duration::from_secs(30)
+        ));
+        spent = spend.total();
+    }
+    value::week_value(paths, &plan, &narrative, &spent)
+}
+
+#[test]
+fn instrument_and_info_use_the_same_week_figure_from_one_fixture() {
+    use csr_engine::companion::{
+        render::instrument::{self, Composition},
+        value,
+    };
+    for state in [
+        "02-running",
+        "03-agents",
+        "09-api-cost",
+        "10-unknown-cost",
+        "01-empty",
+    ] {
+        let (_home, paths) = state_home(state);
+        let week = fixture_week(&paths);
+        let composition =
+            Composition::build(&json!({"value":week}), &json!({"id":"sess-now"}), NOW);
+        let mut pane = Pane::new(paths, &args("main", "sess-now", 44, 30));
+        pane.pixels = true;
+        pane.enable_cards();
+        pane.frame(44, 30, NOW);
+        let actual = &pane.instrument_metrics.as_ref().unwrap().csr_cost;
+        assert_eq!(actual.usd, week["figure"]["usd"].as_f64(), "{state}");
+        assert_eq!(actual.share, composition.csr_cost.share, "{state}");
+        let info = value::fuel_text(&week);
+        if week["mode"] == "plan" && actual.share.is_some_and(|n| n > 0.) {
+            assert_eq!(format!("≈{}%", actual.share_label()), info);
+            let q = json!({"code":"7D","used":52});
+            assert!(instrument::quota_caption(&composition, &q)
+                .ends_with(&format!("CSR {} pts", actual.share_label())));
+            assert!(actual.segment(52.).is_some());
+        } else if week["mode"] == "api" {
+            assert_eq!(format!("{info} this week"), actual.money_line());
+            assert_eq!(actual.api_line(), "$1.20 this week · 37 calls");
+        }
+        if state == "10-unknown-cost" {
+            assert_eq!(actual.share_label(), "—");
+        }
+        if state == "01-empty" {
+            assert_eq!(actual.share_label(), "0");
+        }
+    }
+}
+
+#[test]
+fn csr_cost_distinguishes_unknown_zero_and_bounds_without_a_second_cost_path() {
+    use csr_engine::companion::value::{self, InstrumentCost};
+    for figure in [
+        Value::Null,
+        json!({"usd":null,"share":0}),
+        json!({"usd":null,"unpriced":["future-model"]}),
+    ] {
+        let cost = InstrumentCost::from_week(&json!({"figure":figure}));
+        assert_eq!(cost.share_label(), "—");
+        assert_eq!(cost.money_line(), "CSR —");
+        assert_eq!(cost.segment(56.), None);
+    }
+    let zero = InstrumentCost::from_week(&json!({"figure":{"usd":0,"share":null}}));
+    assert_eq!(zero.share_label(), "0");
+    assert_eq!(zero.money_line(), "$0 this week");
+    assert_eq!(zero.api_line(), "CSR 0 · 0 calls");
+    assert_eq!(zero.segment(56.), None);
+    let cost = InstrumentCost::from_week(
+        &json!({"figure":{"usd":1.2,"share":0.4,"bound":true},"calls":35,"looks":2}),
+    );
+    assert_eq!(
+        cost.money_line(),
+        format!("{} this week", value::money_text(Some(1.2), true))
+    );
+    assert_eq!(cost.share_label(), "≤0.4");
+    assert_eq!(cost.api_line(), "≤$1.20 this week · 37 calls");
+    let (_, end) = cost.segment(56.).unwrap();
+    assert!((end - 0.004).abs() < 1e-7);
+    assert!(end < 0.56);
+    assert_eq!(cost.segment(0.), Some((0., 0.)));
+    let (_, end) = cost.segment(0.1).unwrap();
+    assert!((end - 0.001).abs() < 1e-7);
+}
+
+#[test]
+fn unpriced_narrative_and_unreadable_table_stay_unknown_in_the_actual_pane() {
+    for unpriced in [false, true] {
+        let (_home, paths) = state_home("02-running");
+        let con = rusqlite::Connection::open(&paths.db).unwrap();
+        if unpriced {
+            con.execute(
+                "UPDATE narrative_usage SET model='unpriced-future-model'",
+                [],
+            )
+            .unwrap();
+        } else {
+            con.execute("DROP TABLE narrative_usage", []).unwrap();
+        }
+        let week = fixture_week(&paths);
+        assert!(week["figure"].is_null());
+        let mut pane = Pane::new(paths, &args("main", "sess-now", 44, 30));
+        pane.pixels = false;
+        let shown = pane.frame(44, 30, NOW).join("\n");
+        assert!(shown.contains("CSR —"), "{shown}");
+        assert!(!shown.contains("CSR 0"), "{shown}");
+    }
+}
+
+#[test]
+fn weekly_caption_names_only_csrs_percentage_points() {
+    use csr_engine::companion::render::instrument::{quota_caption, Composition};
+    let (_home, paths) = state_home("02-running");
+    let week = fixture_week(&paths);
+    let mut data = Composition::build(&json!({"value":week}), &json!({"id":"sess-now"}), NOW);
+    let q = json!({"code":"7D", "used":57});
+    data.csr_cost.share = Some(0.9);
+    assert_eq!(quota_caption(&data, &q), "7D · CSR 0.9 pts");
+    data.csr_cost.share = Some(0.);
+    assert_eq!(quota_caption(&data, &q), "7D · CSR 0 pts");
+    data.csr_cost.share = None;
+    assert_eq!(quota_caption(&data, &q), "7D · CSR — pts");
+}
+
+#[test]
+fn gauge_centres_are_even_and_positive_csr_arcs_have_a_visible_separator() {
+    let mut arcs = 0;
+    let mut rows_checked = 0;
+    for state in STATES {
+        for (cols, rows) in [(38, 30), (44, 30), (60, 40), (76, 67)] {
+            for theme in [Theme::Dark, Theme::Light] {
+                let (_home, paths) = state_home(state);
+                let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+                pane.pixels = true;
+                pane.enable_cards();
+                pane.theme = theme;
+                if state == "03-agents" {
+                    pane.key("i");
+                }
+                pane.frame(cols, rows, NOW);
+                let m = pane.instrument_metrics.as_ref().unwrap();
+                let gauges = &m.quota_gauges;
+                assert!(gauges.len() >= 2, "{state} {cols}: missing quota row");
+                let scale = (rows - 1) as f32 * 34. / m.height;
+                let steps: Vec<_> = gauges
+                    .windows(2)
+                    .map(|p| p[1].center.0 - p[0].center.0)
+                    .collect();
+                for step in &steps {
+                    assert!((step - steps[0]).abs() < 0.01, "{state} {cols}: {steps:?}");
+                }
+                for gauge in gauges {
+                    assert!((gauge.center.1 - gauges[0].center.1).abs() < 0.01);
+                    if let Some((rest, from, to)) = gauge.csr_segment {
+                        assert!(
+                            (to - from) * 360. >= 6. - 0.001,
+                            "{state}: sweep {}",
+                            (to - from) * 360.
+                        );
+                        assert!(from >= rest && to <= 1.);
+                        if rest > 0. {
+                            let gap_px =
+                                (from - rest) * std::f32::consts::TAU * gauge.radius * scale;
+                            assert!((gap_px - 1.).abs() < 0.01, "{state}: separator {gap_px}px");
+                        }
+                        arcs += 1;
+                    } else if gauge.code == "7D" {
+                        assert!(m.csr_cost.share.is_none_or(|v| v <= 0.));
+                    }
+                }
+                let token = theme.tokens();
+                // Distinct hue: CSR is magenta (R>B>G), quota usage is blue (B>R).
+                assert!(
+                    token.csr_share[0] > token.csr_share[2]
+                        && token.csr_share[2] > token.csr_share[1]
+                );
+                assert!(token.sky[2] > token.sky[0]);
+                rows_checked += 1;
+            }
+        }
+    }
+    assert_eq!(rows_checked, STATES.len() * 8);
+    assert!(arcs >= 56);
+}
+
+#[test]
+fn real_shaped_fresh_input_varies_and_flat_history_abstains() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for expanded in [false, true] {
+            let (_home, paths) = state_home("12-fresh");
+            let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+            pane.pixels = true;
+            pane.enable_cards();
+            pane.theme = theme;
+            if expanded {
+                pane.key("i");
+            }
+            pane.frame(76, 67, NOW);
+            let plots = &pane.instrument_metrics.as_ref().unwrap().fresh_plots;
+            assert_eq!(plots.len(), 1);
+            let p = &plots[0];
+            assert_eq!(p.heights.len(), 24);
+            let min = p.heights.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = p.heights.iter().copied().fold(0., f32::max);
+            assert!((max - min) / p.region.3 >= 0.4);
+            assert!(
+                (min / max - 0.05).abs() < 0.001,
+                "cache read or TTL metadata leaked into fresh height"
+            );
+            assert_eq!(p.compactions, [12]);
+            let (_home, paths) = state_home("13-flat");
+            let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+            pane.pixels = true;
+            pane.enable_cards();
+            pane.theme = theme;
+            if expanded {
+                pane.key("i");
+            }
+            pane.frame(76, 67, NOW);
+            let m = pane.instrument_metrics.as_ref().unwrap();
+            assert!(m.fresh_plots.is_empty());
+            assert!(
+                m.ring_bounds.is_some(),
+                "flat expanded history returns its room to the ring"
+            );
+        }
+    }
+}
+
+#[test]
+fn narrow_footer_keeps_every_key_labeled() {
+    for state in ["01-empty", "02-running", "11-last-time"] {
+        let (_home, paths) = state_home(state);
+        let mut pane = Pane::new(paths, &args("main", "sess-now", 38, 30));
+        pane.pixels = false;
+        let shown = pane.frame(38, 30, NOW);
+        let foot = text::plain(&shown[29]);
+        assert!(foot.contains("i fig"), "{state}: {foot}");
+        assert!(
+            foot.contains("l chg") && foot.contains("t thr"),
+            "{state}: {foot}"
+        );
+        assert!(
+            foot.contains("b th") && foot.contains("q close"),
+            "{state}: {foot}"
+        );
+        assert!(text::len(&foot) <= 38);
+        if state == "11-last-time" {
+            let content = shown.join("\n");
+            assert!(
+                content.contains("Last time here") && content.contains("abcdef1"),
+                "{content}"
+            );
+        }
+    }
+}
+
+#[test]
+fn repository_history_fills_the_last_card_without_expanding_card_gaps() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (cols, rows) in [(38, 30), (44, 30), (60, 40), (76, 67)] {
+            let (_home, paths) = state_home("11-last-time");
+            let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+            pane.pixels = true;
+            pane.enable_cards();
+            pane.theme = theme;
+            pane.frame(cols, rows, NOW);
+            let m = pane.instrument_metrics.as_ref().unwrap();
+            assert!((m.figure_region.0 - (16. + m.dream) - 12.).abs() < 0.1);
+            let (help_y, help_h) = m.help_region.unwrap();
+            assert!((help_y - (m.figure_region.0 + m.figure_region.1) - 12.).abs() < 0.1);
+            assert!(m.history_rows >= 5, "{cols}x{rows}: {}", m.history_rows);
+            let slack = help_y + help_h - 16. - m.history_bottom.unwrap();
+            assert!(
+                (0. ..18.1).contains(&slack),
+                "{cols}x{rows}: unused content height {slack}"
+            );
+            assert!((m.last_card_gap_px - 12.).abs() <= 2.);
+        }
+    }
+}
+
+#[test]
+fn native_weekly_quota_keeps_7d_and_magenta_csr_points() {
+    for state in ["01-empty", "02-running"] {
+        for theme in [Theme::Dark, Theme::Light] {
+            let (_home, paths) = state_home(state);
+            let mut pane = Pane::new(paths, &args("main", "sess-now", 38, 30));
+            pane.pixels = false;
+            pane.theme = theme;
+            let shown = pane.frame(38, 30, NOW).join("\n");
+            let t = theme.tokens();
+            let colour = text::fg([t.csr_share[0], t.csr_share[1], t.csr_share[2]]);
+            assert!(shown.contains(&format!("{colour}CSR ")), "{shown}");
+            let plain = text::plain(&shown);
+            assert!(plain.contains("7D ") && plain.contains(" pts"), "{plain}");
+        }
+    }
 }

@@ -46,6 +46,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 ab_glyph = "0.2.32"
+ttf-parser = "0.25.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
 ignore = "0.4"

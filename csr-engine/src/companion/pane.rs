@@ -492,6 +492,16 @@ impl Pane {
             data["readings"] = json!(self.readers.how_claude_read(&self.paths, &self.sid, 2, now));
         }
         if self.view == "main" {
+            Self::week_data(
+                &Wide {
+                    paths: &self.paths,
+                    db: self.db.as_ref(),
+                    persist: self.persist,
+                },
+                (&mut self.narrative, &mut self.spend),
+                &mut data,
+                now,
+            );
             self.phone.foot = Some((phone, column));
             self.edge = None;
             data["threads"] = json!(every);
@@ -503,6 +513,22 @@ impl Pane {
             let mut data = data;
             if let Some(notice) = &self.offer_notice {
                 data["offer_notice"] = json!(notice);
+            }
+            if array(&s["main"]).is_empty()
+                && array(&s["prompts"]).is_empty()
+                && masthead::ctx_now(&data["claude_fields"], data["claude_at"].as_f64(), s)
+                    .0
+                    .is_none_or(|n| n <= 0.)
+            {
+                let project = s["project"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| super::paths::csr_project(&root))
+                    .unwrap_or("");
+                data["repo_recap"] = json!(self
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.repo_recap(project, &self.sid, now)));
             }
             let composition = super::render::instrument::Composition::build(&data, s, now);
             return self.instrument_frame(&composition, cols, rows);
@@ -757,7 +783,7 @@ impl Pane {
         use super::render::{instrument, raster, text};
         self.instrument_metrics = None;
         let cell = super::render::kitty::cell_size();
-        let strip = if self.pixels && self.cards && cols < 40 {
+        let strip = if self.pixels && self.cards && cols < 32 {
             instrument::strip(
                 composition,
                 cols as u32 * cell.0,
@@ -777,10 +803,9 @@ impl Pane {
         self.acts = instrument::acts(composition, cols);
         // Answer placement follows the rendered rows, including wrapped metadata.
         if let Some((row, act)) = self.acts.iter().next().map(|(r, a)| (*r, a.clone())) {
-            if let Some(actual) = semantic
-                .iter()
-                .position(|line| line.starts_with("1 helpful") || line.starts_with("1 Turn dreams"))
-            {
+            if let Some(actual) = semantic.iter().position(|line| {
+                line.starts_with("1 helpful") || line.starts_with("Press 1 to turn dreams")
+            }) {
                 self.acts.remove(&row);
                 self.acts.insert(actual, act);
             }
@@ -810,7 +835,7 @@ impl Pane {
         if let Some(strip) = strip {
             if let Ok(png) = raster::png(&strip) {
                 let count = strip.height().div_ceil(cell.1) as usize;
-                let row = rows.saturating_sub(1 + count);
+                let row = out.len().min(rows.saturating_sub(1 + count));
                 out.truncate(row);
                 self.placed = vec![super::render::kitty::Placement {
                     row,
@@ -823,7 +848,7 @@ impl Pane {
                     self.acts.insert(r, json!({"key":"instrument:figure"}));
                 }
             }
-        } else if self.pixels && self.cards && cols >= 40 {
+        } else if self.pixels && self.cards && cols >= 32 {
             let cell = super::render::kitty::cell_size();
             if let Some((pm, metrics)) = instrument::draw(
                 composition,
@@ -831,7 +856,7 @@ impl Pane {
                 rows.saturating_sub(1) as u32 * cell.1,
                 self.theme,
                 self.instrument_open,
-                cols < 40,
+                false,
             ) {
                 if let Ok(png) = raster::png(&pm) {
                     self.instrument_metrics = Some(metrics.clone());
@@ -927,8 +952,19 @@ impl Pane {
         let rgb = [token.quiet[0], token.quiet[1], token.quiet[2]];
         let ground = [token.ground[0], token.ground[1], token.ground[2]];
         let ink = [token.ink[0], token.ink[1], token.ink[2]];
+        let weekly_csr = format!("CSR {} pts", composition.csr_cost.share_label());
         for line in &mut out {
             let padding = " ".repeat(cols.saturating_sub(text::len(line)));
+            if line.contains(&weekly_csr) {
+                let csr_ink =
+                    text::fg([token.csr_share[0], token.csr_share[1], token.csr_share[2]]);
+                *line = line
+                    .replace("7D", &format!("{}7D{}", text::fg(rgb), text::fg(ink)))
+                    .replace(
+                        &weekly_csr,
+                        &format!("{csr_ink}{weekly_csr}{}", text::fg(ink)),
+                    );
+            }
             *line = format!(
                 "{}{}{line}{padding}{}",
                 text::bg(ground),
@@ -964,12 +1000,26 @@ impl Pane {
         if width(&keys, gap) > usable {
             gap = 1;
         }
-        for (full, short) in [
-            ("changes", "chg"),
-            ("threads", "thr"),
-            ("figure", "fig"),
-            ("theme", "thm"),
-        ] {
+        let shorten = if cols < 44 {
+            [
+                ("changes", "chg"),
+                ("threads", "thr"),
+                ("figure", "fig"),
+                ("theme", "thm"),
+                ("queue", "q"),
+                ("fig", "fig"),
+            ]
+        } else {
+            [
+                ("figure", "fig"),
+                ("theme", "thm"),
+                ("queue", ""),
+                ("fig", ""),
+                ("changes", "chg"),
+                ("threads", "thr"),
+            ]
+        };
+        for (full, short) in shorten {
             if width(&keys, gap) <= usable {
                 break;
             }

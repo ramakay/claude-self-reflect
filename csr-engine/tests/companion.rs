@@ -639,11 +639,11 @@ fn png_mode_writes_the_oracle_session_and_screen_without_touching_home() {
         format!("{}\n", output.path().display())
     );
     let actual = fs::read_to_string(output.path().join("screen.txt")).unwrap();
-    let mut screen_args = args("main", 46, 30);
+    let mut screen_args = args("main", 44, 30);
     screen_args.png = Some(output.path().into());
     let mut screen_pane = Pane::new(paths.clone(), &screen_args);
     screen_pane.pixels = true;
-    let expected = screen_pane.frame(46, 30, 1792320000.).join("\n") + "\n";
+    let expected = screen_pane.frame(44, 30, 1792320000.).join("\n") + "\n";
     assert_eq!(actual, expected);
     let actual = image::open(output.path().join("session.png"))
         .unwrap()
@@ -2194,5 +2194,31 @@ mod relay {
             validated.status.success() && text.contains("Validation passed"),
             "{text}"
         );
+    }
+}
+
+#[test]
+fn png_screen_respects_requested_cell_dimensions() {
+    for (cols, rows) in [(38, 30), (60, 40)] {
+        let (_home, paths) = bare_home();
+        let output = tempfile::tempdir().unwrap();
+        let mut shot = args("main", cols, rows);
+        shot.png = Some(output.path().into());
+        shot.sid = Some("sess-now".into());
+        shot.now = Some(1792320000.);
+        csr_engine::companion::png::export(paths.clone(), &shot).unwrap();
+        let actual = fs::read_to_string(output.path().join("screen.txt")).unwrap();
+        let mut pane = Pane::new(paths, &shot);
+        let expected = pane.frame(cols, rows, 1792320000.).join("\n") + "\n";
+        assert_eq!(actual, expected, "{cols}x{rows}");
+        assert_eq!(actual.lines().count(), rows);
+        for line in actual.lines() {
+            assert_eq!(
+                csr_engine::companion::render::text::len(
+                    &csr_engine::companion::render::text::plain(line)
+                ),
+                cols
+            );
+        }
     }
 }

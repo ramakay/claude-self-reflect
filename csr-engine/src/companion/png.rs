@@ -18,7 +18,7 @@ pub fn export(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
             .unwrap_or_else(super::paths::now);
         let paths_again = paths.clone();
         let mut pane = Pane::new(paths, args);
-        let lines = pane.frame(46, 30, now);
+        let lines = pane.frame(args.cols.max(1), args.rows.max(1), now);
         let cell = (16, 34);
         if let Some(facts) = &pane.session_picture {
             if let Some(pixmap) = raster::session(facts, 40, cell, &[]) {
@@ -98,6 +98,28 @@ fn instrument_png(
         let lines = pane.frame(cols, rows, now);
         let image = compose(&lines, &pane.placed, cols, rows, cell, theme)?;
         image.save(dir.join(format!("instrument-{name}.png")))?;
+        if let Some(metrics) = &pane.instrument_metrics {
+            std::fs::write(
+                dir.join(format!("instrument-{name}.metrics.json")),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "key_gap_px": metrics.last_card_gap_px,
+                    "figure_region": metrics.figure_region,
+                    "agents_region": metrics.agents_region,
+                    "help_region": metrics.help_region,
+                    "history_rows": metrics.history_rows,
+                    "history_bottom": metrics.history_bottom,
+                    "light_card_stops": theme.tokens().glass,
+                    "layout_height": metrics.height,
+                    "content_left": metrics.content_left,
+                    "content_width": metrics.content_width,
+                    "quota_gauges": metrics.quota_gauges,
+                    "fresh_plots": metrics.fresh_plots,
+                    "csr_share": theme.tokens().csr_share,
+                    "sky": theme.tokens().sky,
+                    "cols": cols, "rows": rows,
+                }))?,
+            )?;
+        }
     }
     Ok(())
 }

@@ -36,6 +36,30 @@ pub fn wash(ink: Rgb, strength: f64) -> Rgb {
     super::text::blend(PAPER, ink, strength)
 }
 
+/// The Instrument's single spacing scale, in layout points.
+pub const S1: f32 = 4.;
+pub const S2: f32 = 8.;
+pub const S3: f32 = 12.;
+pub const S4: f32 = 16.;
+pub const S5: f32 = 24.;
+pub const S6: f32 = 32.;
+pub const ICON_GAP: f32 = 6.;
+pub const TITLE_SIZE: f32 = 13.;
+pub const TITLE_LINE: f32 = 18.;
+pub const BODY_SIZE: f32 = 12.5;
+pub const BODY_LINE: f32 = 18.;
+pub const CAPTION_SIZE: f32 = 10.5;
+pub const CAPTION_LINE: f32 = 14.;
+pub const CHIP_SIZE: f32 = 10.;
+pub const CHIP_LINE: f32 = 14.;
+
+#[derive(Clone, Copy)]
+pub struct Shadow {
+    pub y: f32,
+    pub blur: f32,
+    pub color: [u8; 4],
+}
+
 /// All appearance choices for the instrument composition. Adding a theme adds one set.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Theme(usize);
@@ -48,17 +72,23 @@ impl std::fmt::Debug for Theme {
 pub struct Tokens {
     pub fresh: [u8; 4],
     pub ground: [u8; 4],
+    pub mesh_ground: [u8; 4],
     pub ink: [u8; 4],
     pub quiet: [u8; 4],
     pub faint: [u8; 4],
-    pub aurora: [&'static [(f32, [u8; 4])]; 4],
+    pub aurora: [&'static [(f32, [u8; 4])]; 3],
+    pub ambient_shadow: Shadow,
+    pub contact_shadow: Shadow,
+    pub top_highlight: [u8; 4],
     pub linear_at: [f32; 2],
     pub glass: [[u8; 4]; 2],
     pub hair: [u8; 4],
     pub mint: [u8; 4],
     pub sky: [u8; 4],
+    pub csr_share: [u8; 4],
     pub dream: [u8; 4],
     pub amber: [u8; 4],
+    pub warn: [u8; 4],
     pub risk: [u8; 4],
     pub asked: [u8; 4],
     pub track: [u8; 4],
@@ -78,26 +108,35 @@ pub const SETS: &[(&str, Tokens)] = &[
         Tokens {
             fresh: [244, 145, 199, 255],
             ground: [18, 20, 23, 255],
+            mesh_ground: [17, 20, 24, 255],
             ink: [242, 244, 246, 255],
             quiet: [184, 193, 203, 255],
             faint: [174, 184, 196, 255],
             aurora: [
-                &[(0., [14, 124, 134, 77]), (1., [14, 124, 134, 0])],
-                &[
-                    (0., [11, 42, 91, 242]),
-                    (0.6, [11, 42, 91, 115]),
-                    (1., [11, 42, 91, 0]),
-                ],
-                &[(0., [14, 124, 134, 191]), (1., [14, 124, 134, 0])],
-                &[(0., [184, 216, 74, 140]), (1., [184, 216, 74, 0])],
+                &[(0., [14, 58, 58, 217]), (1., [14, 58, 58, 0])],
+                &[(0., [29, 42, 92, 191]), (1., [29, 42, 92, 0])],
+                &[(0., [44, 90, 46, 140]), (1., [44, 90, 46, 0])],
             ],
+            ambient_shadow: Shadow {
+                y: 6.,
+                blur: 18.,
+                color: [0, 0, 0, 89],
+            },
+            contact_shadow: Shadow {
+                y: 1.,
+                blur: 2.,
+                color: [0, 0, 0, 77],
+            },
+            top_highlight: [255, 255, 255, 15],
             linear_at: [0., 1.],
-            glass: [[34, 38, 45, 179], [21, 24, 28, 189]],
+            glass: [[31, 36, 43, 184], [26, 31, 38, 184]],
             hair: [255, 255, 255, 23],
             mint: [155, 232, 194, 255],
             sky: [124, 196, 255, 255],
+            csr_share: [255, 151, 209, 255],
             dream: [232, 197, 71, 255],
             amber: [242, 182, 50, 255],
+            warn: [242, 182, 50, 255],
             risk: [255, 163, 140, 255],
             asked: [184, 173, 255, 255],
             track: [58, 66, 77, 255],
@@ -116,26 +155,48 @@ pub const SETS: &[(&str, Tokens)] = &[
         Tokens {
             fresh: [133, 35, 96, 255],
             ground: [251, 251, 249, 255],
+            mesh_ground: [247, 247, 245, 255],
             ink: [23, 25, 28, 255],
             quiet: [69, 77, 88, 255],
             faint: [78, 87, 100, 255],
             aurora: [
-                &[(0., [108, 196, 192, 40]), (1., [108, 196, 192, 0])],
                 &[
-                    (0., [110, 151, 212, 65]),
-                    (0.6, [110, 151, 212, 30]),
-                    (1., [110, 151, 212, 0]),
+                    (0., [95, 218, 150, 245]),
+                    (0.35, [95, 218, 150, 245]),
+                    (1., [95, 218, 150, 0]),
                 ],
-                &[(0., [108, 196, 192, 45]), (1., [108, 196, 192, 0])],
-                &[(0., [184, 216, 74, 35]), (1., [184, 216, 74, 0])],
+                &[
+                    (0., [180, 155, 241, 235]),
+                    (0.35, [180, 155, 241, 235]),
+                    (1., [180, 155, 241, 0]),
+                ],
+                &[
+                    (0., [250, 177, 115, 225]),
+                    (0.35, [250, 177, 115, 225]),
+                    (1., [250, 177, 115, 0]),
+                ],
             ],
+            ambient_shadow: Shadow {
+                y: 8.,
+                blur: 24.,
+                color: [16, 24, 40, 20],
+            },
+            contact_shadow: Shadow {
+                y: 1.,
+                blur: 2.,
+                color: [16, 24, 40, 15],
+            },
+            top_highlight: [255, 255, 255, 191],
             linear_at: [0., 1.],
-            glass: [[255, 255, 255, 237], [249, 250, 248, 242]],
+            // Limit aurora leakage to 7/255; the background mesh keeps its full strength.
+            glass: [[255, 255, 255, 248], [249, 249, 249, 248]],
             hair: [23, 25, 28, 35],
             mint: [26, 109, 78, 255],
             sky: [32, 91, 147, 255],
+            csr_share: [162, 27, 103, 255],
             dream: [121, 85, 0, 255],
             amber: [132, 86, 0, 255],
+            warn: [113, 69, 0, 255],
             risk: [169, 53, 27, 255],
             asked: [104, 68, 164, 255],
             track: [212, 219, 223, 255],
@@ -227,7 +288,8 @@ mod instrument_tests {
     }
     #[test]
     fn text_meets_aa_on_every_glass_stop_over_every_aurora_stop() {
-        for (_, t) in SETS {
+        for (name, t) in SETS {
+            let mut minimum = f64::INFINITY;
             let composite = |a: [u8; 4], b: [u8; 4]| {
                 let mut out = b;
                 for i in 0..3 {
@@ -239,7 +301,7 @@ mod instrument_tests {
                 out[3] = 255;
                 out
             };
-            let mut grounds = vec![t.ground];
+            let mut grounds = vec![t.mesh_ground];
             for layer in t.aurora {
                 grounds = grounds
                     .iter()
@@ -257,17 +319,202 @@ mod instrument_tests {
                     }
                     for ink in [
                         // Dream-section bodies use ink; their short labels use dream amber.
-                        t.ink, t.dream, t.quiet, t.faint, t.mint, t.sky, t.amber, t.risk, t.asked,
+                        t.ink,
+                        t.dream,
+                        t.quiet,
+                        t.faint,
+                        t.mint,
+                        t.sky,
+                        t.amber,
+                        t.warn,
+                        t.risk,
+                        t.asked,
+                        t.csr_share,
+                        t.fresh,
                     ] {
                         let a = luminance(card);
                         let b = luminance(ink);
-                        assert!(
-                            (a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5,
-                            "{ink:?} on {card:?}"
-                        );
+                        let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                        minimum = minimum.min(contrast);
+                        assert!(contrast >= 4.5, "{ink:?} on {card:?}: {contrast:.3}");
                     }
                 }
             }
+            println!("{name}: minimum text contrast {minimum:.3}:1, including CSR magenta");
+        }
+    }
+    // D65 sRGB -> CIELAB, then Sharma/Wu/Dalal CIEDE2000 (unit weights).
+    fn lab(rgb: [u8; 4]) -> [f64; 3] {
+        let linear = |v: u8| {
+            let v = f64::from(v) / 255.;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let [r, g, b] = [linear(rgb[0]), linear(rgb[1]), linear(rgb[2])];
+        let f = |v: f64| {
+            if v > 216. / 24389. {
+                v.cbrt()
+            } else {
+                v * 841. / 108. + 4. / 29.
+            }
+        };
+        let x = f((0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047);
+        let y = f(0.2126729 * r + 0.7151522 * g + 0.0721750 * b);
+        let z = f((0.0193339 * r + 0.1191920 * g + 0.9503041 * b) / 1.08883);
+        [116. * y - 16., 500. * (x - y), 200. * (y - z)]
+    }
+    fn delta_e_2000(a: [f64; 3], b: [f64; 3]) -> f64 {
+        let [l1, a1, b1] = a;
+        let [l2, a2, b2] = b;
+        let c = (a1.hypot(b1) + a2.hypot(b2)) / 2.;
+        let g = 0.5 * (1. - (c.powi(7) / (c.powi(7) + 25_f64.powi(7))).sqrt());
+        let (a1, a2) = ((1. + g) * a1, (1. + g) * a2);
+        let (c1, c2) = (a1.hypot(b1), a2.hypot(b2));
+        let hue = |a: f64, b: f64| {
+            if a == 0. && b == 0. {
+                0.
+            } else {
+                b.atan2(a).to_degrees().rem_euclid(360.)
+            }
+        };
+        let (h1, h2) = (hue(a1, b1), hue(a2, b2));
+        let mut dh = h2 - h1;
+        if c1 * c2 == 0. {
+            dh = 0.;
+        } else if dh > 180. {
+            dh -= 360.;
+        } else if dh < -180. {
+            dh += 360.;
+        }
+        let dh = 2. * (c1 * c2).sqrt() * (dh / 2.).to_radians().sin();
+        let (dl, dc) = (l2 - l1, c2 - c1);
+        let (lm, cm) = ((l1 + l2) / 2., (c1 + c2) / 2.);
+        let hm = if c1 * c2 == 0. {
+            h1 + h2
+        } else if (h1 - h2).abs() <= 180. {
+            (h1 + h2) / 2.
+        } else if h1 + h2 < 360. {
+            (h1 + h2 + 360.) / 2.
+        } else {
+            (h1 + h2 - 360.) / 2.
+        };
+        let cos = |v: f64| v.to_radians().cos();
+        let t = 1. - 0.17 * cos(hm - 30.) + 0.24 * cos(2. * hm) + 0.32 * cos(3. * hm + 6.)
+            - 0.20 * cos(4. * hm - 63.);
+        let sl = 1. + 0.015 * (lm - 50.).powi(2) / (20. + (lm - 50.).powi(2)).sqrt();
+        let sc = 1. + 0.045 * cm;
+        let sh = 1. + 0.015 * cm * t;
+        let rt = -2.
+            * (cm.powi(7) / (cm.powi(7) + 25_f64.powi(7))).sqrt()
+            * (60. * (-((hm - 275.) / 25.).powi(2)).exp())
+                .to_radians()
+                .sin();
+        ((dl / sl).powi(2) + (dc / sc).powi(2) + (dh / sh).powi(2) + rt * (dc / sc) * (dh / sh))
+            .sqrt()
+    }
+    #[test]
+    fn ciede2000_matches_published_reference_pairs() {
+        for (a, b, expected) in [
+            ([50., 2.6772, -79.7751], [50., 0., -82.7485], 2.0425),
+            ([50., 3.1571, -77.2803], [50., 0., -82.7485], 2.8615),
+            ([50., -1.3802, -84.2814], [50., 0., -82.7485], 1.0000),
+            ([50., 0., 0.], [50., -1., 2.], 2.3669),
+            ([50., 2.49, -0.001], [50., -2.49, 0.001], 7.1792),
+        ] {
+            assert!((delta_e_2000(a, b) - expected).abs() < 0.0001);
+            assert!((delta_e_2000(b, a) - expected).abs() < 0.0001);
+        }
+    }
+    #[test]
+    fn light_mesh_anchor_colours_survive_raster_and_card_compositing() {
+        use super::super::instrument_gfx::{lin, Canvas, S};
+        // All three radial centres are outside the pane. Their nearest in-pane
+        // pixel centres must keep the existing strong mesh colour in the gaps.
+        for (w, h) in [
+            (605., 800.),
+            (605., 1135.),
+            (605., 400.),
+            (304., 500.),
+            (608., 986.), // 38 columns x 29 content rows at the fallback cell size.
+        ] {
+            let mut canvas = Canvas::new(w, h);
+            canvas.background(&LIGHT);
+            let points = [
+                (0, 0),
+                (canvas.pm.width() - 1, (h * S * 0.45) as u32),
+                ((w * S * 0.45) as u32, canvas.pm.height() - 1),
+            ];
+            let sample = |pm: &tiny_skia::Pixmap, x, y| {
+                let p = pm.pixel(x, y).unwrap().demultiply();
+                [p.red(), p.green(), p.blue(), p.alpha()]
+            };
+            let mut mesh_min = f64::INFINITY;
+            for (i, &(x, y)) in points.iter().enumerate() {
+                let mesh = sample(&canvas.pm, x, y);
+                let delta = delta_e_2000(lab(mesh), lab(LIGHT.ground));
+                mesh_min = mesh_min.min(delta);
+                assert!(delta >= 6., "{w}x{h} anchor {i}: mesh {delta}");
+            }
+            // Compare the real glass raster over the actual mesh to the same RGB
+            // gradient made opaque. No text/shadows; inset pixels exclude edge AA.
+            let mut reference = Canvas::new(w, h);
+            let stops = [
+                (LIGHT.linear_at[0], LIGHT.glass[0]),
+                (LIGHT.linear_at[1], LIGHT.glass[1]),
+            ];
+            let opaque = stops.map(|(at, mut rgba)| {
+                rgba[3] = 255;
+                (at, rgba)
+            });
+            canvas.glass(0., 0., w, h, 0., lin(0., 0., 0., h, &stops));
+            reference.glass(0., 0., w, h, 0., lin(0., 0., 0., h, &opaque));
+            let mut colours = std::collections::HashMap::new();
+            let mut max_delta = 0_f64;
+            let mut minimum_contrast = f64::INFINITY;
+            let mut checked = 0;
+            for y in 2..canvas.pm.height() - 2 {
+                for x in 2..canvas.pm.width() - 2 {
+                    let card = sample(&canvas.pm, x, y);
+                    let token = sample(&reference.pm, x, y);
+                    let (delta, contrast) = *colours.entry((card, token)).or_insert_with(|| {
+                        let delta = delta_e_2000(lab(card), lab(token));
+                        let a = luminance(card);
+                        let contrast = [
+                            LIGHT.ink,
+                            LIGHT.quiet,
+                            LIGHT.faint,
+                            LIGHT.mint,
+                            LIGHT.sky,
+                            LIGHT.dream,
+                            LIGHT.amber,
+                            LIGHT.warn,
+                            LIGHT.risk,
+                            LIGHT.asked,
+                            LIGHT.csr_share,
+                            LIGHT.fresh,
+                        ]
+                        .into_iter()
+                        .map(|ink| {
+                            let b = luminance(ink);
+                            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                        (delta, contrast)
+                    });
+                    max_delta = max_delta.max(delta);
+                    minimum_contrast = minimum_contrast.min(contrast);
+                    checked += 1;
+                }
+            }
+            println!("{w}x{h}: {checked} interior pixels, gap mesh min ΔE2000 {mesh_min:.3}, card max ΔE2000 {max_delta:.3}, min text contrast {minimum_contrast:.3}:1");
+            assert!(max_delta <= 4., "{w}x{h}: card tint ΔE2000 {max_delta}");
+            assert!(
+                minimum_contrast >= 4.5,
+                "{w}x{h}: contrast {minimum_contrast}"
+            );
         }
     }
     #[test]

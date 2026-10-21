@@ -1,0 +1,30 @@
+
+
+
+
+
+
+
+
+
+
+
+
+☾ what-if · d
+Confusing Claude · 1
+Should be a hook · 1
+3 notes kept · 2 findings confirmed
+1 fact retired
+Story · refreshed 30s ago
+Text parity is ready for review.
+~ reader.rs · read ⌗8e4e3f27
++ render/instrument.rs · meta
+⌗7625eed7
+! render/instrument.rs · draw
+unverified
+CTX 190k/1M · +0/turn · ♻ >15 prompts
+1 by CSR
+7D 52%» · CSR 0.6 pts · 5H 2% · ◷ 59m
+Codex 7D 41%
+5¢ this week
+ d q l chg t thr i fig b thm q close

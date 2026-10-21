@@ -1053,6 +1053,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "ttf-parser",
  "uuid",
  "zstd",
 ]

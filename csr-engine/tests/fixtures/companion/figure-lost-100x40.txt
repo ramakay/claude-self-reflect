@@ -22,19 +22,19 @@
 [48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
 [48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
 [48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
-[48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
-[48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
-[48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
-[48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
-[48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
-[48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
-[48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
-[48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
-[48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
 [48;2;18;20;23m[38;2;242;244;246m☾ The dreamer looks as you work.                                                                    [0m
 [48;2;18;20;23m[38;2;242;244;246mIt asks a what-if from your past sessions.                                                          [0m
 [48;2;18;20;23m[38;2;242;244;246mAsk about past work. CSR finds it.                                                                  [0m
 [48;2;18;20;23m[38;2;242;244;246mCode changed? CSR warns Claude.                                                                     [0m
 [48;2;18;20;23m[38;2;242;244;246mCSR keeps the threads you dropped.                                                                  [0m
-[48;2;18;20;23m[38;2;242;244;246m7D 34% · 5H 12% · ● CSR: daemon down                                                                [0m
+[48;2;18;20;23m[38;2;242;244;246mTry a question                                                                                      [0m
+[48;2;18;20;23m[38;2;242;244;246mWhat did we decide about this repo? Find a decision and its source session.                         [0m
+[48;2;18;20;23m[38;2;242;244;246mWhat was unfinished last time? Recover the next steps from earlier work.                            [0m
+[48;2;18;20;23m[38;2;242;244;246mWhy did we change this file? Follow the conversation behind the code.                               [0m
+[48;2;18;20;23m[38;2;242;244;246mWhere did we fix this bug before? Find earlier attempts and the final fix.                          [0m
+[48;2;18;20;23m[38;2;242;244;246mWhat did I ask Claude to remember? Look up saved instructions and preferences.                      [0m
+[48;2;18;20;23m[38;2;242;244;246mShow the history of this function. Find prior edits and their context.                              [0m
+[48;2;18;20;23m[38;2;242;244;246mWhat changed in the last session? Review the session's evidenced work.                              [0m
+[48;2;18;20;23m[38;2;242;244;246mWhich approach did we reject? Retrieve alternatives and their reasons.                              [0m
+[48;2;18;20;23m[38;2;242;244;246m[38;2;184;193;203m7D[38;2;242;244;246m 34% · [38;2;255;151;209mCSR — pts[38;2;242;244;246m · 5H 12% · ● CSR: daemon down                                                    [0m
 [48;2;18;20;23m[38;2;184;193;203m l changes  t threads  i figure  b theme  q close                                                   [0m
