@@ -111,6 +111,16 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
             );
         }
     }
+    // /clear: the person asked for a clean context, so no recap and no episode index. At most a
+    // two-line handoff from the session they just cleared.
+    if input.source.as_deref() == Some("clear") {
+        if input.subagent().is_none() && !recap_disabled() {
+            if let Some(handoff) = clear_handoff(input, engine, cwd) {
+                println!("{handoff}");
+            }
+        }
+        return Ok(());
+    }
     if let Err(e) = handle_inner(input, engine, cwd).await {
         eprintln!("CSR: session-start hook error (non-fatal): {}", e);
         // Output minimal context so session gets SOMETHING rather than silent "Success"
@@ -118,6 +128,18 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
         println!("{DEGRADED_STATUS}");
     }
     Ok(()) // Always succeed
+}
+
+/// The handoff for the session just cleared: the project's newest episode that is not the new
+/// session itself. SessionEnd stored it a moment ago.
+fn clear_handoff(input: &HookInput, engine: &Engine, cwd: &Path) -> Option<String> {
+    let project = resolve_project_from_cwd(&cwd.to_string_lossy())?;
+    let episodes =
+        recent_project_episodes_resuming(engine.storage(), &project, EPISODE_INDEX_MAX, None);
+    let (episode, age) = episodes
+        .iter()
+        .find(|(ep, _)| Some(ep.session_id.as_str()) != input.session_id.as_deref())?;
+    super::recap::compose_clear_handoff(episode, age)
 }
 
 /// The line a project gets when nothing else rendered, and whether it is the

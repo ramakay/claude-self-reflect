@@ -31,8 +31,69 @@ pub struct DreamCard {
     pub looks: usize,
     pub none: usize,
     pub carried: bool,
-    pub confusing: Vec<Value>,
-    pub should_be: Vec<Value>,
+}
+/// What a threads-timeline row is about. Set where the row is built, never parsed from its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RiverKind {
+    /// Code changed with no commit receipt yet.
+    Write,
+    Compact,
+    /// Something the user raised.
+    Prompt,
+    Dream,
+    Agent,
+    /// A shift backed by a commit.
+    Commit,
+    Other,
+}
+#[derive(Clone, Debug)]
+pub struct RiverRow {
+    pub at: f64,
+    pub kind: RiverKind,
+    /// The glyph the plain-text pane leads the row with. The picture draws the kind's icon instead.
+    pub lead: &'static str,
+    pub line: String,
+}
+impl RiverRow {
+    /// The picture's text: the kind's icon replaces the lead glyph, except a shift at risk.
+    fn picture_text(&self) -> String {
+        if self.lead == "! " {
+            format!("{}{}", self.lead, self.line)
+        } else {
+            self.line.clone()
+        }
+    }
+}
+fn river_row(at: f64, kind: RiverKind, lead: &'static str, line: String) -> RiverRow {
+    RiverRow {
+        at,
+        kind,
+        lead,
+        line,
+    }
+}
+/// What a shift row is and when it happened. A shift that names a commit (`oid:` receipt) is a
+/// commit row, dated by that commit among the session's commit shifts (`at` is the commit time;
+/// `date` is only its day, used when `at` is missing). Any other shift is an unlanded code edit.
+fn shift_when(entry: &Value, commits: &[Value]) -> (RiverKind, Option<f64>) {
+    let oid = array(&entry["receipts"])
+        .iter()
+        .filter_map(Value::as_str)
+        .find_map(|r| r.strip_prefix("oid:"))
+        .filter(|oid| !oid.is_empty());
+    let Some(oid) = oid else {
+        return (RiverKind::Write, None);
+    };
+    let at = commits
+        .iter()
+        .filter(|c| string(&c["oid"]).starts_with(oid))
+        .find_map(|c| {
+            c["at"]
+                .as_f64()
+                .filter(|at| *at > 0.)
+                .or_else(|| crate::companion::paths::epoch(string(&c["date"])))
+        });
+    (RiverKind::Commit, at)
 }
 #[derive(Clone, Debug)]
 pub struct Composition {
@@ -48,13 +109,17 @@ pub struct Composition {
     pub codex_week: Value,
     pub csr_cost: InstrumentCost,
     pub dream: DreamCard,
+    /// What confused Claude, across every look of this session, newest first.
+    pub confusing: Vec<Value>,
+    /// What should be a skill, memory or tool, across every look of this session.
+    pub should_be: Vec<Value>,
     pub story: String,
     pub story_age: String,
     pub shifts: Vec<Value>,
     pub figure: Value,
     pub tally: Value,
     pub agents: agents::Projection,
-    pub river: Vec<(f64, String)>,
+    pub river: Vec<RiverRow>,
     pub notice: Option<String>,
     pub asked_away: bool,
     pub now: f64,
@@ -68,13 +133,28 @@ pub struct Open {
     pub threads: bool,
     pub dreams: bool,
 }
-fn observation(v: &Value) -> Vec<Value> {
-    array(v)
+/// How many confused-Claude or should-be items a card keeps.
+const OBSERVATION_CAP: usize = 5;
+/// Every look of this session that carries `key`, newest first, one item per `line`. A later look
+/// with an empty list never erases what an earlier one found.
+fn observations(data: &Value, session: &Value, key: &str) -> Vec<Value> {
+    let mut sources: Vec<&Value> = array(&data["dreams"])
         .iter()
-        .filter(|x| !string(&x["line"]).is_empty() && !string(&x["evidence"]).is_empty())
-        .take(2)
-        .cloned()
-        .collect()
+        .chain(array(&data["dream_records"]))
+        .filter(|r| &r["session"] == session && r[key].is_array())
+        .collect();
+    sources.sort_by(|a, b| num(&b["at"]).total_cmp(&num(&a["at"])));
+    let mut out: Vec<Value> = vec![];
+    for item in sources.iter().flat_map(|r| array(&r[key])) {
+        if !string(&item["line"]).is_empty()
+            && !string(&item["evidence"]).is_empty()
+            && !out.iter().any(|o| o["line"] == item["line"])
+        {
+            out.push(item.clone());
+        }
+    }
+    out.truncate(OBSERVATION_CAP);
+    out
 }
 impl Composition {
     pub fn build(data: &Value, s: &Value, now: f64) -> Self {
@@ -121,15 +201,16 @@ impl Composition {
             .iter()
             .filter(|r| r["session"] == s["id"] && r["kind"] == "look" && r["outcome"] == "none")
             .count();
-        let source = if top.is_null() { look } else { &top };
         let mut river: Vec<_> = array(&data["dreams"])
             .iter()
             .filter(|d| d["session"] == s["id"])
             .map(|d| {
-                (
+                river_row(
                     num(&d["at"]),
+                    RiverKind::Dream,
+                    "☾ ",
                     format!(
-                        "☾ {}{}",
+                        "{}{}",
                         string(&d["line"]),
                         d["answer"]
                             .as_str()
@@ -142,7 +223,7 @@ impl Composition {
         river.extend(
             array(&s["compacts"])
                 .iter()
-                .map(|v| (num(v), "♻ Compacted".into())),
+                .map(|v| river_row(num(v), RiverKind::Compact, "♻ ", "Compacted".into())),
         );
         let raw_story = string(&data["story"]["now"]).trim();
         let stripped_story = ["Work stands at:", "Where the work stands:", "Story:"]
@@ -179,36 +260,52 @@ impl Composition {
                 entry
             })
             .collect::<Vec<_>>();
+        let commits = array(&data["shifts"]);
         for shift in &shifts {
-            river.push((
-                num(&data["story_map"]["at"]),
-                format!(
-                    "{} {} · {}",
-                    mark(shift),
-                    string(&shift["scope"]),
-                    string(&shift["now"])
-                ),
+            let (kind, at) = shift_when(shift, commits);
+            river.push(river_row(
+                at.unwrap_or_else(|| num(&data["story_map"]["at"])),
+                kind,
+                match mark(shift) {
+                    "!" => "! ",
+                    "+" => "+ ",
+                    "-" => "- ",
+                    _ => "~ ",
+                },
+                format!("{} · {}", string(&shift["scope"]), string(&shift["now"])),
             ));
         }
         for agent in &projection.agents {
             if let Some(start) = agent.started {
-                river.push((start / 1000., format!("○ {} started", agent.description)));
+                river.push(river_row(
+                    start / 1000.,
+                    RiverKind::Agent,
+                    "○ ",
+                    format!("{} started", agent.description),
+                ));
             }
             if let Some(done) = &agent.completion {
-                river.push((done.at / 1000., format!("✓ {} finished", agent.description)));
+                river.push(river_row(
+                    done.at / 1000.,
+                    RiverKind::Agent,
+                    "✓ ",
+                    format!("{} finished", agent.description),
+                ));
             }
         }
         river.extend(array(&data["threads"]).iter().map(|thread| {
-            (
+            river_row(
                 num(&thread["last_seen"]),
+                RiverKind::Prompt,
+                "↳ ",
                 format!(
-                    "↳ {} · {}",
+                    "{} · {}",
                     string(&thread["text"]),
                     crate::companion::threads::thread_group(thread)
                 ),
             )
         }));
-        river.sort_by(|a, b| b.0.total_cmp(&a.0));
+        river.sort_by(|a, b| b.at.total_cmp(&a.at));
         let mut stamps: Vec<_> = array(&s["main"])
             .iter()
             .map(|r| num(&r[0]))
@@ -313,9 +410,9 @@ impl Composition {
                 look: look.clone(),
                 looks,
                 none,
-                confusing: observation(&source["confusing_claude"]),
-                should_be: observation(&source["should_be"]),
             },
+            confusing: observations(data, &s["id"], "confusing_claude"),
+            should_be: observations(data, &s["id"], "should_be"),
             story,
             story_age: age,
             shifts,
@@ -362,6 +459,45 @@ fn sells() -> [&'static str; 3] {
         "Code changed? CSR warns Claude.",
         "CSR keeps the threads you dropped.",
     ]
+}
+/// One timeline icon centred on (`cx`, `cy`). Lucide has no quote glyph in the bundled subset, so
+/// the prompt mark is drawn; every other kind is a bundled Lucide glyph.
+fn river_icon(canvas: &mut Canvas, f: &Fonts, kind: RiverKind, cx: f32, cy: f32, t: &Tokens) {
+    const SIZE: f32 = 12.;
+    let glyph = |canvas: &mut Canvas, which: Icon, col: Rgba| {
+        let st = icon(SIZE);
+        let value = which.glyph().to_string();
+        let (l, r, top, bottom) = f.ink(&value, st);
+        canvas.text(
+            f,
+            &value,
+            cx - (l + r) / 2.,
+            cy - (top + bottom) / 2.,
+            st,
+            col,
+            A::L,
+        );
+    };
+    match kind {
+        RiverKind::Write => glyph(canvas, Icon::FilePen, t.sky),
+        RiverKind::Compact => glyph(canvas, Icon::Recycle, t.amber),
+        RiverKind::Dream => glyph(canvas, Icon::MoonStar, t.dream),
+        RiverKind::Agent => glyph(canvas, Icon::Bot, t.asked),
+        RiverKind::Commit => glyph(canvas, Icon::GitCommit, t.mint),
+        RiverKind::Prompt => {
+            for dx in [-3.2, 2.6] {
+                let (x, y) = (cx + dx, cy - 1.8);
+                canvas.circle(x, y, 2.1, t.ink);
+                let mut tail = tiny_skia::PathBuilder::new();
+                tail.move_to(x + 1.6, y + 0.4);
+                tail.quad_to(x + 1.4, y + 3.2, x - 1.8, y + 5.2);
+                if let Some(tail) = tail.finish() {
+                    canvas.stroke(&tail, 1.5, t.ink, true);
+                }
+            }
+        }
+        RiverKind::Other => canvas.circle(cx, cy, 2.5, t.faint),
+    }
 }
 fn mark(v: &Value) -> &str {
     match string(&v["mark"]) {
@@ -491,18 +627,21 @@ fn meta(c: &Composition) -> String {
     }
     bits.join(" · ")
 }
-fn observation_title(item: &Value, should: bool) -> String {
-    if !should {
-        return "Confusing Claude".into();
-    }
+/// A card of `rows` one-line observations under its title.
+fn observation_card_h(rows: usize) -> f32 {
+    P * 2. + theme::TITLE_LINE + S2 + rows as f32 * theme::BODY_LINE
+}
+const CONFUSED_TITLE: &str = "Confused Claude";
+const SHOULD_BE_TITLE: &str = "Should be a skill / memory / tool";
+/// The short label a should-be item carries on its row.
+fn should_be_kind(item: &Value) -> &'static str {
     match string(&item["kind"]) {
-        "skill" => "Should be a skill",
-        "memory" => "Should be a memory",
-        "hook" => "Should be a hook",
-        "CLAUDE.md" | "CLAUDE.md rule" | "claude_md" | "rule" => "Should be a CLAUDE.md rule",
-        _ => "Should be kept",
+        "skill" => "skill",
+        "memory" => "memory",
+        "hook" => "hook",
+        "CLAUDE.md" | "CLAUDE.md rule" | "claude_md" | "rule" => "CLAUDE.md rule",
+        _ => "tool",
     }
-    .into()
 }
 fn evidence_receipt(item: &Value) -> String {
     let evidence = string(&item["evidence"]);
@@ -520,27 +659,6 @@ fn evidence_receipt(item: &Value) -> String {
             turns.join(", ")
         )
     }
-}
-fn extras(c: &Composition, counts: bool) -> Vec<String> {
-    [(false, &c.dream.confusing), (true, &c.dream.should_be)]
-        .into_iter()
-        .filter(|(_, v)| !v.is_empty())
-        .map(|(should, items)| {
-            let title = observation_title(&items[0], should);
-            if counts {
-                format!("{title} · {}", items.len())
-            } else {
-                format!(
-                    "{title}: {}",
-                    items
-                        .iter()
-                        .map(|i| format!("{} · {}", string(&i["line"]), evidence_receipt(i)))
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                )
-            }
-        })
-        .collect()
 }
 fn csr_status(g: &Value) -> Option<(String, &str)> {
     let sev = g["sts"]["sev"]
@@ -661,30 +779,37 @@ pub fn rows_with_figure(
             cols,
         ));
     }
-    let details = extras(c, false);
-    let details_count = details.iter().flat_map(|s| wrap(s)).count();
-    for line in extras(c, hero.len() + details_count > cap) {
-        hero.extend(wrap(&line));
-    }
     // Tiny terminals show the complete question in its drill-down. Never cut a rendered line.
     if hero.len() > cap {
         collapsed_hero = true;
         hero = wrap("☾ what-if · d");
-        for line in extras(c, true) {
-            hero.extend(wrap(&line));
-        }
         if hero.len() > cap {
             hero = wrap("☾ d");
-            if !c.dream.confusing.is_empty() {
-                hero.push(format!("! {}", c.dream.confusing.len()));
-            }
-            if !c.dream.should_be.is_empty() {
-                hero.push(format!("↳ {}", c.dream.should_be.len()));
-            }
             hero.truncate(cap);
         }
     }
     out.extend(hero);
+    for (title, items, should) in [
+        (CONFUSED_TITLE, &c.confusing, false),
+        (SHOULD_BE_TITLE, &c.should_be, true),
+    ] {
+        if items.is_empty() {
+            continue;
+        }
+        out.extend(wrap(title));
+        for item in items {
+            out.extend(wrap(&format!(
+                "{}{} · {}",
+                if should {
+                    format!("{}: ", should_be_kind(item))
+                } else {
+                    String::new()
+                },
+                string(&item["line"]),
+                evidence_receipt(item)
+            )));
+        }
+    }
     if c.offer {
         out.extend(wrap("Press 1 to turn dreams on in all your sessions."));
     }
@@ -704,11 +829,7 @@ pub fn rows_with_figure(
         out.extend(wrap(n));
     }
     if let Some(recap) = &c.repo_recap {
-        out.extend(wrap(&format!(
-            "Last time here · {} · {}",
-            recap.age,
-            recap.session.chars().take(8).collect::<String>()
-        )));
+        out.extend(wrap(&format!("Last time here · {}", recap.age)));
         for line in recap.text.lines() {
             out.extend(wrap(line));
         }
@@ -740,10 +861,12 @@ pub fn rows_with_figure(
         details_start = out.len();
     }
     if open.threads {
-        for (at, line) in &c.river {
+        for row in &c.river {
             out.extend(wrap(&format!(
-                "{} · {line}",
-                masthead::span((c.now - at).max(0.))
+                "{} · {}{}",
+                masthead::span((c.now - row.at).max(0.)),
+                row.lead,
+                row.line
             )));
         }
     }
@@ -752,12 +875,6 @@ pub fn rows_with_figure(
             out.extend(wrap(&c.question()));
         }
         out.extend(wrap(string(&c.dream.top["text"])));
-        for line in extras(c, false) {
-            out.extend(wrap(&line));
-        }
-        for item in c.dream.confusing.iter().chain(&c.dream.should_be) {
-            out.extend(wrap(string(&item["evidence"])));
-        }
         for d in &c.dream.queue {
             out.extend(wrap(string(&d["line"])));
         }
@@ -840,15 +957,23 @@ pub fn rows_with_figure(
             history.extend(recap.history.iter().take(room - 1).map(|prior| {
                 text::fit(
                     &format!(
-                        "{} {} · {}",
-                        history_mark(&prior.outcome),
+                        "{}{} · {}",
+                        history_mark(&prior.outcome)
+                            .map(|m| format!("{m} "))
+                            .unwrap_or_default(),
                         prior.age,
-                        prior.intent
+                        earlier_intent(&prior.intent)
                     ),
                     cols,
                 )
             }));
+            // Starter questions follow the list when the pane has room left over.
+            if c.empty_session {
+                pitch_insert = Some(at + history.len());
+            }
             out.splice(at..at, history);
+        } else if c.empty_session {
+            pitch_insert = Some(at);
         }
     }
     if let Some(at) = pitch_insert {
@@ -908,12 +1033,65 @@ fn starter_questions() -> [(&'static str, &'static str); 8] {
         ),
     ]
 }
-fn history_mark(outcome: &str) -> &'static str {
-    match outcome {
-        "done" => "✓",
-        "open" => "→",
-        _ => "?",
+/// "Try a question" with as many starter questions as fit between `cursor` and `bottom`.
+fn starter_cards(canvas: &mut Canvas, f: &Fonts, mut cursor: f32, bottom: f32, t: &Tokens) {
+    let title = sans(theme::TITLE_SIZE, t.bold);
+    let body = sans(theme::BODY_SIZE, t.regular);
+    let caption = sans(theme::CAPTION_SIZE, t.regular);
+    if bottom - cursor < theme::TITLE_LINE + S3 + theme::BODY_LINE + theme::CAPTION_LINE {
+        return;
     }
+    label(
+        canvas,
+        f,
+        "Try a question",
+        IX,
+        cursor + f.cap(title),
+        theme::TITLE_SIZE,
+        t.ink,
+        t.bold,
+    );
+    cursor += theme::TITLE_LINE + S3;
+    for (question, hint) in starter_questions() {
+        if cursor + theme::BODY_LINE + theme::CAPTION_LINE > bottom {
+            break;
+        }
+        single(
+            canvas,
+            f,
+            question,
+            IX,
+            cursor + f.cap(body),
+            IW,
+            theme::BODY_SIZE,
+            t.ink,
+            t,
+        );
+        single(
+            canvas,
+            f,
+            hint,
+            IX,
+            cursor + theme::BODY_LINE + f.cap(caption),
+            IW,
+            theme::CAPTION_SIZE,
+            t.quiet,
+            t,
+        );
+        cursor += theme::BODY_LINE + theme::CAPTION_LINE + S3;
+    }
+}
+/// A mark only where the outcome is known; an unknown outcome says nothing.
+fn history_mark(outcome: &str) -> Option<&'static str> {
+    match outcome {
+        "done" => Some("✓"),
+        "open" => Some("→"),
+        _ => None,
+    }
+}
+/// Under an "Earlier here" heading every row was asked, so the lead-in is noise.
+fn earlier_intent(intent: &str) -> &str {
+    intent.strip_prefix("you asked: ").unwrap_or(intent)
 }
 fn agent_lines(c: &Composition) -> Vec<String> {
     c.agents
@@ -1392,6 +1570,8 @@ fn label(c: &mut Canvas, f: &Fonts, s: &str, x: f32, y: f32, size: f32, col: Rgb
         "Context" => Some(Icon::Gauge),
         "Quotas" => Some(Icon::Hourglass),
         "Where the work stands" | "This session" => Some(Icon::ScrollText),
+        CONFUSED_TITLE => Some(Icon::CircleHelp),
+        SHOULD_BE_TITLE => Some(Icon::Lightbulb),
         _ => None,
     };
     let x = if let Some(glyph) = title_icon {
@@ -1601,7 +1781,6 @@ pub struct Metrics {
     pub last_card_gap_px: f32,
     pub height: f32,
     pub question_lines: Vec<String>,
-    pub sections_collapsed: bool,
 }
 fn question_layout(f: &Fonts, q: &str, width: u32, t: &Tokens) -> (St, Vec<String>) {
     let size = (24. + (width as f32 - 704.) / 256. * 6.).clamp(22., 30.);
@@ -1663,30 +1842,6 @@ pub fn draw(
                 S3 + c.shifts.len().min(3) as f32 * theme::CAPTION_LINE
             }
     };
-    let full_extras = extras(c, false);
-    let collapsed = full_extras
-        .iter()
-        .any(|line| f.width(line, caption) > IW * 2.);
-    let extra_lines = extras(c, collapsed);
-    let extra_layout = extra_lines
-        .iter()
-        .map(|line| {
-            let (name, body) = line.split_once(": ").unwrap_or((line, ""));
-            let glyph = if name.starts_with("Confusing") {
-                Icon::CircleHelp
-            } else {
-                Icon::Sparkles
-            };
-            let name = format!("{} {name}:", glyph.glyph());
-            let tw = f.width(&name, sans(theme::CAPTION_SIZE, t.medium)) + f.width(" ", caption);
-            let rows = f.wrap(body, caption, IW - tw);
-            (name, tw, rows)
-        })
-        .collect::<Vec<_>>();
-    let extras_h = extra_layout
-        .iter()
-        .map(|(_, _, lines)| lines.len() as f32 * theme::CAPTION_LINE)
-        .sum::<f32>();
     let metadata = meta(c);
     let mut meta_rows: Vec<Vec<&str>> = vec![];
     let mut row = vec![];
@@ -1743,8 +1898,7 @@ pub fn draw(
             0.
         } else {
             S2 + status_lines.len() as f32 * theme::CAPTION_LINE
-        }
-        + if extras_h > 0. { S3 + extras_h } else { 0. };
+        };
     // Keep the full specified headline size and the hero's 30% budget together in short panes.
     maxh = maxh.max((hero_h / 0.30).ceil());
     let active = c.agents.agents.iter().any(agents::is_active);
@@ -1804,12 +1958,6 @@ pub fn draw(
         }
     } else if open.dreams {
         drill_lines.extend(f.wrap(string(&c.dream.top["text"]), sans(11.5, t.regular), IW));
-        for s in extras(c, false) {
-            drill_lines.extend(f.wrap(&s, sans(11.5, t.regular), IW));
-        }
-        for item in c.dream.confusing.iter().chain(&c.dream.should_be) {
-            drill_lines.extend(f.wrap(string(&item["evidence"]), sans(11.5, t.regular), IW));
-        }
         for d in &c.dream.queue {
             drill_lines.extend(f.wrap(string(&d["line"]), sans(11.5, t.regular), IW));
         }
@@ -1829,8 +1977,23 @@ pub fn draw(
     } else {
         110.
     };
-    let top_core =
-        M + hero_h + S3 + story_h + if story_h > 0. { S3 } else { 0. } + notice_h + notice_gap;
+    let observed = [
+        (CONFUSED_TITLE, &c.confusing, false),
+        (SHOULD_BE_TITLE, &c.should_be, true),
+    ];
+    let observed_h: f32 = observed
+        .iter()
+        .filter(|(_, items, _)| !items.is_empty())
+        .map(|(_, items, _)| observation_card_h(items.len()) + S3)
+        .sum();
+    let top_core = M
+        + hero_h
+        + S3
+        + observed_h
+        + story_h
+        + if story_h > 0. { S3 } else { 0. }
+        + notice_h
+        + notice_gap;
     let tail_core = agents_h
         + if active { S3 } else { 0. }
         + empty_help
@@ -2046,53 +2209,57 @@ pub fn draw(
             cursor += theme::CAPTION_LINE;
         }
     }
-    if extras_h > 0. {
-        cursor += S3;
-    }
-    for (title_text, tw, lines) in &extra_layout {
-        let b = cursor + f.cap(caption);
+    y += hero_h + card_gap;
+    for (title_text, items, should) in observed {
+        if items.is_empty() {
+            continue;
+        }
+        let h = observation_card_h(items.len());
+        panel(&mut canvas, y, h, t);
         label(
             &mut canvas,
             f,
             title_text,
             IX,
-            b,
-            theme::CAPTION_SIZE,
-            t.dream,
-            t.medium,
+            y + P + f.cap(title),
+            theme::TITLE_SIZE,
+            t.ink,
+            t.bold,
         );
-        for (i, row) in lines.iter().enumerate() {
-            let b = cursor + f.cap(caption);
-            let (body_text, receipt) = row.split_once(" · ").unwrap_or((row, ""));
-            let x = IX + if i == 0 { *tw } else { 0. };
-            label(
+        let mut row_y = y + P + theme::TITLE_LINE + S2;
+        for item in items {
+            let base = row_y + f.cap(body);
+            let receipt = evidence_receipt(item);
+            let receipt_w = f.width(&receipt, caption);
+            let kind_w = if should { 78. } else { 0. };
+            if should {
+                label(
+                    &mut canvas,
+                    f,
+                    should_be_kind(item),
+                    IX,
+                    base,
+                    theme::CAPTION_SIZE,
+                    t.dream,
+                    t.medium,
+                );
+            }
+            single(
                 &mut canvas,
                 f,
-                body_text,
-                x,
-                b,
-                theme::CAPTION_SIZE,
+                string(&item["line"]),
+                IX + kind_w,
+                base,
+                IW - kind_w - receipt_w - S3,
+                theme::BODY_SIZE,
                 t.ink,
-                t.regular,
+                t,
             );
-            if !receipt.is_empty() {
-                let x = x + f.width(body_text, caption) + ICON_GAP;
-                let st = mono(theme::CHIP_SIZE, t.regular);
-                let rw = f.width(receipt, st);
-                canvas.rrect(
-                    x - S1,
-                    b - f.cap(st) - S1 / 2.,
-                    rw + S2,
-                    theme::CHIP_LINE,
-                    S1,
-                    t.chip,
-                );
-                canvas.text(f, receipt, x, b, st, t.quiet, A::L);
-            }
-            cursor += theme::CAPTION_LINE;
+            canvas.text(f, &receipt, IX + IW, base, caption, t.quiet, A::R);
+            row_y += theme::BODY_LINE;
         }
+        y += h + card_gap;
     }
-    y += hero_h + card_gap;
     if let Some(notice) = &c.notice {
         panel(&mut canvas, y, notice_h, t);
         single(
@@ -2196,43 +2363,26 @@ pub fn draw(
             }
         } else if open.threads {
             let spine_h = (extra_h - P * 2.).max(0.);
-            canvas.vhair(IX + 55., y + P, spine_h, t.band);
-            if c.requests.len() > 1 {
-                let max = c.requests.iter().map(|(a, b)| a + b).fold(1., f64::max);
-                let mut path = tiny_skia::PathBuilder::new();
-                path.move_to(IX + 55., y + P);
-                for (i, (cached, fresh)) in c.requests.iter().rev().enumerate() {
-                    path.line_to(
-                        IX + 55. - ((cached + fresh) / max * 36.) as f32,
-                        y + P + i as f32 / (c.requests.len() - 1) as f32 * spine_h,
-                    );
-                }
-                path.line_to(IX + 55., y + P + spine_h);
-                path.close();
-                if let Some(path) = path.finish() {
-                    canvas.fill_shader(
-                        &path,
-                        lin(
-                            IX + 19.,
-                            y + P,
-                            IX + 55.,
-                            y + P + spine_h,
-                            &[(t.linear_at[0], t.mint), (t.linear_at[1], t.sky)],
-                        ),
-                    );
-                }
-            }
-            for (at, line) in c
+            let spine_x = IX + 55.;
+            let rows: Vec<_> = c
                 .river
                 .iter()
                 .skip(open.scroll)
-                .take(((extra_h - P * 2.).max(0.) / 33.) as usize)
-            {
-                canvas.circle(IX + 55., b - 4., 3., t.dream);
+                .take((spine_h / 33.) as usize)
+                .collect();
+            // The spine runs between the icons, never through them, and ends at the last one.
+            let mut from = y + P;
+            for i in 0..rows.len() {
+                let mid = b + i as f32 * 33. - 4.;
+                canvas.vhair(spine_x, from, (mid - 9. - from).max(0.), t.band);
+                from = mid + 9.;
+            }
+            for row in rows {
+                river_icon(&mut canvas, f, row.kind, spine_x, b - 4., t);
                 single(
                     &mut canvas,
                     f,
-                    &masthead::span((c.now - at).max(0.)),
+                    &masthead::span((c.now - row.at).max(0.)),
                     IX,
                     b,
                     48.,
@@ -2240,7 +2390,17 @@ pub fn draw(
                     t.quiet,
                     t,
                 );
-                single(&mut canvas, f, line, IX + 70., b, IW - 70., 11.5, t.ink, t);
+                single(
+                    &mut canvas,
+                    f,
+                    &row.picture_text(),
+                    IX + 70.,
+                    b,
+                    IW - 70.,
+                    11.5,
+                    t.ink,
+                    t,
+                );
                 b += 33.;
             }
         } else {
@@ -2351,11 +2511,7 @@ pub fn draw(
             label(
                 &mut canvas,
                 f,
-                &format!(
-                    "{} · session {}",
-                    recap.age,
-                    recap.session.chars().take(8).collect::<String>()
-                ),
+                &recap.age,
                 IX,
                 cursor + f.cap(caption),
                 theme::CAPTION_SIZE,
@@ -2394,14 +2550,37 @@ pub fn draw(
                     t.bold,
                 );
                 cursor += theme::TITLE_LINE + S2;
+                // Marks sit in their own gutter, only when some row has one.
+                let gutter = if recap
+                    .history
+                    .iter()
+                    .take(available_rows)
+                    .any(|prior| history_mark(&prior.outcome).is_some())
+                {
+                    16.
+                } else {
+                    0.
+                };
                 for prior in recap.history.iter().take(available_rows) {
-                    let age = format!("{}  {}", history_mark(&prior.outcome), prior.age);
-                    let age_w = f.width(&age, caption).max(88.);
+                    if let Some(mark) = history_mark(&prior.outcome) {
+                        label(
+                            &mut canvas,
+                            f,
+                            mark,
+                            IX,
+                            cursor + f.cap(body),
+                            theme::CAPTION_SIZE,
+                            t.quiet,
+                            t.regular,
+                        );
+                    }
+                    let age = &prior.age;
+                    let age_w = (f.width(age, caption) + gutter).max(88.);
                     label(
                         &mut canvas,
                         f,
-                        &age,
-                        IX,
+                        age,
+                        IX + gutter,
                         cursor + f.cap(body),
                         theme::CAPTION_SIZE,
                         t.quiet,
@@ -2410,7 +2589,7 @@ pub fn draw(
                     single(
                         &mut canvas,
                         f,
-                        &prior.intent,
+                        earlier_intent(&prior.intent),
                         IX + age_w + S3,
                         cursor + f.cap(body),
                         IW - age_w - S3,
@@ -2422,6 +2601,9 @@ pub fn draw(
                     history_rows += 1;
                 }
                 history_bottom = Some(cursor);
+            }
+            if c.empty_session {
+                starter_cards(&mut canvas, f, cursor + S4, help_y + help_draw_h - P, t);
             }
         } else {
             let mut cursor = help_y + P;
@@ -2476,50 +2658,8 @@ pub fn draw(
                 );
                 cursor += theme::BODY_LINE + theme::CAPTION_LINE + S4;
             }
-            let bottom = help_y + help_draw_h - P;
-            if c.empty_session
-                && bottom - cursor
-                    >= theme::TITLE_LINE + S3 + theme::BODY_LINE + theme::CAPTION_LINE
-            {
-                label(
-                    &mut canvas,
-                    f,
-                    "Try a question",
-                    IX,
-                    cursor + f.cap(title),
-                    theme::TITLE_SIZE,
-                    t.ink,
-                    t.bold,
-                );
-                cursor += theme::TITLE_LINE + S3;
-                for (question, hint) in starter_questions() {
-                    if cursor + theme::BODY_LINE + theme::CAPTION_LINE > bottom {
-                        break;
-                    }
-                    single(
-                        &mut canvas,
-                        f,
-                        question,
-                        IX,
-                        cursor + f.cap(body),
-                        IW,
-                        theme::BODY_SIZE,
-                        t.ink,
-                        t,
-                    );
-                    single(
-                        &mut canvas,
-                        f,
-                        hint,
-                        IX,
-                        cursor + theme::BODY_LINE + f.cap(caption),
-                        IW,
-                        theme::CAPTION_SIZE,
-                        t.quiet,
-                        t,
-                    );
-                    cursor += theme::BODY_LINE + theme::CAPTION_LINE + S3;
-                }
+            if c.empty_session {
+                starter_cards(&mut canvas, f, cursor, help_y + help_draw_h - P, t);
             }
         }
         y = help_y + help_draw_h;
@@ -2590,7 +2730,6 @@ pub fn draw(
                 - last_card_bottom * content_h as f32 / height,
             height,
             question_lines: question,
-            sections_collapsed: collapsed,
         },
     ))
 }
@@ -3449,6 +3588,225 @@ mod tests {
     }
 
     use super::*;
+
+    fn timeline_data() -> (Value, Value) {
+        let now = 1_800_000_000.;
+        let s = json!({"id":"tl","compacts":[now - 5400.],"main":[],"prompts":[]});
+        let entry = |claim: &str, receipt: &str| {
+            json!({"sig":claim,"kind":"shift","claim":claim,"now":claim,"was":null,
+                "before":[],"after":[{"scope":"summarizer.rs","sym":"store_story","mark":"~"}],
+                "receipts":[receipt],"grounded":true,"moved":true})
+        };
+        let data = json!({
+            "story_map": {"at": now - 6200., "entries": [
+                entry("Keep prior shift reflections on story rewrite", "oid:aaaaaaa"),
+                entry("Pane fails open when the map is absent", "oid:bbbbbbb"),
+                entry("Unlanded edit of the ledger", "edit:ledger"),
+                entry("Dated by neither", "oid:ccccccc"),
+            ]},
+            "shifts": [
+                {"oid":"aaaaaaa1111","date":"2026-10-21","at": now - 3000.},
+                {"oid":"bbbbbbb2222","date":"2026-10-20","at": now - 86400.},
+            ],
+            "dreams": [{"session":"tl","at": now - 600., "line":"What if recall started from the file?", "answer":"yes"}],
+            "threads": [{"text":"Decide the release name","last_seen": now - 9000., "state":"open"}],
+        });
+        (data, s)
+    }
+
+    #[test]
+    fn timeline_rows_carry_their_kind_and_their_own_age() {
+        let now = 1_800_000_000.;
+        let (data, s) = timeline_data();
+        let c = Composition::build(&data, &s, now);
+        let rows: Vec<_> = c.river.iter().map(|r| (r.kind, r.at)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                (RiverKind::Dream, now - 600.),
+                (RiverKind::Commit, now - 3000.),
+                (RiverKind::Compact, now - 5400.),
+                (RiverKind::Write, now - 6200.),
+                (RiverKind::Commit, now - 6200.),
+                (RiverKind::Prompt, now - 9000.),
+                (RiverKind::Commit, now - 86400.),
+            ]
+        );
+        let lines: Vec<_> = c.river.iter().map(|r| r.line.as_str()).collect();
+        assert!(lines[0].starts_with("What if"), "{lines:?}");
+        assert_eq!(lines[2], "Compacted");
+        assert!(lines
+            .iter()
+            .all(|l| !l.starts_with(['☾', '♻', '↳', '○', '✓'])));
+    }
+
+    #[test]
+    fn the_threads_drilldown_draws_one_icon_per_row_and_no_gradient() {
+        let now = 1_800_000_000.;
+        let (data, s) = timeline_data();
+        let mut c = Composition::build(&data, &s, now);
+        c.river.push(river_row(
+            now - 700.,
+            RiverKind::Agent,
+            "",
+            "Scan the repo started".into(),
+        ));
+        c.river.push(river_row(
+            now - 800.,
+            RiverKind::Other,
+            "",
+            "Something else".into(),
+        ));
+        c.river.sort_by(|a, b| b.at.total_cmp(&a.at));
+        c.requests = (0..20)
+            .map(|i| (150_000. + f64::from(i) * 1000., 2_000.))
+            .collect();
+        let open = Open {
+            threads: true,
+            ..Open::default()
+        };
+        let png = std::env::var_os("CSR_THREADS_PNG");
+        for theme in [Theme::Dark, Theme::Light] {
+            let (pm, _) = draw(&c, 1210, 1700, theme, open, false).expect("instrument draws");
+            if let Some(dir) = &png {
+                let name = format!("{}/threads-{theme:?}.png", dir.to_string_lossy());
+                save(&name, &pm);
+            }
+        }
+    }
+
+    fn fresh_with_history(prior: usize) -> Composition {
+        let mut c = Composition::build(&json!({}), &json!({"id":"fresh"}), 1_800_000_000.);
+        assert!(c.empty_session);
+        c.repo_recap = Some(crate::companion::repo_recap::RepoRecap {
+            session: "64f9b5b9aaaa".into(),
+            at: 1_799_900_000.,
+            age: "1d ago".into(),
+            text: "you asked: Fix the footer".into(),
+            history: (0..prior)
+                .map(|i| crate::companion::repo_recap::RepoSessionSummary {
+                    session: format!("s{i}"),
+                    at: 1_799_000_000. - i as f64,
+                    age: format!("{}d ago", i + 2),
+                    intent: format!("you asked: Question number {i}"),
+                    outcome: if i == 1 { "done" } else { "unknown" }.into(),
+                })
+                .collect(),
+        });
+        c
+    }
+
+    #[test]
+    fn earlier_here_drops_noise_and_fills_spare_room_with_starter_questions() {
+        let c = fresh_with_history(4);
+        let text = text_rows(&c, 100, 60, Open::default()).join("\n");
+        assert!(text.contains("Last time here · 1d ago"), "{text}");
+        assert!(!text.contains("64f9b5b9"), "{text}");
+        assert!(text.contains("2d ago · Question number 0"), "{text}");
+        assert!(text.contains("✓ 3d ago · Question number 1"), "{text}");
+        assert!(!text.lines().any(|l| l.starts_with("? ")), "{text}");
+        assert!(!text.contains("Question number 0 ·"), "{text}");
+        let after = text.split("Earlier here").nth(1).unwrap();
+        assert!(after.contains("Try a question"), "{text}");
+        assert_eq!(earlier_intent("you asked: x"), "x");
+        assert_eq!(earlier_intent("something"), "something");
+        assert_eq!(history_mark("unknown"), None);
+        let png = std::env::var_os("CSR_FRESH_PNG");
+        for (name, n) in [("fresh-session", 19), ("fresh-few", 4)] {
+            let c = fresh_with_history(n);
+            let (pm, _) = draw(&c, 1210, 1700, Theme::Dark, Open::default(), false).expect("draws");
+            if let Some(dir) = &png {
+                save(&format!("{}/{name}.png", dir.to_string_lossy()), &pm);
+            }
+        }
+    }
+
+    fn observed_data() -> Value {
+        let item = |line: &str, evidence: &str| json!({"line":line,"evidence":evidence});
+        let should = |kind: &str, line: &str| json!({"kind":kind,"line":line,"evidence":"Turns 4 and 8: 'x'"});
+        json!({
+            "dreams": [{"id":"d1","session":"o","at":100.,"line":"What if?",
+                "confusing_claude":[item("Misread the pane.","Turn 4: 'pane'")],
+                "should_be":[should("hook","Check formatting before commits.")]}],
+            "dream_records": [
+                {"kind":"look","session":"o","at":300.,"outcome":"none",
+                    "confusing_claude":[],"should_be":[]},
+                {"kind":"look","session":"o","at":200.,"outcome":"none",
+                    "confusing_claude":[item("Repeated a rejected approach.","Turn 12"),
+                        item("Misread the pane.","Turn 15")],
+                    "should_be":[should("skill","Bump the version in both files.")]},
+                {"kind":"look","session":"other","at":400.,"outcome":"none",
+                    "confusing_claude":[item("Not this session.","Turn 1")]},
+            ],
+        })
+    }
+
+    #[test]
+    fn confused_and_should_be_come_from_every_look_not_just_the_newest() {
+        let c = Composition::build(&observed_data(), &json!({"id":"o"}), 1000.);
+        let lines = |v: &[Value]| {
+            v.iter()
+                .map(|i| string(&i["line"]).to_owned())
+                .collect::<Vec<_>>()
+        };
+        // The newest look found nothing; the earlier ones still count, deduped by line.
+        assert_eq!(
+            lines(&c.confusing),
+            ["Repeated a rejected approach.", "Misread the pane."]
+        );
+        assert_eq!(
+            lines(&c.should_be),
+            [
+                "Bump the version in both files.",
+                "Check formatting before commits."
+            ]
+        );
+        let mut many = observed_data();
+        many["dream_records"][1]["confusing_claude"] = json!((0..9)
+            .map(|i| json!({"line":format!("Line {i}"),"evidence":"Turn 1"}))
+            .collect::<Vec<_>>());
+        let c = Composition::build(&many, &json!({"id":"o"}), 1000.);
+        assert_eq!(c.confusing.len(), OBSERVATION_CAP);
+    }
+
+    #[test]
+    fn the_two_observation_cards_are_separate_and_leave_the_dreamer_alone() {
+        let c = Composition::build(&observed_data(), &json!({"id":"o"}), 1000.);
+        let open = Open {
+            dreams: true,
+            ..Open::default()
+        };
+        let text = text_rows(&c, 100, 60, open);
+        let at = |needle: &str| text.iter().position(|l| l == needle);
+        let confused = at(CONFUSED_TITLE).expect("confused card");
+        let should = at(SHOULD_BE_TITLE).expect("should-be card");
+        assert!(confused < should);
+        assert_eq!(
+            text[confused + 1],
+            "Repeated a rejected approach. · turn 12"
+        );
+        assert!(
+            text.contains(&"skill: Bump the version in both files. · turns 4, 8".to_owned()),
+            "{text:?}"
+        );
+        assert!(text.contains(&"hook: Check formatting before commits. · turns 4, 8".to_owned()));
+        // The dreamer's own lines carry no counts and no folded-in findings.
+        assert!(text[..confused]
+            .iter()
+            .all(|l| !l.contains("Confusing Claude") && !l.starts_with("! ")));
+        let quiet = Composition::build(&json!({}), &json!({"id":"o"}), 1000.);
+        let text = text_rows(&quiet, 100, 60, Open::default());
+        assert!(!text
+            .iter()
+            .any(|l| l == CONFUSED_TITLE || l == SHOULD_BE_TITLE));
+        if let Some(dir) = std::env::var_os("CSR_OBS_PNG") {
+            for (name, c) in [("observed", &c), ("quiet", &quiet)] {
+                let (pm, _) =
+                    draw(c, 1210, 1700, Theme::Dark, Open::default(), false).expect("draws");
+                save(&format!("{}/{name}.png", dir.to_string_lossy()), &pm);
+            }
+        }
+    }
 
     #[test]
     fn quota_money_drops_this_week_before_a_caption_can_hit_its_neighbour() {

@@ -1,7 +1,7 @@
 ☾ The dreamer looks as you work.
 dreamer 0 of 40k
 It asks a what-if from your past sessions.
-Last time here · 1h ago · prior-pa
+Last time here · 1h ago
 Make the companion readable: Restore footer labels
 (abcdef1).
 Settled: Keep one layout owner (fedcba9).
@@ -10,31 +10,31 @@ Next: Check the live narrow pane.
 Earlier here
 ✓ 2h ago · Verify companion history case 1
 → 3h ago · Verify companion history case 2
-? 4h ago · you asked: Verify companion history case 3
+4h ago · Verify companion history case 3
 ✓ 5h ago · Verify companion history case 4
 → 6h ago · Verify companion history case 5
-? 7h ago · you asked: Verify companion history case 6
+7h ago · Verify companion history case 6
 ✓ 8h ago · Verify companion history case 7
 → 9h ago · Verify companion history case 8
-? 10h ago · you asked: Verify companion history case 9
+10h ago · Verify companion history case 9
 ✓ 11h ago · Verify companion history case 10
 → 12h ago · Verify companion history case 11
-? 13h ago · you asked: Verify companion history case 12
+13h ago · Verify companion history case 12
 ✓ 14h ago · Verify companion history case 13
 → 15h ago · Verify companion history case 14
-? 16h ago · you asked: Verify companion history case 15
+16h ago · Verify companion history case 15
 ✓ 17h ago · Verify companion history case 16
 → 18h ago · Verify companion history case 17
-? 19h ago · you asked: Verify companion history case 18
+19h ago · Verify companion history case 18
 ✓ 20h ago · Verify companion history case 19
 → 21h ago · Verify companion history case 20
-? 22h ago · you asked: Verify companion history case 21
+22h ago · Verify companion history case 21
 ✓ 23h ago · Verify companion history case 22
 → 1d ago · Verify companion history case 23
-? 1d ago · you asked: Verify companion history case 24
+1d ago · Verify companion history case 24
 ✓ 1d ago · Verify companion history case 25
 → 1d ago · Verify companion history case 26
-? 1d ago · you asked: Verify companion history case 27
+1d ago · Verify companion history case 27
 7D 52%» · CSR 0 pts · 5H 3% · Codex 7D 41%
 $0 this week
  l changes  t threads  i figure  b theme  q close

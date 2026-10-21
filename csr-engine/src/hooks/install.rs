@@ -68,7 +68,7 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
         "hooks": {
             "SessionStart": [
                 {
-                    "matcher": "startup|resume|compact",
+                    "matcher": "startup|resume|compact|clear",
                     "hooks": [{"type": "command", "command": format!("{} hook session-start", binary_path)}]
                 },
                 {
@@ -661,7 +661,7 @@ mod tests {
             .contains("session-start"));
         assert_eq!(
             fast_hook["matcher"].as_str().unwrap(),
-            "startup|resume|compact"
+            "startup|resume|compact|clear"
         );
 
         // Second: async command hook invoking claude -p for briefing
@@ -678,6 +678,38 @@ mod tests {
         assert_eq!(briefing_hook["hooks"][0]["timeout"].as_u64().unwrap(), 150);
         // Briefing only on startup|resume (not compact — compact doesn't need fresh briefing)
         assert_eq!(briefing_hook["matcher"].as_str().unwrap(), "startup|resume");
+    }
+
+    #[test]
+    fn test_merge_migrates_the_old_session_start_matcher_to_include_clear() {
+        let mut settings = serde_json::json!({
+            "hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": "node /Users/me/other-tool.js"}]},
+                {"matcher": "startup|resume|compact",
+                 "hooks": [{"type": "command", "command": "/usr/local/bin/csr-engine hook session-start"}]},
+                {"matcher": "startup|resume",
+                 "hooks": [{"type": "command", "command": "/usr/local/bin/csr-engine hook session-briefing", "async": true}]}
+            ]}
+        });
+        merge_hook_config(
+            &mut settings,
+            &generate_hook_config("/usr/local/bin/csr-engine"),
+        )
+        .unwrap();
+        let entries = settings["hooks"]["SessionStart"].as_array().unwrap();
+        let matchers: Vec<_> = entries.iter().map(|e| e["matcher"].as_str()).collect();
+        // The user's own hook stays; one session-start entry now covers clear; briefing is unchanged.
+        assert_eq!(
+            matchers,
+            [
+                None,
+                Some("startup|resume|compact|clear"),
+                Some("startup|resume")
+            ]
+        );
+        assert!(!entries
+            .iter()
+            .any(|e| e["matcher"].as_str() == Some("startup|resume|compact")));
     }
 
     fn csr_subagent_stop_entry() -> serde_json::Value {

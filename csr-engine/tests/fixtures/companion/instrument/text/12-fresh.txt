@@ -47,14 +47,14 @@
 
 
 
-
-
 ☾ What if one of Fable's three prototypes made the what-if question the star
 of the pane, as you wanted on 10-09?
 0.82 · pane redesign · ⌗6ca2a4d5 10-09 · +2 more · dreamer 14k of 40k
 1 helpful · 2 thought of it · 3 not relevant · 4 ask Claude
-Confusing Claude: Misread which pane should change. · turn 4
-Should be a hook: Check the card height after each layout edit. · turns 4, 8
+Confused Claude
+Misread which pane should change. · turn 4
+Should be a skill / memory / tool
+hook: Check the card height after each layout edit. · turns 4, 8
 3 notes kept · 2 findings confirmed · 1 fact retired
 Story · refreshed <1m ago
 Text parity is ready for review.

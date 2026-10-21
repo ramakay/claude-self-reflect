@@ -936,11 +936,17 @@ fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() 
                 .collect::<Vec<_>>();
             if state == "11-last-time" {
                 // More height adds older history while keeping the recap and quota facts whole.
-                let is_history = |line: &&String| {
-                    ["✓ ", "→ ", "? "]
-                        .iter()
-                        .any(|prefix| line.starts_with(prefix))
-                };
+                let is_history = |line: &&String| line.contains(" ago · Verify companion history");
+                // Spare height past the last history row holds the starter questions.
+                let mut starters = false;
+                let long_content = long_content
+                    .into_iter()
+                    .filter(|line| {
+                        starters |= line.as_str() == "Try a question";
+                        starters &= !line.starts_with("7D ");
+                        !starters
+                    })
+                    .collect::<Vec<_>>();
                 assert_eq!(
                     short_content
                         .iter()
@@ -1049,7 +1055,9 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
                 "2 findings confirmed",
                 "1 fact retired",
                 "unverified",
-                "Should be a hook:",
+                "Confused Claude",
+                "Should be a skill / memory / tool",
+                "hook: Check the card height after each layout edit.",
                 "turns 4, 8",
             ],
         ),
@@ -1112,7 +1120,9 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
                 .0;
             assert!(pane.click(row, 0, NOW));
             let detail = pane.frame(76, 67, NOW).join("\n");
-            assert!(detail.contains("at most 30%"));
+            // The findings live in their own cards now; the dreamer's drill-down holds dreams only.
+            assert!(detail.contains("You asked to make the question the star"));
+            assert!(!detail.contains("at most 30%"));
         }
     }
 }
