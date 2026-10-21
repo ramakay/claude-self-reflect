@@ -118,7 +118,7 @@ pub(super) fn load(storage: &Storage, project: &str, sid: &str, now: f64) -> Opt
     // A session CSR knows nothing about is noise in the list, not history.
     let history = entries
         .map(|(summary, _)| summary)
-        .filter(|summary| summary.intent != UNAVAILABLE)
+        .filter(|summary| summary.intent != UNAVAILABLE && !is_chatter(&summary.intent))
         .collect();
     Some(RepoRecap {
         session: primary.session,
@@ -127,6 +127,23 @@ pub(super) fn load(storage: &Storage, project: &str, sid: &str, now: f64) -> Opt
         text,
         history,
     })
+}
+
+/// A prompt that says nothing about the work: a slash command ("/model") or a word or two
+/// ("please proceed", "0c").
+fn is_chatter(intent: &str) -> bool {
+    let Some(prompt) = intent.strip_prefix("you asked: ") else {
+        return false;
+    };
+    let prompt = prompt.trim();
+    // A paste placeholder ("[Pasted text #1 +45 lines]") is not words the person wrote.
+    let words = prompt
+        .split('[')
+        .map(|part| part.split_once(']').map_or(part, |(_, rest)| rest))
+        .flat_map(str::split_whitespace)
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .count();
+    prompt.starts_with('/') || words < 3
 }
 
 fn parse_timestamp(timestamp: &str) -> Option<f64> {
@@ -361,6 +378,30 @@ fn session_recap(
         },
         text,
     )
+}
+
+#[cfg(test)]
+mod chatter_tests {
+    use super::is_chatter;
+    #[test]
+    fn slash_commands_and_fragments_are_chatter_but_real_asks_and_recaps_are_not() {
+        for chatter in [
+            "you asked: /model",
+            "you asked: please proceed",
+            "you asked: 0c",
+            "you asked: activate",
+        ] {
+            assert!(is_chatter(chatter), "{chatter}");
+        }
+        for kept in [
+            "you asked: we recently launched the reel feature - what was the uptick",
+            "a new peer will come calling",
+            "you asked: thoughts on these two ? [Pasted text #1 +35 lines]",
+            "ok",
+        ] {
+            assert!(!is_chatter(kept), "{kept}");
+        }
+    }
 }
 
 #[cfg(test)]
