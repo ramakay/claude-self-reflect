@@ -272,6 +272,31 @@ mod prompt_process {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    /// The hook's connection, or None once `within` passes: a peer blocked in `accept` would
+    /// hang the test binary when the hook's own deadline fires before it connects.
+    fn accept_within(
+        listener: &std::os::unix::net::UnixListener,
+        within: Duration,
+    ) -> Option<std::os::unix::net::UnixStream> {
+        listener.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return Some(stream);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= within {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        }
+    }
+
     /// Launch the binary once, untimed, before any test times a spawn.
     ///
     /// The first exec of a newly linked `csr-engine` blocks before `main`
@@ -391,7 +416,8 @@ mod prompt_process {
             std::fs::create_dir(path.parent().unwrap()).unwrap();
             let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
             let peer = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
+                let mut stream = accept_within(&listener, Duration::from_secs(10))
+                    .expect("the hook never connected");
                 let mut header = [0; 4];
                 stream.read_exact(&mut header).unwrap();
                 let mut request = vec![0; u32::from_be_bytes(header) as usize];
@@ -491,7 +517,8 @@ mod prompt_process {
             .unwrap()
             .write_all(&payload(dir.path()))
             .unwrap();
-        let (_stream, _) = listener.accept().unwrap();
+        let _stream =
+            accept_within(&listener, Duration::from_secs(10)).expect("the hook never connected");
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         assert!(output.stdout.is_empty());
@@ -509,7 +536,11 @@ mod prompt_process {
         std::fs::create_dir(path.parent().unwrap()).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
         let peer = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            // Under load the hook's deadline can fire before it connects; it then exits
+            // cleanly, which is the behaviour under test, so a missing peer is not a failure.
+            let Some(mut stream) = accept_within(&listener, Duration::from_secs(10)) else {
+                return;
+            };
             let mut header = [0; 4];
             stream.read_exact(&mut header).unwrap();
             let mut request = vec![0; u32::from_be_bytes(header) as usize];
