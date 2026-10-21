@@ -15,7 +15,7 @@ asked while you were away
 1 fact retired
 Away 2h14m. The dreamer looked 4×. 3
 new what-ifs.
-Story · refreshed 30s ago
+Story · refreshed <1m ago
 Text parity is ready for review.
 ~ reader.rs · read ⌗8e4e3f27
 + render/instrument.rs · meta

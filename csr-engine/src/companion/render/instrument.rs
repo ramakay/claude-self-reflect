@@ -326,7 +326,7 @@ impl Composition {
                 now,
                 &data["limits"],
                 &data["sts"],
-                &data["compacting"],
+                &drawn_compaction(&data["compacting"]),
             ),
             tally: if notice
                 .as_deref()
@@ -415,10 +415,12 @@ pub fn shift_row(v: &Value, expanded: bool) -> String {
         format!("{} {place}  {}", mark(v), receipt(v))
     }
 }
+/// Ages count in minutes: every repaint re-uploads the whole picture, so a seconds count would
+/// blank the pane once a second for the first minute after each refresh.
 fn age_span(seconds: f64) -> String {
     let seconds = seconds.max(0.);
     if seconds < 60. {
-        format!("{seconds:.0}s")
+        "<1m".to_owned()
     } else {
         masthead::span(seconds)
     }
@@ -564,6 +566,15 @@ fn csr_status(g: &Value) -> Option<(String, &str)> {
         },
         sev,
     ))
+}
+/// The compaction timer the picture shows, in ten-second steps: every repaint re-uploads the
+/// whole picture, so a seconds counter would blank the pane once a second.
+fn drawn_compaction(compacting: &Value) -> Value {
+    let mut info = compacting.clone();
+    if info.is_object() {
+        info["elapsed"] = json!((num(&compacting["elapsed"]) / 10.).floor() * 10.);
+    }
+    info
 }
 fn payback(g: &Value) -> String {
     if g["compacting"].is_object() {
@@ -1220,8 +1231,9 @@ fn quota_row(
             radius: r,
             csr_segment: None,
         });
-        let left = num(&g["cache"]["left"]);
-        let cold = g["cache"]["cold"] == true || left <= 0.;
+        // The minute shown is the one drawn: a seconds sweep repaints the whole picture.
+        let left = (num(&g["cache"]["left"]) / 60.).floor() * 60.;
+        let cold = g["cache"]["cold"] == true || num(&g["cache"]["left"]) <= 0.;
         let ttl = g["cache"]["ttl"]
             .as_f64()
             .filter(|n| *n > 0.)
@@ -3527,5 +3539,40 @@ mod tests {
         assert_eq!(story_text_lines(no_clause, 8, 1), vec!["…".to_string()]);
         assert!(wrap_clauses(&fonts, no_clause, st, 60., 0).is_empty());
         assert!(story_text_lines(no_clause, 8, 0).is_empty());
+    }
+
+    #[test]
+    fn the_cache_ring_redraws_once_a_minute_not_every_second() {
+        let draw_at = |left: f64| {
+            let mut c = Composition::build(&json!({}), &json!({"id":"cache"}), 1000.);
+            c.figure["cache"] = json!({"left": left, "ttl": 3600., "cold": false, "text": "CACHE"});
+            draw(&c, 704, 986, Theme::Light, Open::default(), false)
+                .expect("instrument draws")
+                .0
+        };
+        // Both read "59m": a second's sweep must not repaint the whole picture.
+        assert!(draw_at(3599.).data() == draw_at(3540.).data());
+        assert!(draw_at(3540.).data() != draw_at(3539.).data());
+    }
+
+    #[test]
+    fn a_running_compaction_redraws_every_ten_seconds_not_every_second() {
+        let draw_at = |elapsed: f64| {
+            let data = json!({"compacting": {"elapsed": elapsed, "usual": {"high": 120}}});
+            let c = Composition::build(&data, &json!({"id":"compacting"}), 1000.);
+            draw(&c, 704, 986, Theme::Light, Open::default(), false)
+                .expect("instrument draws")
+                .0
+        };
+        // Each repaint re-uploads the whole picture, and the terminal blanks it meanwhile.
+        assert!(draw_at(41.).data() == draw_at(49.).data());
+        assert!(draw_at(49.).data() != draw_at(50.).data());
+    }
+
+    #[test]
+    fn a_fresh_age_reads_under_a_minute_instead_of_ticking_seconds() {
+        assert_eq!(age_span(3.), "<1m");
+        assert_eq!(age_span(59.), "<1m");
+        assert_eq!(age_span(60.), "1m");
     }
 }

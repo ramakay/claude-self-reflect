@@ -1054,7 +1054,7 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
             ],
         ),
         ("04-band", vec!["♻ ~1 prompt · 28 calls"]),
-        ("05-compacting", vec!["Compacting · 12s of ~45s"]),
+        ("05-compacting", vec!["Compacting · 10s of ~45s"]),
         (
             "06-after",
             vec![

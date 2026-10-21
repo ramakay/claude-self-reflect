@@ -56,7 +56,7 @@
 dreamer 14k of 40k
 The last look found nothing. 5 of 5 looks end this way.
 3 notes kept · 2 findings confirmed · 1 fact retired
-Story · refreshed 30s ago
+Story · refreshed <1m ago
 Text parity is ready for review.
 ~ reader.rs · read ⌗8e4e3f27
 + render/instrument.rs · meta ⌗7625eed7
