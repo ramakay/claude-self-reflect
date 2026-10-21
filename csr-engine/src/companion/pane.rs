@@ -777,10 +777,9 @@ impl Pane {
         self.acts = instrument::acts(composition, cols);
         // Answer placement follows the rendered rows, including wrapped metadata.
         if let Some((row, act)) = self.acts.iter().next().map(|(r, a)| (*r, a.clone())) {
-            if let Some(actual) = semantic
-                .iter()
-                .position(|line| line.starts_with("1 helpful") || line.starts_with("1 Turn dreams"))
-            {
+            if let Some(actual) = semantic.iter().position(|line| {
+                line.starts_with("1 helpful") || line.starts_with("Press 1 to turn dreams")
+            }) {
                 self.acts.remove(&row);
                 self.acts.insert(actual, act);
             }

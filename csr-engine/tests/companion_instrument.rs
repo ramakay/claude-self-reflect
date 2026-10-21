@@ -423,7 +423,19 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
     if state == "08-offer" {
         assert_eq!(metrics.question_lines.join(" "), "Turn dreams on.");
         assert!(text.iter().any(|l| l.contains("Ask about past work.")));
-        assert!(text
+        let cta = "Press 1 to turn dreams on in all your sessions.";
+        assert_eq!(
+            text.iter()
+                .flat_map(|l| l.split_whitespace())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .matches(cta)
+                .count(),
+            1,
+            "{state}: CTA must appear once: {text:?}"
+        );
+        assert!(!text.iter().any(|l| l.contains("1 Turn dreams on")));
+        assert!(!text
             .iter()
             .any(|l| l.contains("Press 1: dreams on in all your sessions.")));
     }
@@ -925,8 +937,7 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
             "08-offer",
             vec![
                 "Turn dreams on.",
-                "1 Turn dreams on",
-                "Press 1: dreams on in all your sessions.",
+                "Press 1 to turn dreams on in all your sessions.",
                 "Ask about past work. CSR finds it.",
                 "dreamer 9k of 40k",
             ],
@@ -995,7 +1006,20 @@ fn offer_hotkey_enables_dreams_on_one_press_in_private_home() {
         .map(|l| text::plain(l))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(shown.contains("1 Turn dreams on"), "{shown}");
+    let shown = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        shown.contains("Press 1 to turn dreams on in all your sessions."),
+        "{shown}"
+    );
+    assert!(!shown.contains("1 Turn dreams on"), "{shown}");
+    assert!(!shown.contains("Press 1: dreams on"), "{shown}");
+    assert_eq!(
+        shown
+            .matches("Press 1 to turn dreams on in all your sessions.")
+            .count(),
+        1,
+        "CTA once: {shown}"
+    );
     assert!(pane
         .acts
         .values()
@@ -1228,6 +1252,97 @@ fn collapsed_context_centres_exact_group_with_bottom_clearance() {
         assert!(metrics.last_card_bottom_pad >= 10.);
         let _ = cx;
     }
+}
+
+#[test]
+fn mid_height_context_uses_side_ring_and_small_gauges() {
+    for state in ["06-after", "07-away", "08-offer"] {
+        for (cols, rows) in [(44, 30), (60, 40)] {
+            for theme in [Theme::Dark, Theme::Light] {
+                let (_home, paths) = state_home(state);
+                let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+                pane.pixels = true;
+                pane.enable_cards();
+                pane.theme = theme;
+                pane.frame(cols, rows, NOW);
+                let metrics = pane.instrument_metrics.as_ref().unwrap();
+                let mid = metrics
+                    .mid_layout
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{state} {cols}x{rows} {theme:?}: expected mid layout, got ring={:?} fig={:?}", metrics.ring_bounds, metrics.figure_region));
+                assert!(
+                    metrics.ring_bounds.is_none(),
+                    "{state} {cols}x{rows}: mid must not use full scaled ring"
+                );
+                let (fig_y, fig_h) = metrics.figure_region;
+                assert!(
+                    fig_h > 110.5,
+                    "{state} {cols}x{rows}: card {fig_h} should be above strip height"
+                );
+                let (_, _, r) = mid.ring;
+                let expected = mid.radius_inner.clamp(25., 64.);
+                assert!(
+                    (r - expected).abs() < 0.05,
+                    "{state} {cols}x{rows}: r={r} != clamp(25, {}, 64)={expected}",
+                    mid.radius_inner
+                );
+                assert!(
+                    mid.gauge_r >= 16. - 0.01 && mid.gauge_r <= 20. + 0.01,
+                    "{state}: gauge_r {}",
+                    mid.gauge_r
+                );
+                let (gt, gb) = mid.group;
+                let title_bottom = fig_y + 22. + 14. - 2.; // title content boundary
+                let card_bottom = fig_y + fig_h;
+                let top_band = gt - title_bottom;
+                let bottom_band = (card_bottom - 24.) - gb;
+                assert!(
+                    top_band <= 24. + 0.5 && bottom_band <= 24. + 0.5,
+                    "{state} {cols}x{rows}: empty bands top={top_band} bottom={bottom_band}"
+                );
+                assert!(
+                    gb <= card_bottom - 24. + 0.5,
+                    "{state}: group bottom {gb} vs card {card_bottom}"
+                );
+                let ring_right = mid.ring.0 + mid.ring.2;
+                assert!(
+                    mid.gauges_left >= ring_right + 8. - 0.5,
+                    "{state}: gauges overlap ring: left={} ring_right={ring_right}",
+                    mid.gauges_left
+                );
+                assert!(
+                    mid.gauge_label_y + 2. <= mid.details_y,
+                    "{state}: gauge labels overlap details"
+                );
+                assert!(mid.details_y <= gb + 0.5, "{state}: details below group");
+                let slot = (card_bottom - 24. - title_bottom).max(0.);
+                let group_h = gb - gt;
+                assert!(
+                    group_h >= slot * 0.45 || group_h >= 2. * r - 0.5,
+                    "{state} {cols}x{rows}: mid group underuses card: group_h={group_h} slot={slot}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn offer_cta_appears_once_without_legacy_phrases() {
+    let (_home, paths) = state_home("08-offer");
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 44, 30));
+    pane.pixels = false;
+    let shown = pane
+        .frame(44, 30, NOW)
+        .iter()
+        .map(|l| text::plain(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let shown = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cta = "Press 1 to turn dreams on in all your sessions.";
+    assert_eq!(shown.matches(cta).count(), 1, "{shown}");
+    assert!(shown.contains("Turn dreams on."), "{shown}");
+    assert!(!shown.contains("1 Turn dreams on"), "{shown}");
+    assert!(!shown.contains("Press 1: dreams on"), "{shown}");
 }
 
 #[test]

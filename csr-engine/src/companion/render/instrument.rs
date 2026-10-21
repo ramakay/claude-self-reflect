@@ -416,8 +416,9 @@ fn status_line(c: &Composition) -> String {
     if let Some(notice) = &c.offer_notice {
         return notice.clone();
     }
+    // Offer CTA owns the enable instruction; status stays empty while the offer is up.
     if c.offer {
-        return "Press 1: dreams on in all your sessions.".into();
+        return String::new();
     }
     match c.dream.state {
         Batch::Nothing if c.dream.looks > 0 => format!(
@@ -661,10 +662,13 @@ pub fn rows_with_figure(
     }
     out.extend(hero);
     if c.offer {
-        out.extend(wrap("1 Turn dreams on"));
+        out.extend(wrap("Press 1 to turn dreams on in all your sessions."));
     }
     if c.dream.state != Batch::Ready {
-        out.extend(wrap(&status_line(c)));
+        let status = status_line(c);
+        if !status.is_empty() {
+            out.extend(wrap(&status));
+        }
     }
     if c.asked_away {
         out.extend(wrap("asked while you were away"));
@@ -1004,6 +1008,8 @@ pub struct Metrics {
     pub ring_group: Option<(f32, f32)>,
     /// `available_height` fed to `r = clamp(78, available_height/2.8, 118)` for the collapsed ring.
     pub ring_formula_avail: Option<f32>,
+    /// Mid-height Context layout bounds (side ring + small gauges). Absent for strip / full ring / expanded.
+    pub mid_layout: Option<MidLayoutBounds>,
     pub story_line_count: usize,
     /// Layout pt between the last card's bottom edge and the pixmap bottom (above the key row).
     pub last_card_bottom_pad: f32,
@@ -1404,9 +1410,21 @@ pub fn draw(
         }
         b += 21.;
     } else if c.offer {
-        let label = "1 Turn dreams on";
-        let w = canvas.text(f, label, IX, b, sans(11.5, t.medium), t.dream, A::L);
-        offer_hit = Some((b, IX, IX + w));
+        // One CTA: chip-styled "1" (same chip language as receipt keys) + the enable sentence.
+        let st = sans(11.5, t.medium);
+        let press_w = f.width("Press ", st) + 5.;
+        let key = "1";
+        let key_w = f.width(key, st);
+        let rest = " to turn dreams on in all your sessions.";
+        let rest_w = f.width(rest, st);
+        let mut x = IX;
+        canvas.text(f, "Press ", x, b, st, t.quiet, A::L);
+        x += press_w;
+        canvas.rrect(x - 4., b - 11., key_w + 8., 16., 8., t.chip);
+        canvas.text(f, key, x, b, st, t.dream, A::L);
+        x += key_w + 5.;
+        canvas.text(f, rest, x, b, st, t.quiet, A::L);
+        offer_hit = Some((b, IX, IX + press_w + key_w + 5. + rest_w));
         b += 21.;
     }
     if !status.is_empty() {
@@ -1610,20 +1628,33 @@ pub fn draw(
     let mut ring_bounds = None;
     let mut ring_group = None;
     let mut ring_formula_avail = None;
+    let mut mid_layout = None;
     // Keep >= 10pt between the last card and the pixmap bottom (key row sits under the picture).
     const LAST_CARD_PAD: f32 = 10.;
-    let figure_draw_h = if !active && help_h <= 0. {
+    let available_figure_h = if !active && help_h <= 0. {
         (height - y - LAST_CARD_PAD).max(figure_h)
     } else {
         figure_h
     };
+    let mid_card = !narrow
+        && !open.figure
+        && c.figure["ctx"]["tokens"].as_f64().is_some_and(|n| n > 0.)
+        && available_figure_h > 110.
+        && !collapsed_context_fits(&c.figure, available_figure_h);
+    // Keep the capped mid ring in an intrinsic card; surplus space belongs outside cards.
+    let figure_draw_h = if mid_card {
+        available_figure_h.min(186.)
+    } else {
+        available_figure_h
+    };
     let figure_region = (y, figure_draw_h);
     let fig_info = figure(&mut canvas, f, c, y, figure_draw_h, t, open.figure, narrow);
-    if let Some((cy, ring, group, avail)) = fig_info {
+    if let Some((cy, ring, group, avail, mid)) = fig_info {
         ceiling_y = cy;
         ring_bounds = ring;
         ring_group = group;
         ring_formula_avail = avail;
+        mid_layout = mid;
     }
     y += figure_draw_h;
     let needs_tail = active || help_h > 0.;
@@ -1632,7 +1663,7 @@ pub fn draw(
     }
     let agents_region = active.then_some((y, agents_h));
     if active {
-        let agents_draw_h = if help_h > 0. {
+        let agents_draw_h = if help_h > 0. || mid_card {
             agents_h
         } else {
             (height - y - LAST_CARD_PAD).max(agents_h)
@@ -1683,7 +1714,11 @@ pub fn draw(
         }
     }
     let help_region = (help_h > 0.).then(|| {
-        let h = (height - y - LAST_CARD_PAD).max(help_h);
+        let h = if mid_card {
+            help_h
+        } else {
+            (height - y - LAST_CARD_PAD).max(help_h)
+        };
         (y, h)
     });
     if let Some((help_y, help_draw_h)) = help_region {
@@ -1750,6 +1785,7 @@ pub fn draw(
             ring_bounds,
             ring_group,
             ring_formula_avail,
+            mid_layout,
             story_line_count,
             last_card_bottom_pad,
             height,
@@ -1758,13 +1794,47 @@ pub fn draw(
         },
     ))
 }
-/// (ceiling_y, ring_bounds, ring_group_top_bottom, ring_formula_avail)
+
+/// Mid-height Context card geometry for tests and space-usage checks.
+#[derive(Clone, Debug)]
+pub struct MidLayoutBounds {
+    /// Main context ring (cx, cy, radius).
+    pub ring: (f32, f32, f32),
+    /// Vertically centred content group top/bottom in layout pt.
+    pub group: (f32, f32),
+    /// Small quota/cache/Codex ring radius.
+    pub gauge_r: f32,
+    pub gauges_cy: f32,
+    /// Baseline of gauge code labels.
+    pub gauge_label_y: f32,
+    /// Compact trend/payback/by-CSR line baseline.
+    pub details_y: f32,
+    /// Unclamped `(h - title - 2P) / 2` before `clamp(25, …, 64)`.
+    pub radius_inner: f32,
+    /// Left edge of the first small gauge (for overlap checks vs the main ring).
+    pub gauges_left: f32,
+    /// Right edge of the last small gauge.
+    pub gauges_right: f32,
+}
+
+/// (ceiling_y, ring_bounds, ring_group_top_bottom, ring_formula_avail, mid_layout)
 type FigureInfo = (
     Option<f32>,
     Option<(f32, f32, f32)>,
     Option<(f32, f32)>,
     Option<f32>,
+    Option<MidLayoutBounds>,
 );
+
+fn collapsed_context_fits(g: &Value, h: f32) -> bool {
+    let title = P + if g["trend"].as_f64().is_some() {
+        34.
+    } else {
+        14.
+    };
+    let below_ring = 16. + 18. + 12. + 30. + 46. + 4.;
+    h - 24. - title + 0.5 >= 2. * (78. + 12.) + below_ring
+}
 
 /// Draw the figure card. Returns (ceiling_y, ring_bounds) for layout metrics.
 fn figure(
@@ -1781,88 +1851,16 @@ fn figure(
     let g = &data.figure;
     let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
     let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.);
-    // Collapsed scaled ring needs title + min_group (r=78) + 24pt label clearance.
-    let collapsed_scaled_fits = {
-        const GAP_RING_PAY: f32 = 16.;
-        const PAY_H: f32 = 18.;
-        const GAP_PAY_GAUGE: f32 = 12.;
-        const GAUGE_R: f32 = 30.;
-        const LABEL_BELOW: f32 = 46.;
-        const LABEL_DESCENT: f32 = 4.;
-        const FIXED_BELOW_RING: f32 =
-            GAP_RING_PAY + PAY_H + GAP_PAY_GAUGE + GAUGE_R + LABEL_BELOW + LABEL_DESCENT;
-        let title_bottom = if g["trend"].as_f64().is_some() {
-            y + P + 34.
-        } else {
-            y + P + 14.
-        };
-        let slot = ((y + h - 24.) - title_bottom).max(0.);
-        let min_group = 2. * (78. + 12.) + FIXED_BELOW_RING;
-        slot + 0.5 >= min_group
-    };
-    // Narrow panes, short cards, or a card too short for the min scaled group → compact side ring.
-    if narrow
-        || (h < 250. && tokens.is_some())
-        || (!expanded && tokens.is_some() && !collapsed_scaled_fits)
-    {
-        let lines = figure_lines(data);
-        let ctx = tokens;
-        let mut x = IX;
-        if let (Some(n), Some(size)) = (ctx, size) {
-            let (cx, cy) = (IX + 28., y + h / 2.);
-            let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
-            if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64())
-            {
-                segs.push(((low / size) as f32, (high / size) as f32, t.band));
-            }
-            c.ring(cx, cy, 25., t.ring, t.track, &segs);
-            c.text(f, &short(n), cx, cy, serif(14., t.medium), t.ink, A::M);
-            c.text(
-                f,
-                &format!("of {}", short(size)),
-                cx,
-                cy + 13.,
-                sans(8., t.regular),
-                t.quiet,
-                A::M,
-            );
-            x += 72.;
-        }
-        for (k, line) in lines.iter().enumerate() {
-            let line = if k == 0 && ctx.is_some() {
-                line.split(" · ").skip(1).collect::<Vec<_>>().join(" · ")
-            } else {
-                line.clone()
-            };
-            single(
-                c,
-                f,
-                &line,
-                x,
-                y + P + 10. + k as f32 * 24.,
-                W - x - P - M,
-                11.5,
-                t.ink,
-                t,
-            );
-        }
-        for (i, q) in array(&g["quotas"])
-            .iter()
-            .filter(|q| q["used"].is_number())
-            .enumerate()
-        {
-            let bx = x + i as f32 * 100.;
-            c.rrect(bx, y + h - 17., 80., 3., 1.5, t.track);
-            c.rrect(
-                bx,
-                y + h - 17.,
-                80. * (num(&q["used"]) / 100.).clamp(0., 1.) as f32,
-                3.,
-                1.5,
-                t.sky,
-            );
-        }
-        return Some((None, None, None, None));
+    let collapsed_scaled_fits = collapsed_context_fits(g, h);
+    // Strip only for narrow panes or truly strip-height cards. Mid-height cards get their own layout.
+    const STRIP_H: f32 = 110.;
+    let use_strip = tokens.is_some() && (narrow || h <= STRIP_H);
+    let use_mid = tokens.is_some() && !expanded && !use_strip && !collapsed_scaled_fits;
+    if use_strip {
+        return Some(draw_context_strip(c, f, data, y, h, t, tokens, size));
+    }
+    if use_mid {
+        return Some(draw_context_mid(c, f, data, y, h, t, tokens, size));
     }
     let mut ceiling_y = None;
     let mut ring_bounds = None;
@@ -2229,7 +2227,362 @@ fn figure(
             A::M,
         );
     }
-    Some((ceiling_y, ring_bounds, ring_group, ring_formula_avail))
+    Some((ceiling_y, ring_bounds, ring_group, ring_formula_avail, None))
+}
+
+/// Compact side-ring strip for narrow panes or cards ≤ ~110 pt.
+fn draw_context_strip(
+    c: &mut Canvas,
+    f: &Fonts,
+    data: &Composition,
+    y: f32,
+    h: f32,
+    t: &Tokens,
+    tokens: Option<f64>,
+    size: Option<f64>,
+) -> FigureInfo {
+    let g = &data.figure;
+    let lines = figure_lines(data);
+    let ctx = tokens;
+    let mut x = IX;
+    if let (Some(n), Some(size)) = (ctx, size) {
+        let (cx, cy) = (IX + 28., y + h / 2.);
+        let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
+        if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64()) {
+            segs.push(((low / size) as f32, (high / size) as f32, t.band));
+        }
+        c.ring(cx, cy, 25., t.ring, t.track, &segs);
+        c.text(f, &short(n), cx, cy, serif(14., t.medium), t.ink, A::M);
+        c.text(
+            f,
+            &format!("of {}", short(size)),
+            cx,
+            cy + 13.,
+            sans(8., t.regular),
+            t.quiet,
+            A::M,
+        );
+        x += 72.;
+    }
+    for (k, line) in lines.iter().enumerate() {
+        let line = if k == 0 && ctx.is_some() {
+            line.split(" · ").skip(1).collect::<Vec<_>>().join(" · ")
+        } else {
+            line.clone()
+        };
+        single(
+            c,
+            f,
+            &line,
+            x,
+            y + P + 10. + k as f32 * 24.,
+            W - x - P - M,
+            11.5,
+            t.ink,
+            t,
+        );
+    }
+    for (i, q) in array(&g["quotas"])
+        .iter()
+        .filter(|q| q["used"].is_number())
+        .enumerate()
+    {
+        let bx = x + i as f32 * 100.;
+        c.rrect(bx, y + h - 17., 80., 3., 1.5, t.track);
+        c.rrect(
+            bx,
+            y + h - 17.,
+            80. * (num(&q["used"]) / 100.).clamp(0., 1.) as f32,
+            3.,
+            1.5,
+            t.sky,
+        );
+    }
+    (None, None, None, None, None)
+}
+
+/// Mid-height Context: left ring + right small gauges + compact details, vertically centred.
+fn draw_context_mid(
+    c: &mut Canvas,
+    f: &Fonts,
+    data: &Composition,
+    y: f32,
+    h: f32,
+    t: &Tokens,
+    tokens: Option<f64>,
+    size: Option<f64>,
+) -> FigureInfo {
+    let g = &data.figure;
+    const TITLE: f32 = 14.;
+    const BOTTOM_CLEAR: f32 = 24.;
+    label(c, f, "Context", IX, y + P, 13., t.ink, t.bold);
+    if let Some((line, sev)) = csr_status(g) {
+        let col = if sev == "red" { t.risk } else { t.amber };
+        c.circle(IX + 87., y + P - 4., 2.5, col);
+        single(c, f, &line, IX + 95., y + P, 230., 10., t.quiet, t);
+    }
+    let (Some(n), Some(size)) = (tokens, size) else {
+        return (None, None, None, None, None);
+    };
+    let radius_inner = (h - TITLE - 2. * P) / 2.;
+    let r = radius_inner.clamp(25., 64.);
+
+    let mut satellites: Vec<_> = array(&g["quotas"])
+        .iter()
+        .filter(|q| q["used"].is_number())
+        .collect();
+    satellites.sort_by_key(|q| if q["code"] == "5H" { 0 } else { 1 });
+    let codex = data.codex_week["percent"].as_f64();
+    let cache = g["cache"]["left"].is_number() || g["cache"]["cold"] == true;
+    let count = satellites.len() + usize::from(cache) + usize::from(codex.is_some());
+
+    let title_bottom = y + P + TITLE - 2.;
+    let slot_bottom = y + h - BOTTOM_CLEAR;
+    let slot = (slot_bottom - title_bottom).max(0.);
+    let gauge_r = (r * 0.32).clamp(16., 20.);
+
+    let label_below = gauge_r + 12.;
+    let details_gap = 10.;
+    let details_h = 6.;
+    let right_h = gauge_r + label_below + details_gap + details_h;
+    let group_h = (2. * r).max(right_h);
+    let group_top = title_bottom + (slot - group_h).max(0.) / 2.;
+    let group_bottom = group_top + group_h;
+    let ring_cx = IX + r;
+    let ring_cy = group_top + group_h / 2.;
+
+    let right_x0 = ring_cx + r + 18.;
+    let right_w = (W - M - P - right_x0).max(80.);
+    let right_top = group_top + (group_h - right_h).max(0.) / 2.;
+    let gauges_cy = right_top + gauge_r;
+    let gauge_label_y = gauges_cy + label_below;
+    let details_y = gauge_label_y + details_gap + 2.;
+
+    let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
+    if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64()) {
+        segs.push(((low / size) as f32, (high / size) as f32, t.band));
+    }
+    c.ring(ring_cx, ring_cy, r, t.ring, t.track, &segs);
+    if let Some(trend) = g["trend"].as_f64() {
+        c.tick(
+            ring_cx,
+            ring_cy,
+            r - 3.,
+            r + 4.,
+            ((n + trend) / size).clamp(0., 1.) as f32,
+            t.thin_ring,
+            t.mint,
+        );
+    }
+    let num_size = (r * 0.56).clamp(12., 28.);
+    c.text(
+        f,
+        &short(n),
+        ring_cx,
+        ring_cy + 5.,
+        serif(num_size, t.medium),
+        t.ink,
+        A::M,
+    );
+    c.text(
+        f,
+        &format!("of {}", short(size)),
+        ring_cx,
+        ring_cy + num_size * 0.55 + 4.,
+        sans((r * 0.28).clamp(7.5, 11.), t.medium),
+        t.quiet,
+        A::M,
+    );
+
+    let step = if count == 0 {
+        0.
+    } else {
+        (right_w / count as f32).clamp(36., 72.)
+    };
+    let gauges_span = if count == 0 {
+        0.
+    } else {
+        step * (count as f32 - 1.)
+    };
+    let gauges_origin = right_x0 + ((right_w - gauges_span).max(0.) / 2.).min(step * 0.35);
+    let mut gauges_left = gauges_origin;
+    let mut gauges_right = gauges_origin;
+
+    for (i, q) in satellites.iter().enumerate() {
+        let x = gauges_origin + i as f32 * step;
+        gauges_left = gauges_left.min(x - gauge_r);
+        gauges_right = gauges_right.max(x + gauge_r);
+        let v = num(&q["used"]);
+        c.ring(
+            x,
+            gauges_cy,
+            gauge_r,
+            t.ring,
+            t.track,
+            &[(0., (v / 100.).clamp(0., 1.) as f32, t.sky)],
+        );
+        let pct = format!("{v:.0}%");
+        c.text(
+            f,
+            &pct,
+            x,
+            gauges_cy + 3.,
+            serif((gauge_r * 0.7).clamp(8., 12.), t.medium),
+            t.ink,
+            A::M,
+        );
+        let pace = q["pace"].as_f64().is_some_and(|p| v / 100. > p);
+        c.text(
+            f,
+            &format!("{}{}", string(&q["code"]), if pace { " »" } else { "" }),
+            x,
+            gauge_label_y,
+            sans(9., t.medium),
+            if pace { t.dream } else { t.quiet },
+            A::M,
+        );
+    }
+    let mut slot_i = satellites.len();
+    if let Some(left) = g["cache"]["left"]
+        .as_f64()
+        .or_else(|| (g["cache"]["cold"] == true).then_some(0.))
+    {
+        let x = gauges_origin + slot_i as f32 * step;
+        gauges_left = gauges_left.min(x - gauge_r);
+        gauges_right = gauges_right.max(x + gauge_r);
+        let cold = g["cache"]["cold"] == true || left <= 0.;
+        let ttl = g["cache"]["ttl"].as_f64().unwrap_or(3600.);
+        c.ring(
+            x,
+            gauges_cy,
+            gauge_r,
+            t.ring,
+            t.track,
+            &[(
+                0.,
+                (left / ttl).clamp(0., 1.) as f32,
+                if cold { t.amber } else { t.mint },
+            )],
+        );
+        c.text(
+            f,
+            &if cold {
+                "COLD".into()
+            } else {
+                masthead::span(left)
+            },
+            x,
+            gauges_cy + 3.,
+            serif((gauge_r * 0.65).clamp(7.5, 11.), t.medium),
+            t.ink,
+            A::M,
+        );
+        c.text(
+            f,
+            if cold {
+                string(&g["cache"]["long"])
+                    .strip_prefix("COLD · ")
+                    .unwrap_or("◷ cache")
+            } else {
+                "◷ cache"
+            },
+            x,
+            gauge_label_y,
+            sans(9., t.medium),
+            t.quiet,
+            A::M,
+        );
+        slot_i += 1;
+    }
+    if let Some(v) = codex {
+        let x = gauges_origin + slot_i as f32 * step;
+        gauges_left = gauges_left.min(x - gauge_r);
+        gauges_right = gauges_right.max(x + gauge_r);
+        c.ring(
+            x,
+            gauges_cy,
+            gauge_r,
+            t.ring,
+            t.track,
+            &[(0., (v / 100.).clamp(0., 1.) as f32, t.asked)],
+        );
+        c.text(
+            f,
+            &format!("{v:.0}%"),
+            x,
+            gauges_cy + 3.,
+            serif((gauge_r * 0.7).clamp(8., 12.), t.medium),
+            t.ink,
+            A::M,
+        );
+        c.text(
+            f,
+            "Codex 7D",
+            x,
+            gauge_label_y,
+            sans(9., t.medium),
+            t.quiet,
+            A::M,
+        );
+    }
+
+    let mut details = Vec::new();
+    if let Some(trend) = g["trend"].as_f64() {
+        details.push(format!(
+            "{}{}/turn",
+            if trend >= 0. { "+" } else { "−" },
+            short(trend.abs())
+        ));
+    }
+    let pay = payback(g);
+    if !pay.is_empty() {
+        details.push(pay);
+    }
+    if let Some(n) = data.tally["by_csr"].as_u64().filter(|n| *n > 0) {
+        details.push(format!("{n} by CSR"));
+    }
+    if !details.is_empty() {
+        let line = details.join(" · ");
+        let col = if g["payback"]["sev"] == "amber" {
+            t.amber
+        } else if g["compacting"].is_object() {
+            t.mint
+        } else {
+            t.quiet
+        };
+        single(c, f, &line, right_x0, details_y, right_w, 10.5, col, t);
+    }
+    if g["compacting"].is_object() {
+        if let Some(high) = g["compacting"]["usual"]["high"]
+            .as_f64()
+            .filter(|n| *n > 0.)
+        {
+            let bar_y = details_y + 8.;
+            let bar_w = right_w.min(120.);
+            c.rrect(right_x0, bar_y, bar_w, 3., 1.5, t.track);
+            c.rrect(
+                right_x0,
+                bar_y,
+                bar_w * (num(&g["compacting"]["elapsed"]) / high).clamp(0., 1.) as f32,
+                3.,
+                1.5,
+                t.mint,
+            );
+        }
+    }
+
+    let mid = MidLayoutBounds {
+        ring: (ring_cx, ring_cy, r),
+        group: (group_top, group_bottom),
+        gauge_r,
+        gauges_cy,
+        gauge_label_y,
+        details_y,
+        radius_inner,
+        gauges_left,
+        gauges_right,
+    };
+    (None, None, None, None, Some(mid))
 }
 
 /// Click rows are derived from the same live composition used by both renderers.
