@@ -17,7 +17,7 @@
 [48;2;18;20;23m[38;2;242;244;246mbusy?                                         [0m
 [48;2;18;20;23m[38;2;242;244;246m1 helpful · 2 thought of it · 3 not relevant  [0m
 [48;2;18;20;23m[38;2;242;244;246m4 ask Claude                                  [0m
-[48;2;18;20;23m[38;2;242;244;246mStory · refreshed 30s ago                     [0m
+[48;2;18;20;23m[38;2;242;244;246mStory · refreshed <1m ago                     [0m
 [48;2;18;20;23m[38;2;242;244;246mText parity is ready for review.              [0m
 [48;2;18;20;23m[38;2;242;244;246m~ csr-engine/src/companion/reader.rs · read   [0m
 [48;2;18;20;23m[38;2;242;244;246m⌗8e4e3f27                                     [0m

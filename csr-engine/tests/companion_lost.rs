@@ -365,9 +365,9 @@ fn the_pane_draws_at_once_when_a_compaction_ends() {
     // none yet: nothing to end
     draw(&mut pane, NOW);
     assert!(!pane.compaction_gone());
-    let marker = compacting_marker(&paths, "sess-fresh", NOW - 5.);
+    let marker = compacting_marker(&paths, "sess-fresh", NOW - 15.);
     let running = screen(&draw(&mut pane, NOW));
-    assert!(running.contains("Compacting · 5s"), "{running}");
+    assert!(running.contains("Compacting · 10s"), "{running}");
     assert!(!pane.compaction_gone());
     // the marker goes: the watch loop is told before its next tick
     fs::remove_file(&marker).unwrap();
