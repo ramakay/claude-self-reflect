@@ -3,15 +3,14 @@
 // rounded rects, gradients, glass, thin rings with round caps, dotted rings,
 // antialiased text with baseline snapping, ink measurement, wrapping, contact sheet.
 #![allow(dead_code, clippy::too_many_arguments)]
-use super::instrument_icons;
+use super::{instrument_icons, theme};
 use ab_glyph::{point, Font, FontVec, GlyphId, ScaleFont, VariableFont};
 use image::{codecs::png::PngEncoder, ImageEncoder};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use tiny_skia::{
-    Color, FillRule, FilterQuality, GradientStop, IntSize, LineCap, LinearGradient, Paint, Path,
-    PathBuilder, Pattern, Pixmap, PixmapPaint, Point, RadialGradient, Rect, Shader, SpreadMode,
-    Stroke, Transform,
+    Color, FillRule, GradientStop, IntSize, LineCap, LinearGradient, Paint, Path, PathBuilder,
+    Pixmap, PixmapPaint, Point, RadialGradient, Rect, Shader, SpreadMode, Stroke, Transform,
 };
 
 pub const S: f32 = 2.0; // retina: 1 pt = 2 px
@@ -605,6 +604,107 @@ pub fn radial(cx: f32, cy: f32, r: f32, sx: f32, sy: f32, s: &[(f32, Rgba)]) -> 
     .unwrap()
 }
 
+type ShadowKey = (u32, u32, u32, u32);
+struct ShadowMask {
+    width: usize,
+    height: usize,
+    pad: i32,
+    alpha: Vec<u8>,
+}
+type ShadowCache = Vec<(ShadowKey, std::sync::Arc<ShadowMask>)>;
+static SHADOW_MASKS: std::sync::LazyLock<std::sync::Mutex<ShadowCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Three separable box passes approximate a Gaussian. Sliding sums make each pass O(pixels).
+fn blur_alpha(alpha: &mut [u8], width: usize, height: usize, radius: usize) {
+    if radius == 0 {
+        return;
+    }
+    let mut temp = vec![0; alpha.len()];
+    let divisor = (2 * radius + 1) as u32;
+    for _ in 0..3 {
+        for y in 0..height {
+            let row = y * width;
+            let mut sum: u32 = (0..=radius.min(width - 1))
+                .map(|x| u32::from(alpha[row + x]))
+                .sum();
+            for x in 0..width {
+                temp[row + x] = ((sum + divisor / 2) / divisor) as u8;
+                if x >= radius {
+                    sum -= u32::from(alpha[row + x - radius]);
+                }
+                if x + radius + 1 < width {
+                    sum += u32::from(alpha[row + x + radius + 1]);
+                }
+            }
+        }
+        for x in 0..width {
+            let mut sum: u32 = (0..=radius.min(height - 1))
+                .map(|y| u32::from(temp[y * width + x]))
+                .sum();
+            for y in 0..height {
+                alpha[y * width + x] = ((sum + divisor / 2) / divisor) as u8;
+                if y >= radius {
+                    sum -= u32::from(temp[(y - radius) * width + x]);
+                }
+                if y + radius + 1 < height {
+                    sum += u32::from(temp[(y + radius + 1) * width + x]);
+                }
+            }
+        }
+    }
+}
+
+fn shadow_mask(w: f32, h: f32, corner: f32, blur: f32) -> std::sync::Arc<ShadowMask> {
+    let key = (
+        (w * S).round() as u32,
+        (h * S).round() as u32,
+        (corner * S).round() as u32,
+        (blur * S / 2.).round() as u32,
+    );
+    let mut cache = SHADOW_MASKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
+        let entry = cache.remove(i);
+        let result = entry.1.clone();
+        cache.push(entry);
+        return result;
+    }
+    let pad = key.3 * 3 + 1;
+    let (width, height) = (key.0 + pad * 2, key.1 + pad * 2);
+    let mut mask = Pixmap::new(width, height).expect("card shadow mask");
+    let path = rrect_path(
+        pad as f32,
+        pad as f32,
+        key.0 as f32,
+        key.1 as f32,
+        key.2 as f32,
+    );
+    mask.fill_path(
+        &path,
+        &paint(theme::OPAQUE_WHITE),
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+    let mut alpha = mask
+        .data()
+        .chunks_exact(4)
+        .map(|p| p[3])
+        .collect::<Vec<_>>();
+    blur_alpha(&mut alpha, width as usize, height as usize, key.3 as usize);
+    let result = std::sync::Arc::new(ShadowMask {
+        width: width as usize,
+        height: height as usize,
+        pad: pad as i32,
+        alpha,
+    });
+    if cache.len() >= 32 {
+        cache.remove(0);
+    }
+    cache.push((key, result.clone()));
+    result
+}
+
 impl Canvas {
     pub fn new(w_pt: f32, h_pt: f32) -> Canvas {
         Canvas {
@@ -767,50 +867,72 @@ impl Canvas {
         self.line(x0, y0, x1, y1, w, col);
     }
 
-    /// Frosted glass: blur what is under the rounded rect, then lay a tint over it.
+    /// The mesh already varies over hundreds of points, so no per-card backdrop blur is needed.
     pub fn glass(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, tint: Shader<'static>) {
+        self.rrect_sh(x, y, w, h, r, tint);
+    }
+
+    pub fn background(&mut self, t: &theme::Tokens) {
+        let (w, h) = (self.pm.width() as f32 / S, self.pm.height() as f32 / S);
+        self.pm.fill(color(t.ground));
+        let full = rrect_path(0., 0., w, h, 0.);
+        let diagonal = w.hypot(h);
+        for ((x, y, radius), stops) in [
+            (-0.15 * w, -0.10 * h, 0.9 * diagonal),
+            (1.15 * w, 0.45 * h, diagonal),
+            (0.45 * w, 1.10 * h, 1.1 * diagonal),
+        ]
+        .into_iter()
+        .zip(t.aurora)
+        {
+            self.fill_shader(&full, radial(x, y, radius, 1., 1., stops));
+        }
+    }
+
+    /// Outer shadows are clipped to the pixmap, whose height excludes the terminal key row.
+    pub fn shadow(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, shadow: theme::Shadow) {
         if self.dry {
             return;
         }
-        let pad = 24i32;
+        let mask = shadow_mask(w, h, r, shadow.blur);
+        let ox = (x * S).round() as i32 - mask.pad;
+        let oy = ((y + shadow.y) * S).round() as i32 - mask.pad;
         let (pw, ph) = (self.pm.width() as i32, self.pm.height() as i32);
-        let x0 = ((x * S) as i32 - pad).max(0);
-        let y0 = ((y * S) as i32 - pad).max(0);
-        let x1 = (((x + w) * S) as i32 + pad).min(pw);
-        let y1 = (((y + h) * S) as i32 + pad).min(ph);
-        let (bw, bh) = ((x1 - x0) as u32, (y1 - y0) as u32);
-        if let Some(part) = self
-            .pm
-            .clone_rect(tiny_skia::IntRect::from_xywh(x0, y0, bw, bh).unwrap())
-        {
-            let img = image::RgbaImage::from_raw(bw, bh, part.data().to_vec()).unwrap();
-            let small = image::imageops::resize(
-                &img,
-                (bw / 8).max(1),
-                (bh / 8).max(1),
-                image::imageops::FilterType::Triangle,
-            );
-            let big =
-                image::imageops::resize(&small, bw, bh, image::imageops::FilterType::Triangle);
-            let blurred =
-                Pixmap::from_vec(big.into_raw(), IntSize::from_wh(bw, bh).unwrap()).unwrap();
-            let pat = Pattern::new(
-                blurred.as_ref(),
-                SpreadMode::Pad,
-                FilterQuality::Bilinear,
-                1.0,
-                Transform::from_translate(x0 as f32, y0 as f32),
-            );
-            let p = rrect_path(x * S, y * S, w * S, h * S, r * S);
-            let pt = Paint {
-                shader: pat,
-                anti_alias: true,
-                ..Paint::default()
-            };
-            self.pm
-                .fill_path(&p, &pt, FillRule::Winding, Transform::identity(), None);
+        let data = self.pm.data_mut();
+        for my in 0..mask.height {
+            let py = oy + my as i32;
+            if py < 0 || py >= ph {
+                continue;
+            }
+            for mx in 0..mask.width {
+                let px = ox + mx as i32;
+                if px < 0 || px >= pw {
+                    continue;
+                }
+                // CSS-style outer shadow: don't darken the glass's interior backdrop.
+                let lx = (px as f32 + 0.5) / S - x;
+                let ly = (py as f32 + 0.5) / S - y;
+                if lx >= 0. && ly >= 0. && lx <= w && ly <= h {
+                    let dx = (r - lx).max(lx - (w - r)).max(0.);
+                    let dy = (r - ly).max(ly - (h - r)).max(0.);
+                    if dx * dx + dy * dy <= r * r {
+                        continue;
+                    }
+                }
+                let a = f32::from(mask.alpha[my * mask.width + mx]) / 255.
+                    * f32::from(shadow.color[3])
+                    / 255.;
+                if a <= 0. {
+                    continue;
+                }
+                let i = ((py * pw + px) * 4) as usize;
+                for k in 0..3 {
+                    data[i + k] = (f32::from(shadow.color[k]) * a
+                        + f32::from(data[i + k]) * (1. - a))
+                        .round() as u8;
+                }
+            }
         }
-        self.rrect_sh(x, y, w, h, r, tint);
     }
 
     /// Draw text; `base` is the baseline in pt. Returns advance in pt.
@@ -1093,5 +1215,41 @@ mod bundled_font_tests {
             }
         }
         assert!(fonts.used.borrow().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::*;
+    #[test]
+    fn box_blur_spreads_symmetrically_and_reuses_size_masks() {
+        let mut alpha = vec![0; 31 * 31];
+        alpha[15 * 31 + 15] = 255;
+        blur_alpha(&mut alpha, 31, 31, 2);
+        assert!(alpha[15 * 31 + 14] > 0);
+        for y in 0..31 {
+            for x in 0..31 {
+                assert_eq!(alpha[y * 31 + x], alpha[y * 31 + 30 - x]);
+                assert_eq!(alpha[y * 31 + x], alpha[(30 - y) * 31 + x]);
+            }
+        }
+        let a = shadow_mask(200., 120., 24., 18.);
+        let b = shadow_mask(200., 120., 24., 18.);
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+    }
+    #[test]
+    fn shadows_clip_at_pane_edges_and_leave_glass_interior_untouched() {
+        let mut canvas = Canvas::new(120., 100.);
+        canvas.background(&theme::DARK);
+        let before = canvas.pm.clone();
+        canvas.shadow(4., 4., 112., 92., 16., theme::DARK.ambient_shadow);
+        let centre = ((50 * 2) * canvas.pm.width() as usize + 60 * 2) * 4;
+        assert_eq!(
+            &before.data()[centre..centre + 4],
+            &canvas.pm.data()[centre..centre + 4]
+        );
+        assert_ne!(before.data(), canvas.pm.data());
+        assert_eq!(canvas.pm.width(), 240);
+        assert_eq!(canvas.pm.height(), 200);
     }
 }

@@ -885,12 +885,14 @@ fn label(c: &mut Canvas, f: &Fonts, s: &str, x: f32, y: f32, size: f32, col: Rgb
     c.text(f, &icons::line(s), x, y, sans(size, w), col, A::L);
 }
 fn panel(c: &mut Canvas, y: f32, h: f32, t: &Tokens) {
+    c.shadow(M, y, CW, h, 24., t.ambient_shadow);
+    c.shadow(M, y, CW, h, 24., t.contact_shadow);
     c.glass(
         M,
         y,
         CW,
         h,
-        28.,
+        24.,
         lin(
             0.,
             y,
@@ -899,7 +901,15 @@ fn panel(c: &mut Canvas, y: f32, h: f32, t: &Tokens) {
             &[(t.linear_at[0], t.glass[0]), (t.linear_at[1], t.glass[1])],
         ),
     );
-    c.rrect_line(M, y, CW, h, 28., t.hair, t.hair_width);
+    c.rrect_line(M, y, CW, h, 24., t.hair, t.hair_width);
+    c.line(
+        M + 24.,
+        y + 0.5 / S,
+        M + CW - 24.,
+        y + 0.5 / S,
+        1. / S,
+        t.top_highlight,
+    );
 }
 fn single(
     c: &mut Canvas,
@@ -1239,16 +1249,7 @@ pub fn draw(
     };
     let height = maxh;
     let mut canvas = Canvas::new(W, height);
-    // Subtle whole-pane vertical tint of the ground only — no local radial auroras in gaps.
-    let g0 = t.ground;
-    let g1 = [
-        g0[0].saturating_add(6),
-        g0[1].saturating_add(8),
-        g0[2].saturating_add(10),
-        g0[3],
-    ];
-    let full = rrect_path(0., 0., W, height, 0.);
-    canvas.fill_shader(&full, lin(0., 0., 0., height, &[(0., g0), (1., g1)]));
+    canvas.background(t);
     let mut y = M;
     panel(&mut canvas, y, hero_h, t);
     label(

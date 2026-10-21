@@ -36,6 +36,30 @@ pub fn wash(ink: Rgb, strength: f64) -> Rgb {
     super::text::blend(PAPER, ink, strength)
 }
 
+/// The Instrument's single spacing scale, in layout points.
+pub const S1: f32 = 4.;
+pub const S2: f32 = 8.;
+pub const S3: f32 = 12.;
+pub const S4: f32 = 16.;
+pub const S5: f32 = 24.;
+pub const S6: f32 = 32.;
+pub const ICON_GAP: f32 = 6.;
+pub const TITLE_SIZE: f32 = 13.;
+pub const TITLE_LINE: f32 = 18.;
+pub const BODY_SIZE: f32 = 12.5;
+pub const BODY_LINE: f32 = 18.;
+pub const CAPTION_SIZE: f32 = 10.5;
+pub const CAPTION_LINE: f32 = 14.;
+pub const CHIP_SIZE: f32 = 10.;
+pub const CHIP_LINE: f32 = 14.;
+
+#[derive(Clone, Copy)]
+pub struct Shadow {
+    pub y: f32,
+    pub blur: f32,
+    pub color: [u8; 4],
+}
+
 /// All appearance choices for the instrument composition. Adding a theme adds one set.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Theme(usize);
@@ -51,7 +75,10 @@ pub struct Tokens {
     pub ink: [u8; 4],
     pub quiet: [u8; 4],
     pub faint: [u8; 4],
-    pub aurora: [&'static [(f32, [u8; 4])]; 4],
+    pub aurora: [&'static [(f32, [u8; 4])]; 3],
+    pub ambient_shadow: Shadow,
+    pub contact_shadow: Shadow,
+    pub top_highlight: [u8; 4],
     pub linear_at: [f32; 2],
     pub glass: [[u8; 4]; 2],
     pub hair: [u8; 4],
@@ -77,22 +104,28 @@ pub const SETS: &[(&str, Tokens)] = &[
         "dark",
         Tokens {
             fresh: [244, 145, 199, 255],
-            ground: [18, 20, 23, 255],
+            ground: [17, 20, 24, 255],
             ink: [242, 244, 246, 255],
             quiet: [184, 193, 203, 255],
             faint: [174, 184, 196, 255],
             aurora: [
-                &[(0., [14, 124, 134, 77]), (1., [14, 124, 134, 0])],
-                &[
-                    (0., [11, 42, 91, 242]),
-                    (0.6, [11, 42, 91, 115]),
-                    (1., [11, 42, 91, 0]),
-                ],
-                &[(0., [14, 124, 134, 191]), (1., [14, 124, 134, 0])],
-                &[(0., [184, 216, 74, 140]), (1., [184, 216, 74, 0])],
+                &[(0., [14, 58, 58, 217]), (1., [14, 58, 58, 0])],
+                &[(0., [29, 42, 92, 191]), (1., [29, 42, 92, 0])],
+                &[(0., [44, 90, 46, 140]), (1., [44, 90, 46, 0])],
             ],
+            ambient_shadow: Shadow {
+                y: 6.,
+                blur: 18.,
+                color: [0, 0, 0, 89],
+            },
+            contact_shadow: Shadow {
+                y: 1.,
+                blur: 2.,
+                color: [0, 0, 0, 77],
+            },
+            top_highlight: [255, 255, 255, 15],
             linear_at: [0., 1.],
-            glass: [[34, 38, 45, 179], [21, 24, 28, 189]],
+            glass: [[31, 36, 43, 184], [26, 31, 38, 184]],
             hair: [255, 255, 255, 23],
             mint: [155, 232, 194, 255],
             sky: [124, 196, 255, 255],
@@ -115,22 +148,28 @@ pub const SETS: &[(&str, Tokens)] = &[
         "light",
         Tokens {
             fresh: [133, 35, 96, 255],
-            ground: [251, 251, 249, 255],
+            ground: [247, 247, 245, 255],
             ink: [23, 25, 28, 255],
             quiet: [69, 77, 88, 255],
             faint: [78, 87, 100, 255],
             aurora: [
-                &[(0., [108, 196, 192, 40]), (1., [108, 196, 192, 0])],
-                &[
-                    (0., [110, 151, 212, 65]),
-                    (0.6, [110, 151, 212, 30]),
-                    (1., [110, 151, 212, 0]),
-                ],
-                &[(0., [108, 196, 192, 45]), (1., [108, 196, 192, 0])],
-                &[(0., [184, 216, 74, 35]), (1., [184, 216, 74, 0])],
+                &[(0., [221, 243, 234, 230]), (1., [221, 243, 234, 0])],
+                &[(0., [233, 229, 251, 204]), (1., [233, 229, 251, 0])],
+                &[(0., [252, 235, 221, 179]), (1., [252, 235, 221, 0])],
             ],
+            ambient_shadow: Shadow {
+                y: 8.,
+                blur: 24.,
+                color: [16, 24, 40, 20],
+            },
+            contact_shadow: Shadow {
+                y: 1.,
+                blur: 2.,
+                color: [16, 24, 40, 15],
+            },
+            top_highlight: [255, 255, 255, 191],
             linear_at: [0., 1.],
-            glass: [[255, 255, 255, 237], [249, 250, 248, 242]],
+            glass: [[255, 255, 255, 173], [249, 249, 249, 173]],
             hair: [23, 25, 28, 35],
             mint: [26, 109, 78, 255],
             sky: [32, 91, 147, 255],
