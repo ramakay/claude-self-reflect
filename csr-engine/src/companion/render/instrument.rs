@@ -34,6 +34,69 @@ pub struct DreamCard {
     pub confusing: Vec<Value>,
     pub should_be: Vec<Value>,
 }
+/// What a threads-timeline row is about. Set where the row is built, never parsed from its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RiverKind {
+    /// Code changed with no commit receipt yet.
+    Write,
+    Compact,
+    /// Something the user raised.
+    Prompt,
+    Dream,
+    Agent,
+    /// A shift backed by a commit.
+    Commit,
+    Other,
+}
+#[derive(Clone, Debug)]
+pub struct RiverRow {
+    pub at: f64,
+    pub kind: RiverKind,
+    /// The glyph the plain-text pane leads the row with. The picture draws the kind's icon instead.
+    pub lead: &'static str,
+    pub line: String,
+}
+impl RiverRow {
+    /// The picture's text: the kind's icon replaces the lead glyph, except a shift at risk.
+    fn picture_text(&self) -> String {
+        if self.lead == "! " {
+            format!("{}{}", self.lead, self.line)
+        } else {
+            self.line.clone()
+        }
+    }
+}
+fn river_row(at: f64, kind: RiverKind, lead: &'static str, line: String) -> RiverRow {
+    RiverRow {
+        at,
+        kind,
+        lead,
+        line,
+    }
+}
+/// What a shift row is and when it happened. A shift that names a commit (`oid:` receipt) is a
+/// commit row, dated by that commit among the session's commit shifts (`at` is the commit time;
+/// `date` is only its day, used when `at` is missing). Any other shift is an unlanded code edit.
+fn shift_when(entry: &Value, commits: &[Value]) -> (RiverKind, Option<f64>) {
+    let oid = array(&entry["receipts"])
+        .iter()
+        .filter_map(Value::as_str)
+        .find_map(|r| r.strip_prefix("oid:"))
+        .filter(|oid| !oid.is_empty());
+    let Some(oid) = oid else {
+        return (RiverKind::Write, None);
+    };
+    let at = commits
+        .iter()
+        .filter(|c| string(&c["oid"]).starts_with(oid))
+        .find_map(|c| {
+            c["at"]
+                .as_f64()
+                .filter(|at| *at > 0.)
+                .or_else(|| crate::companion::paths::epoch(string(&c["date"])))
+        });
+    (RiverKind::Commit, at)
+}
 #[derive(Clone, Debug)]
 pub struct Composition {
     pub empty_session: bool,
@@ -54,7 +117,7 @@ pub struct Composition {
     pub figure: Value,
     pub tally: Value,
     pub agents: agents::Projection,
-    pub river: Vec<(f64, String)>,
+    pub river: Vec<RiverRow>,
     pub notice: Option<String>,
     pub asked_away: bool,
     pub now: f64,
@@ -126,10 +189,12 @@ impl Composition {
             .iter()
             .filter(|d| d["session"] == s["id"])
             .map(|d| {
-                (
+                river_row(
                     num(&d["at"]),
+                    RiverKind::Dream,
+                    "☾ ",
                     format!(
-                        "☾ {}{}",
+                        "{}{}",
                         string(&d["line"]),
                         d["answer"]
                             .as_str()
@@ -142,7 +207,7 @@ impl Composition {
         river.extend(
             array(&s["compacts"])
                 .iter()
-                .map(|v| (num(v), "♻ Compacted".into())),
+                .map(|v| river_row(num(v), RiverKind::Compact, "♻ ", "Compacted".into())),
         );
         let raw_story = string(&data["story"]["now"]).trim();
         let stripped_story = ["Work stands at:", "Where the work stands:", "Story:"]
@@ -179,36 +244,52 @@ impl Composition {
                 entry
             })
             .collect::<Vec<_>>();
+        let commits = array(&data["shifts"]);
         for shift in &shifts {
-            river.push((
-                num(&data["story_map"]["at"]),
-                format!(
-                    "{} {} · {}",
-                    mark(shift),
-                    string(&shift["scope"]),
-                    string(&shift["now"])
-                ),
+            let (kind, at) = shift_when(shift, commits);
+            river.push(river_row(
+                at.unwrap_or_else(|| num(&data["story_map"]["at"])),
+                kind,
+                match mark(shift) {
+                    "!" => "! ",
+                    "+" => "+ ",
+                    "-" => "- ",
+                    _ => "~ ",
+                },
+                format!("{} · {}", string(&shift["scope"]), string(&shift["now"])),
             ));
         }
         for agent in &projection.agents {
             if let Some(start) = agent.started {
-                river.push((start / 1000., format!("○ {} started", agent.description)));
+                river.push(river_row(
+                    start / 1000.,
+                    RiverKind::Agent,
+                    "○ ",
+                    format!("{} started", agent.description),
+                ));
             }
             if let Some(done) = &agent.completion {
-                river.push((done.at / 1000., format!("✓ {} finished", agent.description)));
+                river.push(river_row(
+                    done.at / 1000.,
+                    RiverKind::Agent,
+                    "✓ ",
+                    format!("{} finished", agent.description),
+                ));
             }
         }
         river.extend(array(&data["threads"]).iter().map(|thread| {
-            (
+            river_row(
                 num(&thread["last_seen"]),
+                RiverKind::Prompt,
+                "↳ ",
                 format!(
-                    "↳ {} · {}",
+                    "{} · {}",
                     string(&thread["text"]),
                     crate::companion::threads::thread_group(thread)
                 ),
             )
         }));
-        river.sort_by(|a, b| b.0.total_cmp(&a.0));
+        river.sort_by(|a, b| b.at.total_cmp(&a.at));
         let mut stamps: Vec<_> = array(&s["main"])
             .iter()
             .map(|r| num(&r[0]))
@@ -362,6 +443,45 @@ fn sells() -> [&'static str; 3] {
         "Code changed? CSR warns Claude.",
         "CSR keeps the threads you dropped.",
     ]
+}
+/// One timeline icon centred on (`cx`, `cy`). Lucide has no quote glyph in the bundled subset, so
+/// the prompt mark is drawn; every other kind is a bundled Lucide glyph.
+fn river_icon(canvas: &mut Canvas, f: &Fonts, kind: RiverKind, cx: f32, cy: f32, t: &Tokens) {
+    const SIZE: f32 = 12.;
+    let glyph = |canvas: &mut Canvas, which: Icon, col: Rgba| {
+        let st = icon(SIZE);
+        let value = which.glyph().to_string();
+        let (l, r, top, bottom) = f.ink(&value, st);
+        canvas.text(
+            f,
+            &value,
+            cx - (l + r) / 2.,
+            cy - (top + bottom) / 2.,
+            st,
+            col,
+            A::L,
+        );
+    };
+    match kind {
+        RiverKind::Write => glyph(canvas, Icon::FilePen, t.sky),
+        RiverKind::Compact => glyph(canvas, Icon::Recycle, t.amber),
+        RiverKind::Dream => glyph(canvas, Icon::MoonStar, t.dream),
+        RiverKind::Agent => glyph(canvas, Icon::Bot, t.asked),
+        RiverKind::Commit => glyph(canvas, Icon::GitCommit, t.mint),
+        RiverKind::Prompt => {
+            for dx in [-3.2, 2.6] {
+                let (x, y) = (cx + dx, cy - 1.8);
+                canvas.circle(x, y, 2.1, t.ink);
+                let mut tail = tiny_skia::PathBuilder::new();
+                tail.move_to(x + 1.6, y + 0.4);
+                tail.quad_to(x + 1.4, y + 3.2, x - 1.8, y + 5.2);
+                if let Some(tail) = tail.finish() {
+                    canvas.stroke(&tail, 1.5, t.ink, true);
+                }
+            }
+        }
+        RiverKind::Other => canvas.circle(cx, cy, 2.5, t.faint),
+    }
 }
 fn mark(v: &Value) -> &str {
     match string(&v["mark"]) {
@@ -740,10 +860,12 @@ pub fn rows_with_figure(
         details_start = out.len();
     }
     if open.threads {
-        for (at, line) in &c.river {
+        for row in &c.river {
             out.extend(wrap(&format!(
-                "{} · {line}",
-                masthead::span((c.now - at).max(0.))
+                "{} · {}{}",
+                masthead::span((c.now - row.at).max(0.)),
+                row.lead,
+                row.line
             )));
         }
     }
@@ -2196,43 +2318,26 @@ pub fn draw(
             }
         } else if open.threads {
             let spine_h = (extra_h - P * 2.).max(0.);
-            canvas.vhair(IX + 55., y + P, spine_h, t.band);
-            if c.requests.len() > 1 {
-                let max = c.requests.iter().map(|(a, b)| a + b).fold(1., f64::max);
-                let mut path = tiny_skia::PathBuilder::new();
-                path.move_to(IX + 55., y + P);
-                for (i, (cached, fresh)) in c.requests.iter().rev().enumerate() {
-                    path.line_to(
-                        IX + 55. - ((cached + fresh) / max * 36.) as f32,
-                        y + P + i as f32 / (c.requests.len() - 1) as f32 * spine_h,
-                    );
-                }
-                path.line_to(IX + 55., y + P + spine_h);
-                path.close();
-                if let Some(path) = path.finish() {
-                    canvas.fill_shader(
-                        &path,
-                        lin(
-                            IX + 19.,
-                            y + P,
-                            IX + 55.,
-                            y + P + spine_h,
-                            &[(t.linear_at[0], t.mint), (t.linear_at[1], t.sky)],
-                        ),
-                    );
-                }
-            }
-            for (at, line) in c
+            let spine_x = IX + 55.;
+            let rows: Vec<_> = c
                 .river
                 .iter()
                 .skip(open.scroll)
-                .take(((extra_h - P * 2.).max(0.) / 33.) as usize)
-            {
-                canvas.circle(IX + 55., b - 4., 3., t.dream);
+                .take((spine_h / 33.) as usize)
+                .collect();
+            // The spine runs between the icons, never through them, and ends at the last one.
+            let mut from = y + P;
+            for i in 0..rows.len() {
+                let mid = b + i as f32 * 33. - 4.;
+                canvas.vhair(spine_x, from, (mid - 9. - from).max(0.), t.band);
+                from = mid + 9.;
+            }
+            for row in rows {
+                river_icon(&mut canvas, f, row.kind, spine_x, b - 4., t);
                 single(
                     &mut canvas,
                     f,
-                    &masthead::span((c.now - at).max(0.)),
+                    &masthead::span((c.now - row.at).max(0.)),
                     IX,
                     b,
                     48.,
@@ -2240,7 +2345,17 @@ pub fn draw(
                     t.quiet,
                     t,
                 );
-                single(&mut canvas, f, line, IX + 70., b, IW - 70., 11.5, t.ink, t);
+                single(
+                    &mut canvas,
+                    f,
+                    &row.picture_text(),
+                    IX + 70.,
+                    b,
+                    IW - 70.,
+                    11.5,
+                    t.ink,
+                    t,
+                );
                 b += 33.;
             }
         } else {
@@ -3449,6 +3564,92 @@ mod tests {
     }
 
     use super::*;
+
+    fn timeline_data() -> (Value, Value) {
+        let now = 1_800_000_000.;
+        let s = json!({"id":"tl","compacts":[now - 5400.],"main":[],"prompts":[]});
+        let entry = |claim: &str, receipt: &str| {
+            json!({"sig":claim,"kind":"shift","claim":claim,"now":claim,"was":null,
+                "before":[],"after":[{"scope":"summarizer.rs","sym":"store_story","mark":"~"}],
+                "receipts":[receipt],"grounded":true,"moved":true})
+        };
+        let data = json!({
+            "story_map": {"at": now - 6200., "entries": [
+                entry("Keep prior shift reflections on story rewrite", "oid:aaaaaaa"),
+                entry("Pane fails open when the map is absent", "oid:bbbbbbb"),
+                entry("Unlanded edit of the ledger", "edit:ledger"),
+                entry("Dated by neither", "oid:ccccccc"),
+            ]},
+            "shifts": [
+                {"oid":"aaaaaaa1111","date":"2026-10-21","at": now - 3000.},
+                {"oid":"bbbbbbb2222","date":"2026-10-20","at": now - 86400.},
+            ],
+            "dreams": [{"session":"tl","at": now - 600., "line":"What if recall started from the file?", "answer":"yes"}],
+            "threads": [{"text":"Decide the release name","last_seen": now - 9000., "state":"open"}],
+        });
+        (data, s)
+    }
+
+    #[test]
+    fn timeline_rows_carry_their_kind_and_their_own_age() {
+        let now = 1_800_000_000.;
+        let (data, s) = timeline_data();
+        let c = Composition::build(&data, &s, now);
+        let rows: Vec<_> = c.river.iter().map(|r| (r.kind, r.at)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                (RiverKind::Dream, now - 600.),
+                (RiverKind::Commit, now - 3000.),
+                (RiverKind::Compact, now - 5400.),
+                (RiverKind::Write, now - 6200.),
+                (RiverKind::Commit, now - 6200.),
+                (RiverKind::Prompt, now - 9000.),
+                (RiverKind::Commit, now - 86400.),
+            ]
+        );
+        let lines: Vec<_> = c.river.iter().map(|r| r.line.as_str()).collect();
+        assert!(lines[0].starts_with("What if"), "{lines:?}");
+        assert_eq!(lines[2], "Compacted");
+        assert!(lines
+            .iter()
+            .all(|l| !l.starts_with(['☾', '♻', '↳', '○', '✓'])));
+    }
+
+    #[test]
+    fn the_threads_drilldown_draws_one_icon_per_row_and_no_gradient() {
+        let now = 1_800_000_000.;
+        let (data, s) = timeline_data();
+        let mut c = Composition::build(&data, &s, now);
+        c.river.push(river_row(
+            now - 700.,
+            RiverKind::Agent,
+            "",
+            "Scan the repo started".into(),
+        ));
+        c.river.push(river_row(
+            now - 800.,
+            RiverKind::Other,
+            "",
+            "Something else".into(),
+        ));
+        c.river.sort_by(|a, b| b.at.total_cmp(&a.at));
+        c.requests = (0..20)
+            .map(|i| (150_000. + f64::from(i) * 1000., 2_000.))
+            .collect();
+        let open = Open {
+            threads: true,
+            ..Open::default()
+        };
+        let png = std::env::var_os("CSR_THREADS_PNG");
+        for theme in [Theme::Dark, Theme::Light] {
+            let (pm, _) = draw(&c, 1210, 1700, theme, open, false).expect("instrument draws");
+            if let Some(dir) = &png {
+                let name = format!("{}/threads-{theme:?}.png", dir.to_string_lossy());
+                save(&name, &pm);
+            }
+        }
+    }
 
     #[test]
     fn quota_money_drops_this_week_before_a_caption_can_hit_its_neighbour() {
