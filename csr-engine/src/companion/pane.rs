@@ -492,6 +492,16 @@ impl Pane {
             data["readings"] = json!(self.readers.how_claude_read(&self.paths, &self.sid, 2, now));
         }
         if self.view == "main" {
+            Self::week_data(
+                &Wide {
+                    paths: &self.paths,
+                    db: self.db.as_ref(),
+                    persist: self.persist,
+                },
+                (&mut self.narrative, &mut self.spend),
+                &mut data,
+                now,
+            );
             self.phone.foot = Some((phone, column));
             self.edge = None;
             data["threads"] = json!(every);

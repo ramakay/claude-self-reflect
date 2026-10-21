@@ -324,6 +324,63 @@ pub fn share_text(percent: Option<f64>, bound: bool) -> String {
     let digits = -((shown.log10() + 1e-9).floor() as i32);
     format!("{mark}{}%", pyfmt::fixed(shown, digits.max(0) as usize))
 }
+
+/// Presentation of the existing weekly figure; no accounting or extra reads happen here.
+#[derive(Clone, Debug)]
+pub struct InstrumentCost {
+    pub usd: Option<f64>,
+    pub share: Option<f64>,
+    pub bound: bool,
+    pub calls: i64,
+}
+impl InstrumentCost {
+    pub fn from_week(week: &Value) -> Self {
+        let figure = &week["figure"];
+        let usd = figure["usd"].as_f64().filter(|n| n.is_finite() && *n >= 0.);
+        Self {
+            usd,
+            share: if usd == Some(0.) {
+                Some(0.)
+            } else {
+                usd.and_then(|_| figure["share"].as_f64())
+                    .filter(|n| n.is_finite() && *n >= 0.)
+            },
+            bound: figure["bound"] == true,
+            calls: (num(&week["calls"]) + num(&week["looks"])) as i64,
+        }
+    }
+    pub fn share_label(&self) -> String {
+        match self.share {
+            None => "—".into(),
+            Some(0.) => "0".into(),
+            Some(n) => share_text(Some(n), self.bound)
+                .trim_start_matches('≈')
+                .trim_end_matches('%')
+                .into(),
+        }
+    }
+    pub fn money_line(&self) -> String {
+        match self.usd {
+            None => "CSR —".into(),
+            Some(0.) => "$0 this week".into(),
+            usd => format!("{} this week", money_text(usd, self.bound)),
+        }
+    }
+    pub fn api_line(&self) -> String {
+        let cost = if self.usd == Some(0.) {
+            "CSR 0".into()
+        } else {
+            self.money_line()
+        };
+        format!("{cost} · {}", plural(self.calls, "call"))
+    }
+    /// Fractions of the same full meter as the quota; never exaggerate a tiny share.
+    pub fn segment(&self, used: f64) -> Option<(f32, f32)> {
+        self.share
+            .filter(|share| *share > 0.)
+            .map(|share| (0., (share.min(used.max(0.)) / 100.).clamp(0., 1.) as f32))
+    }
+}
 /// What CSR cost, the figure alone: `≈0.04%` of the weekly limit on a subscription, `$1.69` at list
 /// price with an API key; empty when it cannot be said.
 pub fn fuel_text(v: &Value) -> String {

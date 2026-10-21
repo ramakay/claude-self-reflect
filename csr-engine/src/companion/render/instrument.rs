@@ -6,7 +6,9 @@ use super::{
     text,
     theme::{self, Theme, Tokens, ICON_GAP, S1, S2, S3, S4, S5},
 };
-use crate::companion::{agents, array, dreams, masthead, num, pyfmt::short, string};
+use crate::companion::{
+    agents, array, dreams, masthead, num, pyfmt::short, string, value::InstrumentCost,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -42,6 +44,7 @@ pub struct Composition {
     pub learnt: Vec<String>,
     pub requests: Vec<(f64, f64)>,
     pub codex_week: Value,
+    pub csr_cost: InstrumentCost,
     pub dream: DreamCard,
     pub story: String,
     pub story_age: String,
@@ -279,6 +282,7 @@ impl Composition {
                 .rev()
                 .collect(),
             codex_week: data["codex"]["week"].clone(),
+            csr_cost: InstrumentCost::from_week(&data["value"]),
             dream: DreamCard {
                 state,
                 handed: array(&data["dreams"])
@@ -754,6 +758,14 @@ pub fn rows_with_figure(
         }
     } else {
         let mut extra = vec![];
+        if let Some(q) = array(&c.figure["quotas"])
+            .iter()
+            .find(|q| q["code"] == "7D" && q["used"].is_number())
+        {
+            extra.push(quota_caption(c, q));
+        } else {
+            extra.push(format!("CSR cost: {}", c.csr_cost.api_line()));
+        }
         if let Some(n) = c.codex_week["percent"].as_f64() {
             extra.push(format!("Codex 7D {n:.0}%"));
         }
@@ -846,8 +858,18 @@ fn figure_lines(c: &Composition) -> Vec<String> {
     let mut quotas: Vec<_> = array(&g["quotas"])
         .iter()
         .filter(|q| q["used"].is_number())
-        .map(text::paced)
+        .map(|q| {
+            let line = text::paced(q);
+            if q["code"] == "7D" {
+                format!("{line} · CSR {}", c.csr_cost.share_label())
+            } else {
+                line
+            }
+        })
         .collect();
+    if !has_week(c) {
+        quotas.push(format!("CSR cost: {}", c.csr_cost.api_line()));
+    }
     if g["cache"]["left"].is_number() || g["cache"]["cold"] == true {
         quotas.push(string(&g["cache"]["text"]).replace("CACHE ", "◷ "));
     }
@@ -857,10 +879,264 @@ fn figure_lines(c: &Composition) -> Vec<String> {
     if let Some((line, _)) = csr_status(g) {
         quotas.push(format!("● {line}"));
     }
-    [top.join(" · "), quotas.join(" · ")]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect()
+    [
+        top.join(" · "),
+        quotas.join(" · "),
+        if has_week(c) && c.csr_cost.usd.is_some() {
+            c.csr_cost.money_line()
+        } else {
+            String::new()
+        },
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect()
+}
+
+fn has_week(data: &Composition) -> bool {
+    array(&data.figure["quotas"])
+        .iter()
+        .any(|q| q["code"] == "7D" && q["used"].is_number())
+}
+
+/// The same caption is used by every pixel quota layout.
+pub fn quota_caption(data: &Composition, q: &Value) -> String {
+    if q["code"] == "7D" {
+        format!(
+            "7D {:.0}% · CSR {}",
+            num(&q["used"]),
+            data.csr_cost.share_label()
+        )
+    } else {
+        let pace = q["pace"]
+            .as_f64()
+            .is_some_and(|p| num(&q["used"]) / 100. > p);
+        format!("{}{}", string(&q["code"]), if pace { " »" } else { "" })
+    }
+}
+
+fn quota_ring(c: &mut Canvas, data: &Composition, q: &Value, x: f32, y: f32, r: f32, t: &Tokens) {
+    let used = num(&q["used"]);
+    c.ring(
+        x,
+        y,
+        r,
+        t.ring,
+        t.track,
+        &[(0., (used / 100.).clamp(0., 1.) as f32, t.sky)],
+    );
+    if q["code"] == "7D" {
+        if let Some((from, to)) = data.csr_cost.segment(used) {
+            // Butt caps keep CSR's small segment entirely inside the used arc.
+            c.arc(x, y, r, from, to, t.ring, t.csr_share, false);
+        }
+    }
+}
+
+fn fitted_caption(
+    c: &mut Canvas,
+    f: &Fonts,
+    line: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    size: f32,
+    t: &Tokens,
+) {
+    let st = sans(size, t.medium);
+    let size = (size * width / f.width(line, st).max(width)).min(size);
+    c.text(f, line, x, y, sans(size, t.medium), t.quiet, A::M);
+}
+
+/// Quota row shared by full, mid-height and narrow text-mode strips. The weekly gauge and
+/// API card get wider slots so their complete captions fit without colliding with neighbours.
+fn quota_row(
+    c: &mut Canvas,
+    f: &Fonts,
+    data: &Composition,
+    left: f32,
+    width: f32,
+    cy: f32,
+    r: f32,
+    label_y: f32,
+    caption_size: f32,
+    t: &Tokens,
+) -> (f32, f32) {
+    let g = &data.figure;
+    let mut quotas = array(&g["quotas"])
+        .iter()
+        .filter(|q| q["used"].is_number())
+        .collect::<Vec<_>>();
+    quotas.sort_by_key(|q| if q["code"] == "5H" { 0 } else { 1 });
+    let cache = g["cache"]["left"].is_number() || g["cache"]["cold"] == true;
+    let codex = data.codex_week["percent"].as_f64();
+    let api = !has_week(data);
+    let weights = quotas
+        .iter()
+        .map(|q| if q["code"] == "7D" { 2. } else { 1. })
+        .sum::<f32>()
+        + u8::from(cache) as f32
+        + u8::from(codex.is_some()) as f32
+        + if api { 2. } else { 0. };
+    let unit = width / weights.max(1.);
+    let mut cursor = left;
+    let mut bounds = (left + width, left);
+    for q in quotas {
+        let weekly = q["code"] == "7D";
+        let slot = unit * if weekly { 2. } else { 1. };
+        let x = cursor + slot / 2.;
+        cursor += slot;
+        bounds.0 = bounds.0.min(x - r);
+        bounds.1 = bounds.1.max(x + r);
+        quota_ring(c, data, q, x, cy, r, t);
+        c.text(
+            f,
+            &format!("{:.0}%", num(&q["used"])),
+            x,
+            cy + 4.,
+            serif((r * 0.6).clamp(10., 18.), t.medium),
+            t.ink,
+            A::M,
+        );
+        fitted_caption(
+            c,
+            f,
+            &quota_caption(data, q),
+            x,
+            label_y,
+            slot - S2,
+            caption_size,
+            t,
+        );
+        if weekly && data.csr_cost.usd.is_some() {
+            fitted_caption(
+                c,
+                f,
+                &data.csr_cost.money_line(),
+                x,
+                label_y + theme::CAPTION_LINE,
+                slot - S2,
+                caption_size,
+                t,
+            );
+        }
+    }
+    if cache {
+        let x = cursor + unit / 2.;
+        cursor += unit;
+        bounds.0 = bounds.0.min(x - r);
+        bounds.1 = bounds.1.max(x + r);
+        let left = num(&g["cache"]["left"]);
+        let cold = g["cache"]["cold"] == true || left <= 0.;
+        let ttl = g["cache"]["ttl"]
+            .as_f64()
+            .filter(|n| *n > 0.)
+            .unwrap_or(3600.);
+        c.ring(
+            x,
+            cy,
+            r,
+            t.ring,
+            t.track,
+            &[(
+                0.,
+                (left / ttl).clamp(0., 1.) as f32,
+                if cold { t.amber } else { t.mint },
+            )],
+        );
+        let cache_value = if cold {
+            "COLD".into()
+        } else {
+            masthead::span(left)
+        };
+        let st = serif((r * 0.6).clamp(10., 18.), t.medium);
+        let st = serif(
+            st.size * (unit - S2) / f.width(&cache_value, st).max(unit - S2),
+            t.medium,
+        );
+        c.text(f, &cache_value, x, cy + 4., st, t.ink, A::M);
+        let caption = if cold {
+            string(&g["cache"]["long"])
+                .strip_prefix("COLD · ")
+                .unwrap_or("◷ cache")
+        } else {
+            "◷ cache"
+        };
+        fitted_caption(c, f, caption, x, label_y, unit - S2, caption_size, t);
+    }
+    if let Some(used) = codex {
+        let x = cursor + unit / 2.;
+        cursor += unit;
+        bounds.0 = bounds.0.min(x - r);
+        bounds.1 = bounds.1.max(x + r);
+        c.ring(
+            x,
+            cy,
+            r,
+            t.ring,
+            t.track,
+            &[(0., (used / 100.).clamp(0., 1.) as f32, t.asked)],
+        );
+        c.text(
+            f,
+            &format!("{used:.0}%"),
+            x,
+            cy + 4.,
+            serif((r * 0.6).clamp(10., 18.), t.medium),
+            t.ink,
+            A::M,
+        );
+        fitted_caption(
+            c,
+            f,
+            "\u{e181} Codex 7D",
+            x,
+            label_y,
+            unit - S2,
+            caption_size,
+            t,
+        );
+    }
+    if api {
+        let slot = unit * 2.;
+        let x = cursor + slot / 2.;
+        let card_w = (slot - S2).min(180.);
+        let top = cy - r;
+        let bottom = label_y + theme::CAPTION_LINE;
+        c.rrect(x - card_w / 2., top, card_w, bottom - top, S2, t.chip);
+        c.rrect_line(
+            x - card_w / 2.,
+            top,
+            card_w,
+            bottom - top,
+            S2,
+            t.hair,
+            t.hair_width,
+        );
+        fitted_caption(
+            c,
+            f,
+            "CSR cost",
+            x,
+            top + theme::CAPTION_LINE,
+            card_w - S2,
+            caption_size,
+            t,
+        );
+        fitted_caption(
+            c,
+            f,
+            &data.csr_cost.api_line(),
+            x,
+            cy + S2,
+            card_w - S2,
+            caption_size,
+            t,
+        );
+        bounds.0 = bounds.0.min(x - card_w / 2.);
+        bounds.1 = bounds.1.max(x + card_w / 2.);
+    }
+    bounds
 }
 
 // The geometry and primitives below are the approved B prototype's glass, serif and ring design.
@@ -1011,6 +1287,7 @@ pub fn request_bar_y(base: f32, value: f64, max: f64, chart_h: f32) -> f32 {
 
 #[derive(Clone, Debug)]
 pub struct Metrics {
+    pub csr_cost: InstrumentCost,
     pub question_size: f32,
     pub question_line_height: f32,
     /// Only missing or system-fallback glyphs; bundled cross-family coverage is primary.
@@ -1244,7 +1521,7 @@ pub fn draw(
     };
     let notice_gap = if c.notice.is_some() { S3 } else { 0. };
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
-    let figure_min = if quotas_only { 140. } else { 110. };
+    let figure_min = if quotas_only { 154. } else { 110. };
     let base_core = M
         + hero_h
         + S3
@@ -1822,6 +2099,7 @@ pub fn draw(
     Some((
         pm,
         Metrics {
+            csr_cost: c.csr_cost.clone(),
             question_size: qs.size,
             question_line_height,
             font_fallbacks,
@@ -1900,6 +2178,7 @@ fn collapsed_context_layout(g: &Value, h: f32) -> (f32, f32, f32) {
         S4 + theme::BODY_LINE + S3
     } + 30.
         + 46.
+        + theme::CAPTION_LINE
         + S1;
     let available = (h - P - title - below_ring).max(0.);
     let radius = (available / 2.8).clamp(78., 118.);
@@ -2036,7 +2315,7 @@ fn figure(
             let max = request_bar_max(bars, num(&g["band"]["high"]), size);
             let bw = IW / bars.len().max(1) as f32;
             // Reserve labels + payback above gauges; shrink the chart baseline when the card is short.
-            let gauge_cy = y + h - 70.;
+            let gauge_cy = y + h - 84.;
             let reserve_below = 18. + 18. + 36.;
             let chart_bottom = (y + 195.).min(gauge_cy - reserve_below).max(y + 130.);
             let chart_top = y + 95.;
@@ -2106,7 +2385,7 @@ fn figure(
             const GAP_PAY_GAUGE: f32 = 12.;
             const GAUGE_R: f32 = 30.;
             const LABEL_BELOW: f32 = 46.;
-            const LABEL_DESCENT: f32 = 4.;
+            const LABEL_DESCENT: f32 = theme::CAPTION_LINE + 4.;
             let title_bottom = y + context_title_height(g);
             let (r, available_height, _) = collapsed_context_layout(g, h);
             let ring_extent = r + S3;
@@ -2172,7 +2451,7 @@ fn figure(
             y + P + theme::TITLE_LINE,
         )
     } else if expanded {
-        let sat = y + h - 70.;
+        let sat = y + h - 84.;
         let below_chart = expanded_chart_bottom + 33.;
         let above_gauges = sat - 36.;
         (
@@ -2184,7 +2463,7 @@ fn figure(
     } else if let (Some(pay), Some(sat)) = (collapsed_pay_y, collapsed_sat_cy) {
         (sat, pay)
     } else {
-        (y + h - 70., y + h - 120.)
+        (y + h - 84., y + h - 120.)
     };
     if g["compacting"].is_object() {
         if let Some(high) = g["compacting"]["usual"]["high"]
@@ -2218,124 +2497,18 @@ fn figure(
             A::M,
         );
     }
-    let mut satellites: Vec<_> = array(&g["quotas"])
-        .iter()
-        .filter(|q| q["used"].is_number())
-        .collect();
-    satellites.sort_by_key(|q| if q["code"] == "5H" { 0 } else { 1 });
-    let codex = data.codex_week["percent"].as_f64();
-    let cache = g["cache"]["left"].is_number() || g["cache"]["cold"] == true;
-    let count = satellites.len() + usize::from(cache) + usize::from(codex.is_some());
-    let step = IW / (count + 1) as f32;
-    for (i, q) in satellites.iter().enumerate() {
-        let x = IX + step * (i + 1) as f32;
-        let v = num(&q["used"]);
-        let col = t.sky;
-        c.ring(
-            x,
-            sat_cy,
-            30.,
-            t.ring,
-            t.track,
-            &[(0., (v / 100.).clamp(0., 1.) as f32, col)],
-        );
-        c.text(
-            f,
-            &format!("{v:.0}%"),
-            x,
-            sat_cy + 4.,
-            serif(18., t.medium),
-            t.ink,
-            A::M,
-        );
-        let pace = q["pace"].as_f64().is_some_and(|p| v / 100. > p);
-        c.text(
-            f,
-            &format!("{}{}", string(&q["code"]), if pace { " »" } else { "" }),
-            x,
-            sat_cy + 46.,
-            sans(10., t.medium),
-            if pace { t.dream } else { t.quiet },
-            A::M,
-        );
-    }
-    if let Some(left) = g["cache"]["left"]
-        .as_f64()
-        .or_else(|| (g["cache"]["cold"] == true).then_some(0.))
-    {
-        let x = IX + step * (satellites.len() + 1) as f32;
-        let cold = g["cache"]["cold"] == true || left <= 0.;
-        let ttl = g["cache"]["ttl"].as_f64().unwrap_or(3600.);
-        c.ring(
-            x,
-            sat_cy,
-            30.,
-            t.ring,
-            t.track,
-            &[(
-                0.,
-                (left / ttl).clamp(0., 1.) as f32,
-                if cold { t.amber } else { t.mint },
-            )],
-        );
-        c.text(
-            f,
-            &if cold {
-                "COLD".into()
-            } else {
-                masthead::span(left)
-            },
-            x,
-            sat_cy + 4.,
-            serif(18., t.medium),
-            t.ink,
-            A::M,
-        );
-        c.text(
-            f,
-            if cold {
-                string(&g["cache"]["long"])
-                    .strip_prefix("COLD · ")
-                    .unwrap_or("◷ cache")
-            } else {
-                "◷ cache"
-            },
-            x,
-            sat_cy + 46.,
-            sans(10., t.medium),
-            t.quiet,
-            A::M,
-        );
-    }
-    if let Some(v) = codex {
-        let x = IX + step * count as f32;
-        c.ring(
-            x,
-            sat_cy,
-            30.,
-            t.ring,
-            t.track,
-            &[(0., (v / 100.).clamp(0., 1.) as f32, t.asked)],
-        );
-        c.text(
-            f,
-            &format!("{v:.0}%"),
-            x,
-            sat_cy + 4.,
-            serif(18., t.medium),
-            t.ink,
-            A::M,
-        );
-        c.text(
-            f,
-            "\u{e181} Codex 7D",
-            x,
-            sat_cy + 46.,
-            sans(10., t.medium),
-            t.quiet,
-            A::M,
-        );
-    }
+    quota_row(
+        c,
+        f,
+        data,
+        IX,
+        IW,
+        sat_cy,
+        30.,
+        sat_cy + 46.,
+        theme::CAPTION_SIZE,
+        t,
+    );
     Some((ceiling_y, ring_bounds, ring_group, ring_formula_avail, None))
 }
 
@@ -2373,40 +2546,26 @@ fn draw_context_strip(
         );
         x += 72.;
     }
-    for (k, line) in lines.iter().enumerate() {
-        let line = if k == 0 && ctx.is_some() {
+    if let Some(line) = lines.first() {
+        let line = if ctx.is_some() {
             line.split(" · ").skip(1).collect::<Vec<_>>().join(" · ")
         } else {
             line.clone()
         };
-        single(
-            c,
-            f,
-            &line,
-            x,
-            y + P + 10. + k as f32 * 24.,
-            W - x - P - M,
-            11.5,
-            t.ink,
-            t,
-        );
+        single(c, f, &line, x, y + P + 10., W - x - P - M, 11.5, t.ink, t);
     }
-    for (i, q) in array(&g["quotas"])
-        .iter()
-        .filter(|q| q["used"].is_number())
-        .enumerate()
-    {
-        let bx = x + i as f32 * 100.;
-        c.rrect(bx, y + h - 17., 80., 3., 1.5, t.track);
-        c.rrect(
-            bx,
-            y + h - 17.,
-            80. * (num(&q["used"]) / 100.).clamp(0., 1.) as f32,
-            3.,
-            1.5,
-            t.sky,
-        );
-    }
+    quota_row(
+        c,
+        f,
+        data,
+        x,
+        W - x - P - M,
+        y + 48.,
+        16.,
+        y + h - 28.,
+        10.,
+        t,
+    );
     (None, None, None, None, None)
 }
 
@@ -2463,15 +2622,6 @@ fn draw_context_mid(
     let radius_inner = (h - TITLE - 2. * P) / 2. - S1;
     let r = radius_inner.clamp(25., 64.);
 
-    let mut satellites: Vec<_> = array(&g["quotas"])
-        .iter()
-        .filter(|q| q["used"].is_number())
-        .collect();
-    satellites.sort_by_key(|q| if q["code"] == "5H" { 0 } else { 1 });
-    let codex = data.codex_week["percent"].as_f64();
-    let cache = g["cache"]["left"].is_number() || g["cache"]["cold"] == true;
-    let count = satellites.len() + usize::from(cache) + usize::from(codex.is_some());
-
     let title_bottom = y + P + TITLE;
     let slot_bottom = y + h - BOTTOM_CLEAR;
     let slot = (slot_bottom - title_bottom).max(0.);
@@ -2480,7 +2630,7 @@ fn draw_context_mid(
     let label_below = gauge_r + 12.;
     let details_gap = S3;
     let details_h = 6.;
-    let right_h = gauge_r + label_below + details_gap + details_h;
+    let right_h = gauge_r + label_below + theme::CAPTION_LINE + details_gap + details_h;
     let group_h = (2. * r).max(right_h);
     let group_top = title_bottom + (slot - group_h).max(0.) / 2.;
     let group_bottom = group_top + group_h;
@@ -2492,7 +2642,7 @@ fn draw_context_mid(
     let right_top = group_top + (group_h - right_h).max(0.) / 2.;
     let gauges_cy = right_top + gauge_r;
     let gauge_label_y = gauges_cy + label_below;
-    let details_y = gauge_label_y + details_gap + 2.;
+    let details_y = gauge_label_y + theme::CAPTION_LINE + details_gap + 2.;
 
     let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
     if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64()) {
@@ -2530,137 +2680,18 @@ fn draw_context_mid(
         A::M,
     );
 
-    let step = if count == 0 {
-        0.
-    } else {
-        (right_w / count as f32).clamp(36., 72.)
-    };
-    let gauges_span = if count == 0 {
-        0.
-    } else {
-        step * (count as f32 - 1.)
-    };
-    let gauges_origin = right_x0 + ((right_w - gauges_span).max(0.) / 2.).min(step * 0.35);
-    let mut gauges_left = gauges_origin;
-    let mut gauges_right = gauges_origin;
-
-    for (i, q) in satellites.iter().enumerate() {
-        let x = gauges_origin + i as f32 * step;
-        gauges_left = gauges_left.min(x - gauge_r);
-        gauges_right = gauges_right.max(x + gauge_r);
-        let v = num(&q["used"]);
-        c.ring(
-            x,
-            gauges_cy,
-            gauge_r,
-            t.ring,
-            t.track,
-            &[(0., (v / 100.).clamp(0., 1.) as f32, t.sky)],
-        );
-        let pct = format!("{v:.0}%");
-        c.text(
-            f,
-            &pct,
-            x,
-            gauges_cy + 3.,
-            serif((gauge_r * 0.7).clamp(8., 12.), t.medium),
-            t.ink,
-            A::M,
-        );
-        let pace = q["pace"].as_f64().is_some_and(|p| v / 100. > p);
-        c.text(
-            f,
-            &format!("{}{}", string(&q["code"]), if pace { " »" } else { "" }),
-            x,
-            gauge_label_y,
-            sans(9., t.medium),
-            if pace { t.dream } else { t.quiet },
-            A::M,
-        );
-    }
-    let mut slot_i = satellites.len();
-    if let Some(left) = g["cache"]["left"]
-        .as_f64()
-        .or_else(|| (g["cache"]["cold"] == true).then_some(0.))
-    {
-        let x = gauges_origin + slot_i as f32 * step;
-        gauges_left = gauges_left.min(x - gauge_r);
-        gauges_right = gauges_right.max(x + gauge_r);
-        let cold = g["cache"]["cold"] == true || left <= 0.;
-        let ttl = g["cache"]["ttl"].as_f64().unwrap_or(3600.);
-        c.ring(
-            x,
-            gauges_cy,
-            gauge_r,
-            t.ring,
-            t.track,
-            &[(
-                0.,
-                (left / ttl).clamp(0., 1.) as f32,
-                if cold { t.amber } else { t.mint },
-            )],
-        );
-        c.text(
-            f,
-            &if cold {
-                "COLD".into()
-            } else {
-                masthead::span(left)
-            },
-            x,
-            gauges_cy + 3.,
-            serif((gauge_r * 0.65).clamp(7.5, 11.), t.medium),
-            t.ink,
-            A::M,
-        );
-        c.text(
-            f,
-            if cold {
-                string(&g["cache"]["long"])
-                    .strip_prefix("COLD · ")
-                    .unwrap_or("◷ cache")
-            } else {
-                "◷ cache"
-            },
-            x,
-            gauge_label_y,
-            sans(9., t.medium),
-            t.quiet,
-            A::M,
-        );
-        slot_i += 1;
-    }
-    if let Some(v) = codex {
-        let x = gauges_origin + slot_i as f32 * step;
-        gauges_left = gauges_left.min(x - gauge_r);
-        gauges_right = gauges_right.max(x + gauge_r);
-        c.ring(
-            x,
-            gauges_cy,
-            gauge_r,
-            t.ring,
-            t.track,
-            &[(0., (v / 100.).clamp(0., 1.) as f32, t.asked)],
-        );
-        c.text(
-            f,
-            &format!("{v:.0}%"),
-            x,
-            gauges_cy + 3.,
-            serif((gauge_r * 0.7).clamp(8., 12.), t.medium),
-            t.ink,
-            A::M,
-        );
-        c.text(
-            f,
-            "\u{e181} Codex 7D",
-            x,
-            gauge_label_y,
-            sans(9., t.medium),
-            t.quiet,
-            A::M,
-        );
-    }
+    let (gauges_left, gauges_right) = quota_row(
+        c,
+        f,
+        data,
+        right_x0,
+        right_w,
+        gauges_cy,
+        gauge_r,
+        gauge_label_y,
+        theme::CAPTION_SIZE,
+        t,
+    );
 
     let mut details = Vec::new();
     if let Some(trend) = g["trend"].as_f64() {
@@ -2770,7 +2801,7 @@ pub fn strip(
     let f = &*fonts;
     let t = theme.tokens();
     let g = &data.figure;
-    let h = 104.;
+    let h = 118.;
     let mut c = Canvas::new(w, h);
     c.pm.fill(tiny_skia::Color::from_rgba8(
         t.ground[0],
@@ -2851,81 +2882,7 @@ pub fn strip(
         let st = sans(10., t.medium);
         c.text(f, &f.fit(&pay, st, w - 86.), 76., 37., st, t.mint, A::L);
     }
-    let mut quotas = array(&g["quotas"])
-        .iter()
-        .filter(|q| q["used"].is_number())
-        .collect::<Vec<_>>();
-    quotas.sort_by_key(|q| if q["code"] == "5H" { 0 } else { 1 });
-    let cache = g["cache"]["left"].is_number() || g["cache"]["cold"] == true;
-    let count = quotas.len() + usize::from(cache);
-    let step = (w - 76. - 10.) / count.max(1) as f32;
-    for (i, q) in quotas.iter().enumerate() {
-        let x = 76. + step * (i as f32 + 0.5);
-        let used = num(&q["used"]);
-        let accent = t.sky;
-        c.ring(
-            x,
-            69.,
-            16.,
-            t.ring,
-            t.track,
-            &[(0., (used / 100.).clamp(0., 1.) as f32, accent)],
-        );
-        c.text(
-            f,
-            &format!("{used:.0}%"),
-            x,
-            73.,
-            serif(10., t.medium),
-            t.ink,
-            A::M,
-        );
-        let pace = q["pace"].as_f64().is_some_and(|p| used / 100. > p);
-        c.text(
-            f,
-            &format!("{}{}", string(&q["code"]), if pace { " »" } else { "" }),
-            x,
-            97.,
-            sans(8., t.medium),
-            t.quiet,
-            A::M,
-        );
-    }
-    if cache {
-        let x = 76. + step * (count as f32 - 0.5);
-        let cold = g["cache"]["cold"] == true;
-        let left = num(&g["cache"]["left"]);
-        let ttl = g["cache"]["ttl"]
-            .as_f64()
-            .filter(|t| *t > 0.)
-            .unwrap_or(3600.);
-        c.ring(
-            x,
-            69.,
-            16.,
-            t.ring,
-            t.track,
-            &[(
-                0.,
-                (left / ttl).clamp(0., 1.) as f32,
-                if cold { t.amber } else { t.mint },
-            )],
-        );
-        c.text(
-            f,
-            &if cold {
-                "COLD".into()
-            } else {
-                masthead::span(left)
-            },
-            x,
-            73.,
-            serif(10., t.medium),
-            t.ink,
-            A::M,
-        );
-        c.text(f, "◷", x, 97., sans(8., t.medium), t.quiet, A::M);
-    }
+    quota_row(&mut c, f, data, 76., w - 86., 65., 16., 93., 8., t);
     Some(c.pm)
 }
 

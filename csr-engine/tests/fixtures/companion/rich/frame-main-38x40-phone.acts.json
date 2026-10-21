@@ -1,11 +1,11 @@
 {
+  "27": {
+    "key": "instrument:dreams"
+  },
   "28": {
     "key": "instrument:dreams"
   },
   "29": {
-    "key": "instrument:dreams"
-  },
-  "30": {
     "dream": "newest",
     "key": "dream:newest",
     "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”",
@@ -32,13 +32,13 @@
       ]
     ]
   },
-  "32": {
+  "31": {
     "key": "instrument:threads"
   },
-  "34": {
+  "33": {
     "key": "instrument:changes"
   },
-  "35": {
+  "34": {
     "key": "instrument:figure"
   },
   "38": {

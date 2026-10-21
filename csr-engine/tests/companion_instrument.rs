@@ -119,7 +119,7 @@ use csr_engine::companion::render::{text, theme::Theme};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 const NOW: f64 = 1792320000.;
-const STATES: [&str; 9] = [
+const STATES: [&str; 11] = [
     "01-empty",
     "02-running",
     "03-agents",
@@ -129,6 +129,8 @@ const STATES: [&str; 9] = [
     "07-away",
     "08-offer",
     "08b-nothing",
+    "09-api-cost",
+    "10-unknown-cost",
 ];
 const QUESTION:&str="What if one of Fable's three prototypes made the what-if question the star of the pane, as you wanted on 10-09?";
 fn write_json(path: &Path, value: &Value) {
@@ -363,6 +365,30 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
         fs::create_dir_all(lock.parent().unwrap()).unwrap();
         fs::write(&lock, std::process::id().to_string()).unwrap();
     }
+    if empty {
+        con.execute("DELETE FROM narrative_usage", []).unwrap();
+    }
+    if state == "09-api-cost" {
+        fs::remove_dir_all(paths.keep.join("usage")).unwrap();
+        write_json(
+            &paths.keep.join("usage/sess-now.json"),
+            &json!({
+                "at":NOW,"context":{"tokens":ctx,"window":1000000},
+                "rateLimits":[{"kind":"five_hour","percentUsed":2,"resetsAt":"2026-10-18T14:08:00Z"}]
+            }),
+        );
+        con.execute("DELETE FROM narrative_usage", []).unwrap();
+        let rate =
+            csr_engine::companion::value::cost_of("claude-haiku-4-5", [1_000_000, 0, 0, 0, 0])
+                .unwrap();
+        for call in 0..37 {
+            con.execute("INSERT INTO narrative_usage(ts,call_site,model,input_tokens) VALUES('2026-10-18T10:38:00','story','claude-haiku-4-5',?)",
+                [if call == 0 { (1.20 / rate * 1e6).round() as i64 } else { 0 }]).unwrap();
+        }
+    }
+    if state == "10-unknown-cost" {
+        con.execute("DROP TABLE narrative_usage", []).unwrap();
+    }
     (home, paths)
 }
 fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<u8>) {
@@ -467,7 +493,8 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
         100. * metrics.dream / metrics.height
     );
     (
-        json!({"text":text,"png_sha256":hash,"acts":pane.acts,"dream_percent":format!("{:.2}",100.*metrics.dream/metrics.height)}),
+        json!({"text":text,"png_sha256":hash,"acts":pane.acts,"dream_percent":format!("{:.2}",100.*metrics.dream/metrics.height),
+            "csr_cost":{"share":metrics.csr_cost.share_label(),"usd":metrics.csr_cost.usd,"calls":metrics.csr_cost.calls}}),
         // Cell-grid export for contact sheets; placement hash stays in the golden JSON.
         {
             let mut out = Vec::new();
@@ -1162,10 +1189,10 @@ fn expanded_bars_report_a_ceiling_on_the_chart_and_quotas_stay_compact() {
         false,
     )
     .unwrap();
-    // Content height must clear gauge label baseline (P+52+46) plus descent, without growing.
+    // Reserve a second caption line for CSR's weekly cost below the quota label.
     assert!(
-        empty_metrics.figure_region.1 >= 138. && empty_metrics.figure_region.1 <= 140.,
-        "quotas card height {}: want 138..=140 so labels fit and stay compact",
+        empty_metrics.figure_region.1 >= 152. && empty_metrics.figure_region.1 <= 154.,
+        "quotas card height {}: want 152..=154 so labels fit and stay compact",
         empty_metrics.figure_region.1
     );
     let help = empty_metrics.help_region.expect("help card");
@@ -1491,5 +1518,131 @@ fn empty_38_column_pane_is_a_complete_instrument() {
             "{:?}",
             metrics.font_fallbacks
         );
+    }
+}
+
+fn fixture_week(paths: &Paths) -> Value {
+    use csr_engine::companion::{db::Db, masthead, value};
+    let fields = masthead::kept_status(paths, "sess-now", NOW);
+    let plan = value::plan_of(
+        &fields["fields"],
+        &masthead::account_limits(paths, NOW),
+        NOW,
+    );
+    let db = Db::open(paths).unwrap();
+    let narrative = value::narrative_week(&db, plan["start"].as_f64().unwrap());
+    let mut spent = Value::Null;
+    if plan["mode"] == "plan" {
+        let mut spend = value::Spend::new(paths, false);
+        assert!(spend.step(
+            plan["start"].as_f64().unwrap(),
+            NOW,
+            Duration::from_secs(30)
+        ));
+        spent = spend.total();
+    }
+    value::week_value(paths, &plan, &narrative, &spent)
+}
+
+#[test]
+fn instrument_and_info_use_the_same_week_figure_from_one_fixture() {
+    use csr_engine::companion::{
+        render::instrument::{self, Composition},
+        value,
+    };
+    for state in [
+        "02-running",
+        "03-agents",
+        "09-api-cost",
+        "10-unknown-cost",
+        "01-empty",
+    ] {
+        let (_home, paths) = state_home(state);
+        let week = fixture_week(&paths);
+        let composition =
+            Composition::build(&json!({"value":week}), &json!({"id":"sess-now"}), NOW);
+        let mut pane = Pane::new(paths, &args("main", "sess-now", 44, 30));
+        pane.pixels = true;
+        pane.enable_cards();
+        pane.frame(44, 30, NOW);
+        let actual = &pane.instrument_metrics.as_ref().unwrap().csr_cost;
+        assert_eq!(actual.usd, week["figure"]["usd"].as_f64(), "{state}");
+        assert_eq!(actual.share, composition.csr_cost.share, "{state}");
+        let info = value::fuel_text(&week);
+        if week["mode"] == "plan" && actual.share.is_some_and(|n| n > 0.) {
+            assert_eq!(format!("≈{}%", actual.share_label()), info);
+            let q = json!({"code":"7D","used":52});
+            assert!(instrument::quota_caption(&composition, &q)
+                .ends_with(&format!("CSR {}", actual.share_label())));
+            assert!(actual.segment(52.).is_some());
+        } else if week["mode"] == "api" {
+            assert_eq!(format!("{info} this week"), actual.money_line());
+            assert_eq!(actual.api_line(), "$1.20 this week · 37 calls");
+        }
+        if state == "10-unknown-cost" {
+            assert_eq!(actual.share_label(), "—");
+        }
+        if state == "01-empty" {
+            assert_eq!(actual.share_label(), "0");
+        }
+    }
+}
+
+#[test]
+fn csr_cost_distinguishes_unknown_zero_and_bounds_without_a_second_cost_path() {
+    use csr_engine::companion::value::{self, InstrumentCost};
+    for figure in [
+        Value::Null,
+        json!({"usd":null,"share":0}),
+        json!({"usd":null,"unpriced":["future-model"]}),
+    ] {
+        let cost = InstrumentCost::from_week(&json!({"figure":figure}));
+        assert_eq!(cost.share_label(), "—");
+        assert_eq!(cost.money_line(), "CSR —");
+        assert_eq!(cost.segment(56.), None);
+    }
+    let zero = InstrumentCost::from_week(&json!({"figure":{"usd":0,"share":null}}));
+    assert_eq!(zero.share_label(), "0");
+    assert_eq!(zero.money_line(), "$0 this week");
+    assert_eq!(zero.api_line(), "CSR 0 · 0 calls");
+    assert_eq!(zero.segment(56.), None);
+    let cost = InstrumentCost::from_week(
+        &json!({"figure":{"usd":1.2,"share":0.4,"bound":true},"calls":35,"looks":2}),
+    );
+    assert_eq!(
+        cost.money_line(),
+        format!("{} this week", value::money_text(Some(1.2), true))
+    );
+    assert_eq!(cost.share_label(), "≤0.4");
+    assert_eq!(cost.api_line(), "≤$1.20 this week · 37 calls");
+    let (_, end) = cost.segment(56.).unwrap();
+    assert!((end - 0.004).abs() < 1e-7);
+    assert!(end < 0.56);
+    assert_eq!(cost.segment(0.), Some((0., 0.)));
+    let (_, end) = cost.segment(0.1).unwrap();
+    assert!((end - 0.001).abs() < 1e-7);
+}
+
+#[test]
+fn unpriced_narrative_and_unreadable_table_stay_unknown_in_the_actual_pane() {
+    for unpriced in [false, true] {
+        let (_home, paths) = state_home("02-running");
+        let con = rusqlite::Connection::open(&paths.db).unwrap();
+        if unpriced {
+            con.execute(
+                "UPDATE narrative_usage SET model='unpriced-future-model'",
+                [],
+            )
+            .unwrap();
+        } else {
+            con.execute("DROP TABLE narrative_usage", []).unwrap();
+        }
+        let week = fixture_week(&paths);
+        assert!(week["figure"].is_null());
+        let mut pane = Pane::new(paths, &args("main", "sess-now", 44, 30));
+        pane.pixels = false;
+        let shown = pane.frame(44, 30, NOW).join("\n");
+        assert!(shown.contains("CSR —"), "{shown}");
+        assert!(!shown.contains("CSR 0"), "{shown}");
     }
 }
