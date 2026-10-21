@@ -55,31 +55,26 @@ pub(super) fn load(storage: &Storage, project: &str, sid: &str, now: f64) -> Opt
             continue;
         }
         // An invalid/future registry identity cannot be resurrected by an older
-        // episode timestamp. Registry project identity is authoritative too.
-        let registry_identity = storage
+        // episode timestamp. The registry's project is only the folder's own name, so a
+        // session started in a subfolder ("csr-engine") still belongs to this repo.
+        let registry_last = storage
             .with_connection(|con| {
                 use rusqlite::OptionalExtension;
                 Ok(con
                     .query_row(
-                        "SELECT project,last_ts FROM session_registry WHERE session_id=?1",
+                        "SELECT last_ts FROM session_registry WHERE session_id=?1",
                         [&episode.session_id],
-                        |row| {
-                            Ok((
-                                row.get::<_, Option<String>>(0)?,
-                                row.get::<_, Option<String>>(1)?,
-                            ))
-                        },
+                        |row| row.get::<_, Option<String>>(0),
                     )
                     .optional()?)
             })
             .ok()
+            .flatten()
             .flatten();
-        if registry_identity.is_some_and(|(p, ts)| {
-            p.as_deref() != Some(project)
-                || ts
-                    .as_deref()
-                    .is_some_and(|ts| parse_timestamp(ts).is_none_or(|at| at > now))
-        }) {
+        if registry_last
+            .as_deref()
+            .is_some_and(|ts| parse_timestamp(ts).is_none_or(|at| at > now))
+        {
             continue;
         }
         let Some(at) = parse_timestamp(&episode.timestamp).filter(|at| *at <= now) else {
@@ -663,6 +658,32 @@ mod tests {
                 !recap.text.contains("abcdef1") && !recap.text.contains("Repair the audio player")
             );
         }
+    }
+
+    #[test]
+    fn a_session_started_in_a_subfolder_is_still_the_last_time_here() {
+        // The registry keys a session by its folder's own name ("csr-engine"); the episode keys
+        // it by the project the folder sits in. A subfolder session is this repo's history.
+        let storage = Storage::open_memory().unwrap();
+        seed(
+            &storage,
+            "sub",
+            "claude-self-reflect",
+            "2026-10-20T10:00:00Z",
+        );
+        storage.with_connection(|con| {
+            con.execute("INSERT INTO session_registry(session_id,project,last_ts,first_prompt) VALUES('sub','csr-engine','2026-10-20T10:05:00Z','Repair the audio player'),('root','claude-self-reflect','2026-10-11T09:00:00Z','An older question at the root')", [])?;
+            Ok(())
+        }).unwrap();
+        let recap = load(
+            &storage,
+            "claude-self-reflect",
+            "new",
+            parse_timestamp("2026-10-20T11:00:00Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recap.session, "sub");
+        assert_eq!(recap.age, "1h ago");
     }
 
     #[test]
