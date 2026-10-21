@@ -98,6 +98,19 @@ fn instrument_png(
         let lines = pane.frame(cols, rows, now);
         let image = compose(&lines, &pane.placed, cols, rows, cell, theme)?;
         image.save(dir.join(format!("instrument-{name}.png")))?;
+        if let Some(metrics) = &pane.instrument_metrics {
+            std::fs::write(
+                dir.join(format!("instrument-{name}.metrics.json")),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "key_gap_px": metrics.last_card_gap_px,
+                    "figure_region": metrics.figure_region,
+                    "agents_region": metrics.agents_region,
+                    "help_region": metrics.help_region,
+                    "layout_height": metrics.height,
+                    "cols": cols, "rows": rows,
+                }))?,
+            )?;
+        }
     }
     Ok(())
 }

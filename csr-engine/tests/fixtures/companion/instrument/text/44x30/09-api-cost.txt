@@ -27,4 +27,4 @@ CTX 192k/1M · +6k/turn · ♻ >15 prompts
 1 by CSR
 5H 2% · CSR cost: $1.20 this week · 37 calls
 ◷ 59m · Codex 7D 41%
- d queue l chg t thr i fig b theme q close
+ d l changes t threads i fig b thm q close

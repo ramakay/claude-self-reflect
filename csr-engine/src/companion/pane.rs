@@ -974,10 +974,12 @@ impl Pane {
             gap = 1;
         }
         for (full, short) in [
-            ("changes", "chg"),
-            ("threads", "thr"),
             ("figure", "fig"),
             ("theme", "thm"),
+            ("queue", ""),
+            ("fig", ""),
+            ("changes", "chg"),
+            ("threads", "thr"),
         ] {
             if width(&keys, gap) <= usable {
                 break;

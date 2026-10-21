@@ -27,4 +27,4 @@ Code changed? CSR warns Claude.
 CSR keeps the threads you dropped.
 7D 52%» · CSR 0 · 5H 3% · Codex 7D 41%
 $0 this week
- l chg t threads i figure b theme q close
+ l changes t threads i fig b theme q close

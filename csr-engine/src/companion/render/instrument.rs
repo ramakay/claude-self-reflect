@@ -943,9 +943,22 @@ fn fitted_caption(
     size: f32,
     t: &Tokens,
 ) {
+    fitted_caption_ink(c, f, line, x, y, width, size, t.quiet, t);
+}
+fn fitted_caption_ink(
+    c: &mut Canvas,
+    f: &Fonts,
+    line: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    size: f32,
+    ink: Rgba,
+    t: &Tokens,
+) {
     let st = sans(size, t.medium);
     let size = (size * width / f.width(line, st).max(width)).min(size);
-    c.text(f, line, x, y, sans(size, t.medium), t.quiet, A::M);
+    c.text(f, line, x, y, sans(size, t.medium), ink, A::M);
 }
 
 /// Quota row shared by full, mid-height and narrow text-mode strips. The weekly gauge and
@@ -998,7 +1011,10 @@ fn quota_row(
             t.ink,
             A::M,
         );
-        fitted_caption(
+        let ahead = q["pace"]
+            .as_f64()
+            .is_some_and(|p| num(&q["used"]) / 100. > p);
+        fitted_caption_ink(
             c,
             f,
             &quota_caption(data, q),
@@ -1006,6 +1022,7 @@ fn quota_row(
             label_y,
             slot - S2,
             caption_size,
+            if weekly && ahead { t.warn } else { t.quiet },
             t,
         );
         if weekly && data.csr_cost.usd.is_some() {
@@ -1317,6 +1334,8 @@ pub struct Metrics {
     pub story_line_count: usize,
     /// Layout pt between the last card's bottom edge and the pixmap bottom (above the key row).
     pub last_card_bottom_pad: f32,
+    /// Distance to the key row after fitting the pane, in output pixels.
+    pub last_card_gap_px: f32,
     pub height: f32,
     pub question_lines: Vec<String>,
     pub sections_collapsed: bool,
@@ -1472,7 +1491,7 @@ pub fn draw(
         0.
     };
     let sell_h = if c.empty_session || c.offer {
-        P * 2. + 3. * theme::BODY_LINE
+        P * 2. + theme::TITLE_LINE + S3 + 3. * (theme::BODY_LINE + theme::CAPTION_LINE) + 2. * S4
     } else {
         0.
     };
@@ -1521,18 +1540,25 @@ pub fn draw(
     };
     let notice_gap = if c.notice.is_some() { S3 } else { 0. };
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
-    let figure_min = if quotas_only { 154. } else { 110. };
-    let base_core = M
-        + hero_h
-        + S3
-        + story_h
-        + if story_h > 0. { S3 } else { 0. }
-        + agents_h
+    let figure_min = if quotas_only {
+        154.
+    } else if open.figure {
+        // Chart (95 + 40), chart labels/payback (72), gauge offset (84).
+        291.
+    } else {
+        110.
+    };
+    let top_core =
+        M + hero_h + S3 + story_h + if story_h > 0. { S3 } else { 0. } + notice_h + notice_gap;
+    let tail_core = agents_h
         + if active { S3 } else { 0. }
-        + notice_h
-        + notice_gap
-        + P;
-    let available_extra = (maxh - base_core - empty_help - figure_min).max(0.);
+        + empty_help
+        + if empty_help > 0. { S3 } else { 0. };
+    // Layout points may scale to fit a narrow/wide terminal. Reserve S3 in final pixels.
+    let min_core = top_core + tail_core + figure_min;
+    maxh = maxh.max(min_core / (1. - S3 / available_height as f32));
+    let key_gap = S3 * maxh / available_height as f32;
+    let available_extra = (maxh - min_core - key_gap - S3).max(0.);
     let extra_h = if open.threads {
         requested_extra_h.min(available_extra)
     } else {
@@ -1546,15 +1572,16 @@ pub fn draw(
             lines as f32 * theme::BODY_LINE + P * 2.
         }
     };
-    let fixed_core = base_core + extra_h;
-    let (figure_h, help_h) = if quotas_only {
-        (figure_min, empty_help)
-    } else {
+    let top_core = top_core + extra_h + if extra_h > 0. { S3 } else { 0. };
+    let (figure_h, help_h) = if quotas_only && empty_help > 0. {
+        // In an empty session, the feature card owns the slack beneath compact quota gauges.
         (
-            (maxh - fixed_core - empty_help - if empty_help > 0. { S3 } else { 0. })
-                .max(figure_min),
-            empty_help,
+            figure_min,
+            maxh - top_core - figure_min - agents_h - if active { S3 } else { 0. } - S3 - key_gap,
         )
+    } else {
+        // Context receives the spare height before any other card does.
+        (maxh - top_core - tail_core - key_gap, empty_help)
     };
     let height = maxh;
     let mut canvas = Canvas::new(W, height);
@@ -1941,39 +1968,15 @@ pub fn draw(
                 b += 38.;
             }
         }
-        y += extra_h;
+        y += extra_h + S3;
     }
     let mut ceiling_y = None;
     let mut ring_bounds = None;
     let mut ring_group = None;
     let mut ring_formula_avail = None;
     let mut mid_layout = None;
-    // Keep >= 10pt between the last card and the pixmap bottom (key row sits under the picture).
-    const LAST_CARD_PAD: f32 = S4;
-    let available_figure_h = figure_h.min((height - y - LAST_CARD_PAD).max(0.));
-    let mid_card = !narrow
-        && !open.figure
-        && c.figure["ctx"]["tokens"].as_f64().is_some_and(|n| n > 0.)
-        && available_figure_h > 110.
-        && !collapsed_context_fits(&c.figure, available_figure_h);
-    // Keep the capped mid ring in an intrinsic card; surplus space belongs outside cards.
-    let figure_draw_h = if open.figure && !quotas_only {
-        available_figure_h.min(336.)
-    } else if mid_card {
-        available_figure_h.min(186.)
-    } else {
-        available_figure_h
-    };
-    let figure_layout_h = figure_draw_h;
-    let figure_draw_h = if !open.figure
-        && !narrow
-        && !quotas_only
-        && collapsed_context_fits(&c.figure, figure_layout_h)
-    {
-        collapsed_context_layout(&c.figure, figure_layout_h).2
-    } else {
-        figure_layout_h
-    };
+    let figure_draw_h = figure_h;
+    let figure_layout_h = figure_h;
     let figure_region = (y, figure_draw_h);
     let fig_info = figure(
         &mut canvas,
@@ -2049,17 +2052,59 @@ pub fn draw(
     let help_region = (help_h > 0.).then_some((y, help_h));
     if let Some((help_y, help_draw_h)) = help_region {
         panel(&mut canvas, help_y, help_draw_h, t);
-        for (k, s) in sells().iter().enumerate() {
+        let content_h =
+            theme::TITLE_LINE + S3 + 3. * (theme::BODY_LINE + theme::CAPTION_LINE) + 2. * S4;
+        let mut cursor = help_y + (help_draw_h - content_h) / 2.;
+        label(
+            &mut canvas,
+            f,
+            "What CSR can do",
+            IX,
+            cursor + f.cap(title),
+            theme::TITLE_SIZE,
+            t.ink,
+            t.bold,
+        );
+        cursor += theme::TITLE_LINE + S3;
+        let features = [
+            (
+                Icon::Brain,
+                "Find decisions and examples in your past conversations.",
+            ),
+            (
+                Icon::FileWarning,
+                "Surface stale context before it sends the work off course.",
+            ),
+            (
+                Icon::ScrollText,
+                "Bring unfinished questions back when they matter.",
+            ),
+        ];
+        for (line, (icon, caption_text)) in sells().iter().zip(features) {
+            let base = cursor + f.cap(body);
+            canvas.icon(f, icon, IX, base, 14., theme::BODY_SIZE, t.mint);
+            let x = IX + 14. + ICON_GAP;
             label(
                 &mut canvas,
                 f,
-                s,
-                IX,
-                help_y + P + f.cap(body) + k as f32 * theme::BODY_LINE,
+                line,
+                x,
+                base,
                 theme::BODY_SIZE,
+                t.ink,
+                t.medium,
+            );
+            label(
+                &mut canvas,
+                f,
+                caption_text,
+                x,
+                cursor + theme::BODY_LINE + f.cap(caption),
+                theme::CAPTION_SIZE,
                 t.quiet,
                 t.regular,
             );
+            cursor += theme::BODY_LINE + theme::CAPTION_LINE + S4;
         }
         y = help_y + help_draw_h;
     }
@@ -2121,6 +2166,8 @@ pub fn draw(
             mid_layout,
             story_line_count,
             last_card_bottom_pad,
+            last_card_gap_px: available_height as f32
+                - last_card_bottom * content_h as f32 / height,
             height,
             question_lines: question,
             sections_collapsed: collapsed,
@@ -2194,6 +2241,49 @@ fn collapsed_context_fits(g: &Value, h: f32) -> bool {
     needed <= h + 0.5
 }
 
+/// Actual per-request input history uses the space left after the context ring reaches its clamp.
+fn history_plot(c: &mut Canvas, f: &Fonts, bars: &[(f64, f64)], y: f32, h: f32, t: &Tokens) {
+    let caption = sans(theme::CAPTION_SIZE, t.regular);
+    let base = y + S3 + f.cap(caption);
+    c.text(f, "Per-turn input", IX, base, caption, t.quiet, A::L);
+    c.text(
+        f,
+        "pink = fresh input",
+        W - IX,
+        base,
+        caption,
+        t.quiet,
+        A::R,
+    );
+    let top = y + S3 + theme::CAPTION_LINE + S1;
+    let bottom = y + h - S2;
+    let plot_h = (bottom - top).max(1.);
+    let max = bars
+        .iter()
+        .map(|(cached, fresh)| cached + fresh)
+        .fold(1., f64::max);
+    let step = IW / bars.len().max(1) as f32;
+    c.hair(IX, bottom, IW, t.track);
+    for (i, (cached, fresh)) in bars.iter().enumerate() {
+        let total = ((cached + fresh) / max) as f32 * plot_h;
+        let fresh = (fresh / max) as f32 * plot_h;
+        c.rect(
+            IX + i as f32 * step,
+            bottom - total,
+            step * 0.7,
+            total,
+            t.sky,
+        );
+        c.rect(
+            IX + i as f32 * step,
+            bottom - total,
+            step * 0.7,
+            fresh,
+            t.fresh,
+        );
+    }
+}
+
 /// Draw the figure card. Returns (ceiling_y, ring_bounds) for layout metrics.
 fn figure(
     c: &mut Canvas,
@@ -2213,12 +2303,7 @@ fn figure(
     const STRIP_H: f32 = 110.;
     let use_strip = tokens.is_some() && (narrow || h <= STRIP_H);
     let use_mid = tokens.is_some() && !expanded && !use_strip && !collapsed_scaled_fits;
-    let panel_h = if tokens.is_some() && !expanded && !use_strip && !use_mid {
-        collapsed_context_layout(g, h).2
-    } else {
-        h
-    };
-    panel(c, y, panel_h, t);
+    panel(c, y, h, t);
     if use_strip {
         return Some(draw_context_strip(c, f, data, y, h, t, tokens, size));
     }
@@ -2317,7 +2402,7 @@ fn figure(
             // Reserve labels + payback above gauges; shrink the chart baseline when the card is short.
             let gauge_cy = y + h - 84.;
             let reserve_below = 18. + 18. + 36.;
-            let chart_bottom = (y + 195.).min(gauge_cy - reserve_below).max(y + 130.);
+            let chart_bottom = (gauge_cy - reserve_below).max(y + 130.);
             let chart_top = y + 95.;
             let chart_h = (chart_bottom - chart_top).max(40.);
             let chart_bottom = chart_top + chart_h;
@@ -2389,12 +2474,22 @@ fn figure(
             let title_bottom = y + context_title_height(g);
             let (r, available_height, _) = collapsed_context_layout(g, h);
             let ring_extent = r + S3;
-            let group_top = title_bottom;
+            let needed = collapsed_context_layout(g, h).2;
+            let slack = (h - needed).max(0.);
+            let history_h = if data.requests.len() > 1 && slack >= 50. {
+                slack
+            } else {
+                0.
+            };
+            let group_top = title_bottom + if history_h > 0. { 0. } else { slack / 2. };
             let cy = group_top + ring_extent;
             let cx = W / 2.;
-            let pay_y = cy + ring_extent + GAP_RING_PAY;
+            if history_h > 0. {
+                history_plot(c, f, &data.requests, cy + ring_extent, history_h, t);
+            }
+            let pay_y = cy + ring_extent + history_h + GAP_RING_PAY;
             let sat_cy = if payback(g).is_empty() {
-                cy + ring_extent + S3 + GAUGE_R
+                cy + ring_extent + history_h + S3 + GAUGE_R
             } else {
                 pay_y + PAY_H + GAP_PAY_GAUGE + GAUGE_R
             };
@@ -2631,15 +2726,21 @@ fn draw_context_mid(
     let details_gap = S3;
     let details_h = 6.;
     let right_h = gauge_r + label_below + theme::CAPTION_LINE + details_gap + details_h;
-    let group_h = (2. * r).max(right_h);
+    let core_h = (2. * r).max(right_h);
+    let history_h = if data.requests.len() > 1 && slot - core_h - S3 >= 50. {
+        slot - core_h - S3
+    } else {
+        0.
+    };
+    let group_h = core_h + if history_h > 0. { S3 + history_h } else { 0. };
     let group_top = title_bottom + (slot - group_h).max(0.) / 2.;
     let group_bottom = group_top + group_h;
     let ring_cx = IX + r;
-    let ring_cy = group_top + group_h / 2.;
+    let ring_cy = group_top + core_h / 2.;
 
     let right_x0 = ring_cx + r + S4;
     let right_w = (W - M - P - right_x0).max(80.);
-    let right_top = group_top + (group_h - right_h).max(0.) / 2.;
+    let right_top = group_top + (core_h - right_h).max(0.) / 2.;
     let gauges_cy = right_top + gauge_r;
     let gauge_label_y = gauges_cy + label_below;
     let details_y = gauge_label_y + theme::CAPTION_LINE + details_gap + 2.;
@@ -2738,6 +2839,9 @@ fn draw_context_mid(
         }
     }
 
+    if history_h > 0. {
+        history_plot(c, f, &data.requests, group_top + core_h + S3, history_h, t);
+    }
     let mid = MidLayoutBounds {
         ring: (ring_cx, ring_cy, r),
         group: (group_top, group_bottom),

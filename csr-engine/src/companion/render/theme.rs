@@ -88,6 +88,7 @@ pub struct Tokens {
     pub csr_share: [u8; 4],
     pub dream: [u8; 4],
     pub amber: [u8; 4],
+    pub warn: [u8; 4],
     pub risk: [u8; 4],
     pub asked: [u8; 4],
     pub track: [u8; 4],
@@ -135,6 +136,7 @@ pub const SETS: &[(&str, Tokens)] = &[
             csr_share: [62, 98, 128, 255],
             dream: [232, 197, 71, 255],
             amber: [242, 182, 50, 255],
+            warn: [242, 182, 50, 255],
             risk: [255, 163, 140, 255],
             asked: [184, 173, 255, 255],
             track: [58, 66, 77, 255],
@@ -158,9 +160,21 @@ pub const SETS: &[(&str, Tokens)] = &[
             quiet: [69, 77, 88, 255],
             faint: [78, 87, 100, 255],
             aurora: [
-                &[(0., [221, 243, 234, 230]), (1., [221, 243, 234, 0])],
-                &[(0., [233, 229, 251, 204]), (1., [233, 229, 251, 0])],
-                &[(0., [252, 235, 221, 179]), (1., [252, 235, 221, 0])],
+                &[
+                    (0., [95, 218, 150, 245]),
+                    (0.35, [95, 218, 150, 245]),
+                    (1., [95, 218, 150, 0]),
+                ],
+                &[
+                    (0., [180, 155, 241, 235]),
+                    (0.35, [180, 155, 241, 235]),
+                    (1., [180, 155, 241, 0]),
+                ],
+                &[
+                    (0., [250, 177, 115, 225]),
+                    (0.35, [250, 177, 115, 225]),
+                    (1., [250, 177, 115, 0]),
+                ],
             ],
             ambient_shadow: Shadow {
                 y: 8.,
@@ -174,13 +188,14 @@ pub const SETS: &[(&str, Tokens)] = &[
             },
             top_highlight: [255, 255, 255, 191],
             linear_at: [0., 1.],
-            glass: [[255, 255, 255, 173], [249, 249, 249, 173]],
+            glass: [[255, 255, 255, 160], [249, 249, 249, 160]],
             hair: [23, 25, 28, 35],
             mint: [26, 109, 78, 255],
             sky: [32, 91, 147, 255],
             csr_share: [16, 46, 74, 255],
             dream: [121, 85, 0, 255],
             amber: [132, 86, 0, 255],
+            warn: [113, 69, 0, 255],
             risk: [169, 53, 27, 255],
             asked: [104, 68, 164, 255],
             track: [212, 219, 223, 255],
@@ -302,7 +317,8 @@ mod instrument_tests {
                     }
                     for ink in [
                         // Dream-section bodies use ink; their short labels use dream amber.
-                        t.ink, t.dream, t.quiet, t.faint, t.mint, t.sky, t.amber, t.risk, t.asked,
+                        t.ink, t.dream, t.quiet, t.faint, t.mint, t.sky, t.amber, t.warn, t.risk,
+                        t.asked,
                     ] {
                         let a = luminance(card);
                         let b = luminance(ink);
@@ -312,6 +328,140 @@ mod instrument_tests {
                         );
                     }
                 }
+            }
+        }
+    }
+    // D65 sRGB -> CIELAB, then Sharma/Wu/Dalal CIEDE2000 (unit weights).
+    fn lab(rgb: [u8; 4]) -> [f64; 3] {
+        let linear = |v: u8| {
+            let v = f64::from(v) / 255.;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let [r, g, b] = [linear(rgb[0]), linear(rgb[1]), linear(rgb[2])];
+        let f = |v: f64| {
+            if v > 216. / 24389. {
+                v.cbrt()
+            } else {
+                v * 841. / 108. + 4. / 29.
+            }
+        };
+        let x = f((0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047);
+        let y = f(0.2126729 * r + 0.7151522 * g + 0.0721750 * b);
+        let z = f((0.0193339 * r + 0.1191920 * g + 0.9503041 * b) / 1.08883);
+        [116. * y - 16., 500. * (x - y), 200. * (y - z)]
+    }
+    fn delta_e_2000(a: [f64; 3], b: [f64; 3]) -> f64 {
+        let [l1, a1, b1] = a;
+        let [l2, a2, b2] = b;
+        let c = (a1.hypot(b1) + a2.hypot(b2)) / 2.;
+        let g = 0.5 * (1. - (c.powi(7) / (c.powi(7) + 25_f64.powi(7))).sqrt());
+        let (a1, a2) = ((1. + g) * a1, (1. + g) * a2);
+        let (c1, c2) = (a1.hypot(b1), a2.hypot(b2));
+        let hue = |a: f64, b: f64| {
+            if a == 0. && b == 0. {
+                0.
+            } else {
+                b.atan2(a).to_degrees().rem_euclid(360.)
+            }
+        };
+        let (h1, h2) = (hue(a1, b1), hue(a2, b2));
+        let mut dh = h2 - h1;
+        if c1 * c2 == 0. {
+            dh = 0.;
+        } else if dh > 180. {
+            dh -= 360.;
+        } else if dh < -180. {
+            dh += 360.;
+        }
+        let dh = 2. * (c1 * c2).sqrt() * (dh / 2.).to_radians().sin();
+        let (dl, dc) = (l2 - l1, c2 - c1);
+        let (lm, cm) = ((l1 + l2) / 2., (c1 + c2) / 2.);
+        let hm = if c1 * c2 == 0. {
+            h1 + h2
+        } else if (h1 - h2).abs() <= 180. {
+            (h1 + h2) / 2.
+        } else if h1 + h2 < 360. {
+            (h1 + h2 + 360.) / 2.
+        } else {
+            (h1 + h2 - 360.) / 2.
+        };
+        let cos = |v: f64| v.to_radians().cos();
+        let t = 1. - 0.17 * cos(hm - 30.) + 0.24 * cos(2. * hm) + 0.32 * cos(3. * hm + 6.)
+            - 0.20 * cos(4. * hm - 63.);
+        let sl = 1. + 0.015 * (lm - 50.).powi(2) / (20. + (lm - 50.).powi(2)).sqrt();
+        let sc = 1. + 0.045 * cm;
+        let sh = 1. + 0.015 * cm * t;
+        let rt = -2.
+            * (cm.powi(7) / (cm.powi(7) + 25_f64.powi(7))).sqrt()
+            * (60. * (-((hm - 275.) / 25.).powi(2)).exp())
+                .to_radians()
+                .sin();
+        ((dl / sl).powi(2) + (dc / sc).powi(2) + (dh / sh).powi(2) + rt * (dc / sc) * (dh / sh))
+            .sqrt()
+    }
+    #[test]
+    fn ciede2000_matches_published_reference_pairs() {
+        for (a, b, expected) in [
+            ([50., 2.6772, -79.7751], [50., 0., -82.7485], 2.0425),
+            ([50., 3.1571, -77.2803], [50., 0., -82.7485], 2.8615),
+            ([50., -1.3802, -84.2814], [50., 0., -82.7485], 1.0000),
+            ([50., 0., 0.], [50., -1., 2.], 2.3669),
+            ([50., 2.49, -0.001], [50., -2.49, 0.001], 7.1792),
+        ] {
+            assert!((delta_e_2000(a, b) - expected).abs() < 0.0001);
+            assert!((delta_e_2000(b, a) - expected).abs() < 0.0001);
+        }
+    }
+    #[test]
+    fn light_mesh_anchor_colours_survive_raster_and_card_compositing() {
+        use super::super::instrument_gfx::{lin, Canvas, S};
+        // All three radial centres are outside the pane. Measure their nearest in-pane
+        // pixel centres: top-left, right edge at 45% height, bottom edge at 45% width.
+        for (w, h) in [(605., 800.), (605., 1135.), (605., 400.), (304., 500.)] {
+            let mut canvas = Canvas::new(w, h);
+            canvas.background(&LIGHT);
+            let points = [
+                (0, 0),
+                (canvas.pm.width() - 1, (h * S * 0.45) as u32),
+                ((w * S * 0.45) as u32, canvas.pm.height() - 1),
+            ];
+            let sample = |pm: &tiny_skia::Pixmap, x, y| {
+                let p = pm.pixel(x, y).unwrap().demultiply();
+                [p.red(), p.green(), p.blue(), p.alpha()]
+            };
+            let mesh: Vec<_> = points
+                .iter()
+                .map(|&(x, y)| sample(&canvas.pm, x, y))
+                .collect();
+            // The same glass shader as the cards, over the actual mesh, without text/shadows.
+            canvas.glass(
+                0.,
+                0.,
+                w,
+                h,
+                0.,
+                lin(
+                    0.,
+                    0.,
+                    0.,
+                    h,
+                    &[
+                        (LIGHT.linear_at[0], LIGHT.glass[0]),
+                        (LIGHT.linear_at[1], LIGHT.glass[1]),
+                    ],
+                ),
+            );
+            for (i, &(x, y)) in points.iter().enumerate() {
+                let card = sample(&canvas.pm, x, y);
+                let mesh_delta = delta_e_2000(lab(mesh[i]), lab(LIGHT.ground));
+                let card_delta = delta_e_2000(lab(card), lab(LIGHT.ground));
+                println!("{w}x{h} anchor {i}: mesh {mesh_delta:.3}, card {card_delta:.3}, mesh RGB {:?}, card RGB {card:?}", mesh[i]);
+                assert!(mesh_delta >= 6., "anchor {i}: mesh {mesh_delta}");
+                assert!(card_delta >= 6., "anchor {i}: card {card_delta}");
             }
         }
     }

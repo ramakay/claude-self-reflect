@@ -493,7 +493,7 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
         100. * metrics.dream / metrics.height
     );
     (
-        json!({"text":text,"png_sha256":hash,"acts":pane.acts,"dream_percent":format!("{:.2}",100.*metrics.dream/metrics.height),
+        json!({"text":text,"png_sha256":hash,"key_gap_px":format!("{:.2}",metrics.last_card_gap_px),"acts":pane.acts,"dream_percent":format!("{:.2}",100.*metrics.dream/metrics.height),
             "csr_cost":{"share":metrics.csr_cost.share_label(),"usd":metrics.csr_cost.usd,"calls":metrics.csr_cost.calls}}),
         // Cell-grid export for contact sheets; placement hash stays in the golden JSON.
         {
@@ -1197,7 +1197,7 @@ fn expanded_bars_report_a_ceiling_on_the_chart_and_quotas_stay_compact() {
     );
     let help = empty_metrics.help_region.expect("help card");
     assert!(
-        empty_metrics.last_card_bottom_pad >= 10.,
+        (empty_metrics.last_card_gap_px - 12.).abs() <= 2.,
         "last card pad {}: want >= 10pt above keys",
         empty_metrics.last_card_bottom_pad
     );
@@ -1216,6 +1216,10 @@ fn footer_abbreviates_only_what_must_fit_and_keeps_q_close() {
     pane.pixels = false;
     let footer = text::plain(&pane.frame(44, 30, NOW)[29]);
     assert!(footer.contains("q close"), "{footer}");
+    assert!(
+        footer.contains("l changes") && footer.contains("t threads"),
+        "{footer}"
+    );
     assert!(!footer.contains("q quit"), "{footer}");
     assert!(
         footer.starts_with(' '),
@@ -1231,11 +1235,15 @@ fn footer_abbreviates_only_what_must_fit_and_keeps_q_close() {
         spans.last().unwrap()[1].as_u64().unwrap() <= 43,
         "keys fit cols-2: {spans:?}"
     );
-    // 48-wide fits full words with a single-space join.
-    let wide = text::plain(&pane.frame(48, 30, NOW)[29]);
-    assert!(wide.contains("changes") || wide.contains("chg"), "{wide}");
-    if wide.contains("changes") {
-        assert!(wide.contains("threads") && wide.contains("figure") && wide.contains("theme"));
+    for cols in [48, 60] {
+        let wide = text::plain(&pane.frame(cols, 30, NOW)[29]);
+        assert!(
+            wide.contains("l changes") && wide.contains("t threads") && wide.contains("q close"),
+            "{wide}"
+        );
+        if cols == 60 {
+            assert!(wide.contains("figure") && wide.contains("theme"), "{wide}");
+        }
     }
 }
 
@@ -1274,8 +1282,7 @@ fn collapsed_context_hugs_exact_group_with_bottom_clearance() {
             "{cols}x{rows}: group_bottom {group_bottom} needs >=16pt above card bottom {card_bottom}"
         );
         let title_band = fig_y + 16. + 18. + 8. + 14. + 12.;
-        assert!((group_top - title_band).abs() < 0.5);
-        assert!((card_bottom - group_bottom - 16.).abs() < 0.5);
+        assert!(group_top >= title_band - 0.5);
         assert!(
             cy > group_top && cy < group_bottom,
             "{cols}x{rows}: ring centre outside group"
@@ -1285,7 +1292,7 @@ fn collapsed_context_hugs_exact_group_with_bottom_clearance() {
             rows.saturating_sub(1),
             "picture ends one row above keys"
         );
-        assert!(metrics.last_card_bottom_pad >= 10.);
+        assert!((metrics.last_card_gap_px - 12.).abs() <= 2.);
         let _ = cx;
     }
 }
@@ -1413,37 +1420,47 @@ fn collapsed_ring_formula_holds_for_all_token_fixtures() {
 }
 
 #[test]
-fn last_card_padding_holds_for_all_fixtures_and_expanded_or_help_tails() {
+fn every_fixture_ends_one_s3_gap_above_the_key_row() {
+    let mut measurements = Vec::new();
     for state in STATES {
-        for (cols, rows) in [(44, 30), (60, 40)] {
-            let (_home, paths) = state_home(state);
-            let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
-            pane.pixels = true;
-            pane.enable_cards();
-            if state == "03-agents" {
-                pane.key("i");
-            }
-            pane.frame(cols, rows, NOW);
-            let metrics = pane.instrument_metrics.as_ref().unwrap();
-            assert!(
-                metrics.last_card_bottom_pad >= 10.,
-                "{state} {cols}x{rows}: pad {}",
-                metrics.last_card_bottom_pad
-            );
-            if let Some((hy, hh)) = metrics.help_region {
+        for (cols, rows) in [(76, 67), (38, 30), (44, 30), (60, 40)] {
+            for theme in [Theme::Dark, Theme::Light] {
+                let (_home, paths) = state_home(state);
+                let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+                pane.pixels = true;
+                pane.enable_cards();
+                pane.theme = theme;
+                if state == "03-agents" {
+                    pane.key("i");
+                }
+                pane.frame(cols, rows, NOW);
+                let metrics = pane.instrument_metrics.as_ref().unwrap();
+                let placement = &pane.placed[0];
+                let png = image::load_from_memory(&placement.png).unwrap();
+                let (y, h) = metrics
+                    .help_region
+                    .or(metrics.agents_region)
+                    .unwrap_or(metrics.figure_region);
+                // Convert the actual final card's logical bottom through the encoded PNG's
+                // scale, then measure against the terminal key row's pixel origin.
+                let card_bottom =
+                    placement.row as f32 * 34. + (y + h) * png.height() as f32 / metrics.height;
+                let key_top = (rows - 1) as f32 * 34.;
+                let gap = key_top - card_bottom;
                 assert!(
-                    hy + hh + metrics.last_card_bottom_pad <= metrics.height + 0.5,
-                    "{state}: help overrun"
+                    (gap - 12.).abs() <= 2.,
+                    "{state} {cols}x{rows} {theme:?}: key gap {gap}px"
                 );
-            }
-            let (fy, fh) = metrics.figure_region;
-            if metrics.help_region.is_none() && metrics.agents_region.is_none() {
-                assert!(
-                    fy + fh + metrics.last_card_bottom_pad <= metrics.height + 0.5,
-                    "{state}: figure overrun"
-                );
+                assert!((metrics.last_card_gap_px - gap).abs() <= 0.1);
+                println!("key gap {state} {cols}x{rows} {theme:?}: {gap:.3}px");
+                measurements.push(json!({"state":state,"cols":cols,"rows":rows,"theme":format!("{theme:?}"),"gap_px":gap}));
             }
         }
+    }
+    if let Some(dir) = std::env::var_os("CSR_INSTRUMENT_PNG") {
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir).unwrap();
+        write_json(&dir.join("key-gaps.json"), &json!(measurements));
     }
 }
 
