@@ -27,4 +27,4 @@ CTX 192k/1M · +6k/turn · ♻ >15 prompts
 Codex 7D 41%
 5¢ this week
 3 in flight · 2 stalled
- d l chg t threads i b thm q close
+ d q l chg t thr i fig b thm q close

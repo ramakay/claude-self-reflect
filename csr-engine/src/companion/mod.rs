@@ -33,6 +33,7 @@ pub mod readings;
 pub mod recall;
 pub mod relay;
 pub mod render;
+pub mod repo_recap;
 pub mod send;
 pub mod session;
 pub mod shiftmap;

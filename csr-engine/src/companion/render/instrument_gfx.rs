@@ -585,12 +585,20 @@ pub struct QuotaGauge {
     pub csr_segment: Option<(f32, f32, f32)>,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FreshPlot {
+    pub region: (f32, f32, f32, f32),
+    pub heights: Vec<f32>,
+    pub compactions: Vec<usize>,
+}
+
 pub struct Canvas {
     pub pm: Pixmap,
     pub dry: bool,
     /// Final output pixels per logical point (before supersampling/downsampling).
     pub output_scale: f32,
     pub quota_gauges: Vec<QuotaGauge>,
+    pub fresh_plots: Vec<FreshPlot>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -798,6 +806,7 @@ impl Canvas {
             dry: false,
             output_scale: S,
             quota_gauges: Vec::new(),
+            fresh_plots: Vec::new(),
         }
     }
     pub fn dry() -> Canvas {
@@ -806,6 +815,7 @@ impl Canvas {
             dry: true,
             output_scale: S,
             quota_gauges: Vec::new(),
+            fresh_plots: Vec::new(),
         }
     }
     pub fn fill(&mut self, p: &Path, col: Rgba) {
@@ -1165,6 +1175,7 @@ pub fn contact(f: &Fonts, tiles: &[(String, Pixmap, String)], path: &str, bg: Rg
         dry: false,
         output_scale: S,
         quota_gauges: Vec::new(),
+        fresh_plots: Vec::new(),
     };
     c.pm.fill(color(bg));
     let mut y = gap;

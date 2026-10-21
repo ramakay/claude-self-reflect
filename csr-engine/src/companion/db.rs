@@ -5,8 +5,12 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+type RecapCache =
+    BTreeMap<(String, String), (std::time::Instant, Option<super::repo_recap::RepoRecap>)>;
+
 pub struct Db {
     storage: Storage,
+    recaps: std::cell::RefCell<RecapCache>,
     shifts: std::cell::RefCell<BTreeMap<std::path::PathBuf, (std::time::Instant, Vec<Value>)>>,
 
     #[cfg(test)]
@@ -24,10 +28,34 @@ impl Db {
         })?;
         Ok(Self {
             storage,
+            recaps: Default::default(),
             shifts: Default::default(),
             #[cfg(test)]
             queries: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+    pub fn repo_recap(
+        &self,
+        project: &str,
+        sid: &str,
+        now: f64,
+    ) -> Option<super::repo_recap::RepoRecap> {
+        let key = (project.to_owned(), sid.to_owned());
+        if let Some((at, recap)) = self.recaps.borrow().get(&key) {
+            if at.elapsed().as_secs() < 60 {
+                let mut recap = recap.clone();
+                if let Some(value) = &mut recap {
+                    // Rebuild age through the composer on the next cache refresh.
+                    value.age = super::repo_recap::age_label((now - value.at).max(0.));
+                }
+                return recap;
+            }
+        }
+        let recap = super::repo_recap::load(&self.storage, project, sid, now);
+        self.recaps
+            .borrow_mut()
+            .insert(key, (std::time::Instant::now(), recap.clone()));
+        recap
     }
     pub fn learnt_counts(&self, project: &str, sid: &str, now: f64) -> Vec<(usize, &'static str)> {
         let Some(end) = chrono::DateTime::from_timestamp(now as i64, 0) else {

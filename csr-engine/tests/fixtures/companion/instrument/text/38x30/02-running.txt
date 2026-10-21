@@ -27,4 +27,4 @@ CTX 192k/1M · +6k/turn · ♻ >15 prompts
 7D 52%» · CSR 1.2 · 5H 2% · ◷ 59m
 Codex 7D 41%
 5¢ this week
- d l chg t threads i b thm q close
+ d q l chg t thr i fig b thm q close

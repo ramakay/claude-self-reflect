@@ -37,6 +37,8 @@ pub struct DreamCard {
 #[derive(Clone, Debug)]
 pub struct Composition {
     pub empty_session: bool,
+    pub repo_recap: Option<crate::companion::repo_recap::RepoRecap>,
+    pub request_compactions: Vec<usize>,
     /// Dreams are off in settings: show the one-press offer plus what CSR can do.
     pub offer: bool,
     /// Notice when enabling dreams from the offer failed.
@@ -256,6 +258,10 @@ impl Composition {
             });
         Self {
             empty_session,
+            repo_recap: serde_json::from_value(data["repo_recap"].clone())
+                .ok()
+                .filter(|_: &crate::companion::repo_recap::RepoRecap| empty_session),
+            request_compactions: recent_request_compactions(s),
             offer,
             offer_notice: data["offer_notice"].as_str().map(str::to_owned),
             learnt: array(&data["learnt"])
@@ -684,7 +690,16 @@ pub fn rows_with_figure(
     if let Some(n) = &c.notice {
         out.extend(wrap(n));
     }
-    if c.empty_session || c.offer {
+    if let Some(recap) = &c.repo_recap {
+        out.extend(wrap(&format!(
+            "Last time here · {} · {}",
+            recap.age,
+            recap.session.chars().take(8).collect::<String>()
+        )));
+        for line in recap.text.lines() {
+            out.extend(wrap(line));
+        }
+    } else if c.empty_session || c.offer {
         for line in sells() {
             out.extend(wrap(line));
         }
@@ -1382,24 +1397,59 @@ pub fn story_text_lines(s: &str, cols: usize, max_lines: usize) -> Vec<String> {
     })
 }
 
-/// Chart max for expanded request bars: data, compact band, and the context window.
-pub fn request_bar_max(bars: &[(f64, f64)], band_high: f64, window: f64) -> f64 {
-    bars.iter()
-        .map(|(cached, fresh)| cached + fresh)
-        .fold(1., f64::max)
-        .max(band_high)
-        .max(window.max(1.))
+/// Fresh input plus cache-write, normalised to the visible maximum. Flat history abstains.
+pub fn fresh_bar_heights(bars: &[(f64, f64)]) -> Option<Vec<f32>> {
+    if bars.len() < 2 {
+        return None;
+    }
+    let max = bars.iter().map(|(_, fresh)| *fresh).fold(0., f64::max);
+    let min = bars
+        .iter()
+        .map(|(_, fresh)| *fresh)
+        .fold(f64::INFINITY, f64::min);
+    if max <= 0. || max < min * 1.5 {
+        return None;
+    }
+    Some(
+        bars.iter()
+            .map(|(_, fresh)| (fresh / max).clamp(0., 1.) as f32)
+            .collect(),
+    )
 }
 
-/// Y of a value on the expanded bar chart (top of chart at `base`, height `chart_h`).
-pub fn request_bar_y(base: f32, value: f64, max: f64, chart_h: f32) -> f32 {
-    base + chart_h - (value / max * chart_h as f64) as f32
+// Match the same ordered, valid request rows as cards::request_bars, before trimming the tail.
+fn recent_request_compactions(s: &Value) -> Vec<usize> {
+    let mut stamps: Vec<_> = array(&s["replies"])
+        .iter()
+        .filter(|row| num(&row[0]) != 0. && num(&row[1]) > 0.)
+        .map(|row| num(&row[0]))
+        .collect();
+    if stamps.len() < 2 {
+        return Vec::new();
+    }
+    stamps.sort_by(f64::total_cmp);
+    let first_visible = stamps.len().saturating_sub(24);
+    let mut indices: Vec<_> = array(&s["compacts"])
+        .iter()
+        .filter_map(|boundary| {
+            let at = boundary.as_f64()?;
+            if at < stamps[0] {
+                return None;
+            }
+            let i = stamps.partition_point(|stamp| *stamp < at);
+            (i >= first_visible && i < stamps.len()).then(|| i - first_visible)
+        })
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+    indices
 }
 
 #[derive(Clone, Debug)]
 pub struct Metrics {
     pub csr_cost: InstrumentCost,
     pub quota_gauges: Vec<QuotaGauge>,
+    pub fresh_plots: Vec<FreshPlot>,
     pub question_size: f32,
     pub question_line_height: f32,
     /// Only missing or system-fallback glyphs; bundled cross-family coverage is primary.
@@ -1585,7 +1635,25 @@ pub fn draw(
     } else {
         0.
     };
-    let sell_h = if c.empty_session || c.offer {
+    let recap_lines = c
+        .repo_recap
+        .as_ref()
+        .map(|recap| {
+            recap
+                .text
+                .lines()
+                .flat_map(|line| f.wrap(line, body, IW))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let sell_h = if c.repo_recap.is_some() {
+        P * 2.
+            + theme::TITLE_LINE
+            + S2
+            + theme::CAPTION_LINE
+            + S3
+            + recap_lines.len() as f32 * theme::BODY_LINE
+    } else if c.empty_session || c.offer {
         P * 2. + theme::TITLE_LINE + S3 + 3. * (theme::BODY_LINE + theme::CAPTION_LINE) + 2. * S4
     } else {
         0.
@@ -1668,14 +1736,19 @@ pub fn draw(
         }
     };
     let top_core = top_core + extra_h + if extra_h > 0. { S3 } else { 0. };
+    let mut card_gap = S3;
     let (figure_h, help_h) = if quotas_only && empty_help > 0. {
-        // In an empty session, the feature card owns the slack beneath compact quota gauges.
-        (
-            figure_min,
-            maxh - top_core - figure_min - agents_h - if active { S3 } else { 0. } - S3 - key_gap,
-        )
+        let available = maxh - top_core - tail_core - key_gap;
+        let figure_h = available.min(empty_quota_height(c)).max(figure_min);
+        let gaps = 1
+            + usize::from(story_h > 0.)
+            + usize::from(notice_h > 0.)
+            + usize::from(extra_h > 0.)
+            + usize::from(active)
+            + usize::from(empty_help > 0.);
+        card_gap += (available - figure_h).max(0.) / gaps as f32;
+        (figure_h, empty_help)
     } else {
-        // Context receives the spare height before any other card does.
         (maxh - top_core - tail_core - key_gap, empty_help)
     };
     let height = maxh;
@@ -1907,7 +1980,7 @@ pub fn draw(
             cursor += theme::CAPTION_LINE;
         }
     }
-    y += hero_h + S3;
+    y += hero_h + card_gap;
     if let Some(notice) = &c.notice {
         panel(&mut canvas, y, notice_h, t);
         single(
@@ -1921,7 +1994,7 @@ pub fn draw(
             t.ink,
             t,
         );
-        y += notice_h + notice_gap;
+        y += notice_h + card_gap;
     }
     let mut shift_hits = vec![];
     let mut story_line_count = 0usize;
@@ -1995,7 +2068,7 @@ pub fn draw(
             );
             cursor += theme::CAPTION_LINE;
         }
-        y += story_h + S3;
+        y += story_h + card_gap;
     }
     if extra_h > 0. {
         panel(&mut canvas, y, extra_h, t);
@@ -2064,7 +2137,7 @@ pub fn draw(
                 b += 38.;
             }
         }
-        y += extra_h + S3;
+        y += extra_h + card_gap;
     }
     let mut ceiling_y = None;
     let mut ring_bounds = None;
@@ -2094,7 +2167,7 @@ pub fn draw(
     y += figure_draw_h;
     let needs_tail = active || help_h > 0.;
     if needs_tail {
-        y += S3;
+        y += card_gap;
     }
     let agents_region = active.then_some((y, agents_h));
     if active {
@@ -2142,65 +2215,108 @@ pub fn draw(
         );
         y += agents_draw_h;
         if help_h > 0. {
-            y += S3;
+            y += card_gap;
         }
     }
     let help_region = (help_h > 0.).then_some((y, help_h));
     if let Some((help_y, help_draw_h)) = help_region {
         panel(&mut canvas, help_y, help_draw_h, t);
-        let content_h =
-            theme::TITLE_LINE + S3 + 3. * (theme::BODY_LINE + theme::CAPTION_LINE) + 2. * S4;
-        let mut cursor = help_y + (help_draw_h - content_h) / 2.;
-        label(
-            &mut canvas,
-            f,
-            "What CSR can do",
-            IX,
-            cursor + f.cap(title),
-            theme::TITLE_SIZE,
-            t.ink,
-            t.bold,
-        );
-        cursor += theme::TITLE_LINE + S3;
-        let features = [
-            (
-                Icon::Brain,
-                "Find decisions and examples in your past conversations.",
-            ),
-            (
-                Icon::FileWarning,
-                "Surface stale context before it sends the work off course.",
-            ),
-            (
-                Icon::ScrollText,
-                "Bring unfinished questions back when they matter.",
-            ),
-        ];
-        for (line, (icon, caption_text)) in sells().iter().zip(features) {
-            let base = cursor + f.cap(body);
-            canvas.icon(f, icon, IX, base, 14., theme::BODY_SIZE, t.mint);
-            let x = IX + 14. + ICON_GAP;
+        if let Some(recap) = &c.repo_recap {
+            let mut cursor = help_y + P;
             label(
                 &mut canvas,
                 f,
-                line,
-                x,
-                base,
-                theme::BODY_SIZE,
+                "Last time here",
+                IX,
+                cursor + f.cap(title),
+                theme::TITLE_SIZE,
                 t.ink,
-                t.medium,
+                t.bold,
             );
+            cursor += theme::TITLE_LINE + S2;
             label(
                 &mut canvas,
                 f,
-                caption_text,
-                x,
-                cursor + theme::BODY_LINE + f.cap(caption),
+                &format!(
+                    "{} · session {}",
+                    recap.age,
+                    recap.session.chars().take(8).collect::<String>()
+                ),
+                IX,
+                cursor + f.cap(caption),
                 theme::CAPTION_SIZE,
                 t.quiet,
                 t.regular,
             );
-            cursor += theme::BODY_LINE + theme::CAPTION_LINE + S4;
+            cursor += theme::CAPTION_LINE + S3;
+            for line in &recap_lines {
+                label(
+                    &mut canvas,
+                    f,
+                    line,
+                    IX,
+                    cursor + f.cap(body),
+                    theme::BODY_SIZE,
+                    t.ink,
+                    t.regular,
+                );
+                cursor += theme::BODY_LINE;
+            }
+        } else {
+            let content_h =
+                theme::TITLE_LINE + S3 + 3. * (theme::BODY_LINE + theme::CAPTION_LINE) + 2. * S4;
+            let mut cursor = help_y + (help_draw_h - content_h) / 2.;
+            label(
+                &mut canvas,
+                f,
+                "What CSR can do",
+                IX,
+                cursor + f.cap(title),
+                theme::TITLE_SIZE,
+                t.ink,
+                t.bold,
+            );
+            cursor += theme::TITLE_LINE + S3;
+            let features = [
+                (
+                    Icon::Brain,
+                    "Find decisions and examples in your past conversations.",
+                ),
+                (
+                    Icon::FileWarning,
+                    "Surface stale context before it sends the work off course.",
+                ),
+                (
+                    Icon::ScrollText,
+                    "Bring unfinished questions back when they matter.",
+                ),
+            ];
+            for (line, (icon, caption_text)) in sells().iter().zip(features) {
+                let base = cursor + f.cap(body);
+                canvas.icon(f, icon, IX, base, 14., theme::BODY_SIZE, t.mint);
+                let x = IX + 14. + ICON_GAP;
+                label(
+                    &mut canvas,
+                    f,
+                    line,
+                    x,
+                    base,
+                    theme::BODY_SIZE,
+                    t.ink,
+                    t.medium,
+                );
+                label(
+                    &mut canvas,
+                    f,
+                    caption_text,
+                    x,
+                    cursor + theme::BODY_LINE + f.cap(caption),
+                    theme::CAPTION_SIZE,
+                    t.quiet,
+                    t.regular,
+                );
+                cursor += theme::BODY_LINE + theme::CAPTION_LINE + S4;
+            }
         }
         y = help_y + help_draw_h;
     }
@@ -2242,6 +2358,7 @@ pub fn draw(
         Metrics {
             csr_cost: c.csr_cost.clone(),
             quota_gauges: canvas.quota_gauges.clone(),
+            fresh_plots: canvas.fresh_plots.clone(),
             question_size: qs.size,
             question_line_height,
             font_fallbacks,
@@ -2288,6 +2405,7 @@ pub struct MidLayoutBounds {
     pub details_y: f32,
     /// Unclamped `(h - title - 2P) / 2` before `clamp(25, …, 64)`.
     pub radius_inner: f32,
+    pub radius_max: f32,
     /// Left edge of the first small gauge (for overlap checks vs the main ring).
     pub gauges_left: f32,
     /// Right edge of the last small gauge.
@@ -2302,6 +2420,20 @@ type FigureInfo = (
     Option<f32>,
     Option<MidLayoutBounds>,
 );
+
+fn empty_quota_radius(c: &Composition) -> f32 {
+    let count = array(&c.figure["quotas"])
+        .iter()
+        .filter(|q| q["used"].is_number())
+        .count()
+        + usize::from(c.figure["cache"]["left"].is_number() || c.figure["cache"]["cold"] == true)
+        + usize::from(c.codex_week["percent"].is_number())
+        + usize::from(!has_week(c));
+    ((IW / count.max(1) as f32 - S3) / 2.).clamp(30., 64.)
+}
+fn empty_quota_height(c: &Composition) -> f32 {
+    P + theme::TITLE_LINE + S2 + 2. * empty_quota_radius(c) + 46. + theme::CAPTION_LINE + P
+}
 
 fn context_title_height(g: &Value) -> f32 {
     P + theme::TITLE_LINE
@@ -2338,47 +2470,59 @@ fn collapsed_context_fits(g: &Value, h: f32) -> bool {
     needed <= h + 0.5
 }
 
-/// Actual per-request input history uses the space left after the context ring reaches its clamp.
-fn history_plot(c: &mut Canvas, f: &Fonts, bars: &[(f64, f64)], y: f32, h: f32, t: &Tokens) {
+/// Fresh-only history. Cached context never sets the bar height or its vertical scale.
+fn history_plot(c: &mut Canvas, f: &Fonts, data: &Composition, y: f32, h: f32, t: &Tokens) {
+    let Some(normalized) = fresh_bar_heights(&data.requests) else {
+        return;
+    };
     let caption = sans(theme::CAPTION_SIZE, t.regular);
     let base = y + S3 + f.cap(caption);
-    c.text(f, "Per-turn input", IX, base, caption, t.quiet, A::L);
-    c.text(
-        f,
-        "pink = fresh input",
-        W - IX,
-        base,
-        caption,
-        t.quiet,
-        A::R,
+    c.text(f, "Fresh tokens / turn", IX, base, caption, t.quiet, A::L);
+    let max = data
+        .requests
+        .iter()
+        .map(|(_, fresh)| *fresh)
+        .fold(0., f64::max);
+    let legend = format!(
+        "input + cache write · max {}{}",
+        short(max),
+        if data.request_compactions.is_empty() {
+            ""
+        } else {
+            " · | compacted"
+        }
     );
+    c.text(f, &legend, W - IX, base, caption, t.quiet, A::R);
     let top = y + S3 + theme::CAPTION_LINE + S1;
     let bottom = y + h - S2;
     let plot_h = (bottom - top).max(1.);
-    let max = bars
-        .iter()
-        .map(|(cached, fresh)| cached + fresh)
-        .fold(1., f64::max);
-    let step = IW / bars.len().max(1) as f32;
+    let step = IW / normalized.len() as f32;
     c.hair(IX, bottom, IW, t.track);
-    for (i, (cached, fresh)) in bars.iter().enumerate() {
-        let total = ((cached + fresh) / max) as f32 * plot_h;
-        let fresh = (fresh / max) as f32 * plot_h;
+    let heights: Vec<_> = normalized.iter().map(|v| v * plot_h).collect();
+    for (i, height) in heights.iter().enumerate() {
         c.rect(
             IX + i as f32 * step,
-            bottom - total,
+            bottom - height,
             step * 0.7,
-            total,
-            t.sky,
-        );
-        c.rect(
-            IX + i as f32 * step,
-            bottom - total,
-            step * 0.7,
-            fresh,
+            *height,
             t.fresh,
         );
     }
+    for i in &data.request_compactions {
+        c.line(
+            IX + *i as f32 * step,
+            top,
+            IX + *i as f32 * step,
+            bottom,
+            t.hair_width,
+            t.amber,
+        );
+    }
+    c.fresh_plots.push(FreshPlot {
+        region: (IX, top, IW, plot_h),
+        heights,
+        compactions: data.request_compactions.clone(),
+    });
 }
 
 /// Draw the figure card. Returns (ceiling_y, ring_bounds) for layout metrics.
@@ -2392,6 +2536,7 @@ fn figure(
     expanded: bool,
     narrow: bool,
 ) -> Option<FigureInfo> {
+    let expanded = expanded && fresh_bar_heights(&data.requests).is_some();
     let g = &data.figure;
     let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
     let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.);
@@ -2407,12 +2552,13 @@ fn figure(
     if use_mid {
         return Some(draw_context_mid(c, f, data, y, h, t, tokens, size));
     }
-    let mut ceiling_y = None;
+    let ceiling_y = None;
     let mut ring_bounds = None;
     let mut ring_group = None;
     let mut ring_formula_avail = None;
     let mut collapsed_pay_y = None;
     let mut collapsed_sat_cy = None;
+    let mut context_quota_radius = 30.;
     label(
         c,
         f,
@@ -2493,35 +2639,11 @@ fn figure(
     let mut expanded_chart_bottom = y + 195.;
     if let (Some(n), Some(size)) = (tokens, size) {
         if expanded {
-            let bars = &data.requests;
-            let max = request_bar_max(bars, num(&g["band"]["high"]), size);
-            let bw = IW / bars.len().max(1) as f32;
-            // Reserve labels + payback above gauges; shrink the chart baseline when the card is short.
+            // Fresh input has its own scale. A context-window ceiling/band would be a different unit.
             let gauge_cy = y + h - 84.;
-            let reserve_below = 18. + 18. + 36.;
-            let chart_bottom = (gauge_cy - reserve_below).max(y + 130.);
-            let chart_top = y + 95.;
-            let chart_h = (chart_bottom - chart_top).max(40.);
-            let chart_bottom = chart_top + chart_h;
+            let chart_bottom = (gauge_cy - 72.).max(y + 135.);
             expanded_chart_bottom = chart_bottom;
-            // Ceiling / band as hairlines at their true values — never a filled slab over the bars.
-            if let Some(high) = g["band"]["high"].as_f64() {
-                c.hair(IX, request_bar_y(chart_top, high, max, chart_h), IW, t.band);
-            }
-            if let Some(low) = g["band"]["low"].as_f64() {
-                c.hair(IX, request_bar_y(chart_top, low, max, chart_h), IW, t.track);
-            }
-            let y_ceil = request_bar_y(chart_top, size, max, chart_h);
-            c.hair(IX, y_ceil, IW, t.band);
-            ceiling_y = Some(y_ceil);
-            for (i, (cached, fresh)) in bars.iter().enumerate() {
-                let bh = ((cached + fresh) / max * chart_h as f64) as f32;
-                let fh = (fresh / max * chart_h as f64) as f32;
-                c.rect(IX + i as f32 * bw, chart_bottom - bh, bw * 0.7, bh, t.sky);
-                c.rect(IX + i as f32 * bw, chart_bottom - bh, bw * 0.7, fh, t.fresh);
-            }
-            // Labels sit below the chart baseline and above the gauges — never over the bars.
-            let below = chart_bottom + 15.;
+            history_plot(c, f, data, y + 70., chart_bottom - (y + 70.) + S2, t);
             if let Some(trend) = g["trend"].as_f64() {
                 label(
                     c,
@@ -2532,22 +2654,12 @@ fn figure(
                         short(trend.abs())
                     ),
                     IX,
-                    below,
+                    chart_bottom + 15.,
                     11.5,
                     t.quiet,
                     t.regular,
                 );
             }
-            label(
-                c,
-                f,
-                "pink = fresh input",
-                W - 155.,
-                below,
-                9.,
-                t.quiet,
-                t.regular,
-            );
             c.text(f, &short(n), IX, y + 60., serif(25., t.medium), t.ink, A::L);
             label(
                 c,
@@ -2565,32 +2677,39 @@ fn figure(
             const GAP_RING_PAY: f32 = 16.;
             const PAY_H: f32 = 18.;
             const GAP_PAY_GAUGE: f32 = 12.;
-            const GAUGE_R: f32 = 30.;
-            const LABEL_BELOW: f32 = 46.;
             const LABEL_DESCENT: f32 = theme::CAPTION_LINE + 4.;
             let title_bottom = y + context_title_height(g);
             let (r, available_height, _) = collapsed_context_layout(g, h);
             let ring_extent = r + S3;
             let needed = collapsed_context_layout(g, h).2;
             let slack = (h - needed).max(0.);
-            let history_h = if data.requests.len() > 1 && slack >= 50. {
+            let history_h = if fresh_bar_heights(&data.requests).is_some() && slack >= 50. {
                 slack
             } else {
                 0.
             };
-            let group_top = title_bottom + if history_h > 0. { 0. } else { slack / 2. };
+            if history_h == 0. {
+                context_quota_radius = (30. + slack / 4.).min(54.).min(empty_quota_radius(data));
+            }
+            let gauge_growth = 2. * (context_quota_radius - 30.);
+            let group_top = title_bottom
+                + if history_h > 0. {
+                    0.
+                } else {
+                    (slack - gauge_growth) / 2.
+                };
             let cy = group_top + ring_extent;
             let cx = W / 2.;
             if history_h > 0. {
-                history_plot(c, f, &data.requests, cy + ring_extent, history_h, t);
+                history_plot(c, f, data, cy + ring_extent, history_h, t);
             }
             let pay_y = cy + ring_extent + history_h + GAP_RING_PAY;
             let sat_cy = if payback(g).is_empty() {
-                cy + ring_extent + history_h + S3 + GAUGE_R
+                cy + ring_extent + history_h + S3 + context_quota_radius
             } else {
-                pay_y + PAY_H + GAP_PAY_GAUGE + GAUGE_R
+                pay_y + PAY_H + GAP_PAY_GAUGE + context_quota_radius
             };
-            let group_bottom = sat_cy + LABEL_BELOW + LABEL_DESCENT;
+            let group_bottom = sat_cy + context_quota_radius + S4 + LABEL_DESCENT;
             ring_bounds = Some((cx, cy, r));
             ring_group = Some((group_top, group_bottom));
             ring_formula_avail = Some(available_height);
@@ -2637,9 +2756,15 @@ fn figure(
     }
     let pay = payback(g);
     // Gauge labels stay >= 24pt above the card bottom; collapsed uses the exact group geometry.
+    let quota_radius = if tokens.is_none() {
+        ((h - (P + theme::TITLE_LINE + S2 + 46. + theme::CAPTION_LINE + P)) / 2.)
+            .clamp(30., empty_quota_radius(data))
+    } else {
+        context_quota_radius
+    };
     let (sat_cy, pay_y) = if tokens.is_none() {
         (
-            y + P + theme::TITLE_LINE + S2 + 30.,
+            y + P + theme::TITLE_LINE + S2 + quota_radius,
             y + P + theme::TITLE_LINE,
         )
     } else if expanded {
@@ -2696,8 +2821,8 @@ fn figure(
         IX,
         IW,
         sat_cy,
-        30.,
-        sat_cy + 46.,
+        quota_radius,
+        sat_cy + quota_radius + S4,
         theme::CAPTION_SIZE,
         t,
     );
@@ -2812,19 +2937,21 @@ fn draw_context_mid(
         return (None, None, None, None, None);
     };
     let radius_inner = (h - TITLE - 2. * P) / 2. - S1;
-    let r = radius_inner.clamp(25., 64.);
+    let variable_history = fresh_bar_heights(&data.requests).is_some();
+    let radius_max = if variable_history { 64. } else { 96. };
+    let r = radius_inner.clamp(25., radius_max);
 
     let title_bottom = y + P + TITLE;
     let slot_bottom = y + h - BOTTOM_CLEAR;
     let slot = (slot_bottom - title_bottom).max(0.);
-    let gauge_r = (r * 0.32).clamp(16., 20.);
+    let gauge_r = (r * 0.32).clamp(16., if variable_history { 20. } else { 30. });
 
     let label_below = gauge_r + 12.;
     let details_gap = S3;
     let details_h = 6.;
     let right_h = gauge_r + label_below + theme::CAPTION_LINE + details_gap + details_h;
     let core_h = (2. * r).max(right_h);
-    let history_h = if data.requests.len() > 1 && slot - core_h - S3 >= 50. {
+    let history_h = if fresh_bar_heights(&data.requests).is_some() && slot - core_h - S3 >= 50. {
         slot - core_h - S3
     } else {
         0.
@@ -2937,7 +3064,7 @@ fn draw_context_mid(
     }
 
     if history_h > 0. {
-        history_plot(c, f, &data.requests, group_top + core_h + S3, history_h, t);
+        history_plot(c, f, data, group_top + core_h + S3, history_h, t);
     }
     let mid = MidLayoutBounds {
         ring: (ring_cx, ring_cy, r),
@@ -2947,6 +3074,7 @@ fn draw_context_mid(
         gauge_label_y,
         details_y,
         radius_inner,
+        radius_max,
         gauges_left,
         gauges_right,
     };
@@ -3026,12 +3154,11 @@ pub fn strip(
     );
     let ctx = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
     if let (Some(n), Some(size)) = (ctx, g["ctx"]["size"].as_f64().filter(|n| *n > 0.)) {
-        if expanded && !data.requests.is_empty() {
-            let max = data.requests.iter().map(|(a, b)| a + b).fold(1., f64::max);
-            let bw = 48. / data.requests.len() as f32;
-            for (i, (a, b)) in data.requests.iter().enumerate() {
-                let bar = ((a + b) / max * 28.) as f32;
-                c.rect(12. + i as f32 * bw, 58. - bar, bw * 0.7, bar, t.sky);
+        if let Some(heights) = fresh_bar_heights(&data.requests).filter(|_| expanded) {
+            let bw = 48. / heights.len() as f32;
+            for (i, height) in heights.iter().enumerate() {
+                let bar = height * 28.;
+                c.rect(12. + i as f32 * bw, 58. - bar, bw * 0.7, bar, t.fresh);
             }
         } else {
             let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
@@ -3110,14 +3237,20 @@ mod tests {
     }
 
     #[test]
-    fn request_bar_max_includes_the_context_window_so_the_ceiling_stays_on_the_chart() {
-        let bars = [(100_000., 20_000.), (180_000., 10_000.)];
-        let max = request_bar_max(&bars, 269_178., 1_000_000.);
-        assert_eq!(max, 1_000_000.);
-        let y = request_bar_y(95., 1_000_000., max, 100.);
-        assert!((y - 95.).abs() < 0.01, "ceiling sits on the chart top: {y}");
-        let y_band = request_bar_y(95., 269_178., max, 100.);
-        assert!(y_band > 95. && y_band < 195.);
+    fn fresh_series_uses_uncached_input_and_writes_and_suppresses_flat_history() {
+        let bars = [(188_000., 2_000.), (180_000., 10_000.), (150_000., 40_000.)];
+        let heights = fresh_bar_heights(&bars).unwrap();
+        assert!((heights[2] - heights[0]) >= 0.4);
+        assert_eq!(heights[2], 1.);
+        assert!(fresh_bar_heights(&[(188_000., 2000.), (187_900., 2100.)]).is_none());
+        assert!(fresh_bar_heights(&[(190_000., 0.), (190_000., 0.)]).is_none());
+        assert!(fresh_bar_heights(&[(190_000., 0.), (150_000., 40000.)]).is_some());
+    }
+
+    #[test]
+    fn compaction_markers_attach_to_equal_timestamp_requests_before_tail_clipping() {
+        let s = json!({"replies":(1..=30).map(|t|json!([t,190000,100,1000,188000])).collect::<Vec<_>>(),"compacts":[2.,7.,20.,31.]});
+        assert_eq!(recent_request_compactions(&s), vec![0, 13]);
     }
 
     #[test]

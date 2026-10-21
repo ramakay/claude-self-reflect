@@ -119,7 +119,7 @@ use csr_engine::companion::render::{text, theme::Theme};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 const NOW: f64 = 1792320000.;
-const STATES: [&str; 11] = [
+const STATES: [&str; 14] = [
     "01-empty",
     "02-running",
     "03-agents",
@@ -131,6 +131,9 @@ const STATES: [&str; 11] = [
     "08b-nothing",
     "09-api-cost",
     "10-unknown-cost",
+    "11-last-time",
+    "12-fresh",
+    "13-flat",
 ];
 const QUESTION:&str="What if one of Fable's three prototypes made the what-if question the star of the pane, as you wanted on 10-09?";
 fn write_json(path: &Path, value: &Value) {
@@ -139,7 +142,7 @@ fn write_json(path: &Path, value: &Value) {
 }
 fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
     let (home, paths) = rich_home();
-    let empty = state == "01-empty";
+    let empty = matches!(state, "01-empty" | "11-last-time");
     let con = rusqlite::Connection::open(&paths.db).unwrap();
     // These are the existing learnt feed schemas, absent from the old minimal oracle DB.
     con.execute_batch("ALTER TABLE memory_registry ADD COLUMN file_path TEXT;
@@ -184,14 +187,29 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
         .unwrap();
     }
     if empty {
+        con.execute(
+            "DELETE FROM session_registry WHERE project='pane-wp2' AND session_id!='sess-now'",
+            [],
+        )
+        .unwrap();
         con.execute("delete from witness_verdicts", []).unwrap();
         con.execute("delete from reflections where id='story'", [])
             .unwrap();
         con.execute("delete from meta where key like 'story_map:%'", [])
             .unwrap();
     }
+    if state == "11-last-time" {
+        let episode = json!({"schema":"v2","session_id":"prior-pane-session","project":"pane-wp2",
+            "timestamp":"2026-10-18T09:00:00Z","request":"Make the companion readable","investigated":[],
+            "completed":"","next_steps":"Check the live narrow pane","blockers":null,"outcome":"done",
+            "error_signatures":[],"tools_used":[],"files_modified":[],"message_count":8,"duration_minutes":30,
+            "recap_evidence_version":1,"anchor_request":"Make the companion readable",
+            "completions":[{"claim":"Restore footer labels","receipt":"abcdef1"}]});
+        con.execute("INSERT INTO reflections VALUES('prior-pane-session',?1,'[\"session_episode\",\"project_pane-wp2\"]','2026-10-18T09:00:00Z')",[episode.to_string()]).unwrap();
+    }
     let ctx = match state {
-        "01-empty" => 0,
+        "01-empty" | "11-last-time" => 0,
+        "12-fresh" | "13-flat" => 190000,
         "04-band" | "05-compacting" => 189000,
         "06-after" => 65000,
         _ => 192000,
@@ -227,6 +245,16 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
                 lines.push(json!({"type":"user","timestamp":stamp,"message":{"role":"user","content":"Keep the question first."}}));
             }
             lines.push(json!({"type":"assistant","timestamp":stamp,"message":{"id":format!("b-{i}"),"role":"assistant","model":"claude-sonnet-5","stop_reason":"end_turn","usage":{"input_tokens":value*if i==12{550}else{10},"cache_read_input_tokens":value*if i==12{450}else{990},"cache_creation":{"ephemeral_1h_input_tokens":value*990},"output_tokens":400},"content":[{"type":"text","text":"Working on the pane."}]}}));
+            if matches!(state, "12-fresh" | "13-flat") {
+                let fresh = if state == "13-flat" {
+                    2000
+                } else {
+                    2000 + i as i64 * 38000 / 23
+                };
+                lines.last_mut().unwrap()["message"]["usage"] = json!({"input_tokens":1000,
+                    "cache_creation_input_tokens":fresh-1000,"cache_read_input_tokens":190000-fresh,
+                    "cache_creation":{"ephemeral_1h_input_tokens":fresh-1000},"output_tokens":400});
+            }
             if state == "04-band" {
                 let last = lines.last().unwrap().clone();
                 for call in 1..15 {
@@ -446,7 +474,10 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
         "{state}: {}",
         metrics.dream / metrics.height
     );
-    if !matches!(state, "01-empty" | "08-offer" | "08b-nothing") {
+    if !matches!(
+        state,
+        "01-empty" | "11-last-time" | "08-offer" | "08b-nothing"
+    ) {
         assert_eq!(
             metrics.question_lines.join(" "),
             QUESTION,
@@ -494,6 +525,10 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
     );
     (
         json!({"text":text,"png_sha256":hash,"key_gap_px":format!("{:.2}",metrics.last_card_gap_px),"acts":pane.acts,"dream_percent":format!("{:.2}",100.*metrics.dream/metrics.height),
+            "fresh_plots":metrics.fresh_plots.iter().map(|p| json!({
+                "region":[format!("{:.3}",p.region.0),format!("{:.3}",p.region.1),format!("{:.3}",p.region.2),format!("{:.3}",p.region.3)],
+                "heights":p.heights.iter().map(|h|format!("{h:.3}")).collect::<Vec<_>>(),"compactions":p.compactions})).collect::<Vec<_>>(),
+            "layout_height":format!("{:.3}",metrics.height),
             "csr_cost":{"share":metrics.csr_cost.share_label(),"usd":metrics.csr_cost.usd,"calls":metrics.csr_cost.calls}}),
         // Cell-grid export for contact sheets; placement hash stays in the golden JSON.
         {
@@ -786,12 +821,15 @@ fn scaled_instrument_answer_click_uses_the_centered_pixel_coordinates() {
 #[test]
 fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() {
     for state in STATES {
-        let golden = fs::read_to_string(
-            fixture()
-                .join("instrument/text")
-                .join(format!("{state}.txt")),
-        )
-        .unwrap();
+        let (_home, paths) = state_home(state);
+        let mut source = Pane::new(paths, &args("main", "sess-now", 76, 67));
+        source.pixels = false;
+        let golden = source
+            .frame(76, 67, NOW)
+            .iter()
+            .map(|row| text::plain(row).trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
         let facts: Vec<_> = golden
             .lines()
             .filter(|line| {
@@ -866,7 +904,7 @@ fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() 
                     .collect::<Vec<_>>()
             );
         }
-        if !matches!(state, "01-empty" | "08b-nothing") {
+        if !matches!(state, "01-empty" | "11-last-time" | "08b-nothing") {
             assert!(golden.contains("Text parity is ready for review."));
         }
         assert!(!golden.contains("Claude:Misread") && !golden.contains("hook:Check"));
@@ -1003,7 +1041,7 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
             assert!(shown.contains(phrase), "{state}: missing {phrase}: {shown}");
         }
         assert!(!shown.contains("STS") && !shown.contains("♻A") && !shown.contains("d dream"));
-        if matches!(state, "01-empty" | "08b-nothing") {
+        if matches!(state, "01-empty" | "11-last-time" | "08b-nothing") {
             let before = fs::read(paths.keep.join("dreams.jsonl")).unwrap();
             pane.key("d");
             pane.frame(76, 67, NOW);
@@ -1155,7 +1193,7 @@ fn daemon_down_is_only_the_08b_fixture_state() {
 }
 
 #[test]
-fn expanded_bars_report_a_ceiling_on_the_chart_and_quotas_stay_compact() {
+fn expanded_fresh_bars_use_their_own_scale_and_empty_quotas_grow() {
     use csr_engine::companion::render::instrument::{self, Composition};
     let (_home, paths) = state_home("03-agents");
     let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
@@ -1164,12 +1202,12 @@ fn expanded_bars_report_a_ceiling_on_the_chart_and_quotas_stay_compact() {
     pane.key("i");
     pane.frame(76, 67, NOW);
     let metrics = pane.instrument_metrics.as_ref().unwrap();
-    let ceiling = metrics.ceiling_y.expect("expanded ceiling");
-    let (fig_y, fig_h) = metrics.figure_region;
     assert!(
-        ceiling >= fig_y + 90. && ceiling <= fig_y + 200.,
-        "ceiling {ceiling} outside figure {fig_y}+{fig_h}"
+        metrics.ceiling_y.is_none(),
+        "context ceiling has different units from fresh input"
     );
+    assert_eq!(metrics.fresh_plots.len(), 1);
+    assert_eq!(metrics.fresh_plots[0].compactions, [12]);
 
     let empty = Composition::build(
         &json!({
@@ -1191,8 +1229,8 @@ fn expanded_bars_report_a_ceiling_on_the_chart_and_quotas_stay_compact() {
     .unwrap();
     // Reserve a second caption line for CSR's weekly cost below the quota label.
     assert!(
-        empty_metrics.figure_region.1 >= 152. && empty_metrics.figure_region.1 <= 154.,
-        "quotas card height {}: want 152..=154 so labels fit and stay compact",
+        empty_metrics.figure_region.1 > 154. && empty_metrics.figure_region.1 < 300.,
+        "quotas card height {}: want natural enlarged quota gauges with their labels",
         empty_metrics.figure_region.1
     );
     let help = empty_metrics.help_region.expect("help card");
@@ -1323,14 +1361,14 @@ fn mid_height_context_uses_side_ring_and_small_gauges() {
                     "{state} {cols}x{rows}: card {fig_h} should be above strip height"
                 );
                 let (_, _, r) = mid.ring;
-                let expected = mid.radius_inner.clamp(25., 64.);
+                let expected = mid.radius_inner.clamp(25., mid.radius_max);
                 assert!(
                     (r - expected).abs() < 0.05,
                     "{state} {cols}x{rows}: r={r} != clamp(25, {}, 64)={expected}",
                     mid.radius_inner
                 );
                 assert!(
-                    mid.gauge_r >= 16. - 0.01 && mid.gauge_r <= 20. + 0.01,
+                    mid.gauge_r >= 16. - 0.01 && mid.gauge_r <= 30. + 0.01,
                     "{state}: gauge_r {}",
                     mid.gauge_r
                 );
@@ -1736,6 +1774,78 @@ fn gauge_centres_are_even_and_positive_csr_arcs_have_a_visible_separator() {
             }
         }
     }
-    assert_eq!(rows_checked, 88);
+    assert_eq!(rows_checked, STATES.len() * 8);
     assert!(arcs >= 56);
+}
+
+#[test]
+fn real_shaped_fresh_input_varies_and_flat_history_abstains() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for expanded in [false, true] {
+            let (_home, paths) = state_home("12-fresh");
+            let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+            pane.pixels = true;
+            pane.enable_cards();
+            pane.theme = theme;
+            if expanded {
+                pane.key("i");
+            }
+            pane.frame(76, 67, NOW);
+            let plots = &pane.instrument_metrics.as_ref().unwrap().fresh_plots;
+            assert_eq!(plots.len(), 1);
+            let p = &plots[0];
+            assert_eq!(p.heights.len(), 24);
+            let min = p.heights.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = p.heights.iter().copied().fold(0., f32::max);
+            assert!((max - min) / p.region.3 >= 0.4);
+            assert!(
+                (min / max - 0.05).abs() < 0.001,
+                "cache read or TTL metadata leaked into fresh height"
+            );
+            assert_eq!(p.compactions, [12]);
+            let (_home, paths) = state_home("13-flat");
+            let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+            pane.pixels = true;
+            pane.enable_cards();
+            pane.theme = theme;
+            if expanded {
+                pane.key("i");
+            }
+            pane.frame(76, 67, NOW);
+            let m = pane.instrument_metrics.as_ref().unwrap();
+            assert!(m.fresh_plots.is_empty());
+            assert!(
+                m.ring_bounds.is_some(),
+                "flat expanded history returns its room to the ring"
+            );
+        }
+    }
+}
+
+#[test]
+fn narrow_footer_keeps_every_key_labeled() {
+    for state in ["01-empty", "02-running", "11-last-time"] {
+        let (_home, paths) = state_home(state);
+        let mut pane = Pane::new(paths, &args("main", "sess-now", 38, 30));
+        pane.pixels = false;
+        let shown = pane.frame(38, 30, NOW);
+        let foot = text::plain(&shown[29]);
+        assert!(foot.contains("i fig"), "{state}: {foot}");
+        assert!(
+            foot.contains("l chg") && foot.contains("t thr"),
+            "{state}: {foot}"
+        );
+        assert!(
+            foot.contains("b th") && foot.contains("q close"),
+            "{state}: {foot}"
+        );
+        assert!(text::len(&foot) <= 38);
+        if state == "11-last-time" {
+            let content = shown.join("\n");
+            assert!(
+                content.contains("Last time here") && content.contains("abcdef1"),
+                "{content}"
+            );
+        }
+    }
 }

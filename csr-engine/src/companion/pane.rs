@@ -514,6 +514,22 @@ impl Pane {
             if let Some(notice) = &self.offer_notice {
                 data["offer_notice"] = json!(notice);
             }
+            if array(&s["main"]).is_empty()
+                && array(&s["prompts"]).is_empty()
+                && masthead::ctx_now(&data["claude_fields"], data["claude_at"].as_f64(), s)
+                    .0
+                    .is_none_or(|n| n <= 0.)
+            {
+                let project = s["project"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| super::paths::csr_project(&root))
+                    .unwrap_or("");
+                data["repo_recap"] = json!(self
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.repo_recap(project, &self.sid, now)));
+            }
             let composition = super::render::instrument::Composition::build(&data, s, now);
             return self.instrument_frame(&composition, cols, rows);
         }
@@ -973,14 +989,26 @@ impl Pane {
         if width(&keys, gap) > usable {
             gap = 1;
         }
-        for (full, short) in [
-            ("figure", "fig"),
-            ("theme", "thm"),
-            ("queue", ""),
-            ("fig", ""),
-            ("changes", "chg"),
-            ("threads", "thr"),
-        ] {
+        let shorten = if cols < 44 {
+            [
+                ("changes", "chg"),
+                ("threads", "thr"),
+                ("figure", "fig"),
+                ("theme", "thm"),
+                ("queue", "q"),
+                ("fig", "fig"),
+            ]
+        } else {
+            [
+                ("figure", "fig"),
+                ("theme", "thm"),
+                ("queue", ""),
+                ("fig", ""),
+                ("changes", "chg"),
+                ("threads", "thr"),
+            ]
+        };
+        for (full, short) in shorten {
             if width(&keys, gap) <= usable {
                 break;
             }
