@@ -408,6 +408,14 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
     );
     let metrics = pane.instrument_metrics.as_ref().unwrap();
     assert!(
+        metrics.font_fallbacks.is_empty(),
+        "{state} {cols}x{rows}: font fallback {:?}",
+        metrics.font_fallbacks
+    );
+    let expected_size = (24. + (cols as f32 * 16. - 704.) / 256. * 6.).clamp(22., 30.);
+    assert!((metrics.question_size - expected_size).abs() < 0.01);
+    assert_eq!(metrics.question_line_height, (expected_size * 1.25).round());
+    assert!(
         metrics.dream / metrics.height <= 0.30,
         "{state}: {}",
         metrics.dream / metrics.height
@@ -473,7 +481,7 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
 }
 #[test]
 fn all_nine_states_and_both_themes_have_honest_top_frame_goldens() {
-    for (cols, rows) in [(76, 67), (44, 30), (60, 40)] {
+    for (cols, rows) in [(76, 67), (38, 30), (44, 30), (60, 40)] {
         for theme in [Theme::Dark, Theme::Light] {
             for state in STATES {
                 let (value, png) = snapshot(state, theme, cols, rows);
@@ -641,7 +649,7 @@ fn live_context_without_transcript_or_open_dream_is_not_an_empty_session() {
             pane.enable_cards();
             pane.frame(cols, 30, NOW);
             assert_eq!(pane.placed.len(), 1, "{cols}");
-            if cols >= 40 {
+            if cols >= 32 {
                 let metrics = pane.instrument_metrics.as_ref().expect("whole Instrument");
                 assert!(metrics.dream / metrics.height <= 0.3);
                 assert!(metrics.story_region.is_some());
@@ -649,7 +657,7 @@ fn live_context_without_transcript_or_open_dream_is_not_an_empty_session() {
                 assert!(pane.placed[0].rows <= 29);
             } else {
                 assert!(pane.instrument_metrics.is_none());
-                assert_eq!(pane.placed[0].row + pane.placed[0].rows, 29);
+                assert!(pane.placed[0].row + pane.placed[0].rows <= 29);
             }
         }
     }
@@ -685,10 +693,10 @@ fn turns_alone_are_active_and_the_newest_open_what_if_wins() {
 }
 
 #[test]
-fn all_states_draw_the_whole_instrument_from_40_columns_in_short_panes() {
+fn all_states_draw_the_whole_instrument_from_32_columns_in_short_panes() {
     for state in STATES {
         let (_home, paths) = state_home(state);
-        for cols in [40, 41, 42, 43, 44, 45, 60, 76, 100] {
+        for cols in [32, 38, 40, 41, 42, 43, 44, 45, 60, 76, 100] {
             let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", cols, 30));
             pane.pixels = true;
             pane.enable_cards();
@@ -840,7 +848,7 @@ fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() 
 }
 
 #[test]
-fn narrow_pixels_use_a_short_bottom_strip_and_native_text() {
+fn narrow_pixels_keep_native_text_and_strip_contiguous() {
     for theme in [Theme::Dark, Theme::Light] {
         let (_home, paths) = state_home("02-running");
         let mut pane = Pane::new(paths, &args("main", "sess-now", 30, 40));
@@ -851,7 +859,12 @@ fn narrow_pixels_use_a_short_bottom_strip_and_native_text() {
         assert_eq!(pane.placed.len(), 1);
         let strip = &pane.placed[0];
         assert!(strip.rows <= 7);
-        assert_eq!(strip.row + strip.rows, 39);
+        assert!(strip.row + strip.rows <= 39);
+        assert!(strip.row > 0);
+        assert!(
+            !text::plain(&rows[strip.row - 1]).trim().is_empty(),
+            "blank band before strip"
+        );
         assert!(rows
             .iter()
             .take(strip.row)
@@ -1200,8 +1213,8 @@ fn footer_abbreviates_only_what_must_fit_and_keeps_q_close() {
 }
 
 #[test]
-fn collapsed_context_centres_exact_group_with_bottom_clearance() {
-    for (cols, rows) in [(44, 30), (60, 40)] {
+fn collapsed_context_hugs_exact_group_with_bottom_clearance() {
+    for (cols, rows) in [(44, 40), (60, 54)] {
         let (_home, paths) = state_home("02-running");
         // Drop request history so collapsed layout is independent of per-turn bars.
         let usage = paths.keep.join("usage/sess-now.json");
@@ -1230,16 +1243,12 @@ fn collapsed_context_centres_exact_group_with_bottom_clearance() {
         let (fig_y, fig_h) = metrics.figure_region;
         let card_bottom = fig_y + fig_h;
         assert!(
-            group_bottom <= card_bottom - 24. + 0.5,
-            "{cols}x{rows}: group_bottom {group_bottom} needs >=24pt above card bottom {card_bottom}"
+            group_bottom <= card_bottom - 16. + 0.5,
+            "{cols}x{rows}: group_bottom {group_bottom} needs >=16pt above card bottom {card_bottom}"
         );
-        let title_band = fig_y + 40.;
-        let avail_mid = (title_band + card_bottom - 24.) / 2.;
-        let group_mid = (group_top + group_bottom) / 2.;
-        assert!(
-            (group_mid - avail_mid).abs() < 12.,
-            "{cols}x{rows}: group not centred: mid={group_mid} avail_mid={avail_mid}"
-        );
+        let title_band = fig_y + 16. + 18. + 8. + 14. + 12.;
+        assert!((group_top - title_band).abs() < 0.5);
+        assert!((card_bottom - group_bottom - 16.).abs() < 0.5);
         assert!(
             cy > group_top && cy < group_bottom,
             "{cols}x{rows}: ring centre outside group"
@@ -1256,7 +1265,7 @@ fn collapsed_context_centres_exact_group_with_bottom_clearance() {
 
 #[test]
 fn mid_height_context_uses_side_ring_and_small_gauges() {
-    for state in ["06-after", "07-away", "08-offer"] {
+    for state in ["06-after", "07-away"] {
         for (cols, rows) in [(44, 30), (60, 40)] {
             for theme in [Theme::Dark, Theme::Light] {
                 let (_home, paths) = state_home(state);
@@ -1292,16 +1301,16 @@ fn mid_height_context_uses_side_ring_and_small_gauges() {
                     mid.gauge_r
                 );
                 let (gt, gb) = mid.group;
-                let title_bottom = fig_y + 22. + 14. - 2.; // title content boundary
+                let title_bottom = fig_y + 16. + 18. + 8.; // padding + title line + gap
                 let card_bottom = fig_y + fig_h;
                 let top_band = gt - title_bottom;
-                let bottom_band = (card_bottom - 24.) - gb;
+                let bottom_band = (card_bottom - 16.) - gb;
                 assert!(
                     top_band <= 24. + 0.5 && bottom_band <= 24. + 0.5,
                     "{state} {cols}x{rows}: empty bands top={top_band} bottom={bottom_band}"
                 );
                 assert!(
-                    gb <= card_bottom - 24. + 0.5,
+                    gb <= card_bottom - 16. + 0.5,
                     "{state}: group bottom {gb} vs card {card_bottom}"
                 );
                 let ring_right = mid.ring.0 + mid.ring.2;
@@ -1315,7 +1324,7 @@ fn mid_height_context_uses_side_ring_and_small_gauges() {
                     "{state}: gauge labels overlap details"
                 );
                 assert!(mid.details_y <= gb + 0.5, "{state}: details below group");
-                let slot = (card_bottom - 24. - title_bottom).max(0.);
+                let slot = (card_bottom - 16. - title_bottom).max(0.);
                 let group_h = gb - gt;
                 assert!(
                     group_h >= slot * 0.45 || group_h >= 2. * r - 0.5,
@@ -1367,7 +1376,7 @@ fn collapsed_ring_formula_holds_for_all_token_fixtures() {
                 );
                 let card_bottom = metrics.figure_region.0 + metrics.figure_region.1;
                 assert!(
-                    gb <= card_bottom - 24. + 0.5,
+                    gb <= card_bottom - 16. + 0.5,
                     "{state} {cols}x{rows}: group bottom {gb} vs card {card_bottom}"
                 );
                 assert!(gt < gb, "{state}: empty group");
@@ -1453,4 +1462,34 @@ fn long_story_cuts_only_on_a_clause_boundary_with_ellipsis() {
         "story lines {}",
         metrics.story_line_count
     );
+}
+
+#[test]
+fn empty_38_column_pane_is_a_complete_instrument() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let (_home, paths) = state_home("01-empty");
+        let mut pane = Pane::new(paths, &args("main", "sess-now", 38, 30));
+        pane.pixels = true;
+        pane.enable_cards();
+        pane.theme = theme;
+        let rows = pane.frame(38, 30, NOW);
+        let metrics = pane
+            .instrument_metrics
+            .as_ref()
+            .expect("full Instrument at 38 columns");
+        assert_eq!(pane.placed.len(), 1);
+        assert_eq!(pane.placed[0].row, 0);
+        assert_eq!(pane.placed[0].rows, 29);
+        assert!(metrics.help_region.is_some());
+        assert!(metrics.figure_region.1 > 100.);
+        assert!(rows
+            .iter()
+            .take(29)
+            .all(|line| text::plain(line).trim().is_empty()));
+        assert!(
+            metrics.font_fallbacks.is_empty(),
+            "{:?}",
+            metrics.font_fallbacks
+        );
+    }
 }

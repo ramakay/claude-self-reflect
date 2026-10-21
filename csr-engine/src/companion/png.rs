@@ -18,7 +18,7 @@ pub fn export(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
             .unwrap_or_else(super::paths::now);
         let paths_again = paths.clone();
         let mut pane = Pane::new(paths, args);
-        let lines = pane.frame(46, 30, now);
+        let lines = pane.frame(args.cols.max(1), args.rows.max(1), now);
         let cell = (16, 34);
         if let Some(facts) = &pane.session_picture {
             if let Some(pixmap) = raster::session(facts, 40, cell, &[]) {

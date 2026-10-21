@@ -113,6 +113,41 @@ struct Placed<'a> {
     x: f32,
     y: f32,
 }
+// ttf-parser returns integer bounds truncated toward zero, but variable outlines
+// retain fractional extrema. A clipped edge makes the rasterizer leak coverage
+// across the glyph box. Enclose the actual curves before allocating that box.
+fn outlined(font: &FontVec, glyph: ab_glyph::Glyph) -> Option<ab_glyph::OutlinedGlyph> {
+    let mut outline = font.outline(glyph.id)?;
+    let mut include = |p: ab_glyph::Point| {
+        outline.bounds.min.x = outline.bounds.min.x.min(p.x.floor());
+        outline.bounds.max.x = outline.bounds.max.x.max(p.x.ceil());
+        outline.bounds.min.y = outline.bounds.min.y.max(p.y.ceil());
+        outline.bounds.max.y = outline.bounds.max.y.min(p.y.floor());
+    };
+    for curve in &outline.curves {
+        use ab_glyph::OutlineCurve::*;
+        match *curve {
+            Line(a, b) => {
+                include(a);
+                include(b);
+            }
+            Quad(a, b, c) => {
+                include(a);
+                include(b);
+                include(c);
+            }
+            Cubic(a, b, c, d) => {
+                include(a);
+                include(b);
+                include(c);
+                include(d);
+            }
+        }
+    }
+    let scale = font.as_scaled(glyph.scale).scale_factor();
+    Some(ab_glyph::OutlinedGlyph::new(glyph, outline, scale))
+}
+
 fn px_scale(f: &FontVec, size_px: f32) -> f32 {
     size_px * f.height_unscaled() / f.units_per_em().unwrap_or(1000.)
 }
@@ -348,12 +383,10 @@ impl Fonts {
             let scale = px_scale(font, glyph_size);
             let sf = font.as_scaled(scale);
             let y = if inline_icon {
-                let cap = main
-                    .outline_glyph(main.glyph_id('H').with_scale(px_scale(main, size_px)))
+                let cap = outlined(main, main.glyph_id('H').with_scale(px_scale(main, size_px)))
                     .map(|o| -o.px_bounds().min.y)
                     .unwrap_or(size_px * 0.7);
-                let middle = font
-                    .outline_glyph(id.with_scale(scale))
+                let middle = outlined(font, id.with_scale(scale))
                     .map(|o| (o.px_bounds().min.y + o.px_bounds().max.y) / 2.)
                     .unwrap_or(0.);
                 -cap / 2. - middle
@@ -373,7 +406,7 @@ impl Fonts {
                 y,
             });
             x += if previous_icon && ch == ' ' {
-                6. * S * mult
+                theme::ICON_GAP * S * mult
             } else {
                 sf.h_advance(id) + st.track * S * mult
             };
@@ -409,7 +442,7 @@ impl Fonts {
         let (mut l, mut r, mut t, mut b) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
         for p in &g {
             let glyph = p.id.with_scale_and_position(p.scale, point(p.x, p.y));
-            if let Some(o) = p.font.outline_glyph(glyph) {
+            if let Some(o) = outlined(p.font, glyph) {
                 let bb = o.px_bounds();
                 l = l.min(bb.min.x);
                 r = r.max(bb.max.x);
@@ -476,6 +509,45 @@ impl Fonts {
         let rest = lines[n - 1..].join(" ");
         out.push(self.fit(&rest, st, maxw));
         out
+    }
+
+    /// Balance headline lines without changing or truncating the words.
+    pub fn wrap_balanced(&self, text: &str, st: St, maxw: f32) -> Vec<String> {
+        let words: Vec<_> = text.split_whitespace().collect();
+        if words.is_empty() {
+            return vec![];
+        }
+        let n = words.len();
+        let mut costs = vec![f32::INFINITY; n + 1];
+        let mut next = vec![n; n];
+        costs[n] = 0.;
+        for start in (0..n).rev() {
+            for end in start + 1..=n {
+                let line = words[start..end].join(" ");
+                let width = self.width(&line, st);
+                if width > maxw && end > start + 1 {
+                    break;
+                }
+                let orphan = if end == n && end - start == 1 && start > 0 {
+                    maxw * maxw * 10.
+                } else {
+                    0.
+                };
+                let cost = (maxw - width).powi(2) + orphan + costs[end];
+                if cost < costs[start] {
+                    costs[start] = cost;
+                    next[start] = end;
+                }
+            }
+        }
+        let mut lines = vec![];
+        let mut start = 0;
+        while start < n {
+            let end = next[start];
+            lines.push(words[start..end].join(" "));
+            start = end;
+        }
+        lines
     }
 
     /// greedy word wrap
@@ -688,7 +760,9 @@ fn shadow_mask(w: f32, h: f32, corner: f32, blur: f32) -> std::sync::Arc<ShadowM
     );
     let mut alpha = mask
         .data()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| p[3])
         .collect::<Vec<_>>();
     blur_alpha(&mut alpha, width as usize, height as usize, key.3 as usize);
@@ -874,7 +948,7 @@ impl Canvas {
 
     pub fn background(&mut self, t: &theme::Tokens) {
         let (w, h) = (self.pm.width() as f32 / S, self.pm.height() as f32 / S);
-        self.pm.fill(color(t.ground));
+        self.pm.fill(color(t.mesh_ground));
         let full = rrect_path(0., 0., w, h, 0.);
         let diagonal = w.hypot(h);
         for ((x, y, radius), stops) in [
@@ -965,7 +1039,7 @@ impl Canvas {
         for p in &glyphs {
             let glyph =
                 p.id.with_scale_and_position(p.scale, point(ox + p.x, by + p.y));
-            if let Some(o) = p.font.outline_glyph(glyph) {
+            if let Some(o) = outlined(p.font, glyph) {
                 let b = o.px_bounds();
                 let (bx, byy) = (b.min.x.floor() as i32, b.min.y.floor() as i32);
                 o.draw(|gx, gy, cov| {
@@ -1188,6 +1262,30 @@ mod bundled_font_tests {
         assert!(fonts.face(icon(18.)).font.glyph_id('\u{e410}').0 > 0);
         for name in fonts.names.values() {
             assert!(!name.starts_with('/'));
+        }
+    }
+
+    #[test]
+    fn variable_serif_fractional_extrema_do_not_fill_the_glyph_box() {
+        let fonts = Fonts::bundled();
+        let font = &fonts.face(serif(30., 600.)).font;
+        for x in [0., 0.25, 0.5, 0.75, 300.25] {
+            let glyph = font
+                .glyph_id('w')
+                .with_scale_and_position(px_scale(font, 60.), point(x, 60.));
+            let o = outlined(font, glyph).unwrap();
+            let bottom = o.px_bounds().height() as u32;
+            let mut outside_coverage = 0_f32;
+            o.draw(|gx, gy, coverage| {
+                // The lower-left corner is outside the w's two diagonal bowls.
+                if gx < 2 && gy >= bottom - 2 {
+                    outside_coverage = outside_coverage.max(coverage);
+                }
+            });
+            assert!(
+                outside_coverage < 0.01,
+                "x={x}: stray coverage {outside_coverage}"
+            );
         }
     }
 

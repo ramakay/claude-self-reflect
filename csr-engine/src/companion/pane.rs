@@ -757,7 +757,7 @@ impl Pane {
         use super::render::{instrument, raster, text};
         self.instrument_metrics = None;
         let cell = super::render::kitty::cell_size();
-        let strip = if self.pixels && self.cards && cols < 40 {
+        let strip = if self.pixels && self.cards && cols < 32 {
             instrument::strip(
                 composition,
                 cols as u32 * cell.0,
@@ -809,7 +809,7 @@ impl Pane {
         if let Some(strip) = strip {
             if let Ok(png) = raster::png(&strip) {
                 let count = strip.height().div_ceil(cell.1) as usize;
-                let row = rows.saturating_sub(1 + count);
+                let row = out.len().min(rows.saturating_sub(1 + count));
                 out.truncate(row);
                 self.placed = vec![super::render::kitty::Placement {
                     row,
@@ -822,7 +822,7 @@ impl Pane {
                     self.acts.insert(r, json!({"key":"instrument:figure"}));
                 }
             }
-        } else if self.pixels && self.cards && cols >= 40 {
+        } else if self.pixels && self.cards && cols >= 32 {
             let cell = super::render::kitty::cell_size();
             if let Some((pm, metrics)) = instrument::draw(
                 composition,
@@ -830,7 +830,7 @@ impl Pane {
                 rows.saturating_sub(1) as u32 * cell.1,
                 self.theme,
                 self.instrument_open,
-                cols < 40,
+                false,
             ) {
                 if let Ok(png) = raster::png(&pm) {
                     self.instrument_metrics = Some(metrics.clone());

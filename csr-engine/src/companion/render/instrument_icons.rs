@@ -90,12 +90,12 @@ pub fn is_icon(ch: char) -> bool {
 }
 
 pub fn line(s: &str) -> String {
-    let prefix = if s.starts_with("~ ") {
-        Some((Icon::FilePen, &s[2..]))
-    } else if s.starts_with("+ ") {
-        Some((Icon::FilePlus, &s[2..]))
-    } else if s.starts_with("! ") {
-        Some((Icon::FileWarning, &s[2..]))
+    let prefix = if let Some(rest) = s.strip_prefix("~ ") {
+        Some((Icon::FilePen, rest))
+    } else if let Some(rest) = s.strip_prefix("+ ") {
+        Some((Icon::FilePlus, rest))
+    } else if let Some(rest) = s.strip_prefix("! ") {
+        Some((Icon::FileWarning, rest))
     } else if s.starts_with("Away ") {
         Some((Icon::Coffee, s))
     } else if s.starts_with("Compacted.") {

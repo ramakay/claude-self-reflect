@@ -4,7 +4,7 @@ use super::{
     instrument_gfx::*,
     instrument_icons::{self as icons, Icon},
     text,
-    theme::{Theme, Tokens},
+    theme::{self, Theme, Tokens, ICON_GAP, S1, S2, S3, S4, S5},
 };
 use crate::companion::{agents, array, dreams, masthead, num, pyfmt::short, string};
 use serde_json::{json, Value};
@@ -864,8 +864,8 @@ fn figure_lines(c: &Composition) -> Vec<String> {
 }
 
 // The geometry and primitives below are the approved B prototype's glass, serif and ring design.
-const M: f32 = 16.;
-const P: f32 = 22.;
+const M: f32 = S4;
+const P: f32 = S4;
 const CW: f32 = W - 2. * M;
 const IX: f32 = M + P;
 const IW: f32 = CW - 2. * P;
@@ -878,7 +878,7 @@ fn label(c: &mut Canvas, f: &Fonts, s: &str, x: f32, y: f32, size: f32, col: Rgb
     };
     let x = if let Some(glyph) = title_icon {
         c.icon(f, glyph, x, y, 14., size, col);
-        x + 14. + 6.
+        x + 14. + ICON_GAP
     } else {
         x
     };
@@ -1011,6 +1011,8 @@ pub fn request_bar_y(base: f32, value: f64, max: f64, chart_h: f32) -> f32 {
 
 #[derive(Clone, Debug)]
 pub struct Metrics {
+    pub question_size: f32,
+    pub question_line_height: f32,
     /// Only missing or system-fallback glyphs; bundled cross-family coverage is primary.
     pub font_fallbacks: BTreeMap<char, String>,
     pub content_left: f32,
@@ -1042,20 +1044,12 @@ pub struct Metrics {
     pub question_lines: Vec<String>,
     pub sections_collapsed: bool,
 }
-fn question_layout(f: &Fonts, q: &str, limit: f32, t: &Tokens) -> (St, Vec<String>) {
-    let mut size = 24.;
-    loop {
-        let st = serif(size, t.bold);
-        let lines = f.wrap(q, st, IW);
-        if lines.len() <= 3 && (lines.len() as f32 * size * 1.28) <= limit {
-            return (st, lines);
-        }
-        size -= 0.5;
-        if size < 9. {
-            return (st, lines);
-        }
-    }
+fn question_layout(f: &Fonts, q: &str, width: u32, t: &Tokens) -> (St, Vec<String>) {
+    let size = (24. + (width as f32 - 704.) / 256. * 6.).clamp(22., 30.);
+    let st = serif(size, t.bold);
+    (st, f.wrap_balanced(q, st, IW))
 }
+
 fn fonts() -> Option<std::sync::MutexGuard<'static, Fonts>> {
     static FONTS: std::sync::LazyLock<std::sync::Mutex<Fonts>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(Fonts::load()));
@@ -1078,98 +1072,133 @@ pub fn draw(
     f.used.borrow_mut().clear();
     let t = theme.tokens();
     let ratio = width as f32 / (W * S);
-    // Lay out the complete instrument before fitting both dimensions. Wide, short panes get
-    // centered side margins rather than an undersized hero budget and a text-only fallback.
-    // Layout uses at least 800pt; the pixmap always scales to the full available height so the
-    // picture meets the key row with no hard edge.
-    let maxh = (available_height as f32 / (S * ratio)).max(800.);
-    let learn_h = if c.learnt.is_empty() { 0. } else { 20. };
-    // Fit up to 4 clause-safe lines once; height uses the actual count so unused
-    // line slots (32–48pt) return to Context instead of reserving a full 4-line card.
-    let story_st = sans(12.5, t.regular);
+    let mut maxh = (available_height as f32 / (S * ratio)).max(800.);
+    let caption = sans(theme::CAPTION_SIZE, t.regular);
+    let body = sans(theme::BODY_SIZE, t.regular);
+    let title = sans(theme::TITLE_SIZE, t.bold);
+    let story_st = body;
     let story_lines_fit = if c.story.is_empty() {
         Vec::new()
     } else {
         wrap_clauses(f, first_sentence(&c.story), story_st, IW, 4)
     };
     let story_line_rows = story_lines_fit.len();
-    let story_h_base = if c.story.is_empty() && c.shifts.is_empty() {
-        if c.learnt.is_empty() {
+    let has_story = !c.story.is_empty() || !c.shifts.is_empty() || !c.learnt.is_empty();
+    let story_age =
+        has_story && !c.story_age.is_empty() && (!c.story.is_empty() || !c.shifts.is_empty());
+    let story_h = if !has_story {
+        0.
+    } else {
+        P * 2.
+            + theme::TITLE_LINE
+            + S2
+            + if story_age {
+                theme::CAPTION_LINE + S3
+            } else {
+                0.
+            }
+            + (story_line_rows + usize::from(!c.learnt.is_empty())) as f32 * theme::BODY_LINE
+            + if c.shifts.is_empty() {
+                0.
+            } else {
+                S3 + c.shifts.len().min(3) as f32 * theme::CAPTION_LINE
+            }
+    };
+    let full_extras = extras(c, false);
+    let collapsed = full_extras
+        .iter()
+        .any(|line| f.width(line, caption) > IW * 2.);
+    let extra_lines = extras(c, collapsed);
+    let extra_layout = extra_lines
+        .iter()
+        .map(|line| {
+            let (name, body) = line.split_once(": ").unwrap_or((line, ""));
+            let glyph = if name.starts_with("Confusing") {
+                Icon::CircleHelp
+            } else {
+                Icon::Sparkles
+            };
+            let name = format!("{} {name}:", glyph.glyph());
+            let tw = f.width(&name, sans(theme::CAPTION_SIZE, t.medium)) + f.width(" ", caption);
+            let rows = f.wrap(body, caption, IW - tw);
+            (name, tw, rows)
+        })
+        .collect::<Vec<_>>();
+    let extras_h = extra_layout
+        .iter()
+        .map(|(_, _, lines)| lines.len() as f32 * theme::CAPTION_LINE)
+        .sum::<f32>();
+    let metadata = meta(c);
+    let mut meta_rows: Vec<Vec<&str>> = vec![];
+    let mut row = vec![];
+    let mut row_width = 0.;
+    for part in metadata
+        .split(" · ")
+        .filter(|p| !p.is_empty() && *p != "carried")
+    {
+        let st = if part.starts_with('⌗') {
+            mono(theme::CHIP_SIZE, t.regular)
+        } else {
+            caption
+        };
+        let part_width = f.width(part, st)
+            + if part.starts_with("dreamer ") {
+                S5 + ICON_GAP
+            } else {
+                0.
+            };
+        if !row.is_empty() && row_width + S3 + part_width > IW {
+            meta_rows.push(std::mem::take(&mut row));
+            row_width = 0.;
+        }
+        if !row.is_empty() {
+            row_width += S3;
+        }
+        row.push(part);
+        row_width += part_width;
+    }
+    if !row.is_empty() {
+        meta_rows.push(row);
+    }
+    let status = status_line(c);
+    let status_lines = f.wrap(&status, caption, IW);
+    let (qs, question) = question_layout(f, &c.question(), width, t);
+    let question_line_height = (qs.size * 1.25).round();
+    let qh = question.len() as f32 * question_line_height;
+    let has_answers = c.dream.state == Batch::Ready || c.offer;
+    let hero_h = P * 2.
+        + theme::TITLE_LINE
+        + S2
+        + qh
+        + if meta_rows.is_empty() {
             0.
         } else {
-            P * 2. + learn_h
+            S3 + meta_rows.len() as f32 * theme::CAPTION_LINE
         }
-    } else if c.shifts.is_empty() {
-        // Title, age, then the fitted story lines (0..=4).
-        P + 38. + story_line_rows.saturating_sub(1) as f32 * 16. + P + learn_h
-    } else {
-        P + 62.
-            + story_line_rows.saturating_sub(1) as f32 * 16.
-            + c.shifts.len().min(3).saturating_sub(1) as f32 * 16.
-            + P
-            + learn_h
-    };
-    let story_support = if story_h_base > 0. {
-        story_h_base + 12.
-    } else {
-        0.
-    };
-    let figure_support = if c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.) {
-        128.
-    } else {
-        360.
-    };
-    let sell_h = if c.empty_session || c.offer { 94. } else { 0. };
-    let support = M + 12. + story_support + 42. + figure_support + sell_h;
-    let hero_limit =
-        (maxh * 0.30)
-            .min((support * 3. / 7.).floor())
-            .floor()
-            .min(if c.empty_session {
-                136.
-            } else if c.offer {
-                180.
-            } else {
-                240.
-            });
-    let has_extra = !c.dream.confusing.is_empty() || !c.dream.should_be.is_empty();
-    let full_extras = extras(c, false);
-    let collapsed = has_extra
-        && full_extras
-            .iter()
-            .any(|s| f.width(s, sans(11.5, t.regular)) > IW * 2.);
-    let extra_lines = extras(c, collapsed);
-    let extras_h = extra_lines
-        .iter()
-        .map(|s| f.wrap(s, sans(11.5, t.regular), IW).len() as f32 * 16.)
-        .sum::<f32>();
-    let status = status_line(c);
-    let status_lines = f.wrap(&status, sans(11.5, t.regular), IW);
-    let status_h = if status.is_empty() {
-        0.
-    } else {
-        status_lines.len() as f32 * 17.
-    };
-    let overhead = P * 2.
-        + 22.
-        + if c.dream.state == Batch::Ready {
-            48.
-        } else if c.offer {
-            36.
+        + if has_answers {
+            S1 + theme::CAPTION_LINE
         } else {
-            12.
+            0.
         }
-        + extras_h
-        + status_h;
-    let (qs, question) = question_layout(f, &c.question(), (hero_limit - overhead).max(25.), t);
-    let qh = question.len() as f32 * qs.size * 1.28;
-    let hero_h = overhead + qh;
-    if hero_h > hero_limit {
-        return None;
-    }
-    let story_h = story_h_base;
+        + if status.is_empty() {
+            0.
+        } else {
+            S2 + status_lines.len() as f32 * theme::CAPTION_LINE
+        }
+        + if extras_h > 0. { S3 + extras_h } else { 0. };
+    // Keep the full specified headline size and the hero's 30% budget together in short panes.
+    maxh = maxh.max((hero_h / 0.30).ceil());
     let active = c.agents.agents.iter().any(agents::is_active);
-    let agents_h = if active { 52. } else { 0. };
+    let agents_h = if active {
+        P * 2. + theme::BODY_LINE
+    } else {
+        0.
+    };
+    let sell_h = if c.empty_session || c.offer {
+        P * 2. + 3. * theme::BODY_LINE
+    } else {
+        0.
+    };
     let requested_extra_h = if open.changes {
         c.shifts.len() as f32 * 58.
     } else if open.threads {
@@ -1208,22 +1237,24 @@ pub fn draw(
             drill_lines.extend(f.wrap(string(&d["line"]), sans(11.5, t.regular), IW));
         }
     }
-    let notice_h = if c.notice.is_some() { 38. } else { 0. };
-    let notice_gap = if c.notice.is_some() { 12. } else { 0. };
+    let notice_h = if c.notice.is_some() {
+        P * 2. + theme::BODY_LINE
+    } else {
+        0.
+    };
+    let notice_gap = if c.notice.is_some() { S3 } else { 0. };
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
-    // Quotas-only cards stay content-sized; context cards may grow. Remaining height
-    // goes to the last help card when sells are present.
-    // Quotas gauges sit at P+52; code labels at +46 with font descent — 138 clears the clip.
-    let figure_min = if quotas_only { 138. } else { 110. };
+    let figure_min = if quotas_only { 140. } else { 110. };
     let base_core = M
         + hero_h
-        + 12.
+        + S3
         + story_h
-        + if story_h > 0. { 12. } else { 0. }
+        + if story_h > 0. { S3 } else { 0. }
         + agents_h
+        + if active { S3 } else { 0. }
         + notice_h
         + notice_gap
-        + 42.;
+        + P;
     let available_extra = (maxh - base_core - empty_help - figure_min).max(0.);
     let extra_h = if open.threads {
         requested_extra_h.min(available_extra)
@@ -1231,27 +1262,29 @@ pub fn draw(
         let lines = drill_lines
             .len()
             .saturating_sub(open.scroll)
-            .min(((available_extra - P * 2.).max(0.) / 17.) as usize);
+            .min(((available_extra - P * 2.).max(0.) / theme::BODY_LINE) as usize);
         if lines == 0 {
             0.
         } else {
-            lines as f32 * 17. + P * 2.
+            lines as f32 * theme::BODY_LINE + P * 2.
         }
     };
     let fixed_core = base_core + extra_h;
-    let leftover = (maxh - fixed_core - figure_min - empty_help).max(0.);
-    let (figure_h, help_h) = if quotas_only && empty_help > 0. {
-        (figure_min, empty_help + leftover)
-    } else if quotas_only {
-        (figure_min + leftover, 0.)
+    let (figure_h, help_h) = if quotas_only {
+        (figure_min, empty_help)
     } else {
-        (figure_min + leftover, empty_help)
+        (
+            (maxh - fixed_core - empty_help - if empty_help > 0. { S3 } else { 0. })
+                .max(figure_min),
+            empty_help,
+        )
     };
     let height = maxh;
     let mut canvas = Canvas::new(W, height);
     canvas.background(t);
     let mut y = M;
     panel(&mut canvas, y, hero_h, t);
+    let title_y = y + P + f.cap(title);
     label(
         &mut canvas,
         f,
@@ -1267,8 +1300,8 @@ pub fn draw(
             "CSR's dreamer"
         },
         IX,
-        y + P,
-        13.,
+        title_y,
+        theme::TITLE_SIZE,
         t.ink,
         t.bold,
     );
@@ -1277,98 +1310,63 @@ pub fn draw(
             &mut canvas,
             f,
             "CARRIED",
-            IX + 132.,
-            y + P,
-            9.5,
+            IX + f.width("The dreamer asks", title) + S3,
+            title_y,
+            theme::CAPTION_SIZE,
             t.dream,
-            t.bold,
+            t.medium,
         );
     }
     canvas.icon(
         f,
         if c.offer { Icon::Moon } else { Icon::MoonStar },
         W - M - P - 18.,
-        y + P,
+        title_y,
         18.,
-        13.,
+        theme::TITLE_SIZE,
         t.dream,
     );
-    let mut b = y + P + 24. + f.cap(qs);
+    let mut cursor = y + P + theme::TITLE_LINE + S2;
     for line in &question {
-        canvas.text(f, line, IX, b, qs, t.ink, A::L);
-        b += qs.size * 1.28;
+        canvas.text(f, line, IX, cursor + f.cap(qs), qs, t.ink, A::L);
+        cursor += question_line_height;
     }
-    b += 2.;
-    let metadata = meta(c);
-    if !metadata.is_empty() {
-        let parts = metadata
-            .split(" · ")
-            .filter(|p| *p != "carried")
-            .collect::<Vec<_>>();
-        let mut size = 11.5;
-        while parts
-            .iter()
-            .map(|p| {
-                f.width(
-                    p,
-                    if p.starts_with('⌗') {
-                        mono(size, t.medium)
-                    } else {
-                        sans(size, t.regular)
-                    },
-                ) + 12.
-                    + if p.starts_with("dreamer ") { 34. } else { 0. }
-            })
-            .sum::<f32>()
-            > IW - 18.
-            && size > 8.
-        {
-            size -= 0.5;
-        }
-        let mut x = IX
-            + if c.dream.top["confidence"].is_number() {
-                18.
-            } else {
-                0.
-            };
-        if let Some(conf) = c.dream.top["confidence"].as_f64() {
-            canvas.ring(
-                IX + 5.,
-                b - 4.,
-                5.,
-                t.thin_ring,
-                t.track,
-                &[(0., conf.clamp(0., 1.) as f32, t.dream)],
-            );
-        }
+    if !meta_rows.is_empty() {
+        cursor += S3;
+    }
+    for parts in &meta_rows {
+        let b = cursor + f.cap(caption);
+        let mut x = IX;
         for part in parts {
             if part.starts_with("dreamer ") {
                 let spent = num(&c.dream.budget["spent"]);
                 let cap = num(&c.dream.budget["cap"]).max(1.);
-                canvas.rrect(x, b - 5., 28., 3., 1.5, t.track);
+                canvas.rrect(x, b - f.cap(caption) / 2., S5, 3., 1.5, t.track);
                 canvas.rrect(
                     x,
-                    b - 5.,
-                    28. * (spent / cap).clamp(0., 1.) as f32,
+                    b - f.cap(caption) / 2.,
+                    S5 * (spent / cap).clamp(0., 1.) as f32,
                     3.,
                     1.5,
                     t.dream,
                 );
-                x += 34.;
-                canvas.text(f, "dreamer ", x, b, sans(size, t.regular), t.quiet, A::L);
-                x += f.width("dreamer ", sans(size, t.regular));
-                let numbers = part.strip_prefix("dreamer ").unwrap();
-                x += canvas.text(f, numbers, x, b, sans(size, t.regular), t.ink, A::L) + 12.;
-                continue;
+                x += S5 + ICON_GAP;
             }
             let st = if part.starts_with('⌗') {
-                mono(size, t.medium)
+                mono(theme::CHIP_SIZE, t.regular)
             } else {
-                sans(size, t.regular)
+                caption
             };
             let w = f.width(part, st);
             if part.starts_with('⌗') {
-                canvas.rrect(x - 4., b - 11., w + 8., 16., 8., t.chip);
+                canvas.rrect(
+                    x - S1,
+                    b - f.cap(st) - S1 / 2.,
+                    w + S2,
+                    theme::CHIP_LINE,
+                    S1,
+                    t.chip,
+                );
             }
             canvas.text(
                 f,
@@ -1383,14 +1381,19 @@ pub fn draw(
                 },
                 A::L,
             );
-            x += w + 12.;
+            x += w + S3;
         }
-        b += 19.;
+        cursor += theme::CAPTION_LINE;
     }
     let mut answer_spans = vec![];
     let mut offer_hit = None;
-    let answer_y = (c.dream.state == Batch::Ready).then_some(b);
+    let mut answer_y = None;
+    if has_answers {
+        cursor += S1;
+    }
     if c.dream.state == Batch::Ready {
+        let b = cursor + f.cap(caption);
+        answer_y = Some(b);
         let mut x = IX;
         for (label, answer) in [
             ("1 ✓ helpful", "helpful"),
@@ -1403,7 +1406,7 @@ pub fn draw(
                 label,
                 x,
                 b,
-                sans(11.5, t.medium),
+                sans(theme::CAPTION_SIZE, t.medium),
                 if answer == "ask_claude" {
                     t.asked
                 } else {
@@ -1412,72 +1415,112 @@ pub fn draw(
                 A::L,
             );
             answer_spans.push((x, x + w, answer.into()));
-            x += w + 16.;
+            x += w + S3;
         }
-        b += 21.;
+        cursor += theme::CAPTION_LINE;
     } else if c.offer {
-        // One CTA: chip-styled "1" (same chip language as receipt keys) + the enable sentence.
-        let st = sans(11.5, t.medium);
-        let press_w = f.width("Press ", st) + 5.;
-        let key = "1";
-        let key_w = f.width(key, st);
-        let rest = " to turn dreams on in all your sessions.";
-        let rest_w = f.width(rest, st);
+        let b = cursor + f.cap(caption);
         let mut x = IX;
-        canvas.text(f, "Press ", x, b, st, t.quiet, A::L);
-        x += press_w;
-        canvas.rrect(x - 4., b - 11., key_w + 8., 16., 8., t.chip);
-        canvas.text(f, key, x, b, st, t.dream, A::L);
-        x += key_w + 5.;
-        canvas.text(f, rest, x, b, st, t.quiet, A::L);
-        offer_hit = Some((b, IX, IX + press_w + key_w + 5. + rest_w));
-        b += 21.;
+        x += canvas.text(f, "Press", x, b, caption, t.quiet, A::L) + ICON_GAP;
+        let key_w = f.width("1", caption);
+        canvas.rrect(
+            x - S1,
+            b - f.cap(caption) - S1 / 2.,
+            key_w + S2,
+            theme::CAPTION_LINE,
+            S1,
+            t.chip,
+        );
+        canvas.text(f, "1", x, b, caption, t.dream, A::L);
+        x += key_w + ICON_GAP;
+        x += canvas.text(
+            f,
+            "to turn dreams on in all your sessions.",
+            x,
+            b,
+            caption,
+            t.quiet,
+            A::L,
+        );
+        offer_hit = Some((b, IX, x));
+        cursor += theme::CAPTION_LINE;
     }
     if !status.is_empty() {
+        cursor += S2;
         for line in &status_lines {
-            label(&mut canvas, f, line, IX, b, 11.5, t.quiet, t.regular);
-            b += 17.;
-        }
-    }
-    for line in extra_lines {
-        let (title, body) = line.split_once(": ").unwrap_or((&line, ""));
-        let st = sans(11.5, t.regular);
-        let marker = if title.starts_with("Confusing") {
-            Icon::CircleHelp
-        } else {
-            Icon::Sparkles
-        };
-        let title = format!("{} {title}:", marker.glyph());
-        // Measure the label at its actual weight, then add one body-space advance.
-        let tw = f.width(&title, sans(11.5, t.medium)) + f.width(" ", st);
-        label(&mut canvas, f, &title, IX, b, 11.5, t.dream, t.medium);
-        let lines = f.wrap(body, st, IW - tw);
-        for (i, row) in lines.iter().enumerate() {
-            // Evidence is a small mono receipt; the full quote stays in the reasons drill-down.
-            let (body, receipt) = row.split_once(" · ").unwrap_or((row, ""));
             label(
                 &mut canvas,
                 f,
-                body,
-                IX + if i == 0 { tw } else { 0. },
+                line,
+                IX,
+                cursor + f.cap(caption),
+                theme::CAPTION_SIZE,
+                t.quiet,
+                t.regular,
+            );
+            cursor += theme::CAPTION_LINE;
+        }
+    }
+    if extras_h > 0. {
+        cursor += S3;
+    }
+    for (title_text, tw, lines) in &extra_layout {
+        let b = cursor + f.cap(caption);
+        label(
+            &mut canvas,
+            f,
+            title_text,
+            IX,
+            b,
+            theme::CAPTION_SIZE,
+            t.dream,
+            t.medium,
+        );
+        for (i, row) in lines.iter().enumerate() {
+            let b = cursor + f.cap(caption);
+            let (body_text, receipt) = row.split_once(" · ").unwrap_or((row, ""));
+            let x = IX + if i == 0 { *tw } else { 0. };
+            label(
+                &mut canvas,
+                f,
+                body_text,
+                x,
                 b,
-                11.5,
+                theme::CAPTION_SIZE,
                 t.ink,
                 t.regular,
             );
             if !receipt.is_empty() {
-                let x = IX + if i == 0 { tw } else { 0. } + f.width(body, st) + 6.;
-                let rw = f.width(receipt, mono(9.5, t.medium));
-                canvas.rrect(x - 3., b - 10., rw + 6., 14., 5., t.chip);
-                canvas.text(f, receipt, x, b, mono(9.5, t.medium), t.quiet, A::L);
+                let x = x + f.width(body_text, caption) + ICON_GAP;
+                let st = mono(theme::CHIP_SIZE, t.regular);
+                let rw = f.width(receipt, st);
+                canvas.rrect(
+                    x - S1,
+                    b - f.cap(st) - S1 / 2.,
+                    rw + S2,
+                    theme::CHIP_LINE,
+                    S1,
+                    t.chip,
+                );
+                canvas.text(f, receipt, x, b, st, t.quiet, A::L);
             }
-            b += 16.;
+            cursor += theme::CAPTION_LINE;
         }
     }
-    y += hero_h + 12.;
+    y += hero_h + S3;
     if let Some(notice) = &c.notice {
         panel(&mut canvas, y, notice_h, t);
-        single(&mut canvas, f, notice, IX, y + 24., IW, 12., t.ink, t);
+        single(
+            &mut canvas,
+            f,
+            notice,
+            IX,
+            y + P + f.cap(body),
+            IW,
+            theme::BODY_SIZE,
+            t.ink,
+            t,
+        );
         y += notice_h + notice_gap;
     }
     let mut shift_hits = vec![];
@@ -1494,77 +1537,65 @@ pub fn draw(
                 "Where the work stands"
             },
             IX,
-            y + P,
-            13.,
+            y + P + f.cap(title),
+            theme::TITLE_SIZE,
             t.ink,
             t.bold,
         );
-        single(
-            &mut canvas,
-            f,
-            &c.story_age,
-            IX,
-            y + P + 17.,
-            IW,
-            11.,
-            t.quiet,
-            t,
-        );
-        for (i, line) in story_lines_fit.iter().enumerate() {
-            canvas.text(
+        let mut cursor = y + P + theme::TITLE_LINE + S2;
+        if story_age {
+            single(
+                &mut canvas,
                 f,
-                line,
+                &c.story_age,
                 IX,
-                y + P + 38. + i as f32 * 16.,
-                story_st,
-                t.ink,
-                A::L,
+                cursor + f.cap(caption),
+                IW,
+                theme::CAPTION_SIZE,
+                t.quiet,
+                t,
             );
+            cursor += theme::CAPTION_LINE + S3;
         }
         story_line_count = story_lines_fit.len();
-        let story_block = if story_lines_fit.is_empty() {
-            38.
-        } else {
-            38. + (story_lines_fit.len() - 1) as f32 * 16.
-        };
+        for line in &story_lines_fit {
+            canvas.text(f, line, IX, cursor + f.cap(body), body, t.ink, A::L);
+            cursor += theme::BODY_LINE;
+        }
         if !c.learnt.is_empty() {
             single(
                 &mut canvas,
                 f,
                 &c.learnt.join(" · "),
                 IX,
-                y + P
-                    + if c.story.is_empty() && c.shifts.is_empty() {
-                        20.
-                    } else {
-                        story_block + 20.
-                    },
+                cursor + f.cap(body),
                 IW,
-                12.,
+                theme::BODY_SIZE,
                 t.mint,
                 t,
             );
+            cursor += theme::BODY_LINE;
         }
-        let shift_base = if c.story.is_empty() && c.shifts.is_empty() {
-            P + learn_h
-        } else {
-            P + story_block + 24. + learn_h
-        };
-        for (k, v) in c.shifts.iter().take(3).enumerate() {
-            shift_hits.push(y + shift_base + k as f32 * 16. - 5.);
+        if !c.shifts.is_empty() {
+            cursor += S3;
+        }
+        for v in c.shifts.iter().take(3) {
+            let b = cursor + f.cap(caption);
+            shift_hits.push(b - f.cap(caption) / 2.);
             single(
                 &mut canvas,
                 f,
                 &shift_row(v, false),
                 IX,
-                y + shift_base + k as f32 * 16.,
+                b,
                 IW,
-                10.5,
+                theme::CAPTION_SIZE,
                 if mark(v) == "!" { t.risk } else { t.mint },
                 t,
             );
+            cursor += theme::CAPTION_LINE;
         }
-        y += story_h + 12.;
+        y += story_h + S3;
     }
     if extra_h > 0. {
         panel(&mut canvas, y, extra_h, t);
@@ -1641,25 +1672,42 @@ pub fn draw(
     let mut ring_formula_avail = None;
     let mut mid_layout = None;
     // Keep >= 10pt between the last card and the pixmap bottom (key row sits under the picture).
-    const LAST_CARD_PAD: f32 = 10.;
-    let available_figure_h = if !active && help_h <= 0. {
-        (height - y - LAST_CARD_PAD).max(figure_h)
-    } else {
-        figure_h
-    };
+    const LAST_CARD_PAD: f32 = S4;
+    let available_figure_h = figure_h.min((height - y - LAST_CARD_PAD).max(0.));
     let mid_card = !narrow
         && !open.figure
         && c.figure["ctx"]["tokens"].as_f64().is_some_and(|n| n > 0.)
         && available_figure_h > 110.
         && !collapsed_context_fits(&c.figure, available_figure_h);
     // Keep the capped mid ring in an intrinsic card; surplus space belongs outside cards.
-    let figure_draw_h = if mid_card {
+    let figure_draw_h = if open.figure && !quotas_only {
+        available_figure_h.min(336.)
+    } else if mid_card {
         available_figure_h.min(186.)
     } else {
         available_figure_h
     };
+    let figure_layout_h = figure_draw_h;
+    let figure_draw_h = if !open.figure
+        && !narrow
+        && !quotas_only
+        && collapsed_context_fits(&c.figure, figure_layout_h)
+    {
+        collapsed_context_layout(&c.figure, figure_layout_h).2
+    } else {
+        figure_layout_h
+    };
     let figure_region = (y, figure_draw_h);
-    let fig_info = figure(&mut canvas, f, c, y, figure_draw_h, t, open.figure, narrow);
+    let fig_info = figure(
+        &mut canvas,
+        f,
+        c,
+        y,
+        figure_layout_h,
+        t,
+        open.figure,
+        narrow,
+    );
     if let Some((cy, ring, group, avail, mid)) = fig_info {
         ceiling_y = cy;
         ring_bounds = ring;
@@ -1670,17 +1718,13 @@ pub fn draw(
     y += figure_draw_h;
     let needs_tail = active || help_h > 0.;
     if needs_tail {
-        y += 12.;
+        y += S3;
     }
     let agents_region = active.then_some((y, agents_h));
     if active {
-        let agents_draw_h = if help_h > 0. || mid_card {
-            agents_h
-        } else {
-            (height - y - LAST_CARD_PAD).max(agents_h)
-        };
+        let agents_draw_h = agents_h;
         panel(&mut canvas, y, agents_draw_h, t);
-        let mut x = IX + 8.;
+        let mut x = IX;
         let mut stalled = 0;
         for a in c
             .agents
@@ -1695,12 +1739,12 @@ pub fn draw(
                 f,
                 Icon::Bot,
                 x,
-                y + 30.,
+                y + P + f.cap(body),
                 14.,
                 11.5,
                 if is_stalled { t.amber } else { t.mint },
             );
-            x += 27.;
+            x += S5;
         }
         let live = c
             .agents
@@ -1713,8 +1757,8 @@ pub fn draw(
             &mut canvas,
             f,
             &format!("{stalled} stalled · {live}"),
-            x + 8.,
-            y + 30.,
+            x + S2,
+            y + P + f.cap(body),
             W - x - 40.,
             11.5,
             t.amber,
@@ -1722,17 +1766,10 @@ pub fn draw(
         );
         y += agents_draw_h;
         if help_h > 0. {
-            y += 12.;
+            y += S3;
         }
     }
-    let help_region = (help_h > 0.).then(|| {
-        let h = if mid_card {
-            help_h
-        } else {
-            (height - y - LAST_CARD_PAD).max(help_h)
-        };
-        (y, h)
-    });
+    let help_region = (help_h > 0.).then_some((y, help_h));
     if let Some((help_y, help_draw_h)) = help_region {
         panel(&mut canvas, help_y, help_draw_h, t);
         for (k, s) in sells().iter().enumerate() {
@@ -1741,8 +1778,8 @@ pub fn draw(
                 f,
                 s,
                 IX,
-                help_y + P + k as f32 * 22.,
-                12.,
+                help_y + P + f.cap(body) + k as f32 * theme::BODY_LINE,
+                theme::BODY_SIZE,
                 t.quiet,
                 t.regular,
             );
@@ -1773,7 +1810,9 @@ pub fn draw(
         image::imageops::FilterType::Lanczos3,
     );
     let left = (width - fitted_width) / 2;
-    let mut output = image::RgbaImage::from_pixel(width, fitted_height, image::Rgba(t.ground));
+    let mut backdrop = Canvas::new(width as f32 / S, fitted_height as f32 / S);
+    backdrop.background(t);
+    let mut output = image::RgbaImage::from_raw(width, fitted_height, backdrop.pm.data().to_vec())?;
     image::imageops::overlay(&mut output, &fitted, i64::from(left), 0);
     let pm = tiny_skia::Pixmap::from_vec(
         output.into_raw(),
@@ -1783,6 +1822,8 @@ pub fn draw(
     Some((
         pm,
         Metrics {
+            question_size: qs.size,
+            question_line_height,
             font_fallbacks,
             content_left: left as f32 / width as f32,
             content_width: fitted_width as f32 / width as f32,
@@ -1840,14 +1881,38 @@ type FigureInfo = (
     Option<MidLayoutBounds>,
 );
 
-fn collapsed_context_fits(g: &Value, h: f32) -> bool {
-    let title = P + if g["trend"].as_f64().is_some() {
-        34.
+fn context_title_height(g: &Value) -> f32 {
+    P + theme::TITLE_LINE
+        + S2
+        + if g["trend"].as_f64().is_some() {
+            theme::CAPTION_LINE + S3
+        } else {
+            0.
+        }
+}
+
+// Radius uses the available-height formula; the card then hugs the measured group.
+fn collapsed_context_layout(g: &Value, h: f32) -> (f32, f32, f32) {
+    let title = context_title_height(g);
+    let below_ring = if payback(g).is_empty() {
+        S3
     } else {
-        14.
-    };
-    let below_ring = 16. + 18. + 12. + 30. + 46. + 4.;
-    h - 24. - title + 0.5 >= 2. * (78. + 12.) + below_ring
+        S4 + theme::BODY_LINE + S3
+    } + 30.
+        + 46.
+        + S1;
+    let available = (h - P - title - below_ring).max(0.);
+    let radius = (available / 2.8).clamp(78., 118.);
+    (
+        radius,
+        available,
+        title + 2. * (radius + S3) + below_ring + P,
+    )
+}
+
+fn collapsed_context_fits(g: &Value, h: f32) -> bool {
+    let (_, _, needed) = collapsed_context_layout(g, h);
+    needed <= h + 0.5
 }
 
 /// Draw the figure card. Returns (ceiling_y, ring_bounds) for layout metrics.
@@ -1861,7 +1926,6 @@ fn figure(
     expanded: bool,
     narrow: bool,
 ) -> Option<FigureInfo> {
-    panel(c, y, h, t);
     let g = &data.figure;
     let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
     let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.);
@@ -1870,6 +1934,12 @@ fn figure(
     const STRIP_H: f32 = 110.;
     let use_strip = tokens.is_some() && (narrow || h <= STRIP_H);
     let use_mid = tokens.is_some() && !expanded && !use_strip && !collapsed_scaled_fits;
+    let panel_h = if tokens.is_some() && !expanded && !use_strip && !use_mid {
+        collapsed_context_layout(g, h).2
+    } else {
+        h
+    };
+    panel(c, y, panel_h, t);
     if use_strip {
         return Some(draw_context_strip(c, f, data, y, h, t, tokens, size));
     }
@@ -1891,8 +1961,8 @@ fn figure(
             "Quotas"
         },
         IX,
-        y + P,
-        13.,
+        y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+        theme::TITLE_SIZE,
         t.ink,
         t.bold,
     );
@@ -1909,7 +1979,7 @@ fn figure(
                 short(trend.abs())
             ),
             IX,
-            y + P + 17.,
+            y + P + theme::TITLE_LINE + S2 + f.cap(sans(theme::CAPTION_SIZE, t.regular)),
             11.5,
             t.quiet,
             t.regular,
@@ -1920,17 +1990,44 @@ fn figure(
             f,
             &format!("{n}"),
             W - 100.,
-            y + P + 7.,
+            y + P + f.cap(serif(24., t.medium)),
             serif(24., t.medium),
             t.ink,
             A::M,
         );
-        label(c, f, "by CSR", W - 84., y + P + 7., 10., t.quiet, t.regular);
+        label(
+            c,
+            f,
+            "by CSR",
+            W - 84.,
+            y + P + f.cap(serif(24., t.medium)),
+            10.,
+            t.quiet,
+            t.regular,
+        );
     }
     if let Some((line, sev)) = csr_status(g) {
         let col = if sev == "red" { t.risk } else { t.amber };
-        c.icon(f, Icon::CircleAlert, IX + 87., y + P, 12., 10., col);
-        single(c, f, &line, IX + 105., y + P, 220., 10., t.quiet, t);
+        c.icon(
+            f,
+            Icon::CircleAlert,
+            IX + 87.,
+            y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+            12.,
+            10.,
+            col,
+        );
+        single(
+            c,
+            f,
+            &line,
+            IX + 105.,
+            y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+            220.,
+            10.,
+            t.quiet,
+            t,
+        );
     }
     let mut expanded_chart_bottom = y + 195.;
     if let (Some(n), Some(size)) = (tokens, size) {
@@ -2010,23 +2107,18 @@ fn figure(
             const GAUGE_R: f32 = 30.;
             const LABEL_BELOW: f32 = 46.;
             const LABEL_DESCENT: f32 = 4.;
-            const FIXED_BELOW_RING: f32 =
-                GAP_RING_PAY + PAY_H + GAP_PAY_GAUGE + GAUGE_R + LABEL_BELOW + LABEL_DESCENT;
-            let title_bottom = if g["trend"].as_f64().is_some() {
-                y + P + 34.
-            } else {
-                y + P + 14.
-            };
-            let slot = ((y + h - 24.) - title_bottom).max(0.);
-            let available_height = (slot - FIXED_BELOW_RING).max(0.);
-            let r = (available_height / 2.8).clamp(78., 118.);
-            let ring_extent = r + 12.;
-            let group_h = 2. * ring_extent + FIXED_BELOW_RING;
-            let group_top = title_bottom + (slot - group_h).max(0.) / 2.;
+            let title_bottom = y + context_title_height(g);
+            let (r, available_height, _) = collapsed_context_layout(g, h);
+            let ring_extent = r + S3;
+            let group_top = title_bottom;
             let cy = group_top + ring_extent;
             let cx = W / 2.;
             let pay_y = cy + ring_extent + GAP_RING_PAY;
-            let sat_cy = pay_y + PAY_H + GAP_PAY_GAUGE + GAUGE_R;
+            let sat_cy = if payback(g).is_empty() {
+                cy + ring_extent + S3 + GAUGE_R
+            } else {
+                pay_y + PAY_H + GAP_PAY_GAUGE + GAUGE_R
+            };
             let group_bottom = sat_cy + LABEL_BELOW + LABEL_DESCENT;
             ring_bounds = Some((cx, cy, r));
             ring_group = Some((group_top, group_bottom));
@@ -2075,7 +2167,10 @@ fn figure(
     let pay = payback(g);
     // Gauge labels stay >= 24pt above the card bottom; collapsed uses the exact group geometry.
     let (sat_cy, pay_y) = if tokens.is_none() {
-        (y + P + 52., y + P + 40.)
+        (
+            y + P + theme::TITLE_LINE + S2 + 30.,
+            y + P + theme::TITLE_LINE,
+        )
     } else if expanded {
         let sat = y + h - 70.;
         let below_chart = expanded_chart_bottom + 33.;
@@ -2327,18 +2422,45 @@ fn draw_context_mid(
     size: Option<f64>,
 ) -> FigureInfo {
     let g = &data.figure;
-    const TITLE: f32 = 14.;
-    const BOTTOM_CLEAR: f32 = 24.;
-    label(c, f, "Context", IX, y + P, 13., t.ink, t.bold);
+    const TITLE: f32 = theme::TITLE_LINE + S2;
+    const BOTTOM_CLEAR: f32 = S4;
+    label(
+        c,
+        f,
+        "Context",
+        IX,
+        y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+        theme::TITLE_SIZE,
+        t.ink,
+        t.bold,
+    );
     if let Some((line, sev)) = csr_status(g) {
         let col = if sev == "red" { t.risk } else { t.amber };
-        c.icon(f, Icon::CircleAlert, IX + 87., y + P, 12., 10., col);
-        single(c, f, &line, IX + 105., y + P, 220., 10., t.quiet, t);
+        c.icon(
+            f,
+            Icon::CircleAlert,
+            IX + 87.,
+            y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+            12.,
+            10.,
+            col,
+        );
+        single(
+            c,
+            f,
+            &line,
+            IX + 105.,
+            y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+            220.,
+            10.,
+            t.quiet,
+            t,
+        );
     }
     let (Some(n), Some(size)) = (tokens, size) else {
         return (None, None, None, None, None);
     };
-    let radius_inner = (h - TITLE - 2. * P) / 2.;
+    let radius_inner = (h - TITLE - 2. * P) / 2. - S1;
     let r = radius_inner.clamp(25., 64.);
 
     let mut satellites: Vec<_> = array(&g["quotas"])
@@ -2350,13 +2472,13 @@ fn draw_context_mid(
     let cache = g["cache"]["left"].is_number() || g["cache"]["cold"] == true;
     let count = satellites.len() + usize::from(cache) + usize::from(codex.is_some());
 
-    let title_bottom = y + P + TITLE - 2.;
+    let title_bottom = y + P + TITLE;
     let slot_bottom = y + h - BOTTOM_CLEAR;
     let slot = (slot_bottom - title_bottom).max(0.);
     let gauge_r = (r * 0.32).clamp(16., 20.);
 
     let label_below = gauge_r + 12.;
-    let details_gap = 10.;
+    let details_gap = S3;
     let details_h = 6.;
     let right_h = gauge_r + label_below + details_gap + details_h;
     let group_h = (2. * r).max(right_h);
@@ -2365,7 +2487,7 @@ fn draw_context_mid(
     let ring_cx = IX + r;
     let ring_cy = group_top + group_h / 2.;
 
-    let right_x0 = ring_cx + r + 18.;
+    let right_x0 = ring_cx + r + S4;
     let right_w = (W - M - P - right_x0).max(80.);
     let right_top = group_top + (group_h - right_h).max(0.) / 2.;
     let gauges_cy = right_top + gauge_r;

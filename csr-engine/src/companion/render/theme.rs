@@ -72,6 +72,7 @@ impl std::fmt::Debug for Theme {
 pub struct Tokens {
     pub fresh: [u8; 4],
     pub ground: [u8; 4],
+    pub mesh_ground: [u8; 4],
     pub ink: [u8; 4],
     pub quiet: [u8; 4],
     pub faint: [u8; 4],
@@ -104,7 +105,8 @@ pub const SETS: &[(&str, Tokens)] = &[
         "dark",
         Tokens {
             fresh: [244, 145, 199, 255],
-            ground: [17, 20, 24, 255],
+            ground: [18, 20, 23, 255],
+            mesh_ground: [17, 20, 24, 255],
             ink: [242, 244, 246, 255],
             quiet: [184, 193, 203, 255],
             faint: [174, 184, 196, 255],
@@ -148,7 +150,8 @@ pub const SETS: &[(&str, Tokens)] = &[
         "light",
         Tokens {
             fresh: [133, 35, 96, 255],
-            ground: [247, 247, 245, 255],
+            ground: [251, 251, 249, 255],
+            mesh_ground: [247, 247, 245, 255],
             ink: [23, 25, 28, 255],
             quiet: [69, 77, 88, 255],
             faint: [78, 87, 100, 255],
@@ -278,7 +281,7 @@ mod instrument_tests {
                 out[3] = 255;
                 out
             };
-            let mut grounds = vec![t.ground];
+            let mut grounds = vec![t.mesh_ground];
             for layer in t.aurora {
                 grounds = grounds
                     .iter()
