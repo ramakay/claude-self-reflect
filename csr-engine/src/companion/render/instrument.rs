@@ -415,10 +415,12 @@ pub fn shift_row(v: &Value, expanded: bool) -> String {
         format!("{} {place}  {}", mark(v), receipt(v))
     }
 }
+/// Ages count in minutes: every repaint re-uploads the whole picture, so a seconds count would
+/// blank the pane once a second for the first minute after each refresh.
 fn age_span(seconds: f64) -> String {
     let seconds = seconds.max(0.);
     if seconds < 60. {
-        format!("{seconds:.0}s")
+        "<1m".to_owned()
     } else {
         masthead::span(seconds)
     }
@@ -3565,5 +3567,12 @@ mod tests {
         // Each repaint re-uploads the whole picture, and the terminal blanks it meanwhile.
         assert!(draw_at(41.).data() == draw_at(49.).data());
         assert!(draw_at(49.).data() != draw_at(50.).data());
+    }
+
+    #[test]
+    fn a_fresh_age_reads_under_a_minute_instead_of_ticking_seconds() {
+        assert_eq!(age_span(3.), "<1m");
+        assert_eq!(age_span(59.), "<1m");
+        assert_eq!(age_span(60.), "1m");
     }
 }

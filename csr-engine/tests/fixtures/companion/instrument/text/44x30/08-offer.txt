@@ -17,7 +17,7 @@ sessions.
 Ask about past work. CSR finds it.
 Code changed? CSR warns Claude.
 CSR keeps the threads you dropped.
-Story · refreshed 30s ago
+Story · refreshed <1m ago
 Text parity is ready for review.
 ~ reader.rs · read ⌗8e4e3f27
 + render/instrument.rs · meta ⌗7625eed7
