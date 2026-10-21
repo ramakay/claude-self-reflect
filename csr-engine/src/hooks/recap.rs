@@ -452,6 +452,45 @@ pub(crate) fn recap_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
     extractable(&source).and_then(|text| clean_intent(&text))
 }
 
+/// The short handoff `/clear` receives in place of a recap: what the cleared session was doing,
+/// what it left open, and where the rest lives. Two lines, no history dump: the person asked for a
+/// clean context. Carries [`RECAP_SENTINEL`](crate::extraction::provenance::RECAP_SENTINEL) and
+/// the `recap [<age>]: ` opening, so the self-contamination guard drops it on re-import. Abstains
+/// (None) when the session has no usable intent.
+pub(crate) fn compose_clear_handoff(ep: &crate::hooks::stop::Episode, age: &str) -> Option<String> {
+    use crate::extraction::provenance::RECAP_SENTINEL;
+    use crate::import::contamination::has_csr_text;
+
+    const OPEN_MAX_CHARS: usize = 120;
+    let intent = recap_intent(ep)?;
+    let open = ep
+        .todos
+        .iter()
+        .find(|todo| todo.status != "completed" && !todo.content.trim().is_empty())
+        .map(|todo| todo.content.as_str())
+        .or(ep.next_steps.as_deref())
+        .or(ep.blockers.as_deref())
+        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|text| !text.is_empty() && !has_csr_text(text))
+        .map(|text| {
+            if text.chars().count() > OPEN_MAX_CHARS {
+                let cut: String = text.chars().take(OPEN_MAX_CHARS).collect();
+                format!("{}…", cut.trim_end())
+            } else {
+                text
+            }
+        });
+    let mut out = format!("recap [cleared, {age}]: {}", terminate_clause(&intent));
+    if let Some(open) = open {
+        out.push_str(&format!(" Still open: {}", terminate_clause(&open)));
+    }
+    out.push_str(&format!(
+        "\nMore: csr_reflect_on_past(\"conv_{}\") {RECAP_SENTINEL}",
+        ep.session_id
+    ));
+    Some(out)
+}
+
 /// The completed clause: the receipts `displayed_receipts` picks, never
 /// assistant prose. Legacy episodes carry none and abstain.
 fn recap_completed(ep: &crate::hooks::stop::Episode) -> Option<String> {
@@ -818,6 +857,57 @@ mod tests {
             compact_anchor: None,
             anchors: vec![],
         }
+    }
+
+    #[test]
+    fn clear_handoff_is_two_short_lines_with_a_pointer_and_the_guard_grammar() {
+        let ep = episode();
+        let handoff = compose_clear_handoff(&ep, "3m ago").expect("a usable intent");
+        let lines: Vec<&str> = handoff.lines().collect();
+        assert_eq!(lines.len(), 2, "{handoff}");
+        assert_eq!(
+            lines[0],
+            "recap [cleared, 3m ago]: Fix the recap composer. Still open: wire session start."
+        );
+        assert_eq!(
+            lines[1],
+            format!("More: csr_reflect_on_past(\"conv_session-1\") {RECAP_SENTINEL}")
+        );
+        assert!(handoff.chars().count() <= 400, "{handoff}");
+        // No dump of the old session: none of its completions, blockers or next steps.
+        for leaked in [
+            "Implemented",
+            "abc1234",
+            "storage migration",
+            "integration suite",
+        ] {
+            assert!(!handoff.contains(leaked), "{leaked}: {handoff}");
+        }
+        // Re-import drops it, by sentinel and by the `recap [` grammar alone.
+        assert!(crate::extraction::provenance::is_csr_emission(&handoff));
+        let no_sentinel = handoff.replace(RECAP_SENTINEL, "");
+        assert!(crate::extraction::provenance::is_csr_emission(&no_sentinel));
+    }
+
+    #[test]
+    fn clear_handoff_falls_back_to_next_steps_cuts_long_text_and_abstains_without_intent() {
+        let mut ep = episode();
+        ep.todos.clear();
+        let handoff = compose_clear_handoff(&ep, "1h ago").unwrap();
+        assert!(
+            handoff.contains("Still open: Run the integration suite."),
+            "{handoff}"
+        );
+        ep.next_steps = Some("word ".repeat(80));
+        let handoff = compose_clear_handoff(&ep, "1h ago").unwrap();
+        assert!(handoff.chars().count() <= 400, "{handoff}");
+        assert!(handoff.lines().next().unwrap().ends_with('…') || handoff.contains("…."));
+        ep.next_steps = None;
+        ep.blockers = None;
+        let handoff = compose_clear_handoff(&ep, "1h ago").unwrap();
+        assert!(!handoff.contains("Still open"), "{handoff}");
+        ep.anchor_request = None;
+        assert!(compose_clear_handoff(&ep, "1h ago").is_none());
     }
 
     #[test]
