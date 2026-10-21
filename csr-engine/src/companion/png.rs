@@ -107,6 +107,11 @@ fn instrument_png(
                     "agents_region": metrics.agents_region,
                     "help_region": metrics.help_region,
                     "layout_height": metrics.height,
+                    "content_left": metrics.content_left,
+                    "content_width": metrics.content_width,
+                    "quota_gauges": metrics.quota_gauges,
+                    "csr_share": theme.tokens().csr_share,
+                    "sky": theme.tokens().sky,
                     "cols": cols, "rows": rows,
                 }))?,
             )?;

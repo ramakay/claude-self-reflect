@@ -1590,7 +1590,7 @@ fn instrument_and_info_use_the_same_week_figure_from_one_fixture() {
             assert_eq!(format!("≈{}%", actual.share_label()), info);
             let q = json!({"code":"7D","used":52});
             assert!(instrument::quota_caption(&composition, &q)
-                .ends_with(&format!("CSR {}", actual.share_label())));
+                .ends_with(&format!("CSR {} pts", actual.share_label())));
             assert!(actual.segment(52.).is_some());
         } else if week["mode"] == "api" {
             assert_eq!(format!("{info} this week"), actual.money_line());
@@ -1662,4 +1662,80 @@ fn unpriced_narrative_and_unreadable_table_stay_unknown_in_the_actual_pane() {
         assert!(shown.contains("CSR —"), "{shown}");
         assert!(!shown.contains("CSR 0"), "{shown}");
     }
+}
+
+#[test]
+fn weekly_caption_names_only_csrs_percentage_points() {
+    use csr_engine::companion::render::instrument::{quota_caption, Composition};
+    let (_home, paths) = state_home("02-running");
+    let week = fixture_week(&paths);
+    let mut data = Composition::build(&json!({"value":week}), &json!({"id":"sess-now"}), NOW);
+    let q = json!({"code":"7D", "used":57});
+    data.csr_cost.share = Some(0.9);
+    assert_eq!(quota_caption(&data, &q), "CSR 0.9 pts");
+    data.csr_cost.share = Some(0.);
+    assert_eq!(quota_caption(&data, &q), "CSR 0 pts");
+    data.csr_cost.share = None;
+    assert_eq!(quota_caption(&data, &q), "CSR — pts");
+}
+
+#[test]
+fn gauge_centres_are_even_and_positive_csr_arcs_have_a_visible_separator() {
+    let mut arcs = 0;
+    let mut rows_checked = 0;
+    for state in STATES {
+        for (cols, rows) in [(38, 30), (44, 30), (60, 40), (76, 67)] {
+            for theme in [Theme::Dark, Theme::Light] {
+                let (_home, paths) = state_home(state);
+                let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+                pane.pixels = true;
+                pane.enable_cards();
+                pane.theme = theme;
+                if state == "03-agents" {
+                    pane.key("i");
+                }
+                pane.frame(cols, rows, NOW);
+                let m = pane.instrument_metrics.as_ref().unwrap();
+                let gauges = &m.quota_gauges;
+                assert!(gauges.len() >= 2, "{state} {cols}: missing quota row");
+                let scale = (rows - 1) as f32 * 34. / m.height;
+                let steps: Vec<_> = gauges
+                    .windows(2)
+                    .map(|p| p[1].center.0 - p[0].center.0)
+                    .collect();
+                for step in &steps {
+                    assert!((step - steps[0]).abs() < 0.01, "{state} {cols}: {steps:?}");
+                }
+                for gauge in gauges {
+                    assert!((gauge.center.1 - gauges[0].center.1).abs() < 0.01);
+                    if let Some((rest, from, to)) = gauge.csr_segment {
+                        assert!(
+                            (to - from) * 360. >= 6. - 0.001,
+                            "{state}: sweep {}",
+                            (to - from) * 360.
+                        );
+                        assert!(from >= rest && to <= 1.);
+                        if rest > 0. {
+                            let gap_px =
+                                (from - rest) * std::f32::consts::TAU * gauge.radius * scale;
+                            assert!((gap_px - 1.).abs() < 0.01, "{state}: separator {gap_px}px");
+                        }
+                        arcs += 1;
+                    } else if gauge.code == "7D" {
+                        assert!(m.csr_cost.share.is_none_or(|v| v <= 0.));
+                    }
+                }
+                let token = theme.tokens();
+                // Distinct hue: CSR is magenta (R>B>G), quota usage is blue (B>R).
+                assert!(
+                    token.csr_share[0] > token.csr_share[2]
+                        && token.csr_share[2] > token.csr_share[1]
+                );
+                assert!(token.sky[2] > token.sky[0]);
+                rows_checked += 1;
+            }
+        }
+    }
+    assert_eq!(rows_checked, 88);
+    assert!(arcs >= 56);
 }

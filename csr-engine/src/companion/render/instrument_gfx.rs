@@ -576,9 +576,21 @@ impl Fonts {
 
 // ---------------------------------------------------------------- canvas
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct QuotaGauge {
+    pub code: String,
+    pub center: (f32, f32),
+    pub radius: f32,
+    /// Fractions: end of other usage, start of CSR, end of CSR.
+    pub csr_segment: Option<(f32, f32, f32)>,
+}
+
 pub struct Canvas {
     pub pm: Pixmap,
     pub dry: bool,
+    /// Final output pixels per logical point (before supersampling/downsampling).
+    pub output_scale: f32,
+    pub quota_gauges: Vec<QuotaGauge>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -784,12 +796,16 @@ impl Canvas {
         Canvas {
             pm: Pixmap::new((w_pt * S).round() as u32, (h_pt * S).round() as u32).unwrap(),
             dry: false,
+            output_scale: S,
+            quota_gauges: Vec::new(),
         }
     }
     pub fn dry() -> Canvas {
         Canvas {
             pm: Pixmap::new(1, 1).unwrap(),
             dry: true,
+            output_scale: S,
+            quota_gauges: Vec::new(),
         }
     }
     pub fn fill(&mut self, p: &Path, col: Rgba) {
@@ -1147,6 +1163,8 @@ pub fn contact(f: &Fonts, tiles: &[(String, Pixmap, String)], path: &str, bg: Rg
     let mut c = Canvas {
         pm: Pixmap::new(width, height).unwrap(),
         dry: false,
+        output_scale: S,
+        quota_gauges: Vec::new(),
     };
     c.pm.fill(color(bg));
     let mut y = gap;

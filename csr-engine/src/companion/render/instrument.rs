@@ -902,11 +902,7 @@ fn has_week(data: &Composition) -> bool {
 /// The same caption is used by every pixel quota layout.
 pub fn quota_caption(data: &Composition, q: &Value) -> String {
     if q["code"] == "7D" {
-        format!(
-            "7D {:.0}% · CSR {}",
-            num(&q["used"]),
-            data.csr_cost.share_label()
-        )
+        format!("CSR {} pts", data.csr_cost.share_label())
     } else {
         let pace = q["pace"]
             .as_f64()
@@ -916,21 +912,33 @@ pub fn quota_caption(data: &Composition, q: &Value) -> String {
 }
 
 fn quota_ring(c: &mut Canvas, data: &Composition, q: &Value, x: f32, y: f32, r: f32, t: &Tokens) {
-    let used = num(&q["used"]);
-    c.ring(
-        x,
-        y,
-        r,
-        t.ring,
-        t.track,
-        &[(0., (used / 100.).clamp(0., 1.) as f32, t.sky)],
-    );
-    if q["code"] == "7D" {
-        if let Some((from, to)) = data.csr_cost.segment(used) {
-            // Butt caps keep CSR's small segment entirely inside the used arc.
-            c.arc(x, y, r, from, to, t.ring, t.csr_share, false);
-        }
+    let used = (num(&q["used"]) / 100.).clamp(0., 1.) as f32;
+    let csr = (q["code"] == "7D")
+        .then_some(data.csr_cost.share)
+        .flatten()
+        .filter(|share| *share > 0.)
+        .map(|share| {
+            // Keep the number honest; the six-degree floor is a visibility aid only.
+            let end = used.max(6. / 360.);
+            let sweep = (share as f32 / 100.).max(6. / 360.).min(end);
+            let from = end - sweep;
+            let gap = 1. / (std::f32::consts::TAU * r * c.output_scale);
+            ((from - gap).max(0.), from, end)
+        });
+    if let Some((rest_end, from, to)) = csr {
+        // Butt caps preserve the one-output-pixel notch without round-cap overlap.
+        c.arc(x, y, r, 0., 1., t.ring, t.track, false);
+        c.arc(x, y, r, 0., rest_end, t.ring, t.sky, false);
+        c.arc(x, y, r, from, to, t.ring, t.csr_share, false);
+    } else {
+        c.ring(x, y, r, t.ring, t.track, &[(0., used, t.sky)]);
     }
+    c.quota_gauges.push(QuotaGauge {
+        code: string(&q["code"]).into(),
+        center: (x, y),
+        radius: r,
+        csr_segment: csr,
+    });
 }
 
 fn fitted_caption(
@@ -961,8 +969,41 @@ fn fitted_caption_ink(
     c.text(f, line, x, y, sans(size, t.medium), ink, A::M);
 }
 
-/// Quota row shared by full, mid-height and narrow text-mode strips. The weekly gauge and
-/// API card get wider slots so their complete captions fit without colliding with neighbours.
+fn quota_money_caption(f: &Fonts, line: &str, width: f32, size: f32, t: &Tokens) -> String {
+    if f.width(line, sans(size, t.medium)) > width {
+        line.strip_suffix(" this week").unwrap_or(line).into()
+    } else {
+        line.into()
+    }
+}
+
+/// Caption fitting never affects the equal-width gauge slots.
+fn quota_label(
+    c: &mut Canvas,
+    f: &Fonts,
+    line: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    size: f32,
+    ink: Rgba,
+    t: &Tokens,
+) {
+    let st = sans(size, t.medium);
+    for (i, line) in f.wrap(line, st, width).iter().take(2).enumerate() {
+        c.text(
+            f,
+            line,
+            x,
+            y + i as f32 * theme::CAPTION_LINE,
+            st,
+            ink,
+            A::M,
+        );
+    }
+}
+
+/// Quota row shared by full, mid-height and narrow text-mode strips.
 fn quota_row(
     c: &mut Canvas,
     f: &Fonts,
@@ -984,19 +1025,13 @@ fn quota_row(
     let cache = g["cache"]["left"].is_number() || g["cache"]["cold"] == true;
     let codex = data.codex_week["percent"].as_f64();
     let api = !has_week(data);
-    let weights = quotas
-        .iter()
-        .map(|q| if q["code"] == "7D" { 2. } else { 1. })
-        .sum::<f32>()
-        + u8::from(cache) as f32
-        + u8::from(codex.is_some()) as f32
-        + if api { 2. } else { 0. };
-    let unit = width / weights.max(1.);
+    let slots = quotas.len() + usize::from(cache) + usize::from(codex.is_some()) + usize::from(api);
+    let unit = width / slots.max(1) as f32;
     let mut cursor = left;
     let mut bounds = (left + width, left);
     for q in quotas {
         let weekly = q["code"] == "7D";
-        let slot = unit * if weekly { 2. } else { 1. };
+        let slot = unit;
         let x = cursor + slot / 2.;
         cursor += slot;
         bounds.0 = bounds.0.min(x - r);
@@ -1014,22 +1049,39 @@ fn quota_row(
         let ahead = q["pace"]
             .as_f64()
             .is_some_and(|p| num(&q["used"]) / 100. > p);
-        fitted_caption_ink(
-            c,
-            f,
-            &quota_caption(data, q),
-            x,
-            label_y,
-            slot - S2,
-            caption_size,
-            if weekly && ahead { t.warn } else { t.quiet },
-            t,
-        );
+        if weekly {
+            // The short CSR points label owns one row; money owns the following row.
+            fitted_caption_ink(
+                c,
+                f,
+                &quota_caption(data, q),
+                x,
+                label_y,
+                slot - S2,
+                caption_size,
+                if ahead { t.warn } else { t.quiet },
+                t,
+            );
+        } else {
+            quota_label(
+                c,
+                f,
+                &quota_caption(data, q),
+                x,
+                label_y,
+                slot - S2,
+                caption_size,
+                t.quiet,
+                t,
+            );
+        }
         if weekly && data.csr_cost.usd.is_some() {
+            let money =
+                quota_money_caption(f, &data.csr_cost.money_line(), slot - S2, caption_size, t);
             fitted_caption(
                 c,
                 f,
-                &data.csr_cost.money_line(),
+                &money,
                 x,
                 label_y + theme::CAPTION_LINE,
                 slot - S2,
@@ -1043,6 +1095,12 @@ fn quota_row(
         cursor += unit;
         bounds.0 = bounds.0.min(x - r);
         bounds.1 = bounds.1.max(x + r);
+        c.quota_gauges.push(QuotaGauge {
+            code: "cache".into(),
+            center: (x, cy),
+            radius: r,
+            csr_segment: None,
+        });
         let left = num(&g["cache"]["left"]);
         let cold = g["cache"]["cold"] == true || left <= 0.;
         let ttl = g["cache"]["ttl"]
@@ -1079,13 +1137,29 @@ fn quota_row(
         } else {
             "◷ cache"
         };
-        fitted_caption(c, f, caption, x, label_y, unit - S2, caption_size, t);
+        quota_label(
+            c,
+            f,
+            caption,
+            x,
+            label_y,
+            unit - S2,
+            caption_size,
+            t.quiet,
+            t,
+        );
     }
     if let Some(used) = codex {
         let x = cursor + unit / 2.;
         cursor += unit;
         bounds.0 = bounds.0.min(x - r);
         bounds.1 = bounds.1.max(x + r);
+        c.quota_gauges.push(QuotaGauge {
+            code: "Codex 7D".into(),
+            center: (x, cy),
+            radius: r,
+            csr_segment: None,
+        });
         c.ring(
             x,
             cy,
@@ -1115,8 +1189,14 @@ fn quota_row(
         );
     }
     if api {
-        let slot = unit * 2.;
+        let slot = unit;
         let x = cursor + slot / 2.;
+        c.quota_gauges.push(QuotaGauge {
+            code: "CSR cost".into(),
+            center: (x, cy),
+            radius: 0.,
+            csr_segment: None,
+        });
         let card_w = (slot - S2).min(180.);
         let top = cy - r;
         let bottom = label_y + theme::CAPTION_LINE;
@@ -1140,16 +1220,30 @@ fn quota_row(
             caption_size,
             t,
         );
-        fitted_caption(
-            c,
-            f,
-            &data.csr_cost.api_line(),
-            x,
-            cy + S2,
-            card_w - S2,
-            caption_size,
-            t,
-        );
+        let api_line = data.csr_cost.api_line();
+        let style = sans(caption_size, t.medium);
+        let api_line = if f.width(&api_line, style) > card_w - S2 {
+            api_line.replace(" this week", "")
+        } else {
+            api_line
+        };
+        let lines = f.wrap(&api_line, style, card_w - S2);
+        if lines.len() <= 2 {
+            quota_label(
+                c,
+                f,
+                &api_line,
+                x,
+                cy + S2,
+                card_w - S2,
+                caption_size,
+                t.quiet,
+                t,
+            );
+        } else {
+            // The native-text fallback's tiny strip still preserves the whole cost/call line.
+            fitted_caption(c, f, &api_line, x, cy + S2, card_w - S2, caption_size, t);
+        }
         bounds.0 = bounds.0.min(x - card_w / 2.);
         bounds.1 = bounds.1.max(x + card_w / 2.);
     }
@@ -1305,6 +1399,7 @@ pub fn request_bar_y(base: f32, value: f64, max: f64, chart_h: f32) -> f32 {
 #[derive(Clone, Debug)]
 pub struct Metrics {
     pub csr_cost: InstrumentCost,
+    pub quota_gauges: Vec<QuotaGauge>,
     pub question_size: f32,
     pub question_line_height: f32,
     /// Only missing or system-fallback glyphs; bundled cross-family coverage is primary.
@@ -1585,6 +1680,7 @@ pub fn draw(
     };
     let height = maxh;
     let mut canvas = Canvas::new(W, height);
+    canvas.output_scale = (width as f32 / W).min(available_height as f32 / height);
     canvas.background(t);
     let mut y = M;
     panel(&mut canvas, y, hero_h, t);
@@ -2145,6 +2241,7 @@ pub fn draw(
         pm,
         Metrics {
             csr_cost: c.csr_cost.clone(),
+            quota_gauges: canvas.quota_gauges.clone(),
             question_size: qs.size,
             question_line_height,
             font_fallbacks,
@@ -2993,6 +3090,24 @@ pub fn strip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_money_drops_this_week_before_a_caption_can_hit_its_neighbour() {
+        let fonts = Fonts::load();
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let line = "$18.22 this week";
+            let natural = fonts.width(line, sans(theme::CAPTION_SIZE, t.medium));
+            assert_eq!(
+                quota_money_caption(&fonts, line, natural + 1., theme::CAPTION_SIZE, t),
+                line
+            );
+            assert_eq!(
+                quota_money_caption(&fonts, line, natural - 1., theme::CAPTION_SIZE, t),
+                "$18.22"
+            );
+        }
+    }
 
     #[test]
     fn request_bar_max_includes_the_context_window_so_the_ceiling_stays_on_the_chart() {
