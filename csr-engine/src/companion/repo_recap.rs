@@ -115,7 +115,11 @@ pub(super) fn load(storage: &Storage, project: &str, sid: &str, now: f64) -> Opt
         session_recap(storage, project, prior, episode, now)
     });
     let (primary, text) = entries.next()?;
-    let history = entries.map(|(summary, _)| summary).collect();
+    // A session CSR knows nothing about is noise in the list, not history.
+    let history = entries
+        .map(|(summary, _)| summary)
+        .filter(|summary| summary.intent != UNAVAILABLE)
+        .collect();
     Some(RepoRecap {
         session: primary.session,
         at: primary.at,
