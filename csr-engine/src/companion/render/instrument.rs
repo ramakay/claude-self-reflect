@@ -1220,8 +1220,9 @@ fn quota_row(
             radius: r,
             csr_segment: None,
         });
-        let left = num(&g["cache"]["left"]);
-        let cold = g["cache"]["cold"] == true || left <= 0.;
+        // The minute shown is the one drawn: a seconds sweep repaints the whole picture.
+        let left = (num(&g["cache"]["left"]) / 60.).floor() * 60.;
+        let cold = g["cache"]["cold"] == true || num(&g["cache"]["left"]) <= 0.;
         let ttl = g["cache"]["ttl"]
             .as_f64()
             .filter(|n| *n > 0.)
@@ -3527,5 +3528,19 @@ mod tests {
         assert_eq!(story_text_lines(no_clause, 8, 1), vec!["…".to_string()]);
         assert!(wrap_clauses(&fonts, no_clause, st, 60., 0).is_empty());
         assert!(story_text_lines(no_clause, 8, 0).is_empty());
+    }
+
+    #[test]
+    fn the_cache_ring_redraws_once_a_minute_not_every_second() {
+        let draw_at = |left: f64| {
+            let mut c = Composition::build(&json!({}), &json!({"id":"cache"}), 1000.);
+            c.figure["cache"] = json!({"left": left, "ttl": 3600., "cold": false, "text": "CACHE"});
+            draw(&c, 704, 986, Theme::Light, Open::default(), false)
+                .expect("instrument draws")
+                .0
+        };
+        // Both read "59m": a second's sweep must not repaint the whole picture.
+        assert!(draw_at(3599.).data() == draw_at(3540.).data());
+        assert!(draw_at(3540.).data() != draw_at(3539.).data());
     }
 }
