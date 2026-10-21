@@ -3,6 +3,7 @@
 // rounded rects, gradients, glass, thin rings with round caps, dotted rings,
 // antialiased text with baseline snapping, ink measurement, wrapping, contact sheet.
 #![allow(dead_code, clippy::too_many_arguments)]
+use super::instrument_icons;
 use ab_glyph::{point, Font, FontVec, GlyphId, ScaleFont, VariableFont};
 use image::{codecs::png::PngEncoder, ImageEncoder};
 use std::cell::RefCell;
@@ -111,6 +112,7 @@ struct Placed<'a> {
     scale: f32,
     id: GlyphId,
     x: f32,
+    y: f32,
 }
 fn px_scale(f: &FontVec, size_px: f32) -> f32 {
     size_px * f.height_unscaled() / f.units_per_em().unwrap_or(1000.)
@@ -305,8 +307,15 @@ impl Fonts {
         let mut out = vec![];
         let mut x = 0.;
         let mut prev: Option<(*const FontVec, GlyphId)> = None;
-        for ch in s.chars() {
-            let mut font = main;
+        let mut previous_icon = false;
+        for original in s.chars() {
+            let ch = instrument_icons::legacy(original);
+            let is_icon = instrument_icons::is_icon(ch);
+            let mut font = if is_icon {
+                &self.face(icon(st.size)).font
+            } else {
+                main
+            };
             let mut id = if ch.is_ascii_digit() && primary.digits[ch as usize - '0' as usize].0 != 0
             {
                 primary.digits[ch as usize - '0' as usize]
@@ -335,15 +344,41 @@ impl Fonts {
                     self.used.borrow_mut().insert(ch, "MISSING".into());
                 }
             }
-            let scale = px_scale(font, size_px);
+            let inline_icon = is_icon && st.fam != Fam::Icon;
+            let glyph_size = if inline_icon { 12. * S * mult } else { size_px };
+            let scale = px_scale(font, glyph_size);
             let sf = font.as_scaled(scale);
+            let y = if inline_icon {
+                let cap = main
+                    .outline_glyph(main.glyph_id('H').with_scale(px_scale(main, size_px)))
+                    .map(|o| -o.px_bounds().min.y)
+                    .unwrap_or(size_px * 0.7);
+                let middle = font
+                    .outline_glyph(id.with_scale(scale))
+                    .map(|o| (o.px_bounds().min.y + o.px_bounds().max.y) / 2.)
+                    .unwrap_or(0.);
+                -cap / 2. - middle
+            } else {
+                0.
+            };
             if let Some((pf, pid)) = prev {
                 if std::ptr::eq(pf, font) && !ch.is_ascii_digit() {
                     x += sf.kern(pid, id);
                 }
             }
-            out.push(Placed { font, scale, id, x });
-            x += sf.h_advance(id) + st.track * S * mult;
+            out.push(Placed {
+                font,
+                scale,
+                id,
+                x,
+                y,
+            });
+            x += if previous_icon && ch == ' ' {
+                6. * S * mult
+            } else {
+                sf.h_advance(id) + st.track * S * mult
+            };
+            previous_icon = is_icon;
             prev = (!ch.is_ascii_digit()).then_some((font as *const FontVec, id));
         }
         (out, x)
@@ -374,7 +409,7 @@ impl Fonts {
         let (g, _) = self.place(s, st, 16.);
         let (mut l, mut r, mut t, mut b) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
         for p in &g {
-            let glyph = p.id.with_scale_and_position(p.scale, point(p.x, 0.));
+            let glyph = p.id.with_scale_and_position(p.scale, point(p.x, p.y));
             if let Some(o) = p.font.outline_glyph(glyph) {
                 let bb = o.px_bounds();
                 l = l.min(bb.min.x);
@@ -806,7 +841,8 @@ impl Canvas {
         let (w, h) = (self.pm.width() as i32, self.pm.height() as i32);
         let data = self.pm.data_mut();
         for p in &glyphs {
-            let glyph = p.id.with_scale_and_position(p.scale, point(ox + p.x, by));
+            let glyph =
+                p.id.with_scale_and_position(p.scale, point(ox + p.x, by + p.y));
             if let Some(o) = p.font.outline_glyph(glyph) {
                 let b = o.px_bounds();
                 let (bx, byy) = (b.min.x.floor() as i32, b.min.y.floor() as i32);
@@ -829,6 +865,25 @@ impl Canvas {
             }
         }
         adv_pt
+    }
+
+    /// Align an icon's optical centre to the cap-height centre of its neighbouring text.
+    pub fn icon(
+        &mut self,
+        f: &Fonts,
+        glyph: instrument_icons::Icon,
+        x: f32,
+        baseline: f32,
+        size: f32,
+        text_size: f32,
+        col: Rgba,
+    ) -> f32 {
+        let value = glyph.glyph().to_string();
+        let st = icon(size);
+        let (_, _, top, bottom) = f.ink(&value, st);
+        let base = baseline - f.cap(sans(text_size, 500.)) / 2. - (top + bottom) / 2.;
+        self.text(f, &value, x, base, st, col, A::L);
+        size
     }
 
     /// wrapped paragraph; first baseline at `base`; returns the last baseline.

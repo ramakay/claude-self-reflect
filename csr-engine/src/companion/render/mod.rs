@@ -1,6 +1,7 @@
 pub mod cards;
 pub mod instrument;
 mod instrument_gfx;
+mod instrument_icons;
 pub mod kitty;
 pub mod pictures;
 pub mod raster;

@@ -2,6 +2,7 @@
 #![allow(clippy::too_many_arguments)]
 use super::{
     instrument_gfx::*,
+    instrument_icons::{self as icons, Icon},
     text,
     theme::{Theme, Tokens},
 };
@@ -869,7 +870,19 @@ const CW: f32 = W - 2. * M;
 const IX: f32 = M + P;
 const IW: f32 = CW - 2. * P;
 fn label(c: &mut Canvas, f: &Fonts, s: &str, x: f32, y: f32, size: f32, col: Rgba, w: f32) {
-    c.text(f, s, x, y, sans(size, w), col, A::L);
+    let title_icon = match s {
+        "Context" => Some(Icon::Gauge),
+        "Quotas" => Some(Icon::Hourglass),
+        "Where the work stands" | "This session" => Some(Icon::ScrollText),
+        _ => None,
+    };
+    let x = if let Some(glyph) = title_icon {
+        c.icon(f, glyph, x, y, 14., size, col);
+        x + 14. + 6.
+    } else {
+        x
+    };
+    c.text(f, &icons::line(s), x, y, sans(size, w), col, A::L);
 }
 fn panel(c: &mut Canvas, y: f32, h: f32, t: &Tokens) {
     c.glass(
@@ -900,7 +913,7 @@ fn single(
     t: &Tokens,
 ) {
     let st = sans(size, t.regular);
-    let s = f.fit(s, st, width);
+    let s = f.fit(&icons::line(s), st, width);
     c.text(f, &s, x, y, st, col, A::L);
 }
 
@@ -1270,26 +1283,15 @@ pub fn draw(
             t.bold,
         );
     }
-    canvas.circle(W - 54., y + P + 2., 15., t.chip);
-    canvas.text(
+    canvas.icon(
         f,
-        "☾",
-        W - 54.,
-        y + P + 8.,
-        sans(18., t.medium),
+        if c.offer { Icon::Moon } else { Icon::MoonStar },
+        W - M - P - 18.,
+        y + P,
+        18.,
+        13.,
         t.dream,
-        A::M,
     );
-    let (left, total) = c.dream.allowance;
-    if total > 0 {
-        canvas.dots(W - 54., y + P + 2., 21., total.min(24), 1.5, &|i| {
-            if i < left {
-                t.dream
-            } else {
-                t.band
-            }
-        });
-    }
     let mut b = y + P + 24. + f.cap(qs);
     for line in &question {
         canvas.text(f, line, IX, b, qs, t.ink, A::L);
@@ -1391,7 +1393,7 @@ pub fn draw(
         let mut x = IX;
         for (label, answer) in [
             ("1 ✓ helpful", "helpful"),
-            ("2 = thought of it", "thought_of_it"),
+            ("2 \u{e1c2} thought of it", "thought_of_it"),
             ("3 ✗ not relevant", "not_relevant"),
             ("4 → ask Claude", "ask_claude"),
         ] {
@@ -1439,7 +1441,12 @@ pub fn draw(
     for line in extra_lines {
         let (title, body) = line.split_once(": ").unwrap_or((&line, ""));
         let st = sans(11.5, t.regular);
-        let title = format!("{title}:");
+        let marker = if title.starts_with("Confusing") {
+            Icon::CircleHelp
+        } else {
+            Icon::Sparkles
+        };
+        let title = format!("{} {title}:", marker.glyph());
         // Measure the label at its actual weight, then add one body-space advance.
         let tw = f.width(&title, sans(11.5, t.medium)) + f.width(" ", st);
         label(&mut canvas, f, &title, IX, b, 11.5, t.dream, t.medium);
@@ -1683,13 +1690,14 @@ pub fn draw(
         {
             let is_stalled = agents::stalled(a, c.now);
             stalled += usize::from(is_stalled);
-            canvas.ring(
+            canvas.icon(
+                f,
+                Icon::Bot,
                 x,
-                y + 26.,
-                8.,
-                t.ring,
-                t.track,
-                &[(0., 0.86, if is_stalled { t.amber } else { t.mint })],
+                y + 30.,
+                14.,
+                11.5,
+                if is_stalled { t.amber } else { t.mint },
             );
             x += 27.;
         }
@@ -1920,8 +1928,8 @@ fn figure(
     }
     if let Some((line, sev)) = csr_status(g) {
         let col = if sev == "red" { t.risk } else { t.amber };
-        c.circle(IX + 87., y + P - 4., 2.5, col);
-        single(c, f, &line, IX + 95., y + P, 230., 10., t.quiet, t);
+        c.icon(f, Icon::CircleAlert, IX + 87., y + P, 12., 10., col);
+        single(c, f, &line, IX + 105., y + P, 220., 10., t.quiet, t);
     }
     let mut expanded_chart_bottom = y + 195.;
     if let (Some(n), Some(size)) = (tokens, size) {
@@ -2224,7 +2232,7 @@ fn figure(
         );
         c.text(
             f,
-            "Codex 7D",
+            "\u{e181} Codex 7D",
             x,
             sat_cy + 46.,
             sans(10., t.medium),
@@ -2323,8 +2331,8 @@ fn draw_context_mid(
     label(c, f, "Context", IX, y + P, 13., t.ink, t.bold);
     if let Some((line, sev)) = csr_status(g) {
         let col = if sev == "red" { t.risk } else { t.amber };
-        c.circle(IX + 87., y + P - 4., 2.5, col);
-        single(c, f, &line, IX + 95., y + P, 230., 10., t.quiet, t);
+        c.icon(f, Icon::CircleAlert, IX + 87., y + P, 12., 10., col);
+        single(c, f, &line, IX + 105., y + P, 220., 10., t.quiet, t);
     }
     let (Some(n), Some(size)) = (tokens, size) else {
         return (None, None, None, None, None);
@@ -2522,7 +2530,7 @@ fn draw_context_mid(
         );
         c.text(
             f,
-            "Codex 7D",
+            "\u{e181} Codex 7D",
             x,
             gauge_label_y,
             sans(9., t.medium),
