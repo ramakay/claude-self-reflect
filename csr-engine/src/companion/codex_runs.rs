@@ -120,6 +120,8 @@ struct Run {
     tokens: Option<u64>,
     /// (record time, percent, resets_at or None)
     week: Option<(f64, f64, Option<f64>)>,
+    /// The scan's budget ran out before the end of the file.
+    behind: bool,
 }
 impl Run {
     fn take(&mut self, record: &Value) {
@@ -261,6 +263,7 @@ impl CodexRolloutIndex {
         if info.len() != run.offset && *budget > 0 {
             read_lines(path, &mut run, budget);
         }
+        run.behind = *budget == 0 && run.offset < info.len();
         self.runs.insert(path.to_path_buf(), run);
     }
     /// Scan, at most every `EVERY` seconds; the runs seen, and the week.
@@ -328,7 +331,18 @@ impl CodexRolloutIndex {
             })
             .collect();
         let mut week: Option<(f64, f64, Option<f64>)> = None;
-        for reading in self.runs.values().filter_map(|run| run.week) {
+        // a newest file read in part holds an older reading than its end: the gauge would climb
+        // a scan at a time, and each step repaints the pane's whole picture
+        let newest = self
+            .runs
+            .values()
+            .max_by(|a, b| a.mtime.total_cmp(&b.mtime));
+        let readings = if newest.is_some_and(|run| run.behind) {
+            vec![]
+        } else {
+            self.runs.values().filter_map(|run| run.week).collect()
+        };
+        for reading in readings {
             if week.is_none_or(|w| reading.0 > w.0) {
                 week = Some(reading);
             }
@@ -665,6 +679,29 @@ mod tests {
         }
         assert_eq!(index.runs[&mid].offset, fs::metadata(&mid).unwrap().len());
         assert_eq!(index.runs[&mid].identity.as_deref(), Some("run-mid"));
+    }
+    #[test]
+    fn test_the_week_waits_until_the_newest_file_is_read_through() {
+        let d = tempfile::tempdir().unwrap();
+        let [new, _mid, _old] = three(d.path());
+        // the meta line and the first reading (39%) of the newest file
+        let text = fs::read_to_string(&new).unwrap();
+        let two = text
+            .split_inclusive('\n')
+            .take(2)
+            .map(str::len)
+            .sum::<usize>();
+        let mut index = CodexRolloutIndex::with_budget(d.path(), two as u64);
+        // part of the newest file holds an older reading: showing it would climb a scan at a time
+        assert!(index.refresh(NOW)["week"].is_null());
+        assert!(index.runs[&new].offset < fs::metadata(&new).unwrap().len());
+        let mut now = NOW;
+        let mut last = Value::Null;
+        for _ in 0..12 {
+            now += 2.5;
+            last = index.refresh(now);
+        }
+        assert_eq!(last["week"]["percent"], 41.);
     }
     #[test]
     fn test_a_file_with_nothing_new_costs_no_budget() {
