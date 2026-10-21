@@ -311,6 +311,21 @@ fn stamp(path: &Path) -> io::Result<Stamp> {
         identity: (m.dev(), m.ino()),
     })
 }
+/// The file that points the pane at a development build: one line, the path of a csr-engine
+/// binary. While it names an executable file the pane runs that binary and reloads on every
+/// rebuild; once it is gone the pane goes back to the engine it was started with.
+pub const ENGINE_OVERRIDE: &str = "pane-engine";
+/// The engine a pane was started with, carried across an exec into an override build so that
+/// removing the override can bring the pane home.
+const HOME_ENGINE: &str = "CSR_PANE_HOME_ENGINE";
+/// Which binary the pane should be running: the override when it names a file, else home.
+fn engine_target(keep: &Path, home: &Path) -> PathBuf {
+    fs::read_to_string(keep.join(ENGINE_OVERRIDE))
+        .ok()
+        .map(|text| PathBuf::from(text.trim()))
+        .filter(|path| path.is_absolute() && path.is_file())
+        .unwrap_or_else(|| home.to_path_buf())
+}
 struct Reload {
     loaded: Option<Stamp>,
     observed: Option<Stamp>,
@@ -323,6 +338,16 @@ impl Reload {
         Self {
             loaded,
             observed: loaded,
+            since: now,
+            attempted: false,
+        }
+    }
+    /// Watch a different binary than the one this process runs: the first stable, probed look
+    /// at it reloads.
+    fn switch(path: &Path, now: Instant) -> Self {
+        Self {
+            loaded: None,
+            observed: stamp(path).ok(),
             since: now,
             attempted: false,
         }
@@ -394,8 +419,17 @@ fn recover_terminal(
     Ok(())
 }
 pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
-    let exe = std::env::current_exe()?;
-    let mut reload = Reload::new(&exe, Instant::now());
+    let running = std::env::current_exe()?;
+    let home = std::env::var_os(HOME_ENGINE)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| running.clone());
+    let mut exe = engine_target(&paths.keep, &home);
+    let mut reload = if exe == running {
+        Reload::new(&exe, Instant::now())
+    } else {
+        Reload::switch(&exe, Instant::now())
+    };
+    let mut looked = Instant::now();
     let mut reload_error = None;
     let epoch = Arc::new(AtomicUsize::new(0));
     let panics = epoch.clone();
@@ -445,6 +479,18 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                 restart_due = None;
             }
             let force = restart_due.is_some_and(|due| Instant::now() >= due);
+            if looked.elapsed() >= Duration::from_secs(1) {
+                looked = Instant::now();
+                let target = engine_target(&paths.keep, &home);
+                if target != exe {
+                    reload = if target == running {
+                        Reload::new(&target, looked)
+                    } else {
+                        Reload::switch(&target, looked)
+                    };
+                    exe = target;
+                }
+            }
             match reload.poll(&exe, Instant::now(), force) {
                 Ok(true) => {
                     if stopping() {
@@ -455,6 +501,7 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                         || {
                             std::process::Command::new(&exe)
                                 .args(std::env::args_os().skip(1))
+                                .env(HOME_ENGINE, &home)
                                 .exec()
                         },
                         || terminal.resume(),
@@ -694,6 +741,44 @@ mod reload_regressions {
             .unwrap());
         assert!(reload
             .poll(&path, now + Duration::from_secs(4), false)
+            .unwrap());
+    }
+    #[test]
+    fn the_override_file_points_the_pane_at_a_build_and_its_removal_brings_it_home() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("installed");
+        let dev = d.path().join("dev");
+        script(&dev, "#!/bin/sh\nprintf 'csr-engine-companion 1.0\\n'\n");
+        assert_eq!(engine_target(d.path(), &home), home);
+        // A relative path, or one that is not a file, is ignored.
+        fs::write(d.path().join(ENGINE_OVERRIDE), "dev\n").unwrap();
+        assert_eq!(engine_target(d.path(), &home), home);
+        fs::write(
+            d.path().join(ENGINE_OVERRIDE),
+            format!("{}\n", d.path().display()),
+        )
+        .unwrap();
+        assert_eq!(engine_target(d.path(), &home), home);
+        fs::write(
+            d.path().join(ENGINE_OVERRIDE),
+            format!("{}\n", dev.display()),
+        )
+        .unwrap();
+        assert_eq!(engine_target(d.path(), &home), dev);
+        fs::remove_file(d.path().join(ENGINE_OVERRIDE)).unwrap();
+        assert_eq!(engine_target(d.path(), &home), home);
+    }
+    #[test]
+    fn switching_to_another_binary_reloads_once_it_is_stable_and_probed() {
+        let d = tempfile::tempdir().unwrap();
+        let dev = d.path().join("dev");
+        script(&dev, "#!/bin/sh\nprintf 'csr-engine-companion 1.0\\n'\n");
+        let now = Instant::now();
+        let mut reload = Reload::switch(&dev, now);
+        assert!(!reload.settled());
+        assert!(!reload.poll(&dev, now, false).unwrap());
+        assert!(reload
+            .poll(&dev, now + Duration::from_secs(1), false)
             .unwrap());
     }
     #[test]
