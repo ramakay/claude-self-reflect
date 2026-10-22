@@ -100,10 +100,17 @@ pub fn keyword_chunk_hits(
     let searches = match family_projects {
         Some(mut projects) => {
             projects.sort_unstable();
-            projects
-                .into_iter()
-                .map(|project| storage.fts5_search(query, fetch, Some(project)))
-                .collect::<Vec<_>>()
+            projects.dedup();
+            // One ranking pass for the whole family; a failure falls back to
+            // the search per project, where a failing project contributes
+            // nothing and the others still answer.
+            match storage.fts5_search_projects(query, fetch, &projects) {
+                Ok(windows) => windows.into_iter().map(Ok).collect::<Vec<_>>(),
+                Err(_) => projects
+                    .into_iter()
+                    .map(|project| storage.fts5_search(query, fetch, Some(project)))
+                    .collect::<Vec<_>>(),
+            }
         }
         None => vec![storage.fts5_search(query, fetch, None)],
     };

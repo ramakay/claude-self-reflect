@@ -927,6 +927,18 @@ impl Storage {
         queries::fts5_search(&conn, query, limit, project)
     }
 
+    /// [`Self::fts5_search`] for several projects with ONE ranking pass; see
+    /// `queries::fts5_search_projects`.
+    pub fn fts5_search_projects(
+        &self,
+        query: &str,
+        limit: usize,
+        projects: &[&str],
+    ) -> Result<Vec<Vec<(ConversationChunk, usize, f64)>>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::fts5_search_projects(&conn, query, limit, projects)
+    }
+
     /// [`Self::fts5_search`] for a ready-made FTS5 match expression.
     pub fn fts5_search_expr(
         &self,

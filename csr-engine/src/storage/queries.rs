@@ -2213,6 +2213,87 @@ pub fn fts5_search_expr(
     fts5_search_matched(conn, fts_query, limit, project, None)
 }
 
+/// [`fts5_search`] for several projects at once: one entry per element of
+/// `projects` (same order), each exactly what `fts5_search(query, limit,
+/// Some(project))` returns for it.
+///
+/// A project-scoped FTS5 search ranks EVERY row the match expression selects
+/// (the project test sits in the join, after the `ORDER BY rank` sort), so a
+/// search per project repeats that whole ranking once per project. This ranks
+/// once, walks the ranked rows keeping the first `limit` of each project, and
+/// stops when every project is full. Only the rows kept are read whole.
+pub fn fts5_search_projects(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    projects: &[&str],
+) -> Result<Vec<Vec<(ConversationChunk, usize, f64)>>> {
+    let mut out: Vec<Vec<(ConversationChunk, usize, f64)>> = vec![Vec::new(); projects.len()];
+    let Some(fts_query) = fts5_match_expr(query) else {
+        return Ok(out);
+    };
+    if limit == 0 || projects.is_empty() {
+        return Ok(out);
+    }
+    if projects.contains(&"all") {
+        anyhow::bail!("`all` is the unscoped search, not a project");
+    }
+    let wanted = serde_json::to_string(projects)?;
+    // (rowid, bm25) of the kept rows, per project, best first.
+    let mut kept: Vec<Vec<(i64, f64)>> = vec![Vec::new(); projects.len()];
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT c.rowid, c.project_name, bm25(chunks_fts)
+             FROM chunks c
+             JOIN chunks_fts fts ON fts.rowid = c.rowid
+             WHERE chunks_fts MATCH ?1
+               AND c.project_name IN (SELECT value FROM json_each(?2))
+             ORDER BY fts.rank",
+        )?;
+        let mut rows = stmt.query(params![fts_query, wanted])?;
+        let mut open = projects.len();
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            let Some(slot) = projects.iter().position(|p| *p == name) else {
+                continue;
+            };
+            if kept[slot].len() >= limit {
+                continue;
+            }
+            kept[slot].push((row.get(0)?, row.get(2)?));
+            if kept[slot].len() == limit {
+                open -= 1;
+                if open == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    let rowids: Vec<i64> = kept.iter().flatten().map(|(rowid, _)| *rowid).collect();
+    if rowids.is_empty() {
+        return Ok(out);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count,
+                c.summary, c.is_sidechain, c.rowid
+         FROM chunks c
+         WHERE c.rowid IN (SELECT value FROM json_each(?1))",
+    )?;
+    let by_rowid: std::collections::HashMap<i64, ConversationChunk> = stmt
+        .query_map([serde_json::to_string(&rowids)?], |row| {
+            Ok((row.get::<_, i64>(8)?, row_to_chunk(row)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (slot, hits) in kept.into_iter().enumerate() {
+        for (ordinal, (rowid, bm25)) in hits.into_iter().enumerate() {
+            if let Some(chunk) = by_rowid.get(&rowid).cloned() {
+                out[slot].push((chunk, ordinal, bm25));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn fts5_search_matched(
     conn: &Connection,
     fts_query: &str,
@@ -6102,6 +6183,47 @@ mod tests {
             hits[0].2 <= hits[1].2,
             "FTS5 bm25 order must be ascending: {hits:?}"
         );
+    }
+
+    /// One ranking pass over several projects must hand each project exactly
+    /// the window a search of that project alone returns: same rows, order,
+    /// ordinals and bm25, with the cut at `limit` per project.
+    #[test]
+    fn fts5_search_projects_equals_one_search_per_project() {
+        let conn = mem();
+        for i in 0..14 {
+            let project = ["alpha", "beta", "gamma"][i % 3];
+            let mut chunk = test_chunk(
+                &format!("c{i:02}"),
+                &format!("needle {} {}", "needle ".repeat(i % 5), "filler ".repeat(i)),
+            );
+            chunk.project_name = project.into();
+            insert_chunk(&conn, &chunk, &[0.1; 4]).unwrap();
+        }
+        let mut other = test_chunk("zz", "needle needle needle needle needle");
+        other.project_name = "outsider".into();
+        insert_chunk(&conn, &other, &[0.1; 4]).unwrap();
+
+        for limit in [1, 3, 5, 50] {
+            let projects = ["alpha", "beta", "gamma", "absent"];
+            let together = fts5_search_projects(&conn, "needle filler", limit, &projects).unwrap();
+            assert_eq!(together.len(), projects.len());
+            for (project, window) in projects.iter().zip(&together) {
+                let alone = fts5_search(&conn, "needle filler", limit, Some(project)).unwrap();
+                let shape = |hits: &[(ConversationChunk, usize, f64)]| {
+                    hits.iter()
+                        .map(|(chunk, ordinal, bm25)| (chunk.id.clone(), *ordinal, *bm25))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(shape(window), shape(&alone), "{project} at limit {limit}");
+                assert!(window.iter().all(|(c, _, _)| c.project_name == *project));
+            }
+        }
+        assert!(fts5_search_projects(&conn, "needle", 5, &["all"]).is_err());
+        assert!(fts5_search_projects(&conn, "x", 5, &["alpha"])
+            .unwrap()
+            .iter()
+            .all(Vec::is_empty));
     }
 
     #[test]
