@@ -972,6 +972,24 @@ pub fn run(conn: &Connection) -> Result<()> {
          );",
     )?;
 
+    // Migration: files a PostToolUse hook could not extract inside its write
+    // budget. The hook queues the file here (and bumps its `graph_gen`, so the
+    // drain also resolves the project); the drain extracts it before resolving.
+    // `seq` is the file's `graph_gen` at queue time: an extraction takes its
+    // queue entry by `seq`, so a newer extraction is never overwritten by an
+    // older one.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS code_graph_extract_queue (
+             project    TEXT NOT NULL,
+             file       TEXT NOT NULL,
+             read_path  TEXT NOT NULL,
+             conv_id    TEXT NOT NULL DEFAULT '',
+             session_id TEXT NOT NULL DEFAULT '',
+             seq        INTEGER NOT NULL,
+             PRIMARY KEY (project, file)
+         );",
+    )?;
+
     // Migration: add project_name to code_evolution if missing (v9 cross-project fix)
     {
         let has_project_col: bool = conn

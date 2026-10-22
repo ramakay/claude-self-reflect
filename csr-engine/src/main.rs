@@ -1849,6 +1849,7 @@ async fn run(
                 serde_json::json!({
                 "drained": true,
                 "projects": drain.projects,
+                "extracted": drain.extracted,
                 "files": drain.files,
                 "edge_writes": drain.edge_writes,
                 "rank_writes": drain.rank_writes,

@@ -482,6 +482,98 @@ pub struct Extraction<'a> {
     /// Only a clean parse may retire nodes and replace edges; `None` for a
     /// partial parse, which must leave both alone.
     pub edges: Option<&'a [EdgeRow]>,
+    /// The extract-queue entry (`seq`) this extraction answers. `None` for a
+    /// fresh edit, which supersedes any queue entry for the file.
+    pub claim: Option<i64>,
+}
+
+/// A file waiting to be extracted by the drain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedExtraction {
+    pub project: String,
+    pub file: String,
+    pub read_path: String,
+    pub conv_id: String,
+    pub session_id: String,
+    pub seq: i64,
+}
+
+/// Queue `file` for extraction by the drain and bump its `graph_gen`, in one
+/// transaction: a hook that ran out of budget calls this instead of extracting.
+/// A later queue call replaces the entry (newer `seq`).
+pub fn queue_extraction(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    read_path: &str,
+    conv_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    in_tx(conn, |tx| {
+        tx.execute(
+            "INSERT INTO code_graph_file_state
+                (project, file, dirty, extracted_at, ast_status, graph_gen)
+             VALUES (?1, ?2, 0, datetime('now'), 'supported', 1)
+             ON CONFLICT(project, file) DO UPDATE SET graph_gen = graph_gen + 1",
+            params![project, file],
+        )?;
+        let seq: i64 = tx.query_row(
+            "SELECT graph_gen FROM code_graph_file_state WHERE project = ?1 AND file = ?2",
+            params![project, file],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO code_graph_extract_queue
+                (project, file, read_path, conv_id, session_id, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![project, file, read_path, conv_id, session_id, seq],
+        )?;
+        bump_project_gen(tx, project)
+    })
+}
+
+/// Files queued for extraction, oldest first.
+pub fn queued_extractions(conn: &Connection) -> Result<Vec<QueuedExtraction>> {
+    let mut stmt = conn.prepare(
+        "SELECT project, file, read_path, conv_id, session_id, seq
+         FROM code_graph_extract_queue ORDER BY project, seq",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(QueuedExtraction {
+            project: r.get(0)?,
+            file: r.get(1)?,
+            read_path: r.get(2)?,
+            conv_id: r.get(3)?,
+            session_id: r.get(4)?,
+            seq: r.get(5)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Whether any file waits to be extracted.
+pub fn has_queued_extractions(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM code_graph_extract_queue)",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// Drop a queue entry whose file cannot be read any more (deleted); the bumped
+/// `graph_gen` still gets the project resolved. Only the entry at `seq`.
+pub fn drop_queued_extraction(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    seq: i64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM code_graph_extract_queue WHERE project = ?1 AND file = ?2 AND seq = ?3",
+        params![project, file, seq],
+    )?;
+    Ok(())
 }
 
 /// Store an extraction in ONE transaction: node upserts, retirement of the
@@ -489,8 +581,28 @@ pub struct Extraction<'a> {
 /// bump that queues the project-wide resolve. A process killed anywhere in it
 /// leaves the graph as it was before; there is no state with new edges and an
 /// unchanged generation.
-pub fn store_extraction(conn: &Connection, x: &Extraction<'_>) -> Result<()> {
+///
+/// Returns `false`, storing nothing, when `x.claim` names a queue entry that is
+/// gone or replaced: a newer extraction of the file got there first.
+pub fn store_extraction(conn: &Connection, x: &Extraction<'_>) -> Result<bool> {
     in_tx(conn, |tx| {
+        let taken = match x.claim {
+            Some(seq) => tx.execute(
+                "DELETE FROM code_graph_extract_queue
+                 WHERE project = ?1 AND file = ?2 AND seq = ?3",
+                params![x.project, x.file, seq],
+            )?,
+            None => {
+                tx.execute(
+                    "DELETE FROM code_graph_extract_queue WHERE project = ?1 AND file = ?2",
+                    params![x.project, x.file],
+                )?;
+                1
+            }
+        };
+        if taken == 0 {
+            return Ok(false);
+        }
         for node in x.nodes {
             let changed =
                 get_node(tx, &node.id)?.is_none_or(|stored| stored.body_hash != node.body_hash);
@@ -506,7 +618,8 @@ pub fn store_extraction(conn: &Connection, x: &Extraction<'_>) -> Result<()> {
             retire_missing_nodes(tx, x.project, x.file, &seen)?;
             replace_file_edges(tx, x.project, x.file, edges)?;
         }
-        upsert_file_state_pending(tx, x.project, x.file, x.content_hash)
+        upsert_file_state_pending(tx, x.project, x.file, x.content_hash)?;
+        Ok(true)
     })
 }
 

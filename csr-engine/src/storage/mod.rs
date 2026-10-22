@@ -2306,9 +2306,15 @@ impl Storage {
     }
 
     /// Store one file's extraction atomically. See `codegraph::store_extraction`.
-    pub fn store_code_extraction(&self, x: &codegraph::Extraction<'_>) -> Result<()> {
+    pub fn store_code_extraction(&self, x: &codegraph::Extraction<'_>) -> Result<bool> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         codegraph::store_extraction(&conn, x)
+    }
+
+    /// Whether a hook left any file for the drain to extract.
+    pub fn has_queued_code_extractions(&self) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::has_queued_extractions(&conn)
     }
 
     /// Files an extraction changed that no resolve has covered yet.

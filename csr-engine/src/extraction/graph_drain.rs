@@ -101,6 +101,9 @@ pub fn another_drainer_is_live(storage: &Storage, own: &str) -> bool {
 pub struct GraphDrain {
     /// Projects resolved and ranked.
     pub projects: usize,
+    /// Files the hook queued for extraction (out of write budget) that this
+    /// pass extracted.
+    pub extracted: usize,
     /// Files settled (not extracted again during the pass).
     pub files: usize,
     /// Edge writes the pass made.
@@ -157,7 +160,10 @@ pub fn drain_outcome(storage: &Storage, db_path: &Path) -> Result<Outcome> {
 }
 
 fn drain_unrecorded(storage: &Storage, db_path: &Path) -> Result<Outcome> {
-    if storage.pending_resolve_files()?.is_empty() {
+    // A queued extraction counts although its file may read as settled: the
+    // resolve of an earlier pass can have covered the generation the queue bumped
+    // before the extraction itself succeeded.
+    if storage.pending_resolve_files()?.is_empty() && !storage.has_queued_code_extractions()? {
         return Ok(Outcome::Idle);
     }
     let data_dir = db_path.parent().unwrap_or(Path::new("."));
@@ -235,6 +241,9 @@ pub fn drain_with(
 ) -> Result<GraphDrain> {
     let started = Instant::now();
     let mut out = GraphDrain::default();
+    // Files a hook ran out of budget for are extracted first: they bump their
+    // `graph_gen`, so the resolve below covers them.
+    extract_queued(conn, &mut out)?;
     let pending = codegraph::pending_resolve_files(conn)?;
     let mut projects: Vec<&str> = pending.iter().map(|(p, _, _)| p.as_str()).collect();
     projects.dedup();
@@ -252,6 +261,37 @@ pub fn drain_with(
     }
     out.elapsed = started.elapsed();
     Ok(out)
+}
+
+/// Extract the files PostToolUse queued instead of extracting (its write budget
+/// was spent). Each is claimed by its queue `seq`, so a newer extraction of the
+/// same file (the next edit) is never overwritten by this older read. A file
+/// that cannot be read any more is dropped from the queue; its `graph_gen` was
+/// bumped at queue time, so the project is still resolved. A failure leaves the
+/// entry queued for the next pass and is reported with the project's errors.
+fn extract_queued(conn: &Connection, out: &mut GraphDrain) -> Result<()> {
+    use super::file_extract::{extract_and_store, Extracted, Job};
+    for q in codegraph::queued_extractions(conn)? {
+        let job = Job {
+            project: &q.project,
+            read_path: &q.read_path,
+            stored_path: &q.file,
+            conv_id: &q.conv_id,
+            session_id: &q.session_id,
+            claim: Some(q.seq),
+        };
+        match extract_and_store(conn, &job) {
+            Ok(Extracted::Stored { .. }) => out.extracted += 1,
+            // Nothing readable to store, or a newer extraction took the entry.
+            Ok(Extracted::Skipped) => {
+                codegraph::drop_queued_extraction(conn, &q.project, &q.file, q.seq)?
+            }
+            Err(e) => out
+                .errors
+                .push((q.project.clone(), format!("extract {}: {e:#}", q.file))),
+        }
+    }
+    Ok(())
 }
 
 /// One project: resolve, then rank, then settle `files`.
@@ -628,6 +668,7 @@ mod tests {
             nodes: &nodes,
             source_chunk_id: None,
             edges: Some(&[]),
+            claim: None,
         })
         .unwrap();
     }

@@ -3062,6 +3062,7 @@ pub async fn graph_drain_tick(storage: Arc<Storage>, db_path: PathBuf, role: Dra
             }
             tracing::info!(
                 projects = drain.projects,
+                extracted = drain.extracted,
                 files = drain.files,
                 edge_writes = drain.edge_writes,
                 rank_writes = drain.rank_writes,

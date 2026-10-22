@@ -99,7 +99,22 @@ pub fn exits_before_engine(hook_name: &str, input: &HookInput) -> bool {
 /// Handle the post-tool-use hook.
 /// Always returns Ok(()) to never block Claude Code (C-2 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<()> {
-    let deadline = Instant::now() + WRITE_BUDGET;
+    handle_with(input, engine, WRITE_BUDGET, resolve_project_for_hook).await
+}
+
+/// How long the last-gasp queue write may wait for the write lock once the
+/// budget is spent. Short: it is one small transaction, and the alternative is
+/// to lose the file from the graph.
+const QUEUE_GRACE: Duration = Duration::from_millis(250);
+
+/// [`handle`] with the write budget and the project resolver passed in.
+async fn handle_with(
+    input: &HookInput,
+    engine: &Engine,
+    budget: Duration,
+    resolve: impl Fn(Option<&Path>, Option<&str>) -> String + Copy,
+) -> Result<()> {
+    let deadline = Instant::now() + budget;
     let bash_files = bash_written_files(input);
     if input.tool_name.as_deref() == Some("Bash") && bash_files.is_empty() {
         return Ok(());
@@ -124,7 +139,7 @@ pub async fn handle(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<(
             .map(|f| f.to_string_lossy().into_owned())
             .collect()
     };
-    for file_path in &touched {
+    for (i, file_path) in touched.iter().enumerate() {
         // Code map freshness: enqueue only, the daemon does the work. One
         // INSERT, no parse, no git; a failure (missing table, locked db) is
         // logged and never reaches Claude Code.
@@ -134,27 +149,66 @@ pub async fn handle(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<(
         // The enqueue put the storage default back; the writes below wait only
         // as long as the budget has left.
         if !clamp_write_wait(engine, deadline) {
-            eprintln!("CSR: write budget spent, left to the code map queue (non-fatal)");
+            eprintln!("CSR: write budget spent, graph left to the drain (non-fatal)");
+            queue_graph_extractions(input, engine, &touched[i..], resolve);
             break;
         }
-        if let Err(e) =
-            track_code_evolution_for(input, engine, file_path, resolve_project_for_hook).await
-        {
+        if let Err(e) = track_code_evolution_for(input, engine, file_path, resolve).await {
             eprintln!("CSR: code evolution tracking error (non-fatal): {}", e);
         }
         // v9.4 liveness path: re-extract the touched file into the code graph so
         // callers/callees/ledger reflect the edit immediately (edges as
         // `name:` placeholders, which those queries read; the daemon binds them).
         if !clamp_write_wait(engine, deadline) {
-            eprintln!("CSR: write budget spent, graph update skipped (non-fatal)");
+            eprintln!("CSR: write budget spent, graph left to the drain (non-fatal)");
+            queue_graph_extractions(input, engine, &touched[i..], resolve);
             break;
         }
-        if let Err(e) = update_code_graph_for(input, engine, file_path, resolve_project_for_hook) {
+        if let Err(e) = update_code_graph_for(input, engine, file_path, resolve) {
             eprintln!("CSR: code graph update error (non-fatal): {}", e);
         }
     }
 
     Ok(())
+}
+
+/// Leave these files' graph extraction to the drain: the budget is spent, so
+/// each is queued (`codegraph::queue_extraction`, which also bumps its
+/// `graph_gen`) instead of extracted. The code map queue does not cover this:
+/// it rescans separate `codemap_*` tables, never `code_nodes`/`code_edges`. One
+/// small write per file under [`QUEUE_GRACE`]; a failure is logged, and the next
+/// edit of the file extracts it anyway.
+fn queue_graph_extractions(
+    input: &HookInput,
+    engine: &Engine,
+    files: &[String],
+    resolve: impl Fn(Option<&Path>, Option<&str>) -> String,
+) {
+    let _ = engine
+        .storage()
+        .with_connection(|conn| conn.busy_timeout(QUEUE_GRACE).map_err(Into::into));
+    let conv_id = conv_id_for(input);
+    let session_id = input.session_id.clone().unwrap_or_default();
+    for file_path in files {
+        let Some((project, stored)) = graph_target(input, file_path, &resolve) else {
+            continue;
+        };
+        if crate::extraction::ast_analysis::lang_from_path_str(file_path).is_none() {
+            continue;
+        }
+        if let Err(e) = engine.storage().with_connection(|conn| {
+            crate::storage::codegraph::queue_extraction(
+                conn,
+                &project,
+                &stored,
+                file_path,
+                &conv_id,
+                &session_id,
+            )
+        }) {
+            eprintln!("CSR: graph extraction not queued (non-fatal): {e}");
+        }
+    }
 }
 
 /// The `file_path` an Edit/Write/MultiEdit sent.
@@ -206,9 +260,6 @@ fn conv_id_for(input: &HookInput) -> String {
     input.session_id.clone().unwrap_or_default()
 }
 
-/// Maximum file size we will re-parse into the code graph (256KB).
-const MAX_GRAPH_FILE_BYTES: u64 = 256 * 1024;
-
 /// Re-extract the edited file into the code graph (v9.4 liveness path).
 /// Reads the on-disk file (post-edit), upserts nodes, replaces this file's edges,
 /// and marks file state, queuing the file for the daemon's project-wide resolve
@@ -240,111 +291,72 @@ fn update_code_graph_for(
     file_path: &str,
     resolve: impl Fn(Option<&Path>, Option<&str>) -> String,
 ) -> Result<()> {
-    // Repo/project identity is derivable from `file_path` alone (no lang
-    // needed), so compute it before the language gate — WP2 Stage 3 (H8
-    // innovation, receipt R4) wants an honest file-level row even for
-    // extensions the extractor doesn't parse, instead of the file vanishing
-    // silently.
-    let project = resolve(Path::new(file_path).parent(), input.cwd.as_deref());
-    // No project, no graph write. `resolve_code_edges("")` and
-    // `compute_code_rank("")` read `''` as EVERY project (`?1 = '' OR project
-    // = ?1`), so a scratch file with no session project would bind a call in
-    // one project to a definition in another and re-rank the whole graph from
-    // inside the hook. A node filed under `''` is no better: no scoped query
-    // would ever find it.
-    if project.is_empty() {
+    let Some((project, stored_path)) = graph_target(input, file_path, &resolve) else {
+        return Ok(());
+    };
+
+    if crate::extraction::ast_analysis::lang_from_path_str(file_path).is_none() {
+        // Unsupported language — record file-level provenance instead of
+        // dropping the file entirely (best-effort; never blocks the hook).
+        if let Err(e) = engine
+            .storage()
+            .mark_code_file_unsupported(&project, &stored_path)
+        {
+            eprintln!("CSR: ast_status=unsupported record error (non-fatal): {e}");
+        }
         return Ok(());
     }
-    let stored_path = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
-    let stored_path_str = stored_path.to_string_lossy();
 
-    let lang = match crate::extraction::ast_analysis::lang_from_path_str(file_path) {
-        Some(l) => l,
-        None => {
-            // Unsupported language — record file-level provenance instead of
-            // dropping the file entirely (best-effort; never blocks the hook).
-            if let Err(e) = engine
-                .storage()
-                .mark_code_file_unsupported(&project, &stored_path_str)
-            {
-                eprintln!("CSR: ast_status=unsupported record error (non-fatal): {e}");
-            }
-            return Ok(());
-        }
-    };
-
-    let meta = std::fs::metadata(file_path);
-    if let Ok(m) = &meta {
-        if m.len() > MAX_GRAPH_FILE_BYTES {
-            return Ok(());
-        }
-    }
     // Read from the original path (worktree-local); store under the canonical
-    // main-repo path so worktree edits do not create duplicate nodes.
-    let source = match std::fs::read_to_string(file_path) {
-        Ok(s) => s,
-        Err(_) => return Ok(()), // file gone/unreadable — skip silently
-    };
-
-    let session_id = input.session_id.clone().unwrap_or_default();
-    let conv_id = conv_id_for(input);
-
-    let fragment = crate::extraction::codegraph::extract_graph_fragment(
-        &source,
-        lang,
-        &stored_path_str,
-        &project,
-        &project,
-        &conv_id,
-        &session_id,
-    );
-
-    // Repo identity (WP2 Stage 1, H8 finding): stable across cwd/session
-    // boundaries, unlike `project` — never overwrites it.
-    let repo_root = crate::extraction::repo_root::repo_root_for_file(&stored_path_str);
-
-    let storage = engine.storage();
-    let source_chunk_id = storage.latest_chunk_id_for_conversation(&conv_id)?;
-    let nodes: Vec<crate::storage::codegraph::NodeRow> = fragment
-        .nodes
-        .iter()
-        .map(|n| {
-            let mut n = n.clone();
-            n.repo_root = repo_root.clone();
-            n
-        })
-        .collect();
-    // Only a CLEAN parse may drive the destructive half. A partial parse still
-    // returns some valid definitions — `extract_graph_fragment` sets
-    // `parse_clean = false` while `nodes` stays non-empty — and treating that
-    // truncated view as authoritative would retire every symbol it failed to
-    // see, taking each one's `code_node_attribution` provenance with it. Files
-    // are routinely observed mid-edit, so this is a common path, not a corner
-    // case. Upserts are additive and safe unconditionally; only retirement and
-    // edge replacement are gated. This is the same signal `eval::codegraph` and
-    // `import::backfill` already gate on.
-    let content_hash = crate::extraction::anchors::hash_normalized(&source);
-    // One transaction: the nodes, the retirement, the edge replacement and the
-    // `graph_gen` bump that queues the project-wide resolve for the drain
-    // (`extraction::graph_drain`). A kill between them can never leave new
+    // main-repo path so worktree edits do not create duplicate nodes. One
+    // transaction for the whole extraction, ending with the `graph_gen` bump
+    // that queues the project-wide resolve for the drain
+    // (`extraction::graph_drain`): a kill between the steps can never leave new
     // edges under a generation the drain already settled.
-    storage.store_code_extraction(&crate::storage::codegraph::Extraction {
-        project: &project,
-        file: &stored_path_str,
-        content_hash: &content_hash,
-        nodes: &nodes,
-        source_chunk_id: source_chunk_id.as_deref(),
-        edges: fragment.parse_clean.then_some(fragment.edges.as_slice()),
+    let conv_id = conv_id_for(input);
+    let session_id = input.session_id.clone().unwrap_or_default();
+    let stored = engine.storage().with_connection(|conn| {
+        crate::extraction::file_extract::extract_and_store(
+            conn,
+            &crate::extraction::file_extract::Job {
+                project: &project,
+                read_path: file_path,
+                stored_path: &stored_path,
+                conv_id: &conv_id,
+                session_id: &session_id,
+                claim: None,
+            },
+        )
     })?;
-
-    eprintln!(
-        "CSR: code graph updated for {} ({} nodes, {} edges)",
-        stored_path_str,
-        fragment.nodes.len(),
-        fragment.edges.len()
-    );
+    if let crate::extraction::file_extract::Extracted::Stored { nodes, edges } = stored {
+        eprintln!("CSR: code graph updated for {stored_path} ({nodes} nodes, {edges} edges)");
+    }
 
     Ok(())
+}
+
+/// The project and canonical stored path a graph write for `file_path` goes
+/// under; `None` when there is no project.
+///
+/// Repo/project identity is derivable from `file_path` alone (no lang needed),
+/// so it is computed before the language gate — WP2 Stage 3 (H8 innovation,
+/// receipt R4) wants an honest file-level row even for extensions the extractor
+/// doesn't parse. No project, no graph write: `resolve_code_edges("")` and
+/// `compute_code_rank("")` read `''` as EVERY project (`?1 = '' OR project =
+/// ?1`), so a scratch file with no session project would bind a call in one
+/// project to a definition in another. A node filed under `''` is no better: no
+/// scoped query would ever find it.
+fn graph_target(
+    input: &HookInput,
+    file_path: &str,
+    resolve: &impl Fn(Option<&Path>, Option<&str>) -> String,
+) -> Option<(String, String)> {
+    let project = resolve(Path::new(file_path).parent(), input.cwd.as_deref());
+    if project.is_empty() {
+        return None;
+    }
+    let stored = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
+    Some((project, stored.to_string_lossy().into_owned()))
 }
 
 /// Paths a file-level presence row must never record: credentials, dependency
@@ -957,6 +969,104 @@ mod tests {
             (queued && edges == ["name:other"]) || (!queued && edges == settled),
             "new edges without a queued resolve: queued={queued} edges={edges:?}"
         );
+    }
+
+    fn count_nodes(storage: &crate::storage::Storage) -> i64 {
+        storage
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM code_nodes WHERE kind = 'function'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_finds_the_budget_spent_is_queued_and_the_drain_extracts_it() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().canonicalize().unwrap().join("late.rs");
+        std::fs::write(&file, "fn caller() { callee(); }\nfn callee() {}\n").unwrap();
+        let input = write_input(&file, Some("/Users/x/projects/my-repo"));
+
+        // No budget at all: the hook skips every graph write it would make.
+        handle_with(&input, &engine, Duration::ZERO, resolve_without_env)
+            .await
+            .unwrap();
+        assert_eq!(count_nodes(&storage), 0, "nothing was extracted");
+        let queued = storage
+            .with_connection(crate::storage::codegraph::queued_extractions)
+            .unwrap();
+        assert_eq!(queued.len(), 1, "the file was left for the drain");
+        assert_eq!(queued[0].project, "my-repo");
+        assert_eq!(queued[0].file, file.to_string_lossy());
+        assert_eq!(storage.pending_resolve_files().unwrap().len(), 1);
+
+        // The drain extracts it, resolves the project and settles the file.
+        let report = storage
+            .with_connection(|c| crate::extraction::graph_drain::drain(c, &|_: &str| true))
+            .unwrap();
+        assert_eq!(report.extracted, 1);
+        assert_eq!(count_nodes(&storage), 2);
+        assert!(storage.pending_resolve_files().unwrap().is_empty());
+        assert!(!storage.has_queued_code_extractions().unwrap());
+        let resolved: i64 = storage
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT COALESCE(SUM(resolved), 0) FROM code_edges WHERE kind = 'calls'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(resolved, 1);
+    }
+
+    #[tokio::test]
+    async fn a_queued_extraction_never_overwrites_a_newer_one() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().canonicalize().unwrap().join("race.rs");
+        std::fs::write(&file, "fn old_name() {}\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        let input = write_input(&file, Some("/Users/x/projects/my-repo"));
+        handle_with(&input, &engine, Duration::ZERO, resolve_without_env)
+            .await
+            .unwrap();
+        let queued = storage
+            .with_connection(crate::storage::codegraph::queued_extractions)
+            .unwrap()
+            .remove(0);
+
+        // The next edit extracts the file in full before the drain gets to it.
+        std::fs::write(&file, "fn new_name() {}\n").unwrap();
+        update_code_graph_for(&input, &engine, &path, resolve_without_env).unwrap();
+        assert!(!storage.has_queued_code_extractions().unwrap());
+
+        // The drain's read of the older queue entry finds it taken.
+        let job = crate::extraction::file_extract::Job {
+            project: &queued.project,
+            read_path: &queued.read_path,
+            stored_path: &queued.file,
+            conv_id: &queued.conv_id,
+            session_id: &queued.session_id,
+            claim: Some(queued.seq),
+        };
+        let outcome = storage
+            .with_connection(|c| crate::extraction::file_extract::extract_and_store(c, &job))
+            .unwrap();
+        assert_eq!(outcome, crate::extraction::file_extract::Extracted::Skipped);
+        let names: Vec<String> = storage
+            .with_connection(|c| {
+                let mut stmt =
+                    c.prepare("SELECT name FROM code_nodes WHERE kind = 'function' ORDER BY name")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(names, vec!["new_name".to_string()]);
     }
 
     #[test]
