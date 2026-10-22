@@ -55,49 +55,92 @@ pub fn classify(path: &str, key: &str) -> Option<Kind> {
     }
 }
 
-/// Where the pane of `sid` listens.
-pub fn pipe_path(keep: &Path, sid: &str) -> Option<PathBuf> {
-    valid_id(sid).then(|| keep.join("panes").join(format!("{sid}.wake")))
+/// Where the pane of `sid` with process id `pid` listens. Every pane has an endpoint of its own,
+/// so a second pane of the same session never takes the first one's.
+pub fn pipe_path(keep: &Path, sid: &str, pid: u32) -> Option<PathBuf> {
+    valid_id(sid).then(|| keep.join("panes").join(format!("{sid}.{pid}.wake")))
 }
 
-/// Tell the pane of `sid`, if one is listening. True when the byte was written; a pane that is
-/// not there, or not reading, or not keeping up, is no error.
+/// The endpoints of the panes of `sid`: `<sid>.<pid>.wake` (an id has no dot, so the name splits
+/// cleanly).
+fn endpoints(keep: &Path, sid: &str) -> Vec<(PathBuf, u32)> {
+    if !valid_id(sid) {
+        return vec![];
+    }
+    fs::read_dir(keep.join("panes"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let pid = name
+                .strip_prefix(sid)?
+                .strip_prefix('.')?
+                .strip_suffix(".wake")?
+                .parse::<u32>()
+                .ok()?;
+            Some((entry.path(), pid))
+        })
+        .collect()
+}
+
+/// Whether no process has this pid. Only used to tidy a pipe up, never to decide who is sent
+/// anything.
+fn gone(pid: u32) -> bool {
+    pid == 0
+        || (unsafe { libc::kill(pid as i32, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+}
+
+/// Tell the panes of `sid`, those that are listening. True when the byte reached at least one;
+/// a pane that is not there, or not reading, or not keeping up, is no error. The pipe of a pane
+/// whose process is gone is removed.
 pub fn notify(keep: &Path, sid: &str, kind: Kind) -> bool {
-    let Some(path) = pipe_path(keep, sid) else {
-        return false;
-    };
-    let Ok(mut pipe) = fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(&path)
-    else {
-        return false;
-    };
-    // Whatever sits at the path, a pipe of ours is the only thing a byte goes to.
-    let ours = pipe
-        .metadata()
-        .is_ok_and(|m| m.file_type().is_fifo() && m.uid() == unsafe { libc::geteuid() });
-    ours && pipe.write_all(&[kind.byte()]).is_ok()
+    let mut sent = false;
+    for (path, pid) in endpoints(keep, sid) {
+        let Ok(mut pipe) = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&path)
+        else {
+            // Nobody reads it: it is a pane's pipe in the moment before it opens it, or a dead
+            // pane's.
+            if gone(pid) && fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_fifo()) {
+                let _ = fs::remove_file(&path);
+            }
+            continue;
+        };
+        // Whatever sits at the path, a pipe of ours is the only thing a byte goes to.
+        let ours = pipe
+            .metadata()
+            .is_ok_and(|m| m.file_type().is_fifo() && m.uid() == unsafe { libc::geteuid() });
+        sent |= ours && pipe.write_all(&[kind.byte()]).is_ok();
+    }
+    sent
 }
 
-/// The pane's end of the pipe. Dropping it removes the pipe, if it is still this one.
+/// The pane's end of its pipe. Dropping it removes the pipe, if it is still this one.
 pub struct Listener {
     path: PathBuf,
     pipe: fs::File,
     id: (u64, u64),
 }
 impl Listener {
-    /// Make the pipe for `sid` and open it for reading, replacing whatever a pane that ended
-    /// badly left there. None for an id that cannot be a file name, or when the system says no.
+    /// Make this process's pipe for `sid` and open it for reading, replacing whatever an earlier
+    /// process of the same pid left. None for an id that cannot be a file name, or when the
+    /// system says no.
     pub fn open(keep: &Path, sid: &str) -> Option<Self> {
-        let path = pipe_path(keep, sid)?;
+        Self::open_as(keep, sid, std::process::id())
+    }
+    fn open_as(keep: &Path, sid: &str, pid: u32) -> Option<Self> {
+        let path = pipe_path(keep, sid, pid)?;
         let _ = fs::remove_file(&path);
         let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
         if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
             return None;
         }
         // O_CLOEXEC is Rust's default: a reload by `exec` closes it and the next process makes
-        // its own.
+        // its own, under the same pid and so the same name.
         let pipe = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -128,7 +171,6 @@ impl Listener {
 }
 impl Drop for Listener {
     fn drop(&mut self) {
-        // A newer pane of the same session has put its own pipe here: leave that one.
         if fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id) {
             let _ = fs::remove_file(&self.path);
         }
@@ -183,6 +225,7 @@ impl Debounce {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn the_hooks_that_change_a_pane_are_told_apart_by_how_soon() {
@@ -263,7 +306,7 @@ mod tests {
         assert!(!notify(d.path(), "s", Kind::Now), "no pipe");
         // A pane that crashed leaves its pipe behind with nobody to read it.
         drop(Listener::open(d.path(), "s").unwrap());
-        let left = pipe_path(d.path(), "s").unwrap();
+        let left = pipe_path(d.path(), "s", std::process::id()).unwrap();
         assert!(!left.exists(), "a pane that ends takes its pipe with it");
         let name = std::ffi::CString::new(left.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
@@ -299,14 +342,46 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_pane_of_the_session_keeps_its_pipe_when_the_older_one_ends() {
+    fn two_panes_of_one_session_each_get_the_wake_and_one_ending_costs_the_other_nothing() {
         let d = tempfile::tempdir().unwrap();
         fs::create_dir_all(d.path().join("panes")).unwrap();
-        let older = Listener::open(d.path(), "s").unwrap();
-        let mut newer = Listener::open(d.path(), "s").unwrap();
-        drop(older);
+        let mut older = Listener::open_as(d.path(), "s", 1_000_001).unwrap();
+        let mut newer = Listener::open_as(d.path(), "s", 1_000_002).unwrap();
+        let mut other = Listener::open_as(d.path(), "t", 1_000_003).unwrap();
         assert!(notify(d.path(), "s", Kind::Now));
+        assert_eq!(older.take(), (true, false), "the first pane still listens");
         assert_eq!(newer.take(), (true, false));
+        assert_eq!(other.take(), (false, false), "another session's pane");
+        let older_pipe = pipe_path(d.path(), "s", 1_000_001).unwrap();
+        drop(older);
+        assert!(!older_pipe.exists());
+        assert!(notify(d.path(), "s", Kind::Burst));
+        assert_eq!(newer.take(), (false, true), "the newer pane goes on");
+        drop(newer);
+        assert!(!notify(d.path(), "s", Kind::Now), "nobody left");
+    }
+
+    #[test]
+    fn the_pipe_of_a_process_that_is_gone_is_removed_and_a_live_ones_is_not() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("panes")).unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let make = |pid: u32| {
+            let path = pipe_path(d.path(), "s", pid).unwrap();
+            let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            path
+        };
+        let left = make(dead);
+        let alive = make(std::process::id());
+        assert!(!notify(d.path(), "s", Kind::Now));
+        assert!(!left.exists(), "a dead pane's pipe is tidied away");
+        assert!(
+            alive.exists(),
+            "a live process may be about to read its own"
+        );
     }
 
     #[test]

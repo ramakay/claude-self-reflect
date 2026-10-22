@@ -363,7 +363,9 @@ fn terminal_session(reload: bool) {
     let kept: serde_json::Value = serde_json::from_slice(&fs::read(&pid).unwrap()).unwrap();
     assert_eq!(kept["pid"], child_guard.0.id());
     // The pane listens at a pipe of its own; the relay trusts no pid.
-    let wakes = paths.keep.join("panes/sess-now.wake");
+    let wakes = paths
+        .keep
+        .join(format!("panes/sess-now.{}.wake", child_guard.0.id()));
     assert!(
         wakes.exists(),
         "the pane keeps a pipe for the relay's wakes"
@@ -2376,7 +2378,9 @@ fn a_pane_outside_herdrs_default_focus_still_draws_when_woken() {
         .spawn()
         .unwrap();
     let frames = || fs::read_to_string(&frame_log).map_or(0, |t| t.lines().count());
-    let wakes = paths.keep.join("panes/sess-now.wake");
+    let wakes = paths
+        .keep
+        .join(format!("panes/sess-now.{}.wake", child.id()));
     let start = Instant::now();
     while (frames() == 0 || !wakes.exists()) && start.elapsed() < Duration::from_secs(20) {
         std::thread::sleep(Duration::from_millis(20));
@@ -2429,6 +2433,94 @@ fn the_pane_ends_when_herdr_says_the_agent_pane_closed() {
                 .unwrap();
             let request: serde_json::Value = serde_json::from_str(&request).unwrap();
             let mut conn = conn;
+/// Two panes of one session (a second terminal opened on it) each keep a wake pipe of their own:
+/// a wake reaches both, and when one ends the other still hears every wake.
+#[cfg(unix)]
+#[test]
+fn two_panes_of_one_session_both_draw_when_woken_and_one_ending_leaves_the_other_woken() {
+    use std::time::{Duration, Instant};
+    let (_home, paths) = home();
+    let spawn = |log: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .env("HOME", &paths.home)
+            .env("TERM_PROGRAM", "kitty")
+            .env("CSR_PANE_FRAME_LOG", log)
+            .args([
+                "companion",
+                "pane",
+                "--repo",
+                env!("CARGO_MANIFEST_DIR"),
+                "--watch",
+                "--sid",
+                "sess-now",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let first_log = paths.home.join("first.log");
+    let second_log = paths.home.join("second.log");
+    let mut first = spawn(&first_log);
+    let mut second = spawn(&second_log);
+    let frames = |log: &std::path::Path| fs::read_to_string(log).map_or(0, |t| t.lines().count());
+    let pipe = |pid: u32| paths.keep.join(format!("panes/sess-now.{pid}.wake"));
+    let start = Instant::now();
+    while (frames(&first_log) == 0
+        || frames(&second_log) == 0
+        || !pipe(first.id()).exists()
+        || !pipe(second.id()).exists())
+        && start.elapsed() < Duration::from_secs(60)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let both_listening = pipe(first.id()).exists() && pipe(second.id()).exists();
+    // Let the first frames settle and the debounce's spacing pass.
+    std::thread::sleep(Duration::from_millis(2500));
+    let wake = |before: (usize, usize)| {
+        assert!(csr_engine::companion::wake::notify(
+            &paths.keep,
+            "sess-now",
+            csr_engine::companion::wake::Kind::Now
+        ));
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10)
+            && (frames(&first_log) == before.0 || frames(&second_log) == before.1)
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let before = (frames(&first_log), frames(&second_log));
+    wake(before);
+    let after_both = (frames(&first_log), frames(&second_log));
+    let _ = first.kill();
+    let _ = first.wait();
+    std::thread::sleep(Duration::from_millis(2500));
+    let lone = frames(&second_log);
+    assert!(csr_engine::companion::wake::notify(
+        &paths.keep,
+        "sess-now",
+        csr_engine::companion::wake::Kind::Now
+    ));
+    let start = Instant::now();
+    while frames(&second_log) == lone && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let after_lone = frames(&second_log);
+    let _ = second.kill();
+    let _ = second.wait();
+    assert!(both_listening, "each pane keeps a wake pipe of its own");
+    assert!(
+        after_both.0 > before.0 && after_both.1 > before.1,
+        "a wake must reach both panes: before {before:?}, after {after_both:?}"
+    );
+    assert!(
+        after_lone > lone,
+        "the second pane lost its wakes when the first ended"
+    );
+}
+
             if request["method"] == "events.subscribe" {
                 let listed: Vec<_> = request["params"]["subscriptions"]
                     .as_array()
