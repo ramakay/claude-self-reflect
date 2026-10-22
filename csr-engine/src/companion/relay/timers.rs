@@ -182,6 +182,14 @@ pub mod fake {
         pub fn pending(&self) -> usize {
             self.rows().len()
         }
+
+        /// Drop every timer's work. A feature's timer closes over the `Ctx`, and the `Ctx` holds
+        /// these timers: left alone the pair keeps each other alive, and with them the store's
+        /// open database, for the rest of the test run.
+        pub fn clear(&self) {
+            let rows = std::mem::take(&mut *self.rows());
+            drop(rows);
+        }
     }
 
     impl Timers for FakeTimers {

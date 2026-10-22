@@ -733,6 +733,17 @@ pub mod testing {
         /// The context's timers: `timers.advance(ms, host)` fires what falls due.
         pub timers: Arc<FakeTimers>,
         pub dir: tempfile::TempDir,
+        _clear: ClearTimers,
+    }
+
+    /// Clears the timers when the fixture goes (see `FakeTimers::clear`). A field of its own, not
+    /// a `Drop` on `Fixture`, so a test may still take the fixture's parts one by one.
+    pub struct ClearTimers(Arc<super::super::timers::fake::FakeTimers>);
+
+    impl Drop for ClearTimers {
+        fn drop(&mut self) {
+            self.0.clear();
+        }
     }
 
     /// A context in session `s` at `/repo`, with a store in a temp folder of its own.
@@ -768,6 +779,7 @@ pub mod testing {
             cx,
             host,
             clock,
+            _clear: ClearTimers(timers.clone()),
             timers,
             dir,
         }
