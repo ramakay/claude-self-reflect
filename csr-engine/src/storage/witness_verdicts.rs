@@ -875,25 +875,14 @@ pub fn symbol_verdict_states_for_files(
     Ok(out)
 }
 
-/// SQL for [`symbol_verdict_states_for_lineages`] over `anchors` bind
-/// quadruples. The correlated `wl2` probe is served by
-/// `idx_witness_ledger_file_symbol`.
-fn lineage_states_sql(anchors: usize) -> String {
-    let filters: Vec<String> = (0..anchors)
-        .map(|i| {
-            let base = 4 * i + 1;
-            format!(
-                "(wl.project = ?{base} AND wl.file = ?{} AND wl.symbol = ?{}
-                  AND ((?{} IS NULL AND wl.source_kind <> 'backfill_rederived_v2')
-                       OR (wl.source_kind = 'backfill_rederived_v2'
-                           AND wl.source_id = ?{})))",
-                base + 1,
-                base + 2,
-                base + 3,
-                base + 3
-            )
-        })
-        .collect();
+/// SQL for [`symbol_verdict_states_for_lineages`]. The anchors arrive as ONE
+/// bound JSON array of `[project, file, symbol, source_id|null]` rows, so the
+/// text never changes with the number of anchors: it is parsed once per
+/// connection (`prepare_cached`) instead of once per call. A statement built
+/// from an `OR` of per-anchor filters costs far more to parse than to run.
+/// `wl` is reached through `idx_witness_ledger_lookup`; the correlated `wl2`
+/// probe is served by `idx_witness_ledger_file_symbol`.
+fn lineage_states_sql() -> String {
     format!(
         "SELECT wl.project, wl.file, wl.symbol,
                 v.witness_id, v.verdict, v.successor_witness_id,
@@ -909,12 +898,17 @@ fn lineage_states_sql(anchors: usize) -> String {
                                   AND wl2.source_kind <> 'backfill_rederived_v2')))
          FROM witness_verdicts v
          JOIN witness_ledger wl ON wl.id = v.witness_id
-         WHERE ({})
-           AND v.id > {LIVE_EVENT_FLOOR_SQL}
+         JOIN (SELECT j.value ->> 0 AS project, j.value ->> 1 AS file,
+                      j.value ->> 2 AS symbol, j.value ->> 3 AS source_id
+               FROM json_each(?1) j) a
+           ON wl.project = a.project AND wl.file = a.file AND wl.symbol = a.symbol
+          AND ((a.source_id IS NULL AND wl.source_kind <> 'backfill_rederived_v2')
+               OR (wl.source_kind = 'backfill_rederived_v2'
+                   AND wl.source_id = a.source_id))
+         WHERE v.id > {LIVE_EVENT_FLOOR_SQL}
            AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
                        WHERE v2.witness_id = v.witness_id)
-         ORDER BY v.id DESC",
-        filters.join(" OR ")
+         ORDER BY v.id DESC"
     )
 }
 
@@ -928,23 +922,18 @@ pub(crate) fn symbol_verdict_states_for_lineages(
     anchors: &[(String, String, String, Option<String>)],
 ) -> Result<std::collections::BTreeMap<(String, String, String), SymbolVerdictState>> {
     let mut out = std::collections::BTreeMap::new();
-    const BATCH: usize = 200;
-    for batch in anchors.chunks(BATCH) {
-        let sql = lineage_states_sql(batch.len());
-        let params: Vec<&dyn rusqlite::types::ToSql> = batch
-            .iter()
-            .flat_map(|(project, file, symbol, source_id)| {
-                [
-                    project as &dyn rusqlite::types::ToSql,
-                    file as &dyn rusqlite::types::ToSql,
-                    symbol as &dyn rusqlite::types::ToSql,
-                    source_id as &dyn rusqlite::types::ToSql,
-                ]
-            })
-            .collect();
-        let mut stmt = conn.prepare(&sql)?;
+    // A repeated anchor would join its ledger rows twice; the old `OR` filter
+    // collapsed duplicates, so collapse them here.
+    let distinct: std::collections::BTreeSet<&(String, String, String, Option<String>)> =
+        anchors.iter().collect();
+    if distinct.is_empty() {
+        return Ok(out);
+    }
+    {
+        let anchors_json = serde_json::to_string(&distinct)?;
+        let mut stmt = conn.prepare_cached(&lineage_states_sql())?;
         let rows: Vec<((String, String, String), WitnessVerdictRow, bool)> = stmt
-            .query_map(params.as_slice(), |row| {
+            .query_map([anchors_json.as_str()], |row| {
                 let verdict_str: String = row.get(4)?;
                 Ok((
                     (row.get(0)?, row.get(1)?, row.get(2)?),
@@ -2096,6 +2085,46 @@ mod tests {
         .unwrap()
     }
 
+    /// The anchors travel as one bound JSON array, so a long list (past the
+    /// old 200-per-statement batch), repeats, quotes and non-ASCII names all
+    /// have to reach the join intact, and a repeat must not double a witness.
+    #[test]
+    fn lineage_states_take_a_long_list_with_repeats_and_odd_names() {
+        let conn = open();
+        let w = witness(&conn, "aaa", "b3:1");
+        raw_event(&conn, w, "anchor_obsolete", "rcpt");
+        let hit = (
+            "proj".to_string(),
+            "/repo/src/lib.rs".to_string(),
+            "foo".to_string(),
+            None,
+        );
+        let mut anchors: Vec<(String, String, String, Option<String>)> = (0..450)
+            .map(|i| {
+                (
+                    "proj".to_string(),
+                    format!("/repo/src/we\"ird \u{e9}{i}.rs"),
+                    format!("sym'{i}\"\\"),
+                    if i % 2 == 0 {
+                        None
+                    } else {
+                        Some(format!("gen{i}"))
+                    },
+                )
+            })
+            .collect();
+        anchors.insert(300, hit.clone());
+        anchors.push(hit.clone());
+        anchors.push(hit.clone());
+        let states = symbol_verdict_states_for_lineages(&conn, &anchors).unwrap();
+        assert_eq!(states.len(), 1, "only the audited anchor has a state");
+        let key = (hit.0.clone(), hit.1.clone(), hit.2.clone());
+        assert_eq!(states[&key].negative_witness_ids, vec![w]);
+        assert!(symbol_verdict_states_for_lineages(&conn, &[])
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn witness_with_only_sub_floor_events_has_no_latest_event() {
         let conn = open();
@@ -2250,7 +2279,7 @@ mod tests {
         let conn = open();
         for (name, sql) in [
             ("files", files_states_sql(2)),
-            ("lineages", lineage_states_sql(2)),
+            ("lineages", lineage_states_sql()),
         ] {
             let plan = plan_of(&conn, &sql);
             assert!(
