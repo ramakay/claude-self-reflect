@@ -259,6 +259,39 @@ fn a_change_to_what_the_frame_reads_makes_the_pane_due() {
 }
 
 #[test]
+fn a_codex_rollout_written_to_is_news_even_when_the_last_scan_was_too_recent_to_read_it() {
+    let (_home, paths) = rich_home();
+    let folder = paths.home.join(".codex/sessions/2026/10/18");
+    fs::create_dir_all(&folder).unwrap();
+    let rollout = folder.join("rollout-a.jsonl");
+    let line = |used: u32| {
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"event_msg","timestamp":NOW - 5.,"payload":{
+                "type":"token_count","info":{"total_token_usage":{"total_tokens":9}},
+                "rate_limits":{"limit_id":"codex","secondary":{
+                    "window_minutes":10080,"used_percent":used,"resets_at":NOW + 86400.}}}})
+        )
+    };
+    fs::write(&rollout, line(10)).unwrap();
+    let mut pane = pane_in(&paths);
+    pane.frame(76, 67, NOW);
+    assert!(!pane.due(NOW + 0.2), "a quiet rollout is not news");
+    // Written inside the scan's own two seconds: the frame cannot read it yet.
+    let mut longer = fs::read_to_string(&rollout).unwrap();
+    longer.push_str(&line(20));
+    fs::write(&rollout, longer).unwrap();
+    assert!(pane.due(NOW + 1.5), "an append to a rollout is news");
+    pane.frame(76, 67, NOW + 1.5);
+    assert!(
+        pane.due(NOW + 2.6),
+        "the frame could not read it, so it is asked for again once the scan may"
+    );
+    pane.frame(76, 67, NOW + 2.6);
+    assert!(!pane.due(NOW + 3.7), "read once is quiet again");
+}
+
+#[test]
 fn the_pane_heartbeat_is_not_news() {
     let (_home, paths) = rich_home();
     fs::create_dir_all(paths.keep.join("panes")).unwrap();

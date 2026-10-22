@@ -274,6 +274,8 @@ pub struct Pane {
     pub encodes: usize,
     pub reused: usize,
 }
+/// The gate's name for the rollout files' fingerprint.
+const CODEX_ROLLOUTS: &str = "codex rollouts";
 impl Pane {
     pub fn new(paths: Paths, args: &PaneArgs) -> Self {
         let sid = args.sid.clone().unwrap_or_default();
@@ -362,21 +364,29 @@ impl Pane {
     /// running, is kept for `due`.
     pub fn frame(&mut self, cols: usize, rows: usize, now: f64) -> Vec<String> {
         // Looked at first, so a change made while the frame reads is seen by the next check.
-        let (mut snapshot, mut version) = self.look();
+        let (mut snapshot, mut version) = self.look(now);
         let found = self.session.as_ref().and_then(|s| s.path.clone());
         let out = self.build_frame(cols, rows, now);
+        // What the frame holds of Codex is what its last scan read, which can be older than the
+        // files now (a scan waits two seconds): the gate keeps asking until a scan catches up.
+        snapshot = snapshot.including(CODEX_ROLLOUTS, self.codex.scanned());
         // The first frame finds the transcript: it was not in the first look.
         if self.session.as_ref().and_then(|s| s.path.clone()) != found {
-            (snapshot, version) = self.look();
+            (snapshot, version) = self.look(now);
+            snapshot = snapshot.including(CODEX_ROLLOUTS, self.codex.scanned());
         }
         let settled = self.view == "main" && self.db.is_some() && !self.busy();
         self.gate.saw(snapshot, version, now, settled);
         out
     }
-    fn look(&self) -> (super::gate::Snapshot, Option<i64>) {
+    fn look(&self, now: f64) -> (super::gate::Snapshot, Option<i64>) {
         let transcript = self.session.as_ref().and_then(|s| s.path.as_deref());
         (
-            super::gate::Snapshot::take(&self.paths, &self.sid, transcript),
+            // Codex's rollouts feed the weekly figure and live outside everything else the
+            // snapshot covers; the Claude transcripts the spend reads are listed once a minute
+            // by the spend itself, a longer wait than the gate's floor.
+            super::gate::Snapshot::take(&self.paths, &self.sid, transcript)
+                .including(CODEX_ROLLOUTS, self.codex.fingerprint(now)),
             self.db.as_ref().and_then(Db::version),
         )
     }
@@ -389,6 +399,7 @@ impl Pane {
         self.spend.as_ref().is_some_and(|s| !s.ready)
             || (self.carry.started() && self.carry.done().is_none())
             || self.map.refreshing()
+            || self.codex.behind()
             || self.compacting
     }
     /// The first moment the drawing changes by itself: what the instrument frame named, the
@@ -410,7 +421,7 @@ impl Pane {
     pub fn due(&mut self, now: f64) -> bool {
         let deadline = self.deadline();
         let mut gate = std::mem::take(&mut self.gate);
-        let due = gate.due(now, deadline, || self.look());
+        let due = gate.due(now, deadline, || self.look(now));
         self.gate = gate;
         due
     }

@@ -179,7 +179,19 @@ pub struct CodexRolloutIndex {
     sessions: PathBuf,
     runs: BTreeMap<PathBuf, Run>,
     checked: Option<f64>,
+    /// What the files looked like at the last scan: see [`Self::fingerprint`].
+    scanned: u64,
     budget: u64,
+}
+/// The files' identity, length and modification time to the nanosecond, folded to one number.
+fn stamp_of(found: &[(PathBuf, fs::Metadata)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (path, info) in found {
+        (path, info.dev(), info.ino(), info.len()).hash(&mut hasher);
+        (info.mtime(), info.mtime_nsec()).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 impl CodexRolloutIndex {
     pub fn new(home: &Path) -> Self {
@@ -189,6 +201,7 @@ impl CodexRolloutIndex {
             root,
             runs: BTreeMap::new(),
             checked: None,
+            scanned: 0,
             budget: READ_BUDGET,
         }
     }
@@ -201,6 +214,27 @@ impl CodexRolloutIndex {
     }
     pub fn present(&self) -> bool {
         self.root.is_dir()
+    }
+    /// Which rollout files exist and how far each has been written, as one number. An append
+    /// to a file already known moves it; a folder's own timestamp would not. Zero with no
+    /// Codex at all.
+    pub fn fingerprint(&self, now: f64) -> u64 {
+        if !self.present() {
+            return 0;
+        }
+        let mut found = self.paths(now);
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        stamp_of(&found)
+    }
+    /// What [`Self::fingerprint`] was when the runs were last read: the pane's gate compares the
+    /// files with this, so a write that landed inside the scan's two seconds is still news
+    /// when they pass.
+    pub fn scanned(&self) -> u64 {
+        self.scanned
+    }
+    /// Files recorded but not yet read to their end: the next scan has work whatever the files do.
+    pub fn behind(&self) -> bool {
+        self.runs.values().any(|r| r.behind)
     }
     /// The rollout files worth reading: written within `KEEP_DAYS`, found without following
     /// links. Date folders (YYYY/MM/DD) older than that are not entered.
@@ -277,6 +311,8 @@ impl CodexRolloutIndex {
         self.checked = Some(now);
         let mut seen = std::collections::BTreeSet::new();
         let mut found = self.paths(now);
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        self.scanned = stamp_of(&found);
         // newest first, so a spent budget leaves the oldest files for the next scan
         found.sort_by(|a, b| {
             let stamp = |i: &fs::Metadata| i.mtime() as f64 + i.mtime_nsec() as f64 / 1e9;

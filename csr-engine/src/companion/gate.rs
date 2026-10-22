@@ -100,6 +100,21 @@ impl Snapshot {
         out.push((paths.db.clone(), db));
         Self(out)
     }
+    /// Also a number that stands for something outside the files above (the rollouts of another
+    /// tool, say): the snapshot differs when it does.
+    pub fn including(mut self, what: &str, fingerprint: u64) -> Self {
+        self.0.retain(|(path, _)| path != Path::new(what));
+        self.0.push((
+            PathBuf::from(what),
+            Some(Stamp {
+                dev: fingerprint,
+                ino: 0,
+                len: 0,
+                mtime_ns: 0,
+            }),
+        ));
+        self
+    }
 }
 
 /// What the last frame saw, and what it left running.
