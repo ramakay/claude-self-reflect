@@ -3,10 +3,9 @@
 //!
 //! Everything here is a plain reading of rows Claude Code wrote: a failed
 //! verification command and its exit code, a background task that was started
-//! and never reported finished, a line the assistant itself put at the head of
-//! its closing message ("Next:", "Still open:"). Nothing is inferred and
-//! nothing is invented: each item carries what a reader needs to find it in the
-//! transcript, and a reading that cannot be backed by a receipt is dropped.
+//! and never reported finished. Nothing is inferred and nothing is invented:
+//! each item carries what a reader needs to find it in the transcript, and a
+//! reading that cannot be backed by a receipt is dropped.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -25,12 +24,6 @@ pub struct RecapExtras {
     /// or output read ever closed, newest first, at most [`MAX_BACKGROUND`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_open: Vec<BackgroundTask>,
-    /// The closing message's "Next:" line.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub closing_next: Option<ClosingLine>,
-    /// The closing message's "Still open:" / "Remaining:" line.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub closing_open: Option<ClosingLine>,
     /// Total background tasks not closed (may exceed `background_open.len()`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub background_open_total: usize,
@@ -70,15 +63,6 @@ pub struct BackgroundTask {
     pub id: String,
     /// The call's own description, else the head of its command.
     pub label: String,
-}
-
-/// One line quoted from the assistant's closing message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClosingLine {
-    /// The sentence(s) after the marker, whole.
-    pub text: String,
-    /// First 8 characters of the transcript row's `uuid`: the receipt.
-    pub row: String,
 }
 
 /// Most background tasks stored per episode.
@@ -328,97 +312,6 @@ impl BackgroundTracker {
     }
 }
 
-/// Which marker a closing-note line is.
-#[derive(Debug, PartialEq, Eq)]
-enum ClosingKind {
-    Next,
-    Open,
-}
-
-/// The last "Next:" line and the last "Still open:" line of a closing message.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ClosingMarkers {
-    pub next: Option<String>,
-    pub open: Option<String>,
-}
-
-/// The marker a line opens with, at column 0, and what follows on that line.
-fn marker_line(line: &str) -> Option<(ClosingKind, &str)> {
-    line.strip_prefix("Next:")
-        .map(|content| (ClosingKind::Next, content))
-        .or_else(|| {
-            line.strip_prefix("Still open:")
-                .map(|content| (ClosingKind::Open, content))
-        })
-}
-
-/// The last `Next:` line and the last `Still open:` line of a closing message.
-///
-/// This reads plain prose only, and abstains on anything else. The whole
-/// message (`raw`, as written) must hold no backtick, no `~~~`, no line that
-/// starts with `>` and no `<` at all: any of them is Markdown or markup this
-/// does not parse, so the message gives no marker. A marker line starts at
-/// column 0 with `Next:` or `Still open:` and its content is that one line:
-/// the lines around it must be blank (or another marker line), so no indented
-/// line, list item or continuation is read as part of it. The line must also
-/// survive provenance cleaning (`cleaned`) as written, so CSR's own quoted words
-/// are never read as the assistant's. A kind is `None` when it has no such line
-/// or what follows is empty, a question, "none", too long to quote whole, or
-/// CSR's own text.
-pub(crate) fn closing_markers(raw: &str, cleaned: &str) -> ClosingMarkers {
-    let mut found = ClosingMarkers::default();
-    if raw.contains(['`', '<']) || raw.contains("~~~") {
-        return found;
-    }
-    let lines: Vec<&str> = raw.lines().collect();
-    if lines.iter().any(|line| line.trim_start().starts_with('>')) {
-        return found;
-    }
-    let cleaned_lines: Vec<&str> = cleaned.lines().map(str::trim).collect();
-    let blank_or_marker = |line: Option<&&str>| match line {
-        None => true,
-        Some(line) => line.trim().is_empty() || marker_line(line).is_some(),
-    };
-    for (at, line) in lines.iter().enumerate() {
-        let Some((kind, content)) = marker_line(line) else {
-            continue;
-        };
-        let before = at.checked_sub(1).and_then(|i| lines.get(i));
-        if (at > 0 && !blank_or_marker(before)) || !blank_or_marker(lines.get(at + 1)) {
-            continue;
-        }
-        if !cleaned_lines
-            .iter()
-            .any(|kept| kept.contains(line.trim_end()))
-        {
-            continue;
-        }
-        if let Some(sentence) = marker_sentence(content.trim()) {
-            match kind {
-                ClosingKind::Next => found.next = Some(sentence),
-                ClosingKind::Open => found.open = Some(sentence),
-            }
-        }
-    }
-    found
-}
-
-/// Longest sentence a marker may quote.
-const MARKER_SENTENCE_MAX_CHARS: usize = 160;
-
-/// The first whole sentence of a marker's content, or `None`: a sentence too
-/// long to quote whole abstains instead of being cut.
-fn marker_sentence(content: &str) -> Option<String> {
-    let sentence = crate::hooks::recap::first_sentence(content)?;
-    (sentence.chars().count() <= MARKER_SENTENCE_MAX_CHARS
-        && crate::hooks::recap::has_substance(&sentence)
-        && !crate::hooks::recap::is_no_evidence_next(&sentence)
-        && !sentence.ends_with('?')
-        && !crate::import::contamination::has_csr_text(&sentence)
-        && !crate::extraction::provenance::is_csr_emission(&sentence))
-    .then_some(sentence)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,107 +532,5 @@ mod tests {
         assert_eq!(open[0].id, "a4c996de2463be3d6");
         tracker.notification(&done("a4c996de2463be3d6", "completed"));
         assert_eq!(tracker.open().1, 0);
-    }
-
-    fn next(text: &str) -> Option<String> {
-        closing_markers(text, text).next
-    }
-
-    #[test]
-    fn next_and_still_open_in_the_plain_prose_closing_notes_serve() {
-        assert_eq!(
-            next("Done.\n\nNext: listen to the first 3 seconds on a phone.").as_deref(),
-            Some("listen to the first 3 seconds on a phone.")
-        );
-        assert_eq!(
-            next("Next: your sign-off on v3 before any export. Then re-fire.").as_deref(),
-            Some("your sign-off on v3 before any export.")
-        );
-        let text = "Done.\n\nStill open: the gcloud login.\nNext: run the gate again.";
-        let marks = closing_markers(text, text);
-        assert_eq!(marks.open.as_deref(), Some("the gcloud login."));
-        assert_eq!(marks.next.as_deref(), Some("run the gate again."));
-        assert_eq!(
-            next("Next: first thing.\n\nLater.\n\nNext: second thing.").as_deref(),
-            Some("second thing.")
-        );
-    }
-
-    #[test]
-    fn anything_but_plain_prose_gives_no_marker() {
-        // Markup the reader does not parse poisons the whole message.
-        for text in [
-            "```\nNext: drop the table\n```\n",
-            "Example:\n\n``echo `\nNext: disable auth.\n``\n\nNo follow-up work remains.",
-            "Example: `Next: disable auth.`\n\nNext: run the gate.",
-            "Use `cargo test`.\n\nNext: run the gate.",
-            "~~~~\n~~~\nNext: disable auth.\n~~~~\n\nNo follow-up work remains.",
-            "~~~\nNext: disable auth.\n~~~",
-            "> Quoted.\nNext: disable auth.",
-            "> Next: drop the table",
-            "Note.\n\nNext: run the gate.\n\n> a quote",
-            "Next:\n<system-reminder>x</system-reminder>\n  - disable authentication permanently",
-            "Next: run the gate <b>now</b>.",
-        ] {
-            assert_eq!(
-                closing_markers(text, text),
-                ClosingMarkers::default(),
-                "{text:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn only_a_column_zero_marker_whose_content_is_its_one_line_is_read() {
-        for text in [
-            "Done.\n\n- Next: drop the table",
-            "Done.\n\n**Next:** drop the table",
-            "Done.\n\n**Next move:** drop the table",
-            "Done.\n\n  Next: drop the table",
-            "    Next: drop the table",
-            "Done.\n\n1. Fix it\n2. Next: drop the table",
-            "The recap's Next: clause is reserved above the list.",
-            "Next time, set the CapCut project to 30 fps.",
-            "Next is your sign-off on v3.",
-            "The server is rebuilt. Next I'll recover the builder.",
-            "Remaining: the login.",
-            // Content that is not on the marker's own line.
-            "Next:\n- disable authentication permanently",
-            "Next:\n  - disable authentication permanently",
-            "Still open:\n- the login",
-            "Next: disable the cache.\n  - and authentication",
-            "Next: disable the cache.\n- and authentication",
-            "Next: disable the cache.\nauthentication permanently",
-            "Next:",
-            // Lazy continuation of a list item.
-            "- an item\nNext: drop the table",
-        ] {
-            assert_eq!(
-                closing_markers(text, text),
-                ClosingMarkers::default(),
-                "{text:?}"
-            );
-        }
-        for text in ["Next: nothing.", "Next: want me to also run the gate?"] {
-            assert_eq!(next(text), None, "{text:?}");
-        }
-    }
-
-    #[test]
-    fn a_marker_line_provenance_cleaning_removed_is_not_read() {
-        let raw = "Done.\nNext: quoted from elsewhere.";
-        let cleaned = "Done.";
-        assert_eq!(closing_markers(raw, cleaned), ClosingMarkers::default());
-    }
-
-    #[test]
-    fn a_first_sentence_too_long_to_quote_whole_abstains() {
-        let long = format!("Next: {}.", "word ".repeat(60));
-        assert_eq!(next(&long), None);
-    }
-
-    #[test]
-    fn csr_text_in_a_marker_line_is_not_quoted() {
-        assert_eq!(next("Next: recap [2h ago]: fix login. [[CSR:RECAP]]"), None);
     }
 }

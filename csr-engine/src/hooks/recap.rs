@@ -209,7 +209,6 @@ fn compose_recap_inner(
         now_parts.push(blocker);
     }
     now_parts.extend(gate_failure_entry(ep));
-    now_parts.extend(closing_open_entry(ep));
     now_parts.extend(background_entry(ep));
     now_parts.extend(
         feeds
@@ -246,8 +245,7 @@ fn compose_recap_inner(
                 .iter()
                 .filter(|todo| todo.status != "completed")
                 .find_map(|todo| next_preview(&todo.content))
-        })
-        .or_else(|| closing_next_entry(ep));
+        });
 
     let retired_entries: Vec<String> = feeds
         .retired_while_away
@@ -801,16 +799,6 @@ fn gate_failure_entry(ep: &crate::hooks::stop::Episode) -> Option<String> {
     })
 }
 
-/// The closing message's own "Still open:" line, quoted with its row.
-fn closing_open_entry(ep: &crate::hooks::stop::Episode) -> Option<String> {
-    let line = ep.recap_extras.closing_open.as_ref()?;
-    let text = closing_text(line)?;
-    Some(format!(
-        "closing note, still open: {text} (msg {})",
-        line.row
-    ))
-}
-
 /// Background tasks the transcript never shows finishing.
 fn background_entry(ep: &crate::hooks::stop::Episode) -> Option<String> {
     let extras = &ep.recap_extras;
@@ -831,28 +819,6 @@ fn background_entry(ep: &crate::hooks::stop::Episode) -> Option<String> {
     } else {
         format!("background task not reported finished: {label} ({id})")
     })
-}
-
-/// The closing message's own "Next:" line, quoted with its row. Behind the
-/// structured todo `Next:`, which is authored as a task.
-fn closing_next_entry(ep: &crate::hooks::stop::Episode) -> Option<String> {
-    let line = ep.recap_extras.closing_next.as_ref()?;
-    let text = closing_text(line)?;
-    Some(format!("{text} (msg {})", line.row))
-}
-
-/// A stored closing line, re-checked at composition: the stored text must
-/// still be substantive, whole, and not CSR's own words, and the receipt must
-/// be present.
-fn closing_text(line: &crate::hooks::recap_evidence::ClosingLine) -> Option<String> {
-    let text = normalize_feed_text(&line.text);
-    let text = text.trim_end_matches(['.', '!']).trim().to_string();
-    (!line.row.trim().is_empty()
-        && has_substance(&text)
-        && !is_no_evidence_next(&text)
-        && !crate::import::contamination::has_csr_text(&text)
-        && !crate::extraction::provenance::is_csr_emission(&text))
-    .then_some(text)
 }
 
 /// The receipts the recap may show: those produced under the task the intent
@@ -1281,7 +1247,7 @@ mod tests {
 
     // ---- session evidence clauses (hooks::recap_evidence) ----
 
-    use crate::hooks::recap_evidence::{BackgroundTask, ClosingLine, GateFailure};
+    use crate::hooks::recap_evidence::{BackgroundTask, GateFailure};
 
     fn bare_feeds() -> RecapFeeds {
         RecapFeeds {
@@ -1414,57 +1380,8 @@ mod tests {
     }
 
     #[test]
-    fn now_and_next_quote_the_closing_message_with_its_row() {
-        let mut ep = bare_episode();
-        ep.recap_extras.closing_open = Some(ClosingLine {
-            text: "the gcloud login, so I can check traffic.".into(),
-            row: "3f9a1c2b".into(),
-        });
-        ep.recap_extras.closing_next = Some(ClosingLine {
-            text: "listen to the first 3 seconds on a phone.".into(),
-            row: "77aa00cc".into(),
-        });
-        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
-        assert!(
-            text.contains(
-                "Now: closing note, still open: the gcloud login, so I can check traffic (msg 3f9a1c2b)."
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains("Next: listen to the first 3 seconds on a phone (msg 77aa00cc)."),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn a_structured_todo_next_outranks_the_closing_message_next() {
-        let mut ep = bare_episode();
-        ep.todos = vec![TodoItem {
-            content: "wire session start".into(),
-            status: "pending".into(),
-        }];
-        ep.next_steps = Some("wire session start".into());
-        ep.recap_extras.closing_next = Some(ClosingLine {
-            text: "something else entirely.".into(),
-            row: "77aa00cc".into(),
-        });
-        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
-        assert!(text.contains("Next: wire session start."), "{text}");
-        assert!(!text.contains("something else"), "{text}");
-    }
-
-    #[test]
     fn stored_evidence_without_a_receipt_or_with_csr_text_is_dropped() {
         let mut ep = bare_episode();
-        ep.recap_extras.closing_next = Some(ClosingLine {
-            text: "recap [2h ago]: fix login. [[CSR:RECAP]]".into(),
-            row: "77aa00cc".into(),
-        });
-        ep.recap_extras.closing_open = Some(ClosingLine {
-            text: "wait for review.".into(),
-            row: String::new(),
-        });
         ep.recap_extras.background_open = vec![BackgroundTask {
             id: String::new(),
             label: "upload build".into(),
@@ -1499,14 +1416,7 @@ mod tests {
             label: "upload build".into(),
         }];
         ep.recap_extras.background_open_total = 1;
-        ep.recap_extras.closing_open = Some(ClosingLine {
-            text: "your spend OK on the new opener.".into(),
-            row: "3f9a1c2b".into(),
-        });
-        ep.recap_extras.closing_next = Some(ClosingLine {
-            text: "listen to the first 3 seconds on a phone.".into(),
-            row: "77aa00cc".into(),
-        });
+        ep.next_steps = Some("listen to the first 3 seconds on a phone.".into());
         let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
         for clause in ["Settled:", "Now:", "Next:"] {
             assert!(text.contains(clause), "{clause}: {text}");
