@@ -955,9 +955,10 @@ static INDEX_ENTRY_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock
     .expect("index entry regex")
 });
 
-/// A CONTINUUM `LAST:` line pasted alone: `LAST: <text> ([outcome=<label>, ]trust=<tier>)`.
+/// A CONTINUUM `LAST:` line pasted alone: `LAST: <text> ([outcome=<label>, ]trust=<tier>)`,
+/// where the tier is one `TrustTier` writes; a person's `(trust=low)` is prose.
 static CONTINUUM_LAST_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?m)^[ \t]*LAST: .+ \((?:outcome=[^)\n]*, )?trust=[a-z_]+\)[ \t]*$")
+    regex::Regex::new(r"(?m)^[ \t]*LAST: .+ \((?:outcome=[^)\n]*, )?trust=(?:unknown|external|trusted_tool|user_history|user_confirmed|system)\)[ \t]*$")
         .expect("continuum last regex")
 });
 
@@ -1333,6 +1334,30 @@ mod tests {
             "Run it and note that trust=user_history appears in status.",
         ] {
             assert!(!is_csr_emission(prose), "{prose}");
+        }
+    }
+
+    /// A person's sentence can have the same shape as a LAST line. Only the
+    /// trust tiers CSR writes make it CSR's.
+    #[test]
+    fn user_prose_shaped_like_a_last_line_with_an_unknown_tier_is_not_an_emission() {
+        for prose in [
+            "LAST: Review the certificate chain (trust=low)",
+            "LAST: check the proxy (trust=none)",
+        ] {
+            assert!(!is_csr_emission(prose), "{prose}");
+            assert!(extractable(prose).is_some(), "{prose}");
+        }
+        for tier in [
+            "unknown",
+            "external",
+            "trusted_tool",
+            "user_history",
+            "user_confirmed",
+            "system",
+        ] {
+            let line = format!("LAST: Review the certificate chain (trust={tier})");
+            assert!(is_csr_emission(&line), "{line}");
         }
     }
 
