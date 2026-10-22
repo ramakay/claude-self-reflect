@@ -128,6 +128,19 @@ pub struct Episode {
     /// before this existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub late_errors: bool,
+    /// Whether the assistant's closing words under the session's latest task
+    /// read as a success. The outcome reads these, not the session-wide
+    /// `completed`, so a success said under an early task cannot vouch for a
+    /// later one; the task-directory override reuses it for the same reason.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closing_success: bool,
+    /// The literal last typed message of the session, as the person wrote it
+    /// (plumbing and CSR emissions stripped). `None` when the last typed row
+    /// was a forwarded note, or there was none. Never walks back to an older
+    /// message: the recap only names it after the anchor when it reads as an
+    /// ask, and says nothing when it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_ask: Option<String>,
 }
 
 /// A compact intent and whether the displayed receipts belong to that task.
@@ -688,6 +701,10 @@ fn ends_turn(val: &serde_json::Value, msg_type: &str) -> bool {
     }
 }
 
+/// Longest stored `latest_ask`, in bytes. The recap renders at most
+/// `INTENT_MAX_CHARS` of it, so the cut never reaches a rendered sentence.
+const LATEST_ASK_MAX_BYTES: usize = 400;
+
 /// Whether a typed prompt opens a new task, as opposed to an acknowledgement
 /// ("go", "ok do it") that continues the one before it.
 fn is_task_prompt(prose: &str) -> bool {
@@ -840,6 +857,10 @@ where
     let mut last_row_at: Option<chrono::DateTime<chrono::Utc>> = None;
     // An error-pattern match in a tool result since the latest task began.
     let mut late_errors = false;
+    // The assistant's latest main-session text since the latest task began.
+    let mut closing_text = String::new();
+    // The literal last typed message (a forwarded note clears it).
+    let mut latest_ask: Option<String> = None;
 
     // Tool names whose file_path inputs count as "investigated"
     let read_tools: HashSet<&str> = ["Read", "Glob", "Grep"].into_iter().collect();
@@ -901,6 +922,9 @@ where
             if let Some(TypedPrompt { prose, note }) =
                 forwarded_note(raw_row).or_else(|| typed_prompt(val))
             {
+                if !sidechain && opening_seen != Some(true) {
+                    latest_ask = (!note).then(|| truncate_str(&prose, LATEST_ASK_MAX_BYTES).to_string());
+                }
                 if opening_seen != Some(true) && (note || is_task_prompt(&prose)) {
                     let sent_at = val
                         .get("timestamp")
@@ -926,6 +950,7 @@ where
                         }
                         _ => {
                             late_errors = false;
+                            closing_text.clear();
                             segments.push(TaskSegment {
                                 prose,
                                 note,
@@ -1030,6 +1055,9 @@ where
                                     crate::extraction::provenance::extractable(text)
                                 {
                                     completed = truncate_str(&cleaned, 300).to_string();
+                                    if !sidechain {
+                                        closing_text = completed.clone();
+                                    }
                                 }
                             }
                         }
@@ -1039,6 +1067,9 @@ where
                 if let Some(text) = content.as_str() {
                     if let Some(cleaned) = crate::extraction::provenance::extractable(text) {
                         completed = truncate_str(&cleaned, 300).to_string();
+                        if !sidechain {
+                            closing_text = completed.clone();
+                        }
                     }
                 }
             }
@@ -1083,15 +1114,12 @@ where
                             .and_then(|v| v.as_str())
                             .is_some_and(|id| git_tool_ids.contains(id));
                         let failed = block.get("is_error").and_then(|v| v.as_bool()) == Some(true);
-                        // A tool call that FAILED and says why. Output that merely
-                        // contains the words (a Read or Grep of source, a quoted test
+                        // A tool call that FAILED. Output that merely contains
+                        // error words (a Read or Grep of source, a quoted test
                         // name) is not an error: that flagged most long sessions.
-                        if failed
-                            && !sidechain
-                            && error_patterns
-                                .iter()
-                                .any(|pattern| block_text.contains(pattern))
-                        {
+                        // A failed call with a message the patterns do not know
+                        // ("Exit code 1", "File not found") still counts.
+                        if failed && !sidechain {
                             late_errors = true;
                         }
                         if from_git && !failed && !sidechain {
@@ -1169,8 +1197,8 @@ where
     });
 
     // Determine outcome (task-aware: incomplete todos cap success at partial)
-    let success_signal = crate::extraction::has_success_signal(&completed);
-    let outcome = compute_outcome(message_count, late_errors, success_signal, &todos);
+    let closing_success = crate::extraction::has_success_signal(&closing_text);
+    let outcome = compute_outcome(message_count, late_errors, closing_success, &todos);
     let duration_minutes = match (first_row_at, last_row_at) {
         (Some(first), Some(last)) => {
             u32::try_from((last - first).num_minutes().max(0)).unwrap_or(u32::MAX)
@@ -1217,6 +1245,8 @@ where
         completions_untied,
         compact_anchor,
         late_errors,
+        closing_success,
+        latest_ask,
     }
 }
 
@@ -1592,19 +1622,7 @@ pub async fn extract_and_store_episode(
         // zero task files carries no signal; transcript state stands.
         if state.files_seen > state.parse_failures {
             task_inputs = Some(state.inputs);
-            episode.todos = state.todos;
-            episode.next_steps = episode
-                .todos
-                .iter()
-                .find(|t| t.status != "completed")
-                .map(|t| t.content.clone());
-            let success_signal = crate::extraction::has_success_signal(&episode.completed);
-            episode.outcome = compute_outcome(
-                episode.message_count,
-                episode.late_errors,
-                success_signal,
-                &episode.todos,
-            );
+            apply_task_dir_todos(&mut episode, state.todos);
         }
     }
 
@@ -1795,6 +1813,25 @@ fn propose_task_resolutions(
 fn load_task_dir_state(session_id: &str) -> Option<TaskDirState> {
     let dir = dirs::home_dir()?.join(".claude/tasks").join(session_id);
     load_task_state_from_dir(&dir)
+}
+
+/// Let the on-disk task list replace the transcript-mined todos, then redo the
+/// todo-dependent parts of the episode. The outcome reads the closing task's own
+/// success signal (`closing_success`), never the session-wide `completed`: a
+/// success said under an early task must not come back as the session's result.
+fn apply_task_dir_todos(episode: &mut Episode, todos: Vec<TodoItem>) {
+    episode.todos = todos;
+    episode.next_steps = episode
+        .todos
+        .iter()
+        .find(|t| t.status != "completed")
+        .map(|t| t.content.clone());
+    episode.outcome = compute_outcome(
+        episode.message_count,
+        episode.late_errors,
+        episode.closing_success,
+        &episode.todos,
+    );
 }
 
 /// What a task-directory read found. `files_seen` counts task JSON files present
@@ -2568,6 +2605,118 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_call_counts_whatever_its_message_says() {
+        // A shell failure prints no error[/Error:/panic pattern at all.
+        let ep = extract(&[
+            dur_typed("Run the release script and report", "2026-10-21T10:00:00Z"),
+            dur_result("Exit code 1", true, "2026-10-21T10:01:00Z"),
+            dur_result("File not found", true, "2026-10-21T10:02:00Z"),
+            dur_done("2026-10-21T10:03:00Z"),
+        ]);
+        assert!(ep.late_errors);
+        assert_eq!(ep.outcome, "failed");
+    }
+
+    #[test]
+    fn a_success_said_under_an_earlier_task_does_not_close_the_session() {
+        let ep = extract(&[
+            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_timed(
+                serde_json::json!({"type": "assistant", "message": {
+                    "content": [{"type": "text", "text": "Fixed. All tests pass."}],
+                    "stop_reason": "end_turn"
+                }}),
+                "2026-10-21T10:02:00Z",
+            ),
+            dur_typed("Now update the changelog for that fix", "2026-10-21T11:00:00Z"),
+            dur_result("changelog opened", false, "2026-10-21T11:01:00Z"),
+        ]);
+        assert!(!ep.closing_success, "the latest task has said nothing yet");
+        assert_ne!(ep.outcome, "success");
+        // The same words said under the closing task do count.
+        let ep = extract(&[
+            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_done("2026-10-21T10:02:00Z"),
+            dur_typed("Now update the changelog for that fix", "2026-10-21T11:00:00Z"),
+            dur_timed(
+                serde_json::json!({"type": "assistant", "message": {
+                    "content": [{"type": "text", "text": "Done. The changelog is updated."}],
+                    "stop_reason": "end_turn"
+                }}),
+                "2026-10-21T11:02:00Z",
+            ),
+        ]);
+        assert!(ep.closing_success);
+        assert_eq!(ep.outcome, "success");
+    }
+
+    #[test]
+    fn the_task_dir_override_keeps_the_closing_tasks_success_not_the_sessions() {
+        let mut ep = extract(&[
+            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_timed(
+                serde_json::json!({"type": "assistant", "message": {
+                    "content": [{"type": "text", "text": "Fixed. All tests pass."}],
+                    "stop_reason": "end_turn"
+                }}),
+                "2026-10-21T10:02:00Z",
+            ),
+            dur_typed("Now update the changelog for that fix", "2026-10-21T11:00:00Z"),
+            dur_result("changelog opened", false, "2026-10-21T11:01:00Z"),
+        ]);
+        // The session-wide `completed` still holds the early success.
+        assert!(crate::extraction::has_success_signal(&ep.completed) || ep.completed.is_empty());
+        apply_task_dir_todos(&mut ep, Vec::new());
+        assert_ne!(ep.outcome, "success");
+        apply_task_dir_todos(
+            &mut ep,
+            vec![TodoItem {
+                content: "write the changelog".into(),
+                status: "pending".into(),
+            }],
+        );
+        assert_eq!(ep.next_steps.as_deref(), Some("write the changelog"));
+        assert_ne!(ep.outcome, "success");
+    }
+
+    #[test]
+    fn latest_ask_is_the_literal_last_typed_message_and_never_walks_back() {
+        let ep = extract(&[
+            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_done("2026-10-21T10:02:00Z"),
+            dur_typed("Why did the second worker finish so early", "2026-10-21T10:30:00Z"),
+            dur_done("2026-10-21T10:32:00Z"),
+        ]);
+        assert_eq!(
+            ep.latest_ask.as_deref(),
+            Some("Why did the second worker finish so early")
+        );
+        // An acknowledgement is still the last thing typed: no walking back.
+        let ep = extract(&[
+            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_done("2026-10-21T10:02:00Z"),
+            dur_typed("ok go", "2026-10-21T10:30:00Z"),
+        ]);
+        assert_eq!(ep.latest_ask.as_deref(), Some("ok go"));
+        // A sidechain row and a tool result are not typed messages.
+        let mut side = serde_json::json!({"type": "user", "promptSource": "typed",
+            "isSidechain": true, "message": {"content": "Summarize the diff for the agent"}});
+        side["timestamp"] = serde_json::json!("2026-10-21T10:40:00Z");
+        let ep = extract(&[
+            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_done("2026-10-21T10:02:00Z"),
+            side.to_string(),
+            dur_result("done", false, "2026-10-21T10:41:00Z"),
+        ]);
+        assert_eq!(
+            ep.latest_ask.as_deref(),
+            Some("Fix the login validation before the release")
+        );
+        // No typed row at all: nothing.
+        assert!(extract(&[dur_done("2026-10-21T10:02:00Z")]).latest_ask.is_none());
+    }
+
+    #[test]
     fn episode_excludes_correlated_csr_pair_but_keeps_sibling_tool_and_user_error() {
         let lines_owned = [
             serde_json::json!({
@@ -2759,6 +2908,8 @@ mod tests {
             completions_untied: false,
             compact_anchor: None,
             late_errors: false,
+            closing_success: false,
+            latest_ask: None,
         };
 
         let json = serde_json::to_string(&ep).unwrap();
@@ -2817,6 +2968,8 @@ mod tests {
             completions_untied: false,
             compact_anchor: None,
             late_errors: false,
+            closing_success: false,
+            latest_ask: None,
         };
 
         let tags = episode_tags(&ep);

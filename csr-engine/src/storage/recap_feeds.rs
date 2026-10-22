@@ -1038,6 +1038,8 @@ mod tests {
             completions_untied: false,
             compact_anchor: None,
             late_errors: false,
+            closing_success: false,
+            latest_ask: None,
             anchors: vec![],
         };
         let feeds = RecapFeeds {

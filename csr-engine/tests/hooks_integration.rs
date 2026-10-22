@@ -1969,6 +1969,8 @@ fn test_explore_prompt_never_fails() {
         completions_untied: false,
         compact_anchor: None,
         late_errors: false,
+        closing_success: false,
+        latest_ask: None,
         anchors: vec![],
     };
 
@@ -2506,6 +2508,8 @@ fn test_episode_struct_serialization() {
         completions_untied: false,
         compact_anchor: None,
         late_errors: false,
+        closing_success: false,
+        latest_ask: None,
         anchors: vec![],
     };
 
