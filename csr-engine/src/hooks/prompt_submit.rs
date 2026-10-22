@@ -1793,7 +1793,7 @@ async fn search_chunks_with_vec_core(
                     let age_days = (now - ts).num_days();
                     // Reject future-dated chunks (clock skew) and stale chunks
                     if !(0..=MAX_CHUNK_AGE_DAYS).contains(&age_days) {
-                        continue;
+                            continue;
                     }
                 }
 
@@ -2405,25 +2405,76 @@ fn quoted_in_prompt(content: &str, pasted_words: &str) -> bool {
     key.len() >= MIN_OPENING_KEY_CHARS && pasted_words.contains(&key)
 }
 
-/// What a tool-dominated chunk must carry to be worth handing back: a stated
-/// decision or verdict, a receipts line, a PR or commit reference, or a passing
-/// test summary. Anything else in a tool dump is the tool's output, which the
-/// session that ran the tool already read.
-fn receipt_pattern() -> &'static regex::Regex {
+/// What a tool-dominated chunk must carry to be worth handing back: a
+/// statement of a decision, a verdict, a cause or the receipts, or a PR or
+/// commit named in a sentence. Anything else in a tool dump is the tool's
+/// output, which the session that ran the tool already read.
+///
+/// The words alone prove nothing: `decision: bool` in a struct, `commit
+/// 3f9a2c1…` in a `git log`, and `test result: ok` in a cargo log are output
+/// and source. So a label counts only where it opens a line, a list item or a
+/// sentence and what follows reads as prose, not code. A bare test log is not a
+/// receipt: it says what the run printed, not what the person concluded.
+fn statement_label() -> &'static regex::Regex {
     static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     PATTERN.get_or_init(|| {
         regex::Regex::new(
-            r"(?i)\bPR\s?#\d+|\bcommit\s+[0-9a-f]{7,40}\b|\b(?:receipts?|decisions?|decided|verdict|root cause)\s*:|test result: ok|\b\d+ passed; 0 failed",
+            r"(?im)(?:^|[.!?][ \t]+)[ \t>*#|-]*(decisions?|decided|verdict|root cause|receipts?)\**[ \t]*:\**[ \t]*([^\n]*)",
         )
-        .expect("receipt pattern compiles")
+        .expect("statement label compiles")
     })
+}
+
+fn change_reference() -> &'static regex::Regex {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PATTERN.get_or_init(|| {
+        regex::Regex::new(r"(?i)\bPR[ \t]?#\d+|\bcommit[ \t]+[0-9a-f]{7,40}\b")
+            .expect("change reference compiles")
+    })
+}
+
+/// Syntax that prose does not use.
+fn code_like(text: &str) -> bool {
+    text.contains(['{', '}']) || ["=>", "->", "::", "()"].iter().any(|op| text.contains(op))
+}
+
+/// Words made of letters only (an apostrophe or hyphen inside is fine).
+fn prose_words(text: &str) -> usize {
+    text.split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|word| {
+            word.chars().count() >= 2
+                && word
+                    .chars()
+                    .all(|c| c.is_alphabetic() || c == '\'' || c == '-')
+        })
+        .count()
+}
+
+fn states_decision_or_receipt(content: &str) -> bool {
+    let labelled = statement_label().captures_iter(content).any(|found| {
+        let tail = found.get(2).map_or("", |m| m.as_str());
+        if code_like(tail) {
+            return false;
+        }
+        // A receipts line is figures (sizes, counts, hashes), not sentences.
+        if found[1].to_lowercase().starts_with("receipt") {
+            !tail.trim().is_empty()
+        } else {
+            prose_words(tail) >= 3
+        }
+    });
+    labelled
+        || content.lines().any(|line| {
+            change_reference().is_match(line) && !code_like(line) && prose_words(line) >= 6
+        })
 }
 
 /// The chunk is mostly tool output and states no decision or receipt. A chunk
 /// with no recorded share (imported before spans were) is judged as before.
 fn is_tool_dump(tool_result_share: Option<f64>, content: &str) -> bool {
     tool_result_share.is_some_and(|share| share >= TOOL_DUMP_SHARE)
-        && !receipt_pattern().is_match(content)
+        && !states_decision_or_receipt(content)
 }
 
 /// Check if content is self-referential noise about CSR internals.
@@ -2728,17 +2779,50 @@ mod tests {
         assert!(!is_tool_dump(Some(0.0), listing));
         assert!(!is_tool_dump(None, listing));
         assert!(!is_tool_dump(Some(1.0), decision));
-        assert!(!is_tool_dump(Some(1.0), "merged in PR #62, tests green"));
-        assert!(!is_tool_dump(Some(1.0), "fixed at commit 3f9a2c1d"));
         assert!(!is_tool_dump(
             Some(1.0),
-            "test result: ok. 1153 passed; 0 failed"
+            "Both fixes are merged in PR #62 and the backend tests are green."
         ));
+        assert!(!is_tool_dump(
+            Some(1.0),
+            "The scorer fix landed at commit 3f9a2c1d after the review found the timing bug."
+        ));
+        // A bare test log is what the run printed, not a statement about it.
+        assert!(is_tool_dump(
+            Some(1.0),
+            "test result: ok. 1153 passed; 0 failed; 0 ignored"
+        ));
+        assert!(is_tool_dump(Some(1.0), "1153 passed; 0 failed"));
         // A bare word is not a receipt: only the labelled form is.
         assert!(is_tool_dump(
             Some(1.0),
             "the decision was documented upstream"
         ));
+    }
+
+    /// Source code and raw logs carry the receipt words as identifiers and
+    /// command output; only a label that opens a statement counts.
+    #[test]
+    fn source_and_logs_do_not_pass_as_a_decision_or_a_receipt() {
+        for dump in [
+            "struct Policy { decision: bool, retries: usize }",
+            "pub struct Policy {\n    decision: bool,\n    retries: usize,\n}",
+            "let verdict: Verdict = judge(&chunk);\nlet receipts: Vec<Receipt> = Vec::new();",
+            "fn decide(x: &Input) -> Decision {\n    Decision { decision: x.ok }\n}",
+            "commit 3f9a2c1d4e5f60718293a4b5c6d7e8f901234567\nAuthor: t <t@t>\nDate:   Wed Oct 21\n",
+            "#62 open fix scoring  PR #62  PR #63\n#63 open home bounce",
+        ] {
+            assert!(is_tool_dump(Some(1.0), dump), "{dump}");
+        }
+        for kept in [
+            "Decision: we keep the 800ms budget because the p95 never crossed it.",
+            "**Decision:** keep the label on the floor and filter on the share instead.",
+            "- Root cause: the scorer returned a hardcoded timing value before the match ran.",
+            "Checked the build. Verdict: the second option is faster and no less safe.",
+            "**Receipts:** 1440x2560, 60 fps, 5400 frames, 90.000 s, 261 MB.",
+        ] {
+            assert!(!is_tool_dump(Some(1.0), kept), "{kept}");
+        }
     }
 
     /// Four external-floor chunks match the query equally. The one that only
