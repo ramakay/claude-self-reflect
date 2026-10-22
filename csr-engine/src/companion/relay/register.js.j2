@@ -132,7 +132,7 @@ async function spawn($, e, again) {
     if (ended - born >= LONG) fails = 0
     else if (!readyAt || ended - readyAt < SOON) fails++
     if (fails < TRIES) $.clock.after(2000, () => void spawn($, e, true).catch(() => undefined))
-    else if (fails++ === TRIES) void $.ui.toast(failed ? 'CSR engine missing: npx claude-self-reflect setup' : 'CSR engine keeps stopping: run csr-engine setup')
+    else if (fails++ === TRIES) void Promise.resolve($.ui.toast(failed ? 'CSR engine missing: npx claude-self-reflect setup' : 'CSR engine keeps stopping: run csr-engine setup')).catch(() => undefined) // detached like the promise above: a host that is gone must not leave a rejection nothing handles
   })().catch(() => undefined) // this runs after the hook that started it returned: a host that is gone must not leave a rejection nothing handles
   await up
   if (sock === mine) {
