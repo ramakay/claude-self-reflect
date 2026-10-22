@@ -926,6 +926,17 @@ pub fn run(conn: &Connection) -> Result<()> {
         );
     }
 
+    // Migration: one counter per project, bumped by every write a resolve reads
+    // (node upsert/retire, edge replace, repo_defs replace, a file's generation
+    // bump). The drain plans a resolve without the write lock and re-reads this
+    // counter under it: if it moved, the plan is stale and is discarded.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS code_graph_project_gen (
+             project TEXT PRIMARY KEY,
+             gen     INTEGER NOT NULL DEFAULT 0
+         );",
+    )?;
+
     // Migration: add project_name to code_evolution if missing (v9 cross-project fix)
     {
         let has_project_col: bool = conn

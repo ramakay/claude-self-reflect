@@ -1838,6 +1838,8 @@ async fn run(
                     "files": drain.files,
                     "edge_writes": drain.edge_writes,
                     "rank_writes": drain.rank_writes,
+                    "replans": drain.replans,
+                    "locked_passes": drain.locked_passes,
                     "ms": drain.elapsed.as_millis() as u64,
                     "longest_lock_hold_ms": drain.longest_lock_hold.as_millis() as u64,
                 }),

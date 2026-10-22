@@ -150,6 +150,31 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
     })
 }
 
+/// Bump the project's resolve-input counter. Every write a project resolve
+/// reads calls this inside the transaction that makes it, so a reader that
+/// saw the counter, read the graph, and finds the counter unchanged under the
+/// write lock knows nothing it read has moved.
+pub fn bump_project_gen(conn: &Connection, project: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO code_graph_project_gen (project, gen) VALUES (?1, 1)
+         ON CONFLICT(project) DO UPDATE SET gen = gen + 1",
+        params![project],
+    )?;
+    Ok(())
+}
+
+/// The project's resolve-input counter (0 before any write).
+pub fn project_gen(conn: &Connection, project: &str) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT gen FROM code_graph_project_gen WHERE project = ?1",
+            params![project],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
 /// Upsert a node. `first_conv_id` is preserved on an existing row (immutable
 /// history); `last_conv_id` / `last_session_id` / `body_hash` / span / timestamps
 /// are refreshed to the latest sighting.
@@ -202,7 +227,7 @@ pub fn upsert_node(conn: &Connection, n: &NodeRow) -> Result<()> {
             n.repo_root,
         ],
     )?;
-    Ok(())
+    bump_project_gen(conn, &n.project)
 }
 
 /// Record the exact transcript chunk containing the latest tool edit that
@@ -237,11 +262,14 @@ pub fn set_last_chunk_id(conn: &Connection, node_id: &str, chunk_id: &str) -> Re
 /// longer produce a false positive regardless of ordering.
 pub fn replace_file_edges(
     conn: &Connection,
-    _project: &str,
+    project: &str,
     src_file: &str,
     edges: &[EdgeRow],
 ) -> Result<()> {
-    in_tx(conn, |tx| replace_file_edges_in(tx, src_file, edges))
+    in_tx(conn, |tx| {
+        replace_file_edges_in(tx, src_file, edges)?;
+        bump_project_gen(tx, project)
+    })
 }
 
 /// Run `f` in a transaction of its own, or inside the caller's when `conn`
@@ -297,22 +325,22 @@ pub fn upsert_repo_defs(
     file: &str,
     defs: &[(String, String, String)],
 ) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM repo_defs WHERE project = ?1 AND file = ?2",
-        params![project, file],
-    )?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO repo_defs (project, file, name, kind, lang, scanned_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+    in_tx(conn, |tx| {
+        tx.execute(
+            "DELETE FROM repo_defs WHERE project = ?1 AND file = ?2",
+            params![project, file],
         )?;
-        for (name, kind, lang) in defs {
-            stmt.execute(params![project, file, name, kind, lang])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO repo_defs (project, file, name, kind, lang, scanned_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            )?;
+            for (name, kind, lang) in defs {
+                stmt.execute(params![project, file, name, kind, lang])?;
+            }
         }
-    }
-    tx.commit()?;
-    Ok(())
+        bump_project_gen(tx, project)
+    })
 }
 
 /// Retire `code_nodes` rows for `(project, file)` whose id is not in
@@ -372,6 +400,7 @@ pub fn retire_missing_nodes(
                 params![id, project, file],
             )?;
         }
+        bump_project_gen(tx, project)?;
         Ok(stale_ids.len())
     })
 }
@@ -438,7 +467,7 @@ pub fn upsert_file_state_pending(
              graph_gen = graph_gen + 1",
         params![project, file, content_hash],
     )?;
-    Ok(())
+    bump_project_gen(conn, project)
 }
 
 /// One file's extraction, to be stored as a unit by [`store_extraction`].
