@@ -296,7 +296,22 @@ impl Daemon {
         startup_identity: Option<crate::binary_identity::FileIdentity>,
         startup_exe_path: Option<PathBuf>,
     ) -> Result<i32> {
-        let _lock = Self::acquire_lock()?;
+        let lock = Self::acquire_lock()?;
+        self.run_with_lock(lock, startup_identity, startup_exe_path)
+            .await
+    }
+
+    /// [`Daemon::run`] for a caller that already holds the daemon lock (from
+    /// [`Daemon::acquire_lock`]), so the lock can be taken before the engine is
+    /// loaded. A flock belongs to the open file, so it must be this very handle:
+    /// taking it again here would find it contended.
+    pub async fn run_with_lock(
+        self,
+        lock: std::fs::File,
+        startup_identity: Option<crate::binary_identity::FileIdentity>,
+        startup_exe_path: Option<PathBuf>,
+    ) -> Result<i32> {
+        let _lock = lock;
         tracing::info!("daemon started, acquired lockfile");
         // Heartbeat: MCP servers started within a day of it leave the index
         // and the model to this daemon, even while it restarts.

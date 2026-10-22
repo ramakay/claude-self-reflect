@@ -1105,6 +1105,9 @@ async fn run(
         no_ai,
     }) = args.command
     {
+        // The lock first: a second daemon (another launchd label, a terminal)
+        // must lose here, cheaply, not after loading the engine and the model.
+        let daemon_lock = csr_engine::daemon::Daemon::acquire_lock()?;
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1129,7 +1132,9 @@ async fn run(
             config,
             !no_ai,
         );
-        let exit_code = daemon.run(startup_identity, startup_exe_path).await?;
+        let exit_code = daemon
+            .run_with_lock(daemon_lock, startup_identity, startup_exe_path)
+            .await?;
         if exit_code != 0 {
             // Skips `runtime::run_to_completion`'s bounded shutdown wait
             // (see that function's doc comment) — deliberately: the
