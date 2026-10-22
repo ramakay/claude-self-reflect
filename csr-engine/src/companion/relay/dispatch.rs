@@ -1878,4 +1878,44 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
     }
+    /// The wake only fires where a handler is dispatched, so every hook that wakes a pane must have
+    /// an entry of the shape `classify` expects in the table the relay really runs.
+    #[test]
+    fn every_hook_that_wakes_a_pane_has_the_entry_the_wake_rides_on() {
+        let t = default_table();
+        let keys = [
+            ("/event", "stop"),
+            ("/event", "turn_start"),
+            ("/event", "turn_complete"),
+            ("/event", "seen"),
+            ("/event", "digit"),
+            ("/event", "chapter"),
+            ("/event", "marker"),
+            ("/event", "measure"),
+            ("/after", "spawned"),
+            ("/after", "tool"),
+        ];
+        for (path, key) in keys {
+            assert!(wake::classify(path, key).is_some(), "{path} {key}");
+            let entries = t.entries(key);
+            let has = |after: bool| {
+                entries.iter().any(|e| {
+                    if after {
+                        e.after.is_some()
+                    } else {
+                        e.event.is_some()
+                    }
+                })
+            };
+            assert!(has(path == "/after"), "{key} has no {path} entry");
+        }
+        // And nothing else wakes a pane by accident.
+        for hook in manifest::HOOKS {
+            for path in ["/event", "/after"] {
+                if wake::classify(path, hook.key).is_some() {
+                    assert!(keys.contains(&(path, hook.key)), "{path} {}", hook.key);
+                }
+            }
+        }
+    }
 }
