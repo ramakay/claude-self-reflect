@@ -341,22 +341,37 @@ fn and_chain(command: &str) -> Option<Vec<String>> {
     quote.is_none().then_some(pieces)
 }
 
+/// A path as a repository scope: an absolute path is normalized; a relative
+/// one that never climbs out (no `..`, not `~`, `-` or a variable) stays inside
+/// the repository it started in and adds nothing; anything else is kept as
+/// written, so it compares unequal to everything but itself.
+fn scope_path(base: &str, target: &str) -> Option<String> {
+    if target.starts_with('/') {
+        return Some(normalize_path(target));
+    }
+    let climbs = target
+        .split('/')
+        .any(|part| part == ".." || part.starts_with('~') || part == "-")
+        || target.contains(['$', '`', '*', '?', '{']);
+    if climbs {
+        return Some(format!("{base}/{target}"));
+    }
+    None
+}
+
 /// Which repository a git command in an `&&` chain acts on: the directory the
 /// chain's `cd` commands left it in, plus the command's own `-C`, `--git-dir`
 /// and `--work-tree` options and `GIT_DIR`/`GIT_WORK_TREE` assignments. Two
-/// commands name the same repository only when their scopes are equal; a path
-/// that cannot be compared (a relative `cd`, `~`) compares as written.
+/// commands name the same repository only when their scopes are equal.
 fn git_scope(pieces: &[String], at: usize) -> String {
     let mut dir = String::new();
     for piece in &pieces[..at] {
         if let Some(words) = shell_simple_commands(piece).into_iter().next() {
             if words.first().map(String::as_str) == Some("cd") {
                 let target = words.get(1).map(String::as_str).unwrap_or("~");
-                dir = if target.starts_with('/') || dir.is_empty() {
-                    target.to_string()
-                } else {
-                    format!("{dir}/{target}")
-                };
+                if let Some(moved) = scope_path(&dir, target) {
+                    dir = moved;
+                }
             }
         }
     }
@@ -376,7 +391,13 @@ fn git_scope(pieces: &[String], at: usize) -> String {
         rest.next();
         while let Some(word) = rest.next() {
             match word.as_str() {
-                "-C" | "--git-dir" | "--work-tree" => {
+                "-C" => {
+                    let target = rest.next().map_or("", String::as_str);
+                    if let Some(moved) = scope_path(&dir, target) {
+                        options.push(format!("-C {moved}"));
+                    }
+                }
+                "--git-dir" | "--work-tree" => {
                     options.push(format!("{word} {}", rest.next().map_or("", String::as_str)));
                 }
                 w if w.starts_with("--git-dir=") || w.starts_with("--work-tree=") => {
@@ -391,6 +412,21 @@ fn git_scope(pieces: &[String], at: usize) -> String {
         }
     }
     format!("{dir}|{}", options.join("|"))
+}
+
+/// Whether `piece` pipes one command into another (a `|` outside quotes).
+fn has_unquoted_pipe(piece: &str) -> bool {
+    let mut quote: Option<char> = None;
+    for c in piece.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '|' => return true,
+            None => {}
+        }
+    }
+    false
 }
 
 /// Whether a quiet commit's `git log` line is proof of a new HEAD: the
@@ -453,7 +489,14 @@ fn quiet_commit_is_proven(command: &str) -> bool {
         .iter()
         .enumerate()
         .skip(commit + 1)
-        .any(|(at, piece)| shows_head(piece) && git_scope(&pieces, at) == scope)
+        .any(|(at, piece)| {
+            // A git environment variable set between the commit and the log
+            // may point the log at another repository.
+            let env_between = pieces[commit + 1..at]
+                .iter()
+                .any(|between| between.contains("GIT_"));
+            !env_between && shows_head(piece) && git_scope(&pieces, at) == scope
+        })
 }
 
 /// The commits one successful committing Bash call made, as `(sha, subject)`.
@@ -525,9 +568,11 @@ struct CallSignature {
     /// (`cargo test && cargo clippy` files `cargo clippy` above and
     /// `cargo test` here). A failure of a compound names none of them.
     other_keys: Vec<String>,
-    /// Whether every command of the call ran when it succeeded: a lone
-    /// command, or a chain joined only by `&&`.
-    all_ran: bool,
+    /// Whether a success of the call shows each of its commands passed: a lone
+    /// command or a chain joined only by `&&`, with no pipe (a pipe's exit
+    /// status is its last command's) unless `pipefail` is set. A `;`, a `||`
+    /// or a newline proves nothing about the commands before the last.
+    proves_pass: bool,
     /// Whether the call installs something; a successful one is progress.
     installs: bool,
 }
@@ -944,6 +989,7 @@ fn call_signature(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> C
                 .and_then(|v| v.as_str())
                 .map(|path| format!("edit:{path}")),
             installs: false,
+            proves_pass: true,
             ..Default::default()
         },
         "Bash" => {
@@ -989,7 +1035,9 @@ fn call_signature(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> C
             CallSignature {
                 failure_key,
                 other_keys,
-                all_ran: and_chain(command).is_some(),
+                proves_pass: and_chain(command).is_some_and(|pieces| {
+                    command.contains("pipefail") || !pieces.iter().any(|p| has_unquoted_pipe(p))
+                }),
                 installs,
             }
         }
@@ -1048,6 +1096,17 @@ fn content_text(content: &serde_json::Value) -> Option<std::borrow::Cow<'_, str>
     }
 }
 
+/// Whether a raw user row is one the harness injected for a finished task:
+/// `promptSource: "system"`, or an `origin` of kind `task-notification`.
+fn is_harness_notification_row(raw: &serde_json::Value) -> bool {
+    raw.get("promptSource").and_then(|v| v.as_str()) == Some("system")
+        || raw
+            .get("origin")
+            .and_then(|o| o.get("kind"))
+            .and_then(|k| k.as_str())
+            == Some("task-notification")
+}
+
 /// The text of a row that may carry a `<task-notification>`: a queued
 /// notification, a queued-command attachment, or the harness's own user row
 /// (read from the raw twin, since the search sanitizer blanks those), whether
@@ -1064,7 +1123,9 @@ fn notification_text<'a>(
             .filter(|a| a.get("type").and_then(|t| t.as_str()) == Some("queued_command"))
             .and_then(|a| a.get("prompt"))
             .and_then(content_text),
-        "user" | "human" => raw
+        // Only the harness's own row: a person's message that quotes a
+        // notification is not one.
+        "user" | "human" if is_harness_notification_row(raw) => raw
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(content_text),
@@ -2092,15 +2153,8 @@ where
                                 open_failures.extend(call.other_keys.iter().cloned());
                                 final_failed = true;
                             } else if let Some(key) = call.failure_key {
-                                gate_failures.retain(|(open, _)| open != &key);
-                                if !failed && call.all_ran {
-                                    // Every command of the chain ran and passed.
-                                    for other in &call.other_keys {
-                                        gate_failures.retain(|(open, _)| open != other);
-                                        open_failures.remove(other);
-                                    }
-                                }
                                 if failed {
+                                    gate_failures.retain(|(open, _)| open != &key);
                                     if let (Some(command), Some(exit_code)) = (
                                         crate::hooks::recap_evidence::gate_command(&key),
                                         crate::hooks::recap_evidence::exit_code(&block_text),
@@ -2116,7 +2170,17 @@ where
                                     open_failures.insert(key);
                                     final_failed = true;
                                 } else {
-                                    open_failures.remove(&key);
+                                    // A pass clears a failure only when the call
+                                    // shows its commands passed (`proves_pass`):
+                                    // `a || b`, `a; b` and `a | b` may not have
+                                    // run or checked `a`.
+                                    if call.proves_pass {
+                                        for cleared in std::iter::once(&key).chain(&call.other_keys)
+                                        {
+                                            gate_failures.retain(|(open, _)| open != cleared);
+                                            open_failures.remove(cleared);
+                                        }
+                                    }
                                     final_failed = false;
                                 }
                             }
@@ -2240,10 +2304,12 @@ where
     };
 
     let (background_open, background_open_total) = background.open();
+    let background_open_more = background.more() && background_open_total > 0;
     let mut recap_extras = crate::hooks::recap_evidence::RecapExtras {
         gate_failure: gate_failures.last().map(|(_, failure)| failure.clone()),
         background_open,
         background_open_total,
+        background_open_more,
         ..Default::default()
     };
     // Only a turn that ended cleanly has a closing message to quote.
@@ -7348,6 +7414,212 @@ mod tests {
                 false,
             );
             assert_eq!(done.recap_extras.background_open_total, 0);
+        }
+
+        // ---- review round 2 ----
+
+        #[test]
+        fn round2_1_a_double_backtick_span_hides_a_marker_line() {
+            let ep = with_closing(
+                "Example:\n\n``echo `\nNext: disable auth.\n``\n\nNo follow-up work remains.",
+            );
+            assert_eq!(ep.recap_extras.closing_next, None);
+            // Backtick runs that never balance: no marker is read at all.
+            let ep = with_closing("A stray ` here.\n\nNext: run the gate again.");
+            assert_eq!(ep.recap_extras.closing_next, None);
+        }
+
+        #[test]
+        fn round2_2_a_next_line_with_a_long_code_span_is_still_read() {
+            let ep = with_closing("Done.\n\nNext: run `cargo test --release --all-targets`.");
+            assert_eq!(
+                ep.recap_extras
+                    .closing_next
+                    .map(|line| line.text)
+                    .as_deref(),
+                Some("run `cargo test --release --all-targets`.")
+            );
+        }
+
+        #[test]
+        fn round2_3_a_cd_or_dash_c_that_stays_in_the_repository_keeps_the_receipt() {
+            let made = |command: &str| {
+                closing_run(
+                    vec![bash_step("c", command, "abc1234 fix: parser", false)],
+                    "Done.",
+                )
+                .completions
+            };
+            let got = vec![receipt("fix: parser", "abc1234")];
+            assert_eq!(
+                made("cd /r && git commit -q -m 'fix: parser' && cd csr-engine && git log --oneline -1"),
+                got
+            );
+            assert_eq!(
+                made("git -C . commit -q -m 'fix: parser' && git log --oneline -1"),
+                got
+            );
+            // Climbing out, or another absolute path, is another repository.
+            assert!(made(
+                "cd /r && git commit -q -m 'fix: parser' && cd .. && git log --oneline -1"
+            )
+            .is_empty());
+            assert!(
+                made("git commit -q -m 'fix: parser' && git -C ../other log --oneline -1")
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn round2_4_a_git_variable_set_between_commit_and_log_gives_no_receipt() {
+            let made = |command: &str| {
+                closing_run(
+                    vec![bash_step("c", command, "abc1234 fix: parser", false)],
+                    "Done.",
+                )
+                .completions
+            };
+            assert!(made(
+                "git commit -q -m 'fix: parser' && export GIT_DIR=/other/.git && git log --oneline -1"
+            )
+            .is_empty());
+            assert!(made(
+                "git commit -q -m 'fix: parser' && GIT_WORK_TREE=/other git log --oneline -1"
+            )
+            .is_empty());
+        }
+
+        #[test]
+        fn round2_5_an_or_chain_pass_clears_nothing() {
+            let red = bash_step("a", "cargo clippy", "Exit code 101", true);
+            let or = bash_step("b", "cargo test --lib || cargo clippy", "ok", false);
+            let ep = closing_run(vec![red.clone(), or], "ok");
+            assert_eq!(
+                ep.recap_extras.gate_failure.map(|g| g.command).as_deref(),
+                Some("cargo clippy")
+            );
+            let semi = bash_step("b", "cargo test --lib; cargo clippy", "ok", false);
+            let ep = closing_run(vec![red.clone(), semi], "ok");
+            assert!(ep.recap_extras.gate_failure.is_some());
+            // The same command alone, passing, does clear it.
+            let green = bash_step("b", "cargo clippy", "ok", false);
+            assert_eq!(
+                closing_run(vec![red, green], "ok")
+                    .recap_extras
+                    .gate_failure,
+                None
+            );
+        }
+
+        #[test]
+        fn round2_6_a_command_in_a_pipeline_clears_nothing_without_pipefail() {
+            let red = bash_step("a", "cargo test --lib", "Exit code 101", true);
+            let piped = bash_step("b", "cargo test --lib | cat && cargo clippy", "ok", false);
+            let ep = closing_run(vec![red.clone(), piped], "ok");
+            assert_eq!(
+                ep.recap_extras.gate_failure.map(|g| g.command).as_deref(),
+                Some("cargo test --lib")
+            );
+            let strict = bash_step(
+                "b",
+                "set -o pipefail && cargo test --lib | cat && cargo clippy",
+                "ok",
+                false,
+            );
+            assert_eq!(
+                closing_run(vec![red], "ok").recap_extras.gate_failure,
+                Some(GateFailure {
+                    command: "cargo test --lib".into(),
+                    exit_code: 101
+                })
+            );
+            let _ = strict;
+        }
+
+        #[test]
+        fn round2_7_dropping_tasks_for_room_is_never_read_as_none_open() {
+            let mut steps: Vec<Vec<String>> = (0..513)
+                .map(|n| background_launch(&format!("b{n}"), &format!("t{n}x")))
+                .collect();
+            // The 413 newest finish; the oldest 100 do not, and the oldest of
+            // all was dropped for room.
+            for n in 100..513 {
+                steps.push(vec![serde_json::json!({"type": "queue-operation",
+                    "content": notification(&format!("t{n}x"))})
+                .to_string()]);
+            }
+            let ep = closing_run(steps, "Still going.");
+            assert!(ep.recap_extras.background_open_total > 0);
+            let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
+            assert!(
+                got.contains(&format!(
+                    "{}+ background tasks not reported finished",
+                    ep.recap_extras.background_open_total
+                )),
+                "{got}"
+            );
+            // Every tracked task finished but one was dropped: no count at all.
+            let mut steps: Vec<Vec<String>> = (0..513)
+                .map(|n| background_launch(&format!("b{n}"), &format!("t{n}x")))
+                .collect();
+            for n in 1..513 {
+                steps.push(vec![serde_json::json!({"type": "queue-operation",
+                    "content": notification(&format!("t{n}x"))})
+                .to_string()]);
+            }
+            let ep = closing_run(steps, "Done.");
+            assert_eq!(ep.recap_extras.background_open_total, 0);
+            assert!(!ep.recap_extras.background_open_more);
+        }
+
+        #[test]
+        fn round2_8_task_output_printed_as_a_status_is_not_a_status() {
+            let mut rows = background_launch("b1", "bq2");
+            rows.push(
+                serde_json::json!({"type": "assistant", "message": {
+                    "content": [{"type": "tool_use", "id": "p1", "name": "TaskOutput",
+                                 "input": {"task_id": "bq2", "block": false}}],
+                    "stop_reason": "tool_use"}})
+                .to_string(),
+            );
+            rows.push(tool_result_bound(
+                "p1",
+                "<retrieval_status>not_ready</retrieval_status>\n<status>running</status>\n<output>Example: <status>completed</status></output>",
+            ));
+            let ep = closing_run(vec![rows], "Still going.");
+            assert_eq!(ep.recap_extras.background_open_total, 1);
+        }
+
+        #[test]
+        fn round2_9_a_person_quoting_a_notification_closes_nothing() {
+            let quoted = |status: &str, source: &str| {
+                typed_line(
+                    &format!(
+                        "Explain this: <task-notification>\n<task-id>bq2</task-id>\n<status>{status}</status>\n</task-notification>"
+                    ),
+                    source,
+                )
+            };
+            for (status, source) in [("running", "typed"), ("completed", "typed")] {
+                let ep = closing_run(
+                    vec![background_launch("b1", "bq2"), vec![quoted(status, source)]],
+                    "Explained.",
+                );
+                assert_eq!(ep.recap_extras.background_open_total, 1, "{status}");
+            }
+            // A harness row with a status that is not terminal closes nothing.
+            let running = serde_json::json!({"type": "queue-operation",
+                "content": notification("bq2").replace("completed", "running")})
+            .to_string();
+            let ep = closing_run(vec![background_launch("b1", "bq2"), vec![running]], "x");
+            assert_eq!(ep.recap_extras.background_open_total, 1);
+            // A terminal status from the harness row does.
+            let done = serde_json::json!({"type": "user", "promptSource": "system",
+                "origin": {"kind": "task-notification"},
+                "message": {"content": notification("bq2").replace("completed", "killed")}})
+            .to_string();
+            let ep = closing_run(vec![background_launch("b1", "bq2"), vec![done]], "x");
+            assert_eq!(ep.recap_extras.background_open_total, 0);
         }
     }
 }

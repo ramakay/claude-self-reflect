@@ -824,8 +824,10 @@ fn background_entry(ep: &crate::hooks::stop::Episode) -> Option<String> {
     let total = extras
         .background_open_total
         .max(extras.background_open.len());
-    Some(if total > 1 {
-        format!("{total} background tasks not reported finished, newest: {label} ({id})")
+    let more = ep.recap_extras.background_open_more;
+    Some(if total > 1 || more {
+        let plus = if more { "+" } else { "" };
+        format!("{total}{plus} background tasks not reported finished, newest: {label} ({id})")
     } else {
         format!("background task not reported finished: {label} ({id})")
     })

@@ -34,6 +34,14 @@ pub struct RecapExtras {
     /// Total background tasks not closed (may exceed `background_open.len()`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub background_open_total: usize,
+    /// More tasks may be open than `background_open_total` counts: some were
+    /// dropped for room, so the total is a lower bound.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background_open_more: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -131,10 +139,18 @@ static STOPPED_RE: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 static FINAL_STATUS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)<status>\s*(?:completed|failed|killed|cancelled|canceled|stopped|exited)\s*</status>",
-    )
-    .unwrap()
+    Regex::new(r"(?i)<status>\s*(?:completed|failed|killed|stopped)\s*</status>").unwrap()
+});
+/// Text a task printed, which must never be read as the envelope around it.
+static TASK_OUTPUT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<output>.*?(?:</output>|$)").unwrap());
+/// One notification envelope, whole.
+static ENVELOPE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<task-notification>(.*?)</task-notification>").unwrap());
+/// The free-text parts of an envelope, which are not its status.
+static ENVELOPE_BODY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<(?:summary|output|note|result)>.*?(?:</(?:summary|output|note|result)>|$)")
+        .unwrap()
 });
 
 impl CloseKind {
@@ -142,7 +158,8 @@ impl CloseKind {
     fn shows_end(self, result: &str) -> bool {
         match self {
             CloseKind::Stop => STOPPED_RE.is_match(result),
-            CloseKind::Output => FINAL_STATUS_RE.is_match(result),
+            // The status is the envelope's own: what the task printed is cut.
+            CloseKind::Output => FINAL_STATUS_RE.is_match(&TASK_OUTPUT_RE.replace_all(result, "")),
         }
     }
 }
@@ -164,20 +181,28 @@ pub(crate) struct BackgroundTracker {
     pending: HashMap<String, (CloseKind, Vec<String>)>,
     /// Next launch order.
     seq: u64,
+    /// Open tasks dropped for room: the tracked count is then a lower bound.
+    evicted: usize,
+    /// Close evidence was lost: nothing is claimed about what is open.
+    unreliable: bool,
 }
 
-/// Drops the oldest entry of `map` while it holds more than [`MAX_TRACKED`].
-fn bound<V>(map: &mut HashMap<String, (u64, V)>) {
+/// Drops the oldest entry of `map` while it holds more than [`MAX_TRACKED`],
+/// and says how many it dropped.
+fn bound<V>(map: &mut HashMap<String, (u64, V)>) -> usize {
+    let mut dropped = 0;
     while map.len() > MAX_TRACKED {
         let Some(oldest) = map
             .iter()
             .min_by_key(|(_, (order, _))| *order)
             .map(|(key, _)| key.clone())
         else {
-            return;
+            return dropped;
         };
         map.remove(&oldest);
+        dropped += 1;
     }
+    dropped
 }
 
 impl BackgroundTracker {
@@ -230,7 +255,9 @@ impl BackgroundTracker {
             return;
         }
         if self.pending.len() >= MAX_TRACKED {
-            self.pending.clear();
+            // A close that was dropped would leave a finished task open.
+            self.unreliable = true;
+            return;
         }
         self.pending.insert(call_id.to_string(), (kind, named));
     }
@@ -257,22 +284,44 @@ impl BackgroundTracker {
             .map(|caps| caps[1].to_string());
         if let Some(task) = task {
             self.open.insert(task, (order, label));
-            bound(&mut self.open);
+            self.evicted += bound(&mut self.open);
         }
     }
 
-    /// Any row text that may carry a `<task-notification>`.
+    /// The text of a harness-injected row. It closes the tasks of the
+    /// notifications it consists of and nothing else: the text must be nothing
+    /// but whole `<task-notification>` envelopes (a user quoting one, with
+    /// words around it, is not the harness), and an envelope closes its task
+    /// only with a terminal status read outside its summary, output and note.
     pub(crate) fn notification(&mut self, text: &str) {
-        if !text.contains("<task-notification>") {
+        let text = text.trim();
+        if !text.starts_with("<task-notification>") {
             return;
         }
-        for caps in NOTIFICATION_RE.captures_iter(text) {
-            self.open.remove(&caps[1]);
+        if !ENVELOPE_RE.replace_all(text, "").trim().is_empty() {
+            return;
         }
+        for envelope in ENVELOPE_RE.captures_iter(text) {
+            let head = ENVELOPE_BODY_RE.replace_all(&envelope[1], "");
+            let Some(task) = NOTIFICATION_RE.captures(&head) else {
+                continue;
+            };
+            if FINAL_STATUS_RE.is_match(&head) {
+                self.open.remove(&task[1]);
+            }
+        }
+    }
+
+    /// Whether the tracked count is a lower bound: tasks were dropped for room.
+    pub(crate) fn more(&self) -> bool {
+        self.evicted > 0
     }
 
     /// `(open tasks newest first, at most MAX_BACKGROUND; total open tracked)`.
     pub(crate) fn open(&self) -> (Vec<BackgroundTask>, usize) {
+        if self.unreliable {
+            return (Vec::new(), 0);
+        }
         let mut open: Vec<(&String, &(u64, String))> = self.open.iter().collect();
         open.sort_by_key(|(_, (order, _))| std::cmp::Reverse(*order));
         let total = open.len();
@@ -342,57 +391,148 @@ pub(crate) struct ClosingMarkers {
     pub open: Option<String>,
 }
 
-fn without_backticks(text: &str) -> String {
-    text.chars().filter(|c| *c != '`').collect()
+/// `(byte offset, length)` of each run of backticks in `line`.
+fn backtick_runs(line: &str) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+    for (at, c) in line.char_indices() {
+        match (c == '`', start) {
+            (true, None) => start = Some(at),
+            (false, Some(from)) => {
+                runs.push((from, at - from));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = start {
+        runs.push((from, line.len() - from));
+    }
+    runs
 }
 
-/// Whether a backtick run toggles inline code on this line, carried over from
-/// `in_code` at its start.
-fn inline_code_after(line: &str, mut in_code: bool) -> bool {
-    let mut previous_tick = false;
-    for c in line.chars() {
-        let tick = c == '`';
-        if tick && !previous_tick {
-            in_code = !in_code;
+/// The code span still open after `line`, given the one open before it
+/// (CommonMark: a run of `n` backticks opens a span that only a run of exactly
+/// `n` closes; any other run inside is literal).
+fn advance_code(line: &str, mut open: Option<usize>) -> Option<usize> {
+    for (_, len) in backtick_runs(line) {
+        match open {
+            None => open = Some(len),
+            Some(n) if n == len => open = None,
+            Some(_) => {}
         }
-        previous_tick = tick;
     }
-    in_code
+    open
+}
+
+/// The prose of a line outside its code spans, as fragments in order.
+fn prose_fragments(line: &str) -> Vec<String> {
+    let mut fragments = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut from = 0;
+    for (start, len) in backtick_runs(line) {
+        match open {
+            None => {
+                fragments.push(line[from..start].to_string());
+                open = Some(len);
+            }
+            Some(n) if n == len => {
+                open = None;
+                from = start + len;
+            }
+            Some(_) => {}
+        }
+    }
+    if open.is_none() {
+        fragments.push(line[from..].to_string());
+    }
+    fragments
+        .into_iter()
+        .map(|fragment| fragment.trim().to_string())
+        .filter(|fragment| !fragment.is_empty())
+        .collect()
+}
+
+/// Whether the prose of a marker line outside its code spans survived
+/// provenance cleaning: every fragment is found, in order, on one cleaned line.
+/// Cleaning drops long inline code, so the code itself is not compared.
+fn prose_survives(line: &str, cleaned_lines: &[&str]) -> bool {
+    let fragments = prose_fragments(line);
+    !fragments.is_empty()
+        && cleaned_lines.iter().any(|cleaned| {
+            let mut at = 0;
+            fragments.iter().all(|fragment| {
+                cleaned[at..].find(fragment.as_str()).is_some_and(|found| {
+                    at += found + fragment.len();
+                    true
+                })
+            })
+        })
+}
+
+/// Whether the backtick runs and fences of `text` balance: every code span
+/// closes within its paragraph and every fence closes.
+fn code_balances(text: &str) -> bool {
+    let mut fenced = false;
+    let mut open: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            if open.is_some() {
+                return false;
+            }
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        if trimmed.is_empty() {
+            if open.is_some() {
+                return false;
+            }
+            continue;
+        }
+        open = advance_code(trimmed, open);
+    }
+    open.is_none() && !fenced
 }
 
 /// The last marker line of each kind in `raw` (the assistant's closing
 /// message as written), as the whole sentence(s) after the marker. A marker
 /// counts only at the start of a line (after a bullet and emphasis), outside
 /// inline code, code fences, blockquotes and indented code, and not as an item
-/// of a numbered list (where "Next" only orders the items). The line must also
-/// survive provenance cleaning (`cleaned`), so CSR's own quoted words are never
-/// read as the assistant's. A kind is `None` when it has no such line or what
-/// follows is empty, a question, "none", or CSR's own text.
+/// of a numbered list (where "Next" only orders the items). The line's prose
+/// must also survive provenance cleaning (`cleaned`), so CSR's own quoted words
+/// are never read as the assistant's. A message whose backtick runs or fences
+/// do not balance gives no marker at all. A kind is `None` when it has no such
+/// line or what follows is empty, a question, "none", or CSR's own text.
 pub(crate) fn closing_markers(raw: &str, cleaned: &str) -> ClosingMarkers {
-    let kept: std::collections::HashSet<String> = cleaned
-        .lines()
-        .map(|line| without_backticks(line).trim().to_string())
-        .collect();
+    let mut found = ClosingMarkers::default();
+    if !code_balances(raw) {
+        return found;
+    }
+    let cleaned_lines: Vec<&str> = cleaned.lines().map(str::trim).collect();
     let lines: Vec<&str> = raw.lines().collect();
     let mut fenced = false;
-    let mut in_code = false;
-    let mut found = ClosingMarkers::default();
+    let mut open: Option<usize> = None;
     for (at, raw_line) in lines.iter().enumerate() {
         let trimmed = raw_line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             fenced = !fenced;
-            in_code = false;
+            continue;
+        }
+        if fenced {
             continue;
         }
         // A line that opens inside an inline code span is code, not a marker.
-        let starts_in_code = in_code;
-        in_code = if trimmed.is_empty() {
-            false
+        let starts_in_code = open.is_some();
+        open = if trimmed.is_empty() {
+            None
         } else {
-            inline_code_after(trimmed, in_code)
+            advance_code(trimmed, open)
         };
-        if fenced
-            || starts_in_code
+        if starts_in_code
             || trimmed.starts_with('>')
             || trimmed.starts_with('|')
             || trimmed.starts_with('#')
@@ -409,7 +549,7 @@ pub(crate) fn closing_markers(raw: &str, cleaned: &str) -> ClosingMarkers {
         let Some((kind, content)) = marker_content(body, &lower) else {
             continue;
         };
-        if !kept.contains(without_backticks(trimmed).trim()) {
+        if !prose_survives(trimmed, &cleaned_lines) {
             continue;
         }
         let mut content = content.trim().to_string();
@@ -726,7 +866,7 @@ mod tests {
         let (open, _) = tracker.open();
         assert_eq!(open[0].id, "a4c996de2463be3d6");
         tracker.notification(
-            "<task-notification><task-id>a4c996de2463be3d6</task-id></task-notification>",
+            "<task-notification><task-id>a4c996de2463be3d6</task-id><status>completed</status></task-notification>",
         );
         assert_eq!(tracker.open().1, 0);
     }
