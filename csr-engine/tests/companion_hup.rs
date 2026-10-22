@@ -45,11 +45,11 @@ impl Pane {
     /// controlling terminal in a session of its own, as in a terminal emulator: its hangup then
     /// also sends SIGHUP.
     fn start(controlling: bool) -> Self {
-        Self::start_as(controlling, None)
+        Self::start_with(controlling, &[])
     }
-    /// With `stick`, the pane's loop is made to stick (`CSR_PANE_TEST_STICK`), to see what the
-    /// watchdog does when the loop itself cannot end the pane.
-    fn start_as(controlling: bool, stick: Option<&str>) -> Self {
+    /// With `envs` set in the pane's environment: the seams of the tests that make its loop stick
+    /// (`CSR_PANE_TEST_STICK`), or arm an alarm before a reload (`CSR_PANE_TEST_ALARM`).
+    fn start_with(controlling: bool, envs: &[(&str, &str)]) -> Self {
         let spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let (mut master, mut slave) = (0, 0);
@@ -93,9 +93,7 @@ impl Pane {
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap());
-        if let Some(stick) = stick {
-            command.env("CSR_PANE_TEST_STICK", stick);
-        }
+        command.envs(envs.iter().copied());
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("HERDR") {
                 command.env_remove(key);
@@ -316,7 +314,7 @@ fn a_pane_on_a_live_terminal_stays_up_at_low_cpu() {
 /// hangup that came after the loop looked). The watchdog ends it, and cleans up as a clean exit does.
 #[test]
 fn a_pane_stuck_after_its_terminal_hung_up_is_ended_by_the_watchdog() {
-    let mut pane = Pane::start_as(false, Some("ending"));
+    let mut pane = Pane::start_with(false, &[("CSR_PANE_TEST_STICK", "ending")]);
     pane.close_terminal();
     assert!(
         pane.ends_within(Duration::from_secs(6)).is_some(),
@@ -327,7 +325,7 @@ fn a_pane_stuck_after_its_terminal_hung_up_is_ended_by_the_watchdog() {
 
 #[test]
 fn a_stuck_pane_is_ended_by_the_watchdog_on_sigterm_and_gives_the_terminal_back() {
-    let mut pane = Pane::start_as(false, Some("ending"));
+    let mut pane = Pane::start_with(false, &[("CSR_PANE_TEST_STICK", "ending")]);
     pane.terminate();
     assert!(
         pane.ends_within(Duration::from_secs(6)).is_some(),
@@ -341,9 +339,50 @@ fn a_stuck_pane_is_ended_by_the_watchdog_on_sigterm_and_gives_the_terminal_back(
 /// A pane that is only busy, with a live terminal and no end asked for, is never ended.
 #[test]
 fn a_busy_pane_on_a_live_terminal_is_left_alone() {
-    let mut pane = Pane::start_as(false, Some("busy"));
+    let mut pane = Pane::start_with(false, &[("CSR_PANE_TEST_STICK", "busy")]);
     assert!(
         pane.ends_within(Duration::from_secs(8)).is_none(),
         "the watchdog ended a pane that was only busy"
+    );
+}
+
+/// The executable a process runs, as `ps` names it.
+fn running(pid: u32) -> String {
+    let out = Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// An alarm armed before a reload (as the watchdog arms one to bound its write to the terminal)
+/// survives the exec: it must not be left to kill the engine that replaces the pane.
+#[test]
+fn a_reload_with_an_alarm_armed_leaves_the_new_engine_alive() {
+    let mut pane = Pane::start_with(false, &[("CSR_PANE_TEST_ALARM", "1")]);
+    let engine = pane.home.path().join("csr-engine-reloaded");
+    fs::copy(env!("CARGO_BIN_EXE_csr-engine"), &engine).unwrap();
+    fs::write(
+        pane.home
+            .path()
+            .join(".claude-self-reflect/csr-companion/pane-engine"),
+        engine.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    let pid = pane.child.id();
+    let start = Instant::now();
+    while !running(pid).ends_with("csr-engine-reloaded")
+        && start.elapsed() < Duration::from_secs(15)
+    {
+        assert!(pane.child.try_wait().unwrap().is_none(), "the pane died");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        running(pid).ends_with("csr-engine-reloaded"),
+        "the pane did not reload"
+    );
+    assert!(
+        pane.ends_within(Duration::from_secs(3)).is_none(),
+        "the engine that replaced the pane was killed by the old one's alarm"
     );
 }

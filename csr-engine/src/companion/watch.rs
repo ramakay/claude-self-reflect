@@ -51,13 +51,25 @@ extern "C" fn ending(_: libc::c_int) {
 /// with POLLHUP. Nothing else tells a pane: the terminal's reads return end of file, which
 /// crossterm's reader takes for "nothing yet" and retries at once, so a pane that is inside its
 /// `poll` when this happens never comes back out of it (and never sees SIGTERM's flag). So every
-/// call into crossterm is made only after this has said no. A stdin that is not a terminal is
-/// never gone.
+/// call into crossterm is made only after this has said no. A stdin that was never a terminal
+/// is never gone. One that was a terminal at the start (`TTY`) is gone once the kernel says
+/// POLLHUP or POLLERR, or once it is no longer one at all: on Linux the ioctls of a hung-up
+/// terminal fail, and `isatty` with them.
 fn tty_gone() -> bool {
-    unsafe {
-        libc::isatty(libc::STDIN_FILENO) == 1
-            && wait_on(libc::STDIN_FILENO, Duration::ZERO) == Input::Gone
-    }
+    lost(
+        TTY.load(Ordering::Relaxed),
+        // An interrupted ioctl is no hangup.
+        unsafe {
+            libc::isatty(libc::STDIN_FILENO) == 1
+                || io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+        },
+        || wait_on(libc::STDIN_FILENO, Duration::ZERO),
+    )
+}
+/// Whether stdin was a terminal when the pane started.
+static TTY: AtomicBool = AtomicBool::new(false);
+fn lost(was_terminal: bool, is_terminal: bool, look: impl FnOnce() -> Input) -> bool {
+    was_terminal && (!is_terminal || look() == Input::Gone)
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Input {
@@ -123,6 +135,7 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
         let raw = io::stdin().is_terminal();
+        TTY.store(raw, Ordering::Relaxed);
         let guard = Self { raw };
         guard.resume()?;
         Ok(guard)
@@ -685,9 +698,17 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                     if stopping() {
                         break;
                     }
+                    // The watchdog's alarm outlives an exec: it stands down before one, and is
+                    // armed again if the exec fails.
+                    watchdog.stop();
+                    // For tests: an alarm armed as the watchdog's is, to see it does not outlive the exec.
+                    if std::env::var_os("CSR_PANE_TEST_ALARM").is_some() {
+                        unsafe { libc::alarm(1) };
+                    }
                     TerminalGuard::restore();
                     reload_error = Some(failed_exec(
                         || {
+                            unsafe { libc::alarm(0) };
                             std::process::Command::new(&exe)
                                 .args(std::env::args_os().skip(1))
                                 .env(HOME_ENGINE, &home)
@@ -695,6 +716,10 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                         },
                         || terminal.resume(),
                     ));
+                    watchdog = Watchdog::start(
+                        wake_pipe.as_ref().and_then(wake::Listener::cleaner),
+                        mine.path.clone(),
+                    );
                     drawn = None;
                 }
                 Err(error) => reload_error = Some(format!("engine reload: {error}")),
@@ -957,6 +982,20 @@ mod tests {
             1 << 20
         );
         assert_eq!(fs::read_to_string(log).unwrap(), "after token=[redacted]\n");
+    }
+    #[test]
+    fn test_a_terminal_that_stops_being_one_is_gone_and_a_stdin_that_never_was_is_not() {
+        let gone = || Input::Gone;
+        let quiet = || Input::Quiet;
+        // Linux: the hangup makes isatty fail.
+        assert!(lost(true, false, quiet));
+        // macOS: isatty holds and poll says hangup.
+        assert!(lost(true, true, gone));
+        // A live terminal.
+        assert!(!lost(true, true, quiet));
+        // Redirected input never counts, whatever poll would say of a closed pipe.
+        assert!(!lost(false, false, gone));
+        assert!(!lost(false, true, gone));
     }
     #[test]
     fn test_a_descriptor_poll_cannot_watch_is_slept_on_not_spun_on() {
