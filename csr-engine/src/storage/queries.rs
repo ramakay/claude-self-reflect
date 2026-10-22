@@ -2165,7 +2165,8 @@ pub fn fts5_reflection_prefix_matches(
                 AND tags NOT LIKE '%\"session_story\"%'
                 AND tags NOT LIKE '%\"session_episode\"%'
                 AND tags NOT LIKE '%\"session_briefing\"%'
-                AND tags NOT LIKE '%\"context_cache\"%'))
+                AND tags NOT LIKE '%\"context_cache\"%'
+                AND tags NOT LIKE '%\"narrative\\_%' ESCAPE '\\'))
          ORDER BY timestamp DESC LIMIT ?3",
     )?;
     let rows = stmt
@@ -6147,6 +6148,39 @@ mod tests {
             &[0.1; 4],
         )
         .unwrap();
+        let matches =
+            fts5_reflection_prefix_matches(&conn, "why did we drop Docker and Qdrant", 10).unwrap();
+        assert_eq!(
+            matches,
+            vec!["5eb5aebb-65ab-4fba-9917-86cb83845154".to_string()]
+        );
+    }
+
+    /// Derived rows are excluded in SQL, before the fetch cap: a run of newer
+    /// derived prefix matches must not push an older explicit memory out of
+    /// the rows the filter ever sees.
+    #[test]
+    fn newer_derived_prefix_matches_do_not_starve_an_older_explicit_memory() {
+        let conn = mem();
+        insert_reflection(
+            &conn,
+            "5eb5aebb-65ab-4fba-9917-86cb83845154",
+            "why did we drop Docker and Qdrant: install burden",
+            &["csr:memory".to_string()],
+            &[0.1; 4],
+        )
+        .unwrap();
+        for i in 0..12 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            insert_reflection(
+                &conn,
+                &format!("extracted_v3_{i}"),
+                "why did we drop Docker and Qdrant? the extraction restates it",
+                &["narrative_extracted_v3".to_string()],
+                &[0.1; 4],
+            )
+            .unwrap();
+        }
         let matches =
             fts5_reflection_prefix_matches(&conn, "why did we drop Docker and Qdrant", 10).unwrap();
         assert_eq!(
