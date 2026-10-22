@@ -699,10 +699,15 @@ mod tests {
             // The socket file appears at bind(2), before listen(2), so `ready` can return while
             // connect is still refused. Probing with a connect would take the daemon's only
             // request slot, so the retry lives here instead.
+            let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             let mut stream = loop {
                 match tokio::net::UnixStream::connect(socket_path(dir.path())).await {
                     Ok(stream) => break stream,
                     Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        assert!(
+                            tokio::time::Instant::now() < connect_deadline,
+                            "the daemon socket still refused connections after 10 s ({key})"
+                        );
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                     Err(e) => panic!("{e}"),
