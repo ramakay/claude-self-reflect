@@ -2323,6 +2323,13 @@ impl Storage {
         codegraph::live_since(&conn, project, file, since_ns)
     }
 
+    /// Projects whose resolve inputs changed since a pass last covered them
+    /// (see `codegraph::dirty_projects`).
+    pub fn dirty_graph_projects(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::dirty_projects(&conn, codegraph::now_secs())
+    }
+
     /// Files an extraction changed that no resolve has covered yet.
     pub fn pending_resolve_files(&self) -> Result<Vec<(String, String, i64)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;

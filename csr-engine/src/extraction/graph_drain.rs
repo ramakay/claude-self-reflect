@@ -177,7 +177,12 @@ pub fn drain_outcome(storage: &Storage, db_path: &Path) -> Result<Outcome> {
 fn drain_unrecorded(storage: &Storage, db_path: &Path) -> Result<Outcome> {
     // A queued snapshot counts although every file may read as settled: it has
     // not been extracted, so no generation covers it yet.
-    if storage.pending_resolve_files()?.is_empty() && !snapshots_waiting(storage, db_path)? {
+    // So does a project whose resolve inputs moved with no file pending: a repo
+    // scan or a co-edit replay writes tables the resolve reads and queues no file.
+    if storage.pending_resolve_files()?.is_empty()
+        && !snapshots_waiting(storage, db_path)?
+        && storage.dirty_graph_projects()?.is_empty()
+    {
         return Ok(Outcome::Idle);
     }
     let data_dir = db_path.parent().unwrap_or(Path::new("."));
@@ -304,7 +309,13 @@ pub fn drain_with(
     extract_snapshots(conn, spool.as_deref(), None, &mut out)?;
     between(Phase::QueueExtracted);
     let pending = codegraph::pending_resolve_files(conn)?;
-    let mut projects: Vec<&str> = pending.iter().map(|(p, _, _)| p.as_str()).collect();
+    let dirty = codegraph::dirty_projects(conn, codegraph::now_secs())?;
+    let mut projects: Vec<&str> = pending
+        .iter()
+        .map(|(p, _, _)| p.as_str())
+        .chain(dirty.iter().map(String::as_str))
+        .collect();
+    projects.sort_unstable();
     projects.dedup();
 
     for project in projects {
@@ -411,6 +422,14 @@ fn extract_one(conn: &Connection, s: &codegraph::Snapshot) -> Result<bool> {
     ))
 }
 
+/// Whether the project's resolve inputs moved since a pass last covered them
+/// (`codegraph::dirty_projects`).
+fn project_dirty(conn: &Connection, project: &str) -> Result<bool> {
+    Ok(codegraph::dirty_projects(conn, codegraph::now_secs())?
+        .iter()
+        .any(|p| p == project))
+}
+
 /// Whether an edit of `project` is waiting that a plan made now would not
 /// contain: a queued snapshot, or a spool record not ingested yet.
 fn edits_waiting(conn: &Connection, project: &str, spool: Option<&Path>) -> Result<bool> {
@@ -447,7 +466,7 @@ fn drain_project(
         // Read after the extractions, so the generations settled below are the
         // ones this plan covers.
         let files = codegraph::pending_resolve_files_for(conn, project)?;
-        if files.is_empty() {
+        if files.is_empty() && !project_dirty(conn, project)? {
             return Ok(());
         }
         let read = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
@@ -466,13 +485,15 @@ fn drain_project(
             continue;
         }
         let skipped = apply_planned(&write, &writes)?;
+        // The counters this pass covers: the plan's, plus the apply's own bumps.
+        let covered = codegraph::project_gen_parts(&write, project)?;
         write.commit()?;
         out.longest_lock_hold = out.longest_lock_hold.max(lock_started.elapsed());
         out.edge_writes += writes.len();
-        applied = Some((files, skipped));
+        applied = Some((files, skipped, covered));
         break;
     }
-    let Some((files, skipped)) = applied else {
+    let Some((files, skipped, covered)) = applied else {
         return drain_project_locked(conn, project, spool, file_exists, out);
     };
     let files: Vec<&(String, String, i64)> = files.iter().collect();
@@ -495,6 +516,9 @@ fn drain_project(
         }
         write_rank_rows(&write, &changed)?;
         out.files += settle(&write, &files, skipped)?;
+        if skipped == 0 {
+            codegraph::mark_project_settled(&write, project, covered)?;
+        }
         write.commit()?;
         out.longest_lock_hold = out.longest_lock_hold.max(lock_started.elapsed());
         out.rank_writes += changed.len();
@@ -534,6 +558,10 @@ fn drain_project_locked(
     let changed = changed_rank_rows(&write, rank_rows(&write, project)?)?;
     write_rank_rows(&write, &changed)?;
     let settled = settle(&write, &files, skipped)?;
+    if skipped == 0 {
+        let covered = codegraph::project_gen_parts(&write, project)?;
+        codegraph::mark_project_settled(&write, project, covered)?;
+    }
     write.commit()?;
     graph_spool::remove(&spooled);
     out.extracted += extraction.extracted;
@@ -1384,5 +1412,179 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// A late arrival (a delayed hook, a spooled record) must not evict the
+    /// newest version of a file: with versions 2..=65 waiting, version 1 is
+    /// dropped and the drain still ends on version 65.
+    #[test]
+    fn a_late_snapshot_never_evicts_the_newest_version() {
+        let (_keep, dir, storage) = fixture();
+        storage
+            .with_connection(|conn| {
+                let path = dir.join("a.rs").to_string_lossy().into_owned();
+                let t = codegraph::now_ns();
+                let last = codegraph::MAX_SNAPSHOTS_PER_FILE + 1;
+                for i in 2..=last {
+                    codegraph::insert_snapshot(
+                        conn,
+                        &snapshot_of(&path, t + i, &format!("fn v{i}() {{}}\n"), None),
+                    )?;
+                }
+                codegraph::insert_snapshot(conn, &snapshot_of(&path, t + 1, "fn v1() {}\n", None))?;
+                assert_eq!(
+                    graph_rows_total(conn, "code_graph_snapshots"),
+                    codegraph::MAX_SNAPSHOTS_PER_FILE
+                );
+                extract_all_snapshots(conn)?;
+                assert_eq!(function_names(conn), [format!("v{last}")]);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// An arrival at or below the file's high-water mark was already superseded:
+    /// it is dropped on arrival, not queued, and evicts nothing.
+    #[test]
+    fn a_snapshot_below_the_high_water_mark_is_not_queued() {
+        let (_keep, dir, storage) = fixture();
+        storage
+            .with_connection(|conn| {
+                let path = dir.join("a.rs").to_string_lossy().into_owned();
+                let t = codegraph::now_ns();
+                codegraph::insert_snapshot(
+                    conn,
+                    &snapshot_of(&path, t + 5, "fn new() {}\n", None),
+                )?;
+                extract_all_snapshots(conn)?;
+                codegraph::insert_snapshot(
+                    conn,
+                    &snapshot_of(&path, t + 2, "fn old() {}\n", None),
+                )?;
+                assert_eq!(graph_rows_total(conn, "code_graph_snapshots"), 0);
+                extract_all_snapshots(conn)?;
+                assert_eq!(function_names(conn), ["new"]);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn mystery_edge(storage: &Storage) -> (String, String, String, i64) {
+        storage
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT dst_id, COALESCE(callee_kind,''), COALESCE(evidence,''), resolved
+                     FROM code_edges WHERE src_id = 'caller' AND dst_id LIKE '%mystery'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?)
+            })
+            .unwrap()
+    }
+
+    /// A write the resolve reads but that queues no file (a repo scan, a co-edit
+    /// replay) is work: one drain tick after everything has settled re-resolves
+    /// the project, and then the project is idle again.
+    #[test]
+    fn a_repo_scan_after_everything_settled_gets_one_resolve_pass() {
+        let (_dir, db, storage) = extracted();
+        storage
+            .with_connection(|c| {
+                codegraph::replace_file_edges(
+                    c,
+                    "proj",
+                    "b.rs",
+                    &[
+                        call("caller", "callee", "b.rs"),
+                        call("caller", "mystery", "b.rs"),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .upsert_code_file_state_pending("proj", "b.rs", "hash-2")
+            .unwrap();
+        assert!(drain_if_pending(&storage, &db).unwrap().is_some());
+        assert!(pending(&storage).is_empty());
+        // Settled: nothing to do.
+        assert!(drain_if_pending(&storage, &db).unwrap().is_none());
+        let before = mystery_edge(&storage);
+
+        // The repo scan finds `mystery` defined in a file the graph has no nodes for.
+        storage
+            .upsert_repo_defs(
+                "proj",
+                "other.rs",
+                &[("mystery".into(), "function".into(), "rust".into())],
+            )
+            .unwrap();
+        assert!(pending(&storage).is_empty(), "no file is queued by a scan");
+
+        let report = drain_if_pending(&storage, &db).unwrap();
+        assert!(report.is_some(), "the scan left the drain idle");
+        assert_ne!(mystery_edge(&storage), before, "the resolve did not rerun");
+        // One pass settles it.
+        assert!(drain_if_pending(&storage, &db).unwrap().is_none());
+    }
+
+    /// A co-edit replay (`code_evolution` bumps every project) asks for a pass
+    /// only once the project has been settled for `STAR_ONLY_COOLDOWN_SECS`: a
+    /// row per edit must not re-resolve every project per edit.
+    #[test]
+    fn an_evolution_row_asks_for_a_pass_only_after_the_cooldown() {
+        let (_dir, db, storage) = extracted();
+        assert!(drain_if_pending(&storage, &db).unwrap().is_some());
+        assert!(drain_if_pending(&storage, &db).unwrap().is_none());
+
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT INTO code_evolution (id, session_id, project_name, file_path)
+                     VALUES ('e1', 's', 'elsewhere', 'b.rs')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            drain_if_pending(&storage, &db).unwrap().is_none(),
+            "inside the cooldown"
+        );
+
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "UPDATE code_graph_project_settled SET settled_at = settled_at - ?1",
+                    [codegraph::STAR_ONLY_COOLDOWN_SECS + 1],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(drain_if_pending(&storage, &db).unwrap().is_some());
+        assert!(drain_if_pending(&storage, &db).unwrap().is_none());
+    }
+
+    /// The migration seeds the settled table from the counters as they stand, so
+    /// an existing database is not handed one pass per project.
+    #[test]
+    fn a_database_upgraded_with_counters_starts_settled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        {
+            let storage = Storage::open(&db).unwrap();
+            storage
+                .with_connection(|c| {
+                    upsert_node(c, &def("callee", "a.rs", "callee"))?;
+                    c.execute_batch(
+                        "DELETE FROM code_graph_project_settled;
+                         DROP TABLE code_graph_project_settled;",
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let storage = Storage::open(&db).unwrap();
+        assert!(storage.dirty_graph_projects().unwrap().is_empty());
     }
 }

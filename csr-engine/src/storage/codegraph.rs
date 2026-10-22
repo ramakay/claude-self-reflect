@@ -160,6 +160,96 @@ pub fn project_gen(conn: &Connection, project: &str) -> Result<i64> {
     )?)
 }
 
+/// Unix seconds now.
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// A project's resolve-input counter, split: its own row and the every-project
+/// row (`'*'`) that is added to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GenParts {
+    pub own: i64,
+    pub star: i64,
+}
+
+fn gen_row(conn: &Connection, project: &str) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT gen FROM code_graph_project_gen WHERE project = ?1",
+            params![project],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// [`project_gen`] as its two parts.
+pub fn project_gen_parts(conn: &Connection, project: &str) -> Result<GenParts> {
+    Ok(GenParts {
+        own: gen_row(conn, project)?,
+        star: gen_row(conn, "*")?,
+    })
+}
+
+/// Record that a resolve pass covered the project's inputs as of `covered`.
+/// Only ever moves forward.
+pub fn mark_project_settled(conn: &Connection, project: &str, covered: GenParts) -> Result<()> {
+    conn.execute(
+        "INSERT INTO code_graph_project_settled (project, own, star, settled_at)
+         VALUES (?1, ?2, ?3, CAST(strftime('%s', 'now') AS INTEGER))
+         ON CONFLICT(project) DO UPDATE SET
+             own = MAX(own, excluded.own),
+             star = MAX(star, excluded.star),
+             settled_at = excluded.settled_at",
+        params![project, covered.own, covered.star],
+    )?;
+    Ok(())
+}
+
+/// How long a project must have been settled before a change only the
+/// every-project counter saw (a `code_evolution` row, which every edit writes)
+/// asks for another pass. The resolver reads `code_evolution` for co-edit
+/// evidence without a project filter, so such a row can change a project's
+/// answer, but a pass per project per edit is not worth it.
+pub const STAR_ONLY_COOLDOWN_SECS: i64 = 60;
+
+/// Projects whose resolve inputs changed since the last pass that covered them
+/// and that no pending file or queued snapshot accounts for: the counter of the
+/// project's own row is ahead of the settled one, or the every-project row is
+/// and `STAR_ONLY_COOLDOWN_SECS` have passed since the project last settled.
+pub fn dirty_projects(conn: &Connection, now_secs: i64) -> Result<Vec<String>> {
+    let star = gen_row(conn, "*")?;
+    let mut stmt = conn.prepare(
+        "SELECT g.project, g.gen, COALESCE(s.own, 0), COALESCE(s.star, 0), COALESCE(s.settled_at, 0)
+         FROM code_graph_project_gen g
+         LEFT JOIN code_graph_project_settled s ON s.project = g.project
+         WHERE g.project != '*' AND g.project != ''
+         ORDER BY g.project",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (project, own, settled_own, settled_star, settled_at) = row?;
+        let own_moved = own > settled_own;
+        let star_moved = star > settled_star && now_secs - settled_at >= STAR_ONLY_COOLDOWN_SECS;
+        if own_moved || star_moved {
+            out.push(project);
+        }
+    }
+    Ok(out)
+}
+
 /// Upsert a node. `first_conv_id` is preserved on an existing row (immutable
 /// history); `last_conv_id` / `last_session_id` / `body_hash` / span / timestamps
 /// are refreshed to the latest sighting.
@@ -473,8 +563,10 @@ pub struct Extraction<'a> {
 }
 
 /// The most snapshots one file may have waiting. A drain that is not running
-/// must not let a hammered file pile up 256 KB per edit; past this the newest
-/// pending snapshot is replaced (the intermediate edit loses its attribution).
+/// must not let a hammered file pile up 256 KB per edit. Past this, an arrival
+/// older than the newest queued is dropped and a newer one replaces the newest,
+/// so the queue always ends on the file's newest version; only an intermediate
+/// edit loses its attribution (`last_chunk_id` credit), never the end state.
 pub const MAX_SNAPSHOTS_PER_FILE: i64 = 64;
 
 /// `kind` of a snapshot of a file the extractor cannot parse: the drain records
@@ -502,16 +594,33 @@ pub struct Snapshot {
     pub origin: Option<String>,
 }
 
-/// Unix nanoseconds now: the clock `Snapshot::seq` is on.
+/// Unix nanoseconds now: the clock `Snapshot::seq` is on. Strictly increasing
+/// within a process, so two snapshots one hook takes in a row (a Bash call's
+/// files) never share a number, or a spool file name.
 pub fn now_ns() -> i64 {
-    std::time::SystemTime::now()
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let clock = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64)
+        .map_or(0, |d| d.as_nanos() as i64);
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = clock.max(last + 1);
+        match LAST.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => last = seen,
+        }
+    }
 }
 
 /// Add `s` to the snapshot queue. It takes `s.seq`, or the next free number
-/// when another snapshot holds it, and returns the `seq` it got. Writes no
-/// graph row: this is the hook's only graph write.
+/// when another snapshot holds it, and returns the `seq` it got (`s.seq` for a
+/// snapshot that was dropped on arrival, see below). Writes no graph row: this
+/// is the hook's only graph write.
+///
+/// Dropped on arrival: a snapshot at or below the file's high-water mark, and,
+/// when the file already has [`MAX_SNAPSHOTS_PER_FILE`] queued, one older than
+/// the newest queued.
 pub fn insert_snapshot(conn: &Connection, s: &Snapshot) -> Result<i64> {
     in_tx(conn, |tx| {
         if let Some(origin) = &s.origin {
@@ -526,12 +635,29 @@ pub fn insert_snapshot(conn: &Connection, s: &Snapshot) -> Result<i64> {
                 return Ok(seq);
             }
         }
-        let depth: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM code_graph_snapshots WHERE project = ?1 AND file = ?2",
+        // Superseded before it arrived: the file's consumed high-water mark is
+        // at or past it (a delayed hook, a spool record replayed after its
+        // snapshot was extracted). The extractor would drop it; so does the queue,
+        // before anything is evicted for it.
+        if s.seq <= snapshot_high_water(tx, &s.project, &s.file)? {
+            return Ok(s.seq);
+        }
+        let (depth, newest): (i64, Option<i64>) = tx.query_row(
+            "SELECT COUNT(*), MAX(seq) FROM code_graph_snapshots WHERE project = ?1 AND file = ?2",
             params![s.project, s.file],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         if depth >= MAX_SNAPSHOTS_PER_FILE {
+            // Full. The cap exists to bound a pile-up behind a dead drain, and
+            // what survives it must still end on the file's newest version, so:
+            // an arrival older than the newest queued is dropped (a delayed
+            // intermediate version; the newest decides the end state), and an
+            // arrival newer than it replaces the newest (the one version the
+            // drain skips is an intermediate one). The newest is never evicted
+            // for anything older.
+            if newest.is_some_and(|n| s.seq < n) {
+                return Ok(s.seq);
+            }
             tx.execute(
                 "DELETE FROM code_graph_snapshots WHERE seq =
                      (SELECT MAX(seq) FROM code_graph_snapshots WHERE project = ?1 AND file = ?2)",

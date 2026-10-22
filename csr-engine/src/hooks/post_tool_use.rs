@@ -121,27 +121,20 @@ async fn handle_with(
     // session itself: queue the edit and start the detached drain. No-op elsewhere.
     super::codemap_session_post_tool_use(input, engine);
 
-    // Track code evolution for Edit/Write/MultiEdit operations (v9) and for
-    // the files a Bash call wrote.
-    let touched: Vec<String> = if is_acted_on_tool(input.tool_name.as_deref()) {
-        tool_file_path(input)
-            .map(str::to_string)
-            .into_iter()
-            .collect()
-    } else {
-        bash_files
-            .iter()
-            .map(|f| f.to_string_lossy().into_owned())
-            .collect()
-    };
+    let touched = touched_files(input, &bash_files);
+    // The graph: the hook's only write to it is a snapshot of each edit
+    // (`codegraph::insert_snapshot`, or the lock-free spool when the database
+    // will not take it quickly). The drain extracts it
+    // (`extraction::graph_drain`), so the hook neither parses nor holds the
+    // write lock for more than that one INSERT. Every touched file is
+    // snapshotted before anything optional runs: the file-history writes below
+    // wait on the same lock, and a budget they spend must not cost a Bash call's
+    // later files their snapshot.
+    let mut db_busy = false;
     for file_path in &touched {
-        // The graph: the hook's only write to it is a snapshot of the edit
-        // (`codegraph::insert_snapshot`, or the lock-free spool when the
-        // database will not take it quickly). The drain extracts it
-        // (`extraction::graph_drain`), so the hook neither parses nor holds the
-        // write lock for more than that one INSERT, and first, so the slower
-        // steps below cannot delay or starve it.
-        snapshot_graph_edit(input, engine, file_path, &resolve, deadline);
+        snapshot_graph_edit(input, engine, file_path, &resolve, deadline, &mut db_busy);
+    }
+    for file_path in &touched {
         // Code map freshness: enqueue only, the daemon does the work. One
         // INSERT, no parse, no git; a failure (missing table, locked db) is
         // logged and never reaches Claude Code.
@@ -162,21 +155,103 @@ async fn handle_with(
     Ok(())
 }
 
+/// The files this call edited or wrote: an Edit/Write/MultiEdit's `file_path`,
+/// else the files a Bash call wrote (`bash_files`).
+fn touched_files(input: &HookInput, bash_files: &[PathBuf]) -> Vec<String> {
+    if is_acted_on_tool(input.tool_name.as_deref()) {
+        tool_file_path(input)
+            .map(str::to_string)
+            .into_iter()
+            .collect()
+    } else {
+        bash_files
+            .iter()
+            .map(|f| f.to_string_lossy().into_owned())
+            .collect()
+    }
+}
+
+/// How long [`spool_if_database_busy`] waits for the write lock before the
+/// edit goes to the spool unopened.
+pub const PROBE_WAIT: Duration = Duration::from_millis(500);
+
+/// Before the engine is built: if the database's write lock is held for longer
+/// than `wait`, snapshot the call's files into the spool and say so (`true`:
+/// the hook is done). Opening the engine runs the migrations, which on an old
+/// database need that lock and give up only after the storage default (5 s),
+/// far past the hook's budget; a writer that holds it that long must not cost
+/// the edit its snapshot. A free lock, a missing database (the normal path
+/// creates it) or any other open error is `false` and changes nothing.
+pub fn spool_if_database_busy(db_path: &Path, input: &HookInput, wait: Duration) -> bool {
+    use rusqlite::{Connection, OpenFlags};
+    if !db_path.exists() {
+        return false;
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    let _ = conn.busy_timeout(wait);
+    match conn.execute_batch("BEGIN IMMEDIATE") {
+        Ok(()) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            false
+        }
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if matches!(
+                e.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            let spooled = spool_without_database(db_path, input);
+            eprintln!(
+                "CSR: database busy, {spooled} graph snapshot(s) spooled unopened (non-fatal)"
+            );
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Snapshot every file this call touched into the spool next to `db_path`,
+/// without opening the database. For a hook whose engine could not be built.
+/// The transcript chunk the edit belongs to is not looked up (that needs the
+/// database), so the extraction credits the edit's conversation and session but
+/// no chunk. Returns how many snapshots were written.
+pub fn spool_without_database(db_path: &Path, input: &HookInput) -> usize {
+    let Some(dir) = crate::extraction::graph_spool::dir_for_db(db_path) else {
+        return 0;
+    };
+    let bash_files = bash_written_files(input);
+    let mut written = 0;
+    for file_path in touched_files(input, &bash_files) {
+        let Some(snapshot) = capture_snapshot(input, &file_path, &resolve_project_for_hook) else {
+            continue;
+        };
+        match crate::extraction::graph_spool::write(&dir, &snapshot) {
+            Ok(_) => written += 1,
+            Err(e) => eprintln!("CSR: graph snapshot lost: spool: {e:#}"),
+        }
+    }
+    written
+}
+
 /// How long the snapshot INSERT may wait for the write lock. Short on purpose:
 /// the alternative to waiting is the spool, which costs one small file and no
 /// lock, so the hook never queues behind a long writer for the graph.
 const SNAPSHOT_WAIT: Duration = Duration::from_millis(150);
 
-/// Hand the edit of `file_path` to the graph drain: one snapshot row, or, when
-/// the database does not take it within [`SNAPSHOT_WAIT`] (or the remaining
-/// budget), one spool file. Never extracts, never parses, never fails the hook.
-fn snapshot_graph_edit(
+/// What the hook saw of `file_path`, ready to queue: `None` when there is
+/// nothing to hand the drain (no project, or a supported file that cannot be
+/// read as text). Carries no transcript chunk; the caller adds it when it has
+/// a database.
+fn capture_snapshot(
     input: &HookInput,
-    engine: &Engine,
     file_path: &str,
     resolve: &impl Fn(Option<&Path>, Option<&str>) -> String,
-    deadline: Instant,
-) {
+) -> Option<crate::storage::codegraph::Snapshot> {
     use crate::storage::codegraph::{self, Snapshot};
     // No project, no graph write: `resolve_code_edges("")` and
     // `compute_code_rank("")` read `''` as EVERY project (`?1 = '' OR project =
@@ -185,7 +260,7 @@ fn snapshot_graph_edit(
     // no scoped query would ever find it.
     let project = resolve(Path::new(file_path).parent(), input.cwd.as_deref());
     if project.is_empty() {
-        return;
+        return None;
     }
     let conv_id = conv_id_for(input);
     let session_id = input.session_id.clone().unwrap_or_default();
@@ -193,11 +268,10 @@ fn snapshot_graph_edit(
     // The capture time is taken after the read: the text is at least as old as
     // its `seq`, and a later edit of the file always has a larger one.
     let content = if supported {
-        match crate::extraction::file_extract::read_for_snapshot(file_path) {
-            Some(text) => Some(text),
-            // Unreadable, not UTF-8 or too large: nothing to extract.
-            None => return,
-        }
+        // Unreadable, not UTF-8 or too large: nothing to extract.
+        Some(crate::extraction::file_extract::read_for_snapshot(
+            file_path,
+        )?)
     } else {
         None
     };
@@ -206,22 +280,13 @@ fn snapshot_graph_edit(
     // extraction did before the snapshot: `canonical_repo_path` spells a
     // directory without a `.git` as given on its first lookup in a process and
     // resolved after that, so a file that is skipped must not use the first one.
-    let stored = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path))
+    let file = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path))
         .to_string_lossy()
         .into_owned();
-    let source_chunk_id = if supported {
-        engine
-            .storage()
-            .with_connection(|conn| codegraph::latest_chunk_id(conn, &conv_id))
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
-    let snapshot = Snapshot {
+    Some(Snapshot {
         seq,
         project,
-        file: stored,
+        file,
         read_path: file_path.to_string(),
         kind: if supported {
             codegraph::SNAPSHOT_EXTRACT
@@ -232,17 +297,51 @@ fn snapshot_graph_edit(
         content,
         conv_id,
         session_id,
-        source_chunk_id,
+        source_chunk_id: None,
         origin: None,
-    };
+    })
+}
 
-    let wait = SNAPSHOT_WAIT.min(deadline.saturating_duration_since(Instant::now()));
-    let inserted = engine.storage().with_connection(|conn| {
-        conn.busy_timeout(wait)?;
-        codegraph::insert_snapshot(conn, &snapshot)
-    });
-    let Err(db_error) = inserted else {
+/// Hand the edit of `file_path` to the graph drain: one snapshot row, or, when
+/// the database does not take it within [`SNAPSHOT_WAIT`] (or the remaining
+/// budget), one spool file. Never extracts, never parses, never fails the hook.
+/// `db_busy` is set by the first file that could not be inserted, and the
+/// files after it go straight to the spool instead of each waiting out the
+/// same lock.
+fn snapshot_graph_edit(
+    input: &HookInput,
+    engine: &Engine,
+    file_path: &str,
+    resolve: &impl Fn(Option<&Path>, Option<&str>) -> String,
+    deadline: Instant,
+    db_busy: &mut bool,
+) {
+    use crate::storage::codegraph;
+    let Some(mut snapshot) = capture_snapshot(input, file_path, resolve) else {
         return;
+    };
+    let db_error = if *db_busy {
+        anyhow::anyhow!("an earlier snapshot of this call found the database locked")
+    } else {
+        if snapshot.content.is_some() {
+            snapshot.source_chunk_id = engine
+                .storage()
+                .with_connection(|conn| codegraph::latest_chunk_id(conn, &snapshot.conv_id))
+                .ok()
+                .flatten();
+        }
+        let wait = SNAPSHOT_WAIT.min(deadline.saturating_duration_since(Instant::now()));
+        let inserted = engine.storage().with_connection(|conn| {
+            conn.busy_timeout(wait)?;
+            codegraph::insert_snapshot(conn, &snapshot)
+        });
+        match inserted {
+            Ok(_) => return,
+            Err(e) => {
+                *db_busy = true;
+                e
+            }
+        }
     };
     let dir = engine
         .storage()
@@ -336,6 +435,7 @@ fn update_code_graph_for(
         file_path,
         &resolve,
         Instant::now() + WRITE_BUDGET,
+        &mut false,
     );
     drain_snapshots_for_test(engine)
 }
@@ -1144,6 +1244,139 @@ mod tests {
         assert_eq!(count_nodes(&storage), 2);
         assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 0);
         assert!(storage.pending_resolve_files().unwrap().is_empty());
+    }
+
+    /// P1: a Bash call that touched A, B and C and meets a held write lock
+    /// leaves all three in the spool, whatever the budget did to the first.
+    #[tokio::test]
+    async fn every_file_a_bash_call_touched_is_snapshotted_when_the_budget_is_spent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dir_path = dir.path().canonicalize().unwrap();
+        let db = dir_path.join("csr-engine.db");
+        let (engine, _storage) = file_engine(&db);
+        let work = dir_path.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut names = Vec::new();
+        for n in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(work.join(n), format!("fn f_{}() {{}}\n", &n[..1])).unwrap();
+            names.push(work.join(n).display().to_string());
+        }
+        let command = format!(
+            "echo x >> {} && echo x >> {} && echo x >> {}",
+            names[0], names[1], names[2]
+        );
+        let input = bash_input(&command, Some("/Users/x/projects/my-repo"));
+
+        let holder = rusqlite::Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+        handle_with(
+            &input,
+            &engine,
+            Duration::from_millis(300),
+            resolve_without_env,
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let spooled = std::fs::read_dir(dir_path.join("keep/graph-spool"))
+            .unwrap()
+            .count();
+        assert_eq!(spooled, 3, "one spool record per touched file");
+    }
+
+    fn pre_migration_db(dir: &Path) -> std::path::PathBuf {
+        let db = dir.join("csr-engine.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        db
+    }
+
+    /// P1: the first hook on an old database, with a writer holding the lock
+    /// past the budget, never opens or migrates it: the edit goes to the spool
+    /// without a database and the call returns inside the budget.
+    #[test]
+    fn a_busy_pre_migration_database_is_spooled_around_without_opening_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dir_path = dir.path().canonicalize().unwrap();
+        let db = pre_migration_db(&dir_path);
+        let file = dir_path.join("old.rs");
+        std::fs::write(&file, "fn caller() { callee(); }\nfn callee() {}\n").unwrap();
+        let input = write_input(&file, Some("/Users/x/projects/my-repo"));
+
+        let holder = rusqlite::Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+        assert!(spool_if_database_busy(
+            &db,
+            &input,
+            Duration::from_millis(200)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let spool = dir_path.join("keep/graph-spool");
+        assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 1);
+        holder.execute_batch("ROLLBACK").unwrap();
+        drop(holder);
+
+        // Nothing was migrated by the hook; once the database is opened the
+        // drain ingests and extracts the edit.
+        let storage = crate::storage::Storage::open(&db).unwrap();
+        let report = storage
+            .with_connection(|c| crate::extraction::graph_drain::drain(c, &|_: &str| true))
+            .unwrap();
+        assert_eq!(report.extracted, 1, "{:?}", report.errors);
+        assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 0);
+        assert_eq!(count_nodes(&storage), 2);
+    }
+
+    /// A database whose lock is free is not spooled around: the normal path
+    /// runs.
+    #[test]
+    fn a_free_database_is_left_to_the_normal_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dir_path = dir.path().canonicalize().unwrap();
+        let db = pre_migration_db(&dir_path);
+        let file = dir_path.join("old.rs");
+        std::fs::write(&file, "fn one() {}\n").unwrap();
+        let input = write_input(&file, Some("/Users/x/projects/my-repo"));
+        assert!(!spool_if_database_busy(
+            &db,
+            &input,
+            Duration::from_millis(200)
+        ));
+        assert!(!dir_path.join("keep/graph-spool").exists());
+        // No database yet at all: also the normal path (it creates it).
+        let none = dir_path.join("fresh/csr-engine.db");
+        assert!(!spool_if_database_busy(
+            &none,
+            &input,
+            Duration::from_millis(50)
+        ));
+    }
+
+    /// The engine could not be built (migration timed out, maintenance in
+    /// progress): the edit still reaches the spool.
+    #[test]
+    fn an_edit_is_spooled_without_any_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dir_path = dir.path().canonicalize().unwrap();
+        let db = dir_path.join("csr-engine.db");
+        let a = dir_path.join("a.rs");
+        let b = dir_path.join("b.rs");
+        std::fs::write(&a, "fn a() {}\n").unwrap();
+        std::fs::write(&b, "fn b() {}\n").unwrap();
+        let command = format!("echo x >> {} && echo x >> {}", a.display(), b.display());
+        let input = bash_input(&command, Some("/Users/x/projects/my-repo"));
+        assert_eq!(spool_without_database(&db, &input), 2);
+        assert_eq!(
+            std::fs::read_dir(dir_path.join("keep/graph-spool"))
+                .unwrap()
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]

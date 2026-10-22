@@ -972,6 +972,34 @@ pub fn run(conn: &Connection) -> Result<()> {
          );",
     )?;
 
+    // Migration: the counter values a completed resolve pass covered, per
+    // project (`own` is the project's row, `star` the every-project row). The
+    // drain treats a project whose counter is ahead of this as work even with
+    // no file pending, so a write the resolve reads that queues no file (a repo
+    // scan, a co-edit replay) still gets its pass. A table created now is seeded
+    // with the counters as they stand: an existing database's state is settled,
+    // not a backlog of one pass per project.
+    let settled_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'code_graph_project_settled')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !settled_exists {
+        conn.execute_batch(
+            "CREATE TABLE code_graph_project_settled (
+                 project    TEXT PRIMARY KEY,
+                 own        INTEGER NOT NULL DEFAULT 0,
+                 star       INTEGER NOT NULL DEFAULT 0,
+                 settled_at INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO code_graph_project_settled (project, own, star, settled_at)
+                 SELECT project, gen,
+                        COALESCE((SELECT gen FROM code_graph_project_gen WHERE project = '*'), 0),
+                        CAST(strftime('%s', 'now') AS INTEGER)
+                 FROM code_graph_project_gen WHERE project != '*';",
+        )?;
+    }
+
     // Migration: the edits a PostToolUse hook snapshots for the drain. The hook
     // does not extract: it records what it saw (the file's content, the
     // conversation / session / transcript chunk that edited it) and the drain

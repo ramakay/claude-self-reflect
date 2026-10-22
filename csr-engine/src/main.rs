@@ -2154,18 +2154,50 @@ async fn run(
         if csr_engine::hooks::post_tool_use::exits_before_engine(name, &input) {
             return Ok(());
         }
-        let eng = {
+        // Building the engine opens the database and runs its migrations, which
+        // on an old database need the write lock and give up after seconds. A
+        // PostToolUse hook is on a 1.5 s budget and its edit must not be lost to
+        // a writer that holds the lock: with the lock held past the probe, the
+        // edit goes to the spool without opening anything, and if the engine
+        // cannot be built for any other reason it goes there too.
+        let post_tool_use = name == "post-tool-use";
+        if post_tool_use
+            && csr_engine::hooks::post_tool_use::spool_if_database_busy(
+                &args.db_path,
+                &input,
+                csr_engine::hooks::post_tool_use::PROBE_WAIT,
+            )
+        {
+            return Ok(());
+        }
+        let built = {
             // Hook stdout is the injection channel. A stale or missing cache
             // makes `Engine::new` rebuild through hnsw_rs, which prints to
             // stdout; keep that off the channel until the handler owns it.
             let _quiet = csr_engine::hooks::StdoutQuarantine::begin();
-            if let Some(proxied) = engine::Engine::new_proxied(&args.db_path, &args.projects_dir)? {
-                proxied
-            } else if csr_engine::hooks::hook_needs_index(name, &input) {
-                engine::Engine::new_for_hook(&args.db_path, &args.projects_dir)?
-            } else {
-                engine::Engine::new_import_only(&args.db_path, &args.projects_dir)?
+            (|| -> anyhow::Result<engine::Engine> {
+                if let Some(proxied) =
+                    engine::Engine::new_proxied(&args.db_path, &args.projects_dir)?
+                {
+                    Ok(proxied)
+                } else if csr_engine::hooks::hook_needs_index(name, &input) {
+                    engine::Engine::new_for_hook(&args.db_path, &args.projects_dir)
+                } else {
+                    engine::Engine::new_import_only(&args.db_path, &args.projects_dir)
+                }
+            })()
+        };
+        let eng = match built {
+            Ok(eng) => eng,
+            Err(e) if post_tool_use => {
+                let spooled =
+                    csr_engine::hooks::post_tool_use::spool_without_database(&args.db_path, &input);
+                eprintln!(
+                    "CSR: engine unavailable ({e:#}); {spooled} graph snapshot(s) spooled (non-fatal)"
+                );
+                return Ok(());
             }
+            Err(e) => return Err(e),
         };
         csr_engine::hooks::dispatch_hook(name, &eng, input, stdin_elapsed).await?;
         return Ok(());
