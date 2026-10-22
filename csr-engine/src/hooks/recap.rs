@@ -153,15 +153,13 @@ fn compose_recap_inner(
     }
 
     let mut recap = match (intent.as_deref(), completed.as_deref()) {
-        // Receipts that are not the anchor's own completion get their own
-        // clause, so the recap never reads them as what the anchor achieved.
-        // A commit, a merge or an edit made during the anchor's turn is not
-        // thereby its answer (a question about a workflow does not become
-        // "answered" by a merge the session made meanwhile); only a task the
-        // session marked finished reads as the anchor's result.
-        (Some(intent), Some(completed))
-            if ep.completions_untied || !completed_is_a_finished_task(ep) =>
-        {
+        // The receipts shown were all made under the anchor's own task (see
+        // `anchor_completions`). A commit or a merge made during the anchor's
+        // turn is not thereby its answer (a question about a workflow does not
+        // become "answered" by a merge the session made meanwhile), so it gets
+        // its own clause; only a task the session marked finished reads as the
+        // anchor's result.
+        (Some(intent), Some(completed)) if !completed_is_a_finished_task(ep) => {
             format!(
                 "recap [{age}]: {} Latest: {}",
                 terminate_clause(intent),
@@ -760,10 +758,28 @@ pub(crate) fn is_request(text: &str) -> bool {
         && !(matches!(second, "this" | "that") && TIME_WORDS.contains(&third))
 }
 
-/// The completed clause: the receipts `recap_receipts` picks, never
+/// The receipts the recap may show: those produced under the task the intent
+/// quotes. A commit made under a later or an earlier ask says nothing about
+/// this one, so it never stands beside it. An episode written before the tie
+/// was recorded shows all its receipts when they were the anchor's own, and
+/// none when they were not.
+fn anchor_completions(
+    ep: &crate::hooks::stop::Episode,
+) -> Vec<crate::hooks::stop::CompletionReceipt> {
+    match &ep.anchor_receipts {
+        Some(indices) => indices
+            .iter()
+            .filter_map(|&index| ep.completions.get(index).cloned())
+            .collect(),
+        None if ep.completions_untied => Vec::new(),
+        None => ep.completions.clone(),
+    }
+}
+
+/// The completed clause: the anchor's own `displayed_receipts`, never
 /// assistant prose. Legacy episodes carry none and abstain.
 fn recap_completed(ep: &crate::hooks::stop::Episode) -> Option<String> {
-    let entries: Vec<String> = recap_receipts(&ep.completions)
+    let entries: Vec<String> = displayed_receipts(&anchor_completions(ep))
         .into_iter()
         .map(|(_, entry)| entry)
         .collect();
@@ -773,9 +789,10 @@ fn recap_completed(ep: &crate::hooks::stop::Episode) -> Option<String> {
 /// Whether the completed clause is a task the session marked finished (the
 /// receipts shown are all of one kind, the strongest the session has).
 fn completed_is_a_finished_task(ep: &crate::hooks::stop::Episode) -> bool {
-    recap_receipts(&ep.completions)
+    let own = anchor_completions(ep);
+    displayed_receipts(&own)
         .first()
-        .and_then(|(index, _)| ep.completions.get(*index))
+        .and_then(|(index, _)| own.get(*index))
         .is_some_and(|done| receipt_kind(&done.receipt) == ReceiptKind::Task)
 }
 
@@ -793,8 +810,6 @@ pub(crate) enum ReceiptKind {
     Commit,
     /// A task or todo marked completed.
     Task,
-    /// The files a task's successful edits changed (`3 edits`).
-    Edit,
 }
 
 pub(crate) fn receipt_kind(receipt: &str) -> ReceiptKind {
@@ -802,50 +817,20 @@ pub(crate) fn receipt_kind(receipt: &str) -> ReceiptKind {
     if is_commit_receipt(receipt) {
         return ReceiptKind::Commit;
     }
-    let is_edit_count = receipt.split_once(' ').is_some_and(|(count, word)| {
-        !count.is_empty()
-            && count.chars().all(|c| c.is_ascii_digit())
-            && matches!(word, "edit" | "edits")
-    });
-    if is_edit_count {
-        ReceiptKind::Edit
-    } else {
-        ReceiptKind::Task
-    }
+    ReceiptKind::Task
 }
 
 /// The receipts that show a session finished something, oldest first, each
 /// with its index in `completions`: the latest two commit receipts, or the
-/// latest two task or todo receipts when the session made no commit. Edit
-/// receipts are not among them (see [`recap_receipts`]). Entries are rendered
-/// whole as `<claim> (<receipt>)`; a claim over 100 chars is dropped, never
+/// latest two task or todo receipts when the session made no commit. Entries
+/// are rendered whole as `<claim> (<receipt>)`; a claim over 100 chars is dropped, never
 /// cut.
 pub(crate) fn displayed_receipts(
     completions: &[crate::hooks::stop::CompletionReceipt],
 ) -> Vec<(usize, String)> {
-    pick_receipts(completions, &[ReceiptKind::Commit, ReceiptKind::Task])
-}
-
-/// What the recap's completed clause shows: [`displayed_receipts`], or, for a
-/// session that finished nothing, the files its edits changed.
-pub(crate) fn recap_receipts(
-    completions: &[crate::hooks::stop::CompletionReceipt],
-) -> Vec<(usize, String)> {
-    pick_receipts(
-        completions,
-        &[ReceiptKind::Commit, ReceiptKind::Task, ReceiptKind::Edit],
-    )
-}
-
-fn pick_receipts(
-    completions: &[crate::hooks::stop::CompletionReceipt],
-    kinds: &[ReceiptKind],
-) -> Vec<(usize, String)> {
-    use crate::extraction::provenance::extractable;
     const MAX_ENTRIES: usize = 2;
-    /// Edits are the weakest proof: the latest task's alone, never a list.
-    const MAX_EDIT_ENTRIES: usize = 1;
     const MAX_CLAIM_CHARS: usize = 100;
+    use crate::extraction::provenance::extractable;
     let render = |done: &crate::hooks::stop::CompletionReceipt| {
         let receipt = normalize_feed_text(&done.receipt);
         // The detector reads the claim as stored, before extraction trims it:
@@ -864,19 +849,12 @@ fn pick_receipts(
             .rev()
             .filter(|(_, done)| receipt_kind(&done.receipt) == kind)
             .filter_map(|(index, done)| render(done).map(|entry| (index, entry)))
-            .take(if kind == ReceiptKind::Edit {
-                MAX_EDIT_ENTRIES
-            } else {
-                MAX_ENTRIES
-            })
+            .take(MAX_ENTRIES)
             .collect()
     };
-    let mut shown = Vec::new();
-    for &kind in kinds {
-        shown = pick(kind);
-        if !shown.is_empty() {
-            break;
-        }
+    let mut shown = pick(ReceiptKind::Commit);
+    if shown.is_empty() {
+        shown = pick(ReceiptKind::Task);
     }
     shown.reverse();
     shown
@@ -1189,6 +1167,7 @@ mod tests {
                 receipt: "abc1234".into(),
             }],
             completions_untied: false,
+            anchor_receipts: None,
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
@@ -2543,7 +2522,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_receipts_are_the_weakest_and_never_a_finished_thing() {
+    fn only_receipts_made_under_the_anchor_are_shown() {
         let done = |claim: &str, receipt: &str| CompletionReceipt {
             claim: claim.into(),
             receipt: receipt.into(),
@@ -2552,38 +2531,41 @@ mod tests {
         ep.todos.clear();
         ep.next_steps = None;
         ep.blockers = None;
-        ep.completions = vec![done("edited stop.rs, recap.rs", "7 edits")];
-        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        ep.completions = vec![
+            done("fix(a): under an earlier ask", "aaaaaaa"),
+            done("fix(b): under the anchor", "bbbbbbb"),
+            done("fix(c): under a later ask", "ccccccc"),
+        ];
+        // Only the anchor's own commit stands beside its intent.
+        ep.anchor_receipts = Some(vec![1]);
         assert_eq!(
-            got,
-            "recap [now]: Fix the recap composer. Latest: edited stop.rs, recap.rs (7 edits). [[CSR:RECAP]]"
+            compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap(),
+            "recap [now]: Fix the recap composer. Latest: fix(b): under the anchor (bbbbbbb). [[CSR:RECAP]]"
         );
-        // The companion's repo recap reads "done" from these: edits are not.
-        assert!(displayed_receipts(&ep.completions).is_empty());
-        // Only the latest task's edits show.
-        ep.completions.push(done("edited recap.rs", "2 edits"));
-        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        // The anchor made none: the recap says what was asked and nothing more.
+        ep.anchor_receipts = Some(vec![]);
         assert_eq!(
-            got,
-            "recap [now]: Fix the recap composer. Latest: edited recap.rs (2 edits). [[CSR:RECAP]]"
+            compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap(),
+            "recap [now]: Fix the recap composer. [[CSR:RECAP]]"
         );
-        ep.completions.pop();
-        // A completed task outranks them, a commit outranks both.
-        ep.completions
-            .push(done("Write regression tests", "task #3 completed"));
-        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        // An episode stored before the tie was recorded: its receipts are the
+        // anchor's own, or they are not shown at all.
+        ep.anchor_receipts = None;
+        ep.completions_untied = true;
         assert_eq!(
-            got,
+            compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap(),
+            "recap [now]: Fix the recap composer. [[CSR:RECAP]]"
+        );
+        ep.completions_untied = false;
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert!(got.contains("(bbbbbbb); fix(c): under a later ask (ccccccc)"));
+        // A task the session marked completed reads as the anchor's result.
+        ep.completions = vec![done("Write regression tests", "task #3 completed")];
+        ep.anchor_receipts = Some(vec![0]);
+        assert_eq!(
+            compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap(),
             "recap [now]: Fix the recap composer: Write regression tests (task #3 completed). [[CSR:RECAP]]"
         );
-        ep.completions.push(done("fix(recap): subject", "abc1234"));
-        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
-        assert_eq!(
-            got,
-            "recap [now]: Fix the recap composer. Latest: fix(recap): subject (abc1234). [[CSR:RECAP]]"
-        );
-        assert_eq!(receipt_kind("12 edits"), ReceiptKind::Edit);
-        assert_eq!(receipt_kind("1 edit"), ReceiptKind::Edit);
         assert_eq!(receipt_kind("todo completed"), ReceiptKind::Task);
         assert_eq!(receipt_kind("task #4 completed"), ReceiptKind::Task);
         assert_eq!(receipt_kind("deadbee"), ReceiptKind::Commit);
@@ -2619,26 +2601,22 @@ mod tests {
     }
 
     #[test]
-    fn untied_receipts_render_as_their_own_clause() {
+    fn legacy_untied_receipts_are_not_shown() {
+        // An episode stored before the tie was recorded, whose receipts were
+        // not the anchor's own: they stand beside neither the intent nor alone.
         let mut ep = episode();
         ep.anchor_request = Some("Fix the recap composer".into());
         ep.completions_untied = true;
+        ep.anchor_receipts = None;
         ep.next_steps = None;
         ep.todos.clear();
         ep.blockers = None;
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
-        assert_eq!(
-            got,
-            "recap [now]: Fix the recap composer. Latest: Implemented deterministic recap output (abc1234). [[CSR:RECAP]]"
-        );
+        assert_eq!(got, "recap [now]: Fix the recap composer. [[CSR:RECAP]]");
         assert!(crate::extraction::provenance::is_csr_emission(&got));
-        // Without an intent the receipts stand alone, as before.
+        // Without an intent there is nothing left to say.
         ep.anchor_request = None;
-        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
-        assert_eq!(
-            got,
-            "recap [now]: Implemented deterministic recap output (abc1234). [[CSR:RECAP]]"
-        );
+        assert_eq!(compose_recap(&ep, &RecapFeeds::empty(), "now"), None);
     }
 
     // ---- round 5: clause cut for an over-long first task ----

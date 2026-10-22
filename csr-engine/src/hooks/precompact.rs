@@ -43,6 +43,10 @@ pub(crate) struct CompactSnapshot {
     pub watermark: Option<String>,
     pub completions: Vec<super::stop::CompletionReceipt>,
     pub completions_untied: bool,
+    /// The receipts produced under `anchor_request` (`Episode::anchor_receipts`).
+    /// A snapshot written before this field existed carries `None`.
+    #[serde(default)]
+    pub anchor_receipts: Option<Vec<usize>>,
 }
 
 /// The conversation rows the compact snapshot is built from: the rows the importer
@@ -98,6 +102,7 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
                 watermark: episode.watermark,
                 completions: episode.completions,
                 completions_untied: episode.completions_untied,
+                anchor_receipts: episode.anchor_receipts,
             };
             let saved = serde_json::to_string(&snapshot)
                 .map_err(anyhow::Error::from)

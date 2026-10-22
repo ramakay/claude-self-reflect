@@ -1036,6 +1036,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            anchor_receipts: None,
             compact_anchor: None,
             late_errors: false,
             closing_success: false,

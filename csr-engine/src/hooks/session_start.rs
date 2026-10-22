@@ -1294,6 +1294,7 @@ fn overlay_compact_snapshot(
     if snapshot.anchor_request.is_some() && snapshot.anchor_request == ep.anchor_request {
         current.completions = snapshot.completions;
         current.completions_untied = snapshot.completions_untied;
+        current.anchor_receipts = snapshot.anchor_receipts;
     }
     current.recap_evidence_version = Some(super::stop::RECAP_EVIDENCE_VERSION);
     Some(current)
@@ -1319,6 +1320,7 @@ fn recap_episode<'a>(
                 let mut current = ep.clone();
                 current.anchor_request = Some(intent);
                 current.completions_untied = anchor.completions_untied;
+                current.anchor_receipts = anchor.receipts.clone();
                 return std::borrow::Cow::Owned(current);
             }
         }
@@ -2176,6 +2178,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            anchor_receipts: None,
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
@@ -2248,6 +2251,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            anchor_receipts: None,
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
@@ -2299,6 +2303,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            anchor_receipts: None,
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
@@ -2352,6 +2357,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            anchor_receipts: None,
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
@@ -2406,6 +2412,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            anchor_receipts: None,
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
@@ -2722,6 +2729,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            anchor_receipts: None,
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
@@ -3610,6 +3618,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         ep.compact_anchor = Some(crate::hooks::stop::CompactAnchor {
             request: RULE_TEXT.into(),
             completions_untied: false,
+            receipts: None,
         });
         let taken = recap_episode(&ep, Some("compact"), Some(ep.session_id.as_str()));
         assert_eq!(
@@ -3621,6 +3630,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         ep.compact_anchor = Some(crate::hooks::stop::CompactAnchor {
             request: "Now wire the staging endpoint.".into(),
             completions_untied: false,
+            receipts: None,
         });
         let taken = recap_episode(&ep, Some("compact"), Some(ep.session_id.as_str()));
         assert_eq!(
@@ -3642,12 +3652,14 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
             anchor: Some(CompactAnchor {
                 request: "Now wire the staging endpoint.".into(),
                 completions_untied: true,
+                receipts: None,
             }),
             completions: vec![CompletionReceipt {
                 claim: "fresh".into(),
                 receipt: "2222222".into(),
             }],
             completions_untied: true,
+            anchor_receipts: Some(vec![0]),
         }
     }
 
@@ -3685,6 +3697,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         .expect("a snapshot that is ahead");
         assert_eq!(same.completions[0].receipt, "2222222");
         assert!(same.completions_untied);
+        assert_eq!(same.anchor_receipts, Some(vec![0]));
         // A different anchor, or a snapshot that predates the field: the stored
         // receipts stay, the compact anchor still arrives.
         for other in [Some("Something else entirely."), None] {
@@ -3692,6 +3705,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
                 .expect("ahead");
             assert_eq!(kept.completions[0].receipt, "1111111", "{other:?}");
             assert!(!kept.completions_untied, "{other:?}");
+            assert_eq!(kept.anchor_receipts, None, "{other:?}");
             assert_eq!(
                 kept.compact_anchor.as_ref().map(|a| a.request.as_str()),
                 Some("Now wire the staging endpoint.")

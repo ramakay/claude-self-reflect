@@ -115,6 +115,13 @@ pub struct Episode {
     /// whose completions were the anchor's own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub completions_untied: bool,
+    /// The indices into `completions` of the receipts produced under the
+    /// anchor task: the only ones the recap may show beside the anchor's
+    /// intent, since a commit made under a later or earlier ask says nothing
+    /// about this one. `None` for episodes written before this existed, which
+    /// show their receipts only when `completions_untied` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_receipts: Option<Vec<usize>>,
     /// Latest renderable typed task after the first, for same-session compact
     /// recaps only. Additive v2 JSON field: old rows default to today's anchor;
     /// no database migration or transcript read at SessionStart is needed.
@@ -172,6 +179,9 @@ pub struct Episode {
 pub struct CompactAnchor {
     pub request: String,
     pub completions_untied: bool,
+    /// The receipts produced under this anchor (see `Episode::anchor_receipts`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipts: Option<Vec<usize>>,
 }
 
 /// A completion with the evidence that proves it.
@@ -841,9 +851,6 @@ struct TaskSegment {
     last_prompt_at: Option<chrono::DateTime<chrono::Utc>>,
     tool_calls: u32,
     commits: u32,
-    /// Files this task's successful Edit/Write/MultiEdit calls changed, one
-    /// entry per call, in call order.
-    edits: Vec<String>,
 }
 
 impl TaskSegment {
@@ -1257,9 +1264,6 @@ where
     let mut turn_finished = true;
     // Bash tool_use ids whose command can commit or merge, with the command.
     let mut git_calls: HashMap<String, String> = HashMap::new();
-    // Main-thread edit tool_use ids with the file they change; an entry
-    // becomes an edit receipt only when its result succeeds.
-    let mut edit_calls: HashMap<String, String> = HashMap::new();
     // The session's receipts, latest last, each with the index of the task
     // segment it was produced under (None before the first task).
     let mut completions: Vec<(CompletionReceipt, Option<usize>)> = Vec::new();
@@ -1516,12 +1520,6 @@ where
                                         }
                                         if write_tools.contains(name) {
                                             files_modified.insert(fp.to_string());
-                                            if let (false, Some(id)) = (
-                                                sidechain,
-                                                block.get("id").and_then(|v| v.as_str()),
-                                            ) {
-                                                edit_calls.insert(id.to_string(), fp.to_string());
-                                            }
                                         }
                                     }
                                 }
@@ -1651,11 +1649,6 @@ where
                             continue;
                         }
                         let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str());
-                        if let Some(path) = tool_use_id.and_then(|id| edit_calls.remove(id)) {
-                            if let (false, Some(task)) = (failed, segments.last_mut()) {
-                                task.edits.push(path);
-                            }
-                        }
                         if let Some(op) = tool_use_id.and_then(|id| tasks.pending.remove(id)) {
                             if !failed {
                                 for (claim, receipt) in tasks.apply(op, Some(&block_text)) {
@@ -1696,29 +1689,31 @@ where
         .find(|t| t.status != "completed")
         .map(|t| t.content.clone());
 
-    // The weakest receipt: the files a task's successful edits changed. It is
-    // shown only when the session has no commit and no completed task.
-    for (index, task) in segments.iter().enumerate() {
-        if let Some((claim, receipt)) = edit_receipt(&task.edits) {
-            push_completion(&mut completions, Some(index), &claim, &receipt);
-        }
-    }
-
     let (anchor_request, anchor_index) = anchor_segment(&segments);
     let (completions, origins): (Vec<CompletionReceipt>, Vec<Option<usize>>) =
         completions.into_iter().unzip();
     // Receipts read as the anchor's result only when every receipt the recap
     // shows was produced under the anchor segment; otherwise "Latest:".
-    let displayed = crate::hooks::recap::recap_receipts(&completions);
+    let displayed = crate::hooks::recap::displayed_receipts(&completions);
     let untied = |anchor: Option<usize>| {
         displayed
             .iter()
             .any(|(index, _)| anchor.is_none() || origins[*index] != anchor)
     };
     let completions_untied = untied(anchor_index);
+    let made_under = |anchor: Option<usize>| -> Vec<usize> {
+        origins
+            .iter()
+            .enumerate()
+            .filter(|(_, origin)| anchor.is_some() && **origin == anchor)
+            .map(|(index, _)| index)
+            .collect()
+    };
+    let anchor_receipts = Some(made_under(anchor_index));
     let compact_anchor = latest_typed_segment(&segments).map(|(request, index)| CompactAnchor {
         request,
         completions_untied: untied(Some(index)),
+        receipts: Some(made_under(Some(index))),
     });
 
     // Determine outcome (task-aware: incomplete todos cap success at partial)
@@ -1778,6 +1773,7 @@ where
         anchor_request,
         completions,
         completions_untied,
+        anchor_receipts,
         compact_anchor,
         late_errors,
         final_failed,
@@ -1790,46 +1786,7 @@ where
     }
 }
 
-/// The receipt for one task's successful edits: `edited a.rs, b.rs and 2
-/// more` with `N edits` as the proof. Whole file names only; a list that would
-/// run past the recap's claim limit says how many files instead.
-fn edit_receipt(edits: &[String]) -> Option<(String, String)> {
-    const SHOWN_FILES: usize = 3;
-    const MAX_CLAIM_CHARS: usize = 100;
-    if edits.is_empty() {
-        return None;
-    }
-    let mut files: Vec<&str> = Vec::new();
-    for path in edits {
-        let name = path.rsplit('/').next().unwrap_or(path);
-        if !name.is_empty() && !files.contains(&name) {
-            files.push(name);
-        }
-    }
-    let listed = files
-        .iter()
-        .take(SHOWN_FILES)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let claim = match files.len() {
-        0 => return None,
-        n if n > SHOWN_FILES => format!("edited {listed} and {} more", n - SHOWN_FILES),
-        _ => format!("edited {listed}"),
-    };
-    let claim = if claim.chars().count() > MAX_CLAIM_CHARS {
-        format!("edited {} files", files.len())
-    } else {
-        claim
-    };
-    let count = edits.len();
-    Some((
-        claim,
-        format!("{count} edit{}", if count == 1 { "" } else { "s" }),
-    ))
-}
-
-/// Record a completion. Commit, task/todo and edit receipts are capped
+/// Record a completion. Commit and task/todo receipts are capped
 /// separately (`MAX_COMPLETIONS` each, oldest dropped), so a run of todo
 /// completions can never evict the session's commits.
 fn push_completion(
@@ -3657,6 +3614,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            anchor_receipts: None,
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
@@ -3722,6 +3680,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            anchor_receipts: None,
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
@@ -5077,65 +5036,18 @@ mod tests {
     }
 
     #[test]
-    fn successful_edits_are_the_weakest_receipt_and_failed_ones_are_not_counted() {
+    fn edits_alone_are_no_receipt() {
         let edit = |id: &str, path: &str| {
             assistant_named_tool("Edit", id, serde_json::json!({"file_path": path}))
         };
+        // A session that only edited files finished nothing a receipt proves.
         let ep = extract(&[
             typed_line("tighten the recap composer", "typed"),
             edit("e1", "/repo/src/hooks/stop.rs"),
             tool_result_bound("e1", "The file has been updated"),
-            edit("e2", "/repo/src/hooks/recap.rs"),
-            error_result("e2", "String to replace not found"),
-            edit("e3", "/repo/src/hooks/stop.rs"),
-            tool_result_bound("e3", "The file has been updated"),
-        ]);
-        assert_eq!(ep.completions, vec![receipt("edited stop.rs", "2 edits")]);
-        // An edit made by a subagent is not this session's.
-        let ep = extract(&[
-            typed_line("tighten the recap composer", "typed"),
-            sidechain(edit("e1", "/repo/src/hooks/stop.rs")),
-            sidechain(tool_result_bound("e1", "The file has been updated")),
         ]);
         assert!(ep.completions.is_empty());
-        let (claim, proof) = edit_receipt(&[
-            "/r/a.rs".into(),
-            "/r/b.rs".into(),
-            "/r/c.rs".into(),
-            "/r/d.rs".into(),
-            "/r/e.rs".into(),
-            "/r/a.rs".into(),
-        ])
-        .unwrap();
-        assert_eq!(claim, "edited a.rs, b.rs, c.rs and 2 more");
-        assert_eq!(proof, "6 edits");
-        let long = format!("/r/{}.rs", "n".repeat(100));
-        let (claim, _) = edit_receipt(&[long, "/r/b.rs".into()]).unwrap();
-        assert_eq!(claim, "edited 2 files");
-        assert_eq!(edit_receipt(&[]), None);
-    }
-
-    #[test]
-    fn edit_receipts_never_evict_the_sessions_commits() {
-        let mut rows = vec![typed_line("land the fix", "typed")];
-        for n in 0..8 {
-            let id = format!("e{n}");
-            rows.push(assistant_named_tool(
-                "Edit",
-                &id,
-                serde_json::json!({"file_path": format!("/r/f{n}.rs")}),
-            ));
-            rows.push(tool_result_bound(&id, "The file has been updated"));
-        }
-        rows.push(assistant_named_tool(
-            "Bash",
-            "c1",
-            serde_json::json!({"command": "git commit -m done"}),
-        ));
-        rows.push(tool_result_bound("c1", "[main 1a2b3c4] fix: done"));
-        let ep = extract(&rows);
-        assert!(ep.completions.iter().any(|done| done.receipt == "1a2b3c4"));
-        assert!(ep.completions.iter().any(|done| done.receipt == "8 edits"));
+        assert!(crate::hooks::recap::displayed_receipts(&ep.completions).is_empty());
     }
 
     /// One Bash call and its result.
@@ -5182,6 +5094,35 @@ mod tests {
         // Everything it says is re-import suppressed.
         assert!(crate::extraction::provenance::is_csr_emission(&got));
         assert!(crate::extraction::provenance::extractable(&got).is_none());
+    }
+
+    #[test]
+    fn a_commit_made_under_a_later_ask_is_not_shown_beside_the_earlier_one() {
+        let ep = extract(&[
+            typed_line("run the release checks and report", "typed"),
+            assistant_stop_line("The checks pass.", "end_turn"),
+            typed_line("now land the fix for the stale lock in the daemon", "typed"),
+            assistant_named_tool(
+                "Bash",
+                "c",
+                serde_json::json!({"command": "git commit -m 'fix(daemon): stale lock'"}),
+            ),
+            tool_result_bound("c", "[main 1a2b3c4] fix(daemon): stale lock"),
+            assistant_stop_line("Committed.", "end_turn"),
+        ]);
+        assert_eq!(
+            ep.completions,
+            vec![receipt("fix(daemon): stale lock", "1a2b3c4")]
+        );
+        assert_eq!(ep.anchor_receipts, Some(vec![]));
+        let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
+        assert!(got.starts_with("recap [now]: run the release checks and report."));
+        assert!(!got.contains("1a2b3c4"), "{got}");
+        // The commit stays on the episode for the companion's own reading.
+        assert_eq!(
+            crate::hooks::recap::displayed_receipts(&ep.completions).len(),
+            1
+        );
     }
 
     #[test]
@@ -5803,7 +5744,7 @@ mod tests {
         let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
         assert_eq!(
             got,
-            "recap [now]: Review the new billing dashboard implementation. Latest: fix(auth): validate checkout (abc1234). [[CSR:RECAP]]"
+            "recap [now]: Review the new billing dashboard implementation. [[CSR:RECAP]]"
         );
     }
 
