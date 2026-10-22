@@ -258,6 +258,7 @@ pub fn relevance_assessment(
 }
 
 /// A search result enriched with chunk metadata.
+#[derive(Clone)]
 pub struct EnrichedResult {
     pub score: f32,
     pub chunk: ConversationChunk,
@@ -280,6 +281,7 @@ pub struct EnrichedResult {
 /// Effective rerank score for a result whose position differs from raw-score
 /// order. Kept separate from [`EnrichedResult`] so other search surfaces retain
 /// their existing result model.
+#[derive(Clone)]
 pub(crate) struct DisplayRankScore {
     pub chunk_id: String,
     pub adjusted_score: f32,

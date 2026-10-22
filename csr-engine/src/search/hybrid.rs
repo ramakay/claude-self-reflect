@@ -78,6 +78,68 @@ pub fn fuse_rrf(semantic_order: &[String], fts_order: &[String], k: usize) -> Ve
     fused_order
 }
 
+/// A row the keyword lane lists is "weakly similar" when its cosine is below
+/// this share of the best cosine in the query's vector window. Chosen from the
+/// ten live known-answer questions: the lowest an answer sits is 0.65 of the
+/// best cosine, the filler that outranked answers sits at 0.45 to 0.52.
+pub const KEYWORD_ROW_COSINE_FLOOR: f32 = 0.60;
+
+/// Move the weakly similar keyword rows of a fused order below every strongly
+/// similar vector hit, keeping the order inside each group.
+///
+/// A row is weak when the keyword lane lists it and its cosine is under
+/// `floor` times the best cosine in `raw_cosine`; a row the vector window never
+/// returned counts as weak only when `is_reflection` says it is a stored
+/// reflection (a chunk found by keyword alone is a needle match: it carries no
+/// cosine and is left where fusion put it). A row is strong when its cosine is
+/// at least `floor` times the best. When the window has no cosine at all, or
+/// no row is weak, the order is returned unchanged. Nothing is dropped.
+pub fn demote_weakly_similar_keyword_rows(
+    fused: Vec<String>,
+    fts_order: &[String],
+    raw_cosine: &HashMap<&str, f32>,
+    is_reflection: impl Fn(&str) -> bool,
+    floor: f32,
+) -> Vec<String> {
+    let best = raw_cosine.values().copied().fold(0.0_f32, f32::max);
+    if best <= 0.0 {
+        return fused;
+    }
+    let cut = floor * best;
+    let keyword: HashSet<&str> = fts_order.iter().map(String::as_str).collect();
+    let weak = |id: &str| {
+        keyword.contains(id)
+            && match raw_cosine.get(id) {
+                Some(cosine) => *cosine < cut,
+                None => is_reflection(id),
+            }
+    };
+    let strong = |id: &str| raw_cosine.get(id).is_some_and(|cosine| *cosine >= cut);
+    let Some(last_strong) = fused.iter().rposition(|id| strong(id)) else {
+        return fused;
+    };
+    if !fused.iter().take(last_strong).any(|id| weak(id)) {
+        return fused;
+    }
+    let mut kept = Vec::with_capacity(fused.len());
+    let mut demoted = Vec::new();
+    for (position, id) in fused.into_iter().enumerate() {
+        if position < last_strong && weak(&id) {
+            demoted.push(id);
+        } else {
+            kept.push(id);
+        }
+    }
+    let tail = kept.split_off(
+        kept.iter()
+            .rposition(|id| strong(id))
+            .map_or(kept.len(), |p| p + 1),
+    );
+    kept.extend(demoted);
+    kept.extend(tail);
+    kept
+}
+
 /// Keyword chunk hits, best first, plus whether any single FTS window came back
 /// full (so the caller knows more matches may exist past `fetch`).
 pub struct KeywordChunkHits {
@@ -258,6 +320,86 @@ mod tests {
         assert_eq!(fused[0], "c", "{fused:?}");
         assert!(fused.contains(&"x".to_string()));
         assert_eq!(fused.len(), 4);
+    }
+
+    fn cosines<'a>(rows: &[(&'a str, f32)]) -> HashMap<&'a str, f32> {
+        rows.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_weak_row_the_keyword_lane_lists_goes_below_the_strong_vector_hits() {
+        // `weak` fuses first (listed by both lanes) but its cosine is 0.3 of the best.
+        let fused = ids(&["weak", "strong-a", "strong-b", "only-vector"]);
+        let fts = ids(&["weak"]);
+        let cos = cosines(&[
+            ("weak", 0.27),
+            ("strong-a", 0.9),
+            ("strong-b", 0.8),
+            ("only-vector", 0.7),
+        ]);
+        let out = demote_weakly_similar_keyword_rows(fused, &fts, &cos, |_| false, 0.6);
+        assert_eq!(out, ids(&["strong-a", "strong-b", "only-vector", "weak"]));
+    }
+
+    #[test]
+    fn a_keyword_only_chunk_has_no_cosine_and_keeps_its_place() {
+        let fused = ids(&["needle", "strong"]);
+        let fts = ids(&["needle"]);
+        let cos = cosines(&[("strong", 0.9)]);
+        let out = demote_weakly_similar_keyword_rows(fused.clone(), &fts, &cos, |_| false, 0.6);
+        assert_eq!(out, fused);
+    }
+
+    #[test]
+    fn a_keyword_only_reflection_goes_below_the_strong_hits() {
+        let fused = ids(&["note", "strong"]);
+        let fts = ids(&["note"]);
+        let cos = cosines(&[("strong", 0.9)]);
+        let out = demote_weakly_similar_keyword_rows(fused, &fts, &cos, |id| id == "note", 0.6);
+        assert_eq!(out, ids(&["strong", "note"]));
+    }
+
+    #[test]
+    fn a_weak_row_the_keyword_lane_does_not_list_is_left_alone() {
+        let fused = ids(&["weak-vector", "strong"]);
+        let cos = cosines(&[("weak-vector", 0.2), ("strong", 0.9)]);
+        let out = demote_weakly_similar_keyword_rows(fused.clone(), &[], &cos, |_| false, 0.6);
+        assert_eq!(out, fused);
+    }
+
+    #[test]
+    fn the_floor_keeps_every_row_and_the_order_inside_each_group() {
+        let fused = ids(&["w1", "s1", "w2", "s2", "w3", "tail"]);
+        let fts = ids(&["w1", "w2", "w3"]);
+        let cos = cosines(&[
+            ("w1", 0.1),
+            ("w2", 0.2),
+            ("w3", 0.3),
+            ("s1", 0.9),
+            ("s2", 0.8),
+            ("tail", 0.1),
+        ]);
+        let out = demote_weakly_similar_keyword_rows(fused.clone(), &fts, &cos, |_| false, 0.6);
+        // w3 sits after the last strong row already; w1 and w2 join it there.
+        assert_eq!(out, ids(&["s1", "s2", "w1", "w2", "w3", "tail"]));
+        let mut sorted_in = fused;
+        let mut sorted_out = out;
+        sorted_in.sort();
+        sorted_out.sort();
+        assert_eq!(sorted_in, sorted_out);
+    }
+
+    #[test]
+    fn no_cosine_in_the_window_means_no_change() {
+        let fused = ids(&["a", "b"]);
+        let out = demote_weakly_similar_keyword_rows(
+            fused.clone(),
+            &ids(&["a"]),
+            &HashMap::new(),
+            |_| true,
+            0.6,
+        );
+        assert_eq!(out, fused);
     }
 
     fn words(text: &str) -> Vec<String> {
