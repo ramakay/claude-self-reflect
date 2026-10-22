@@ -2163,6 +2163,9 @@ pub struct DaemonRun {
     pub outcome: DaemonOutcome,
     /// The launchd label the daemon job runs under: ours, or one found.
     pub label: String,
+    /// Pid of the job before this run touched it, if it was running. A pid
+    /// that is still the same afterwards is the old process, not a start.
+    pub previous_pid: Option<u32>,
     /// Extra lines for the summary (what was carried, what was replaced).
     pub notes: Vec<String>,
 }
@@ -2233,6 +2236,7 @@ fn install_daemon_agent(
                     return DaemonRun {
                         outcome: DaemonOutcome::AlreadyRunning { pid },
                         label: canonical.label,
+                        previous_pid: None,
                         notes,
                     };
                 }
@@ -2291,6 +2295,7 @@ fn install_daemon_agent(
         &plist,
     ));
 
+    let previous_pid = loaded_job.pid;
     let outcome = apply_daemon_agent(
         &spec,
         &target,
@@ -2305,6 +2310,7 @@ fn install_daemon_agent(
     DaemonRun {
         outcome,
         label: target.label,
+        previous_pid,
         notes,
     }
 }
@@ -2447,6 +2453,7 @@ fn daemon_step(
     let bare = |outcome| DaemonRun {
         outcome,
         label: DAEMON_LABEL.to_owned(),
+        previous_pid: None,
         notes: Vec::new(),
     };
     if opted_out {
@@ -2494,10 +2501,26 @@ fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
         run.outcome,
         DaemonOutcome::Running { .. } | DaemonOutcome::KeptExisting
     ) {
-        text.push_str(if wait_for_daemon(&home, Duration::from_secs(20)) {
+        let job = format!("gui/{uid}/{}", run.label);
+        let lock = home.join(".claude-self-reflect/daemon.lock");
+        let confirmed = wait_for_daemon(
+            run.previous_pid,
+            80,
+            &mut || DaemonProbe {
+                job_pid: real_launchctl(&["print", &job])
+                    .ok()
+                    .and_then(|text| parse_launchctl_print(&text).pid),
+                lock_held: crate::daemon::lock_file_held(&lock),
+                lock_pid: std::fs::read_to_string(&lock)
+                    .ok()
+                    .and_then(|t| t.trim().parse().ok()),
+            },
+            &|| std::thread::sleep(Duration::from_millis(250)),
+        );
+        text.push_str(if confirmed {
             "  Daemon is running.\n"
         } else {
-            "  launchd has the daemon, but it has not taken its lock yet (a large corpus loads slowly). Check: csr-engine status\n"
+            "  launchd has the daemon job, but the process it started has not taken the lock yet (a large corpus loads slowly). Check: csr-engine status\n"
         });
     }
     text
@@ -2583,21 +2606,44 @@ fn daemon_report(run: &DaemonRun, engine: &Path) -> String {
     }
 }
 
-/// After a successful load, wait briefly for the daemon to hold its lock, so the
-/// summary can say whether it is up. A large corpus can take longer than the
-/// wait; then it says so rather than claim success.
-fn wait_for_daemon(home: &Path, wait: Duration) -> bool {
-    let lock = home.join(".claude-self-reflect/daemon.lock");
-    let deadline = Instant::now() + wait;
-    loop {
-        if crate::daemon::lock_file_held(&lock) {
+/// What one look at the daemon shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DaemonProbe {
+    /// `pid` in `launchctl print` for the job.
+    job_pid: Option<u32>,
+    /// Something holds `daemon.lock`.
+    lock_held: bool,
+    /// The pid written in `daemon.lock`.
+    lock_pid: Option<u32>,
+}
+
+/// Is this the process setup started? The lock is held by a pid, that pid is
+/// the job's, and it is not the pid the job had before setup touched it. A held
+/// lock alone proves nothing: an older daemon, or a daemon under another label,
+/// holds it too while the job setup started is still loading or failing.
+fn daemon_confirmed(probe: &DaemonProbe, previous_pid: Option<u32>) -> bool {
+    probe.lock_held
+        && probe.job_pid.is_some()
+        && probe.job_pid == probe.lock_pid
+        && probe.job_pid != previous_pid
+}
+
+/// Look until the daemon setup started is confirmed, or the polls run out.
+fn wait_for_daemon(
+    previous_pid: Option<u32>,
+    polls: u32,
+    probe: &mut dyn FnMut() -> DaemonProbe,
+    pause: &dyn Fn(),
+) -> bool {
+    for poll in 0..polls {
+        if poll > 0 {
+            pause();
+        }
+        if daemon_confirmed(&probe(), previous_pid) {
             return true;
         }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(250));
     }
+    false
 }
 
 #[cfg(test)]
@@ -4128,6 +4174,7 @@ esac
             &DaemonRun {
                 outcome,
                 label: DAEMON_LABEL.into(),
+                previous_pid: None,
                 notes: vec![],
             },
             Path::new("/opt/csr/bin/csr-engine"),
@@ -4236,6 +4283,7 @@ esac
         let run_of = |outcome| DaemonRun {
             outcome,
             label: DAEMON_LABEL.into(),
+            previous_pid: None,
             notes: vec![],
         };
         let out = daemon_report(&run_of(DaemonOutcome::OptedOut), Path::new("/x/csr-engine"));
@@ -4726,6 +4774,91 @@ esac
         assert!(
             said.contains("me.csr") && said.contains("bootout"),
             "{said}"
+        );
+    }
+
+    // ----- confirming the daemon setup started -----
+
+    fn probe(job: Option<u32>, held: bool, lock_pid: Option<u32>) -> DaemonProbe {
+        DaemonProbe {
+            job_pid: job,
+            lock_held: held,
+            lock_pid,
+        }
+    }
+
+    #[test]
+    fn a_lock_held_by_someone_else_does_not_confirm_the_new_daemon() {
+        // An older daemon holds the lock while the new job is still starting.
+        assert!(!daemon_confirmed(
+            &probe(Some(200), true, Some(100)),
+            Some(100)
+        ));
+        assert!(!daemon_confirmed(&probe(None, true, Some(100)), None));
+        // The job is still the pid it had before: nothing was restarted.
+        assert!(!daemon_confirmed(
+            &probe(Some(100), true, Some(100)),
+            Some(100)
+        ));
+        // The lock is free: the job is not running yet.
+        assert!(!daemon_confirmed(
+            &probe(Some(200), false, Some(200)),
+            Some(100)
+        ));
+        // A held lock with no readable pid proves nothing.
+        assert!(!daemon_confirmed(&probe(Some(200), true, None), Some(100)));
+        // The process launchd started holds the lock.
+        assert!(daemon_confirmed(
+            &probe(Some(200), true, Some(200)),
+            Some(100)
+        ));
+        assert!(daemon_confirmed(&probe(Some(200), true, Some(200)), None));
+    }
+
+    #[test]
+    fn waiting_gives_up_on_a_lock_that_is_not_ours_and_stops_when_ours_arrives() {
+        let polls = std::cell::Cell::new(0);
+        let loser = wait_for_daemon(
+            Some(100),
+            5,
+            &mut || {
+                polls.set(polls.get() + 1);
+                probe(Some(200), true, Some(100))
+            },
+            &|| {},
+        );
+        assert!(!loser);
+        assert_eq!(polls.get(), 5);
+
+        let mut seen = 0;
+        let started = wait_for_daemon(
+            Some(100),
+            5,
+            &mut || {
+                seen += 1;
+                match seen {
+                    1 => probe(Some(100), true, Some(100)), // the old process, not yet gone
+                    2 => probe(None, false, None),          // between processes
+                    _ => probe(Some(300), true, Some(300)),
+                }
+            },
+            &|| {},
+        );
+        assert!(started);
+        assert_eq!(seen, 3);
+    }
+
+    #[test]
+    fn the_job_pid_before_setup_is_remembered() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&spec, 4321);
+        assert_eq!(install_run(&spec, &mut fake).previous_pid, Some(4321));
+        assert_eq!(
+            install_run(&spec, &mut FakeLaunchctl::new(false)).previous_pid,
+            None
         );
     }
 }
