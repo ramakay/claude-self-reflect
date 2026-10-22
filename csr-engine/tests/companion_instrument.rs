@@ -1957,3 +1957,296 @@ fn native_weekly_quota_keeps_7d_and_magenta_csr_points() {
         }
     }
 }
+
+/// A session whose dreamer found nothing to ask but left observations: three places Claude went
+/// wrong and two things that should be a skill or a hook. No what-if is open, so the number keys
+/// are free of the dream answers.
+fn observed_home() -> (tempfile::TempDir, Paths) {
+    let (home, paths) = state_home("08b-nothing");
+    let log = paths.keep.join("dreams.jsonl");
+    let mut text = fs::read_to_string(&log).unwrap();
+    text.push_str(
+        &json!({"kind":"look","session":"sess-now","at":NOW - 20.,"outcome":"none",
+            "confusing_claude":[
+                {"line":"Misread which pane should change.","evidence":"Turn 4: 'the companion pane'"},
+                {"line":"Repeated the rejected approach.","evidence":"Turns 12 and 15: 'keep it local'",
+                    "explain":"Claude tried the local cache again after you ruled it out.",
+                    "next":"Tell Claude once, in CLAUDE.md, that the local cache is out."},
+                {"line":"Said the test passed without running it.","evidence":"'it should pass now'"}],
+            "should_be":[
+                {"kind":"hook","line":"Check the card height after each layout edit.","evidence":"Turns 4 and 8: 'at most 30%'"},
+                {"kind":"skill","line":"Bump the version in both files.","evidence":"Turns 9 and 20: 'both files'"}]})
+        .to_string(),
+    );
+    text.push('\n');
+    fs::write(&log, text).unwrap();
+    (home, paths)
+}
+fn plain_rows(pane: &mut Pane, cols: usize, rows: usize) -> Vec<String> {
+    pane.frame(cols, rows, NOW)
+        .iter()
+        .map(|l| text::plain(l).trim_end().to_owned())
+        .collect()
+}
+/// The first row with anything on it: text mode sits its content above the keys.
+fn first_row(rows: &[String]) -> &str {
+    rows.iter()
+        .map(String::as_str)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+}
+fn row_of(rows: &[String], starts: &str) -> usize {
+    rows.iter()
+        .position(|l| l.starts_with(starts))
+        .unwrap_or_else(|| panic!("no row starts with {starts:?}: {rows:#?}"))
+}
+
+#[test]
+fn number_keys_open_an_observation_item_and_the_popup_is_modal() {
+    let (_home, paths) = observed_home();
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 100, 60));
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(rows.iter().any(|l| l == "Confused Claude"), "{rows:#?}");
+    assert!(
+        rows.last().unwrap().contains("o details"),
+        "{:?}",
+        rows.last()
+    );
+    // 2 opens the second item of the first card, in full, with the dreamer's own words.
+    assert!(pane.key("2"));
+    let rows = plain_rows(&mut pane, 100, 60);
+    let top = row_of(&rows, "Confused Claude · 2 of 3");
+    assert_eq!(rows[top + 1], "Repeated the rejected approach.");
+    assert!(rows[top + 2].starts_with("Evidence: Turns 12 and 15"));
+    assert_eq!(
+        rows[top + 3],
+        "What happened: Claude tried the local cache again after you ruled it out."
+    );
+    assert!(rows[top + 4].starts_with("Next step for you: Tell Claude once, in CLAUDE.md"));
+    let footer = rows.last().unwrap();
+    assert!(
+        footer.contains("c copy") && footer.contains("esc close") && !footer.contains("o details"),
+        "{footer}"
+    );
+    // Modal: the keys of the pane underneath do nothing while it is up.
+    for key in ["l", "t", "i", "d", "a"] {
+        pane.key(key);
+    }
+    let after = plain_rows(&mut pane, 100, 60);
+    assert_eq!(after, rows);
+    // The item without turn numbers still gets a composed explanation.
+    pane.key("3");
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(
+        rows.iter()
+            .any(|l| l.starts_with("What happened: The dreamer flagged")),
+        "{rows:#?}"
+    );
+    assert!(rows
+        .iter()
+        .any(|l| l.starts_with("Next step for you: Re-read the quoted evidence")));
+    // j and k step through the card and wrap round.
+    pane.key("j");
+    assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 1 of 3"));
+    pane.key("k");
+    assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 3 of 3"));
+    // A number past the card's last item changes nothing.
+    pane.key("5");
+    assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 3 of 3"));
+    // Tab flips to the other card.
+    pane.key("tab");
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert_eq!(
+        first_row(&rows),
+        "Should be a skill / memory / tool · 1 of 2 · hook"
+    );
+    // esc closes the popup and the pane is as it was.
+    pane.key("escape");
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(rows.iter().any(|l| l == "Confused Claude"), "{rows:#?}");
+    // q closes an open popup first; the next q closes the pane.
+    pane.key("o");
+    assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 1 of 3"));
+    assert!(pane.key("q"));
+    assert!(plain_rows(&mut pane, 100, 60)
+        .iter()
+        .any(|l| l == "Confused Claude"));
+    assert!(!pane.key("q"));
+}
+
+#[test]
+fn c_copies_the_item_with_its_explanation_or_a_draft_for_a_should_be_item() {
+    let (_home, paths) = observed_home();
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 100, 60));
+    plain_rows(&mut pane, 100, 60);
+    // Nothing is copied until asked.
+    pane.key("o");
+    plain_rows(&mut pane, 100, 60);
+    assert_eq!(pane.take_copy(), None);
+    pane.key("c");
+    let copied = pane.take_copy().expect("c copies");
+    assert!(
+        copied.starts_with("Confused Claude: Misread which pane should change.\nEvidence: Turn 4: 'the companion pane'\nWhat happened: The dreamer flagged"),
+        "{copied}"
+    );
+    assert!(copied.contains("Next step: Re-read turn 4"), "{copied}");
+    assert_eq!(pane.take_copy(), None, "taken once");
+    assert!(plain_rows(&mut pane, 100, 60)
+        .iter()
+        .any(|l| l == "Copied."));
+    // A should-be skill copies a draft, ready to paste, and writes nothing itself.
+    pane.key("tab");
+    pane.key("2");
+    plain_rows(&mut pane, 100, 60);
+    assert!(plain_rows(&mut pane, 100, 60)
+        .last()
+        .unwrap()
+        .contains("c copy draft"));
+    pane.key("c");
+    let draft = pane.take_copy().expect("c copies the draft");
+    assert!(
+        draft.starts_with("---\nname: bump-the-version-in-both\ndescription: Bump the version in both files.\n---\n"),
+        "{draft}"
+    );
+    assert!(
+        draft.contains("Seen: Turns 9 and 20: 'both files'"),
+        "{draft}"
+    );
+    // Closing and reopening forgets that it was copied.
+    pane.key("escape");
+    pane.key("o");
+    assert!(!plain_rows(&mut pane, 100, 60)
+        .iter()
+        .any(|l| l == "Copied."));
+}
+
+#[test]
+fn a_ready_dream_keeps_the_number_keys_and_o_opens_the_cards() {
+    let (_home, paths) = state_home("02-running");
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 100, 60));
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(rows.iter().any(|l| l.starts_with("1 helpful")), "{rows:#?}");
+    // o opens the first observation item.
+    pane.key("o");
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(
+        first_row(&rows).starts_with("Confused Claude · 1 of 1"),
+        "{rows:#?}"
+    );
+    pane.key("escape");
+    plain_rows(&mut pane, 100, 60);
+    // 1 answers the dream, as before; it opens nothing.
+    pane.key("1");
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(
+        !rows.iter().any(|l| l.starts_with("Confused Claude ·")),
+        "{rows:#?}"
+    );
+}
+
+#[test]
+fn clicking_an_observation_row_opens_it_and_any_click_closes_it() {
+    let (_home, paths) = observed_home();
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 100, 60));
+    let rows = plain_rows(&mut pane, 100, 60);
+    let row = row_of(&rows, "Repeated the rejected approach.");
+    assert!(pane.acts.contains_key(&row), "the row is a click target");
+    assert!(pane.click(row, 10, NOW));
+    let shown = plain_rows(&mut pane, 100, 60);
+    assert!(
+        first_row(&shown).starts_with("Confused Claude · 2 of 3"),
+        "{shown:#?}"
+    );
+    // The popup's footer answers: a click on c copies.
+    let footer = shown.len() - 1;
+    let at = shown[footer].find("c copy").expect("footer c");
+    assert!(pane.click(footer, at, NOW));
+    assert!(pane.take_copy().is_some());
+    // Any other click closes.
+    assert!(pane.click(5, 5, NOW));
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(rows.iter().any(|l| l == "Confused Claude"), "{rows:#?}");
+    // A should-be row opens its own card.
+    let row = row_of(&rows, "skill: Bump the version in both files.");
+    pane.click(row, 3, NOW);
+    let shown = plain_rows(&mut pane, 100, 60);
+    assert!(
+        first_row(&shown).starts_with("Should be a skill / memory / tool · 2 of 2 · skill"),
+        "{shown:#?}"
+    );
+}
+
+#[test]
+fn the_popup_repaints_once_on_open_and_once_on_close() {
+    use csr_engine::companion::render::kitty;
+    let (_home, paths) = observed_home();
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+    pane.pixels = true;
+    pane.enable_cards();
+    let (cols, rows) = (76, 67);
+    let shot = |pane: &mut Pane| {
+        let written = pane.frame(cols, rows, NOW);
+        (written, kitty::bands(&pane.placed))
+    };
+    let (written, closed) = shot(&mut pane);
+    let written_closed = written.clone();
+    let drawn = kitty::Drawn {
+        cols,
+        rows,
+        written: written.clone(),
+        placed: closed.clone(),
+    };
+    // Every observation row is a click target in the picture.
+    let places = pane
+        .instrument_metrics
+        .as_ref()
+        .unwrap()
+        .observation_rows
+        .len();
+    assert_eq!(places, 5);
+    let first = pane
+        .acts
+        .values()
+        .filter(|a| string(&a["key"]).starts_with("observe:"))
+        .count();
+    assert_eq!(first, 5, "{:?}", pane.acts);
+    // Opening changes the picture once; the same popup frame again changes nothing.
+    pane.key("o");
+    let (written, open) = shot(&mut pane);
+    assert_ne!(open, closed);
+    let opened = kitty::repaint_pictures(Some(&drawn), cols, rows, &written, &open);
+    assert!(!opened.contains("\x1b[2J"), "no full clear on open");
+    assert!(opened.contains("\x1b_G"), "the picture is sent");
+    let drawn_open = kitty::Drawn {
+        cols,
+        rows,
+        written: written.clone(),
+        placed: open.clone(),
+    };
+    let (written2, open2) = shot(&mut pane);
+    assert_eq!(
+        kitty::repaint_pictures(Some(&drawn_open), cols, rows, &written2, &open2),
+        ""
+    );
+    // Closing puts the pane back exactly, in one more repaint.
+    pane.key("escape");
+    let (written3, back) = shot(&mut pane);
+    assert_eq!(back, closed);
+    assert!(!kitty::repaint_pictures(Some(&drawn_open), cols, rows, &written3, &back).is_empty());
+    assert_eq!(written3, written_closed);
+    // A click on a card row in the picture opens its popup.
+    let (row, _) = pane
+        .acts
+        .iter()
+        .find(|(_, a)| a["key"] == "observe:0:1")
+        .map(|(r, a)| (*r, a.clone()))
+        .expect("second confusing row is a target");
+    pane.click(row, 20, NOW);
+    let (_, popup) = shot(&mut pane);
+    assert_ne!(popup, closed);
+    let metrics = pane.instrument_metrics.as_ref().unwrap();
+    assert!(metrics.observation_rows.iter().any(|r| r.1 == 1));
+}
+fn string(v: &Value) -> &str {
+    v.as_str().unwrap_or("")
+}

@@ -605,8 +605,11 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                         let key = match k.code {
                             KeyCode::Char(c) => c.to_lowercase().to_string(),
                             KeyCode::Esc => "escape".into(),
+                            KeyCode::Tab => "tab".into(),
                             KeyCode::Up => "up".into(),
                             KeyCode::Down => "down".into(),
+                            KeyCode::Left => "left".into(),
+                            KeyCode::Right => "right".into(),
                             _ => String::new(),
                         };
                         let typing =
@@ -615,6 +618,9 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                         if !(key == "q" && typing) && !pane.key(&key) {
                             ENDING.store(true, Ordering::Relaxed);
                             break;
+                        }
+                        if let Some(text) = pane.take_copy() {
+                            copy_to_clipboard(&text);
                         }
                         pressed = true;
                     }
@@ -631,6 +637,27 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     drop(terminal);
     drop(signals);
     result
+}
+/// Put `text` on the clipboard: an OSC 52 sequence for terminals that pass it on, and `pbcopy`
+/// on a Mac, where herdr may not. Best effort; a failure is silent.
+fn copy_to_clipboard(text: &str) {
+    use base64::Engine;
+    print!(
+        "\x1b]52;c;{}\x07",
+        base64::engine::general_purpose::STANDARD.encode(text)
+    );
+    let _ = io::stdout().flush();
+    if cfg!(target_os = "macos") {
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
 }
 #[cfg(test)]
 mod tests {

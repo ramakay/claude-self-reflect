@@ -3,6 +3,7 @@ pub mod instrument;
 mod instrument_gfx;
 mod instrument_icons;
 pub mod kitty;
+pub mod observation;
 pub mod pictures;
 pub mod raster;
 pub mod text;

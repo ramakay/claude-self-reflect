@@ -2053,6 +2053,21 @@ should_be: [{{"kind":"hook","line":"Check formatting before each commit.","evide
             parse_dream(legacy)
         );
     }
+    // explain and next ride along when they are sentences of a sane length, and only then.
+    let detailed = parse_sections(&format!(
+        "confusing_claude: [{{\"line\":\"A\",\"evidence\":\"Turn 1\",\"explain\":\" It misread. \",\"next\":\"{}\"}}]\nshould_be: [{{\"kind\":\"memory\",\"line\":\"B\",\"evidence\":\"Turn 2\",\"next\":\"Save it.\"}}]",
+        "x".repeat(201)
+    ));
+    let confusing = &detailed["confusing_claude"][0];
+    assert_eq!(confusing["explain"], "It misread.");
+    assert!(
+        confusing.get("next").is_none(),
+        "an overlong next is left out"
+    );
+    let should = &detailed["should_be"][0];
+    assert_eq!(should["next"], "Save it.");
+    assert!(should.get("explain").is_none());
+    assert_eq!(sections["confusing_claude"][0].get("explain"), None);
     let none = parse_sections("dream: none\nconfusing_claude: []\nshould_be: []");
     assert_eq!(none["should_be"], serde_json::json!([]));
 }

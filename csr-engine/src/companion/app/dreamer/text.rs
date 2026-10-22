@@ -361,6 +361,17 @@ pub fn parse_sections(reply: &str) -> serde_json::Value {
                     return None;
                 }
                 let mut out = json!({"line": line, "evidence": evidence});
+                // Optional detail for the pane's popup. A missing or overlong one is left out; the
+                // pane composes its own wording from line and evidence.
+                for field in ["explain", "next"] {
+                    if let Some(text) = item[field]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty() && t.chars().count() <= 200)
+                    {
+                        out[field] = json!(text);
+                    }
+                }
                 if classified {
                     let kind = item["kind"].as_str()?;
                     if !["skill", "memory", "hook", "CLAUDE.md"].contains(&kind) {

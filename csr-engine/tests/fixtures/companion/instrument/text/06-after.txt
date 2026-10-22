@@ -64,4 +64,4 @@ Text parity is ready for review.
 CTX 65k/1M
 7D 52%» · CSR 0.8 pts · 5H 2% · ◷ 59m · Codex 7D 41%
 5¢ this week
- d queue  l changes  t threads  i figure  b theme  q close
+ d queue  l changes  t threads  i figure  o details  b theme  q close

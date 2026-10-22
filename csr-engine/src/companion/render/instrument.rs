@@ -3,6 +3,7 @@
 use super::{
     instrument_gfx::*,
     instrument_icons::{self as icons, Icon},
+    observation::{self, Detail, ObsCard, PopupAt},
     text,
     theme::{self, Theme, Tokens, ICON_GAP, S1, S2, S3, S4, S5},
 };
@@ -204,6 +205,8 @@ pub struct Open {
     pub changes: bool,
     pub threads: bool,
     pub dreams: bool,
+    /// An observation item shown in full over the pane.
+    pub popup: Option<PopupAt>,
 }
 /// The threads timeline's heading and its subtitle.
 const MONOLOGUE: &str = "Monologue";
@@ -536,6 +539,17 @@ impl Composition {
             now,
         }
     }
+    /// The items of one observation card, newest first.
+    pub fn items(&self, card: ObsCard) -> &[Value] {
+        match card {
+            ObsCard::Confusing => &self.confusing,
+            ObsCard::ShouldBe => &self.should_be,
+        }
+    }
+    /// The popup's content for `at`, or `None` when that item is no longer on its card.
+    pub fn detail(&self, at: PopupAt) -> Option<Detail> {
+        observation::detail(self.items(at.card), at)
+    }
     pub fn question(&self) -> String {
         if self.offer {
             return "Turn dreams on.".into();
@@ -740,10 +754,10 @@ fn meta(c: &Composition) -> String {
 fn observation_card_h(rows: usize) -> f32 {
     P * 2. + theme::TITLE_LINE + S2 + rows as f32 * theme::BODY_LINE
 }
-const CONFUSED_TITLE: &str = "Confused Claude";
-const SHOULD_BE_TITLE: &str = "Should be a skill / memory / tool";
+pub(super) const CONFUSED_TITLE: &str = "Confused Claude";
+pub(super) const SHOULD_BE_TITLE: &str = "Should be a skill / memory / tool";
 /// The short label a should-be item carries on its row.
-fn should_be_kind(item: &Value) -> &'static str {
+pub(super) fn should_be_kind(item: &Value) -> &'static str {
     match string(&item["kind"]) {
         "skill" => "skill",
         "memory" => "memory",
@@ -752,7 +766,20 @@ fn should_be_kind(item: &Value) -> &'static str {
         _ => "tool",
     }
 }
-fn evidence_receipt(item: &Value) -> String {
+/// One observation row as the plain-text pane writes it.
+pub fn observation_text(item: &Value, should: bool) -> String {
+    format!(
+        "{}{} · {}",
+        if should {
+            format!("{}: ", should_be_kind(item))
+        } else {
+            String::new()
+        },
+        string(&item["line"]),
+        evidence_receipt(item)
+    )
+}
+pub(super) fn evidence_receipt(item: &Value) -> String {
     let evidence = string(&item["evidence"]);
     let before_quote = evidence.split(':').next().unwrap_or(evidence);
     let turns = before_quote
@@ -868,6 +895,9 @@ pub fn rows_with_figure(
     open: Open,
     show_figure: bool,
 ) -> Vec<String> {
+    if let Some(detail) = open.popup.and_then(|at| c.detail(at)) {
+        return observation::rows(&detail, cols);
+    }
     let mut out = vec![];
     let mut history_insert = None;
     let mut pitch_insert = None;
@@ -907,16 +937,7 @@ pub fn rows_with_figure(
         }
         out.extend(wrap(title));
         for item in items {
-            out.extend(wrap(&format!(
-                "{}{} · {}",
-                if should {
-                    format!("{}: ", should_be_kind(item))
-                } else {
-                    String::new()
-                },
-                string(&item["line"]),
-                evidence_receipt(item)
-            )));
+            out.extend(wrap(&observation_text(item, should)));
         }
     }
     if c.offer {
@@ -1674,9 +1695,9 @@ fn quota_row(
 }
 
 // The geometry and primitives below are the approved B prototype's glass, serif and ring design.
-const M: f32 = S4;
-const P: f32 = S4;
-const CW: f32 = W - 2. * M;
+pub(super) const M: f32 = S4;
+pub(super) const P: f32 = S4;
+pub(super) const CW: f32 = W - 2. * M;
 const IX: f32 = M + P;
 const IW: f32 = CW - 2. * P;
 fn label(c: &mut Canvas, f: &Fonts, s: &str, x: f32, y: f32, size: f32, col: Rgba, w: f32) {
@@ -1873,6 +1894,8 @@ pub struct Metrics {
     pub offer_hit: Option<(f32, f32, f32)>,
     pub story_region: Option<(f32, f32)>,
     pub shift_hits: Vec<f32>,
+    /// Each observation row's card, place on it and centre Y in layout pt: the click targets.
+    pub observation_rows: Vec<(ObsCard, usize, f32)>,
     pub agents_region: Option<(f32, f32)>,
     pub figure_region: (f32, f32),
     pub help_region: Option<(f32, f32)>,
@@ -2325,6 +2348,7 @@ pub fn draw(
         }
     }
     y += hero_h + card_gap;
+    let mut observation_rows = vec![];
     for (title_text, items, should) in observed {
         if items.is_empty() {
             continue;
@@ -2342,7 +2366,16 @@ pub fn draw(
             t.bold,
         );
         let mut row_y = y + P + theme::TITLE_LINE + S2;
-        for item in items {
+        for (index, item) in items.iter().enumerate() {
+            observation_rows.push((
+                if should {
+                    ObsCard::ShouldBe
+                } else {
+                    ObsCard::Confusing
+                },
+                index,
+                row_y + theme::BODY_LINE / 2.,
+            ));
             let base = row_y + f.cap(body);
             let receipt = evidence_receipt(item);
             let receipt_w = f.width(&receipt, caption);
@@ -2816,6 +2849,16 @@ pub fn draw(
         figure_region.0 + figure_region.1
     };
     let last_card_bottom_pad = (height - last_card_bottom).max(0.);
+    if let Some(detail) = open.popup.and_then(|at| c.detail(at)) {
+        observation::overlay(
+            &mut canvas,
+            f,
+            &detail,
+            height,
+            last_card_bottom.min(height),
+            t,
+        );
+    }
     let raw = image::RgbaImage::from_raw(
         canvas.pm.width(),
         canvas.pm.height(),
@@ -2858,6 +2901,7 @@ pub fn draw(
             offer_hit,
             story_region,
             shift_hits,
+            observation_rows,
             agents_region,
             figure_region,
             help_region,
@@ -4095,6 +4139,101 @@ mod tests {
                 let (pm, _) =
                     draw(c, 1210, 1700, Theme::Dark, Open::default(), false).expect("draws");
                 save(&format!("{}/{name}.png", dir.to_string_lossy()), &pm);
+            }
+        }
+    }
+
+    #[test]
+    fn the_popup_floats_over_the_pane_and_its_text_rows_replace_the_cards() {
+        let mut data = observed_data();
+        data["dream_records"][1]["should_be"][0]["explain"] =
+            json!("You keep restating the release steps.");
+        let c = Composition::build(&data, &json!({"id":"o"}), 1000.);
+        let at = |card, index| PopupAt {
+            card,
+            index,
+            copied: false,
+        };
+        // Text: the popup's own rows, and the dreamer's explanation when it wrote one.
+        let open = Open {
+            popup: Some(at(ObsCard::ShouldBe, 0)),
+            ..Open::default()
+        };
+        let text = text_rows(&c, 80, 40, open);
+        assert_eq!(
+            text[0],
+            "Should be a skill / memory / tool · 1 of 2 · skill"
+        );
+        assert_eq!(text[1], "Bump the version in both files.");
+        assert!(text.contains(&"What happened: You keep restating the release steps.".to_owned()));
+        assert!(text
+            .iter()
+            .any(|l| l.starts_with("Next step for you: Press c to copy a skill draft")));
+        // An item that left its card shows the plain pane, not an empty popup.
+        let gone = Open {
+            popup: Some(at(ObsCard::Confusing, 7)),
+            ..Open::default()
+        };
+        assert_eq!(
+            text_rows(&c, 80, 40, gone),
+            text_rows(&c, 80, 40, Open::default())
+        );
+        // Picture: every card row is a click target, and the popup changes the picture.
+        let png = std::env::var_os("CSR_POPUP_PNG");
+        for theme in [Theme::Dark, Theme::Light] {
+            let (plain, metrics) =
+                draw(&c, 1210, 1700, theme, Open::default(), false).expect("draws");
+            let places: Vec<_> = metrics
+                .observation_rows
+                .iter()
+                .map(|(c, i, _)| (*c, *i))
+                .collect();
+            assert_eq!(
+                places,
+                [
+                    (ObsCard::Confusing, 0),
+                    (ObsCard::Confusing, 1),
+                    (ObsCard::ShouldBe, 0),
+                    (ObsCard::ShouldBe, 1)
+                ]
+            );
+            let ys: Vec<f32> = metrics.observation_rows.iter().map(|r| r.2).collect();
+            assert!(ys.windows(2).all(|w| w[0] < w[1]), "{ys:?}");
+            for (name, popup) in [
+                ("confusing", at(ObsCard::Confusing, 1)),
+                ("should-be", at(ObsCard::ShouldBe, 0)),
+                (
+                    "copied",
+                    PopupAt {
+                        copied: true,
+                        ..at(ObsCard::ShouldBe, 0)
+                    },
+                ),
+            ] {
+                let open = Open {
+                    popup: Some(popup),
+                    ..Open::default()
+                };
+                let (shown, with) = draw(&c, 1210, 1700, theme, open, false).expect("draws");
+                assert_ne!(
+                    shown.data(),
+                    plain.data(),
+                    "{theme:?} {name}: the popup is drawn"
+                );
+                // The cards beneath keep their layout: the click targets do not move.
+                assert_eq!(with.observation_rows, metrics.observation_rows);
+                if let Some(dir) = &png {
+                    save(
+                        &format!("{}/popup-{name}-{theme:?}.png", dir.to_string_lossy()),
+                        &shown,
+                    );
+                }
+            }
+            if let Some(dir) = &png {
+                save(
+                    &format!("{}/cards-{theme:?}.png", dir.to_string_lossy()),
+                    &plain,
+                );
             }
         }
     }

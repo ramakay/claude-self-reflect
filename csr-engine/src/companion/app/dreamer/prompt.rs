@@ -205,14 +205,15 @@ pub const OBSERVATIONS: &str = r#"
 
 ## Two optional session observations
 After dream/explain (also after dream: none), append exactly two labelled JSON arrays:
-confusing_claude: [{"line":"A short account of the misread","evidence":"Turn 12: exact short quote"}]
-should_be: [{"kind":"skill","line":"The repeated ask that belongs here","evidence":"Turns 4 and 12: short quotes"}]
+confusing_claude: [{"line":"A short account of the misread","evidence":"Turn 12: exact short quote","explain":"One plain sentence: what happened","next":"One concrete action the person can take"}]
+should_be: [{"kind":"skill","line":"The repeated ask that belongs here","evidence":"Turns 4 and 12: short quotes","explain":"One plain sentence: why it belongs there","next":"One concrete action the person can take"}]
 
 Confusing Claude: at most two places in THIS session where Claude misread the person,
 contradicted itself, or repeated a mistake. Do not treat disagreement as a mistake.
 Should be a …: at most two REPEATED asks or patterns worth making into a skill, memory,
 hook, or CLAUDE.md rule. kind must be skill, memory, hook, or CLAUDE.md.
-Each line is one short sentence (160 characters maximum). Each evidence cites the
+Each line is one short sentence (160 characters maximum). explain and next are optional,
+one plain sentence each (200 characters maximum); omit either rather than guess. Each evidence cites the
 actual turn(s), or quotes the actual session words (240 characters maximum). Never
 invent a turn number or quote. These observations use the current session, independently
 of the what-if's past-session receipt. Empty means []; never fill a quota. If there is

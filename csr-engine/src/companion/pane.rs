@@ -1,3 +1,4 @@
+use super::render::observation::{self, ObsCard, PopupAt};
 use super::{
     array, carry, cli::PaneArgs, db::Db, dreams, feed::Feed, infinite, layout, masthead, num,
     pages, paths::Paths, render::text::*, send, session::Session, string, threads, value,
@@ -246,6 +247,15 @@ pub struct Pane {
     compacting: bool,
     /// Visible notice when the dreams-off offer could not write settings.
     offer_notice: Option<String>,
+    /// The observation popup: its card, the item's line (its identity, since a new look shifts
+    /// places) and whether its text was just copied.
+    popup: Option<(ObsCard, String, bool)>,
+    /// The lines of each observation card at the last frame, `[confusing, should_be]`.
+    obs_lines: [Vec<String>; 2],
+    /// What `c` copies for the popup at the last frame.
+    popup_copy: Option<String>,
+    /// Text for the watch loop to put on the clipboard.
+    copy_out: Option<String>,
 }
 impl Pane {
     pub fn new(paths: Paths, args: &PaneArgs) -> Self {
@@ -315,6 +325,10 @@ impl Pane {
             carry_gate: None,
             compacting: false,
             offer_notice: None,
+            popup: None,
+            obs_lines: Default::default(),
+            popup_copy: None,
+            copy_out: None,
         }
     }
     /// Draw cards where pixels and a system font allow; text mode is left byte for byte as it was.
@@ -782,24 +796,41 @@ impl Pane {
     ) -> Vec<String> {
         use super::render::{instrument, raster, text};
         self.instrument_metrics = None;
+        self.obs_lines = [ObsCard::Confusing, ObsCard::ShouldBe].map(|card| {
+            composition
+                .items(card)
+                .iter()
+                .map(|i| string(&i["line"]).to_owned())
+                .collect()
+        });
+        let mut open = self.instrument_open;
+        open.popup = None;
+        self.popup_copy = None;
+        if let Some((card, line, copied)) = self.popup.clone() {
+            match self.obs_lines[card as usize]
+                .iter()
+                .position(|l| *l == line)
+            {
+                Some(index) => {
+                    let at = PopupAt {
+                        card,
+                        index,
+                        copied,
+                    };
+                    open.popup = Some(at);
+                    self.popup_copy = composition.detail(at).map(|d| d.copy);
+                }
+                // The item left its card: there is nothing to show.
+                None => self.popup = None,
+            }
+        }
         let cell = super::render::kitty::cell_size();
         let strip = if self.pixels && self.cards && cols < 32 {
-            instrument::strip(
-                composition,
-                cols as u32 * cell.0,
-                self.theme,
-                self.instrument_open.figure,
-            )
+            instrument::strip(composition, cols as u32 * cell.0, self.theme, open.figure)
         } else {
             None
         };
-        let semantic = instrument::rows_with_figure(
-            composition,
-            cols,
-            rows,
-            self.instrument_open,
-            strip.is_none(),
-        );
+        let semantic = instrument::rows_with_figure(composition, cols, rows, open, strip.is_none());
         self.acts = instrument::acts(composition, cols);
         // Answer placement follows the rendered rows, including wrapped metadata.
         if let Some((row, act)) = self.acts.iter().next().map(|(r, a)| (*r, a.clone())) {
@@ -820,6 +851,19 @@ impl Pane {
             }
         }
         self.pill = None;
+        for (card, should) in [(ObsCard::Confusing, false), (ObsCard::ShouldBe, true)] {
+            for (index, item) in composition.items(card).iter().enumerate() {
+                let text = instrument::observation_text(item, should);
+                let first = text::wrap(&text, cols.max(1), 1000).into_iter().next();
+                if let Some(row) = first.and_then(|first| semantic.iter().position(|l| *l == first))
+                {
+                    self.acts.insert(
+                        row,
+                        json!({"key": format!("observe:{}:{index}", card as usize)}),
+                    );
+                }
+            }
+        }
         for (row, line) in semantic.iter().enumerate() {
             if line.starts_with("Story ·") {
                 self.acts.insert(row, json!({"key":"instrument:threads"}));
@@ -855,7 +899,7 @@ impl Pane {
                 cols as u32 * cell.0,
                 rows.saturating_sub(1) as u32 * cell.1,
                 self.theme,
-                self.instrument_open,
+                open,
                 false,
             ) {
                 if let Ok(png) = raster::png(&pm) {
@@ -900,6 +944,12 @@ impl Pane {
                     {
                         self.acts.insert(row, json!({"key":"instrument:figure"}));
                     }
+                    for (card, index, y) in &metrics.observation_rows {
+                        self.acts.insert(
+                            to_row(*y),
+                            json!({"key": format!("observe:{}:{index}", *card as usize)}),
+                        );
+                    }
                     if let (Some(mut answer), Some(y)) = (answer, metrics.answer_y) {
                         answer["spans"] = json!(metrics
                             .answer_spans
@@ -933,6 +983,10 @@ impl Pane {
                     }
                 }
             }
+        }
+        if open.popup.is_some() {
+            // Only the popup's own footer answers while it is up.
+            self.acts.clear();
         }
         out.truncate(rows.saturating_sub(1));
         out = out.into_iter().map(|line| text::safe_line(&line)).collect();
@@ -980,13 +1034,16 @@ impl Pane {
         if !composition.dream.queue.is_empty() {
             keys.push(("d", "queue"));
         }
-        keys.extend([
-            ("l", "changes"),
-            ("t", "threads"),
-            ("i", "figure"),
-            ("b", "theme"),
-            ("q", "close"),
-        ]);
+        keys.extend([("l", "changes"), ("t", "threads"), ("i", "figure")]);
+        if !composition.confusing.is_empty() || !composition.should_be.is_empty() {
+            keys.push(("o", "details"));
+        }
+        keys.extend([("b", "theme"), ("q", "close")]);
+        if open.popup.is_some() {
+            let detail = open.popup.and_then(|at| composition.detail(at));
+            keys = observation::footer_keys(detail.as_ref());
+            keys.push(("b", "theme"));
+        }
         // Same left inset as the cards (1 cell); fit labels into cols-2. Keep q close.
         let inset = if cols > 2 { 1usize } else { 0 };
         let usable = cols.saturating_sub(inset.saturating_mul(2)).max(1);
@@ -996,6 +1053,10 @@ impl Pane {
                 .sum::<usize>()
                 + keys.len().saturating_sub(1) * gap
         };
+        // "o details" is the optional key: it goes before the gap tightens or any label shortens.
+        if width(&keys, 2) > usable {
+            keys.retain(|(k, _)| *k != "o");
+        }
         let mut gap = 2usize;
         if width(&keys, gap) > usable {
             gap = 1;
@@ -1027,7 +1088,7 @@ impl Pane {
                 *label = short;
             }
         }
-        for key in ["l", "t", "i", "d", "z"] {
+        for key in ["o", "l", "t", "i", "d", "z"] {
             if width(&keys, gap) <= usable {
                 break;
             }
@@ -1313,8 +1374,81 @@ impl Pane {
         })?;
         Ok(())
     }
-    pub fn key(&mut self, key: &str) -> bool {
+    /// The first observation card with items on it: the one the number keys and `o` open.
+    fn first_card(&self) -> Option<ObsCard> {
+        [ObsCard::Confusing, ObsCard::ShouldBe]
+            .into_iter()
+            .find(|card| !self.obs_lines[*card as usize].is_empty())
+    }
+    /// Show item `index` of `card` in full. False when the card has no such item.
+    fn open_observation(&mut self, card: ObsCard, index: usize) -> bool {
+        let Some(line) = self.obs_lines[card as usize].get(index) else {
+            return false;
+        };
+        self.popup = Some((card, line.clone(), false));
+        true
+    }
+    /// The text the watch loop should put on the clipboard, once.
+    pub fn take_copy(&mut self) -> Option<String> {
+        self.copy_out.take()
+    }
+    /// Keys while the popup is up. It is modal: nothing else on the pane answers until it closes.
+    fn popup_key(&mut self, key: &str) -> bool {
+        let Some((card, line, _)) = self.popup.clone() else {
+            return false;
+        };
+        let lines = &self.obs_lines[card as usize];
+        let at = lines.iter().position(|l| *l == line).unwrap_or(0);
+        let step = |by: isize| {
+            let len = lines.len().max(1) as isize;
+            (at as isize + by).rem_euclid(len) as usize
+        };
         match key {
+            "escape" | "esc" | "q" => self.popup = None,
+            "c" => {
+                if let Some(text) = self.popup_copy.clone() {
+                    self.copy_out = Some(text);
+                    if let Some(popup) = self.popup.as_mut() {
+                        popup.2 = true;
+                    }
+                }
+            }
+            "j" | "down" | "n" | "right" => {
+                let to = step(1);
+                self.open_observation(card, to);
+            }
+            "k" | "up" | "p" | "left" => {
+                let to = step(-1);
+                self.open_observation(card, to);
+            }
+            "tab" => {
+                if !self.obs_lines[card.other() as usize].is_empty() {
+                    self.open_observation(card.other(), 0);
+                }
+            }
+            "b" => self.theme.toggle(),
+            digit
+                if digit.len() == 1
+                    && ('1'..='5').contains(&digit.chars().next().unwrap_or(' ')) =>
+            {
+                let to = digit.parse::<usize>().unwrap_or(1) - 1;
+                self.open_observation(card, to);
+            }
+            _ => (),
+        }
+        true
+    }
+    pub fn key(&mut self, key: &str) -> bool {
+        if self.popup_key(key) {
+            return true;
+        }
+        match key {
+            "o" if self.view == "main" => {
+                if let Some(card) = self.first_card() {
+                    self.open_observation(card, 0);
+                }
+                return true;
+            }
             "a" if self.view == "main" => {
                 self.instrument_open.agents = !self.instrument_open.agents;
                 self.instrument_open.changes = false;
@@ -1359,7 +1493,7 @@ impl Pane {
                 self.view = "main".into();
                 return true;
             }
-            "1" | "2" | "3" | "4" if self.view == "main" => {
+            "1" | "2" | "3" | "4" | "5" if self.view == "main" => {
                 let index = key.parse::<usize>().unwrap_or(1) - 1;
                 let answer = self
                     .acts
@@ -1378,6 +1512,10 @@ impl Pane {
                         .any(|a| a["key"] == "instrument:dreams-on")
                 {
                     return self.press_dreams_offer();
+                }
+                // With no dream asking for an answer, the number keys open the first card's items.
+                if let Some(card) = self.first_card() {
+                    self.open_observation(card, index);
                 }
                 return true;
             }
@@ -1520,6 +1658,22 @@ impl Pane {
     }
     pub fn click(&mut self, row: usize, col: usize, now: f64) -> bool {
         let act = self.acts.get(&row).cloned();
+        if self.popup.is_some() {
+            // The popup's footer keys answer; any other click closes it.
+            let pressed = act.as_ref().filter(|a| a["key"] == "legend").and_then(|a| {
+                array(&a["keys"])
+                    .iter()
+                    .find(|s| num(&s[0]) <= col as f64 && (col as f64) < num(&s[1]))
+                    .and_then(|s| s[2].as_str().map(str::to_owned))
+            });
+            return match pressed.as_deref() {
+                Some("c" | "tab" | "b") => self.key(pressed.as_deref().unwrap_or("")),
+                _ => {
+                    self.popup = None;
+                    true
+                }
+            };
+        }
         // On a phone's narrow column a tap anywhere but the legend and the masthead (the i
         // page) fills the screen.
         if self.phone.foot == Some((true, true))
@@ -1542,6 +1696,21 @@ impl Pane {
             self.open = Value::Null;
             return true;
         };
+        if let Some((card, index)) = string(&act["key"])
+            .strip_prefix("observe:")
+            .and_then(|rest| rest.split_once(':'))
+            .and_then(|(card, index)| {
+                Some((card.parse::<usize>().ok()?, index.parse::<usize>().ok()?))
+            })
+        {
+            let card = if card == 0 {
+                ObsCard::Confusing
+            } else {
+                ObsCard::ShouldBe
+            };
+            self.open_observation(card, index);
+            return true;
+        }
         if let Some(key) = string(&act["key"]).strip_prefix("instrument:") {
             if key == "dreams-on" {
                 return self.press_dreams_offer();
