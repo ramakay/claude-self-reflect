@@ -1565,10 +1565,12 @@ mod tests {
         assert!(drain_if_pending(&storage, &db).unwrap().is_none());
     }
 
-    /// The migration seeds the settled table from the counters as they stand, so
-    /// an existing database is not handed one pass per project.
+    /// Upgrading from a build with no settled table: the old drain settled every
+    /// file, and a repo scan bumped the generation after that without queueing a
+    /// file. Nothing may be declared covered: each existing project gets one
+    /// resolve pass, after which it is idle.
     #[test]
-    fn a_database_upgraded_with_counters_starts_settled() {
+    fn an_upgrade_gives_every_existing_project_exactly_one_pass() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("csr-engine.db");
         {
@@ -1576,15 +1578,99 @@ mod tests {
             storage
                 .with_connection(|c| {
                     upsert_node(c, &def("callee", "a.rs", "callee"))?;
+                    upsert_node(c, &def("caller", "b.rs", "caller"))?;
+                    codegraph::replace_file_edges(
+                        c,
+                        "proj",
+                        "b.rs",
+                        &[call("caller", "callee", "b.rs")],
+                    )?;
+                    // The old drain resolved and settled it ...
+                    c.execute("UPDATE code_edges SET dst_id = 'callee', resolved = 1", [])?;
+                    // ... and a repo scan afterwards queued no file.
+                    codegraph::upsert_repo_defs(
+                        c,
+                        "proj",
+                        "other.rs",
+                        &[("later".into(), "function".into(), "rust".into())],
+                    )?;
+                    // An older build: no settled table, and no row for a project
+                    // that only has repo_defs.
                     c.execute_batch(
-                        "DELETE FROM code_graph_project_settled;
-                         DROP TABLE code_graph_project_settled;",
+                        "DROP TABLE code_graph_project_settled;
+                         INSERT INTO repo_defs (project, file, name, kind)
+                             VALUES ('scan-only', 'x.rs', 'f', 'function');
+                         DELETE FROM code_graph_project_gen WHERE project = 'scan-only';",
                     )?;
                     Ok(())
                 })
                 .unwrap();
         }
         let storage = Storage::open(&db).unwrap();
+        assert_eq!(
+            storage.dirty_graph_projects().unwrap(),
+            ["proj".to_string(), "scan-only".to_string()]
+        );
+        let report = drain_if_pending(&storage, &db).unwrap().unwrap();
+        assert_eq!(report.projects, 2);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(storage.dirty_graph_projects().unwrap().is_empty());
+        assert!(drain_if_pending(&storage, &db).unwrap().is_none());
+        // Opening it again does not hand out a second pass.
+        drop(storage);
+        let storage = Storage::open(&db).unwrap();
+        assert!(storage.dirty_graph_projects().unwrap().is_empty());
+    }
+
+    fn chunk_of(conn: &Connection, name: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT last_chunk_id FROM code_nodes WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// An edit whose chunk is unknown (spooled without a database) that changes
+    /// a node's body clears the credit an earlier edit left; one that leaves the
+    /// body alone keeps it.
+    #[test]
+    fn a_chunkless_edit_that_changes_the_body_clears_the_stale_credit() {
+        let (_keep, dir, storage) = fixture();
+        storage
+            .with_connection(|conn| {
+                let path = dir.join("a.rs").to_string_lossy().into_owned();
+                let t = codegraph::now_ns();
+                let mut a = snapshot_of(&path, t + 1, "fn target() { one(); }\n", None);
+                a.source_chunk_id = Some("chunk-A".into());
+                codegraph::insert_snapshot(conn, &a)?;
+                extract_all_snapshots(conn)?;
+                assert_eq!(chunk_of(conn, "target").as_deref(), Some("chunk-A"));
+
+                // Same body, no chunk: the credit stands.
+                codegraph::insert_snapshot(
+                    conn,
+                    &snapshot_of(&path, t + 2, "fn target() { one(); }\n", None),
+                )?;
+                extract_all_snapshots(conn)?;
+                assert_eq!(chunk_of(conn, "target").as_deref(), Some("chunk-A"));
+
+                // Changed body, no chunk: A no longer describes it.
+                codegraph::insert_snapshot(
+                    conn,
+                    &snapshot_of(&path, t + 3, "fn target() { two(); }\n", None),
+                )?;
+                extract_all_snapshots(conn)?;
+                assert_eq!(chunk_of(conn, "target"), None);
+
+                // Changed again with a chunk: it is credited.
+                let mut c = snapshot_of(&path, t + 4, "fn target() { three(); }\n", None);
+                c.source_chunk_id = Some("chunk-C".into());
+                codegraph::insert_snapshot(conn, &c)?;
+                extract_all_snapshots(conn)?;
+                assert_eq!(chunk_of(conn, "target").as_deref(), Some("chunk-C"));
+                Ok(())
+            })
+            .unwrap();
     }
 }

@@ -817,8 +817,19 @@ pub fn store_extraction(conn: &Connection, x: &Extraction<'_>) -> Result<bool> {
                 get_node(tx, &node.id)?.is_none_or(|stored| stored.body_hash != node.body_hash);
             upsert_node(tx, node)?;
             if changed {
-                if let Some(chunk_id) = x.source_chunk_id {
-                    set_last_chunk_id(tx, &node.id, chunk_id)?;
+                match x.source_chunk_id {
+                    Some(chunk_id) => set_last_chunk_id(tx, &node.id, chunk_id)?,
+                    // This edit changed the body and its chunk is unknown (the
+                    // hook spooled it without a database, or the transcript is
+                    // not imported yet). The credit left on the node is an
+                    // earlier edit's, which no longer describes the body: unknown
+                    // is NULL, not that chunk.
+                    None => tx
+                        .execute(
+                            "UPDATE code_nodes SET last_chunk_id = NULL WHERE id = ?1",
+                            params![node.id],
+                        )
+                        .map(drop)?,
                 }
             }
         }

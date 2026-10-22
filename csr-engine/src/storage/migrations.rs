@@ -976,9 +976,14 @@ pub fn run(conn: &Connection) -> Result<()> {
     // project (`own` is the project's row, `star` the every-project row). The
     // drain treats a project whose counter is ahead of this as work even with
     // no file pending, so a write the resolve reads that queues no file (a repo
-    // scan, a co-edit replay) still gets its pass. A table created now is seeded
-    // with the counters as they stand: an existing database's state is settled,
-    // not a backlog of one pass per project.
+    // scan, a co-edit replay) still gets its pass.
+    //
+    // A table created now starts EMPTY (nothing covered) and every project that
+    // has graph content gets its counter bumped, so each existing project is
+    // resolved exactly once after the upgrade. Seeding it from the counters as
+    // they stand would declare settled whatever an older drain left uncovered
+    // (a repo scan that bumped a generation and queued no file), and nothing
+    // would revisit it until another write.
     let settled_exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'code_graph_project_settled')",
         [],
@@ -992,11 +997,13 @@ pub fn run(conn: &Connection) -> Result<()> {
                  star       INTEGER NOT NULL DEFAULT 0,
                  settled_at INTEGER NOT NULL DEFAULT 0
              );
-             INSERT INTO code_graph_project_settled (project, own, star, settled_at)
-                 SELECT project, gen,
-                        COALESCE((SELECT gen FROM code_graph_project_gen WHERE project = '*'), 0),
-                        CAST(strftime('%s', 'now') AS INTEGER)
-                 FROM code_graph_project_gen WHERE project != '*';",
+             INSERT INTO code_graph_project_gen (project, gen)
+                 SELECT project, 1 FROM (
+                     SELECT DISTINCT project FROM code_nodes
+                     UNION SELECT DISTINCT project FROM repo_defs
+                     UNION SELECT DISTINCT project FROM code_graph_file_state
+                 ) WHERE project IS NOT NULL AND project != ''
+                 ON CONFLICT(project) DO UPDATE SET gen = gen + 1;",
         )?;
     }
 
