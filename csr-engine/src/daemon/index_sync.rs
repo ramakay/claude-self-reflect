@@ -167,20 +167,41 @@ fn apply_batch(
         if index.generation() != generation {
             break;
         }
-        // A change this side's generation already holds (it was dumped
-        // after it) is not re-applied: that would mint a tombstone and an
-        // unpublished mutation for content already on disk.
-        let held = change.seq <= index.side_cursor(change.reflection);
-        if !held {
-            tracing::trace!(invalidate = change.invalidate, "applying stored vector");
-            index.apply_vector(change.id, change.vector, change.reflection);
-        }
-        index.advance_change_cursor(change.seq);
+        let seq = change.seq;
+        apply_change(&mut index, change);
         drop(index);
-        cursor = change.seq;
+        cursor = seq;
         count += 1;
     }
     (cursor, generation, count)
+}
+
+/// Apply one journal row to an index and move its cursor past it.
+fn apply_change(index: &mut SearchEngine, change: embedding_changes::Change) {
+    // A change this side's generation already holds (it was dumped
+    // after it) is not re-applied: that would mint a tombstone and an
+    // unpublished mutation for content already on disk.
+    let held = change.seq <= index.side_cursor(change.reflection);
+    if !held {
+        tracing::trace!(invalidate = change.invalidate, "applying stored vector");
+        index.apply_vector(change.id, change.vector, change.reflection);
+    }
+    index.advance_change_cursor(change.seq);
+}
+
+/// One sync pass that never blocks the thread, for a test that runs it from
+/// inside an async task (where `blocking_read` panics): every journal row after
+/// the index's cursor, applied in order.
+#[cfg(test)]
+pub(crate) fn replay_for_test(storage: &Storage, search: &RwLock<SearchEngine>) {
+    let cursor = search.try_read().unwrap().change_cursor();
+    let changes = storage
+        .with_connection(|conn| embedding_changes::read(conn, cursor, usize::MAX >> 1))
+        .unwrap();
+    let mut index = search.try_write().unwrap();
+    for change in changes {
+        apply_change(&mut index, change);
+    }
 }
 
 #[cfg(test)]

@@ -678,6 +678,10 @@ impl Engine {
             // storage mutex or a database writer.
             let mut stored_now: Vec<(String, Vec<f32>)> = Vec::with_capacity(batch.len());
             let mut failure = None;
+            // Read before the commits: the index sync may replay past them
+            // (and past another connection's delete of one) before the guard
+            // is taken; see `SearchEngine::defers_to_sync`.
+            let fence = self.storage.change_fence();
             for (chunk, embedding) in batch.iter().zip(embeddings) {
                 let stored = (|| -> Result<()> {
                     self.storage
@@ -711,10 +715,16 @@ impl Engine {
                     }
                 }
             }
+            #[cfg(test)]
+            crate::storage::lock_probe::before_index_apply(
+                &stored_now.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            );
             {
                 let mut idx = self.search.write().await;
-                for (id, embedding) in stored_now {
-                    idx.insert_chunk(id, embedding);
+                if !idx.defers_to_sync(false, fence) {
+                    for (id, embedding) in stored_now {
+                        idx.insert_chunk(id, embedding);
+                    }
                 }
             }
             if let Some(error) = failure {
@@ -1854,6 +1864,79 @@ mod tests {
             0,
             "a storage call waited while the index write guard was held"
         );
+    }
+
+    fn fence_engine(tmp: &tempfile::TempDir) -> (Engine, PathBuf) {
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(projects.join("-tmp-proj")).unwrap();
+        let src = projects.join("-tmp-proj").join("sess-fence.jsonl");
+        write_guard_session(&src);
+        let engine = Engine::from_parts_with_index_dir(
+            Arc::new(Storage::open_memory().unwrap()),
+            Arc::new(EmbeddingEngine::new().unwrap()),
+            Arc::new(RwLock::new(SearchEngine::new(64))),
+            projects,
+            tmp.path().join("index-v3"),
+        );
+        (engine, src)
+    }
+
+    fn chunk_ids(storage: &Storage) -> Vec<String> {
+        storage
+            .with_connection(|conn| {
+                let mut stmt = conn.prepare("SELECT id FROM chunks")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_deferred_insert_does_not_bring_back_a_chunk_deleted_after_the_commit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (engine, src) = fence_engine(&tmp);
+        let _race = crate::storage::lock_probe::delete_then_sync(
+            engine.storage.clone(),
+            engine.search.clone(),
+        );
+        assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
+        assert!(chunk_ids(&engine.storage).is_empty(), "the delete did not run");
+        assert_eq!(
+            engine.search.read().await.chunk_count(),
+            0,
+            "the index holds a vector SQLite deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deferred_insert_lands_when_the_sync_has_not_moved() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (engine, src) = fence_engine(&tmp);
+        assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
+        let ids = chunk_ids(&engine.storage);
+        assert!(!ids.is_empty());
+        let search = engine.search.read().await;
+        for id in &ids {
+            assert!(search.has_chunk(id), "the importer's own insert was skipped");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delete_the_sync_has_not_reached_still_wins_over_the_deferred_insert() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (engine, src) = fence_engine(&tmp);
+        let storage = engine.storage.clone();
+        let _race = crate::storage::lock_probe::on_before_index_apply(move |ids| {
+            for id in ids {
+                storage.delete_chunk(id).unwrap();
+            }
+        });
+        assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
+        assert!(chunk_ids(&engine.storage).is_empty());
+        // The cursor was behind, so the insert landed; the sync still holds
+        // the delete and removes it when it gets there, in journal order.
+        crate::daemon::index_sync::replay_for_test(&engine.storage, &engine.search);
+        assert_eq!(engine.search.read().await.chunk_count(), 0);
     }
 
     fn insert_test_chunk(storage: &Storage, id: &str) {

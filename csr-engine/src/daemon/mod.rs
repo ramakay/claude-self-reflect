@@ -2394,6 +2394,7 @@ async fn process_v3_extraction(
         ];
 
         // Store the V3 reflection with its support set
+        let fence = storage.change_fence();
         storage.insert_derived_reflection(&reflection_id, &content, &tags, &embedding, &inputs)?;
         {
             // Supersede Layer 1: delete heuristic reflection if it exists. The
@@ -2407,9 +2408,12 @@ async fn process_v3_extraction(
                 _ => None,
             };
             let mut idx = search.write().await;
-            idx.insert_reflection(reflection_id.clone(), embedding);
-            if let Some(old_id) = superseded {
-                idx.remove_reflection(&old_id);
+            // Past the fence the index sync replays both changes in order.
+            if !idx.defers_to_sync(true, fence) {
+                idx.insert_reflection(reflection_id.clone(), embedding);
+                if let Some(old_id) = superseded {
+                    idx.remove_reflection(&old_id);
+                }
             }
         } // Write lock released before context_cache embed
 
@@ -2839,6 +2843,7 @@ async fn store_narrative(
                 ),
             ])
         });
+    let fence = storage.change_fence();
     storage.insert_derived_reflection(&reflection_id, narrative, &tags, &embedding, &inputs)?;
     // Supersede Layer 2: delete V3 extraction reflection if it exists. Storage
     // first, then a write guard over the index updates alone.
@@ -2851,9 +2856,12 @@ async fn store_narrative(
     };
     {
         let mut idx = search.write().await;
-        idx.insert_reflection(reflection_id.clone(), embedding);
-        if let Some(old_id) = superseded {
-            idx.remove_reflection(&old_id);
+        // Past the fence the index sync replays both changes in order.
+        if !idx.defers_to_sync(true, fence) {
+            idx.insert_reflection(reflection_id.clone(), embedding);
+            if let Some(old_id) = superseded {
+                idx.remove_reflection(&old_id);
+            }
         }
     }
 

@@ -172,6 +172,51 @@ pub(crate) mod lock_probe {
         (installed, held)
     }
 
+    thread_local! {
+        static BEFORE_INDEX_APPLY: RefCell<Option<Box<dyn FnMut(&[String])>>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(crate) struct InstalledApply;
+
+    /// Run `hook` with the ids an importer committed, between its last storage
+    /// commit and the index write guard: the window where another connection
+    /// and the index sync can act.
+    pub(crate) fn on_before_index_apply(hook: impl FnMut(&[String]) + 'static) -> InstalledApply {
+        BEFORE_INDEX_APPLY.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        InstalledApply
+    }
+
+    impl Drop for InstalledApply {
+        fn drop(&mut self) {
+            BEFORE_INDEX_APPLY.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// The interleaving behind the deferred index insert: after the importer
+    /// committed, another connection deletes the chunks and the index sync
+    /// replays that delete and moves its cursor past it.
+    pub(crate) fn delete_then_sync(
+        storage: std::sync::Arc<super::Storage>,
+        search: std::sync::Arc<tokio::sync::RwLock<crate::search::SearchEngine>>,
+    ) -> InstalledApply {
+        on_before_index_apply(move |ids| {
+            for id in ids {
+                storage.delete_chunk(id).unwrap();
+            }
+            crate::daemon::index_sync::replay_for_test(&storage, &search);
+        })
+    }
+
+    pub(crate) fn before_index_apply(ids: &[String]) {
+        // Taken out while it runs: the hook itself calls storage.
+        let hook = BEFORE_INDEX_APPLY.with(|slot| slot.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(ids);
+            BEFORE_INDEX_APPLY.with(|slot| *slot.borrow_mut() = Some(hook));
+        }
+    }
+
     pub(super) fn fire() {
         PROBE.with(|slot| {
             if let Some(probe) = slot.borrow().as_ref() {
@@ -1322,6 +1367,15 @@ impl Storage {
     pub fn latest_embedding_change_seq(&self) -> Result<i64> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         embedding_changes::latest_seq(&conn)
+    }
+
+    /// The journal sequence an importer reads before its storage commits and
+    /// hands to [`crate::search::SearchEngine::defers_to_sync`] after them. A
+    /// failed read gives -1, which leaves the mutation to the index sync: the
+    /// commit is in the journal, so the sync applies it; a lost direct insert
+    /// heals, a resurrected vector would not.
+    pub fn change_fence(&self) -> i64 {
+        self.latest_embedding_change_seq().unwrap_or(-1)
     }
 
     /// See [`embedding_changes::count_after`].

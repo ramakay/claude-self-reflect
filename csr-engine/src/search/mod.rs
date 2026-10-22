@@ -593,6 +593,24 @@ impl SearchEngine {
         }
     }
 
+    /// Whether the index sync has already moved past `fence` on one side, so
+    /// an importer's deferred index mutation must be left to it.
+    ///
+    /// `fence` is the journal sequence read BEFORE the importer's storage
+    /// commits (`Storage::change_fence`); the mutation is applied later,
+    /// under the write guard, without the guard having covered the commit. A
+    /// cursor past the fence means the sync replayed journal rows after our
+    /// commit point; it reads the vector SQLite holds now (or its absence, if
+    /// another connection deleted the row) and orders our change with every
+    /// later one, so replaying our stale in-memory copy over it could bring
+    /// back a vector SQLite no longer has, for good. A cursor at or before
+    /// the fence means the sync has not reached our change, and will replay it
+    /// and any later delete in order after this mutation. A proxied engine
+    /// only marks the chunks as pending, which is always safe.
+    pub(crate) fn defers_to_sync(&self, reflection: bool, fence: i64) -> bool {
+        self.proxy.is_none() && self.side_cursor(reflection) > fence
+    }
+
     /// Record that both sides reflect every `embedding_changes` row up to
     /// `seq` (a rebuild that read SQLite after it).
     pub fn set_change_cursor(&mut self, seq: i64) {

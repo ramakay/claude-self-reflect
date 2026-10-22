@@ -1083,12 +1083,16 @@ async fn store_story(
 
     // The new story replaces the old: one story per session, the latest
     if let Some(prior) = prior {
+        // Read before the deletes (see `SearchEngine::defers_to_sync`).
+        let fence = engine.storage().change_fence();
         for old in &prior.ids {
             let _ = engine.storage().delete_reflection(old);
         }
         let mut idx = engine.search().write().await;
-        for old in &prior.ids {
-            idx.remove_reflection(old);
+        if !idx.defers_to_sync(true, fence) {
+            for old in &prior.ids {
+                idx.remove_reflection(old);
+            }
         }
     }
 

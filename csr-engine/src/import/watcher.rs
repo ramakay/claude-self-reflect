@@ -750,6 +750,8 @@ pub(crate) async fn import_file_content_diff(
         // storage call (see `Engine::import_file_with_attribution`).
         let mut stored_now: Vec<(String, Vec<f32>)> = Vec::with_capacity(pending.len());
         let mut failure = None;
+        // Read before the commits (see `SearchEngine::defers_to_sync`).
+        let fence = storage.change_fence();
         for (chunk, embedding) in pending.iter().zip(embeddings_out) {
             let stored = (|| -> Result<()> {
                 storage.insert_chunk_with_source(chunk, &embedding, attribution.source)?;
@@ -779,10 +781,16 @@ pub(crate) async fn import_file_content_diff(
                 }
             }
         }
+        #[cfg(test)]
+        crate::storage::lock_probe::before_index_apply(
+            &stored_now.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        );
         {
             let mut idx = search.write().await;
-            for (id, embedding) in stored_now {
-                idx.insert_chunk(id, embedding);
+            if !idx.defers_to_sync(false, fence) {
+                for (id, embedding) in stored_now {
+                    idx.insert_chunk(id, embedding);
+                }
             }
         }
         if let Some(error) = failure {
@@ -1351,6 +1359,39 @@ mod maintenance_probes {
         let batch = wait_for_batch(&mut receiver, &retries).await.unwrap();
         assert!(batch.contains(&path));
         drop(sender);
+    }
+
+    #[tokio::test]
+    async fn watcher_import_leaves_a_chunk_deleted_after_its_commit_deleted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(projects.join("-tmp-proj")).unwrap();
+        let src = projects.join("-tmp-proj").join("sess-watch-fence.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "user", "uuid": "u-1", "timestamp": "2026-10-14T10:00:00Z",
+                "message": {"content": "please look at the retry loop in the uploader"}
+            }),
+            serde_json::json!({
+                "type": "assistant", "uuid": "a-1", "timestamp": "2026-10-14T10:00:05Z",
+                "message": {"content": [{"type": "text", "text": "The uploader retries without backoff; I added exponential backoff."}]}
+            }),
+        ];
+        let body: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        std::fs::write(&src, body).unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(64)));
+        let _race =
+            crate::storage::lock_probe::delete_then_sync(storage.clone(), search.clone());
+        import_file_content_diff(&storage, &embeddings, &search, &projects, &src)
+            .await
+            .unwrap();
+        assert_eq!(
+            search.read().await.chunk_count(),
+            0,
+            "the index holds a vector SQLite deleted"
+        );
     }
 
     #[tokio::test]

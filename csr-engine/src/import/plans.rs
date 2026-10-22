@@ -477,6 +477,8 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     // storage call (see `Engine::import_file_with_attribution`).
     let mut stored_now: Vec<(String, Vec<f32>)> = Vec::with_capacity(new_chunks.len());
     let mut failure = None;
+    // Read before the commits (see `SearchEngine::defers_to_sync`).
+    let fence = storage.change_fence();
     for (chunk, embedding) in new_chunks.iter().zip(embeddings.iter()) {
         let stored = (|| -> Result<()> {
             storage.insert_chunk_with_source(chunk, embedding, "plan")?;
@@ -508,14 +510,20 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
             }
         }
     }
+    #[cfg(test)]
+    crate::storage::lock_probe::before_index_apply(
+        &stored_now.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+    );
     {
         // tokio::sync::RwLock has no plain (non-async) writer; blocking_write is its
         // supported bridge for a sync call site like this one — import_plan's public
         // signature is deliberately sync (frozen spec), wiring into an async caller is
         // the orchestrator's job, not this module's.
         let mut idx = engine.search().blocking_write();
-        for (id, embedding) in stored_now {
-            idx.insert_chunk(id, embedding);
+        if !idx.defers_to_sync(false, fence) {
+            for (id, embedding) in stored_now {
+                idx.insert_chunk(id, embedding);
+            }
         }
     }
     if let Some(error) = failure {
@@ -847,6 +855,41 @@ mod tests {
                 crate::provenance::TrustTier::TrustedTool
             );
         }
+    }
+
+    #[test]
+    fn import_plan_leaves_a_chunk_deleted_after_its_commit_deleted() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone());
+        let _race =
+            crate::storage::lock_probe::delete_then_sync(storage.clone(), engine.search().clone());
+        let plan = PlanDoc {
+            slug: "fence-plan".into(),
+            path: PathBuf::from("/dev/null"),
+            mtime: "2026-07-20T12:00:00Z".into(),
+            content: distinctive_body("fence"),
+        };
+        assert!(import_plan(&engine, &plan).unwrap() > 0);
+        assert_eq!(engine.search().blocking_read().chunk_count(), 0);
+        assert!(storage
+            .get_chunk_ids_for_conversation("plan:fence-plan")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn import_plan_inserts_when_the_sync_has_not_moved() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage);
+        let plan = PlanDoc {
+            slug: "fence-plan-2".into(),
+            path: PathBuf::from("/dev/null"),
+            mtime: "2026-07-20T12:00:00Z".into(),
+            content: distinctive_body("fencetwo"),
+        };
+        let imported = import_plan(&engine, &plan).unwrap();
+        assert!(imported > 0);
+        assert_eq!(engine.search().blocking_read().chunk_count(), imported);
     }
 
     #[test]
