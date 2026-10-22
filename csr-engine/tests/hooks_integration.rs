@@ -1243,6 +1243,8 @@ fn partial_parse_must_not_retire_previously_stored_nodes() {
             repo.as_path(),
         ))
         .unwrap();
+        // The hook only snapshots the edit; the drain extracts it.
+        csr_engine::extraction::graph_drain::extract_all_snapshots_in(&storage).unwrap();
     };
 
     // Clean parse: two functions land in the graph.

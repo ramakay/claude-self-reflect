@@ -178,9 +178,15 @@ fn snapshot_graph_edit(
     deadline: Instant,
 ) {
     use crate::storage::codegraph::{self, Snapshot};
-    let Some((project, stored)) = graph_target(input, file_path, resolve) else {
+    // No project, no graph write: `resolve_code_edges("")` and
+    // `compute_code_rank("")` read `''` as EVERY project (`?1 = '' OR project =
+    // ?1`), so a scratch file with no session project would bind a call in one
+    // project to a definition in another. A node filed under `''` is no better:
+    // no scoped query would ever find it.
+    let project = resolve(Path::new(file_path).parent(), input.cwd.as_deref());
+    if project.is_empty() {
         return;
-    };
+    }
     let conv_id = conv_id_for(input);
     let session_id = input.session_id.clone().unwrap_or_default();
     let supported = crate::extraction::ast_analysis::lang_from_path_str(file_path).is_some();
@@ -196,6 +202,13 @@ fn snapshot_graph_edit(
         None
     };
     let seq = codegraph::now_ns();
+    // Canonicalized only for a file that is going to be stored, as the
+    // extraction did before the snapshot: `canonical_repo_path` spells a
+    // directory without a `.git` as given on its first lookup in a process and
+    // resolved after that, so a file that is skipped must not use the first one.
+    let stored = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path))
+        .to_string_lossy()
+        .into_owned();
     let source_chunk_id = if supported {
         engine
             .storage()
@@ -335,30 +348,6 @@ fn drain_snapshots_for_test(engine: &Engine) -> Result<()> {
         anyhow::ensure!(out.errors.is_empty(), "{:?}", out.errors);
         Ok(())
     })
-}
-
-/// The project and canonical stored path a graph write for `file_path` goes
-/// under; `None` when there is no project.
-///
-/// Repo/project identity is derivable from `file_path` alone (no lang needed),
-/// so it is computed before the language gate — WP2 Stage 3 (H8 innovation,
-/// receipt R4) wants an honest file-level row even for extensions the extractor
-/// doesn't parse. No project, no graph write: `resolve_code_edges("")` and
-/// `compute_code_rank("")` read `''` as EVERY project (`?1 = '' OR project =
-/// ?1`), so a scratch file with no session project would bind a call in one
-/// project to a definition in another. A node filed under `''` is no better: no
-/// scoped query would ever find it.
-fn graph_target(
-    input: &HookInput,
-    file_path: &str,
-    resolve: &impl Fn(Option<&Path>, Option<&str>) -> String,
-) -> Option<(String, String)> {
-    let project = resolve(Path::new(file_path).parent(), input.cwd.as_deref());
-    if project.is_empty() {
-        return None;
-    }
-    let stored = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
-    Some((project, stored.to_string_lossy().into_owned()))
 }
 
 /// Paths a file-level presence row must never record: credentials, dependency

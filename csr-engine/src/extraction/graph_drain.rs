@@ -335,6 +335,11 @@ pub fn extract_all_snapshots(conn: &Connection) -> Result<GraphDrain> {
     Ok(out)
 }
 
+/// [`extract_all_snapshots`] on a [`Storage`]'s own connection.
+pub fn extract_all_snapshots_in(storage: &Storage) -> Result<GraphDrain> {
+    storage.with_connection(extract_all_snapshots)
+}
+
 /// Ingest the spool into the snapshot queue and extract every queued snapshot
 /// (of `only` project, or all), oldest capture first. Each snapshot is its own
 /// transaction (inside the caller's, if it has one): consumed and stored
