@@ -168,6 +168,17 @@ fn shift_when(entry: &Value, commits: &[Value]) -> (RiverKind, Option<f64>) {
         });
     (RiverKind::Commit, at)
 }
+/// The raw times behind a few of the labels the picture shows. The labels are what is drawn; these
+/// only say when a label next changes, so they stay out of the draw key.
+#[derive(Clone, Debug, Default)]
+pub struct Clocks {
+    /// When the story was told.
+    pub story_at: Option<f64>,
+    /// When the "Compacted." notice goes away.
+    pub notice_until: Option<f64>,
+    /// Seconds the running compaction has taken, as read.
+    pub compacting_elapsed: Option<f64>,
+}
 #[derive(Clone, Debug)]
 pub struct Composition {
     pub empty_session: bool,
@@ -195,6 +206,7 @@ pub struct Composition {
     pub river: Vec<RiverRow>,
     pub notice: Option<String>,
     pub asked_away: bool,
+    pub clocks: Clocks,
     pub now: f64,
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -452,6 +464,19 @@ impl Composition {
                         line
                     })
             });
+        let card = &data["infinite"]["card"];
+        let notice_until = notice
+            .as_deref()
+            .filter(|n| n.starts_with("Compacted."))
+            .and(card["at"].as_f64())
+            .map(|at| at + 120.);
+        let clocks = Clocks {
+            story_at: data["story"]["at"].as_f64(),
+            notice_until,
+            compacting_elapsed: data["compacting"]["elapsed"]
+                .as_f64()
+                .filter(|_| data["compacting"].is_object()),
+        };
         Self {
             empty_session,
             repo_recap: serde_json::from_value(data["repo_recap"].clone())
@@ -536,6 +561,7 @@ impl Composition {
             river,
             asked_away: gap.is_some_and(|w| num(&top["at"]) > w[0] && num(&top["at"]) < w[1]),
             notice,
+            clocks,
             now,
         }
     }
@@ -560,6 +586,145 @@ impl Composition {
             Batch::Nothing | Batch::Empty => "The dreamer looks as you work.".into(),
         }
     }
+    /// What the picture and the text rows show that depends on `now`, as the words and flags they
+    /// show it in. Two compositions that differ only in `now` and agree here draw the same.
+    fn time_labels(&self, open: Open) -> Vec<String> {
+        let mut out = vec![];
+        if open.threads {
+            out.extend(self.river.iter().map(|row| row.time_label(self.now)));
+        }
+        if self.dream.state == Batch::Dreaming {
+            out.push(status_line(self));
+        }
+        out.extend(
+            self.agents
+                .agents
+                .iter()
+                .filter(|a| agents::is_active(a))
+                .map(|a| agents::stalled(a, self.now).to_string()),
+        );
+        out.extend(agent_lines(self));
+        out
+    }
+    /// A hash of everything `draw`, `strip` and the text rows consume. Raw `now` is not in it: the
+    /// labels it shows are, and the figure's continuous values are cut to what is drawn (the cache
+    /// ring in minutes, the quotas' pace as ahead or not).
+    pub fn draw_key(&self, open: Open) -> u64 {
+        use std::{
+            fmt::Write,
+            hash::{Hash, Hasher},
+        };
+        struct Sink(std::collections::hash_map::DefaultHasher);
+        impl Write for Sink {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0.write(s.as_bytes());
+                Ok(())
+            }
+        }
+        let mut cut = self.clone();
+        cut.now = 0.;
+        cut.clocks = Clocks::default();
+        if let Some(cache) = cut.figure["cache"].as_object_mut() {
+            for key in ["left", "ttl"] {
+                if let Some(n) = cache.get(key).and_then(Value::as_f64) {
+                    cache.insert(key.into(), json!((n / 60.).floor() * 60.));
+                }
+            }
+        }
+        if let Some(quotas) = cut.figure["quotas"].as_array_mut() {
+            for q in quotas {
+                if q["pace"].is_number() {
+                    q["pace"] = json!(text::ahead_of_pace(q));
+                }
+            }
+        }
+        let mut sink = Sink(Default::default());
+        let _ = write!(sink, "{cut:?}");
+        self.time_labels(open).hash(&mut sink.0);
+        sink.0.finish()
+    }
+    /// The first moment after `now` that something drawn changes with no new data: a minute
+    /// edge of an age on screen, the cache ring's minute, the compaction's ten seconds, an agent
+    /// turning stalled, a notice leaving, a quota passing its reset or its pace, midnight.
+    pub fn next_change_at(&self, open: Open) -> Option<f64> {
+        /// A deadline lands a hair after the edge so the label has changed when it is checked.
+        const EDGE: f64 = 0.01;
+        let now = self.now;
+        let minute = |at: f64| at + 60. * (((now - at).max(0.) / 60.).floor() + 1.);
+        let mut due: Vec<f64> = vec![];
+        if open.threads {
+            for at in self.river.iter().filter_map(|row| row.when) {
+                due.push(if now - at < 3600. {
+                    minute(at)
+                } else {
+                    next_midnight(now)
+                });
+            }
+        }
+        if self.dream.state == Batch::Dreaming {
+            due.extend(self.dream.look["at"].as_f64().map(minute));
+        }
+        if !self.story_age.is_empty() {
+            due.extend(self.clocks.story_at.map(minute));
+        }
+        due.extend(self.clocks.notice_until);
+        due.extend(
+            self.clocks
+                .compacting_elapsed
+                .map(|e| now + 10. - e.rem_euclid(10.)),
+        );
+        for a in self.agents.agents.iter() {
+            if a.status == "running" && !agents::stalled(a, now) {
+                due.push(a.last_at / 1000. + 600.);
+            }
+            if open.agents {
+                due.extend(a.started.map(|s| minute(s / 1000.)));
+            }
+        }
+        let cache = &self.figure["cache"];
+        if cache["cold"] != true {
+            if let Some(left) = cache["left"].as_f64().filter(|n| *n > 0.) {
+                due.push(now + left - 60. * (left / 60.).floor());
+            }
+        }
+        let quotas = array(&self.figure["quotas"]);
+        for q in quotas {
+            let Some(resets) = q["resets"].as_f64() else {
+                continue;
+            };
+            due.push(resets);
+            let len = match string(&q["code"]) {
+                "5H" => 18000.,
+                "7D" => 604800.,
+                _ => continue,
+            };
+            // Pace appears when the window opens; "ahead" ends when the pace catches up.
+            due.push(resets - len);
+            if let Some(used) = q["used"].as_f64() {
+                due.push(resets - len * (1. - (used / 100. - 0.05)));
+            }
+        }
+        if quotas.iter().any(|q| q["resets"].is_number())
+            || (open.threads && !self.river.is_empty())
+        {
+            due.push(next_midnight(now));
+        }
+        due.into_iter()
+            .filter(|t| t.is_finite() && *t > now)
+            .min_by(f64::total_cmp)
+            .map(|t| t + EDGE)
+    }
+}
+/// The first local midnight after `now`: a time label's date part changes there.
+fn next_midnight(now: f64) -> f64 {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_opt(now as i64, 0)
+        .single()
+        .and_then(|t| t.date_naive().succ_opt())
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .and_then(|d| Local.from_local_datetime(&d).earliest())
+        .map_or(now + 3600., |t| t.timestamp() as f64)
 }
 
 /// What CSR can do here: the sell lines under an empty session or the dreams-off offer.
@@ -4355,6 +4520,74 @@ mod tests {
         // Each repaint re-uploads the whole picture, and the terminal blanks it meanwhile.
         assert!(draw_at(41.).data() == draw_at(49.).data());
         assert!(draw_at(49.).data() != draw_at(50.).data());
+    }
+
+    fn threads_open() -> Open {
+        Open {
+            threads: true,
+            ..Open::default()
+        }
+    }
+    #[test]
+    fn the_draw_key_holds_until_the_next_change_and_moves_after_it() {
+        let (data, s) = timeline_data();
+        let open = threads_open();
+        let (mut flips, mut edges) = (0, 0);
+        for step in 0..300 {
+            let now = 1_800_000_000. + step as f64 * 37.;
+            let c = Composition::build(&data, &s, now);
+            let (key, due) = (c.draw_key(open), c.next_change_at(open).unwrap());
+            assert!(due > now);
+            // No label moves before the deadline, whenever it is looked at.
+            for at in [now + 0.5, (now + due) / 2., due - 0.05] {
+                let later = Composition::build(&data, &s, at);
+                assert_eq!(later.draw_key(open), key, "key moved at +{}s", at - now);
+            }
+            // A minute edge of a row's age moves the key; only the day edge may not.
+            if due - now < 61. {
+                edges += 1;
+                flips +=
+                    usize::from(Composition::build(&data, &s, due + 0.05).draw_key(open) != key);
+            }
+        }
+        assert!(edges > 20, "{edges}");
+        assert_eq!(flips, edges);
+        // Without the threads list open no row age is on screen: the key does not move with them.
+        let c = Composition::build(&data, &s, 1_800_000_000.);
+        let later = Composition::build(&data, &s, 1_800_000_000. + 61.);
+        assert_eq!(c.draw_key(Open::default()), later.draw_key(Open::default()));
+    }
+
+    #[test]
+    fn the_cache_ring_and_the_notice_name_their_own_edges() {
+        let now = 1_800_000_000.;
+        let mut c = Composition::build(&json!({}), &json!({"id":"edges"}), now);
+        c.figure["cache"] = json!({"left": 3599.5, "ttl": 3600., "cold": false});
+        // The minute shown changes when 59m reads 58m: at 3540 seconds left.
+        let due = c.next_change_at(Open::default()).unwrap();
+        assert!((due - (now + 59.5 + 0.01)).abs() < 1e-6, "{}", due - now);
+        c.figure["cache"] = json!({"left": 30., "ttl": 300., "cold": false});
+        assert!((c.next_change_at(Open::default()).unwrap() - (now + 30.01)).abs() < 1e-6);
+        c.figure["cache"] = json!({"left": null, "cold": true});
+        assert_eq!(c.next_change_at(Open::default()), None);
+        c.clocks.notice_until = Some(now + 7.);
+        assert!((c.next_change_at(Open::default()).unwrap() - (now + 7.01)).abs() < 1e-6);
+        c.clocks.compacting_elapsed = Some(43.);
+        assert!((c.next_change_at(Open::default()).unwrap() - (now + 7.01)).abs() < 1e-6);
+        c.clocks.compacting_elapsed = Some(49.);
+        assert!((c.next_change_at(Open::default()).unwrap() - (now + 1.01)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_quota_ahead_of_pace_is_the_key_not_the_pace_itself() {
+        let now = 1_800_000_000.;
+        let quota = |pace: f64| {
+            let mut c = Composition::build(&json!({}), &json!({"id":"q"}), now);
+            c.figure["quotas"] = json!([{"code":"5H","used":60.,"pace":pace,"resets":now + 9000.}]);
+            c.draw_key(Open::default())
+        };
+        assert_eq!(quota(0.10), quota(0.11));
+        assert_ne!(quota(0.10), quota(0.60));
     }
 
     #[test]

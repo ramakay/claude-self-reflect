@@ -182,6 +182,15 @@ pub fn legend_parts(
     (format!(" {}{marks}{OFF}{shown}", ink("faint")), spans)
 }
 
+/// What the last instrument frame drew, kept under the key of everything it drew from. The same
+/// key means the same pixels, placements, hit rows and metrics, so none is rebuilt.
+struct Instrument {
+    key: u64,
+    rows: Vec<String>,
+    placed: Vec<super::render::kitty::Placement>,
+    acts: BTreeMap<usize, Value>,
+    metrics: Option<super::render::instrument::Metrics>,
+}
 /// Account reads borrowed while the session is also borrowed.
 struct Wide<'a> {
     paths: &'a Paths,
@@ -256,6 +265,13 @@ pub struct Pane {
     popup_copy: Option<String>,
     /// Text for the watch loop to put on the clipboard.
     copy_out: Option<String>,
+    instrument_kept: Option<Instrument>,
+    /// When the picture next changes with no new data, as the last instrument frame saw it.
+    pub next_change: Option<f64>,
+    /// Pictures rasterised, PNGs encoded and frames served from the kept one, since the start.
+    pub rasters: usize,
+    pub encodes: usize,
+    pub reused: usize,
 }
 impl Pane {
     pub fn new(paths: Paths, args: &PaneArgs) -> Self {
@@ -329,6 +345,11 @@ impl Pane {
             obs_lines: Default::default(),
             popup_copy: None,
             copy_out: None,
+            instrument_kept: None,
+            next_change: None,
+            rasters: 0,
+            encodes: 0,
+            reused: 0,
         }
     }
     /// Draw cards where pixels and a system font allow; text mode is left byte for byte as it was.
@@ -825,11 +846,30 @@ impl Pane {
             }
         }
         let cell = super::render::kitty::cell_size();
+        self.next_change = composition.next_change_at(open);
+        // Everything below is a function of this key. Raw `now` is not in it.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            composition.draw_key(open).hash(&mut h);
+            (cols, rows, cell, self.pixels, self.cards, self.phone.zoomed).hash(&mut h);
+            format!("{:?}{:?}", self.theme, open).hash(&mut h);
+            h.finish()
+        };
+        if let Some(kept) = self.instrument_kept.as_ref().filter(|k| k.key == key) {
+            self.acts = kept.acts.clone();
+            self.placed = kept.placed.clone();
+            self.instrument_metrics = kept.metrics.clone();
+            self.pill = None;
+            self.reused += 1;
+            return kept.rows.clone();
+        }
         let strip = if self.pixels && self.cards && cols < 32 {
             instrument::strip(composition, cols as u32 * cell.0, self.theme, open.figure)
         } else {
             None
         };
+        self.rasters += usize::from(strip.is_some());
         let semantic = instrument::rows_with_figure(composition, cols, rows, open, strip.is_none());
         self.acts = instrument::acts(composition, cols);
         // Answer placement follows the rendered rows, including wrapped metadata.
@@ -877,6 +917,7 @@ impl Pane {
         }
         let mut out = semantic;
         if let Some(strip) = strip {
+            self.encodes += 1;
             if let Ok(png) = raster::png(&strip) {
                 let count = strip.height().div_ceil(cell.1) as usize;
                 let row = out.len().min(rows.saturating_sub(1 + count));
@@ -902,6 +943,8 @@ impl Pane {
                 open,
                 false,
             ) {
+                self.rasters += 1;
+                self.encodes += 1;
                 if let Ok(png) = raster::png(&pm) {
                     self.instrument_metrics = Some(metrics.clone());
                     let picture_rows = pm.height().div_ceil(cell.1) as usize;
@@ -1137,6 +1180,13 @@ impl Pane {
             " ".repeat(cols.saturating_sub(text::len(&footer))),
             text::OFF
         ));
+        self.instrument_kept = Some(Instrument {
+            key,
+            rows: out.clone(),
+            placed: self.placed.clone(),
+            acts: self.acts.clone(),
+            metrics: self.instrument_metrics.clone(),
+        });
         out
     }
     /// Account cost reads: the plan's week, what CSR cost
