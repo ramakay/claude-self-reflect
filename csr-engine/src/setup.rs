@@ -1738,7 +1738,7 @@ fn render_daemon_plist(spec: &DaemonAgentSpec) -> String {
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
   <key>Nice</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
