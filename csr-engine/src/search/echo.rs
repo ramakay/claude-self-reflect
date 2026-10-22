@@ -43,22 +43,19 @@ static TOOL_MARKER: LazyLock<Regex> = LazyLock::new(|| {
     .expect("tool marker regex")
 });
 
-/// Assistant narration that announces work without reporting a result: a
-/// closed list of progress phrases, each in full. A sentence that merely opens
-/// with a verb like "Using" or "Running" is a statement and may be the answer.
-static FILLER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)^(?:(?:checking|searching|looking|digging|scanning|querying|consulting|fetching|pulling|loading|grepping)(?: (?:up|into|at|through|for|in|on|past|prior|previous|earlier|the|our|that|this|it|my|memory|memories|csr|sessions?|conversations?|history|again|now|more|related|relevant|what|how|why|whether|if)\b|\s*(?:\x{2026}|\.\.\.|\.|$))|(?:let me|let\x27s|let us|i\x27ll|i will|i\x27m going to|i am going to) (?:check|look|search|find|see|pull|dig|query|try|run|grep|open|fetch|consult|scan|read)\b|(?:one moment|one sec|on it|sure|okay|ok)\s*(?:\x{2026}|\.\.\.|[.!])?$)",
-    )
-    .expect("filler regex")
-});
+/// The only words a progress announcement is made of. Closed: a sentence with
+/// a word outside it (`Searching the old index took thirty seconds.`) is a
+/// statement and may hold the answer.
+const FILLER_WORDS: &str = "up|into|at|through|for|in|on|past|prior|previous|earlier|the|our|that|this|it|my|memory|memories|csr|session|sessions|conversation|conversations|history|again|now|more|related|relevant|what|how|why|whether|if|actual|reasoning|answer|details|context|commit";
 
-/// Words that turn a progress phrase into a reported result.
-static RESULT_WORDS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\b(?:because|since|fixed|resolved|caused|removed|replaced|dropped|chose|decided|due to|turned out|found that|showed|means|so that|instead)\b|:",
-    )
-    .expect("result words regex")
+/// Assistant narration that announces work without reporting a result: a
+/// whole line that is a progress phrase (`Checking past sessions for the actual
+/// reasoning.`, `Let me look.`, `Searching past sessions...`) and nothing else.
+static FILLER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?i)^(?:(?:checking|searching|looking|digging|scanning|querying|consulting|fetching|pulling|loading|grepping)|(?:let me|let\x27s|let us|i\x27ll|i will|i\x27m going to|i am going to) (?:check|look|search|find|see|pull|dig|query|try|run|grep|open|fetch|consult|scan|read))(?: (?:{FILLER_WORDS}))*\s*(?:\x{{2026}}|\.\.\.|[.!])?$|^(?:one moment|one sec|on it|sure|okay|ok)\s*(?:\x{{2026}}|\.\.\.|[.!])?$"
+    ))
+    .expect("filler regex")
 });
 
 /// The outcome words a session story appends to its request. They report that
@@ -103,7 +100,10 @@ pub fn is_question_echo(content: &str) -> bool {
             || (sentence.line_start && is_unpunctuated_question(text))
         {
             questions += 1;
-        } else if !(STATUS.is_match(text) || PATH_ONLY.is_match(text) || is_filler(text)) {
+        } else if !(STATUS.is_match(text)
+            || PATH_ONLY.is_match(text)
+            || (sentence.whole_line && is_filler(text)))
+        {
             return false;
         }
     }
@@ -113,8 +113,14 @@ pub fn is_question_echo(content: &str) -> bool {
 /// Longest a bare interrogative-plus-verb line can be and still be a question.
 const SHORT_WH_WORDS: usize = 6;
 
+/// An interrogative directly followed by an auxiliary or a verb that asks
+/// (`what replaced it`). `What we changed ...` and `What the fix was ...` are
+/// not on it: a pronoun or article after the interrogative opens a statement.
 static SHORT_WH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(?:why|what|how|when|where|who|which) \w+").expect("short wh regex")
+    Regex::new(
+        r"(?i)^(?:why|what|how|when|where|who|which) (?:did|do|does|is|are|was|were|can|should|would|will|has|have|had|replaced|fixed|caused|changed|happened|broke|failed|remains|works|worked|makes|made|needs|needed|means|resolved|shipped|decided|chose|stopped)\b",
+    )
+    .expect("short wh regex")
 });
 
 static COPULA: LazyLock<Regex> =
@@ -122,9 +128,7 @@ static COPULA: LazyLock<Regex> =
 
 /// A progress announcement short enough to carry no finding.
 fn is_filler(sentence: &str) -> bool {
-    sentence.chars().count() <= MAX_FILLER_CHARS
-        && FILLER.is_match(sentence)
-        && !RESULT_WORDS.is_match(sentence)
+    sentence.chars().count() <= MAX_FILLER_CHARS && FILLER.is_match(sentence)
 }
 
 /// A question typed without its question mark: it opens with an interrogative
@@ -165,10 +169,9 @@ fn strip_scaffolding(content: &str) -> String {
     }
     let mut kept = String::new();
     for line in text[..end].lines() {
-        // The signature is one JSON line; what follows it (`Context:`, the
-        // extraction's error-recovery and fix lines) is content.
-        let line = line.find("Signature:").map_or(line, |at| &line[..at]);
-        if is_scaffold_line(line) {
+        let line = without_signature(line);
+        let line = without_label(&line);
+        if line.chars().all(|c| matches!(c, '-' | '=' | ' ')) {
             continue;
         }
         kept.push_str(line);
@@ -178,13 +181,53 @@ fn strip_scaffolding(content: &str) -> String {
     TOOL_MARKER.replace_all(text, " ").into_owned()
 }
 
-/// A line that only labels the derivation: `Context:`, a rule, or a markdown
-/// heading that is not itself a question.
-fn is_scaffold_line(line: &str) -> bool {
-    let line = line.trim().trim_end_matches('-').trim();
-    line == "Context:"
-        || line.chars().all(|c| matches!(c, '-' | '=' | ' '))
-        || (line.starts_with('#') && !line.contains('?') && line.chars().count() <= 60)
+/// The labels a derivation puts in front of its content. The label is
+/// scaffolding; what follows it on the line and below it is content.
+const SCAFFOLD_LABELS: [&str; 6] = [
+    "## User Request",
+    "## Validation",
+    "## Error Recovery",
+    "## Solution Pattern",
+    "## Code Context",
+    "Context:",
+];
+
+fn without_label(line: &str) -> &str {
+    let mut line = line.trim();
+    while let Some(rest) = SCAFFOLD_LABELS
+        .iter()
+        .find_map(|label| line.strip_prefix(label))
+    {
+        line = rest.trim_start();
+    }
+    line
+}
+
+/// The first key of the signature JSON a derivation appends, for a signature
+/// the chunk boundary cut before it closed.
+const SIGNATURE_OPEN: &str = "{\"completion_status\"";
+
+/// `line` without its derivation signature (`Signature: {json}`): only a
+/// signature that is JSON (or the start of the one the derivation writes) goes.
+/// `Signature: Ed25519 with key id K1.` is prose and stays.
+fn without_signature(line: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let Some(at) = line.find("Signature:") else {
+        return Cow::Borrowed(line);
+    };
+    let before = &line[..at];
+    let rest = line[at + "Signature:".len()..].trim_start();
+    if !rest.starts_with('{') {
+        return Cow::Borrowed(line);
+    }
+    let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
+    match stream.next() {
+        Some(Ok(value)) if value.is_object() => {
+            Cow::Owned(format!("{before} {}", &rest[stream.byte_offset()..]))
+        }
+        _ if rest.starts_with(SIGNATURE_OPEN) => Cow::Owned(before.to_string()),
+        _ => Cow::Borrowed(line),
+    }
 }
 
 /// The request, findings and open items of a session episode row (its
@@ -227,6 +270,8 @@ fn episode_text(text: &str) -> Option<String> {
 struct Sentence {
     text: String,
     line_start: bool,
+    /// The only sentence on its line.
+    whole_line: bool,
 }
 
 /// The sentences of `body`: split at line breaks and at a `.`, `?` or `!`
@@ -249,6 +294,9 @@ fn sentences(body: &str) -> Vec<Sentence> {
         if let Some(opening) = out.get_mut(first) {
             opening.line_start = true;
         }
+        if out.len() - first == 1 {
+            out[first].whole_line = true;
+        }
     }
     out
 }
@@ -263,6 +311,7 @@ fn push_sentence(out: &mut Vec<Sentence>, current: &mut String) {
         out.push(Sentence {
             text,
             line_start: false,
+            whole_line: false,
         });
     }
     current.clear();
@@ -445,6 +494,59 @@ mod tests {
             "[reflection] ## User Request\nwhy did the import time out?\n\n---\n{SIG}\nContext:\n## Validation"
         );
         assert!(is_question_echo(&bare));
+    }
+
+    /// Finding 7: filler is a whole line of a closed progress phrase.
+    #[test]
+    fn a_line_that_reports_something_after_a_progress_verb_is_not_filler() {
+        assert!(!is_question_echo(
+            "Why did we replace the index?\nSearching the old index took thirty seconds."
+        ));
+        assert!(is_question_echo(
+            "Why did we replace the index?\nSearching past sessions\u{2026}"
+        ));
+        assert!(is_question_echo(
+            "Why did we replace the index?\nLet me look."
+        ));
+        assert!(is_question_echo(&format!(
+            "{Q}\n\nChecking past sessions for the actual reasoning."
+        )));
+    }
+
+    /// Finding 8: a pronoun after the interrogative opens a statement.
+    #[test]
+    fn what_we_changed_is_a_statement_not_a_question() {
+        assert!(!is_question_echo("What we changed eliminated network hops"));
+        assert!(!is_question_echo(
+            "why did we drop Qdrant?\nWhat we changed eliminated network hops"
+        ));
+        assert!(is_question_echo(
+            "## User Request\nwhy did we drop Qdrant\nwhat replaced it"
+        ));
+    }
+
+    /// Finding 9: only a JSON signature is stripped.
+    #[test]
+    fn a_prose_signature_line_is_content() {
+        assert!(!is_question_echo(
+            "why did we pick Ed25519?\nSignature: Ed25519 with key id K1."
+        ));
+        assert!(is_question_echo(&format!(
+            "why did we pick Ed25519?\n{SIG}"
+        )));
+    }
+
+    /// Finding 10: only the known labels are scaffolding, and what follows a
+    /// label is content.
+    #[test]
+    fn a_heading_that_is_not_a_label_is_content() {
+        assert!(!is_question_echo(
+            "why did we drop Qdrant?\n## SQLite removes network hops"
+        ));
+        assert!(is_question_echo("## User Request why did we drop Qdrant"));
+        assert!(!is_question_echo(
+            "## User Request why did we drop Qdrant? SQLite removes network hops."
+        ));
     }
 
     #[test]
