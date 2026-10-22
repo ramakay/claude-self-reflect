@@ -342,25 +342,42 @@ fn quiet_commit_is_proven(command: &str) -> bool {
     let Some(pieces) = and_chain(command) else {
         return false;
     };
-    let git_subcommand = |piece: &str| -> Option<String> {
-        let words = shell_simple_commands(piece).into_iter().next()?;
+    // A `git log` or `git show` that names no revision other than HEAD: it
+    // prints the commit just made, not its parent or another branch.
+    let shows_head = |piece: &str| -> bool {
+        let Some(words) = shell_simple_commands(piece).into_iter().next() else {
+            return false;
+        };
         let mut rest = words
             .iter()
             .skip_while(|w| w.contains('=') && !w.starts_with('-'));
-        let program = rest.next()?;
-        if program != "git" && !program.ends_with("/git") {
-            return None;
+        if !rest
+            .next()
+            .is_some_and(|p| p == "git" || p.ends_with("/git"))
+        {
+            return false;
         }
+        let mut subcommand = None;
         while let Some(word) = rest.next() {
             match word.as_str() {
-                "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
+                "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace"
+                    if subcommand.is_none() =>
+                {
                     rest.next();
                 }
+                w if subcommand.is_none() && w.starts_with('-') => {}
+                w if subcommand.is_none() => subcommand = Some(w.to_string()),
+                // Options that take their value as the next word.
+                "-n" | "--max-count" | "--format" | "--pretty" | "--date" | "--skip" => {
+                    rest.next();
+                }
+                "--" => return false,
                 w if w.starts_with('-') => {}
-                w => return Some(w.to_string()),
+                "HEAD" => {}
+                _ => return false,
             }
         }
-        None
+        matches!(subcommand.as_deref(), Some("log" | "show"))
     };
     let Some(commit) = pieces
         .iter()
@@ -368,9 +385,7 @@ fn quiet_commit_is_proven(command: &str) -> bool {
     else {
         return false;
     };
-    pieces[commit + 1..]
-        .iter()
-        .any(|piece| matches!(git_subcommand(piece).as_deref(), Some("log" | "show")))
+    pieces[commit + 1..].iter().any(|piece| shows_head(piece))
 }
 
 /// The commits one successful committing Bash call made, as `(sha, subject)`.
@@ -610,40 +625,45 @@ fn program_name(word: &str) -> &str {
 /// as `(program, arguments)`. Heredoc bodies and redirections are not commands.
 fn significant_commands(command: &str) -> Vec<(String, Vec<String>)> {
     let command = command.split("<<").next().unwrap_or(command);
-    let mut found = Vec::new();
-    for words in shell_simple_commands(command) {
-        let mut rest = words
-            .iter()
-            .skip_while(|w| w.contains('=') && !w.starts_with('-') && !w.starts_with('/'))
-            .map(String::as_str)
-            .peekable();
-        // `time cargo test`, `timeout 60 make`: the wrapped command counts.
-        while let Some(first) = rest.peek().copied() {
-            if WRAPPER_PROGRAMS.contains(&program_name(first)) {
-                rest.next();
-            } else if program_name(first) == "timeout" {
-                rest.next();
-                rest.next();
-            } else {
-                break;
-            }
+    shell_simple_commands(command)
+        .iter()
+        .filter_map(|words| significant_command(words))
+        .collect()
+}
+
+/// The program and arguments of one simple command, or `None` when it is
+/// noise (an assignment, a redirection, a shell builtin that proves nothing).
+fn significant_command(words: &[String]) -> Option<(String, Vec<String>)> {
+    let mut rest = words
+        .iter()
+        .skip_while(|w| w.contains('=') && !w.starts_with('-') && !w.starts_with('/'))
+        .map(String::as_str)
+        .peekable();
+    // `time cargo test`, `timeout 60 make`: the wrapped command counts.
+    while let Some(first) = rest.peek().copied() {
+        if WRAPPER_PROGRAMS.contains(&program_name(first)) {
+            rest.next();
+        } else if program_name(first) == "timeout" {
+            rest.next();
+            rest.next();
+        } else {
+            break;
         }
-        let Some(program) = rest.next() else { continue };
-        let name = program_name(program);
-        let real = name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphanumeric() || c == '.')
-            && !name.chars().all(|c| c.is_ascii_digit())
-            && name
-                .chars()
-                .all(|c| !matches!(c, '>' | '<' | '$' | '`' | '{' | '}' | '*'));
-        if !real || NOISE_PROGRAMS.contains(&name) {
-            continue;
-        }
-        found.push((name.to_string(), rest.map(str::to_string).collect()));
     }
-    found
+    let program = rest.next()?;
+    let name = program_name(program);
+    let real = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '.')
+        && !name.chars().all(|c| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| !matches!(c, '>' | '<' | '$' | '`' | '{' | '}' | '*'));
+    if !real || NOISE_PROGRAMS.contains(&name) {
+        return None;
+    }
+    Some((name.to_string(), rest.map(str::to_string).collect()))
 }
 
 /// Whether one command installs something: an `install` program or script,
@@ -720,13 +740,13 @@ fn is_verification(program: &str, args: &[String]) -> bool {
 }
 
 /// Flags that change how a verification command prints or runs, not what it
-/// checks. `true`: the flag takes the next word as its value.
+/// checks. `true`: the flag takes the next word as its value. Build-profile
+/// selectors (`--release`, `--profile`, `--features`, `--target`) are not
+/// here: a pass under another profile is another run.
 fn verification_noise_flag(word: &str) -> Option<bool> {
     match word {
-        "--release" | "-r" | "-q" | "--quiet" | "-v" | "-vv" | "--verbose" | "--locked"
-        | "--offline" | "--frozen" | "--nocapture" | "--no-fail-fast" | "--show-output" => {
-            Some(false)
-        }
+        "-q" | "--quiet" | "-v" | "-vv" | "--verbose" | "--locked" | "--offline" | "--frozen"
+        | "--nocapture" | "--no-fail-fast" | "--show-output" => Some(false),
         "--color" | "-j" | "--jobs" | "--message-format" => Some(true),
         w if w.starts_with("--color=")
             || w.starts_with("--jobs=")
@@ -741,23 +761,56 @@ fn verification_noise_flag(word: &str) -> Option<bool> {
     }
 }
 
-/// The directory a Bash call runs in: the last `cd` in the command (relative
-/// to the call's own directory), else the call's directory.
-fn command_directory(command: &str, cwd: Option<&str>) -> String {
-    let target = shell_simple_commands(command)
-        .into_iter()
-        .filter(|words| words.first().map(String::as_str) == Some("cd"))
-        .filter_map(|words| words.get(1).cloned())
-        .next_back();
-    match (target, cwd) {
-        (Some(dir), _) if dir.starts_with('/') => dir,
-        (Some(dir), Some(base)) => format!("{}/{}", base.trim_end_matches('/'), dir),
-        (Some(dir), None) => dir,
-        (None, Some(base)) => base.to_string(),
-        (None, None) => String::new(),
+/// `path` with `.` and `..` resolved lexically (no filesystem access). A
+/// relative path keeps leading `..` it cannot resolve.
+fn normalize_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => match parts.last() {
+                Some(&last) if last != ".." => {
+                    parts.pop();
+                }
+                _ if absolute => {}
+                _ => parts.push(".."),
+            },
+            other => parts.push(other),
+        }
     }
-    .trim_end_matches('/')
-    .to_string()
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// The directory a verification command runs in: the call's own directory,
+/// moved by every `cd` that comes before the command in the chain (a `cd`
+/// after it changes nothing), normalized lexically.
+fn command_directory(command: &str, program: &str, args: &[String], cwd: Option<&str>) -> String {
+    let command = command.split("<<").next().unwrap_or(command);
+    let mut dir: Option<String> = cwd.map(str::to_string);
+    let mut at_command: Option<Option<String>> = None;
+    for words in shell_simple_commands(command) {
+        if words.first().map(String::as_str) == Some("cd") {
+            let target = words.get(1).map(String::as_str).unwrap_or("~");
+            dir = Some(match (target, &dir) {
+                (t, _) if t.starts_with('/') => t.to_string(),
+                (t, Some(base)) if !t.starts_with('~') && t != "-" => format!("{base}/{t}"),
+                (t, None) if !t.starts_with('~') && t != "-" => t.to_string(),
+                // `cd`, `cd ~/x`, `cd -`: somewhere this cannot name.
+                (t, _) => format!("?{t}"),
+            });
+        } else if let Some((name, found_args)) = significant_command(&words) {
+            if name == program && found_args == args {
+                at_command = Some(dir.clone());
+            }
+        }
+    }
+    normalize_path(&at_command.unwrap_or(dir).unwrap_or_default())
 }
 
 /// The failure key of a verification command: what it checks (program, every
@@ -788,13 +841,15 @@ fn verification_key(command: &str, program: &str, args: &[String], cwd: Option<&
                 words.next();
             }
             Some(false) => {}
+            // `-r` is cargo's `--release`.
+            None if word == "-r" => kept.push("--release"),
             None => kept.push(word),
         }
     }
     format!(
         "{VERIFY_KEY_PREFIX}{program} {} @{}",
         kept.join(" "),
-        command_directory(command, cwd)
+        command_directory(command, program, args, cwd)
     )
 }
 
@@ -5249,6 +5304,34 @@ mod tests {
     }
 
     #[test]
+    fn a_log_of_another_revision_is_no_receipt_for_the_commit() {
+        let out = "9d8c7b6 fix: x";
+        for command in [
+            "git commit -q -m 'fix: x' && git log --oneline -1 HEAD~1",
+            "git commit -q -m 'fix: x' && git log --oneline -1 HEAD^",
+            "git commit -q -m 'fix: x' && git log --oneline -1 main",
+            "git commit -q -m 'fix: x' && git show --oneline -s abc1234",
+            "git commit -q -m 'fix: x' && git log --oneline -1 -- src/a.rs",
+            "git commit -q -m 'fix: x' && git log --oneline -1 origin/main..HEAD",
+        ] {
+            assert!(bash_receipts(command, out, false).is_empty(), "{command}");
+        }
+        for command in [
+            "git commit -q -m 'fix: x' && git log --oneline -1",
+            "git commit -q -m 'fix: x' && git log --oneline -1 HEAD",
+            "git commit -q -m 'fix: x' && git log --oneline -n 1",
+            "git commit -q -m 'fix: x' && git show -s --oneline",
+            "git commit -q -m 'fix: x' && git log --format='%h %s' -1",
+        ] {
+            assert_eq!(
+                bash_receipts(command, out, false),
+                vec![receipt("fix: x", "9d8c7b6")],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn the_same_commit_seen_twice_is_one_receipt() {
         let ep = extract(&[
             typed_line("land the recap fix", "typed"),
@@ -5702,7 +5785,7 @@ mod tests {
             ("cargo test --test broken", "cargo test --test broken"),
             (
                 "cargo test --release --test broken 2>&1 | tail -5",
-                "cargo test --test broken -q > /tmp/out.log",
+                "cargo test --release --test broken -q -j4 --color always > /tmp/out.log",
             ),
             ("cd /repo/a && cargo test", "cd /repo/a && cargo test"),
         ] {
@@ -5713,6 +5796,83 @@ mod tests {
             assert!(!ep.final_failed, "{failing} then {passing}");
             assert_eq!(ep.outcome, "success", "{failing} then {passing}");
         }
+    }
+
+    #[test]
+    fn a_pass_under_another_build_profile_does_not_clear_a_failure() {
+        let commit = || bash_step("c", "git commit -q -m wip", "[main 1a2b3c4] wip", false);
+        let red = |id: &str, command: &str| bash_step(id, command, "Exit code 101", true);
+        let green = |id: &str, command: &str| bash_step(id, command, "ok", false);
+        for (failing, passing) in [
+            ("cargo test", "cargo test --release"),
+            ("cargo test --release", "cargo test"),
+            ("cargo test", "cargo test -r"),
+            ("cargo test", "cargo test --profile ci"),
+            ("cargo test", "cargo test --features slow"),
+            ("cargo test", "cargo test --all-features"),
+            ("cargo test", "cargo test --no-default-features"),
+            ("cargo test", "cargo test --target aarch64-apple-darwin"),
+        ] {
+            let ep = closing_run(
+                vec![commit(), red("a", failing), green("b", passing)],
+                "Done.",
+            );
+            assert!(ep.final_failed, "{failing} then {passing}");
+            assert_eq!(ep.outcome, "partial", "{failing} then {passing}");
+        }
+        // Output-shaping flags and redirections are still noise.
+        let ep = closing_run(
+            vec![
+                commit(),
+                red("a", "cargo test --release"),
+                green("b", "cargo test -r -q -j 4 --color=always > /tmp/o 2>&1"),
+            ],
+            "Fixed.",
+        );
+        assert_eq!(ep.outcome, "success");
+    }
+
+    #[test]
+    fn the_directory_is_the_one_at_the_verification_command_not_the_end_of_the_chain() {
+        let commit = || bash_step("c", "git commit -q -m wip", "[main 1a2b3c4] wip", false);
+        let red = |id: &str, command: &str| bash_step(id, command, "Exit code 101", true);
+        let green = |id: &str, command: &str| bash_step(id, command, "ok", false);
+        // A pass in /repo/b, with a trailing cd back to /repo/a, is not a pass in a.
+        let ep = closing_run(
+            vec![
+                commit(),
+                red("a", "cd /repo/a && cargo test"),
+                green("b", "cd /repo/b && cargo test && cd /repo/a"),
+            ],
+            "Done.",
+        );
+        assert_eq!(ep.outcome, "partial");
+        // A cd after the command does not move a failure either.
+        let key = |command: &str, cwd: Option<&str>| {
+            call_signature("Bash", &serde_json::json!({"command": command}), cwd).failure_key
+        };
+        assert_eq!(
+            key("cd /repo/a && cargo test && cd /repo/b", None),
+            key("cd /repo/a && cargo test", None)
+        );
+        assert_ne!(
+            key("cd /repo/b && cargo test && cd /repo/a", None),
+            key("cd /repo/a && cargo test", None)
+        );
+    }
+
+    #[test]
+    fn directories_are_compared_lexically_after_dot_and_dotdot() {
+        let key = |command: &str, cwd: Option<&str>| {
+            call_signature("Bash", &serde_json::json!({"command": command}), cwd).failure_key
+        };
+        let here = key("cargo test", Some("/repo"));
+        assert_eq!(key("cd .. && cargo test", Some("/repo/tests")), here);
+        assert_eq!(key("cd ./tests/.. && cargo test", Some("/repo")), here);
+        assert_eq!(key("cd /repo/tests/../ && cargo test", None), here);
+        assert_eq!(key("cargo test", Some("/repo/")), here);
+        assert_ne!(key("cd tests && cargo test", Some("/repo")), here);
+        assert_ne!(key("cd ../other && cargo test", Some("/repo")), here);
     }
 
     #[test]
@@ -5805,7 +5965,7 @@ mod tests {
         );
         assert_eq!(
             key("export A=1; time cargo build --release").as_deref(),
-            Some("verify:cargo build @")
+            Some("verify:cargo build --release @")
         );
         assert_eq!(key("git push origin main").as_deref(), Some("git push"));
         assert_eq!(
