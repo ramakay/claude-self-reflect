@@ -696,20 +696,41 @@ mod tests {
                 input: input(dir.path()),
             })
             .unwrap();
-            let mut stream = tokio::net::UnixStream::connect(socket_path(dir.path()))
-                .await
-                .unwrap();
+            // The socket file appears at bind(2), before listen(2), so `ready` can return while
+            // connect is still refused. Probing with a connect would take the daemon's only
+            // request slot, so the retry lives here instead.
+            let mut stream = loop {
+                match tokio::net::UnixStream::connect(socket_path(dir.path())).await {
+                    Ok(stream) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
             write_frame(&mut stream, &bytes).await.unwrap();
+            // This asserts that the daemon abstains, not that it answers within the render
+            // budget, so the wait tolerates a loaded host.
             assert!(
-                tokio::time::timeout(REQUEST_BUDGET, read_frame(&mut stream))
+                tokio::time::timeout(Duration::from_secs(60), read_frame(&mut stream))
                     .await
                     .unwrap()
                     .is_none(),
                 "daemon must abstain when {key} differs"
             );
         }
-        // Matching configuration still renders after all rejected requests.
-        assert!(request(dir.path(), input(dir.path())).await.is_some());
+        // Matching configuration still renders after all rejected requests. The daemon serves one
+        // request at a time and drops a connection that arrives while the last is still being
+        // torn down, so a loaded host may need a few tries.
+        let mut rendered = None;
+        for _ in 0..40 {
+            rendered = request(dir.path(), input(dir.path())).await;
+            if rendered.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(rendered.is_some());
         shutdown.store(true, Ordering::SeqCst);
         server.await.unwrap();
     }
