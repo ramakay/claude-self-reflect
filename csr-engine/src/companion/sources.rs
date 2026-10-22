@@ -376,6 +376,23 @@ pub fn csr_status_at(paths: &Paths, now: f64) -> Value {
     result
 }
 
+/// Wall-clock budget one pane frame spends scanning past compactions; a large corpus
+/// finishes across several frames.
+const COMPACTION_SCAN_BUDGET_MS: u64 = 5;
+static COMPACTION_SCAN_BUDGET: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(COMPACTION_SCAN_BUDGET_MS);
+
+/// Test seam: give each frame's compaction scan a budget no test host can exhaust, so a
+/// small fixture's first frame shows the finished scan on any CPU speed or load. Production
+/// never calls this and keeps the 5 ms budget.
+#[doc(hidden)]
+pub fn set_compaction_scan_budget(budget: std::time::Duration) {
+    COMPACTION_SCAN_BUDGET.store(
+        u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 pub fn compacting_info(paths: &Paths, sid: &str, now: f64, persist: bool) -> Value {
     let marker = paths
         .kept_file("compacting", sid)
@@ -401,7 +418,9 @@ pub fn compacting_info(paths: &Paths, sid: &str, now: f64, persist: bool) -> Val
                 now,
                 persist,
                 super::tail::CHUNK,
-                std::time::Duration::from_millis(5),
+                std::time::Duration::from_millis(
+                    COMPACTION_SCAN_BUDGET.load(std::sync::atomic::Ordering::Relaxed),
+                ),
                 super::watch::stopping,
             )
         })

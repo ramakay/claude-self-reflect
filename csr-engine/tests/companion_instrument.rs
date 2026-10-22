@@ -48,6 +48,10 @@ fn utc() {
 }
 fn rich_home() -> (tempfile::TempDir, Paths) {
     utc();
+    // Production gives each frame's compaction scan 5 ms. The fixture's three transcripts finish
+    // inside that on an idle host, so the goldens show the finished scan ("of ~45s"); an
+    // unbounded budget makes that the result on any CPU speed or load instead of a race.
+    csr_engine::companion::sources::set_compaction_scan_budget(std::time::Duration::from_secs(60));
     let d = tempfile::tempdir_in(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")).unwrap();
     let home = d.path().to_string_lossy().into_owned();
     copy_tree(&fixture().join("home"), d.path(), &home);
