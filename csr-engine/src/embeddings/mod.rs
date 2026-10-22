@@ -1,6 +1,8 @@
 pub mod cache;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
@@ -26,6 +28,30 @@ pub struct EmbeddingEngine {
     /// engine built without a database (tests), which then builds its probes
     /// in memory and never touches the disk.
     probe_dir: Option<std::path::PathBuf>,
+    /// Single-text embeds (a prompt's query) that are queued or running. A
+    /// batch embed releases the model between its texts and waits while this is
+    /// above zero, so a query waits for one text, not for a whole import.
+    interactive: AtomicUsize,
+}
+
+/// How long a batch embed yields to queued interactive embeds before going on
+/// regardless, so a stuck query cannot starve imports.
+const INTERACTIVE_YIELD_LIMIT: Duration = Duration::from_millis(250);
+
+/// Counts one interactive embed for as long as it lives.
+struct InteractiveEmbed<'a>(&'a AtomicUsize);
+
+impl<'a> InteractiveEmbed<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for InteractiveEmbed<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Serializes first-run model downloads within this process. Concurrent
@@ -93,6 +119,7 @@ impl EmbeddingEngine {
             model: Mutex::new(None),
             remote: None,
             probe_dir: None,
+            interactive: AtomicUsize::new(0),
         })
     }
 
@@ -103,6 +130,7 @@ impl EmbeddingEngine {
             model: Mutex::new(None),
             remote: None,
             probe_dir: None,
+            interactive: AtomicUsize::new(0),
         }
     }
 
@@ -113,6 +141,7 @@ impl EmbeddingEngine {
             model: Mutex::new(None),
             remote: Some(proxy),
             probe_dir: None,
+            interactive: AtomicUsize::new(0),
         }
     }
 
@@ -214,6 +243,11 @@ impl EmbeddingEngine {
 
     /// Embed a batch of texts. Returns one 384-dim vector per input.
     /// Loads the model on first call if it hasn't been `warm()`ed already.
+    ///
+    /// The model is held for one text at a time (the batch size was already 1,
+    /// see `EMBED_BATCH_SIZE`) and released between texts, and the batch waits
+    /// there while an [`embed_single`](Self::embed_single) is queued. A prompt's
+    /// query therefore never waits for the rest of an import's chunks.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if let Some(proxy) = &self.remote {
             // A server of a configured daemon never loads the model itself.
@@ -221,22 +255,49 @@ impl EmbeddingEngine {
                 .embed(texts)
                 .ok_or_else(|| anyhow::anyhow!(crate::search::vector_ipc::KEYWORD_ONLY_NOTE));
         }
+        self.embed_locally(texts, false)
+    }
+
+    fn embed_locally(&self, texts: &[&str], interactive: bool) -> Result<Vec<Vec<f32>>> {
+        let _queued = interactive.then(|| InteractiveEmbed::new(&self.interactive));
         self.ensure_loaded()?;
-        let docs: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
-        let mut guard = self
-            .model
-            .lock()
-            .map_err(|e| anyhow::anyhow!("embedding lock: {e}"))?;
-        let model = guard
-            .as_mut()
-            .expect("ensure_loaded returned Ok, so the model is populated");
-        let embeddings = model.embed(docs, Some(EMBED_BATCH_SIZE))?;
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for piece in texts.chunks(EMBED_BATCH_SIZE) {
+            if !interactive {
+                self.yield_to_interactive();
+            }
+            let docs: Vec<String> = piece.iter().map(|s| s.to_string()).collect();
+            let mut guard = self
+                .model
+                .lock()
+                .map_err(|e| anyhow::anyhow!("embedding lock: {e}"))?;
+            let model = guard
+                .as_mut()
+                .expect("ensure_loaded returned Ok, so the model is populated");
+            embeddings.extend(model.embed(docs, Some(EMBED_BATCH_SIZE))?);
+        }
         Ok(embeddings)
     }
 
-    /// Embed a single text string.
+    /// Between two texts of a batch: let queued interactive embeds take the
+    /// model first (bounded by [`INTERACTIVE_YIELD_LIMIT`]).
+    fn yield_to_interactive(&self) {
+        let started = Instant::now();
+        while self.interactive.load(Ordering::SeqCst) > 0
+            && started.elapsed() < INTERACTIVE_YIELD_LIMIT
+        {
+            std::thread::sleep(Duration::from_micros(500));
+        }
+    }
+
+    /// Embed a single text string. This is the interactive path (a prompt's
+    /// query): it takes the model ahead of any batch between that batch's texts.
     pub fn embed_single(&self, text: &str) -> Result<Vec<f32>> {
-        let results = self.embed(&[text])?;
+        let results = if self.remote.is_some() {
+            self.embed(&[text])?
+        } else {
+            self.embed_locally(&[text], true)?
+        };
         results
             .into_iter()
             .next()
@@ -291,6 +352,37 @@ mod tests {
         assert!(!engine.is_loaded());
         engine.warm().unwrap();
         assert!(engine.is_loaded(), "warm() must load the model immediately");
+    }
+
+    /// A prompt's query shares the model with the importer's batches. It must
+    /// wait for the text being embedded, not for the whole batch.
+    #[test]
+    fn a_query_does_not_wait_for_a_whole_running_batch() {
+        let engine = std::sync::Arc::new(EmbeddingEngine::new().unwrap());
+        engine.warm().unwrap();
+        let text = "retry the upload with backoff ".repeat(40);
+        let started = Instant::now();
+        engine.embed_single(&text).unwrap();
+        let one = started.elapsed();
+
+        let batch: Vec<String> = (0..40).map(|i| format!("{i} {text}")).collect();
+        let background = engine.clone();
+        let running = std::thread::spawn(move || {
+            let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+            let started = Instant::now();
+            background.embed(&refs).unwrap();
+            started.elapsed()
+        });
+        std::thread::sleep(one * 3);
+        let started = Instant::now();
+        engine.embed_single("a short question").unwrap();
+        let waited = started.elapsed();
+        let whole = running.join().unwrap();
+
+        assert!(
+            waited < whole / 3,
+            "the query waited {waited:?} of a {whole:?} batch (one text: {one:?})"
+        );
     }
 
     // Serialize env-var mutation across these tests: `cargo test` runs
