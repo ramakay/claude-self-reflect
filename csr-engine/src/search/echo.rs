@@ -1,0 +1,221 @@
+//! Question echoes: result rows that only restate the question.
+//!
+//! A conversation in which someone asked "why did we X?" leaves several rows
+//! that carry the question and nothing else: the raw chunk (the question plus
+//! one line of assistant narration), the extraction (`## User Request <q>` and
+//! its signature) and the session story (`<q> --- Signature: {...}`). Their
+//! words match the next person's identical question better than the answer
+//! does, so they outrank it, and the person is shown their own question back.
+//!
+//! The rule reads the row's own text and nothing else: strip the derivation
+//! scaffolding, then ask whether what is left is only question sentences and
+//! process narration. Similarity to the query plays no part, so a repeated
+//! question whose row also states an answer is not an echo, and a question
+//! the corpus never answered is still recalled (it sinks, it is not dropped).
+
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+/// Longest the stripped body of an echo can be. A longer body is carrying
+/// something besides a restated question.
+const MAX_ECHO_CHARS: usize = 700;
+
+/// Longest a narration sentence can be and still count as filler.
+const MAX_FILLER_CHARS: usize = 160;
+
+/// Prefixes the result renderers put in front of a row's text.
+const ROW_PREFIXES: [&str; 5] = [
+    "[keyword] ",
+    "[story] ",
+    "[reflection] ",
+    "[narrative] ",
+    "[episode] ",
+];
+
+/// Rendered tool markers (`[ToolSearch: ...]`, `[mcp__server__tool: ...]`,
+/// `[Read: ...]`): the importer's one-line rendering of a call, which says what
+/// was looked at and never what was found.
+static TOOL_MARKER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\[(?:mcp__[A-Za-z0-9_\-]+|ToolSearch|Read|Bash|Grep|Glob|Task|Agent|Skill|WebSearch|WebFetch)(?::[^\]\n]*)?\]",
+    )
+    .expect("tool marker regex")
+});
+
+/// Assistant narration that announces work without reporting a result.
+static FILLER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(?:checking|searching|looking|let me|let\x27s|let us|i\x27ll|i will|i\x27m|i am|one moment|on it|sure|okay|ok|now|first|running|reading|fetching|pulling|querying|consulting|digging|scanning|grepping|opening|trying|asking|calling|using|loading)\b",
+    )
+    .expect("filler regex")
+});
+
+/// Openers of a question written without its question mark.
+static QUESTION_OPENER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(?:why|what|how|when|where|who|whom|whose|which|did|do|does|is|are|was|were|can|could|should|would|will|have|has|had|remind me|tell me|explain|recall|remember)\b",
+    )
+    .expect("question opener regex")
+});
+
+/// Whether `content`, after the derivation scaffolding is stripped, is only a
+/// restatement of a question with no answer in it.
+pub fn is_question_echo(content: &str) -> bool {
+    let body = strip_scaffolding(content);
+    if body.chars().count() > MAX_ECHO_CHARS {
+        return false;
+    }
+    let sentences = sentences(&body);
+    let mut questions = 0;
+    for (at, sentence) in sentences.iter().enumerate() {
+        if sentence.ends_with('?') || (at == 0 && is_unpunctuated_question(sentence)) {
+            questions += 1;
+        } else if !(FILLER.is_match(sentence) && sentence.chars().count() <= MAX_FILLER_CHARS) {
+            return false;
+        }
+    }
+    questions > 0
+}
+
+/// A question typed without its question mark: it opens with an interrogative
+/// and carries no punctuation that would make it a statement (a closing period,
+/// or a colon introducing the answer, as in a memory titled `why X: because Y`).
+fn is_unpunctuated_question(sentence: &str) -> bool {
+    QUESTION_OPENER.is_match(sentence)
+        && sentence.chars().count() <= MAX_FILLER_CHARS * 2
+        && !sentence.ends_with(['.', '!', ':', ';'])
+        && !sentence.contains(':')
+}
+
+/// `content` without its row prefixes, `## User Request` header, signature
+/// (and whatever follows it) and rendered tool markers.
+fn strip_scaffolding(content: &str) -> String {
+    let mut text = content.trim_start();
+    while let Some(rest) = ROW_PREFIXES
+        .iter()
+        .find_map(|prefix| text.strip_prefix(prefix))
+    {
+        text = rest.trim_start();
+    }
+    let text = text.strip_prefix("## User Request").unwrap_or(text);
+    let text = match text.find("Signature:") {
+        Some(at) => text[..at].trim_end().trim_end_matches('-'),
+        None => text,
+    };
+    TOOL_MARKER.replace_all(text, " ").into_owned()
+}
+
+/// The sentences of `body`: split at line breaks and at a `.`, `?` or `!`
+/// followed by whitespace, each kept with its terminator.
+fn sentences(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let mut current = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            current.push(c);
+            let ends =
+                matches!(c, '.' | '?' | '!') && chars.peek().is_none_or(|n| n.is_whitespace());
+            if ends {
+                push_sentence(&mut out, &mut current);
+            }
+        }
+        push_sentence(&mut out, &mut current);
+    }
+    out
+}
+
+fn push_sentence(out: &mut Vec<String>, current: &mut String) {
+    let sentence = current
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\u{201c}' | '\u{201d}' | '-' | '*'))
+        .trim()
+        .to_string();
+    if sentence.chars().any(char::is_alphanumeric) {
+        out.push(sentence);
+    }
+    current.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIG: &str = r#"Signature: {"completion_status":"partial","confidence":"MEDIUM","frameworks":["rust"],"pattern_reusability":"medium","error_recovery":false,"total_edits":0,"iteration_count":2,"tools_used":["ToolSearch"],"files_modified":[],"concepts":[]}"#;
+    const Q: &str = "why did we drop Docker and Qdrant for a single Rust binary?";
+
+    #[test]
+    fn a_story_that_is_the_question_and_its_signature_is_an_echo() {
+        assert!(is_question_echo(&format!("[story] {Q} --- Signature: {{\"completion_status\":\"partial\",\"confidence\":\"MEDIUM\",\"frameworks\":[\"rust\"],\"pattern_reusability\":\"medium\",\"error_recovery\":fa. Partially completed")));
+        assert!(is_question_echo(&format!("{Q} --- {SIG}")));
+    }
+
+    #[test]
+    fn an_extraction_that_is_the_question_and_its_signature_is_an_echo() {
+        assert!(is_question_echo(&format!(
+            "[reflection] ## User Request\n{Q}\n\n\n---\n{SIG}\nContext:\n## Validation"
+        )));
+    }
+
+    #[test]
+    fn a_question_with_assistant_filler_is_an_echo() {
+        assert!(is_question_echo(&format!(
+            "{Q}\n\nChecking past sessions for the actual reasoning."
+        )));
+        assert!(is_question_echo(
+            "[keyword] why did we drop Qdrant\"\n\n[ToolSearch: select:mcp__claude-self-reflect__csr_reflect_on_past]\n\n[mcp__claude-self-reflect__csr_reflect_on_past: why drop Qdrant replace with Rust engine decision reasons]"
+        ));
+    }
+
+    #[test]
+    fn a_question_without_a_question_mark_is_still_a_question() {
+        assert!(is_question_echo("what did we decide about the hook budget"));
+        assert!(is_question_echo(
+            "what did we decide about the hook budget\n\nLooking that up now."
+        ));
+    }
+
+    #[test]
+    fn a_question_followed_by_an_answer_is_not_an_echo() {
+        assert!(!is_question_echo(&format!(
+            "{Q} Because installing Docker was too painful and an embedded index was faster."
+        )));
+        assert!(!is_question_echo(&format!(
+            "{Q}\n\nInstalling it was too painful, and the scale never needed a database server."
+        )));
+        assert!(!is_question_echo(&format!(
+            "[story] {Q} The user chose one binary. --- {SIG}"
+        )));
+    }
+
+    #[test]
+    fn an_answer_that_mentions_a_question_is_not_an_echo() {
+        assert!(!is_question_echo(
+            "Installing it was too painful, and the scale never needed a database server. A Phase 0 spike then showed an embedded index was faster anyway."
+        ));
+        assert!(!is_question_echo(
+            "Memory has answer. Qdrant died with whole v7 Python/Docker stack in v8.0 rewrite. Why drop: install friction."
+        ));
+        assert!(!is_question_echo(
+            "Decision: drop Qdrant.\n\nwhy did we drop Docker and Qdrant?"
+        ));
+    }
+
+    #[test]
+    fn a_statement_that_opens_like_a_question_is_not_an_echo() {
+        assert!(!is_question_echo(
+            "[reflection] why did we drop Docker and Qdrant: the install burden and the scale never needed a server."
+        ));
+        assert!(!is_question_echo(
+            "why we chose one binary was the install burden."
+        ));
+    }
+
+    #[test]
+    fn plain_statements_and_empty_text_are_not_echoes() {
+        assert!(!is_question_echo(""));
+        assert!(!is_question_echo("[story] --- Signature: {}"));
+        assert!(!is_question_echo("fix the flaky test in hooks_integration"));
+    }
+}

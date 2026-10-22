@@ -865,6 +865,33 @@ fn sink_out_of_family_under_explicit_scope(
     enriched.extend(sink);
 }
 
+/// Sink the rows that cannot answer a question below the rows that can, never
+/// dropping one: first the rows that only restate a question
+/// ([`crate::search::echo::is_question_echo`]), then CSR's own search-result
+/// and `csr_why` output
+/// ([`crate::import::contamination::is_csr_tool_payload`]). Both are decided
+/// by the row's own text, never by its similarity to the query, so a question
+/// asked again whose row also states the answer keeps its rank. Stable: every
+/// class keeps its fused order, so when an echo and an answer come from the
+/// same conversation the answer is what represents that conversation.
+fn sink_non_answers(enriched: &mut [EnrichedResult]) {
+    let class = |result: &EnrichedResult| -> u8 {
+        let content = result.chunk.content.as_str();
+        if crate::import::contamination::is_csr_tool_payload(content) {
+            2
+        } else if crate::search::echo::is_question_echo(content) {
+            1
+        } else {
+            0
+        }
+    };
+    let classes: HashMap<String, u8> = enriched
+        .iter()
+        .map(|result| (result.chunk.id.clone(), class(result)))
+        .collect();
+    enriched.sort_by_key(|result| classes.get(&result.chunk.id).copied().unwrap_or(0));
+}
+
 /// Move every id in `prefix_ids` that also appears in `order` to the front,
 /// in `prefix_ids`' own order, leaving every other id's relative order
 /// untouched. `prefix_ids` is small (a handful of exact-prefix reflection
@@ -2071,6 +2098,10 @@ async fn reflect_gather_pass(
             .unwrap_or(usize::MAX)
     };
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
+    // Rows that carry no answer sink below the rows that do. Runs before the
+    // out-of-family sink so that sink, which is the stronger statement about
+    // where a row belongs, keeps the last word on order.
+    sink_non_answers(&mut enriched);
     // Under an explicit project filter, chunk search is already restricted to
     // the project family, but reflections and stories are not: RRF places them
     // by rank, so a cosine-0.12 story from another project could sit above
@@ -12057,6 +12088,222 @@ mod health_probe_tests {
             cids(&ambient_out)[0],
             "conv-home",
             "the control must see the boost: {ambient_out}"
+        );
+    }
+}
+
+/// The live probe shape (2026-10-22, "why did we drop Docker and Qdrant"): the
+/// question restated by a story, an extraction and a raw chunk; CSR's own
+/// `csr_why` and search output; and the chunks that actually answer.
+#[cfg(test)]
+mod echo_recall_tests {
+    use super::*;
+    use crate::import::ConversationChunk;
+    use crate::provenance::Speaker;
+    use crate::storage::recap_feeds::ConsumptionMode;
+
+    const QUERY: &str = "why did we drop Docker and Qdrant";
+    const SIG: &str = r#"Signature: {"completion_status":"partial","confidence":"MEDIUM","frameworks":["rust"],"pattern_reusability":"medium","error_recovery":false,"total_edits":0,"iteration_count":2,"tools_used":["ToolSearch"],"files_modified":[],"concepts":[]}"#;
+    const WHY_ROW: &str = "WHY: why did we drop Qdrant\n\nconv_3ebfc6f9-d73f-49b3-b29b-202ed5f35255:\n  via=reflection score=0.794 [2026-07-15T19:39:01.638330+00:00] conv_3ebfc6f9-d73f-49b3-b29b-202ed5f35255: ## User Request why did we drop Docker and Qdrant";
+    const SEARCH_ROW: &str = "🎯 RESULTS: 5 matches (partial relevance, top score: 0.450)\n⚡ PERFORMANCE: 6ms (1 collection searched)\n\n<search>\n  <summary count=\"5\" relevance=\"partial\" top-score=\"0.450\">\n    <preview>[keyword] why did we drop Docker and Qdrant</preview>\n  </summary>";
+
+    fn vec_at(cos: f32) -> Vec<f32> {
+        vec![cos, (1.0 - cos * cos).sqrt(), 0.0, 0.0]
+    }
+
+    fn chunk(id: &str, conv: &str, cos: f32, content: &str) -> (ConversationChunk, Vec<f32>) {
+        (
+            ConversationChunk {
+                id: id.into(),
+                conversation_id: conv.into(),
+                project_name: "echoproj".into(),
+                timestamp: "2026-10-12T00:00:00Z".into(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: Speaker::Assistant,
+                seq: 0,
+                is_sidechain: false,
+            },
+            vec_at(cos),
+        )
+    }
+
+    fn ids(out: &str) -> Vec<String> {
+        out.split("<id>")
+            .skip(1)
+            .filter_map(|part| part.split("</id>").next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    async fn recall(
+        rows: &[(ConversationChunk, Vec<f32>)],
+        reflections: &[(&str, &[&str], String, f32)],
+    ) -> Vec<String> {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        for (row, vector) in rows {
+            storage.insert_chunk(row, vector).unwrap();
+            engine.insert_chunk(row.id.clone(), vector.clone());
+        }
+        for (id, tags, content, cos) in reflections {
+            let tags: Vec<String> = tags.iter().map(|tag| tag.to_string()).collect();
+            storage
+                .insert_reflection(id, content, &tags, &vec_at(*cos))
+                .unwrap();
+            engine.insert_reflection(id.to_string(), vec_at(*cos));
+        }
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            QUERY,
+            30,
+            0.0,
+            Some("echoproj"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Hybrid,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        ids(&out)
+    }
+
+    fn position(order: &[String], id: &str) -> usize {
+        order
+            .iter()
+            .position(|candidate| candidate == id)
+            .unwrap_or_else(|| panic!("{id} missing from {order:?}"))
+    }
+
+    type ProbeChunks = Vec<(ConversationChunk, Vec<f32>)>;
+    type ProbeReflections = Vec<(&'static str, &'static [&'static str], String, f32)>;
+
+    fn probe_rows() -> (ProbeChunks, ProbeReflections) {
+        let rows = vec![
+            chunk(
+                "echo-chunk",
+                "conv1",
+                0.75,
+                "why did we drop Docker and Qdrant for a single Rust binary?\n\nChecking past sessions for the actual reasoning.",
+            ),
+            chunk("why-row", "conv9", 0.80, WHY_ROW),
+            chunk("search-row", "conv9", 0.78, SEARCH_ROW),
+            chunk(
+                "answer-chunk",
+                "conv1",
+                0.50,
+                "Installing it was too painful, and the scale never needed a database server. A Phase 0 spike then showed an embedded index was faster anyway.",
+            ),
+            chunk(
+                "answer-chunk-2",
+                "conv2",
+                0.52,
+                "Memory has answer. Qdrant died with whole v7 Python/Docker stack in v8.0 rewrite. Why drop: install friction, Docker Desktop needed.",
+            ),
+        ];
+        let reflections = vec![
+            (
+                "story_conv1",
+                &["session_story", "project_echoproj", "conv_conv1"][..],
+                format!("why did we drop Docker and Qdrant for a single Rust binary? --- {SIG}. Partially completed"),
+                0.68,
+            ),
+            (
+                "extracted_v3_conv1",
+                &["narrative_extracted_v3", "project_echoproj", "conv_conv1"][..],
+                format!("## User Request\nwhy did we drop Docker and Qdrant for a single Rust binary?\n\n\n---\n{SIG}\nContext:\n## Validation"),
+                0.72,
+            ),
+        ];
+        (rows, reflections)
+    }
+
+    #[tokio::test]
+    async fn the_answer_outranks_every_echo_of_its_own_question() {
+        let (rows, reflections) = probe_rows();
+        let order = recall(&rows, &reflections).await;
+        let first_echo = ["story_conv1", "extracted_v3_conv1", "echo-chunk"]
+            .iter()
+            .map(|id| position(&order, id))
+            .min()
+            .unwrap();
+        for answer in ["answer-chunk", "answer-chunk-2"] {
+            assert!(
+                position(&order, answer) < first_echo,
+                "{answer} must lead the question echoes: {order:?}"
+            );
+        }
+        assert!(
+            ["answer-chunk", "answer-chunk-2"].contains(&order[0].as_str()),
+            "rank 1 must carry an answer: {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn csr_why_and_search_output_do_not_outrank_answers() {
+        let (rows, reflections) = probe_rows();
+        let order = recall(&rows, &reflections).await;
+        for noise in ["why-row", "search-row"] {
+            for answer in ["answer-chunk", "answer-chunk-2"] {
+                assert!(
+                    position(&order, answer) < position(&order, noise),
+                    "{noise} is CSR's own output and must rank below {answer}: {order:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_question_that_also_carries_its_answer_is_not_demoted() {
+        let (mut rows, reflections) = probe_rows();
+        rows.push(chunk(
+            "repeat-with-answer",
+            "conv3",
+            0.60,
+            "why did we drop Docker and Qdrant? Because installing Docker was too painful and an embedded index was faster.",
+        ));
+        let order = recall(&rows, &reflections).await;
+        for echo in ["story_conv1", "extracted_v3_conv1", "echo-chunk"] {
+            assert!(
+                position(&order, "repeat-with-answer") < position(&order, echo),
+                "a question that carries its answer must lead the bare echoes: {order:?}"
+            );
+        }
+        assert!(
+            position(&order, "repeat-with-answer") < position(&order, "why-row"),
+            "{order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_derived_story_that_opens_with_the_query_is_not_promoted_to_first() {
+        let (rows, reflections) = probe_rows();
+        let order = recall(&rows, &reflections).await;
+        assert_ne!(order[0], "story_conv1", "{order:?}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_memory_that_opens_with_the_query_is_still_promoted() {
+        let (rows, mut reflections) = probe_rows();
+        reflections.push((
+            "5eb5aebb-65ab-4fba-9917-86cb83845154",
+            &["csr:memory", "echoproj"][..],
+            "why did we drop Docker and Qdrant: the install burden and the scale never needed a server.".to_string(),
+            0.30,
+        ));
+        let order = recall(&rows, &reflections).await;
+        assert_eq!(
+            order[0], "5eb5aebb-65ab-4fba-9917-86cb83845154",
+            "{order:?}"
         );
     }
 }

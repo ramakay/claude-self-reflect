@@ -1700,5 +1700,8 @@ pub fn registered_formatter_ids() -> impl Iterator<Item = &'static str> {
     REGISTRY.iter().map(|formatter| formatter.id)
 }
 
+mod payload;
+pub use payload::is_csr_tool_payload;
+
 #[cfg(test)]
 mod tests;

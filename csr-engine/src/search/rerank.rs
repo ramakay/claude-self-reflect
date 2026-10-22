@@ -319,6 +319,10 @@ pub fn is_scaffold_text(content: &str) -> bool {
         // they quote the whole prior session back, so they out-cosine origins.
         || content.contains("This session is being continued from a previous conversation")
         || crate::extraction::provenance::is_csr_emission(content)
+        // CSR's search-result and `csr_why` output that reached the corpus as
+        // plain text (a script run, a Codex `exec`, a paste), outside the CSR
+        // tool block the importer drops by name.
+        || crate::import::contamination::is_csr_tool_payload(content)
 }
 
 /// Content that asserts a correction or a decision — a claim to authority.
