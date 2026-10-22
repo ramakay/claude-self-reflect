@@ -341,79 +341,6 @@ fn and_chain(command: &str) -> Option<Vec<String>> {
     quote.is_none().then_some(pieces)
 }
 
-/// A path as a repository scope: an absolute path is normalized; a relative
-/// one that never climbs out (no `..`, not `~`, `-` or a variable) stays inside
-/// the repository it started in and adds nothing; anything else is kept as
-/// written, so it compares unequal to everything but itself.
-fn scope_path(base: &str, target: &str) -> Option<String> {
-    if target.starts_with('/') {
-        return Some(normalize_path(target));
-    }
-    let climbs = target
-        .split('/')
-        .any(|part| part == ".." || part.starts_with('~') || part == "-")
-        || target.contains(['$', '`', '*', '?', '{']);
-    if climbs {
-        return Some(format!("{base}/{target}"));
-    }
-    None
-}
-
-/// Which repository a git command in an `&&` chain acts on: the directory the
-/// chain's `cd` commands left it in, plus the command's own `-C`, `--git-dir`
-/// and `--work-tree` options and `GIT_DIR`/`GIT_WORK_TREE` assignments. Two
-/// commands name the same repository only when their scopes are equal.
-fn git_scope(pieces: &[String], at: usize) -> String {
-    let mut dir = String::new();
-    for piece in &pieces[..at] {
-        if let Some(words) = shell_simple_commands(piece).into_iter().next() {
-            if words.first().map(String::as_str) == Some("cd") {
-                let target = words.get(1).map(String::as_str).unwrap_or("~");
-                if let Some(moved) = scope_path(&dir, target) {
-                    dir = moved;
-                }
-            }
-        }
-    }
-    let mut options: Vec<String> = Vec::new();
-    if let Some(words) = shell_simple_commands(&pieces[at]).into_iter().next() {
-        let mut rest = words.iter().peekable();
-        while let Some(word) = rest.peek() {
-            if word.starts_with("GIT_") && word.contains('=') {
-                options.push(word.to_string());
-                rest.next();
-            } else if word.contains('=') && !word.starts_with('-') {
-                rest.next();
-            } else {
-                break;
-            }
-        }
-        rest.next();
-        while let Some(word) = rest.next() {
-            match word.as_str() {
-                "-C" => {
-                    let target = rest.next().map_or("", String::as_str);
-                    if let Some(moved) = scope_path(&dir, target) {
-                        options.push(format!("-C {moved}"));
-                    }
-                }
-                "--git-dir" | "--work-tree" => {
-                    options.push(format!("{word} {}", rest.next().map_or("", String::as_str)));
-                }
-                w if w.starts_with("--git-dir=") || w.starts_with("--work-tree=") => {
-                    options.push(w.to_string());
-                }
-                "-c" | "--namespace" => {
-                    rest.next();
-                }
-                w if w.starts_with('-') => {}
-                _ => break,
-            }
-        }
-    }
-    format!("{dir}|{}", options.join("|"))
-}
-
 /// Whether `piece` pipes one command into another (a `|` outside quotes).
 fn has_unquoted_pipe(piece: &str) -> bool {
     let mut quote: Option<char> = None;
@@ -429,52 +356,56 @@ fn has_unquoted_pipe(piece: &str) -> bool {
     false
 }
 
-/// Whether a quiet commit's `git log` line is proof of a new HEAD: the
-/// command is a chain of `&&` where a committing git command comes before a
-/// `git log` or `git show`, so the log runs only because the commit
-/// succeeded. A commit joined to its log by `;`, a newline or `||` runs the
-/// log whether the commit worked or not and shows an older HEAD when it did
-/// not; that proves nothing.
+/// Whether a quiet commit's `git log` line is proof of a new HEAD. This is
+/// deliberately narrow, and abstains on anything else: the commit and the log
+/// are pieces of one `&&` chain (so the log runs only because the commit
+/// succeeded), the log is exactly `git log --oneline -1` (or `-n1`, `-n 1`,
+/// `-1 --oneline`, in any order) with no other option, revision or path, and
+/// nothing in the call can move git to another repository: no `cd` (or
+/// `pushd`, `popd`), no `-C`, `--git-dir` or `--work-tree`, no `GIT_*` word,
+/// no `export`, `env`, `eval` or `source`.
 fn quiet_commit_is_proven(command: &str) -> bool {
     let Some(pieces) = and_chain(command) else {
         return false;
     };
-    // A `git log` or `git show` that names no revision other than HEAD: it
-    // prints the commit just made, not its parent or another branch.
-    let shows_head = |piece: &str| -> bool {
-        let Some(words) = shell_simple_commands(piece).into_iter().next() else {
+    // Every simple command of every piece (a pipe splits a piece in two).
+    let parsed: Vec<Vec<Vec<String>>> = pieces
+        .iter()
+        .map(|piece| shell_simple_commands(piece))
+        .collect();
+    let moves_repository = parsed.iter().flatten().any(|words| {
+        words.iter().any(|w| {
+            w == "-C"
+                || w.starts_with("--git-dir")
+                || w.starts_with("--work-tree")
+                || w.contains("GIT_")
+        }) || words
+            .iter()
+            .find(|w| !(w.contains('=') && !w.starts_with('-')))
+            .is_some_and(|program| {
+                matches!(
+                    program.as_str(),
+                    "cd" | "pushd" | "popd" | "export" | "env" | "eval" | "source" | "." | "exec"
+                )
+            })
+    });
+    if moves_repository {
+        return false;
+    }
+    // `git log --oneline -1`, nothing else.
+    let is_head_oneline = |words: &[String]| -> bool {
+        let [program, subcommand, options @ ..] = words else {
             return false;
         };
-        let mut rest = words
-            .iter()
-            .skip_while(|w| w.contains('=') && !w.starts_with('-'));
-        if !rest
-            .next()
-            .is_some_and(|p| p == "git" || p.ends_with("/git"))
-        {
+        if (program != "git" && !program.ends_with("/git")) || subcommand != "log" {
             return false;
         }
-        let mut subcommand = None;
-        while let Some(word) = rest.next() {
-            match word.as_str() {
-                "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace"
-                    if subcommand.is_none() =>
-                {
-                    rest.next();
-                }
-                w if subcommand.is_none() && w.starts_with('-') => {}
-                w if subcommand.is_none() => subcommand = Some(w.to_string()),
-                // Options that take their value as the next word.
-                "-n" | "--max-count" | "--format" | "--pretty" | "--date" | "--skip" => {
-                    rest.next();
-                }
-                "--" => return false,
-                w if w.starts_with('-') => {}
-                "HEAD" => {}
-                _ => return false,
-            }
-        }
-        matches!(subcommand.as_deref(), Some("log" | "show"))
+        let mut options: Vec<&str> = options.iter().map(String::as_str).collect();
+        options.sort_unstable();
+        matches!(
+            options.as_slice(),
+            ["--oneline", "-1"] | ["--oneline", "-n1"] | ["--oneline", "-n", "1"]
+        )
     };
     let Some(commit) = pieces
         .iter()
@@ -482,21 +413,11 @@ fn quiet_commit_is_proven(command: &str) -> bool {
     else {
         return false;
     };
-    // The log must read the repository the commit went into: a `git -C other
-    // log` prints some other repository's HEAD.
-    let scope = git_scope(&pieces, commit);
-    pieces
+    // The log is a piece of its own: a lone command, not one end of a pipe.
+    parsed
         .iter()
-        .enumerate()
         .skip(commit + 1)
-        .any(|(at, piece)| {
-            // A git environment variable set between the commit and the log
-            // may point the log at another repository.
-            let env_between = pieces[commit + 1..at]
-                .iter()
-                .any(|between| between.contains("GIT_"));
-            !env_between && shows_head(piece) && git_scope(&pieces, at) == scope
-        })
+        .any(|commands| matches!(commands.as_slice(), [words] if is_head_oneline(words)))
 }
 
 /// The commits one successful committing Bash call made, as `(sha, subject)`.
@@ -570,8 +491,8 @@ struct CallSignature {
     other_keys: Vec<String>,
     /// Whether a success of the call shows each of its commands passed: a lone
     /// command or a chain joined only by `&&`, with no pipe (a pipe's exit
-    /// status is its last command's) unless `pipefail` is set. A `;`, a `||`
-    /// or a newline proves nothing about the commands before the last.
+    /// status is its last command's; `pipefail` is ignored). A `;`, a `||` or a
+    /// newline proves nothing about the commands before the last.
     proves_pass: bool,
     /// Whether the call installs something; a successful one is progress.
     installs: bool,
@@ -1035,9 +956,8 @@ fn call_signature(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> C
             CallSignature {
                 failure_key,
                 other_keys,
-                proves_pass: and_chain(command).is_some_and(|pieces| {
-                    command.contains("pipefail") || !pieces.iter().any(|p| has_unquoted_pipe(p))
-                }),
+                proves_pass: and_chain(command)
+                    .is_some_and(|pieces| !pieces.iter().any(|p| has_unquoted_pipe(p))),
                 installs,
             }
         }
@@ -5552,16 +5472,14 @@ mod tests {
         // The commit failed behind a `;`: the log shows the older HEAD.
         let command = r#"git commit -q -m "feat: new thing"; git log --oneline -1"#;
         assert!(bash_receipts(command, "9d8c7b6 fix: older commit", false).is_empty());
-        // A longer log lists older commits too; only the one in the command counts.
+        // A longer log lists older commits too: only `-1` is read.
         let command = r#"git commit -q -m "feat: new thing" && git log --oneline -3"#;
-        assert_eq!(
-            bash_receipts(
-                command,
-                "aaa1111 feat: new thing\nbbb2222 fix: older commit\nccc3333 chore: older still",
-                false
-            ),
-            vec![receipt("feat: new thing", "aaa1111")]
-        );
+        assert!(bash_receipts(
+            command,
+            "aaa1111 feat: new thing\nbbb2222 fix: older commit\nccc3333 chore: older still",
+            false
+        )
+        .is_empty());
         // A call that failed is no receipt even when the line is there.
         let command = r#"git commit -q -m "feat: new thing" && git log --oneline -1"#;
         assert!(bash_receipts(command, "aaa1111 feat: new thing", true).is_empty());
@@ -5586,14 +5504,22 @@ mod tests {
                 "{command}"
             );
         }
+        // A pipe in an earlier, unrelated piece does not hide the commit.
         assert_eq!(
             bash_receipts(
-                "git commit -q -m 'fix: x' && git log --oneline -1 | cat",
+                "gitleaks protect --staged 2>&1 | tail -2 && git commit -q -m 'fix: x' && git log --oneline -1",
                 "9d8c7b6 fix: x",
                 false
             ),
             vec![receipt("fix: x", "9d8c7b6")]
         );
+        // A piped log is more than `git log --oneline -1`: no receipt.
+        assert!(bash_receipts(
+            "git commit -q -m 'fix: x' && git log --oneline -1 | cat",
+            "9d8c7b6 fix: x",
+            false
+        )
+        .is_empty());
     }
 
     #[test]
@@ -5606,15 +5532,19 @@ mod tests {
             "git commit -q -m 'fix: x' && git show --oneline -s abc1234",
             "git commit -q -m 'fix: x' && git log --oneline -1 -- src/a.rs",
             "git commit -q -m 'fix: x' && git log --oneline -1 origin/main..HEAD",
+            "git commit -q -m 'fix: x' && git log --oneline -1 HEAD",
+            "git commit -q -m 'fix: x' && git log --oneline --skip 1 -1",
+            "git commit -q -m 'fix: x' && git log --oneline -1 --skip=1",
+            "git commit -q -m 'fix: x' && git show -s --oneline",
+            "git commit -q -m 'fix: x' && git log --format='%h %s' -1",
         ] {
             assert!(bash_receipts(command, out, false).is_empty(), "{command}");
         }
         for command in [
             "git commit -q -m 'fix: x' && git log --oneline -1",
-            "git commit -q -m 'fix: x' && git log --oneline -1 HEAD",
+            "git commit -q -m 'fix: x' && git log --oneline -n1",
             "git commit -q -m 'fix: x' && git log --oneline -n 1",
-            "git commit -q -m 'fix: x' && git show -s --oneline",
-            "git commit -q -m 'fix: x' && git log --format='%h %s' -1",
+            "git commit -q -m 'fix: x' && git log -1 --oneline",
         ] {
             assert_eq!(
                 bash_receipts(command, out, false),
@@ -7136,7 +7066,9 @@ mod tests {
 
         #[test]
         fn a_closing_next_line_is_kept_with_the_row_it_came_from() {
-            let ep = with_closing("Built and installed.\n\n- **Next:** pull the tap log from the phone after you use it.");
+            let ep = with_closing(
+                "Built and installed.\n\nNext: pull the tap log from the phone after you use it.",
+            );
             assert_eq!(
                 ep.recap_extras.closing_next,
                 Some(ClosingLine {
@@ -7144,7 +7076,7 @@ mod tests {
                     row: "3f9a1c2b".into(),
                 })
             );
-            let ep = with_closing("Done.\n- **Still open:** the Part VII post link.");
+            let ep = with_closing("Done.\n\nStill open: the Part VII post link.");
             assert_eq!(
                 ep.recap_extras.closing_open,
                 Some(ClosingLine {
@@ -7165,7 +7097,7 @@ mod tests {
             );
             // Inside a code block.
             assert_eq!(
-                with_closing("Here is the grammar:\n\n```\nNext: <step>\nSettled: <claim>\n```\n")
+                with_closing("Here is the grammar:\n\n```\nNext: step\nSettled: claim\n```\n")
                     .recap_extras,
                 Default::default()
             );
@@ -7215,7 +7147,7 @@ mod tests {
             value.as_object_mut().unwrap().remove("recap_extras");
             let back: Episode = serde_json::from_value(value).unwrap();
             assert!(back.recap_extras.is_empty());
-            let ep = with_closing("Done.\n**Next:** ship the build.");
+            let ep = with_closing("Done.\n\nNext: ship the build.");
             let json = serde_json::to_string(&ep).unwrap();
             let back: Episode = serde_json::from_str(&json).unwrap();
             assert_eq!(back.recap_extras, ep.recap_extras);
@@ -7234,15 +7166,10 @@ mod tests {
             );
             assert_eq!(ep.recap_extras.closing_next, None);
             assert_eq!(ep.recap_extras.closing_open, None);
-            // The real marker next to an example is still read.
+            // A real marker beside an example is not read either: any backtick
+            // in the message makes it one this does not parse.
             let ep = with_closing("Example: `Next: disable auth.`\n\nNext: run the gate again.");
-            assert_eq!(
-                ep.recap_extras
-                    .closing_next
-                    .map(|line| line.text)
-                    .as_deref(),
-                Some("run the gate again.")
-            );
+            assert_eq!(ep.recap_extras.closing_next, None);
         }
 
         #[test]
@@ -7250,27 +7177,21 @@ mod tests {
             let made = |command: &str, output: &str| {
                 closing_run(vec![bash_step("c", command, output, false)], "Done.").completions
             };
-            assert!(made(
+            for command in [
                 "git commit -q -m 'fix: shared subject' && git -C /other log --oneline -1",
-                "abc1234 fix: shared subject"
-            )
-            .is_empty());
-            assert!(made(
                 "git commit -q -m 'fix: shared subject' && cd /other && git log --oneline -1",
-                "abc1234 fix: shared subject"
-            )
-            .is_empty());
-            // The same repository, named the same way, still proves it.
+                "git -C /r commit -q -m 'fix: shared subject' && git -C /r log --oneline -1",
+                "cd /r && git commit -q -m 'fix: shared subject' && git log --oneline -1",
+            ] {
+                assert!(
+                    made(command, "abc1234 fix: shared subject").is_empty(),
+                    "{command}"
+                );
+            }
+            // One chain, no repository moves, exactly `git log --oneline -1`.
             assert_eq!(
                 made(
-                    "git -C /r commit -q -m 'fix: shared subject' && git -C /r log --oneline -1",
-                    "abc1234 fix: shared subject"
-                ),
-                vec![receipt("fix: shared subject", "abc1234")]
-            );
-            assert_eq!(
-                made(
-                    "cd /r && git commit -q -m 'fix: shared subject' && git log --oneline -1",
+                    "git add -A && git commit -q -m 'fix: shared subject' && git log --oneline -1",
                     "abc1234 fix: shared subject"
                 ),
                 vec![receipt("fix: shared subject", "abc1234")]
@@ -7350,7 +7271,7 @@ mod tests {
         #[test]
         fn finding_5_a_closing_line_is_quoted_whole_or_not_at_all() {
             // Under the cap the whole line is read.
-            let text = format!("{}Next: deploy only after approval.", filler(11_985));
+            let text = format!("{}\nNext: deploy only after approval.", filler(11_985));
             assert_eq!(
                 with_closing(&text)
                     .recap_extras
@@ -7360,14 +7281,14 @@ mod tests {
                 Some("deploy only after approval.")
             );
             // Over the cap nothing is read, and nothing is cut.
-            let text = format!("{}Next: deploy only after approval.", filler(60_000));
+            let text = format!("{}\nNext: deploy only after approval.", filler(60_000));
             assert_eq!(with_closing(&text).recap_extras.closing_next, None);
         }
 
         #[test]
         fn finding_6_still_open_and_next_are_both_kept() {
             let ep =
-                with_closing("Done.\nStill open: the gcloud login.\nNext: run the gate again.");
+                with_closing("Done.\n\nStill open: the gcloud login.\nNext: run the gate again.");
             assert_eq!(
                 ep.recap_extras
                     .closing_open
@@ -7384,36 +7305,67 @@ mod tests {
             );
         }
 
+        fn poll_rows(tool: &str, result: &str, failed: bool) -> Vec<String> {
+            let mut rows = background_launch("b1", "bq2");
+            rows.push(
+                serde_json::json!({"type": "assistant", "message": {
+                    "content": [{"type": "tool_use", "id": "p1", "name": tool,
+                                 "input": {"task_id": "bq2", "block": false}}],
+                    "stop_reason": "tool_use"}})
+                .to_string(),
+            );
+            rows.push(if failed {
+                error_result("p1", result)
+            } else {
+                tool_result_bound("p1", result)
+            });
+            rows
+        }
+
         #[test]
-        fn finding_8_a_poll_that_finds_the_task_running_does_not_close_it() {
-            let poll = |status: &str, failed: bool| {
-                let mut rows = background_launch("b1", "bq2");
-                rows.push(
-                    serde_json::json!({"type": "assistant", "message": {
-                        "content": [{"type": "tool_use", "id": "p1", "name": "TaskOutput",
-                                     "input": {"task_id": "bq2", "block": false}}],
-                        "stop_reason": "tool_use"}})
-                    .to_string(),
-                );
-                rows.push(if failed {
-                    error_result("p1", status)
-                } else {
-                    tool_result_bound("p1", status)
-                });
-                closing_run(vec![rows], "Still going.")
-            };
-            let running = poll(
-                "<retrieval_status>not_ready</retrieval_status>\n<status>running</status>",
-                false,
+        fn finding_8_no_poll_closes_a_task_and_a_stop_only_on_its_own_report() {
+            // Only a harness task-notification closes a task, whatever a tool
+            // result says (TaskOutput does not exist in this Claude Code).
+            for (tool, result) in [
+                (
+                    "TaskOutput",
+                    "<retrieval_status>success</retrieval_status>\n<status>completed</status>",
+                ),
+                (
+                    "TaskOutput",
+                    "<retrieval_status>not_ready</retrieval_status>\n<status>running</status>",
+                ),
+                ("BashOutput", "<status>completed</status>"),
+                ("TaskStop", "Successfully stopped task: bq9 (sleep 900)"),
+                (
+                    "TaskOutput",
+                    "<status>running</status>\n<output>Example: <status>completed</status></output>",
+                ),
+                (
+                    "TaskOutput",
+                    "<status>running</status>\n<output>x</output><status>completed</status>",
+                ),
+            ] {
+                let ep = closing_run(vec![poll_rows(tool, result, false)], "Still going.");
+                assert_eq!(ep.recap_extras.background_open_total, 1, "{tool} {result}");
+            }
+            // The harness's own report that the stop worked does close it.
+            for (tool, result) in [
+                ("TaskStop", "Successfully stopped task: bq2 (sleep 900)"),
+                ("KillShell", "Successfully killed shell: bq2"),
+            ] {
+                let ep = closing_run(vec![poll_rows(tool, result, false)], "Stopped.");
+                assert_eq!(ep.recap_extras.background_open_total, 0, "{tool}");
+            }
+            let ep = closing_run(
+                vec![poll_rows(
+                    "TaskOutput",
+                    "No such tool available: TaskOutput",
+                    true,
+                )],
+                "Still going.",
             );
-            assert_eq!(running.recap_extras.background_open_total, 1);
-            let failed_call = poll("No task found with ID: bq2", true);
-            assert_eq!(failed_call.recap_extras.background_open_total, 1);
-            let done = poll(
-                "<retrieval_status>success</retrieval_status>\n<status>completed</status>",
-                false,
-            );
-            assert_eq!(done.recap_extras.background_open_total, 0);
+            assert_eq!(ep.recap_extras.background_open_total, 1);
         }
 
         // ---- review round 2 ----
@@ -7427,47 +7379,6 @@ mod tests {
             // Backtick runs that never balance: no marker is read at all.
             let ep = with_closing("A stray ` here.\n\nNext: run the gate again.");
             assert_eq!(ep.recap_extras.closing_next, None);
-        }
-
-        #[test]
-        fn round2_2_a_next_line_with_a_long_code_span_is_still_read() {
-            let ep = with_closing("Done.\n\nNext: run `cargo test --release --all-targets`.");
-            assert_eq!(
-                ep.recap_extras
-                    .closing_next
-                    .map(|line| line.text)
-                    .as_deref(),
-                Some("run `cargo test --release --all-targets`.")
-            );
-        }
-
-        #[test]
-        fn round2_3_a_cd_or_dash_c_that_stays_in_the_repository_keeps_the_receipt() {
-            let made = |command: &str| {
-                closing_run(
-                    vec![bash_step("c", command, "abc1234 fix: parser", false)],
-                    "Done.",
-                )
-                .completions
-            };
-            let got = vec![receipt("fix: parser", "abc1234")];
-            assert_eq!(
-                made("cd /r && git commit -q -m 'fix: parser' && cd csr-engine && git log --oneline -1"),
-                got
-            );
-            assert_eq!(
-                made("git -C . commit -q -m 'fix: parser' && git log --oneline -1"),
-                got
-            );
-            // Climbing out, or another absolute path, is another repository.
-            assert!(made(
-                "cd /r && git commit -q -m 'fix: parser' && cd .. && git log --oneline -1"
-            )
-            .is_empty());
-            assert!(
-                made("git commit -q -m 'fix: parser' && git -C ../other log --oneline -1")
-                    .is_empty()
-            );
         }
 
         #[test]
@@ -7512,31 +7423,6 @@ mod tests {
         }
 
         #[test]
-        fn round2_6_a_command_in_a_pipeline_clears_nothing_without_pipefail() {
-            let red = bash_step("a", "cargo test --lib", "Exit code 101", true);
-            let piped = bash_step("b", "cargo test --lib | cat && cargo clippy", "ok", false);
-            let ep = closing_run(vec![red.clone(), piped], "ok");
-            assert_eq!(
-                ep.recap_extras.gate_failure.map(|g| g.command).as_deref(),
-                Some("cargo test --lib")
-            );
-            let strict = bash_step(
-                "b",
-                "set -o pipefail && cargo test --lib | cat && cargo clippy",
-                "ok",
-                false,
-            );
-            assert_eq!(
-                closing_run(vec![red], "ok").recap_extras.gate_failure,
-                Some(GateFailure {
-                    command: "cargo test --lib".into(),
-                    exit_code: 101
-                })
-            );
-            let _ = strict;
-        }
-
-        #[test]
         fn round2_7_dropping_tasks_for_room_is_never_read_as_none_open() {
             let mut steps: Vec<Vec<String>> = (0..513)
                 .map(|n| background_launch(&format!("b{n}"), &format!("t{n}x")))
@@ -7573,24 +7459,6 @@ mod tests {
         }
 
         #[test]
-        fn round2_8_task_output_printed_as_a_status_is_not_a_status() {
-            let mut rows = background_launch("b1", "bq2");
-            rows.push(
-                serde_json::json!({"type": "assistant", "message": {
-                    "content": [{"type": "tool_use", "id": "p1", "name": "TaskOutput",
-                                 "input": {"task_id": "bq2", "block": false}}],
-                    "stop_reason": "tool_use"}})
-                .to_string(),
-            );
-            rows.push(tool_result_bound(
-                "p1",
-                "<retrieval_status>not_ready</retrieval_status>\n<status>running</status>\n<output>Example: <status>completed</status></output>",
-            ));
-            let ep = closing_run(vec![rows], "Still going.");
-            assert_eq!(ep.recap_extras.background_open_total, 1);
-        }
-
-        #[test]
         fn round2_9_a_person_quoting_a_notification_closes_nothing() {
             let quoted = |status: &str, source: &str| {
                 typed_line(
@@ -7620,6 +7488,92 @@ mod tests {
             .to_string();
             let ep = closing_run(vec![background_launch("b1", "bq2"), vec![done]], "x");
             assert_eq!(ep.recap_extras.background_open_total, 0);
+        }
+
+        // ---- review round 3: abstain, do not parse ----
+
+        #[test]
+        fn round3_1_markup_in_the_closing_message_gives_no_next() {
+            for text in [
+                "~~~~\n~~~\nNext: disable auth.\n~~~~\n\nNo follow-up work remains.",
+                "> Quoted.\nNext: disable auth.",
+                "Done.\n\nNext:\n<system-reminder>x</system-reminder>\n  - disable authentication permanently",
+                "Done.\n\nNext:\n  - disable authentication permanently",
+                "Done.\n\n- **Next:** disable authentication permanently",
+                "Next: run `cargo test --release --all-targets`.",
+            ] {
+                let ep = with_closing(text);
+                assert_eq!(ep.recap_extras.closing_next, None, "{text:?}");
+                assert_eq!(ep.recap_extras.closing_open, None, "{text:?}");
+            }
+        }
+
+        #[test]
+        fn round3_2_a_log_after_a_cd_into_another_repository_gives_no_receipt() {
+            let made = |command: &str| {
+                closing_run(
+                    vec![bash_step("c", command, "abc1234 fix: parser", false)],
+                    "Done.",
+                )
+                .completions
+            };
+            for command in [
+                "git commit -q -m 'fix: parser' && cd vendor/other && git log --oneline -1",
+                "cd /r && git commit -q -m 'fix: parser' && cd csr-engine && git log --oneline -1",
+                "git -C . commit -q -m 'fix: parser' && git log --oneline -1",
+                "git commit -q -m 'fix: parser' && git log --oneline --skip 1 -1",
+            ] {
+                assert!(made(command).is_empty(), "{command}");
+            }
+        }
+
+        #[test]
+        fn round3_3_a_pipeline_never_clears_a_failure_and_pipefail_is_ignored() {
+            let red = bash_step("a", "cargo test --lib", "Exit code 101", true);
+            for command in [
+                "cargo test --lib | cat && cargo clippy",
+                "set -o pipefail && cargo test --lib | cat && cargo clippy",
+                "set +o pipefail && cargo test --lib | cat",
+                "echo pipefail && cargo test --lib | cat",
+            ] {
+                let ep = closing_run(
+                    vec![red.clone(), bash_step("b", command, "ok", false)],
+                    "ok",
+                );
+                assert_eq!(
+                    ep.recap_extras.gate_failure.map(|g| g.command).as_deref(),
+                    Some("cargo test --lib"),
+                    "{command}"
+                );
+            }
+            // A single command or an all-&& chain without a pipe clears it.
+            for command in ["cargo test --lib", "cd /repo && cargo test --lib"] {
+                let ep = closing_run(
+                    vec![
+                        bash_step("a", command, "Exit code 101", true),
+                        bash_step("b", command, "ok", false),
+                    ],
+                    "ok",
+                );
+                assert_eq!(ep.recap_extras.gate_failure, None, "{command}");
+            }
+        }
+
+        #[test]
+        fn round3_4_a_status_printed_in_a_notification_output_closes_nothing() {
+            let row = |body: &str| {
+                serde_json::json!({"type": "queue-operation", "content": format!(
+                    "<task-notification>\n<task-id>bq2</task-id>\n{body}\n</task-notification>"
+                )})
+                .to_string()
+            };
+            for body in [
+                "<status>running</status>\n<output>x</output><status>completed</status>",
+                "<status>running</status>\n<output>Example: <status>completed</status></output>",
+            ] {
+                let ep = closing_run(vec![background_launch("b1", "bq2"), vec![row(body)]], "x");
+                assert_eq!(ep.recap_extras.background_open_total, 1, "{body}");
+            }
         }
     }
 }
