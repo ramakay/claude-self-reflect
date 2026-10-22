@@ -2167,8 +2167,10 @@ pub(crate) fn format_code_map(ep: &crate::hooks::stop::Episode, age: &str) -> Op
                 if anchor_count == 1 { "" } else { "s" }
             ));
         }
-        // outcome is a plain String on Episode — use directly, no Option fallback.
-        line.push_str(&format!(" (outcome={})", ep.outcome));
+        // Only a label that can be trusted (see `trusted_outcome`).
+        if let Some(outcome) = crate::hooks::session_start::trusted_outcome(ep) {
+            line.push_str(&format!(" (outcome={outcome})"));
+        }
         // Char-boundary-safe truncate (paths are usually ASCII, but stay correct).
         if line.len() > 120 {
             let mut end = 120;
@@ -3857,6 +3859,10 @@ mod tests {
                 compact_anchor: None,
                 late_errors: false,
                 closing_success: false,
+                closing_ended: false,
+                final_failed: false,
+                closing_receipt: false,
+                outcome_version: None,
                 latest_ask: None,
                 watermark: None,
                 anchors: vec![],
@@ -4597,6 +4603,10 @@ mod tests {
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
+            closing_ended: false,
+            final_failed: false,
+            closing_receipt: false,
+            outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
             anchors: vec![crate::extraction::anchors::FunctionAnchor {

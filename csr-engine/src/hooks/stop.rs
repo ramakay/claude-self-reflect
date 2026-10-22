@@ -120,14 +120,32 @@ pub struct Episode {
     /// no database migration or transcript read at SessionStart is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_anchor: Option<CompactAnchor>,
-    /// Whether a FAILED tool call (`is_error`) under the session's latest task
-    /// matched an error pattern. `error_signatures` spans the whole session and
-    /// any tool output, which for a long one is nearly always non-empty (a Read
-    /// of source that says `panic`, a quoted test name), so the outcome reads
-    /// only the closing task's failed calls. `false` for episodes written
-    /// before this existed.
+    /// Whether the session's latest task still has a failed tool call that no
+    /// later call cleared (`outcome_signature`): a failed `cargo test` that was
+    /// run again and passed is cleared, a `grep` that found nothing never
+    /// counts. `error_signatures` spans the whole session and any tool
+    /// output, which for a long one is nearly always non-empty (a Read of
+    /// source that says `panic`, a quoted test name), so the outcome reads
+    /// only this. `false` for episodes written before this existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub late_errors: bool,
+    /// Whether the latest task's LAST significant call failed: the session
+    /// ended on a failure rather than recovering from one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub final_failed: bool,
+    /// Whether the latest task committed, merged a PR or installed something
+    /// (a call that succeeded): proof of progress that needs no phrase.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closing_receipt: bool,
+    /// Whether the transcript ends on a finished assistant turn: not cut off
+    /// mid-work, not interrupted by the person.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closing_ended: bool,
+    /// Which rule wrote `outcome`. `None`: an episode from before the rule
+    /// read the signals above, whose label was wrong for most sessions
+    /// checked by hand; it is not shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_version: Option<u32>,
     /// Whether the assistant's closing words under the session's latest task
     /// read as a success. The outcome reads these, not the session-wide
     /// `completed`, so a success said under an early task cannot vouch for a
@@ -167,6 +185,9 @@ pub struct CompletionReceipt {
 
 /// Current generation of the recap evidence fields.
 pub const RECAP_EVIDENCE_VERSION: u32 = 1;
+
+/// Current generation of the outcome rule (`compute_outcome`).
+pub const OUTCOME_VERSION: u32 = 1;
 
 /// `git commit` / `cherry-pick` / `revert` / `merge` success line:
 /// `[<branch> <sha>] <subject>` (also `[<branch> (root-commit) <sha>]`,
@@ -314,6 +335,308 @@ fn merged_pr(command: &str, output: &str) -> Option<(String, String)> {
     let number = merge_command_pr(command)?;
     let sha = MERGED_PR_RE.captures(output)?[1].to_string();
     Some((sha, format!("merged PR #{number}")))
+}
+
+/// What a main-thread tool call's result will mean for the outcome.
+#[derive(Default)]
+struct CallSignature {
+    /// The signature a failure of this call is filed under, and a later
+    /// success of any call with the same signature clears. `None`: a probe,
+    /// whose failure says nothing about the task.
+    failure_key: Option<String>,
+    /// Whether the call installs something; a successful one is progress.
+    installs: bool,
+}
+
+/// Programs that report "nothing there" or "not reachable" with a failing exit
+/// status while working as intended: a `grep` that finds nothing, an `ls` of a
+/// missing path, a `curl` of a page that is down. A failure of these is a
+/// finding, not the task failing.
+const PROBE_PROGRAMS: &[&str] = &[
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ag",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "find",
+    "fd",
+    "which",
+    "whereis",
+    "type",
+    "command",
+    "test",
+    "[",
+    "[[",
+    "diff",
+    "cmp",
+    "curl",
+    "wget",
+    "wc",
+    "awk",
+    "sed",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "stat",
+    "file",
+    "jq",
+    "xargs",
+    "ps",
+    "pgrep",
+    "pkill",
+    "lsof",
+    "df",
+    "du",
+    "pwd",
+    "date",
+    "whoami",
+    "uname",
+    "id",
+    "env",
+    "printenv",
+    "open",
+    "readlink",
+    "realpath",
+    "basename",
+    "dirname",
+    "tee",
+    "mdfind",
+    "plutil",
+    "defaults",
+    "osascript",
+    "sqlite3",
+    "gh",
+    "launchctl",
+    "tmux",
+    "herdr",
+    "kill",
+    "ssh",
+    "scp",
+    "rsync",
+    "tree",
+    "less",
+    "more",
+    "column",
+    "nl",
+    "od",
+    "xxd",
+    "hexdump",
+    "strings",
+    "nm",
+    "otool",
+    "lipo",
+    "codesign",
+    "spctl",
+    "ping",
+    "nslookup",
+    "dig",
+    "host",
+    "nc",
+    "netstat",
+    "ifconfig",
+];
+
+/// Shell plumbing that is not the command whose status matters.
+const NOISE_PROGRAMS: &[&str] = &[
+    "cd", "export", "source", ".", "set", "unset", "true", "false", "echo", "printf", "sleep",
+    "exit", "pushd", "popd", "wait", "read", "trap", "umask", "ulimit", "alias", "mkdir", "touch",
+    "rm", "mv", "cp", "ln", "chmod", "chown",
+];
+
+/// Words that wrap another command: the wrapped command is the one that counts.
+const WRAPPER_PROGRAMS: &[&str] = &[
+    "env",
+    "sudo",
+    "time",
+    "nohup",
+    "caffeinate",
+    "exec",
+    "command",
+];
+
+/// Programs whose first argument is the operation, so a failed `cargo test`
+/// is not cleared by a `cargo build` that passed.
+const SUBCOMMAND_PROGRAMS: &[&str] = &[
+    "git",
+    "cargo",
+    "npm",
+    "pnpm",
+    "yarn",
+    "docker",
+    "brew",
+    "xcrun",
+    "swift",
+    "go",
+    "uv",
+    "pip",
+    "pip3",
+    "kubectl",
+    "railway",
+    "gcloud",
+    "rustup",
+    "make",
+    "csr-engine",
+];
+
+/// `git` subcommands that only look.
+const GIT_PROBE_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "diff",
+    "log",
+    "show",
+    "grep",
+    "ls-files",
+    "rev-parse",
+    "branch",
+    "remote",
+    "config",
+    "blame",
+    "cat-file",
+    "ls-tree",
+    "describe",
+    "shortlog",
+    "reflog",
+    "rev-list",
+    "merge-base",
+    "worktree",
+    "tag",
+    "stash",
+];
+
+fn program_name(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
+}
+
+/// The commands of a Bash call that can matter to its outcome, in order: each
+/// as `(program, arguments)`. Heredoc bodies and redirections are not commands.
+fn significant_commands(command: &str) -> Vec<(String, Vec<String>)> {
+    let command = command.split("<<").next().unwrap_or(command);
+    let mut found = Vec::new();
+    for words in shell_simple_commands(command) {
+        let mut rest = words
+            .iter()
+            .skip_while(|w| w.contains('=') && !w.starts_with('-') && !w.starts_with('/'))
+            .map(String::as_str)
+            .peekable();
+        // `time cargo test`, `timeout 60 make`: the wrapped command counts.
+        while let Some(first) = rest.peek().copied() {
+            if WRAPPER_PROGRAMS.contains(&program_name(first)) {
+                rest.next();
+            } else if program_name(first) == "timeout" {
+                rest.next();
+                rest.next();
+            } else {
+                break;
+            }
+        }
+        let Some(program) = rest.next() else { continue };
+        let name = program_name(program);
+        let real = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '.')
+            && !name.chars().all(|c| c.is_ascii_digit())
+            && name
+                .chars()
+                .all(|c| !matches!(c, '>' | '<' | '$' | '`' | '{' | '}' | '*'));
+        if !real || NOISE_PROGRAMS.contains(&name) {
+            continue;
+        }
+        found.push((name.to_string(), rest.map(str::to_string).collect()));
+    }
+    found
+}
+
+/// Whether one command installs something: an `install` program or script,
+/// or an `install` operation (`cargo install`, `npm install`,
+/// `csr-engine hook install`, `devicectl device install app`).
+fn command_installs(program: &str, args: &[String]) -> bool {
+    if PROBE_PROGRAMS.contains(&program) {
+        return false;
+    }
+    let is_install_name = |name: &str| {
+        let name = program_name(name);
+        name == "install"
+            || name.starts_with("install-")
+            || name.starts_with("install_")
+            || name.starts_with("install.")
+    };
+    if is_install_name(program) {
+        return true;
+    }
+    let operands: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    if matches!(
+        program,
+        "bash" | "sh" | "zsh" | "python3" | "python" | "node"
+    ) {
+        return operands.first().is_some_and(|a| is_install_name(a));
+    }
+    operands.iter().take(3).any(|a| *a == "install")
+}
+
+/// What a main-thread tool call's result will mean (see [`CallSignature`]).
+///
+/// An edit is filed under its file, so a later successful edit or write of the
+/// same file clears a failed one. A Bash call is filed under the last
+/// significant command in its chain (`cd x && cargo test | tail` is
+/// `cargo test`); a chain of probes and plumbing has none. Every other tool
+/// (reads, searches, fetches, CSR's own) is a probe.
+fn call_signature(name: &str, input: &serde_json::Value) -> CallSignature {
+    match name {
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => CallSignature {
+            failure_key: input
+                .get("file_path")
+                .or_else(|| input.get("notebook_path"))
+                .and_then(|v| v.as_str())
+                .map(|path| format!("edit:{path}")),
+            installs: false,
+        },
+        "Bash" => {
+            let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            let commands: Vec<(String, Vec<String>)> = significant_commands(command)
+                .into_iter()
+                .filter(|(program, args)| {
+                    let looks = program == "git"
+                        && args
+                            .iter()
+                            .find(|a| !a.starts_with('-'))
+                            .is_some_and(|sub| GIT_PROBE_SUBCOMMANDS.contains(&sub.as_str()));
+                    !looks
+                })
+                .collect();
+            let installs = commands
+                .iter()
+                .any(|(program, args)| command_installs(program, args));
+            let failure_key = commands
+                .iter()
+                .rev()
+                .find(|(program, _)| !PROBE_PROGRAMS.contains(&program.as_str()))
+                .map(|(program, args)| {
+                    let operation = SUBCOMMAND_PROGRAMS
+                        .contains(&program.as_str())
+                        .then(|| args.iter().find(|a| !a.starts_with('-')))
+                        .flatten();
+                    match operation {
+                        Some(operation) => format!("{program} {operation}"),
+                        None => program.clone(),
+                    }
+                });
+            CallSignature {
+                failure_key,
+                installs,
+            }
+        }
+        _ => CallSignature::default(),
+    }
 }
 
 /// Rows Claude Code writes into the user channel as plain text. Nobody typed
@@ -944,8 +1267,23 @@ where
     let mut first_row_at: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut last_row_at: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut watermark: Option<chrono::DateTime<chrono::Utc>> = None;
-    // An error-pattern match in a tool result since the latest task began.
-    let mut late_errors = false;
+    // The latest task's failures: signatures of failed significant calls that
+    // no later call with the same signature cleared, whether the last
+    // significant call failed, and whether the task committed, merged or
+    // installed. `calls` maps tool_use ids to what their result will mean;
+    // `csr_calls` holds CSR's own tool calls, which mean nothing.
+    let mut open_failures: HashSet<String> = HashSet::new();
+    let mut final_failed = false;
+    let mut closing_receipt = false;
+    let mut calls: HashMap<String, CallSignature> = HashMap::new();
+    let mut csr_calls: HashSet<String> = HashSet::new();
+    // Whether the closing task is still going: a request is waiting for its
+    // answer, or the assistant is mid-turn. `clean_end`: the last turn ended
+    // as an assistant turn, not as an interruption. A remark or an
+    // acknowledgement typed after a finished turn opens neither.
+    let mut request_pending = false;
+    let mut turn_in_flight = false;
+    let mut clean_end = false;
     // The assistant's latest main-session text since the latest task began.
     let mut closing_text = String::new();
     // The literal last typed message (a forwarded note clears it).
@@ -1030,6 +1368,7 @@ where
                 };
             }
             if let Some(TypedPrompt { prose, note }) = typed {
+                let is_request_prompt = !note && crate::hooks::recap::is_request(&prose);
                 if opening_seen != Some(true) && (note || is_task_prompt(&prose)) {
                     let sent_at = val
                         .get("timestamp")
@@ -1061,7 +1400,9 @@ where
                             // failure; a task it misses inherits the last
                             // one's state, the cost of one fail-closed rule.
                             if crate::hooks::recap::is_request(&prose) {
-                                late_errors = false;
+                                open_failures.clear();
+                                final_failed = false;
+                                closing_receipt = false;
                                 closing_text.clear();
                             }
                             segments.push(TaskSegment {
@@ -1076,10 +1417,20 @@ where
                 // Any typed prompt, an ack included, opens a turn: "go" after
                 // a finished turn restarts work on the same task.
                 turn_finished = false;
+                if !sidechain && opening_seen != Some(true) && is_request_prompt {
+                    request_pending = true;
+                }
             }
         }
-        if !sidechain && ends_turn(val, msg_type) {
+        let turn_ends = !sidechain && ends_turn(val, msg_type);
+        if turn_ends {
             turn_finished = true;
+            request_pending = false;
+            turn_in_flight = false;
+            // A user row here is "[Request interrupted by user]".
+            clean_end = !matches!(msg_type, "user" | "human");
+        } else if msg_type == "assistant" && !sidechain {
+            turn_in_flight = true;
         }
 
         // Extract tool_use information
@@ -1092,7 +1443,17 @@ where
                         if block_type == "tool_use" {
                             if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
                                 if crate::import::is_csr_tool_use(block, name) {
+                                    if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
+                                        csr_calls.insert(id.to_string());
+                                    }
                                     continue;
+                                }
+                                if let (false, Some(id), Some(input)) = (
+                                    sidechain,
+                                    block.get("id").and_then(|v| v.as_str()),
+                                    block.get("input"),
+                                ) {
+                                    calls.insert(id.to_string(), call_signature(name, input));
                                 }
                                 tools_used.insert(name.to_string());
                                 if let (false, Some(task)) = (sidechain, segments.last_mut()) {
@@ -1240,15 +1601,41 @@ where
                         // error words (a Read or Grep of source, a quoted test
                         // name) is not an error: that flagged most long sessions.
                         // A failed call with a message the patterns do not know
-                        // ("Exit code 1", "File not found") still counts.
-                        if failed && !sidechain {
-                            late_errors = true;
+                        // ("Exit code 1", "File not found") still counts, unless
+                        // it is a probe (`call_signature`), and a later call
+                        // with the same signature that succeeded clears it.
+                        if !sidechain {
+                            let id = block.get("tool_use_id").and_then(|v| v.as_str());
+                            let call = match id.and_then(|id| calls.remove(id)) {
+                                Some(call) => call,
+                                None if id.is_some_and(|id| csr_calls.contains(id)) => {
+                                    CallSignature::default()
+                                }
+                                // A result whose call is not in the transcript.
+                                None => CallSignature {
+                                    failure_key: Some("?".into()),
+                                    installs: false,
+                                },
+                            };
+                            if let Some(key) = call.failure_key {
+                                if failed {
+                                    open_failures.insert(key);
+                                    final_failed = true;
+                                } else {
+                                    open_failures.remove(&key);
+                                    final_failed = false;
+                                }
+                            }
+                            if call.installs && !failed {
+                                closing_receipt = true;
+                            }
                         }
                         if let (Some(command), false, false) = (git_command, failed, sidechain) {
                             let made = commits_made(command, &block_text)
                                 .into_iter()
                                 .chain(merged_pr(command, &block_text));
                             for (sha, subject) in made {
+                                closing_receipt = true;
                                 if let Some(task) = segments.last_mut() {
                                     task.commits += 1;
                                 }
@@ -1336,7 +1723,17 @@ where
 
     // Determine outcome (task-aware: incomplete todos cap success at partial)
     let closing_success = crate::extraction::has_success_signal(&closing_text);
-    let outcome = compute_outcome(message_count, late_errors, closing_success, &todos);
+    let late_errors = !open_failures.is_empty();
+    let closing_ended = clean_end && !request_pending && !turn_in_flight;
+    let outcome = compute_outcome(
+        message_count,
+        &OutcomeSignals {
+            final_failed,
+            proven: closing_receipt || closing_success,
+            ended: closing_ended,
+        },
+        &todos,
+    );
     let duration_minutes = match (first_row_at, last_row_at) {
         (Some(first), Some(last)) => {
             u32::try_from((last - first).num_minutes().max(0)).unwrap_or(u32::MAX)
@@ -1383,6 +1780,10 @@ where
         completions_untied,
         compact_anchor,
         late_errors,
+        final_failed,
+        closing_receipt,
+        closing_ended,
+        outcome_version: Some(OUTCOME_VERSION),
         closing_success,
         latest_ask,
         watermark: watermark.map(|at| at.to_rfc3339()),
@@ -1466,43 +1867,44 @@ fn push_completion(
     }
 }
 
-/// Infer session outcome from message volume, errors, closing success signal,
-/// and structured task completion state.
-///
-/// Incomplete todos cap the result at `"partial"` even when prose signals
-/// success — unresolved task state means the session is not a clean win.
-fn compute_outcome(
-    message_count: usize,
-    late_errors: bool,
-    success_signal: bool,
-    todos: &[TodoItem],
-) -> String {
-    let outcome = if message_count < 3 {
-        "interrupted".to_string()
-    } else if late_errors {
-        // The closing task had a failed call, but a closing success signal means
-        // the session recovered — "partial", not "failed". A dev session that
-        // hits and fixes test failures should not be remembered as a failure.
-        // Only the closing task counts: a long session's earlier errors were
-        // worked through, and scanning every tool output for error words
-        // labelled 18 of the 30 most recent stored episodes "failed".
-        if success_signal {
-            "partial".to_string()
-        } else {
-            "failed".to_string()
-        }
-    } else if success_signal {
-        "success".to_string()
-    } else {
-        "partial".to_string()
-    };
+/// What the closing task left behind, as `compute_outcome` reads it.
+struct OutcomeSignals {
+    /// The last significant call failed.
+    final_failed: bool,
+    /// Progress was proven: a commit, a merge, an install, or a closing success
+    /// phrase.
+    proven: bool,
+    /// The transcript ends on a finished assistant turn.
+    ended: bool,
+}
 
-    // Incomplete tasks cannot be a clean success even if closing prose says so.
-    if outcome == "success" && todos.iter().any(|t| t.status != "completed") {
-        "partial".to_string()
-    } else {
-        outcome
+/// Infer the session outcome from the closing task: how it ended, what it left
+/// failing, what it proved, and the structured task state.
+///
+/// - `failed`: it ended on a failing call and proved nothing.
+/// - `partial`: it ended on a failing call but proved progress, or it was cut
+///   off, or tasks are open.
+/// - `success`: it ended on a finished turn whose last significant call did not
+///   fail and nothing is open. A failure the session moved past is not held
+///   against it; `late_errors` still records it. Failures a later call cleared
+///   (the same command run again and passing) and probes (a `grep` with no
+///   match) are not failing at all.
+///
+/// Incomplete todos cap the result at `"partial"` even when the rest reads as
+/// success: unresolved task state means the session is not a clean win.
+fn compute_outcome(message_count: usize, signals: &OutcomeSignals, todos: &[TodoItem]) -> String {
+    if message_count < 3 {
+        return "interrupted".to_string();
     }
+    let open_todos = todos.iter().any(|t| t.status != "completed");
+    let outcome = if signals.final_failed && !signals.proven {
+        "failed"
+    } else if signals.final_failed || !signals.ended || open_todos {
+        "partial"
+    } else {
+        "success"
+    };
+    outcome.to_string()
 }
 
 /// Choose the most recent episode session that is not the current one.
@@ -2013,10 +2415,14 @@ fn apply_task_dir_todos(episode: &mut Episode, todos: Vec<TodoItem>) {
         .map(|t| t.content.clone());
     episode.outcome = compute_outcome(
         episode.message_count,
-        episode.late_errors,
-        episode.closing_success,
+        &OutcomeSignals {
+            final_failed: episode.final_failed,
+            proven: episode.closing_receipt || episode.closing_success,
+            ended: episode.closing_ended,
+        },
         &episode.todos,
     );
+    episode.outcome_version = Some(OUTCOME_VERSION);
 }
 
 /// What a task-directory read found. `files_seen` counts task JSON files present
@@ -2759,7 +3165,8 @@ mod tests {
         let ep = extract(&rows);
         assert!(!ep.error_signatures.is_empty(), "the signatures stay");
         assert!(!ep.late_errors);
-        assert_eq!(ep.outcome, "partial");
+        // The closing task finished and left nothing failing.
+        assert_eq!(ep.outcome, "success");
         // An error under the closing task, no success: still "failed".
         let mut rows = early_error().to_vec();
         rows.push(dur_result(
@@ -3253,6 +3660,10 @@ mod tests {
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
+            closing_ended: false,
+            final_failed: false,
+            closing_receipt: false,
+            outcome_version: None,
             latest_ask: None,
             watermark: None,
         };
@@ -3314,6 +3725,10 @@ mod tests {
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
+            closing_ended: false,
+            final_failed: false,
+            closing_receipt: false,
+            outcome_version: None,
             latest_ask: None,
             watermark: None,
         };
@@ -3921,7 +4336,12 @@ mod tests {
             content: "x".into(),
             status: "pending".into(),
         }];
-        let outcome = compute_outcome(5, false, true, &todos);
+        let signals = OutcomeSignals {
+            final_failed: false,
+            proven: true,
+            ended: true,
+        };
+        let outcome = compute_outcome(5, &signals, &todos);
         assert_eq!(outcome, "partial");
     }
 
@@ -4716,6 +5136,248 @@ mod tests {
         let ep = extract(&rows);
         assert!(ep.completions.iter().any(|done| done.receipt == "1a2b3c4"));
         assert!(ep.completions.iter().any(|done| done.receipt == "8 edits"));
+    }
+
+    /// One Bash call and its result.
+    fn bash_step(id: &str, command: &str, output: &str, failed: bool) -> Vec<String> {
+        vec![
+            serde_json::json!({"type": "assistant", "message": {
+                "content": [{"type": "tool_use", "id": id, "name": "Bash",
+                             "input": {"command": command}}],
+                "stop_reason": "tool_use"
+            }})
+            .to_string(),
+            if failed {
+                error_result(id, output)
+            } else {
+                tool_result_bound(id, output)
+            },
+        ]
+    }
+
+    /// A session that asks for `ask`, runs `steps`, and closes with `closing`.
+    fn closing_run(steps: Vec<Vec<String>>, closing: &str) -> Episode {
+        let mut rows = vec![typed_line("run the release checks and report", "typed")];
+        rows.extend(steps.into_iter().flatten());
+        rows.push(assistant_stop_line(closing, "end_turn"));
+        extract(&rows)
+    }
+
+    #[test]
+    fn a_failed_call_that_was_run_again_and_passed_is_not_a_failure() {
+        let ep = closing_run(
+            vec![
+                bash_step(
+                    "a",
+                    "cd csr-engine && cargo test --lib 2>&1 | tail -5",
+                    "Exit code 101",
+                    true,
+                ),
+                bash_step(
+                    "b",
+                    "cargo test --lib hooks::stop",
+                    "test result: ok",
+                    false,
+                ),
+            ],
+            "The tests pass after the fix.",
+        );
+        assert!(!ep.late_errors && !ep.final_failed);
+        assert_eq!(ep.outcome, "success");
+        assert_eq!(ep.outcome_version, Some(OUTCOME_VERSION));
+        // The same failure with no second run is a failure the session ended on.
+        let ep = closing_run(
+            vec![bash_step("a", "cargo test --lib", "Exit code 101", true)],
+            "The tests are red.",
+        );
+        assert!(ep.late_errors && ep.final_failed);
+        assert_eq!(ep.outcome, "failed");
+        // A different operation of the same tool does not clear it.
+        let ep = closing_run(
+            vec![
+                bash_step("a", "cargo test --lib", "Exit code 101", true),
+                bash_step("b", "cargo build --release", "Finished", false),
+            ],
+            "Built.",
+        );
+        // A failure the session moved past is recorded, not held against the end.
+        assert!(ep.late_errors && !ep.final_failed);
+        assert_eq!(ep.outcome, "success");
+    }
+
+    #[test]
+    fn a_failed_edit_is_cleared_by_a_later_edit_of_the_same_file() {
+        let edit = |id: &str, path: &str, failed: bool| {
+            vec![
+                assistant_named_tool("Edit", id, serde_json::json!({"file_path": path})),
+                if failed {
+                    error_result(id, "String to replace not found")
+                } else {
+                    tool_result_bound(id, "The file has been updated")
+                },
+            ]
+        };
+        let ep = closing_run(
+            vec![edit("a", "/r/a.rs", true), edit("b", "/r/a.rs", false)],
+            "Done.",
+        );
+        assert_eq!(ep.outcome, "success");
+        let ep = closing_run(
+            vec![edit("a", "/r/a.rs", true), edit("b", "/r/b.rs", false)],
+            "Done.",
+        );
+        // The failed edit stays on the record; the session went on and finished.
+        assert!(ep.late_errors && !ep.final_failed);
+        assert_eq!(ep.outcome, "success");
+    }
+
+    #[test]
+    fn a_probe_that_finds_nothing_is_not_a_failure() {
+        let ep = closing_run(
+            vec![
+                bash_step("a", "grep -rn flaky_test src/", "", true),
+                bash_step("b", "ls /tmp/missing 2>&1", "No such file", true),
+                bash_step(
+                    "c",
+                    "curl -sf https://example.test/health",
+                    "Exit code 22",
+                    true,
+                ),
+                bash_step("d", "git log --oneline -3 | grep nothing", "", true),
+            ],
+            "Nothing matches.",
+        );
+        assert!(!ep.late_errors && !ep.final_failed, "{ep:?}");
+        assert_eq!(ep.outcome, "success");
+    }
+
+    #[test]
+    fn a_commit_a_merge_or_an_install_lifts_a_failed_ending_to_partial() {
+        let failing = || bash_step("a", "cargo test --lib", "Exit code 101", true);
+        let ep = closing_run(vec![failing()], "Red.");
+        assert_eq!(ep.outcome, "failed");
+        // The session then committed what it had.
+        let ep = closing_run(
+            vec![
+                failing(),
+                bash_step("c", "git commit -m wip", "[main 1a2b3c4] wip", false),
+            ],
+            "Committed the work in progress.",
+        );
+        assert!(ep.closing_receipt && !ep.final_failed);
+        assert_eq!(ep.outcome, "success");
+        // Or installed the build, and the failure it ended on is a later install.
+        let ep = closing_run(
+            vec![
+                bash_step("i", "csr-engine hook install --apply", "installed", false),
+                bash_step("f", "cargo test --lib", "Exit code 101", true),
+            ],
+            "Red after the install.",
+        );
+        assert!(ep.final_failed && ep.closing_receipt);
+        assert_eq!(ep.outcome, "partial");
+        // A merged PR proves progress the same way.
+        let merge = "gh pr merge 76 --squash 2>&1 | tail -3; gh pr view 76 --json state,mergeCommit -q '.state+\" \"+.mergeCommit.oid'";
+        let ep = closing_run(
+            vec![
+                failing(),
+                bash_step(
+                    "m",
+                    merge,
+                    "MERGED a8f845882e5068d3eed6d2ca160b182a49c23b06",
+                    false,
+                ),
+            ],
+            "Merged.",
+        );
+        assert!(ep.closing_receipt && ep.final_failed);
+        assert_eq!(ep.outcome, "partial");
+    }
+
+    #[test]
+    fn a_session_cut_off_or_interrupted_is_partial() {
+        // The last row is a tool result: the turn never finished.
+        let mut rows = vec![typed_line("run the release checks and report", "typed")];
+        rows.extend(bash_step("a", "cargo test --lib", "test result: ok", false));
+        let ep = extract(&rows);
+        assert!(!ep.closing_ended);
+        assert_eq!(ep.outcome, "partial");
+        // The person interrupted it.
+        rows.push(
+            serde_json::json!({"type": "user", "message": {"content": [
+                {"type": "text", "text": "[Request interrupted by user]"}
+            ]}})
+            .to_string(),
+        );
+        let ep = extract(&rows);
+        assert!(!ep.closing_ended);
+        assert_eq!(ep.outcome, "partial");
+    }
+
+    #[test]
+    fn a_failure_under_an_earlier_request_does_not_follow_the_session() {
+        let mut rows = vec![typed_line("run the release checks and report", "typed")];
+        rows.extend(bash_step("a", "cargo test --lib", "Exit code 101", true));
+        rows.push(assistant_stop_line("Red.", "end_turn"));
+        rows.push(typed_line(
+            "what is still running on this machine?",
+            "typed",
+        ));
+        rows.extend(bash_step("b", "ps aux | head", "PID ...", false));
+        rows.push(assistant_stop_line("Nothing of ours.", "end_turn"));
+        let ep = extract(&rows);
+        assert!(!ep.late_errors && !ep.final_failed);
+        assert_eq!(ep.outcome, "success");
+    }
+
+    #[test]
+    fn call_signatures_name_the_command_that_matters() {
+        let key = |command: &str| {
+            call_signature("Bash", &serde_json::json!({"command": command})).failure_key
+        };
+        assert_eq!(
+            key("cd csr-engine && cargo test --lib 2>&1 | tail -5").as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            key("export A=1; time cargo build --release").as_deref(),
+            Some("cargo build")
+        );
+        assert_eq!(key("git push origin main").as_deref(), Some("git push"));
+        assert_eq!(
+            key("python3 - <<'EOF'\nprint(1)\nEOF").as_deref(),
+            Some("python3")
+        );
+        assert_eq!(key("./gate.sh --quick").as_deref(), Some("gate.sh"));
+        assert_eq!(key("grep -rn x src | head"), None);
+        assert_eq!(key("git log --oneline -1 && git status"), None);
+        assert_eq!(key("cd /tmp && ls"), None);
+        let installs = |command: &str| {
+            call_signature("Bash", &serde_json::json!({"command": command})).installs
+        };
+        for yes in [
+            "./install-on-phone.sh",
+            "cargo install --path .",
+            "csr-engine hook install --apply",
+            "bash scripts/install.sh",
+            "npm install -g @openai/codex",
+            "xcrun devicectl device install app --device X App.app",
+        ] {
+            assert!(installs(yes), "{yes}");
+        }
+        for no in [
+            "git commit -m \"install fix\"",
+            "echo install",
+            "grep -r install .",
+            "cat install.sh",
+            "cargo test install_paths",
+        ] {
+            assert!(!installs(no), "{no}");
+        }
+        assert_eq!(
+            call_signature("Read", &serde_json::json!({"file_path": "/r/a.rs"})).failure_key,
+            None
+        );
     }
 
     fn sidechain(line: String) -> String {

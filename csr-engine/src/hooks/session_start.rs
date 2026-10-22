@@ -967,8 +967,12 @@ pub fn format_episode_index(episodes: &[(Episode, String)]) -> String {
             .unwrap_or_else(|| "(filtered: CSR meta)".into());
         let outcome = display_outcome(ep, &last);
         out.push_str(&format!(
-            "- [{}] {} — {} (outcome={}) → csr_reflect_on_past(\"conv_{}\")\n",
-            age, request, last, outcome, ep.session_id
+            "- [{}] {} — {}{} → csr_reflect_on_past(\"conv_{}\")\n",
+            age,
+            request,
+            last,
+            outcome_suffix(outcome),
+            ep.session_id
         ));
     }
     out
@@ -992,12 +996,42 @@ pub(crate) fn episode_intent_label(ep: &Episode) -> String {
 /// before the recovered-outcome rule can carry "failed" beside a closing
 /// success signal — a recovery displays as "partial", never a
 /// self-contradicting "pass / failed".
-fn display_outcome<'a>(ep: &'a Episode, last: &str) -> &'a str {
-    if ep.outcome == "failed" && crate::extraction::has_success_signal(last) {
-        "partial"
+fn display_outcome<'a>(ep: &'a Episode, last: &str) -> Option<&'a str> {
+    let outcome = trusted_outcome(ep)?;
+    if outcome == "failed" && crate::extraction::has_success_signal(last) {
+        Some("partial")
     } else {
-        ep.outcome.as_str()
+        Some(outcome)
     }
+}
+
+/// The stored label when it can be trusted, `None` when it cannot.
+///
+/// Two things make a label untrustworthy. Episodes stored before the current
+/// outcome rule carry labels read off any failed tool call (a week of them was
+/// 621 failed, 460 partial, 8 success), so they show nothing until their next
+/// Stop re-extracts them. And `success` is only the absence of a failure unless
+/// the closing task proved something (a commit, a merge, an install, or a
+/// success phrase): a session that ended on "Partly. It is not reliable enough
+/// to ship." has no failing call either, so an unproven `success` is not shown.
+/// `failed` and `partial` rest on a failing last call, a cut-off, or open
+/// tasks, which are evidence, so they stand.
+pub(crate) fn trusted_outcome(ep: &Episode) -> Option<&str> {
+    if ep.outcome_version != Some(crate::hooks::stop::OUTCOME_VERSION) {
+        return None;
+    }
+    if ep.outcome == "success" && !(ep.closing_receipt || ep.closing_success) {
+        return None;
+    }
+    Some(ep.outcome.as_str())
+}
+
+/// The ` (outcome=X)` suffix of an index line, empty when the label is not
+/// trustworthy.
+fn outcome_suffix(outcome: Option<&str>) -> String {
+    outcome
+        .map(|o| format!(" (outcome={o})"))
+        .unwrap_or_default()
 }
 
 /// Whether any text an episode would render is CSR text (the detector search
@@ -1342,8 +1376,14 @@ pub(crate) fn format_tier0_block_with_recap(
         format!("{recap}\n")
     } else {
         let mut fragments = format!(
-            "CSR CONTINUUM [{}]: {}\nLAST: {} (outcome={}, trust={})\n",
-            age, request, last, outcome, trust
+            "CSR CONTINUUM [{}]: {}\nLAST: {} ({}trust={})\n",
+            age,
+            request,
+            last,
+            outcome
+                .map(|o| format!("outcome={o}, "))
+                .unwrap_or_default(),
+            trust
         );
         // Only emit the NEXT/TODOS line when it carries signal — a real next step or
         // open todos. "NEXT: none recorded | TODOS: 0 open" is pure filler.
@@ -2139,6 +2179,10 @@ mod tests {
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
+            closing_ended: false,
+            final_failed: false,
+            closing_receipt: false,
+            outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
             anchors: vec![],
@@ -2207,6 +2251,10 @@ mod tests {
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
+            closing_ended: false,
+            final_failed: false,
+            closing_receipt: false,
+            outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
             anchors: vec![],
@@ -2254,6 +2302,10 @@ mod tests {
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
+            closing_ended: false,
+            final_failed: false,
+            closing_receipt: false,
+            outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
             anchors: vec![],
@@ -2303,6 +2355,10 @@ mod tests {
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
+            closing_ended: false,
+            final_failed: false,
+            closing_receipt: false,
+            outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
             anchors: vec![],
@@ -2353,6 +2409,10 @@ mod tests {
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
+            closing_ended: false,
+            final_failed: false,
+            closing_receipt: false,
+            outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
             anchors: vec![],
@@ -2665,6 +2725,10 @@ mod tests {
             compact_anchor: None,
             late_errors: false,
             closing_success: false,
+            closing_ended: false,
+            final_failed: false,
+            closing_receipt: true,
+            outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
             anchors: vec![],
@@ -3875,6 +3939,49 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         assert!(!index.contains("(outcome=failed)"));
         assert!(index.contains(r#"csr_reflect_on_past("conv_ea57c42a")"#));
         assert!(index.contains("[2h ago] fix the rerank primacy band"));
+    }
+
+    #[test]
+    fn an_episode_stored_before_the_current_outcome_rule_shows_no_label() {
+        let mut legacy = minimal_episode("ship the release notes", "Notes shipped.", None);
+        legacy.outcome = "failed".into();
+        legacy.outcome_version = None;
+        legacy.session_id = "0ldlabel".into();
+        let mut current = minimal_episode("fix the rerank band", "Band fixed.", None);
+        current.outcome = "success".into();
+        current.closing_receipt = true;
+        let index = format_episode_index(&[
+            (legacy.clone(), "1d ago".into()),
+            (current, "2d ago".into()),
+        ]);
+        let legacy_line = index.lines().find(|l| l.contains("0ldlabel")).unwrap();
+        assert!(!legacy_line.contains("outcome="), "{legacy_line}");
+        assert!(legacy_line.contains("ship the release notes"));
+        assert!(index.contains("Band fixed. (outcome=success)"));
+        let block = format_tier0_block(&legacy, &[], "1d ago");
+        assert!(!block.contains("outcome="), "{block}");
+        assert!(block.contains("LAST: Notes shipped. (trust="), "{block}");
+        // The index line is still a CSR emission, so it is never re-imported.
+        assert!(crate::extraction::provenance::is_csr_emission(&index));
+    }
+
+    #[test]
+    fn a_success_that_proved_nothing_shows_no_label_but_a_failure_still_does() {
+        let mut unproven = minimal_episode("is the voice ready to ship", "Partly.", None);
+        unproven.outcome = "success".into();
+        unproven.closing_receipt = false;
+        assert_eq!(trusted_outcome(&unproven), None);
+        unproven.closing_success = true;
+        assert_eq!(trusted_outcome(&unproven), Some("success"));
+        let mut committed = minimal_episode("land the fix", "Done.", None);
+        committed.closing_success = false;
+        committed.closing_receipt = true;
+        assert_eq!(trusted_outcome(&committed), Some("success"));
+        let mut failed = minimal_episode("land the fix", "Red.", None);
+        failed.outcome = "failed".into();
+        assert_eq!(trusted_outcome(&failed), Some("failed"));
+        failed.outcome = "partial".into();
+        assert_eq!(trusted_outcome(&failed), Some("partial"));
     }
 
     #[test]
