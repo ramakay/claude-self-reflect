@@ -681,7 +681,12 @@ impl Composition {
                 due.push(a.last_at / 1000. + 600.);
             }
             if open.agents {
-                due.extend(a.started.map(|s| minute(s / 1000.)));
+                // The label rounds to the nearest minute (`{:.0}m`): it moves at 30 s, 90 s, ...
+                due.extend(a.started.map(|s| {
+                    let began = s / 1000.;
+                    let minutes = ((now - began) / 60.).max(0.);
+                    began + 60. * ((minutes + 0.5).floor() + 0.5)
+                }));
             }
         }
         let cache = &self.figure["cache"];
@@ -4621,6 +4626,46 @@ mod tests {
         // The pace reaches 60% of the window 360 s from now: the `»` goes then.
         let due = ahead.next_change_at(Open::default()).unwrap();
         assert!((due - (now + 360.01)).abs() < 1e-6, "due in {}", due - now);
+    }
+
+    /// An agent's age is drawn rounded to the nearest minute, so it moves at half minutes; the
+    /// schedule must name those moments, not the whole-minute edges the other ages use.
+    #[test]
+    fn an_agent_age_is_scheduled_where_its_rounding_changes() {
+        let now = 1_800_000_000.;
+        let open = Open {
+            agents: true,
+            ..Open::default()
+        };
+        let agent = |age: f64| {
+            let mut c = Composition::build(&json!({}), &json!({"id":"a"}), now);
+            let row = json!({
+                "id":"a1","parent":null,"description":"scan","type":"Explore",
+                "model":"claude-opus-5","status":"done","started":(now - age) * 1000.,
+                "first_seen":(now - age) * 1000.,"last_at":(now - age) * 1000.,"tools":3,
+                "tokens":1200,"edits":[],"edits_omitted":0,"overlaps":[],"overlaps_omitted":0,
+                "last":"","last_tool":null,"current_turn":null,"completion":null,"listed":true,
+            });
+            c.agents.agents = vec![serde_json::from_value(row).unwrap()];
+            c
+        };
+        for (age, in_secs) in [(29., 1.), (31., 59.), (0., 30.), (89.5, 0.5), (90.5, 59.5)] {
+            let c = agent(age);
+            let due = c.next_change_at(open).unwrap();
+            assert!(
+                (due - (now + in_secs + 0.01)).abs() < 1e-6,
+                "age {age}: due in {}",
+                due - now
+            );
+            // And the label really changes there, and not before.
+            let label = |at: f64| {
+                let mut later = agent(age);
+                later.now = at;
+                agent_lines(&later)[0].clone()
+            };
+            assert_ne!(label(due + 0.01), label(now), "age {age}");
+            assert_eq!(label(due - 0.02), label(now), "age {age}");
+        }
     }
 
     #[test]
