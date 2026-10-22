@@ -869,7 +869,9 @@ fn sink_out_of_family_under_explicit_scope(
 /// dropping one: first the rows that only restate a question
 /// ([`crate::search::echo::is_question_echo`]), then CSR's own search-result
 /// and `csr_why` output
-/// ([`crate::import::contamination::is_csr_tool_payload`]). Both are decided
+/// ([`crate::import::contamination::is_csr_tool_payload`]) together with a
+/// screen recorder's frames
+/// ([`crate::import::contamination::is_terminal_replay`]). All are decided
 /// by the row's own text, never by its similarity to the query, so a question
 /// asked again whose row also states the answer keeps its rank. Stable: every
 /// class keeps its fused order, so when an echo and an answer come from the
@@ -877,7 +879,9 @@ fn sink_out_of_family_under_explicit_scope(
 fn sink_non_answers(enriched: &mut [EnrichedResult]) {
     let class = |result: &EnrichedResult| -> u8 {
         let content = result.chunk.content.as_str();
-        if crate::import::contamination::is_csr_tool_payload(content) {
+        if crate::import::contamination::is_csr_tool_payload(content)
+            || crate::import::contamination::is_terminal_replay(content)
+        {
             2
         } else if crate::search::echo::is_question_echo(content) {
             1
@@ -12246,6 +12250,57 @@ mod echo_recall_tests {
             ["answer-chunk", "answer-chunk-2"].contains(&order[0].as_str()),
             "rank 1 must carry an answer: {order:?}"
         );
+    }
+
+    /// A forked worker's tmux pane recording is indexed as text. Its frames
+    /// repeat the typed question and a spinner, so it matches the question
+    /// best and says nothing. Live excerpt (agent-aa8201b27121421bd).
+    const KEYSTROKE_FRAMES: &str = r#"y did we drop Docker and Qdrant
+24 20.706 9 ❯ why did we drop Docker and Qdrant f
+25 20.87 9 ❯ why did we drop Docker and Qdrant for
+26 21.034 9 ❯ why did we drop Docker and Qdrant for a
+27 21.2 9 ❯ why did we drop Docker and Qdrant for a s
+28 21.367 9 ❯ why did we drop Docker and Qdrant for a sin
+29 21.532 9 ❯ why did we drop Docker and Qdrant for a singl
+30 21.697 9 ❯ why did we drop Docker and Qdrant for a single
+31 21.863 9 ❯ why did we drop Docker and Qdrant for a single Ru
+32 22.028 9 ❯ why did we drop Docker and Qdrant for a single Rust
+33 22.197 9 ❯ why did we drop Docker and Qdrant for a single Rust b
+34 22.363 9 ❯ why did we drop Docker and Qdrant for a single Rust bin
+35 22.528 9 ❯ why did we drop Docker and Qdrant for a single Rust binar
+36 22.693 9 ❯ why did we drop Docker and Qdrant for a single Rust binary
+37 23.53 11 ❯ why did we d"#;
+    const SPINNER_FRAMES: &str = r#"154 10 ❯ why did we drop Docker and Qdrant for a single Rust binary | · Actioning… (3s · thinking with medium effort) | ❯
+55 27.318 10 ❯ why did we drop Docker and Qdrant for a single Rust binary | ✢ Actioning… (3s · thinking with medium effort) | ❯
+56 27.485 10 ❯ why did we drop Docker and Qdrant for a single Rust binary | ✶ Actioning… (4s · thinking with medium effort) |"#;
+
+    #[tokio::test]
+    async fn terminal_replay_frames_do_not_outrank_answers() {
+        let (mut rows, reflections) = probe_rows();
+        rows.push(chunk("keystroke-frames", "conv7", 0.90, KEYSTROKE_FRAMES));
+        rows.push(chunk("spinner-frames", "conv7", 0.88, SPINNER_FRAMES));
+        let order = recall(&rows, &reflections).await;
+        for frames in ["keystroke-frames", "spinner-frames"] {
+            for answer in ["answer-chunk", "answer-chunk-2"] {
+                assert!(
+                    position(&order, answer) < position(&order, frames),
+                    "{frames} must sit below {answer}: {order:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chunk_with_one_prompt_line_among_real_content_keeps_its_rank() {
+        let (mut rows, reflections) = probe_rows();
+        rows.push(chunk(
+            "screen-with-answer",
+            "conv8",
+            0.95,
+            "\u{276f} why did we drop Docker and Qdrant for a single Rust binary?\n\u{23fa} Installing it was too painful, and the scale never needed a database server. A Phase 0 spike then showed an embedded index was faster anyway.",
+        ));
+        let order = recall(&rows, &reflections).await;
+        assert_eq!(order[0], "screen-with-answer", "{order:?}");
     }
 
     #[tokio::test]

@@ -1701,7 +1701,9 @@ pub fn registered_formatter_ids() -> impl Iterator<Item = &'static str> {
 }
 
 mod payload;
+mod terminal;
 pub use payload::is_csr_tool_payload;
+pub use terminal::is_terminal_replay;
 
 #[cfg(test)]
 mod tests;

@@ -109,6 +109,9 @@ struct MessageEvidence {
 pub(crate) struct CsrSuppressionStats {
     pub csr_tool_blocks_suppressed: usize,
     pub csr_hook_wrappers_scrubbed: usize,
+    /// Tool results dropped because they are a screen recorder's frames
+    /// ([`contamination::is_terminal_replay`]).
+    pub terminal_replay_suppressed: usize,
     /// Credentials redacted from the text, per kind. Counts only, never values.
     pub secrets: crate::redact::SecretCounts,
 }
@@ -1709,6 +1712,12 @@ fn sanitize_content(
                     sanitizer.stats.csr_tool_blocks_suppressed += 1;
                     continue;
                 }
+                // A pane-capture loop prints one line per frame; the dump is
+                // the question retyped and a spinner, never a finding.
+                if contamination::is_terminal_replay(&tool_result_text(&item)) {
+                    sanitizer.stats.terminal_replay_suppressed += 1;
+                    continue;
+                }
             }
             Some("text") => {
                 let RowText::Keep { scrub_wrappers } = row_text else {
@@ -1975,6 +1984,20 @@ fn tool_result_is_csr_payload(item: &serde_json::Value) -> bool {
         Some(serde_json::Value::String(text)) => contamination::is_csr_tool_payload(text),
         Some(other) if !other.is_null() => contamination::is_csr_tool_payload(&other.to_string()),
         _ => false,
+    }
+}
+
+/// The text of a `tool_result` block, whatever shape the content takes: a
+/// string, or an array of text parts joined by line breaks.
+fn tool_result_text(item: &serde_json::Value) -> String {
+    match item.get("content") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
     }
 }
 
@@ -3460,6 +3483,71 @@ mod tests {
         assert!(!content.contains("PAYLOAD BODY"), "{content}");
         assert!(
             content.contains("the line that prints RESULTS"),
+            "{content}"
+        );
+    }
+
+    /// A fork polled a tmux pane and printed one line per frame; the dump was a
+    /// Bash tool result, so no tool name marks it. Excerpt of the live result
+    /// (agent-aa8201b27121421bd): the typed question retyped, then a spinner.
+    #[test]
+    fn a_terminal_recording_in_a_tool_result_is_dropped_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pane-capture.jsonl");
+        let frames = r#"y did we drop Docker and Qdrant
+24 20.706 9 ❯ why did we drop Docker and Qdrant f
+25 20.87 9 ❯ why did we drop Docker and Qdrant for
+26 21.034 9 ❯ why did we drop Docker and Qdrant for a
+27 21.2 9 ❯ why did we drop Docker and Qdrant for a s
+28 21.367 9 ❯ why did we drop Docker and Qdrant for a sin
+29 21.532 9 ❯ why did we drop Docker and Qdrant for a singl
+30 21.697 9 ❯ why did we drop Docker and Qdrant for a single
+31 21.863 9 ❯ why did we drop Docker and Qdrant for a single Ru
+32 22.028 9 ❯ why did we drop Docker and Qdrant for a single Rust
+33 22.197 9 ❯ why did we drop Docker and Qdrant for a single Rust b
+34 22.363 9 ❯ why did we drop Docker and Qdrant for a single Rust bin
+35 22.528 9 ❯ why did we drop Docker and Qdrant for a single Rust binar
+36 22.693 9 ❯ why did we drop Docker and Qdrant for a single Rust binary
+37 23.53 11 ❯ why did we d"#;
+        let lines = [
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-10-11T12:00:00Z",
+                "message": {"content": [
+                    {"type": "tool_use", "id": "dump", "name": "Bash", "input": {"command": "python3 dump_frames.py"}},
+                    {"type": "tool_use", "id": "ls", "name": "Bash", "input": {"command": "ls"}}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-10-11T12:00:01Z",
+                "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "dump", "content": frames},
+                    {"type": "tool_result", "tool_use_id": "ls", "content": "\u{276f} one prompt line in a listing\nREADME.md\nsrc\nCargo.toml"}
+                ]}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let parsed = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        assert_eq!(parsed.suppression.terminal_replay_suppressed, 1);
+        assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 0);
+        let content = parsed
+            .chunks
+            .into_iter()
+            .map(|chunk| chunk.content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!content.contains("20.706"), "{content}");
+        assert!(
+            content.contains("one prompt line in a listing"),
             "{content}"
         );
     }

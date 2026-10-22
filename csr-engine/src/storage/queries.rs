@@ -3172,9 +3172,10 @@ pub(crate) fn mark_file_imported_at(
     conn.execute(
         "INSERT INTO import_state (
              file_path, conversation_id, chunks_imported, file_mtime,
-             csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed
+             csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed,
+             terminal_replay_suppressed
          )
-         VALUES (?1, ?2, ?3, ?4, 0, 0)
+         VALUES (?1, ?2, ?3, ?4, 0, 0, 0)
          ON CONFLICT(file_path) DO UPDATE SET
              conversation_id = excluded.conversation_id,
              chunks_imported = excluded.chunks_imported,
@@ -3222,18 +3223,23 @@ pub(crate) fn mark_imported_in(
     let path_str = path.to_string_lossy().to_string();
     let (previous, previous_secrets) = tx
         .query_row(
-            "SELECT csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed, secrets_redacted
+            "SELECT csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed, secrets_redacted,
+                    terminal_replay_suppressed
              FROM import_state WHERE file_path = ?1",
             params![path_str],
             |row| {
                 Ok((
-                    (row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?),
+                    (
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ),
                     row.get::<_, Option<String>>(2)?,
                 ))
             },
         )
         .optional()?
-        .unwrap_or(((Some(0), Some(0)), None));
+        .unwrap_or(((Some(0), Some(0), Some(0)), None));
     // A stamped row (even `{}`) was written by a build that scrubs; an unstamped
     // one marks a conversation whose chunk rows predate it (`legacy_frontier`).
     let was_stamped = previous_secrets.is_some();
@@ -3253,6 +3259,11 @@ pub(crate) fn mark_imported_in(
             let persisted = previous.max(current_wrappers);
             (persisted, persisted - previous)
         });
+    let current_replay = suppression.terminal_replay_suppressed as i64;
+    let (persisted_replay, replay_delta) = previous.2.map_or((current_replay, 0), |previous| {
+        let persisted = previous.max(current_replay);
+        (persisted, persisted - previous)
+    });
     let conv_id = path
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
@@ -3261,8 +3272,9 @@ pub(crate) fn mark_imported_in(
     tx.execute(
         "INSERT OR REPLACE INTO import_state
          (file_path, conversation_id, chunks_imported, file_mtime,
-          csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed, secrets_redacted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+          csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed, secrets_redacted,
+          terminal_replay_suppressed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             path_str,
             conv_id,
@@ -3270,7 +3282,8 @@ pub(crate) fn mark_imported_in(
             mtime,
             persisted_tool,
             persisted_wrappers,
-            stamp
+            stamp,
+            persisted_replay
         ],
     )?;
     bump_secret_counters(tx, &previous_secrets, &persisted_secrets)?;
@@ -3287,6 +3300,16 @@ pub(crate) fn mark_imported_in(
             tx,
             "csr_tool_blocks_suppressed",
             &(current + tool_delta).to_string(),
+        )?;
+    }
+    if replay_delta > 0 {
+        let current = get_meta(tx, "terminal_replay_suppressed")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        set_meta(
+            tx,
+            "terminal_replay_suppressed",
+            &(current + replay_delta).to_string(),
         )?;
     }
     if wrapper_delta > 0 {

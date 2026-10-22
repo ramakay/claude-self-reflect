@@ -1561,6 +1561,13 @@ impl Storage {
             .unwrap_or(0))
     }
 
+    pub fn get_terminal_replay_suppressed(&self) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(queries::get_meta(&conn, "terminal_replay_suppressed")?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0))
+    }
+
     /// Backward-compatible aggregate surfaced by status: tool blocks + wrappers.
     pub fn get_csr_self_suppressed(&self) -> Result<i64> {
         Ok(self.get_csr_tool_blocks_suppressed()? + self.get_csr_hook_wrappers_scrubbed()?)
@@ -4350,6 +4357,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(storage.coverage_stats().unwrap(), (3, 1, 2));
+    }
+
+    #[test]
+    fn terminal_replay_counter_applies_each_file_total_once() {
+        let storage = Storage::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay.jsonl");
+        std::fs::write(&path, "{}").unwrap();
+        let stats = |count: usize| crate::import::CsrSuppressionStats {
+            terminal_replay_suppressed: count,
+            ..Default::default()
+        };
+        storage
+            .mark_file_imported_with_suppression(&path, 0, stats(2))
+            .unwrap();
+        assert_eq!(storage.get_terminal_replay_suppressed().unwrap(), 2);
+        // A full reparse of the same file sees the same two results again.
+        storage
+            .mark_file_imported_with_suppression(&path, 0, stats(2))
+            .unwrap();
+        assert_eq!(storage.get_terminal_replay_suppressed().unwrap(), 2);
+        storage
+            .mark_file_imported_with_suppression(&path, 0, stats(3))
+            .unwrap();
+        assert_eq!(storage.get_terminal_replay_suppressed().unwrap(), 3);
+        assert_eq!(storage.get_csr_self_suppressed().unwrap(), 0);
     }
 
     #[test]

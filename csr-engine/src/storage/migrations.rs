@@ -441,7 +441,8 @@ pub fn run(conn: &Connection) -> Result<()> {
             file_mtime TEXT,
             csr_tool_blocks_suppressed INTEGER NOT NULL DEFAULT 0,
             csr_hook_wrappers_scrubbed INTEGER NOT NULL DEFAULT 0,
-            secrets_redacted TEXT
+            secrets_redacted TEXT,
+            terminal_replay_suppressed INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_import_conversation_id
@@ -1101,6 +1102,20 @@ pub fn run(conn: &Connection) -> Result<()> {
             "import_state",
             "csr_hook_wrappers_scrubbed",
             "ALTER TABLE import_state ADD COLUMN csr_hook_wrappers_scrubbed INTEGER;",
+        )?;
+    }
+
+    // Per-file cumulative count of tool results dropped as terminal-capture
+    // replay, idempotent across reparses like the two totals above.
+    let has_replay_col = conn
+        .prepare("SELECT terminal_replay_suppressed FROM import_state LIMIT 0")
+        .is_ok();
+    if !has_replay_col {
+        add_column(
+            conn,
+            "import_state",
+            "terminal_replay_suppressed",
+            "ALTER TABLE import_state ADD COLUMN terminal_replay_suppressed INTEGER;",
         )?;
     }
 
@@ -3995,6 +4010,7 @@ mod tests {
                 ALTER TABLE import_state DROP COLUMN csr_tool_blocks_suppressed;
                 ALTER TABLE import_state DROP COLUMN csr_hook_wrappers_scrubbed;
                 ALTER TABLE import_state DROP COLUMN secrets_redacted;
+                ALTER TABLE import_state DROP COLUMN terminal_replay_suppressed;
                 ALTER TABLE witness_verdicts DROP COLUMN receipt_committed_at;
                 ALTER TABLE rerank_models DROP COLUMN curated_baseline_score;
                 ALTER TABLE rerank_models DROP COLUMN curated_trained_score;

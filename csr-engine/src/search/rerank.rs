@@ -323,6 +323,7 @@ pub fn is_scaffold_text(content: &str) -> bool {
         // plain text (a script run, a Codex `exec`, a paste), outside the CSR
         // tool block the importer drops by name.
         || crate::import::contamination::is_csr_tool_payload(content)
+        || crate::import::contamination::is_terminal_replay(content)
 }
 
 /// Content that asserts a correction or a decision — a claim to authority.
