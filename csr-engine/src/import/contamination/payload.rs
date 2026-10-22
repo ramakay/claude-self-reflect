@@ -9,10 +9,14 @@
 //! format_search_results` and `format_why_labeled`), including a chunk-sized
 //! fragment cut anywhere inside it and the JSON-escaped form a wrapper leaves.
 //!
-//! A single loose token can occur in prose that discusses the format; a payload
-//! needs two distinct loose search-result tokens, or one line of an emitter's
-//! own grammar (a `csr_why` result line, the summary element), or a bare CSR
-//! tool-call marker standing alone.
+//! A token can occur in prose, in source code and in a test that quotes the
+//! format, and a whole tool result (a `Read` of `format/mod.rs`, a diff) must
+//! not be taken for CSR's output because it holds one. So the grammar has to
+//! dominate: every token is spelled the way the emitter writes it (the full
+//! attribute sequence, never a bare attribute), and the text is a payload only
+//! when the tokens are dense (at least one per [`DENSITY_CHARS`]), or when it
+//! is a short fragment mostly made of one line of an emitter's grammar, or a
+//! bare CSR tool-call marker standing alone.
 
 use std::sync::LazyLock;
 
@@ -28,15 +32,18 @@ macro_rules! token {
 // Search-result grammar. `\\?"` accepts the quote both plain and JSON-escaped.
 token!(RESULTS_HEADER, r"🎯 RESULTS: \d+ match");
 token!(PERFORMANCE_LINE, r"⚡ PERFORMANCE: \d+ms \(");
-token!(SUMMARY_OPEN, r#"<summary count=\\?"\d+\\?" relevance="#);
+// The summary element's attributes, instantiated: a number in `top-score`,
+// the `keyword` relevance. A format string (`relevance=\"{}\"`) is source,
+// not output, and does not match. Also matches the attribute run alone, for a
+// chunk cut inside the element.
 token!(
-    RELEVANCE_ATTR,
-    r#"relevance=\\?"[a-z ]+\\?" top-score=\\?""#
+    SUMMARY_OPEN,
+    r#"(?:<summary count=\\?"\d+\\?" )?relevance=\\?"(?:keyword\\?"|[a-z ]+\\?" top-score=\\?"\d)"#
 );
 token!(RESULT_OPEN, r#"<r rank=\\?"\d+\\?">"#);
-token!(EXCERPT_OPEN, r"<excerpt><!\[CDATA\[");
+token!(EXCERPT_OPEN, r"<excerpt><!\[CDATA\[[^{]");
 token!(TRUST_TAG, r"<trust>[a-z_]+</trust>");
-token!(CID_TAG, r"<cid>[^<\n]{1,80}</cid>");
+token!(CID_TAG, r"<cid>[^<\n{]{1,80}</cid>");
 
 // `csr_why` result lines: the legacy `via=<route> score=0.794 [<ts>] conv_<id>`
 // and the current `best_via=<route> reached_by=... score=... [<age>] conv_<id>`.
@@ -67,34 +74,54 @@ token!(
 /// else; with more, the text around it is the person's or Claude's own.
 const CALL_ONLY_RESIDUE_CHARS: usize = 40;
 
+/// Emitter tokens must come at least this densely for a long text to be a
+/// payload. A real result block carries several tokens per result (a few
+/// hundred characters each); a source file or a transcript that quotes the
+/// format carries a handful in thousands of characters.
+const DENSITY_CHARS: usize = 400;
+
+/// A lone line of an emitter's grammar makes a short fragment a payload only
+/// when it is at least this share (as 1/n) of the fragment: a chunk cut inside
+/// the XML is mostly the grammar, a sentence that quotes it is not.
+const FRAGMENT_SHARE_DENOM: usize = 4;
+
 /// Whether `text` (or a fragment of a chunk) is CSR's own search-result or
 /// `csr_why` output, or the bare rendering of a CSR tool call.
 pub fn is_csr_tool_payload(text: &str) -> bool {
     if text.len() < 12 {
         return false;
     }
-    // Each of these is one line of an emitter's grammar that prose has no
-    // reason to reproduce, so one is enough.
-    if WHY_LEGACY_LINE.is_match(text)
-        || WHY_CURRENT_LINE.is_match(text)
-        || WHY_HEADER.is_match(text)
-        || SUMMARY_OPEN.is_match(text)
-        || RELEVANCE_ATTR.is_match(text)
-    {
+    // Lines of an emitter's grammar that prose has no reason to reproduce.
+    let strong: [&Regex; 4] = [
+        &WHY_LEGACY_LINE,
+        &WHY_CURRENT_LINE,
+        &WHY_HEADER,
+        &SUMMARY_OPEN,
+    ];
+    let loose: [&Regex; 6] = [
+        &RESULTS_HEADER,
+        &PERFORMANCE_LINE,
+        &RESULT_OPEN,
+        &EXCERPT_OPEN,
+        &TRUST_TAG,
+        &CID_TAG,
+    ];
+    let (mut strong_hits, mut strong_span) = (0usize, 0usize);
+    for token in strong {
+        for found in token.find_iter(text) {
+            strong_hits += 1;
+            strong_span += found.len();
+        }
+    }
+    let loose_hits: usize = loose
+        .iter()
+        .map(|token| token.find_iter(text).count())
+        .sum();
+    let hits = strong_hits + loose_hits;
+    if hits >= 2 && hits * DENSITY_CHARS >= text.len() {
         return true;
     }
-    let search_tokens = [
-        &*RESULTS_HEADER,
-        &*PERFORMANCE_LINE,
-        &*RESULT_OPEN,
-        &*EXCERPT_OPEN,
-        &*TRUST_TAG,
-        &*CID_TAG,
-    ]
-    .iter()
-    .filter(|token| token.is_match(text))
-    .count();
-    if search_tokens >= 2 {
+    if strong_hits == 1 && loose_hits == 0 && strong_span * FRAGMENT_SHARE_DENOM >= text.len() {
         return true;
     }
     CSR_CALL_MARKER.is_match(text) && {
@@ -146,6 +173,54 @@ mod tests {
             "[mcp__claude-self-reflect__csr_why: why did we drop Qdrant]"
         ));
         assert!(is_csr_tool_payload("[ToolSearch: select:mcp__claude-self-reflect__csr_reflect_on_past]\n\n[mcp__claude-self-reflect__csr_reflect_on_past: why drop Qdrant]"));
+    }
+
+    /// A `Read` of the emitter's source, and prose that quotes the format, must
+    /// survive: the tokens are there but they are a sliver of the text.
+    #[test]
+    fn source_and_prose_that_quote_the_format_are_not_payloads() {
+        let source = r##"   520	        out.push_str(&format!(
+   521	            "  <summary count=\"{}\" relevance=\"{}\" top-score=\"{:.3}\" rank1-score=\"{:.3}\" margin=\"{}\">\n",
+   522	            results.len(),
+   523	            relevance,
+   524	            top_score,
+   525	            rank1_score,
+   526	            margin,
+   527	        ));
+   528	        out.push_str(&format!("    <preview>{}</preview>\n", preview));
+   529	        out.push_str("  </summary>\n");
+   530	
+   531	        // One result element per row, in rank order.
+   532	        for (i, result) in results.iter().enumerate() {
+   533	            out.push_str(&format!("    <r rank=\"{}\">\n", i + 1));
+   534	            out.push_str(&format!("      <s>{:.3}</s>\n", result.score));
+   535	            out.push_str(&format!("      <excerpt><![CDATA[{}]]></excerpt>\n", excerpt));
+   536	            out.push_str(&format!("      <cid>{}</cid>\n", cid));
+   537	            out.push_str(&format!("      <trust>{}</trust>\n", trust));
+   538	        }
+   539	    }
+   540	
+   541	    #[test]
+   542	    fn the_summary_names_the_scope() {
+   543	        let xml = format_search_results(&rows, "q", 1, "claude-self-reflect");
+   544	        assert!(xml.contains("top-score=\"0.765\""));
+   545	        // header: "🎯 RESULTS: 1 matches (high relevance, top score: 0.900)"
+   546	        assert!(xml.contains("<summary count=\"1\" relevance=\"high\" top-score=\"0.900\""));
+   547	    }
+"##;
+        assert!(!is_csr_tool_payload(source));
+        assert!(!is_csr_tool_payload(
+            "The parser fails on <summary count=\"5\" relevance=\"partial\">.\nFix: escape attributes before decoding."
+        ));
+        assert!(!is_csr_tool_payload(
+            "The assertion on relevance=\"partial\" top-score=\"0.450\" failed because the margin attribute moved; I rewrote the helper so the order of attributes no longer matters to the test."
+        ));
+    }
+
+    #[test]
+    fn a_dense_search_result_block_is_still_a_payload() {
+        let block = format!("{SEARCH_HEAD}\n  <meta><q>why did we drop Qdrant</q></meta>\n  <results>\n    <r rank=\"1\">\n      <s>0.683</s>\n      <excerpt><![CDATA[why did we drop Docker and Qdrant for a single Rust binary?]]></excerpt>\n      <cid>story_c95f</cid>\n      <trust>external</trust>\n    </r>\n    <r rank=\"2\">\n      <s>0.746</s>\n      <excerpt><![CDATA[Checking past sessions.]]></excerpt>\n      <cid>c95f</cid>\n      <trust>user_history</trust>\n    </r>");
+        assert!(is_csr_tool_payload(&block));
     }
 
     #[test]
