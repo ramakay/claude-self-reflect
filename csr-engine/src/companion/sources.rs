@@ -384,8 +384,10 @@ static COMPACTION_SCAN_BUDGET: std::sync::atomic::AtomicU64 =
 
 /// Test seam: give each frame's compaction scan a budget no test host can exhaust, so a
 /// small fixture's first frame shows the finished scan on any CPU speed or load. Production
-/// never calls this and keeps the 5 ms budget.
+/// never calls this and keeps the 5 ms budget; only a build with the `test-seams` feature (the
+/// integration tests, through the self dev-dependency) or `cfg(test)` has the function at all.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-seams"))]
 pub fn set_compaction_scan_budget(budget: std::time::Duration) {
     COMPACTION_SCAN_BUDGET.store(
         u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),

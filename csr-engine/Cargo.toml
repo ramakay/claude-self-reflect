@@ -76,7 +76,13 @@ zstd = "0.14.2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# Seams the integration tests need and a release build must not carry. The tests enable it through
+# the self dev-dependency below; nothing else turns it on.
+test-seams = []
+
 [dev-dependencies]
+csr-engine = { path = ".", features = ["test-seams"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
