@@ -259,7 +259,7 @@ fn a_change_to_what_the_frame_reads_makes_the_pane_due() {
 }
 
 #[test]
-fn a_codex_rollout_written_to_is_news_even_when_the_last_scan_was_too_recent_to_read_it() {
+fn a_codex_rollout_written_to_is_news_within_the_scans_own_two_seconds() {
     let (_home, paths) = rich_home();
     let folder = paths.home.join(".codex/sessions/2026/10/18");
     fs::create_dir_all(&folder).unwrap();
@@ -277,18 +277,19 @@ fn a_codex_rollout_written_to_is_news_even_when_the_last_scan_was_too_recent_to_
     let mut pane = pane_in(&paths);
     pane.frame(76, 67, NOW);
     assert!(!pane.due(NOW + 0.2), "a quiet rollout is not news");
-    // Written inside the scan's own two seconds: the frame cannot read it yet.
+    // Appended to: nothing else the pane watches moves, and the pane is due within the two
+    // seconds a Codex scan has always waited.
     let mut longer = fs::read_to_string(&rollout).unwrap();
     longer.push_str(&line(20));
     fs::write(&rollout, longer).unwrap();
-    assert!(pane.due(NOW + 1.5), "an append to a rollout is news");
-    pane.frame(76, 67, NOW + 1.5);
-    assert!(
-        pane.due(NOW + 2.6),
-        "the frame could not read it, so it is asked for again once the scan may"
-    );
-    pane.frame(76, 67, NOW + 2.6);
-    assert!(!pane.due(NOW + 3.7), "read once is quiet again");
+    assert!(pane.due(NOW + 2.1), "an append to a rollout is news");
+    pane.frame(76, 67, NOW + 2.1);
+    assert!(!pane.due(NOW + 3.2), "read once is quiet again");
+    // And again, the next two seconds on.
+    let mut longer = fs::read_to_string(&rollout).unwrap();
+    longer.push_str(&line(30));
+    fs::write(&rollout, longer).unwrap();
+    assert!(pane.due(NOW + 4.3), "and the next append");
 }
 
 #[test]

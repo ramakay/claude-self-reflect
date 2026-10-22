@@ -38,7 +38,7 @@ const LIMIT_ID: &str = "codex";
 /// A rollout older than this tells nothing of the week and of no live run.
 const KEEP_DAYS: f64 = 8.;
 /// Seconds between two scans of the folder; a frame in between reads what the last found.
-const EVERY: f64 = 2.;
+pub const EVERY: f64 = 2.;
 /// A line longer than this (a tool's whole output) is skipped unread.
 const MAX_LINE: usize = 1 << 20;
 /// Characters of a line looked at to tell whether it is a record worth parsing.

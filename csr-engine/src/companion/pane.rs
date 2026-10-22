@@ -245,6 +245,8 @@ pub struct Pane {
     // the Codex rollouts, the readers behind "How Claude read you", and the dream
     // answer the pane keeps in place of the answer rows for six seconds (dream, answer, when)
     codex: super::codex_runs::CodexRolloutIndex,
+    /// The rollouts' fingerprint and when it was taken: walking them is not done every probe.
+    codex_look: std::cell::Cell<Option<(f64, u64)>>,
     readers: super::readings::Readers,
     pub answered: Option<(String, String, f64)>,
     /// Column mode's gauge strip: (first column, first row past it); a click there is on no row.
@@ -339,6 +341,7 @@ impl Pane {
             phone: Default::default(),
             herdr: None,
             codex,
+            codex_look: std::cell::Cell::new(None),
             readers: Default::default(),
             answered: None,
             edge: None,
@@ -381,6 +384,17 @@ impl Pane {
         self.gate.saw(snapshot, version, now, settled);
         out
     }
+    /// The rollouts' fingerprint, taken at most as often as the Codex scan itself runs.
+    fn codex_fingerprint(&self, now: f64) -> u64 {
+        if let Some((at, print)) = self.codex_look.get() {
+            if (0. ..super::codex_runs::EVERY).contains(&(now - at)) {
+                return print;
+            }
+        }
+        let print = self.codex.fingerprint(now);
+        self.codex_look.set(Some((now, print)));
+        print
+    }
     fn look(&self, now: f64) -> (super::gate::Snapshot, Option<i64>) {
         let transcript = self.session.as_ref().and_then(|s| s.path.as_deref());
         (
@@ -388,7 +402,7 @@ impl Pane {
             // snapshot covers; the Claude transcripts the spend reads are listed once a minute
             // by the spend itself, a longer wait than the gate's floor.
             super::gate::Snapshot::take(&self.paths, &self.sid, transcript)
-                .including(CODEX_ROLLOUTS, self.codex.fingerprint(now)),
+                .including(CODEX_ROLLOUTS, self.codex_fingerprint(now)),
             self.db.as_ref().and_then(Db::version),
         )
     }
