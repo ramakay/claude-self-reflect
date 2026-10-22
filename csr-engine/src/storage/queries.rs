@@ -2867,7 +2867,7 @@ fn recent_sessions(
      FROM chunks c
      WHERE c.conversation_id IN (SELECT value FROM json_each(?1)) {scope}
      GROUP BY c.conversation_id
-     ORDER BY MAX(c.timestamp) DESC LIMIT ?2"
+     ORDER BY MAX(c.timestamp) DESC, c.conversation_id LIMIT ?2"
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -2885,10 +2885,13 @@ fn recent_sessions(
     Ok(results)
 }
 
-/// The ids of the `limit` conversations with the newest chunks, newest first.
-/// Walks `idx_chunks_project_timestamp` (or `idx_chunks_timestamp`) from the
-/// top and stops at the `limit`-th distinct conversation, so the cost follows
-/// how many chunks the newest sessions have, not how many the project has.
+/// The ids of the `limit` conversations with the newest chunks, newest first,
+/// equal newest timestamps ordered by conversation id (the order
+/// `recent_sessions` returns them in, so a tie picks the same session every
+/// time). Walks `idx_chunks_project_timestamp` (or `idx_chunks_timestamp`) from
+/// the top and stops at the `limit`-th distinct conversation plus the rest of
+/// its timestamp, so the cost follows how many chunks the newest sessions have,
+/// not how many the project has.
 fn newest_conversations(
     conn: &Connection,
     limit: usize,
@@ -2901,21 +2904,30 @@ fn newest_conversations(
         "?1 IS NULL"
     };
     let sql = format!(
-        "SELECT c.conversation_id FROM chunks c
+        "SELECT c.conversation_id, c.timestamp FROM chunks c
          WHERE {scope} {headless_clause}
          ORDER BY c.timestamp DESC"
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params![project])?;
-    let mut ids: Vec<String> = Vec::new();
-    while ids.len() < limit {
-        let Some(row) = rows.next()? else { break };
+    // (newest timestamp, id): a conversation is first seen at its newest chunk.
+    let mut seen: Vec<(String, String)> = Vec::new();
+    while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
-        if !ids.contains(&id) {
-            ids.push(id);
+        let timestamp: String = row.get(1)?;
+        // Past the limit only the rest of the boundary timestamp is read: the
+        // index order is arbitrary among equal timestamps, so which of the
+        // tied conversations make the cut is decided below, by id.
+        if seen.len() >= limit && seen.last().is_some_and(|(t, _)| *t != timestamp) {
+            break;
+        }
+        if !seen.iter().any(|(_, known)| *known == id) {
+            seen.push((timestamp, id));
         }
     }
-    Ok(ids)
+    seen.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    seen.truncate(limit);
+    Ok(seen.into_iter().map(|(_, id)| id).collect())
 }
 
 /// Helper: map a row to SessionInfo.
@@ -5619,7 +5631,8 @@ mod tests {
                 (SELECT c2.summary FROM chunks c2 WHERE c2.conversation_id = c.conversation_id
                  ORDER BY c2.rowid ASC LIMIT 1)
              FROM chunks c WHERE {scope} {headless}
-             GROUP BY c.conversation_id ORDER BY MAX(c.timestamp) DESC LIMIT ?2"
+             GROUP BY c.conversation_id
+             ORDER BY MAX(c.timestamp) DESC, c.conversation_id LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql).unwrap();
         stmt.query_map(params![project, limit as i64], |r| {
@@ -5659,6 +5672,22 @@ mod tests {
             [],
         )
         .unwrap();
+        // Four conversations whose newest chunk has the same timestamp, newer
+        // than all the rest, inserted in reverse id order: which one a LIMIT 1
+        // returns must not depend on insertion or index order.
+        for (n, id) in ["tie-d", "tie-c", "tie-b", "tie-a"].into_iter().enumerate() {
+            for half in 0..2 {
+                let mut chunk = test_chunk(&format!("{id}-{half}"), "content");
+                chunk.conversation_id = id.into();
+                chunk.project_name = "proj-a".into();
+                chunk.timestamp = if half == 0 {
+                    "2026-09-15T00:00:00Z".into()
+                } else {
+                    format!("2026-09-0{}T00:00:00Z", 1 + n)
+                };
+                insert_chunk(&conn, &chunk, &[0.1; 4]).unwrap();
+            }
+        }
 
         for project in [Some("proj-a"), Some("proj-b"), Some("absent"), None] {
             for exclude_headless in [false, true] {
@@ -5683,6 +5712,19 @@ mod tests {
                     );
                 }
             }
+        }
+        // A tie is decided by conversation id, whatever the limit.
+        for limit in 1..=4 {
+            let ids: Vec<String> = recent_sessions(&conn, limit, Some("proj-a"), false)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.conversation_id)
+                .collect();
+            assert_eq!(
+                ids,
+                ["tie-a", "tie-b", "tie-c", "tie-d"][..limit],
+                "limit {limit}"
+            );
         }
         // The headless run is skipped only when asked.
         let all = recent_sessions(&conn, 10, Some("proj-a"), false).unwrap();
