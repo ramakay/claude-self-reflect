@@ -2,7 +2,8 @@
 //!
 //! The relay (`companion serve`) sees every hook of its Claude Code session. On the ones that
 //! change what a pane shows it writes one byte to a named pipe the pane keeps at
-//! `<keep>/panes/<sid>.wake`:
+//! `<keep>/panes/<sid>.<pid>.wake` (one per pane, so a second pane of a session takes nothing
+//! from the first):
 //!
 //! - `N`, at once: a turn ended, a prompt was sent, a compaction began.
 //! - `S`, soon: a tool finished, a measurement came. These arrive in bursts, so the pane
@@ -11,13 +12,26 @@
 //! A byte only lowers the latency of a redraw. The pane's own checks (`gate.rs`) are correct
 //! without it, for the sessions whose relay cannot reach them.
 //!
-//! No process id is trusted. The relay opens the pipe without blocking: with no pane reading it
-//! (one that ended, or crashed and left the file) the open fails and nothing is sent, and a
-//! process that took the dead pane's pid is never addressed at all.
+//! No process id is trusted, and the relay never removes anything. It opens each pipe without
+//! blocking: with no pane reading it (one that ended, or crashed and left the file) the open
+//! fails and nothing is sent, and a process that took the dead pane's pid is never addressed at
+//! all.
+//!
+//! Who is alive is told by a lock, not by a pid. A pane takes `flock(LOCK_EX)` on
+//! `<sid>.<pid>.lock` before it makes its pipe and holds it for as long as it lives, and removes
+//! both on a clean exit. The kernel drops the lock when the pane dies, however it dies. The next
+//! pane to start sweeps the entries it can lock with `LOCK_NB`: that no one else holds them is
+//! proved by the lock itself, whatever the pids or pid namespaces. The sweep and the pane remove
+//! only files of ours, in a folder of ours.
+//!
+//! Threat model: the same user. `keep` is CSR's private folder, so a link among its ancestors is
+//! accepted (the home folder may be a link to another disk); `panes` itself must be a real folder
+//! of ours, made 0700, or no pipe is used.
 use super::paths::valid_id;
 use std::{
     fs,
     io::{Read, Write},
+    os::fd::AsRawFd,
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -84,73 +98,191 @@ fn endpoints(keep: &Path, sid: &str) -> Vec<(PathBuf, u32)> {
         .collect()
 }
 
-/// Whether no process has this pid. Only used to tidy a pipe up, never to decide who is sent
-/// anything.
-fn gone(pid: u32) -> bool {
-    pid == 0
-        || (unsafe { libc::kill(pid as i32, 0) } != 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+fn euid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+/// The folder of the panes' pipes and locks, when it is a real folder (not a link) of ours.
+fn panes_dir(keep: &Path) -> Option<PathBuf> {
+    let dir = keep.join("panes");
+    let info = fs::symlink_metadata(&dir).ok()?;
+    (info.is_dir() && info.uid() == euid()).then_some(dir)
 }
 
 /// Tell the panes of `sid`, those that are listening. True when the byte reached at least one;
-/// a pane that is not there, or not reading, or not keeping up, is no error. The pipe of a pane
-/// whose process is gone is removed.
+/// a pane that is not there, or not reading, or not keeping up, is no error. Nothing is ever
+/// removed from here: a pipe no one reads is a pane's, about to be opened or left by one that
+/// crashed, and the next pane sweeps it.
 pub fn notify(keep: &Path, sid: &str, kind: Kind) -> bool {
+    if panes_dir(keep).is_none() {
+        return false;
+    }
     let mut sent = false;
-    for (path, pid) in endpoints(keep, sid) {
+    for (path, _) in endpoints(keep, sid) {
         let Ok(mut pipe) = fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
             .open(&path)
         else {
-            // Nobody reads it: it is a pane's pipe in the moment before it opens it, or a dead
-            // pane's.
-            if gone(pid) && fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_fifo()) {
-                let _ = fs::remove_file(&path);
-            }
             continue;
         };
         // Whatever sits at the path, a pipe of ours is the only thing a byte goes to.
         let ours = pipe
             .metadata()
-            .is_ok_and(|m| m.file_type().is_fifo() && m.uid() == unsafe { libc::geteuid() });
+            .is_ok_and(|m| m.file_type().is_fifo() && m.uid() == euid());
         sent |= ours && pipe.write_all(&[kind.byte()]).is_ok();
     }
     sent
 }
 
-/// The pane's end of its pipe. Dropping it removes the pipe, if it is still this one.
+/// Where the lock of the pane `pid` of `sid` is.
+fn lock_path(keep: &Path, sid: &str, pid: u32) -> Option<PathBuf> {
+    valid_id(sid).then(|| keep.join("panes").join(format!("{sid}.{pid}.lock")))
+}
+
+/// `flock(LOCK_EX | LOCK_NB)`: true when this call got the lock.
+fn try_lock(file: &fs::File) -> bool {
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Whether `path` still names the file `file` is open on: the lock file of a pane that ended
+/// can be removed between the open and the lock.
+fn still_there(file: &fs::File, path: &Path) -> bool {
+    match (file.metadata(), fs::symlink_metadata(path)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    }
+}
+
+/// Take the lock at `path`, making the file. None when someone alive holds it, or the file is
+/// not a plain file of ours. A holder that is only sweeping lets go within moments, so a held
+/// lock is tried a few times.
+fn take_lock(path: &Path) -> Option<fs::File> {
+    for _ in 0..5 {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        let info = file.metadata().ok()?;
+        if !info.is_file() || info.uid() != euid() {
+            return None;
+        }
+        if !try_lock(&file) {
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        if still_there(&file, path) {
+            return Some(file);
+        }
+    }
+    None
+}
+
+/// Remove what crashed panes left: for each lock in `dir` that can be taken now (so no live
+/// pane holds it, whatever its pid or pid namespace) and is a plain file of ours, its pipe if
+/// that is a pipe of ours, then the lock, both while holding it. `except` is the caller's own.
+fn sweep(dir: &Path, except: &Path) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let lock = entry.path();
+        if lock == except || lock.extension().is_none_or(|e| e != "lock") {
+            continue;
+        }
+        let Some(stem) = lock.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some((sid, pid)) = stem.rsplit_once('.') else {
+            continue;
+        };
+        if !valid_id(sid) || pid.parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(held) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&lock)
+        else {
+            continue;
+        };
+        let ours = held
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.uid() == euid());
+        if !ours || !try_lock(&held) || !still_there(&held, &lock) {
+            continue;
+        }
+        let pipe = dir.join(format!("{stem}.wake"));
+        match fs::symlink_metadata(&pipe) {
+            Ok(m) if m.file_type().is_fifo() && m.uid() == euid() => {
+                let _ = fs::remove_file(&pipe);
+            }
+            Ok(_) => continue,
+            Err(_) => (),
+        }
+        let _ = fs::remove_file(&lock);
+    }
+}
+
+/// The pane's end of its pipe. Dropping it removes the pipe, if it is still this one, and the
+/// lock.
 pub struct Listener {
     path: PathBuf,
     pipe: fs::File,
     id: (u64, u64),
+    lock_path: PathBuf,
+    lock: fs::File,
 }
 impl Listener {
     /// Make this process's pipe for `sid` and open it for reading, replacing whatever an earlier
-    /// process of the same pid left. None for an id that cannot be a file name, or when the
-    /// system says no.
+    /// process of the same pid left. None for an id that cannot be a file name, a `panes` folder
+    /// that is not ours, or when the system says no.
     pub fn open(keep: &Path, sid: &str) -> Option<Self> {
         Self::open_as(keep, sid, std::process::id())
     }
     fn open_as(keep: &Path, sid: &str, pid: u32) -> Option<Self> {
-        let path = pipe_path(keep, sid, pid)?;
-        let _ = fs::remove_file(&path);
-        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
-        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+        let lock_path = lock_path(keep, sid, pid)?;
+        super::private::ensure_dir(&keep.join("panes"), keep).ok()?;
+        let dir = panes_dir(keep)?;
+        // Before the pipe exists, so that a pipe with no live lock behind it is always a dead
+        // pane's.
+        let lock = take_lock(&lock_path)?;
+        let made = (|| {
+            sweep(&dir, &lock_path);
+            let path = pipe_path(keep, sid, pid)?;
+            // Holding the lock, no other process owns this name: it is an earlier image of this
+            // very process (a reload by `exec`).
+            let _ = fs::remove_file(&path);
+            let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+            if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+                return None;
+            }
+            // O_CLOEXEC is Rust's default: a reload by `exec` closes the pipe and the lock, and
+            // the next process makes its own, under the same pid and so the same names.
+            let pipe = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .ok()?;
+            let info = pipe.metadata().ok()?;
+            Some((path, (info.dev(), info.ino()), pipe))
+        })();
+        let Some((path, id, pipe)) = made else {
+            if still_there(&lock, &lock_path) {
+                let _ = fs::remove_file(&lock_path);
+            }
             return None;
-        }
-        // O_CLOEXEC is Rust's default: a reload by `exec` closes it and the next process makes
-        // its own, under the same pid and so the same name.
-        let pipe = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-            .ok()?;
-        let info = pipe.metadata().ok()?;
+        };
         Some(Self {
             path,
-            id: (info.dev(), info.ino()),
+            id,
             pipe,
+            lock_path,
+            lock,
         })
     }
     /// The wakes that came since the last call: (at once, soon).
@@ -173,6 +305,10 @@ impl Drop for Listener {
     fn drop(&mut self) {
         if fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id) {
             let _ = fs::remove_file(&self.path);
+        }
+        // Still holding the lock: no pane can have taken the name in between.
+        if still_there(&self.lock, &self.lock_path) {
+            let _ = fs::remove_file(&self.lock_path);
         }
     }
 }
@@ -225,7 +361,7 @@ impl Debounce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::{os::unix::fs::PermissionsExt, process::Command};
 
     #[test]
     fn the_hooks_that_change_a_pane_are_told_apart_by_how_soon() {
@@ -361,27 +497,127 @@ mod tests {
         assert!(!notify(d.path(), "s", Kind::Now), "nobody left");
     }
 
+    /// What a pane that crashed leaves: a lock no one holds and its pipe.
+    fn leave(keep: &Path, sid: &str, pid: u32) -> (PathBuf, PathBuf) {
+        let lock = lock_path(keep, sid, pid).unwrap();
+        fs::write(&lock, "").unwrap();
+        let pipe = pipe_path(keep, sid, pid).unwrap();
+        let name = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        (lock, pipe)
+    }
+
     #[test]
-    fn the_pipe_of_a_process_that_is_gone_is_removed_and_a_live_ones_is_not() {
+    fn the_relay_never_removes_a_pipe_whatever_its_pid_says() {
         let d = tempfile::tempdir().unwrap();
         fs::create_dir_all(d.path().join("panes")).unwrap();
         let mut child = Command::new("true").spawn().unwrap();
         let dead = child.id();
         child.wait().unwrap();
-        let make = |pid: u32| {
-            let path = pipe_path(d.path(), "s", pid).unwrap();
-            let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
-            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-            path
-        };
-        let left = make(dead);
-        let alive = make(std::process::id());
-        assert!(!notify(d.path(), "s", Kind::Now));
-        assert!(!left.exists(), "a dead pane's pipe is tidied away");
-        assert!(
-            alive.exists(),
-            "a live process may be about to read its own"
+        // A pid no process has, one a process has (this one: a reused pid looks the same), and
+        // one in no namespace this process can see.
+        let entries: Vec<_> = [dead, std::process::id(), 4_000_000_000]
+            .into_iter()
+            .map(|pid| leave(d.path(), "s", pid))
+            .collect();
+        for _ in 0..3 {
+            assert!(!notify(d.path(), "s", Kind::Now));
+            assert!(!notify(d.path(), "s", Kind::Burst));
+        }
+        for (lock, pipe) in &entries {
+            assert!(lock.exists() && pipe.exists(), "the relay removed {pipe:?}");
+        }
+    }
+
+    #[test]
+    fn a_crashed_panes_entry_is_swept_by_the_next_pane() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("panes")).unwrap();
+        let (lock, pipe) = leave(d.path(), "s", 1_000_001);
+        let (other_lock, other_pipe) = leave(d.path(), "t", 1_000_002);
+        // This process's own leftovers too: an earlier image of the same pid.
+        let mine = leave(d.path(), "s", 1_000_003);
+        let mut pane = Listener::open_as(d.path(), "s", 1_000_003).unwrap();
+        for gone in [&lock, &pipe, &other_lock, &other_pipe] {
+            assert!(!gone.exists(), "{gone:?} was left behind");
+        }
+        assert!(mine.0.exists() && mine.1.exists(), "the new pane's own");
+        assert!(notify(d.path(), "s", Kind::Now));
+        assert_eq!(pane.take(), (true, false), "and its pipe is a live one");
+    }
+
+    #[test]
+    fn a_live_panes_entry_survives_a_sweep() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("panes")).unwrap();
+        let mut live = Listener::open_as(d.path(), "s", 1_000_001).unwrap();
+        let held = (
+            lock_path(d.path(), "s", 1_000_001).unwrap(),
+            pipe_path(d.path(), "s", 1_000_001).unwrap(),
         );
+        let (stale_lock, stale_pipe) = leave(d.path(), "s", 1_000_002);
+        // Starting panes sweep, any number of times; the pid on the lock does not matter.
+        let mut next = Listener::open_as(d.path(), "s", 1_000_003).unwrap();
+        let _again = Listener::open_as(d.path(), "u", 1_000_004).unwrap();
+        assert!(held.0.exists() && held.1.exists(), "a live pane's entry");
+        assert!(!stale_lock.exists() && !stale_pipe.exists());
+        assert!(notify(d.path(), "s", Kind::Burst));
+        assert_eq!(live.take(), (false, true));
+        assert_eq!(next.take(), (false, true));
+    }
+
+    #[test]
+    fn a_pane_that_ends_cleanly_removes_its_pipe_and_its_lock() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("panes")).unwrap();
+        let pane = Listener::open_as(d.path(), "s", 1_000_001).unwrap();
+        let lock = lock_path(d.path(), "s", 1_000_001).unwrap();
+        assert!(lock.exists());
+        drop(pane);
+        let left: Vec<_> = fs::read_dir(d.path().join("panes")).unwrap().collect();
+        assert!(left.is_empty(), "left: {left:?}");
+    }
+
+    #[test]
+    fn a_pane_of_a_pid_that_a_live_pane_holds_does_not_replace_it() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("panes")).unwrap();
+        let mut first = Listener::open_as(d.path(), "s", 1_000_001).unwrap();
+        // The same name from another pid namespace: the lock says it is taken.
+        assert!(Listener::open_as(d.path(), "s", 1_000_001).is_none());
+        assert!(notify(d.path(), "s", Kind::Now));
+        assert_eq!(first.take(), (true, false), "the first is untouched");
+    }
+
+    #[test]
+    fn a_panes_folder_that_is_a_link_or_wide_open_is_not_used_as_it_is() {
+        let d = tempfile::tempdir().unwrap();
+        let elsewhere = d.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let keep = d.path().join("keep");
+        fs::create_dir_all(&keep).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, keep.join("panes")).unwrap();
+        assert!(Listener::open_as(&keep, "s", 1_000_001).is_none());
+        assert!(!notify(&keep, "s", Kind::Now));
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing made");
+        // A folder of ours that was made wide is made private again.
+        fs::remove_file(keep.join("panes")).unwrap();
+        fs::create_dir(keep.join("panes")).unwrap();
+        fs::set_permissions(keep.join("panes"), fs::Permissions::from_mode(0o755)).unwrap();
+        let _pane = Listener::open_as(&keep, "s", 1_000_001).unwrap();
+        let mode = fs::metadata(keep.join("panes"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // And one made by the pane itself starts private.
+        let fresh = d.path().join("fresh");
+        let _other = Listener::open_as(&fresh, "s", 1_000_002).unwrap();
+        let mode = fs::metadata(fresh.join("panes"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]
