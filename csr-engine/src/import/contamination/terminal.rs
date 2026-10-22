@@ -10,9 +10,12 @@
 //! them. Such text matches a typed question better than the answer does and
 //! carries no answer. The rule reads the text alone.
 //!
-//! It fires only when frames dominate: at least [`MIN_FRAMES`] frame segments
-//! and no more than a fifth of the segments being anything else. A chunk that
-//! holds one prompt line or one status line among real content is not replay.
+//! It fires only when the text is frames and nothing else: at least
+//! [`MIN_FRAMES`] frame segments, and no other segment but a first or last one
+//! cut mid-line by the chunk boundary. A test result, an error, an answer or
+//! any other substantive line disqualifies it, as does a chunk that holds one
+//! prompt line or one status line among real content. Search uses it to
+//! re-order only; import never drops on it.
 
 use std::sync::LazyLock;
 
@@ -33,14 +36,32 @@ static SPINNER: LazyLock<Regex> = LazyLock::new(|| {
         .expect("spinner regex")
 });
 
-/// A line of the Claude Code start banner: the logo glyphs, the version, the
-/// model and plan line, or the working-directory line.
-static BANNER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?:[\u{2590}\u{259b}\u{259c}\u{259d}\u{2598}\u{2588}\u{2580}\u{258c}]{3,}|Claude Code v\d|\bwith \w+ effort \u{00b7} Claude\b|~/\S*\s+\u{00b7}\s+/\w+$)",
-    )
-    .expect("banner regex")
+/// A run of the Claude Code logo glyphs. A progress bar (`████████`) is a run
+/// of the same block glyph; the logo mixes in the half and corner blocks.
+static LOGO_RUN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[\u{2590}\u{259b}\u{259c}\u{259d}\u{2598}\u{2588}\u{2580}\u{258c}]{3,}")
+        .expect("logo regex")
 });
+
+/// The banner's model and plan line (`Opus 5.5 with medium effort · Claude Max`).
+/// A banner is a recognisable structure only when this line is in the text.
+static MODEL_LINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bwith \w+ effort \u{00b7} Claude\b").expect("model line regex"));
+
+/// Version and working-directory lines of the banner.
+static BANNER_TEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:Claude Code v\d|\bwith \w+ effort \u{00b7} Claude\b|~/\S*\s+\u{00b7}\s+/\w+$)")
+        .expect("banner text regex")
+});
+
+/// Whether `line` is a line of the start banner: its logo glyphs (a run that
+/// is not a single repeated block), its version, model or directory line.
+fn is_banner_line(line: &str) -> bool {
+    BANNER_TEXT.is_match(line)
+        || LOGO_RUN
+            .find_iter(line)
+            .any(|run| run.as_str().chars().any(|c| c != '\u{2588}'))
+}
 
 /// Other TUI chrome that repeats on every frame.
 static CHROME: LazyLock<Regex> = LazyLock::new(|| {
@@ -55,33 +76,60 @@ enum Segment {
     Other,
 }
 
-/// Whether `text` is dominated by terminal-capture frames (keystroke replay,
-/// spinner and status rows, the start banner) and so carries no answer.
+/// Longest a first or last segment can be and still be the remnant of a frame
+/// the chunk boundary cut.
+const MAX_CUT_REMNANT_CHARS: usize = 20;
+
+/// Whether `text` is terminal-capture frames (keystroke replay, spinner and
+/// status rows, the start banner) and nothing else, so it carries no answer.
 pub fn is_terminal_replay(text: &str) -> bool {
-    let segments = segments(text);
+    let has_model_line = MODEL_LINE.is_match(text);
+    let segments = segments(text, has_model_line);
     if segments.len() < 2 {
         return false;
     }
     let frames = segments
         .iter()
-        .filter(|segment| **segment == Segment::Frame)
+        .filter(|(kind, _)| *kind == Segment::Frame)
         .count();
     let banners = segments
         .iter()
-        .filter(|segment| **segment == Segment::Banner)
+        .filter(|(kind, _)| *kind == Segment::Banner)
         .count();
-    let others = segments.len() - frames - banners;
-    let chrome = frames + banners;
-    let dominated = others * 5 <= segments.len();
-    (chrome >= MIN_FRAMES && dominated) || (banners >= 2 && others == 0)
+    let prompts: Vec<&str> = segments
+        .iter()
+        .filter_map(|(kind, rest)| {
+            (*kind == Segment::Frame)
+                .then(|| rest.strip_prefix('\u{276f}').map(str::trim))
+                .flatten()
+        })
+        .collect();
+    let last = segments.len() - 1;
+    let only_cut_remnants = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, (kind, _))| *kind == Segment::Other)
+        .all(|(at, (_, rest))| (at == 0 || at == last) && is_cut_remnant(rest, &prompts));
+    only_cut_remnants && (frames + banners >= MIN_FRAMES || banners >= 2)
+}
+
+/// A first or last segment the chunk boundary cut: part of a prompt line the
+/// frames repeat, or a few characters of a frame index.
+fn is_cut_remnant(rest: &str, prompts: &[&str]) -> bool {
+    rest.chars().count() <= MAX_CUT_REMNANT_CHARS
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == ' ')
+        || prompts.iter().any(|prompt| prompt.contains(rest))
 }
 
 /// Classify every `" | "`-joined segment of every line.
-fn segments(text: &str) -> Vec<Segment> {
+fn segments(text: &str, has_model_line: bool) -> Vec<(Segment, String)> {
     let mut parsed: Vec<(bool, String)> = Vec::new();
     for line in text.lines() {
         for piece in line.split(" | ") {
-            let piece = piece.trim();
+            // A line cut at a separator leaves a dangling `|`.
+            let piece = piece.trim().trim_end_matches('|').trim();
             if piece.is_empty() {
                 continue;
             }
@@ -99,19 +147,20 @@ fn segments(text: &str) -> Vec<Segment> {
         .iter()
         .enumerate()
         .map(|(at, (indexed, rest))| {
-            if rest.is_empty()
+            let kind = if rest.is_empty()
                 || rest == "\u{276f}"
                 || SPINNER.is_match(rest)
                 || CHROME.is_match(rest)
             {
                 Segment::Frame
-            } else if BANNER.is_match(rest) {
+            } else if has_model_line && is_banner_line(rest) {
                 Segment::Banner
             } else if prompt_text[at].is_some() && (*indexed || grows(&prompt_text, at)) {
                 Segment::Frame
             } else {
                 Segment::Other
-            }
+            };
+            (kind, rest.clone())
         })
         .collect()
 }
@@ -228,6 +277,24 @@ mod tests {
     fn a_few_shell_prompts_with_output_are_not_replay() {
         let text = "\u{276f} git status\nOn branch main\nnothing to commit, working tree clean\n\u{276f} git log -1\ncommit abc123\n\u{276f} cargo test\nrunning 4 tests\ntest result: ok. 4 passed";
         assert!(!is_terminal_replay(text));
+    }
+
+    /// Finding 1: block glyphs alone are not a banner.
+    #[test]
+    fn progress_bars_are_not_a_banner() {
+        assert!(!is_terminal_replay(
+            "download \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} 100%\nchecksum \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} verified"
+        ));
+    }
+
+    /// Finding 2: a real result among the status rows keeps the text in play.
+    #[test]
+    fn a_test_result_among_spinner_rows_is_not_replay() {
+        let text =
+            "* Testing\u{2026}\n".repeat(6) + "test result: FAILED. import_roundtrip panicked";
+        assert!(!is_terminal_replay(&text));
+        let spinners_only = "* Testing\u{2026}\n".repeat(6);
+        assert!(is_terminal_replay(&spinners_only));
     }
 
     #[test]
