@@ -12,6 +12,7 @@ pub mod provenance_backfill;
 mod provenance_matcher;
 pub(crate) mod queued_prompts;
 pub mod registry;
+mod script_calls;
 pub mod scrub;
 pub mod watcher;
 
@@ -109,9 +110,6 @@ struct MessageEvidence {
 pub(crate) struct CsrSuppressionStats {
     pub csr_tool_blocks_suppressed: usize,
     pub csr_hook_wrappers_scrubbed: usize,
-    /// Tool results dropped because they are a screen recorder's frames
-    /// ([`contamination::is_terminal_replay`]).
-    pub terminal_replay_suppressed: usize,
     /// Credentials redacted from the text, per kind. Counts only, never values.
     pub secrets: crate::redact::SecretCounts,
 }
@@ -1712,12 +1710,6 @@ fn sanitize_content(
                     sanitizer.stats.csr_tool_blocks_suppressed += 1;
                     continue;
                 }
-                // A pane-capture loop prints one line per frame; the dump is
-                // the question retyped and a spinner, never a finding.
-                if contamination::is_terminal_replay(&tool_result_text(&item)) {
-                    sanitizer.stats.terminal_replay_suppressed += 1;
-                    continue;
-                }
             }
             Some("text") => {
                 let RowText::Keep { scrub_wrappers } = row_text else {
@@ -1976,28 +1968,15 @@ pub(crate) fn drops_as_marker_only(msg: &serde_json::Value, combined_text: &str)
 }
 
 /// Whether a `tool_result` block's text is CSR's own search-result or
-/// `csr_why` output (see [`contamination::is_csr_tool_payload`]). The text is
+/// `csr_why` output (see [`contamination::is_csr_emission`]): only a whole
+/// emission, never a result that merely holds a CSR token. The text is
 /// read whole, whatever shape the content takes (a string, or an array of text
 /// parts), so a payload wrapped in JSON by a script runner is still seen.
 fn tool_result_is_csr_payload(item: &serde_json::Value) -> bool {
     match item.get("content") {
-        Some(serde_json::Value::String(text)) => contamination::is_csr_tool_payload(text),
-        Some(other) if !other.is_null() => contamination::is_csr_tool_payload(&other.to_string()),
+        Some(serde_json::Value::String(text)) => contamination::is_csr_emission(text),
+        Some(other) if !other.is_null() => contamination::is_csr_emission(&other.to_string()),
         _ => false,
-    }
-}
-
-/// The text of a `tool_result` block, whatever shape the content takes: a
-/// string, or an array of text parts joined by line breaks.
-fn tool_result_text(item: &serde_json::Value) -> String {
-    match item.get("content") {
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(serde_json::Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
     }
 }
 
@@ -2007,28 +1986,11 @@ fn tool_result_text(item: &serde_json::Value) -> String {
 /// script's other output is lost with them, which is the price of the one
 /// structural signal there is.
 fn exec_script_calls_csr(item: &serde_json::Value, name: &str) -> bool {
-    static CALL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(
-            r#"tools(?:\.mcp__claude[_-]self[_-]reflect__\w+|\[\s*["']mcp__claude[_-]self[_-]reflect__\w+["']\s*\])\s*\("#,
-        )
-        .expect("csr call expression regex")
-    });
     name == "exec"
         && item
             .get("input")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|script| {
-                // An actual call expression: a script that only quotes the
-                // namespace (an `rg` pattern, a comment, a string) is not one.
-                CALL.find_iter(script).any(|found| {
-                    let before = &script[..found.start()];
-                    let line = before.rsplit('\n').next().unwrap_or("");
-                    let quoted = before.ends_with(['"', '\'', '`']);
-                    let commented =
-                        line.trim_start().starts_with("//") || line.trim_start().starts_with('*');
-                    !quoted && !commented
-                })
-            })
+            .is_some_and(script_calls::script_calls_csr_tool)
 }
 
 pub(crate) fn is_csr_tool_use(item: &serde_json::Value, name: &str) -> bool {
@@ -3451,7 +3413,7 @@ mod tests {
     fn csr_output_in_a_non_csr_tool_result_is_suppressed_by_its_grammar() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("csr-payload.jsonl");
-        let payload = "\u{1f3af} RESULTS: 5 matches (partial relevance, top score: 0.450)\n\u{26a1} PERFORMANCE: 6ms (1 collection searched)\n\n<search>\n  <summary count=\"5\" relevance=\"partial\" top-score=\"0.450\">\n    <preview>PAYLOAD BODY</preview>";
+        let payload = "\u{1f3af} RESULTS: 5 matches (partial relevance, top score: 0.450)\n\u{26a1} PERFORMANCE: 6ms (1 collection searched)\n\n<search>\n  <summary count=\"5\" relevance=\"partial\" top-score=\"0.450\">\n    <preview>PAYLOAD BODY</preview>\n  </summary>\n  <meta>\n    <q>q</q>\n  </meta>\n  <results>\n    <r rank=\"1\">\n      <excerpt><![CDATA[PAYLOAD BODY]]></excerpt>\n    </r>\n  </results>\n</search>\n";
         let lines = [
             serde_json::json!({
                 "type": "assistant",
@@ -3494,43 +3456,26 @@ mod tests {
         );
     }
 
-    /// A fork polled a tmux pane and printed one line per frame; the dump was a
-    /// Bash tool result, so no tool name marks it. Excerpt of the live result
-    /// (agent-aa8201b27121421bd): the typed question retyped, then a spinner.
+    /// A pane-capture dump is search-side only: it sinks in ranking but import
+    /// keeps it, so a wrong verdict costs rank, never data.
     #[test]
-    fn a_terminal_recording_in_a_tool_result_is_dropped_and_counted() {
+    fn a_terminal_recording_in_a_tool_result_is_kept_at_import() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pane-capture.jsonl");
-        let frames = r#"y did we drop Docker and Qdrant
-24 20.706 9 ❯ why did we drop Docker and Qdrant f
-25 20.87 9 ❯ why did we drop Docker and Qdrant for
-26 21.034 9 ❯ why did we drop Docker and Qdrant for a
-27 21.2 9 ❯ why did we drop Docker and Qdrant for a s
-28 21.367 9 ❯ why did we drop Docker and Qdrant for a sin
-29 21.532 9 ❯ why did we drop Docker and Qdrant for a singl
-30 21.697 9 ❯ why did we drop Docker and Qdrant for a single
-31 21.863 9 ❯ why did we drop Docker and Qdrant for a single Ru
-32 22.028 9 ❯ why did we drop Docker and Qdrant for a single Rust
-33 22.197 9 ❯ why did we drop Docker and Qdrant for a single Rust b
-34 22.363 9 ❯ why did we drop Docker and Qdrant for a single Rust bin
-35 22.528 9 ❯ why did we drop Docker and Qdrant for a single Rust binar
-36 22.693 9 ❯ why did we drop Docker and Qdrant for a single Rust binary
-37 23.53 11 ❯ why did we d"#;
+        let frames = "24 20.706 9 \u{276f} why did we drop Docker and Qdrant f\n25 20.87 9 \u{276f} why did we drop Docker and Qdrant for\n26 21.034 9 \u{276f} why did we drop Docker and Qdrant for a\n27 21.2 9 \u{276f} why did we drop Docker and Qdrant for a s\n28 21.367 9 \u{276f} why did we drop Docker and Qdrant for a sin\n29 21.532 9 \u{276f} why did we drop Docker and Qdrant for a singl\n30 21.697 9 \u{276f} why did we drop Docker and Qdrant for a single";
         let lines = [
             serde_json::json!({
                 "type": "assistant",
                 "timestamp": "2026-10-11T12:00:00Z",
                 "message": {"content": [
-                    {"type": "tool_use", "id": "dump", "name": "Bash", "input": {"command": "python3 dump_frames.py"}},
-                    {"type": "tool_use", "id": "ls", "name": "Bash", "input": {"command": "ls"}}
+                    {"type": "tool_use", "id": "dump", "name": "Bash", "input": {"command": "python3 dump_frames.py"}}
                 ]}
             }),
             serde_json::json!({
                 "type": "user",
                 "timestamp": "2026-10-11T12:00:01Z",
                 "message": {"content": [
-                    {"type": "tool_result", "tool_use_id": "dump", "content": frames},
-                    {"type": "tool_result", "tool_use_id": "ls", "content": "\u{276f} one prompt line in a listing\nREADME.md\nsrc\nCargo.toml"}
+                    {"type": "tool_result", "tool_use_id": "dump", "content": frames}
                 ]}
             }),
         ];
@@ -3543,8 +3488,8 @@ mod tests {
                 .join("\n"),
         )
         .unwrap();
+        assert!(contamination::is_terminal_replay(frames));
         let parsed = parse_jsonl_file_with_stats(&path, "test").unwrap();
-        assert_eq!(parsed.suppression.terminal_replay_suppressed, 1);
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 0);
         let content = parsed
             .chunks
@@ -3552,11 +3497,7 @@ mod tests {
             .map(|chunk| chunk.content)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!content.contains("20.706"), "{content}");
-        assert!(
-            content.contains("one prompt line in a listing"),
-            "{content}"
-        );
+        assert!(content.contains("20.706"), "{content}");
     }
 
     /// A `Read` of CSR's own emitter and tool sources holds the format strings
@@ -3595,7 +3536,7 @@ mod tests {
         )
         .unwrap();
         for (_, text) in &sources {
-            assert!(!contamination::is_csr_tool_payload(text));
+            assert!(!contamination::is_csr_emission(text));
         }
         let parsed = parse_jsonl_file_with_stats(&path, "test").unwrap();
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 0);
@@ -3620,6 +3561,7 @@ mod tests {
             "text(await tools.exec_command({cmd:\"rg tools.mcp__claude_self_reflect__csr_why src\"}));",
             "// await tools.mcp__claude_self_reflect__csr_why({query:\"q\"})\ntext(await tools.exec_command({cmd:\"ls\"}));",
             "const note = \"tools.mcp__claude_self_reflect__csr_why(\";",
+            "text(await tools.exec_command({cmd: \"rg -F 'await tools.mcp__claude_self_reflect__csr_why(' csr-engine/src\"}))",
         ] {
             let item = script(source);
             assert!(!is_csr_tool_use(&item, "exec"), "{source}");

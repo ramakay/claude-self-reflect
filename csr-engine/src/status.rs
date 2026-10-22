@@ -67,8 +67,6 @@ pub struct StatusReport {
     pub csr_self_suppressed: i64,
     pub csr_tool_blocks_suppressed: i64,
     pub csr_hook_wrappers_scrubbed: i64,
-    /// Tool results dropped at import as a terminal recorder's frames.
-    pub terminal_replay_suppressed: i64,
     /// Why the code-graph drain last failed (it lists projects that failed or a
     /// lock that cannot be opened); `None` while it runs clean.
     pub graph_drain_error: Option<String>,
@@ -1381,7 +1379,6 @@ fn gather_status_with(
             csr_self_suppressed: 0,
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
-            terminal_replay_suppressed: 0,
             graph_drain_error: None,
             secrets_redacted: SecretsRedactedStatus::default(),
             mirror: MirrorStatus::default(),
@@ -1431,7 +1428,6 @@ fn gather_status_with(
     let csr_self_suppressed = storage.get_csr_self_suppressed().unwrap_or(0);
     let csr_tool_blocks_suppressed = storage.get_csr_tool_blocks_suppressed().unwrap_or(0);
     let csr_hook_wrappers_scrubbed = storage.get_csr_hook_wrappers_scrubbed().unwrap_or(0);
-    let terminal_replay_suppressed = storage.get_terminal_replay_suppressed().unwrap_or(0);
     let graph_drain_error = storage
         .get_meta(crate::extraction::graph_drain::ERROR_KEY)
         .ok()
@@ -1551,7 +1547,6 @@ fn gather_status_with(
         csr_self_suppressed,
         csr_tool_blocks_suppressed,
         csr_hook_wrappers_scrubbed,
-        terminal_replay_suppressed,
         graph_drain_error,
         secrets_redacted,
         mirror,
@@ -2882,7 +2877,6 @@ mod tests {
             csr_self_suppressed: 0,
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
-            terminal_replay_suppressed: 0,
             graph_drain_error: None,
             secrets_redacted: SecretsRedactedStatus::default(),
             mirror: MirrorStatus::default(),
@@ -3966,14 +3960,12 @@ mod tests {
         let storage = Storage::open(&db_path).unwrap();
         storage.set_meta("csr_tool_blocks_suppressed", "4").unwrap();
         storage.set_meta("csr_hook_wrappers_scrubbed", "2").unwrap();
-        storage.set_meta("terminal_replay_suppressed", "7").unwrap();
 
         let value =
             serde_json::to_value(gather_status(&db_path, &projects_dir, false).unwrap()).unwrap();
         assert_eq!(value["csr_tool_blocks_suppressed"], 4);
         assert_eq!(value["csr_hook_wrappers_scrubbed"], 2);
         assert_eq!(value["csr_self_suppressed"], 6);
-        assert_eq!(value["terminal_replay_suppressed"], 7);
     }
 
     #[test]
