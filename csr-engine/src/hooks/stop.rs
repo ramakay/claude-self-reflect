@@ -253,6 +253,68 @@ fn is_git_committing_command(command: &str) -> bool {
     })
 }
 
+/// A `<sha> <subject>` line, as `git log --oneline` prints it.
+static ONELINE_COMMIT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^([0-9a-f]{7,40}) (\S[^\n]*)$").unwrap());
+
+/// What `gh pr view --json state,mergeCommit` prints for a merged PR:
+/// `MERGED <sha>` or `MERGED <mergedAt> <sha>`.
+static MERGED_PR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^MERGED[ \t]+(?:\S+Z[ \t]+)?([0-9a-f]{7,40})\b").unwrap()
+});
+
+/// The commits one successful committing Bash call made, as `(sha, subject)`.
+///
+/// The `[<branch> <sha>] <subject>` line git prints is proof by itself. A quiet
+/// commit (`git commit -q`, the usual form here) prints no such line; its call
+/// then ends with `git log --oneline -1` or similar, which prints
+/// `<sha> <subject>`. That line counts only when its subject appears in the
+/// command, so a commit that failed behind a `;` (the log then shows an older
+/// HEAD) and a `git log -5` listing give no receipt. A message the shell
+/// quoted differently from how git prints it simply gives none.
+fn commits_made(command: &str, output: &str) -> Vec<(String, String)> {
+    let printed: Vec<(String, String)> = GIT_COMMIT_LINE_RE
+        .captures_iter(output)
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect();
+    if !printed.is_empty() {
+        return printed;
+    }
+    ONELINE_COMMIT_RE
+        .captures_iter(output)
+        .filter(|c| command.contains(&c[2]))
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect()
+}
+
+/// The PR number of the one `gh pr merge <N>` a Bash command runs, or `None`
+/// when it runs none or several (the output could not be told apart).
+fn merge_command_pr(command: &str) -> Option<String> {
+    let mut numbers = shell_simple_commands(command).into_iter().filter_map(|words| {
+        let at = words.iter().position(|w| w == "gh" || w.ends_with("/gh"))?;
+        let rest = &words[at + 1..];
+        (rest.first().map(String::as_str) == Some("pr")
+            && rest.get(1).map(String::as_str) == Some("merge"))
+        .then(|| {
+            rest[2..]
+                .iter()
+                .find(|w| !w.starts_with('-'))
+                .map(|w| w.rsplit('/').next().unwrap_or(w).to_string())
+                .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        })
+    });
+    let first = numbers.next()??;
+    numbers.next().is_none().then_some(first)
+}
+
+/// The merge commit a successful call reports for the PR it merged, as
+/// `(sha, claim)`.
+fn merged_pr(command: &str, output: &str) -> Option<(String, String)> {
+    let number = merge_command_pr(command)?;
+    let sha = MERGED_PR_RE.captures(output)?[1].to_string();
+    Some((sha, format!("merged PR #{number}")))
+}
+
 /// Rows Claude Code writes into the user channel as plain text. Nobody typed
 /// them, so they are never a task.
 const HARNESS_USER_ROW_PREFIXES: [&str; 4] = [
@@ -866,8 +928,8 @@ where
     // Whether the assistant finished a turn since the latest task was asked.
     // A task prompt arriving while that turn is still open continues it.
     let mut turn_finished = true;
-    // Bash tool_use ids whose command can print a commit success line.
-    let mut git_tool_ids: HashSet<String> = HashSet::new();
+    // Bash tool_use ids whose command can commit or merge, with the command.
+    let mut git_calls: HashMap<String, String> = HashMap::new();
     // The session's receipts, latest last, each with the index of the task
     // segment it was produced under (None before the first task).
     let mut completions: Vec<(CompletionReceipt, Option<usize>)> = Vec::new();
@@ -1031,15 +1093,18 @@ where
                                 }
 
                                 if name == "Bash" && !sidechain {
-                                    let commits = block
+                                    let command = block
                                         .get("input")
                                         .and_then(|i| i.get("command"))
-                                        .and_then(|c| c.as_str())
-                                        .is_some_and(is_git_committing_command);
-                                    if let (true, Some(id)) =
-                                        (commits, block.get("id").and_then(|v| v.as_str()))
+                                        .and_then(|c| c.as_str());
+                                    if let (Some(command), Some(id)) =
+                                        (command, block.get("id").and_then(|v| v.as_str()))
                                     {
-                                        git_tool_ids.insert(id.to_string());
+                                        if is_git_committing_command(command)
+                                            || merge_command_pr(command).is_some()
+                                        {
+                                            git_calls.insert(id.to_string(), command.to_string());
+                                        }
                                     }
                                 }
 
@@ -1153,10 +1218,10 @@ where
                             .get("content")
                             .map(extract_text_from_content)
                             .unwrap_or_default();
-                        let from_git = block
+                        let git_command = block
                             .get("tool_use_id")
                             .and_then(|v| v.as_str())
-                            .is_some_and(|id| git_tool_ids.contains(id));
+                            .and_then(|id| git_calls.get(id));
                         let failed = block.get("is_error").and_then(|v| v.as_bool()) == Some(true);
                         // A tool call that FAILED. Output that merely contains
                         // error words (a Read or Grep of source, a quoted test
@@ -1166,16 +1231,19 @@ where
                         if failed && !sidechain {
                             late_errors = true;
                         }
-                        if from_git && !failed && !sidechain {
-                            for commit in GIT_COMMIT_LINE_RE.captures_iter(&block_text) {
+                        if let (Some(command), false, false) = (git_command, failed, sidechain) {
+                            let made = commits_made(command, &block_text)
+                                .into_iter()
+                                .chain(merged_pr(command, &block_text));
+                            for (sha, subject) in made {
                                 if let Some(task) = segments.last_mut() {
                                     task.commits += 1;
                                 }
                                 push_completion(
                                     &mut completions,
                                     segments.len().checked_sub(1),
-                                    &commit[2],
-                                    &commit[1][..7],
+                                    &subject,
+                                    &sha[..7],
                                 );
                             }
                         }
@@ -4392,6 +4460,90 @@ mod tests {
             one
         );
         assert!(commit_receipts_for("echo git commit").is_empty());
+    }
+
+    fn bash_receipts(command: &str, output: &str, failed: bool) -> Vec<CompletionReceipt> {
+        extract(&[
+            typed_line("land the recap fix", "typed"),
+            assistant_named_tool("Bash", "toolu_g", serde_json::json!({"command": command})),
+            if failed {
+                error_result("toolu_g", output)
+            } else {
+                tool_result_bound("toolu_g", output)
+            },
+        ])
+        .completions
+    }
+
+    fn receipt(claim: &str, receipt: &str) -> CompletionReceipt {
+        CompletionReceipt {
+            claim: claim.into(),
+            receipt: receipt.into(),
+        }
+    }
+
+    #[test]
+    fn a_quiet_commit_is_a_receipt_when_the_log_line_names_its_own_subject() {
+        let command = r#"git add -A && git commit -q -m "fix(recap): subject" && git log --oneline -1"#;
+        assert_eq!(
+            bash_receipts(command, "1a2b3c4 fix(recap): subject", false),
+            vec![receipt("fix(recap): subject", "1a2b3c4")]
+        );
+        // A heredoc message carries the subject on its first line.
+        let heredoc = "git commit -q -F - <<'EOF'\nfix(recap): subject\n\nbody\nEOF\ngit log --oneline -1";
+        assert_eq!(
+            bash_receipts(heredoc, "1a2b3c4 fix(recap): subject", false),
+            vec![receipt("fix(recap): subject", "1a2b3c4")]
+        );
+        // Hook chatter before the line changes nothing.
+        assert_eq!(
+            bash_receipts(command, "no leaks found\n1a2b3c4 fix(recap): subject", false),
+            vec![receipt("fix(recap): subject", "1a2b3c4")]
+        );
+    }
+
+    #[test]
+    fn a_quiet_commit_gives_no_receipt_for_a_commit_it_did_not_make() {
+        // The commit failed behind a `;`: the log shows the older HEAD.
+        let command = r#"git commit -q -m "feat: new thing"; git log --oneline -1"#;
+        assert!(bash_receipts(command, "9d8c7b6 fix: older commit", false).is_empty());
+        // A longer log lists older commits too; only the one in the command counts.
+        let command = r#"git commit -q -m "feat: new thing" && git log --oneline -3"#;
+        assert_eq!(
+            bash_receipts(
+                command,
+                "aaa1111 feat: new thing\nbbb2222 fix: older commit\nccc3333 chore: older still",
+                false
+            ),
+            vec![receipt("feat: new thing", "aaa1111")]
+        );
+        // A call that failed is no receipt even when the line is there.
+        let command = r#"git commit -q -m "feat: new thing" && git log --oneline -1"#;
+        assert!(bash_receipts(command, "aaa1111 feat: new thing", true).is_empty());
+        // A log line without a committing command in the call is history.
+        assert!(bash_receipts("git log --oneline -1", "aaa1111 feat: new thing", false).is_empty());
+    }
+
+    #[test]
+    fn a_merged_pr_is_a_receipt_only_with_the_merge_commit_in_the_output() {
+        let command = "gh pr merge 76 --squash 2>&1 | tail -3; gh pr view 76 --json state,mergeCommit -q '.state+\" \"+.mergeCommit.oid'";
+        assert_eq!(
+            bash_receipts(command, "MERGED a8f845882e5068d3eed6d2ca160b182a49c23b06", false),
+            vec![receipt("merged PR #76", "a8f8458")]
+        );
+        assert_eq!(
+            bash_receipts(command, "MERGED 2026-10-21T00:22:31Z 5b1a3b1", false),
+            vec![receipt("merged PR #76", "5b1a3b1")]
+        );
+        // Still open, or the call failed: nothing was merged.
+        assert!(bash_receipts(command, "OPEN ", false).is_empty());
+        assert!(bash_receipts(command, "MERGED a8f8458", true).is_empty());
+        // Two merges in one call cannot be told apart.
+        let two = "gh pr merge 1 --squash; gh pr merge 2 --squash; gh pr view 2 --json state,mergeCommit";
+        assert!(bash_receipts(two, "MERGED a8f8458", false).is_empty());
+        // A view of an already merged PR is not a merge by this session.
+        assert!(bash_receipts("gh pr view 76 --json state,mergeCommit", "MERGED a8f8458", false)
+            .is_empty());
     }
 
     fn sidechain(line: String) -> String {
