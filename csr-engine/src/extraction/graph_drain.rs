@@ -50,7 +50,7 @@ pub const DRAIN_INTERVAL: Duration = Duration::from_secs(15);
 const LOCK_FILE: &str = "graph-drain.lock";
 
 /// What one drain did.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct GraphDrain {
     /// Projects resolved and ranked.
     pub projects: usize,
@@ -64,6 +64,9 @@ pub struct GraphDrain {
     pub replans: usize,
     /// Projects drained inside one write transaction after repeated drops.
     pub locked_passes: usize,
+    /// Projects whose pass failed, with the error. A failed project is left
+    /// pending and rolled back; the others are drained regardless.
+    pub errors: Vec<(String, String)>,
     /// Wall time of the whole drain.
     pub elapsed: Duration,
     /// Longest the database write lock was held by one transaction.
@@ -128,8 +131,13 @@ pub fn drain_with(
     for project in projects {
         let files: Vec<&(String, String, i64)> =
             pending.iter().filter(|(p, _, _)| p == project).collect();
-        drain_project(conn, project, &files, file_exists, between, &mut out)?;
-        out.projects += 1;
+        // One project failing must not starve the ones after it: its
+        // transaction rolled back, its files stay pending, the next pass tries
+        // it again.
+        match drain_project(conn, project, &files, file_exists, between, &mut out) {
+            Ok(()) => out.projects += 1,
+            Err(e) => out.errors.push((project.to_string(), format!("{e:#}"))),
+        }
     }
     out.elapsed = started.elapsed();
     Ok(out)
@@ -575,5 +583,41 @@ mod tests {
             })
             .unwrap();
         assert_eq!(violations, 0);
+    }
+
+    #[test]
+    fn a_project_that_fails_does_not_stop_the_projects_after_it() {
+        let (_dir, db, storage) = extracted();
+        // An alphabetically earlier project whose rank write fails.
+        storage
+            .with_connection(|c| {
+                let other = |id: &str, file: &str, name: &str| NodeRow {
+                    project: "aaa".into(),
+                    ..def(id, file, name)
+                };
+                upsert_node(c, &other("bad_node", "x.rs", "bad"))?;
+                codegraph::replace_file_edges(c, "aaa", "x.rs", &[])?;
+                c.execute_batch(
+                    "CREATE TRIGGER rank_fails BEFORE INSERT ON code_node_rank
+                     WHEN NEW.node_id = 'bad_node'
+                     BEGIN SELECT RAISE(ABORT, 'rank write failed'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .upsert_code_file_state_pending("aaa", "x.rs", "hash-x")
+            .unwrap();
+
+        let report = drain_if_pending(&storage, &db).unwrap().unwrap();
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].0, "aaa");
+        assert!(report.errors[0].1.contains("rank write failed"));
+        // The later project was drained and settled.
+        assert_eq!(report.projects, 1);
+        assert_eq!(edge_state(&storage), ("callee".into(), 1));
+        let left = pending(&storage);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, "aaa", "the failed project stays pending");
     }
 }

@@ -1830,21 +1830,24 @@ async fn run(
     }) = args.command
     {
         let storage = csr_engine::storage::Storage::open(&args.db_path)?;
-        let report =
-            match csr_engine::extraction::graph_drain::drain_if_pending(&storage, &args.db_path)? {
-                Some(drain) => serde_json::json!({
-                    "drained": true,
-                    "projects": drain.projects,
-                    "files": drain.files,
-                    "edge_writes": drain.edge_writes,
-                    "rank_writes": drain.rank_writes,
-                    "replans": drain.replans,
-                    "locked_passes": drain.locked_passes,
-                    "ms": drain.elapsed.as_millis() as u64,
-                    "longest_lock_hold_ms": drain.longest_lock_hold.as_millis() as u64,
-                }),
-                None => serde_json::json!({ "drained": false }),
-            };
+        let report = match csr_engine::extraction::graph_drain::drain_if_pending(
+            &storage,
+            &args.db_path,
+        )? {
+            Some(drain) => serde_json::json!({
+                "drained": true,
+                "projects": drain.projects,
+                "files": drain.files,
+                "edge_writes": drain.edge_writes,
+                "rank_writes": drain.rank_writes,
+                "replans": drain.replans,
+                "locked_passes": drain.locked_passes,
+                "failed_projects": drain.errors.iter().map(|(p, e)| serde_json::json!({"project": p, "error": e})).collect::<Vec<_>>(),
+                "ms": drain.elapsed.as_millis() as u64,
+                "longest_lock_hold_ms": drain.longest_lock_hold.as_millis() as u64,
+            }),
+            None => serde_json::json!({ "drained": false }),
+        };
         println!("{report}");
         return Ok(());
     }

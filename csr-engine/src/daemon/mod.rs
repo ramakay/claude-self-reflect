@@ -3045,15 +3045,23 @@ pub async fn graph_drain_tick(storage: Arc<Storage>, db_path: PathBuf) {
     })
     .await;
     match result {
-        Ok(Ok(Some(drain))) => tracing::info!(
-            projects = drain.projects,
-            files = drain.files,
-            edge_writes = drain.edge_writes,
-            rank_writes = drain.rank_writes,
-            ms = drain.elapsed.as_millis() as u64,
-            lock_ms = drain.longest_lock_hold.as_millis() as u64,
-            "code graph drained"
-        ),
+        Ok(Ok(Some(drain))) => {
+            for (project, error) in &drain.errors {
+                tracing::warn!(%project, "code graph drain failed for a project: {error}");
+            }
+            tracing::info!(
+                projects = drain.projects,
+                files = drain.files,
+                edge_writes = drain.edge_writes,
+                rank_writes = drain.rank_writes,
+                replans = drain.replans,
+                locked_passes = drain.locked_passes,
+                failed = drain.errors.len(),
+                ms = drain.elapsed.as_millis() as u64,
+                lock_ms = drain.longest_lock_hold.as_millis() as u64,
+                "code graph drained"
+            )
+        }
         Ok(Ok(None)) => {}
         Ok(Err(e)) => tracing::warn!("code graph drain failed: {e}"),
         Err(e) => tracing::warn!("code graph drain panicked: {e}"),
