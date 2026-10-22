@@ -5,8 +5,8 @@
 Single Rust binary (`csr-engine`). No Python, no Docker, no Qdrant.
 
 ```
-csr-engine (78MB)
-  ├── MCP server (rmcp, 13 tools)
+csr-engine (94MB)
+  ├── MCP server (rmcp, 16 tools)
   ├── Embeddings (FastEmbed, 384-dim, local)
   ├── Search (HNSW, <1ms p95)
   ├── Storage (SQLite)
@@ -29,7 +29,7 @@ csr-engine eval --full         # Full eval (20 tests, ~200ms)
 csr-engine quality <file>      # AST code quality analysis
 ```
 
-## MCP Tools (14 total)
+## MCP Tools (16 total)
 
 ```
 csr_reflect_on_past   — Semantic search across past conversations
@@ -46,6 +46,8 @@ get_full_conversation — Complete JSONL retrieval
 get_session_learnings — Iteration memory for Ralph loops
 csr_code_graph        — Which conversations shaped a function/file (AST anchors)
 csr_why               — Provenance chain: why does this code/decision exist (reinstatement recall)
+csr_resolve           — Record verified verdicts (resolved/still_open/regressed) on chunks; resolved demote+annotate in future searches
+csr_transcript        — Structured facts from a session transcript JSONL (stats, prompts, tool calls, files, errors, slices, grep)
 ```
 
 ## Critical Rules
@@ -89,7 +91,7 @@ cargo bench --bench spike_bench
 ### Key Patterns
 
 - **rmcp tool params**: Use `Parameters<MyStruct>` pattern, NOT individual `#[tool(param)]`
-- **rmcp tool annotations**: All 13 tools have `annotations(read_only_hint, destructive_hint, idempotent_hint)` in macro
+- **rmcp tool annotations**: All 16 tools declare `annotations(...)` in the macro
 - **rmcp 1.6 builders**: `ServerInfo::new(caps).with_instructions()`, `Implementation::new()`, `ReadResourceResult::new()`
 - **fastembed**: Requires `aarch64` Rust — no x86_64-apple-darwin ONNX binaries
 - **rusqlite 0.38**: No `ToSql` for `usize` — cast to `i64`

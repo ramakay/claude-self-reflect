@@ -6,7 +6,7 @@ title: Installation
 
 - **macOS** (Apple Silicon) or **Linux** (x86_64 / ARM64)
 - **Claude Code** CLI installed
-- ~78 MB disk for the binary, ~87 MB for the embedding model (downloaded on first run); the database grows with your history
+- ~94 MB disk for the binary, ~87 MB for the embedding model (downloaded on first run); the database grows with your history
 - For the optional companion pane: Claude Code 2.1.296 or later, and the [herdr](https://herdr.dev) terminal multiplexer (`brew install herdr`)
 
 No Docker, no API keys, and no Node, TypeScript or Python at run time: the companion pane runs inside the `csr-engine` binary.

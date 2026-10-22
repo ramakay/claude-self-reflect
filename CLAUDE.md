@@ -37,7 +37,7 @@ protected and moves only through reviewed PRs merged by the maintainer.
 Single Rust binary (`csr-engine`). No Python, no Docker, no Qdrant.
 
 ```
-csr-engine (~78MB release build)
+csr-engine (~94MB release build)
   ├── MCP server (rmcp, 16 tools)
   ├── Embeddings (FastEmbed, 384-dim, local)
   ├── Search (HNSW, <1ms p95)
@@ -123,7 +123,7 @@ csr_transcript        — Structured facts from a session transcript JSONL (stat
 # Build
 cd csr-engine && cargo build --release
 
-# Test suite — 5,112 tests: 4,649 lib + 463 across 20 integration targets (verified at commit 3fdf2558); `cargo test` runs all of them
+# Test suite — 5,316 tests: 4,821 lib + 495 across 23 integration targets (verified at commit e7c6e00e); `cargo test` runs all of them
 cargo test
 cargo test --test hooks_integration
 cargo test --test integration

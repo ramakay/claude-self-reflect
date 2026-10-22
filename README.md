@@ -8,7 +8,7 @@
 
 **Claude forgets everything. This fixes that.**
 
-Single 78MB binary. Embedded SQLite, no database server. No containers. No API keys required.
+Single 94MB binary. Embedded SQLite, no database server. No containers. No API keys required.
 
 [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [Paper](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
@@ -17,7 +17,7 @@ Single 78MB binary. Embedded SQLite, no database server. No containers. No API k
 > Dreaming checks old conclusions against your git history and marks a stale anchor with the commit that changed it. No LLM in that check.
 > CSR also reads plans, task state, Codex sessions, subagent transcripts, memory-file metadata and the session registry, and ships a companion plugin with a pane beside the session.
 > A live code map covers every definition in the repos your sessions work in, across main and every worktree, so CSR can answer for code no conversation touched.
-> Sub-millisecond search, 5,112 tests passing (4,649 lib, 463 across 20 integration targets, 19 more ignored; verified at commit 3fdf2558), zero external dependencies.
+> Sub-millisecond search, 5,316 tests passing (4,821 lib, 495 across 23 integration targets, 19 more ignored; verified at commit e7c6e00e), zero external dependencies.
 > [Release notes](CHANGELOG.md)
 
 <img src="docs-site/public/images/csr-demo.gif" alt="CSR Demo — Setup, Search, and Hooks" width="800" />
@@ -59,12 +59,12 @@ No special syntax. No commands. Install once, and past context appears automatic
 
 ---
 
-## One Binary. 78MB.
+## One Binary. 94MB.
 
 <a href="https://ramakay.github.io/claude-self-reflect/#/docs/architecture">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-02-arch-dark.png" />
-  <img align="right" src="docs-site/public/images/card-02-arch-light.png" alt="Architecture — One Binary, 78MB" width="420" />
+  <img align="right" src="docs-site/public/images/card-02-arch-light.png" alt="Architecture — One Binary, 94MB" width="420" />
 </picture>
 </a>
 
@@ -292,7 +292,7 @@ No special syntax. No commands. CSR finds relevant past context and injects it a
 |--------|-------|
 | **Cached startup** | 7.1s with an 834K-chunk index (`csr-engine eval` startup line); scales with index size |
 | **Search latency (p95)** | <1ms |
-| **Binary size** | 78MB |
+| **Binary size** | 94MB (aarch64-apple-darwin release build) |
 | **Import speed** | ~20 conversations/sec |
 | **Embedding** | 0.73ms/text (batch) |
 
