@@ -2532,6 +2532,12 @@ fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
     text
 }
 
+/// `path` made absolute against `cwd` (the directory the user ran setup from).
+fn absolute_in(cwd: &Path, path: &Path) -> std::path::PathBuf {
+    let joined = cwd.join(path);
+    std::path::absolute(&joined).unwrap_or(joined)
+}
+
 /// The path to store for this binary. Not the canonical one: a symlink such as
 /// `~/.local/bin/csr-engine` that an upgrade repoints keeps working, while the
 /// versioned file it pointed at may be deleted. The name setup was invoked by
@@ -2551,16 +2557,16 @@ fn stable_engine_path(
     let candidate = argv0.and_then(|name| {
         let name = Path::new(name);
         if name.components().count() > 1 {
-            Some(std::path::absolute(cwd.join(name)).unwrap_or_else(|_| cwd.join(name)))
+            Some(absolute_in(cwd, name))
         } else {
             let path_var = path_var?;
             std::env::split_paths(path_var)
-                .map(|dir| dir.join(name))
+                .map(|dir| absolute_in(cwd, &dir.join(name)))
                 .find(|p| p.is_file())
         }
     });
     match candidate {
-        Some(path) if same_file(&path) => path,
+        Some(path) if path.is_absolute() && same_file(&path) => path,
         _ => current_exe.to_path_buf(),
     }
 }
@@ -4655,6 +4661,31 @@ esac
         // invoked by a relative path
         let relative = stable_engine_path(Some("bin/csr-engine".as_ref()), cwd, None, &running);
         assert_eq!(relative, bin.join("csr-engine"));
+
+        // A relative PATH entry means "relative to where the user stood": launchd
+        // cannot resolve that, so the stored path is made absolute against cwd.
+        let relative_entry = stable_engine_path(
+            Some("csr-engine".as_ref()),
+            cwd,
+            Some(std::ffi::OsStr::new("bin")),
+            &running,
+        );
+        assert_eq!(relative_entry, bin.join("csr-engine"));
+        let dotted_entry = stable_engine_path(
+            Some("csr-engine".as_ref()),
+            cwd,
+            Some(std::ffi::OsStr::new("./bin")),
+            &running,
+        );
+        assert_eq!(dotted_entry, bin.join("csr-engine"));
+        // never a relative path in the plist, whatever the inputs
+        let from_relative_cwd = stable_engine_path(
+            Some("csr-engine".as_ref()),
+            Path::new("."),
+            Some(std::ffi::OsStr::new("bin")),
+            &running,
+        );
+        assert!(from_relative_cwd.is_absolute(), "{from_relative_cwd:?}");
 
         // A different file on PATH (a shim) is not this binary: the running one wins.
         let shim_dir = dir.path().join("shim");
