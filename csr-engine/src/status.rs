@@ -2052,30 +2052,112 @@ static DREAM_KIND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     regex::Regex::new(r#""kind"\s*:\s*"(?:dream|batch)""#).expect("a fixed pattern")
 });
 
+/// Visit the non-empty lines of `path` from the last to the first, reading
+/// `chunk` bytes at a time from the end. `visit` returns false to stop, so a
+/// reader that only wants the recent tail never touches the rest of the file.
+fn lines_from_end(path: &Path, chunk: usize, mut visit: impl FnMut(&[u8]) -> bool) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return;
+    };
+    let Ok(mut pos) = file.seek(SeekFrom::End(0)) else {
+        return;
+    };
+    // Bytes after the newline that ended the previous chunk's first line: the
+    // start of a line whose beginning is still earlier in the file.
+    let mut pending: Vec<u8> = Vec::new();
+    let chunk = chunk.max(1) as u64;
+    while pos > 0 {
+        let take = chunk.min(pos);
+        pos -= take;
+        let mut buf = vec![0u8; take as usize];
+        if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut buf).is_err() {
+            return;
+        }
+        buf.extend_from_slice(&pending);
+        let mut pieces = buf.split(|b| *b == b'\n');
+        // The first piece may be the tail of a line that began earlier.
+        let first = pieces.next().unwrap_or_default().to_vec();
+        let rest: Vec<&[u8]> = pieces.collect();
+        for line in rest.iter().rev() {
+            if !line.is_empty() && !visit(line) {
+                return;
+            }
+        }
+        pending = first;
+    }
+    if !pending.is_empty() {
+        visit(&pending);
+    }
+}
+
+/// `"at": 1234.5` somewhere in a record, with or without spaces. Only a hint
+/// for where to stop reading; the exact test happens after parsing.
+static AT_FIELD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#""at"\s*:\s*(-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"#)
+        .expect("a fixed pattern")
+});
+
+/// Lines this much older than the cutoff count towards ending the backward
+/// read. The logs are append-only and written as things happen, so time runs
+/// forward in them; the margin absorbs a record written a little out of order
+/// (a batch stamped when it started, a late answer).
+const SCAN_SLACK_SECS: f64 = 86_400.0;
+
+/// How many such old lines in a row end the read. One is not enough: the live
+/// log holds stray records with a fixed old stamp (a test fixture wrote them,
+/// 251 hours older than their neighbours) among current ones. A real boundary
+/// is thousands of old lines; a stray is one or two.
+const SCAN_OLD_RUN: usize = 64;
+
 /// Distinct companion dreams at or after `since` (epoch seconds), counted the
 /// way the pane counts them (`companion::dreams::load_dream_log`: batches
 /// expanded, one entry per id). Lines that cannot be a dream are skipped
 /// before parsing, because the log holds thousands of other records and this
 /// runs on the statusline's refresh.
 fn companion_dreams_since(logs: &[std::path::PathBuf], since: f64) -> i64 {
+    companion_dreams_scan(logs, since).0
+}
+
+/// [`companion_dreams_since`] plus how many log lines were looked at.
+fn companion_dreams_scan(logs: &[std::path::PathBuf], since: f64) -> (i64, usize) {
     let mut records = Vec::new();
+    let mut visited = 0;
     for log in logs {
-        let Ok(bytes) = std::fs::read(log) else {
-            continue;
-        };
-        for line in String::from_utf8_lossy(&bytes).lines() {
-            if !DREAM_KIND.is_match(line) {
-                continue;
+        // Newest first; the dream index applies records in order, so this log's
+        // slice is turned around before it is added.
+        let mut newest_first = Vec::new();
+        let mut old_run = 0;
+        lines_from_end(log, 256 * 1024, |bytes| {
+            visited += 1;
+            let line = String::from_utf8_lossy(bytes);
+            let stamp = AT_FIELD
+                .captures(&line)
+                .and_then(|c| c[1].parse::<f64>().ok());
+            match stamp {
+                Some(at) if at < since - SCAN_SLACK_SECS => {
+                    old_run += 1;
+                    if old_run >= SCAN_OLD_RUN {
+                        return false;
+                    }
+                }
+                Some(_) => old_run = 0,
+                None => {}
             }
-            if let Ok(row) = serde_json::from_str::<serde_json::Value>(line) {
-                records.push(row);
+            if DREAM_KIND.is_match(&line) {
+                if let Ok(row) = serde_json::from_str::<serde_json::Value>(&line) {
+                    newest_first.push(row);
+                }
             }
-        }
+            true
+        });
+        records.extend(newest_first.into_iter().rev());
     }
-    crate::companion::dreams::load_dream_log(&records, "")
+    let count = crate::companion::dreams::load_dream_log(&records, "")
         .iter()
         .filter(|d| d["at"].as_f64().unwrap_or(0.) >= since)
-        .count() as i64
+        .count() as i64;
+    (count, visited)
 }
 
 /// Journal v4 P5 cadence block. Every field is either a configured value or
@@ -4727,5 +4809,171 @@ Body text with a [[some-slug]] wikilink and more prose.
         assert_eq!(status.size_bytes, 37);
         assert!(status.note.contains("no 10.0-or-older csr-engine runs"));
         assert!(legacy.join("old.data").exists());
+    }
+
+    // ----- the recent-dream scan reads from the end of the log -----
+
+    /// The scan this replaced: parse every line, then apply the cutoff.
+    fn full_parse_oracle(logs: &[std::path::PathBuf], since: f64) -> i64 {
+        let mut records = Vec::new();
+        for log in logs {
+            let Ok(bytes) = std::fs::read(log) else {
+                continue;
+            };
+            for line in String::from_utf8_lossy(&bytes).lines() {
+                if !DREAM_KIND.is_match(line) {
+                    continue;
+                }
+                if let Ok(row) = serde_json::from_str::<serde_json::Value>(line) {
+                    records.push(row);
+                }
+            }
+        }
+        crate::companion::dreams::load_dream_log(&records, "")
+            .iter()
+            .filter(|d| d["at"].as_f64().unwrap_or(0.) >= since)
+            .count() as i64
+    }
+
+    fn dream_line(id: &str, at: f64) -> String {
+        format!(r#"{{"kind":"dream","id":"{id}","line":"x","at":{at}}}"#)
+    }
+
+    #[test]
+    fn the_windowed_scan_agrees_with_a_full_parse_of_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_900_000_000.0_f64;
+        let day = 86_400.0;
+        let mut lines = vec![
+            dream_line("old1", now - 40. * day),
+            format!(r#"{{"kind":"look","at":{}}}"#, now - 39. * day),
+            // an id first seen long ago and rewritten recently: one recent dream
+            dream_line("redo", now - 30. * day),
+            dream_line("redo", now - day),
+            format!(
+                r#"{{"kind":"batch","at":{},"dreams":[{{"id":"b1","line":"y"}},{{"id":"b2","line":"z"}}]}}"#,
+                now - 2. * day
+            ),
+            format!(
+                r#"{{"kind": "dream", "id": "spaced", "line": "v", "at": {}}}"#,
+                now - 3. * day
+            ),
+            "not json at all".to_owned(),
+            r#"{"kind":"answer","id":"redo","answer":"helpful"}"#.to_owned(),
+            dream_line("edge", now - 7. * day),
+            dream_line("just-old", now - 7. * day - 5.),
+            // written out of order: an older record after newer ones
+            dream_line("late-old", now - 8. * day),
+            dream_line("new", now - 60.),
+            format!(r#"{{"kind":"look","at":{}}}"#, now),
+        ];
+        lines.push(String::new());
+        let log = dir.path().join("dreams.jsonl");
+        std::fs::write(&log, lines.join("\n")).unwrap();
+        let other = dir.path().join("second.jsonl");
+        std::fs::write(&other, dream_line("second", now - day) + "\n").unwrap();
+        let missing = dir.path().join("absent.jsonl");
+        let logs = [log, missing, other];
+        for since in [now - 7. * day, now - day, now - 60., now + 1., 0.] {
+            assert_eq!(
+                companion_dreams_since(&logs, since),
+                full_parse_oracle(&logs, since),
+                "since {since}"
+            );
+        }
+        assert_eq!(companion_dreams_since(&logs, now - 7. * day), 7);
+    }
+
+    #[test]
+    fn the_scan_stops_at_the_cutoff_instead_of_reading_the_whole_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_900_000_000.0_f64;
+        let mut text = String::new();
+        for n in 0..5000 {
+            text.push_str(&format!(
+                "{}\n{{\"kind\":\"look\",\"at\":{},\"pad\":\"{}\"}}\n",
+                dream_line(&format!("old{n}"), now - 100. * 86_400.),
+                now - 100. * 86_400.,
+                "x".repeat(200)
+            ));
+        }
+        for n in 0..3 {
+            text.push_str(&dream_line(&format!("new{n}"), now - 60.));
+            text.push('\n');
+        }
+        let log = dir.path().join("dreams.jsonl");
+        std::fs::write(&log, text).unwrap();
+        let (count, visited) = companion_dreams_scan(&[log], now - 7. * 86_400.);
+        assert_eq!(count, 3);
+        assert!(visited <= 100, "read {visited} lines of a 10003-line log");
+    }
+
+    #[test]
+    fn a_slightly_old_line_among_new_ones_does_not_end_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_900_000_000.0_f64;
+        let since = now - 7. * 86_400.;
+        let log = dir.path().join("dreams.jsonl");
+        std::fs::write(
+            &log,
+            [
+                dream_line("a", now - 60.),
+                dream_line("stale", since - 3_600.), // an hour past the cutoff, mid-file
+                dream_line("b", now - 30.),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        assert_eq!(companion_dreams_since(&[log], since), 2);
+    }
+
+    #[test]
+    fn lines_are_read_back_to_front_across_chunk_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let text = "first\nsecond line here\n\n".to_owned()
+            + &"long".repeat(40)
+            + "\nlast-without-newline";
+        std::fs::write(&path, &text).unwrap();
+        for chunk in [1, 3, 7, 16, 4096] {
+            let mut seen = Vec::new();
+            lines_from_end(&path, chunk, |line| {
+                seen.push(String::from_utf8_lossy(line).into_owned());
+                true
+            });
+            let mut want: Vec<String> = text.lines().map(str::to_owned).collect();
+            want.retain(|l| !l.is_empty());
+            want.reverse();
+            assert_eq!(seen, want, "chunk {chunk}");
+        }
+        let mut count = 0;
+        lines_from_end(&path, 8, |_| {
+            count += 1;
+            count < 2
+        });
+        assert_eq!(count, 2, "the visitor can stop the read");
+    }
+
+    #[test]
+    fn a_stray_old_line_inside_the_window_does_not_hide_older_but_still_recent_dreams() {
+        // The live log has a couple of fixed-stamp strays among current records.
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_900_000_000.0_f64;
+        let since = now - 7. * 86_400.;
+        let mut lines = vec![dream_line("early", now - 6. * 86_400.)];
+        lines.push(format!(
+            r#"{{"kind":"look","at":{},"session":"sess-1"}}"#,
+            now - 100. * 86_400.
+        ));
+        lines.push(format!(
+            r#"{{"kind":"look","at":{},"session":"sess-1"}}"#,
+            now - 100. * 86_400.
+        ));
+        lines.push(dream_line("late", now - 60.));
+        let log = dir.path().join("dreams.jsonl");
+        std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+        assert_eq!(companion_dreams_since(std::slice::from_ref(&log), since), 2);
+        assert_eq!(full_parse_oracle(&[log], since), 2);
     }
 }
