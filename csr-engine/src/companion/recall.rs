@@ -37,7 +37,7 @@ pub fn where_it_stands(text: &str) -> String {
 }
 pub fn session_story(db: &Db, paths: &Paths, sid: &str) -> Value {
     for id in super::session::lineage(paths, sid) {
-        let rows = db.query(
+        let rows = db.remembered_query(
             "select content,tags,timestamp from reflections where tags like \
                 ? and tags like '%session_story%' order by timestamp desc limit \
                 1",
@@ -287,7 +287,7 @@ fn recalled_groups(db: &Db, s: &Value) -> BTreeMap<String, Value> {
                 &[json!(conversation)],
             );
             let seen = rows.first();
-            let story = db.scalar(
+            let story = db.remembered_scalar(
                 "select content from reflections where tags like ? and tags like \
                     '%session_story%' order by (id like 'story_%'), timestamp desc \
                     limit 1",

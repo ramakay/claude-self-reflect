@@ -747,6 +747,57 @@ fn blur_alpha(alpha: &mut [u8], width: usize, height: usize, radius: usize) {
     }
 }
 
+/// A background is a pixmap per size and theme; a few are kept (a pane draws one size, in one
+/// theme, plus the backdrop of its fitted picture).
+const BACKGROUNDS_KEPT: usize = 3;
+type BackgroundStops = Vec<(u32, [u8; 4])>;
+#[derive(PartialEq)]
+struct BackgroundKey {
+    width: u32,
+    height: u32,
+    ground: [u8; 4],
+    aurora: [BackgroundStops; 3],
+}
+impl BackgroundKey {
+    fn new(width: u32, height: u32, t: &theme::Tokens) -> Self {
+        let stops = |i: usize| {
+            t.aurora[i]
+                .iter()
+                .map(|(at, c)| (at.to_bits(), *c))
+                .collect()
+        };
+        Self {
+            width,
+            height,
+            ground: t.mesh_ground,
+            aurora: [stops(0), stops(1), stops(2)],
+        }
+    }
+}
+/// The backgrounds kept, least recently used first.
+#[derive(Default)]
+struct Backgrounds(Vec<(BackgroundKey, Pixmap)>);
+impl Backgrounds {
+    /// Copy the background of `key` into `onto`, if it is kept.
+    fn copy_into(&mut self, key: &BackgroundKey, onto: &mut Pixmap) -> bool {
+        let Some(i) = self.0.iter().position(|(k, _)| k == key) else {
+            return false;
+        };
+        let entry = self.0.remove(i);
+        onto.data_mut().copy_from_slice(entry.1.data());
+        self.0.push(entry);
+        true
+    }
+    fn keep(&mut self, key: BackgroundKey, pm: &Pixmap) {
+        if self.0.len() >= BACKGROUNDS_KEPT {
+            self.0.remove(0);
+        }
+        self.0.push((key, pm.clone()));
+    }
+}
+static BACKGROUNDS: std::sync::LazyLock<std::sync::Mutex<Backgrounds>> =
+    std::sync::LazyLock::new(Default::default);
+
 fn shadow_mask(w: f32, h: f32, corner: f32, blur: f32) -> std::sync::Arc<ShadowMask> {
     let key = (
         (w * S).round() as u32,
@@ -972,7 +1023,24 @@ impl Canvas {
         self.rrect_sh(x, y, w, h, r, tint);
     }
 
+    /// The mesh behind everything. It depends on the canvas size and the theme and on nothing
+    /// else, so the last few are kept: a redraw at the same size copies one instead of painting
+    /// three full-canvas radial fills.
     pub fn background(&mut self, t: &theme::Tokens) {
+        if self.dry {
+            self.pm.fill(color(t.mesh_ground));
+            return;
+        }
+        let key = BackgroundKey::new(self.pm.width(), self.pm.height(), t);
+        let hit =
+            (BACKGROUNDS.lock().unwrap_or_else(|e| e.into_inner())).copy_into(&key, &mut self.pm);
+        if !hit {
+            self.paint_background(t);
+            (BACKGROUNDS.lock().unwrap_or_else(|e| e.into_inner())).keep(key, &self.pm);
+        }
+    }
+
+    fn paint_background(&mut self, t: &theme::Tokens) {
         let (w, h) = (self.pm.width() as f32 / S, self.pm.height() as f32 / S);
         self.pm.fill(color(t.mesh_ground));
         let full = rrect_path(0., 0., w, h, 0.);
@@ -1380,6 +1448,54 @@ mod shadow_tests {
         let a = shadow_mask(200., 120., 24., 18.);
         let b = shadow_mask(200., 120., 24., 18.);
         assert!(std::sync::Arc::ptr_eq(&a, &b));
+    }
+    #[test]
+    fn a_kept_background_is_the_background_a_fresh_paint_makes() {
+        for (w, h, theme) in [
+            (73., 41., &theme::DARK),
+            (73., 41., &theme::LIGHT),
+            (58., 90., &theme::DARK),
+        ] {
+            let mut painted = Canvas::new(w, h);
+            painted.paint_background(theme);
+            let mut first = Canvas::new(w, h);
+            first.background(theme);
+            let mut again = Canvas::new(w, h);
+            again.pm.fill(tiny_skia::Color::from_rgba8(9, 8, 7, 255));
+            again.background(theme);
+            assert_eq!(first.pm.data(), painted.pm.data(), "{w}x{h}");
+            assert_eq!(
+                again.pm.data(),
+                painted.pm.data(),
+                "{w}x{h} from the kept one"
+            );
+        }
+        let (mut a, mut b) = (Canvas::new(73., 41.), Canvas::new(73., 41.));
+        a.background(&theme::DARK);
+        b.background(&theme::LIGHT);
+        assert_ne!(a.pm.data(), b.pm.data(), "the theme is part of the key");
+    }
+    #[test]
+    fn backgrounds_are_kept_per_size_and_theme_and_the_oldest_goes_first() {
+        let mut kept = Backgrounds::default();
+        let key = |w, h, t: &theme::Tokens| BackgroundKey::new(w, h, t);
+        let pm = |w, h| Pixmap::new(w, h).unwrap();
+        let mut onto = pm(4, 4);
+        assert!(!kept.copy_into(&key(4, 4, &theme::DARK), &mut onto));
+        kept.keep(key(4, 4, &theme::DARK), &pm(4, 4));
+        kept.keep(key(4, 4, &theme::LIGHT), &pm(4, 4));
+        kept.keep(key(5, 4, &theme::DARK), &pm(5, 4));
+        // Using the first makes the second the oldest.
+        assert!(kept.copy_into(&key(4, 4, &theme::DARK), &mut onto));
+        kept.keep(key(6, 4, &theme::DARK), &pm(6, 4));
+        assert!(kept.copy_into(&key(4, 4, &theme::DARK), &mut onto));
+        assert!(
+            !kept.copy_into(&key(4, 4, &theme::LIGHT), &mut onto),
+            "evicted"
+        );
+        let mut wider = pm(5, 4);
+        assert!(kept.copy_into(&key(5, 4, &theme::DARK), &mut wider));
+        assert_eq!(kept.0.len(), BACKGROUNDS_KEPT);
     }
     #[test]
     fn shadows_clip_at_pane_edges_and_leave_glass_interior_untouched() {

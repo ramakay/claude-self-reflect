@@ -8,8 +8,13 @@ use std::path::Path;
 type RecapCache =
     BTreeMap<(String, String), (std::time::Instant, Option<super::repo_recap::RepoRecap>)>;
 
+/// A remembered answer: the `data_version` it was read at.
+type Remembered = (Option<i64>, Vec<Vec<Value>>);
+const REMEMBERED: usize = 256;
+
 pub struct Db {
     storage: Storage,
+    remembered: std::cell::RefCell<BTreeMap<String, Remembered>>,
     recaps: std::cell::RefCell<RecapCache>,
     shifts: std::cell::RefCell<BTreeMap<std::path::PathBuf, (std::time::Instant, Vec<Value>)>>,
 
@@ -28,6 +33,7 @@ impl Db {
         })?;
         Ok(Self {
             storage,
+            remembered: Default::default(),
             recaps: Default::default(),
             shifts: Default::default(),
             queries: std::sync::atomic::AtomicUsize::new(0),
@@ -133,6 +139,33 @@ impl Db {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
+    }
+    /// `query`, for a statement that scans a table (a `LIKE` with a leading wildcard) and is asked
+    /// again and again with the same parameters. The answer stands while the database has not
+    /// changed (`data_version`, which a commit from any connection moves, a WAL one included);
+    /// without a version there is no memory.
+    pub fn remembered_query(&self, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
+        let key = format!("{sql}\u{0}{}", Value::Array(params.to_vec()));
+        let version = self.version();
+        if let Some((read_at, rows)) = self.remembered.borrow().get(&key) {
+            if version.is_some() && *read_at == version {
+                return rows.clone();
+            }
+        }
+        let rows = self.query(sql, params);
+        let mut kept = self.remembered.borrow_mut();
+        if kept.len() >= REMEMBERED {
+            kept.clear();
+        }
+        kept.insert(key, (version, rows.clone()));
+        rows
+    }
+    pub fn remembered_scalar(&self, sql: &str, params: &[Value]) -> Value {
+        self.remembered_query(sql, params)
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .unwrap_or(Value::Null)
     }
     pub fn scalar(&self, sql: &str, params: &[Value]) -> Value {
         self.query(sql, params)

@@ -359,3 +359,44 @@ fn an_ignored_key_changes_nothing_the_page_shows() {
     pane.key("b");
     assert_ne!(pane.ui_mark(), mark);
 }
+
+/// The story lookup scans `reflections` with a leading wildcard. Asked again with the same
+/// parameters it is not run again while the database stands still; after a commit it is run
+/// once, and then it sees what the commit wrote.
+#[test]
+fn a_story_lookup_is_remembered_until_the_database_moves() {
+    use csr_engine::companion::db::Db;
+    use serde_json::json;
+    let (_home, paths) = rich_home();
+    let db = Db::open(&paths).unwrap();
+    let sql = "select content from reflections where tags like ? and tags like '%session_story%'";
+    let params = [json!("%conv_sess-now%")];
+    let first = db.remembered_query(sql, &params);
+    assert_eq!(first.len(), 1);
+    let after_first = db.queries();
+    for _ in 0..5 {
+        assert_eq!(db.remembered_query(sql, &params), first);
+    }
+    assert_eq!(db.queries(), after_first, "five repeats ran nothing");
+    // Another parameter is another lookup.
+    db.remembered_query(sql, &[json!("%conv_nobody%")]);
+    assert_eq!(db.queries(), after_first + 1);
+
+    let writer = rusqlite::Connection::open(&paths.db).unwrap();
+    writer
+        .execute(
+            "insert into reflections values ('later', 'A newer story.', \
+             '[\"session_story\", \"conv_sess-now\"]', '2026-10-19T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+    let later = db.remembered_query(sql, &params);
+    assert_eq!(
+        db.queries(),
+        after_first + 2,
+        "asked again after the commit"
+    );
+    assert_eq!(later.len(), 2, "and it sees the commit");
+    db.remembered_query(sql, &params);
+    assert_eq!(db.queries(), after_first + 2, "and not again");
+}
