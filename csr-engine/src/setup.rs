@@ -1934,41 +1934,90 @@ fn agent_facts(plist: &PlistValue) -> AgentFacts {
     }
 }
 
-/// Where the first `ProgramArguments` string sits in the raw text, so a repair
-/// can replace those bytes and leave the rest of the user's file untouched.
-fn plist_program_span(text: &str) -> Option<std::ops::Range<usize>> {
-    let key = text.find("<key>ProgramArguments</key>")?;
-    let open = key + text[key..].find("<string>")? + "<string>".len();
-    let close = open + text[open..].find("</string>")?;
-    Some(open..close)
+/// The two strings launchd reads to find the executable, with where each sits
+/// in the raw text so a repair can replace just those bytes.
+#[derive(Default)]
+struct ProgramSpans {
+    /// The top-level `Program` string: the file launchd executes when present.
+    program: Option<(String, std::ops::Range<usize>)>,
+    /// The first string of the top-level `ProgramArguments` array.
+    first_arg: Option<(String, std::ops::Range<usize>)>,
 }
 
-/// The byte range of the top-level `Program` string, which is the file launchd
-/// executes when it is present (ProgramArguments[0] is then only argv[0]).
-/// `value` is the parsed text of that key, so a same-named key nested in
-/// EnvironmentVariables is not mistaken for it.
-fn plist_program_key_span(text: &str, value: &str) -> Option<std::ops::Range<usize>> {
-    const KEY: &str = "<key>Program</key>";
-    let mut from = 0;
-    while let Some(found) = text[from..].find(KEY) {
-        let after = from + found + KEY.len();
-        let rest = &text[after..];
-        let gap = rest.len() - rest.trim_start().len();
-        if rest[gap..].starts_with("<string>") {
-            let open = after + gap + "<string>".len();
-            let close = open + text[open..].find("</string>")?;
-            if xml_unescape(&text[open..close]) == value {
-                return Some(open..close);
-            }
+/// Find `Program` and `ProgramArguments[0]` structurally: only keys that are
+/// direct children of the plist's top-level dict count, so a same-named key or
+/// an equal string inside EnvironmentVariables or any nested dict is never
+/// mistaken for them.
+fn plist_program_spans(text: &str) -> ProgramSpans {
+    let tokens = plist_tokens(text);
+    let offset = |s: &str| s.as_ptr() as usize - text.as_ptr() as usize;
+    // a `<string>` element at `at` (after whitespace): its text and byte range
+    let string_at = |mut at: usize| -> Option<(String, std::ops::Range<usize>)> {
+        while tokens.get(at).is_some_and(|t| !t.0) {
+            at += 1;
         }
-        from = after;
+        let (true, "string") = *tokens.get(at)? else {
+            return None;
+        };
+        let (false, content) = *tokens.get(at + 1)? else {
+            return None;
+        };
+        let start = offset(content);
+        Some((xml_unescape(content), start..start + content.len()))
+    };
+    let mut found = ProgramSpans::default();
+    let mut at = 0;
+    while at < tokens.len() && !(tokens[at].0 && tokens[at].1.starts_with("plist")) {
+        at += 1;
     }
-    None
+    at += 1;
+    while tokens.get(at).is_some_and(|t| !t.0) {
+        at += 1;
+    }
+    if tokens.get(at) != Some(&(true, "dict")) {
+        return found;
+    }
+    at += 1;
+    loop {
+        while tokens.get(at).is_some_and(|t| !t.0) {
+            at += 1;
+        }
+        let Some((true, "key")) = tokens.get(at).copied() else {
+            return found;
+        };
+        at += 1;
+        let key = match tokens.get(at) {
+            Some((false, name)) => {
+                at += 1;
+                xml_unescape(name)
+            }
+            _ => String::new(),
+        };
+        at += 1; // </key>
+        let value_start = at;
+        match key.as_str() {
+            "Program" if found.program.is_none() => found.program = string_at(value_start),
+            "ProgramArguments" if found.first_arg.is_none() => {
+                let mut inner = value_start;
+                while tokens.get(inner).is_some_and(|t| !t.0) {
+                    inner += 1;
+                }
+                if tokens.get(inner) == Some(&(true, "array")) {
+                    found.first_arg = string_at(inner + 1);
+                }
+            }
+            _ => {}
+        }
+        // step over the whole value, nested or not
+        if plist_value(&tokens, &mut at).is_none() {
+            return found;
+        }
+    }
 }
 
-/// Does the loaded job run what the agent file asks for? Same arguments, and
-/// every environment entry of the file present with the same value (launchd
-/// adds a few of its own, so the loaded side may hold more).
+/// Does the loaded job run what the agent file asks for? Same arguments, every
+/// environment entry of the file present with the same value, and nothing extra
+/// in the job beyond launchd's own keys and PATH.
 fn loaded_job_matches(wanted: &AgentFacts, loaded: &LoadedJob) -> bool {
     wanted.program_args == loaded.arguments
         && wanted
@@ -2383,16 +2432,9 @@ fn apply_daemon_agent(
         Some(text) if adopted || !text.contains(DAEMON_PLIST_MARKER) => {
             // nothing was merged into a file we do not write
             notes.retain(|n| n.starts_with("Another agent"));
-            let parsed = parse_plist(text);
-            let first_arg = parsed
-                .as_ref()
-                .map(|p| agent_facts(p).program_args)
-                .and_then(|args| args.into_iter().next());
-            let program_key = parsed
-                .as_ref()
-                .and_then(|p| p.get("Program"))
-                .and_then(|v| v.text())
-                .map(str::to_owned);
+            let found = plist_program_spans(text);
+            let program_key = found.program.as_ref().map(|(value, _)| value.clone());
+            let first_arg = found.first_arg.as_ref().map(|(value, _)| value.clone());
             // launchd executes Program when there is one; otherwise argv[0].
             // Whatever it would run, if gone, is repaired in place, and a dead
             // argv[0] next to it is repaired with it. A live Program leaves a
@@ -2410,17 +2452,15 @@ fn apply_daemon_agent(
                 let engine = xml_escape(&spec.engine.to_string_lossy());
                 let mut spans = Vec::new();
                 let mut gone = Vec::new();
-                if let Some(value) = &program_key {
-                    if let Some(span) = plist_program_key_span(text, value) {
-                        spans.push(span);
-                        gone.push(value.clone());
-                    }
+                if let Some((value, span)) = found.program.clone() {
+                    spans.push(span);
+                    gone.push(value);
                 }
                 if dead(&first_arg) {
-                    if let (Some(value), Some(span)) = (&first_arg, plist_program_span(text)) {
+                    if let Some((value, span)) = found.first_arg.clone() {
                         spans.push(span);
-                        if !gone.contains(value) {
-                            gone.push(value.clone());
+                        if !gone.contains(&value) {
+                            gone.push(value);
                         }
                     }
                 }
@@ -4405,6 +4445,61 @@ esac
 </dict></plist>
 ";
         assert_eq!(run(bare), bare.replace("/old/place/csr-engine", engine));
+    }
+
+    #[test]
+    fn a_decoy_with_the_same_dead_path_is_not_repaired_in_place_of_the_real_key() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let dead = "/old/place/csr-engine";
+        let engine = "/opt/csr/bin/csr-engine";
+        // `{top}` is where the real top-level strings sit; the decoys carry the
+        // very same text earlier in the file and must keep it.
+        let template = |decoy: &str| {
+            format!(
+                "<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+{decoy}
+  <key>Program</key><string>{{top}}</string>
+  <key>ProgramArguments</key><array>
+    <string>{{top}}</string>
+    <string>daemon</string>
+  </array>
+</dict></plist>
+"
+            )
+        };
+        let decoys = [
+            // in EnvironmentVariables: a key named Program, a key named
+            // ProgramArguments, and a plain value equal to the path
+            format!(
+                "  <key>EnvironmentVariables</key><dict>
+    <key>Program</key><string>{dead}</string>
+    <key>ProgramArguments</key><string>{dead}</string>
+    <key>WHERE</key><string>{dead}</string>
+  </dict>"
+            ),
+            // in a nested dict of another key
+            format!(
+                "  <key>Other</key><dict>
+    <key>Program</key><string>{dead}</string>
+    <key>ProgramArguments</key><array><string>{dead}</string></array>
+    <key>Inner</key><dict><key>Program</key><string>{dead}</string></dict>
+  </dict>"
+            ),
+        ];
+        for decoy in decoys {
+            let theirs = template(&decoy).replace("{top}", dead);
+            std::fs::create_dir_all(spec.plist_path().parent().unwrap()).unwrap();
+            std::fs::write(spec.plist_path(), &theirs).unwrap();
+            let mut fake = FakeLaunchctl::new(false);
+            assert_eq!(install(&spec, &mut fake), DaemonOutcome::KeptExisting);
+            assert_eq!(
+                std::fs::read_to_string(spec.plist_path()).unwrap(),
+                template(&decoy).replace("{top}", engine),
+                "decoy:\n{decoy}"
+            );
+        }
     }
 
     #[test]
