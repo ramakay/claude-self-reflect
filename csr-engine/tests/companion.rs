@@ -2244,3 +2244,108 @@ fn png_screen_respects_requested_cell_dimensions() {
         }
     }
 }
+
+/// herdr's events, opt-in: with a fake herdr on a socket, the watching pane subscribes, and when
+/// herdr says the agent pane closed the pane ends by itself, cleanly, and removes its pid file.
+#[cfg(unix)]
+#[test]
+fn the_pane_ends_when_herdr_says_the_agent_pane_closed() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
+    use std::time::{Duration, Instant};
+    let (_home, paths) = home();
+    let socket = paths.home.join("herdr.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (subscribed, closed) = mpsc::channel::<()>();
+    let (close, closing) = mpsc::channel::<()>();
+    let seen = Arc::new(AtomicBool::new(false));
+    let served = seen.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let mut request = String::new();
+            BufReader::new(conn.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let mut conn = conn;
+            if request["method"] == "events.subscribe" {
+                let listed: Vec<_> = request["params"]["subscriptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s["type"].as_str().unwrap().to_string())
+                    .collect();
+                served.store(
+                    listed.contains(&"pane.closed".to_string()),
+                    Ordering::SeqCst,
+                );
+                writeln!(
+                    conn,
+                    r#"{{"id":"csr","result":{{"type":"subscription_started"}}}}"#
+                )
+                .unwrap();
+                subscribed.send(()).unwrap();
+                if closing.recv_timeout(Duration::from_secs(20)).is_ok() {
+                    let _ = writeln!(
+                        conn,
+                        r#"{{"event":"pane_closed","data":{{"pane_id":"w1:p2"}}}}"#
+                    );
+                }
+            } else {
+                // A snapshot that has this pane's tab on screen.
+                let _ = writeln!(
+                    conn,
+                    r#"{{"id":"s","result":{{"snapshot":{{"focused_tab_id":"w1:t1","panes":[{{"pane_id":"w1:p3","tab_id":"w1:t1"}}]}}}}}}"#
+                );
+            }
+        }
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        .env("HOME", &paths.home)
+        .env("TERM_PROGRAM", "kitty")
+        .env("CSR_PANE_HERDR_EVENTS", "1")
+        .env("HERDR_SOCKET_PATH", &socket)
+        .env("HERDR_PANE_ID", "w1:p3")
+        .args([
+            "companion",
+            "pane",
+            "--repo",
+            env!("CARGO_MANIFEST_DIR"),
+            "--watch",
+            "--sid",
+            "sess-now",
+            "--agent",
+            "w1:p2",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = paths.keep.join("panes/sess-now.json");
+    assert!(
+        closed.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "the pane subscribed"
+    );
+    assert!(seen.load(Ordering::SeqCst), "and asked for pane.closed");
+    assert!(pid.exists());
+    assert!(child.try_wait().unwrap().is_none(), "it runs until told");
+    close.send(()).unwrap();
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            panic!("the pane did not end when the agent pane closed");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status:?}");
+    assert!(!pid.exists(), "its pid file is gone");
+}

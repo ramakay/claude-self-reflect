@@ -1,5 +1,6 @@
 use super::{
     cli::PaneArgs,
+    herdr_events::{self, Watcher as HerdrEvents},
     pane::Pane,
     paths::{self, Paths},
     private,
@@ -516,6 +517,8 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let mut last_key = None;
     let mut restart_due = None;
     let mut wake = Debounce::default();
+    // Opt-in (`CSR_PANE_HERDR_EVENTS=1`): herdr says when the tab is out of sight.
+    let events = HerdrEvents::from_env(args.agent.clone());
     let result = (|| -> anyhow::Result<()> {
         while !ENDING.load(Ordering::Relaxed) {
             beat.alive();
@@ -566,8 +569,16 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
             }
             // The error card comes and goes with the reload's error: draw when it does.
             pressed |= reload_error != reloading;
+            if events.as_ref().is_some_and(HerdrEvents::agent_gone) {
+                break;
+            }
             // The relay says the session did something: draw when the debounce lets it.
-            let (now_wake, soon_wake) = Signals::woken();
+            let (mut now_wake, mut soon_wake) = Signals::woken();
+            if let Some((visible, status)) = events.as_ref().map(HerdrEvents::take_wakes) {
+                now_wake |= visible;
+                soon_wake |= status;
+            }
+            let hidden = events.as_ref().is_some_and(HerdrEvents::hidden);
             if now_wake || soon_wake {
                 let at = Instant::now();
                 if now_wake {
@@ -582,9 +593,11 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
             pressed |= pane.map_wait(now).1;
             // A compaction ended: draw it now.
             pressed |= pane.compaction_gone();
-            if (boundary.failures > 0 && (boundary.ready(now) || pressed))
-                || (boundary.failures == 0
-                    && (pressed || (last.elapsed() >= Duration::from_secs(1) && pane.due(now))))
+            if herdr_events::may_draw(hidden, last.elapsed())
+                && ((boundary.failures > 0 && (boundary.ready(now) || pressed))
+                    || (boundary.failures == 0
+                        && (pressed
+                            || (last.elapsed() >= Duration::from_secs(1) && pane.due(now)))))
             {
                 let (cols, rows) = terminal::size().unwrap_or((60, 30));
                 let frame = boundary.run(&paths, now, || {

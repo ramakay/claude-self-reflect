@@ -14,6 +14,7 @@ mod envelopes;
 pub mod feed;
 pub mod flight;
 pub mod gate;
+pub mod herdr_events;
 pub mod hook_json;
 pub mod infinite;
 pub mod info;
