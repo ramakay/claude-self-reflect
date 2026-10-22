@@ -131,9 +131,9 @@ async function spawn($, e, again) {
     const ended = await $.clock.now()
     if (ended - born >= LONG) fails = 0
     else if (!readyAt || ended - readyAt < SOON) fails++
-    if (fails < TRIES) $.clock.after(2000, () => void spawn($, e, true))
+    if (fails < TRIES) $.clock.after(2000, () => void spawn($, e, true).catch(() => undefined))
     else if (fails++ === TRIES) void $.ui.toast(failed ? 'CSR engine missing: npx claude-self-reflect setup' : 'CSR engine keeps stopping: run csr-engine setup')
-  })()
+  })().catch(() => undefined) // this runs after the hook that started it returned: a host that is gone must not leave a rejection nothing handles
   await up
   if (sock === mine) {
     // A child that is ready is a new engine: a pause a timed-out post left for the old one is not its.
