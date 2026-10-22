@@ -120,6 +120,8 @@ impl GuardedConnection {
     }
 
     fn lock(&self) -> Result<LockedConnection<'_>> {
+        #[cfg(test)]
+        lock_probe::fire();
         let operation = self.operation_lock()?;
         let conn = self
             .inner
@@ -129,6 +131,53 @@ impl GuardedConnection {
             conn,
             _operation: operation,
         })
+    }
+}
+
+/// Test seam: run a closure each time this thread asks for the connection, so a
+/// test can see what else the thread holds at that moment (an index write guard).
+#[cfg(test)]
+pub(crate) mod lock_probe {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static PROBE: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Installed;
+
+    pub(crate) fn install(probe: impl Fn() + 'static) -> Installed {
+        PROBE.with(|slot| *slot.borrow_mut() = Some(Box::new(probe)));
+        Installed
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            PROBE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// Count the connection requests this thread makes while `search` is
+    /// write-locked: each one is a storage wait under the index write guard.
+    pub(crate) fn watch_index(
+        search: std::sync::Arc<tokio::sync::RwLock<crate::search::SearchEngine>>,
+    ) -> (Installed, std::rc::Rc<std::cell::Cell<usize>>) {
+        let held = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = held.clone();
+        let installed = install(move || {
+            if search.try_read().is_err() {
+                seen.set(seen.get() + 1);
+            }
+        });
+        (installed, held)
+    }
+
+    pub(super) fn fire() {
+        PROBE.with(|slot| {
+            if let Some(probe) = slot.borrow().as_ref() {
+                probe();
+            }
+        });
     }
 }
 

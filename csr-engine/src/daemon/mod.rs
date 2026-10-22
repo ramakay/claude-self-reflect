@@ -2396,12 +2396,19 @@ async fn process_v3_extraction(
         // Store the V3 reflection with its support set
         storage.insert_derived_reflection(&reflection_id, &content, &tags, &embedding, &inputs)?;
         {
+            // Supersede Layer 1: delete heuristic reflection if it exists. The
+            // storage calls come before the write guard, which covers only the
+            // in-memory index updates (a prompt's search needs the read lock).
+            let superseded = match storage.get_enrichment_reflection_id(conv_id, "heuristic") {
+                Ok(Some(old_id)) => {
+                    let _ = storage.delete_reflection(&old_id);
+                    Some(old_id)
+                }
+                _ => None,
+            };
             let mut idx = search.write().await;
             idx.insert_reflection(reflection_id.clone(), embedding);
-
-            // Supersede Layer 1: delete heuristic reflection if it exists
-            if let Ok(Some(old_id)) = storage.get_enrichment_reflection_id(conv_id, "heuristic") {
-                let _ = storage.delete_reflection(&old_id);
+            if let Some(old_id) = superseded {
                 idx.remove_reflection(&old_id);
             }
         } // Write lock released before context_cache embed
@@ -2833,13 +2840,21 @@ async fn store_narrative(
             ])
         });
     storage.insert_derived_reflection(&reflection_id, narrative, &tags, &embedding, &inputs)?;
-    let mut idx = search.write().await;
-    idx.insert_reflection(reflection_id.clone(), embedding);
-
-    // Supersede Layer 2: delete V3 extraction reflection if it exists
-    if let Ok(Some(old_id)) = storage.get_enrichment_reflection_id(conv_id, "extracted_v3") {
-        let _ = storage.delete_reflection(&old_id);
-        idx.remove_reflection(&old_id);
+    // Supersede Layer 2: delete V3 extraction reflection if it exists. Storage
+    // first, then a write guard over the index updates alone.
+    let superseded = match storage.get_enrichment_reflection_id(conv_id, "extracted_v3") {
+        Ok(Some(old_id)) => {
+            let _ = storage.delete_reflection(&old_id);
+            Some(old_id)
+        }
+        _ => None,
+    };
+    {
+        let mut idx = search.write().await;
+        idx.insert_reflection(reflection_id.clone(), embedding);
+        if let Some(old_id) = superseded {
+            idx.remove_reflection(&old_id);
+        }
     }
 
     storage.mark_enrichment_completed(conv_id, "ai_narrative", &reflection_id)?;

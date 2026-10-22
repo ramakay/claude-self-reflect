@@ -473,13 +473,12 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     // locking needed here, matching the constraint against locking it directly.
     let embeddings = engine.embeddings().embed(&texts)?;
 
-    {
-        // tokio::sync::RwLock has no plain (non-async) writer; blocking_write is its
-        // supported bridge for a sync call site like this one — import_plan's public
-        // signature is deliberately sync (frozen spec), wiring into an async caller is
-        // the orchestrator's job, not this module's.
-        let mut idx = engine.search().blocking_write();
-        for (chunk, embedding) in new_chunks.iter().zip(embeddings.iter()) {
+    // SQLite first, the index after: the write guard is never held across a
+    // storage call (see `Engine::import_file_with_attribution`).
+    let mut stored_now: Vec<(String, Vec<f32>)> = Vec::with_capacity(new_chunks.len());
+    let mut failure = None;
+    for (chunk, embedding) in new_chunks.iter().zip(embeddings.iter()) {
+        let stored = (|| -> Result<()> {
             storage.insert_chunk_with_source(chunk, embedding, "plan")?;
             if let Some(ref conv) = source_conv {
                 // Non-fatal, mirroring Engine::import_file's provenance persistence:
@@ -499,8 +498,28 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
             if let Some(chunk_evidence) = evidence.get(&chunk.id) {
                 storage.replace_chunk_evidence(chunk_evidence)?;
             }
-            idx.insert_chunk(chunk.id.clone(), embedding.clone());
+            Ok(())
+        })();
+        match stored {
+            Ok(()) => stored_now.push((chunk.id.clone(), embedding.clone())),
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
         }
+    }
+    {
+        // tokio::sync::RwLock has no plain (non-async) writer; blocking_write is its
+        // supported bridge for a sync call site like this one — import_plan's public
+        // signature is deliberately sync (frozen spec), wiring into an async caller is
+        // the orchestrator's job, not this module's.
+        let mut idx = engine.search().blocking_write();
+        for (id, embedding) in stored_now {
+            idx.insert_chunk(id, embedding);
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
     }
 
     storage.upsert_import_state_explicit(&conv_id, &conv_id, new_chunks.len(), &plan.mtime)?;
@@ -828,5 +847,24 @@ mod tests {
                 crate::provenance::TrustTier::TrustedTool
             );
         }
+    }
+
+    #[test]
+    fn import_plan_takes_no_storage_lock_under_the_index_write_guard() {
+        let engine = test_engine(Arc::new(Storage::open_memory().unwrap()));
+        let (_probe, under_guard) =
+            crate::storage::lock_probe::watch_index(engine.search().clone());
+        let plan = PlanDoc {
+            slug: "guard-plan".into(),
+            path: PathBuf::from("/dev/null"),
+            mtime: "2026-07-20T12:00:00Z".into(),
+            content: distinctive_body("guard"),
+        };
+        assert!(import_plan(&engine, &plan).unwrap() > 0);
+        assert_eq!(
+            under_guard.get(),
+            0,
+            "a storage call waited while the index write guard was held"
+        );
     }
 }

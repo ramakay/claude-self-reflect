@@ -746,26 +746,47 @@ pub(crate) async fn import_file_content_diff(
         })
         .await??;
 
-        let mut idx = search.write().await;
+        // SQLite first, the index after: the write guard is never held across a
+        // storage call (see `Engine::import_file_with_attribution`).
+        let mut stored_now: Vec<(String, Vec<f32>)> = Vec::with_capacity(pending.len());
+        let mut failure = None;
         for (chunk, embedding) in pending.iter().zip(embeddings_out) {
-            storage.insert_chunk_with_source(chunk, &embedding, attribution.source)?;
-            if let Err(error) = storage.insert_chunk_provenance(
-                &chunk.id,
-                &crate::provenance::ChunkProvenance {
-                    author: chunk.author,
-                    source_conv_id: attribution
-                        .parent_conversation_id
-                        .clone()
-                        .unwrap_or_else(|| chunk.conversation_id.clone()),
-                    supersedes: None,
-                },
-            ) {
-                tracing::warn!(error = %error, chunk = %chunk.id, "chunk provenance persist failed");
+            let stored = (|| -> Result<()> {
+                storage.insert_chunk_with_source(chunk, &embedding, attribution.source)?;
+                if let Err(error) = storage.insert_chunk_provenance(
+                    &chunk.id,
+                    &crate::provenance::ChunkProvenance {
+                        author: chunk.author,
+                        source_conv_id: attribution
+                            .parent_conversation_id
+                            .clone()
+                            .unwrap_or_else(|| chunk.conversation_id.clone()),
+                        supersedes: None,
+                    },
+                ) {
+                    tracing::warn!(error = %error, chunk = %chunk.id, "chunk provenance persist failed");
+                }
+                if let Some(chunk_evidence) = evidence.get(&chunk.id) {
+                    storage.replace_chunk_evidence(chunk_evidence)?;
+                }
+                Ok(())
+            })();
+            match stored {
+                Ok(()) => stored_now.push((chunk.id.clone(), embedding)),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
             }
-            if let Some(chunk_evidence) = evidence.get(&chunk.id) {
-                storage.replace_chunk_evidence(chunk_evidence)?;
+        }
+        {
+            let mut idx = search.write().await;
+            for (id, embedding) in stored_now {
+                idx.insert_chunk(id, embedding);
             }
-            idx.insert_chunk(chunk.id.clone(), embedding);
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
     }
 
@@ -1330,5 +1351,38 @@ mod maintenance_probes {
         let batch = wait_for_batch(&mut receiver, &retries).await.unwrap();
         assert!(batch.contains(&path));
         drop(sender);
+    }
+
+    #[tokio::test]
+    async fn watcher_import_never_waits_on_storage_under_the_index_write_guard() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(projects.join("-tmp-proj")).unwrap();
+        let src = projects.join("-tmp-proj").join("sess-watch-guard.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "user", "uuid": "u-1", "timestamp": "2026-10-14T10:00:00Z",
+                "message": {"content": "please look at the retry loop in the uploader"}
+            }),
+            serde_json::json!({
+                "type": "assistant", "uuid": "a-1", "timestamp": "2026-10-14T10:00:05Z",
+                "message": {"content": [{"type": "text", "text": "The uploader retries without backoff; I added exponential backoff."}]}
+            }),
+        ];
+        let body: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        std::fs::write(&src, body).unwrap();
+        let storage = Storage::open_memory().unwrap();
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(64)));
+        let (_probe, under_guard) = crate::storage::lock_probe::watch_index(search.clone());
+        import_file_content_diff(&storage, &embeddings, &search, &projects, &src)
+            .await
+            .unwrap();
+        assert!(search.read().await.chunk_count() > 0, "nothing was indexed");
+        assert_eq!(
+            under_guard.get(),
+            0,
+            "a storage call waited while the index write guard was held"
+        );
     }
 }

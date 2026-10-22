@@ -672,30 +672,53 @@ impl Engine {
             })
             .await??;
 
-            let mut idx = self.search.write().await;
+            // SQLite first, the index after: a prompt's search needs the index
+            // read lock, and a waiting writer blocks new readers, so the write
+            // guard must never be held across a call that can wait on the
+            // storage mutex or a database writer.
+            let mut stored_now: Vec<(String, Vec<f32>)> = Vec::with_capacity(batch.len());
+            let mut failure = None;
             for (chunk, embedding) in batch.iter().zip(embeddings) {
-                self.storage
-                    .insert_chunk_with_source(chunk, &embedding, attribution.source)?;
-                // Persist provenance: who authored this chunk + its source conv.
-                // Supersession detection is deferred (None) — recall still gains
-                // from author-authority weighting. Non-fatal on error.
-                if let Err(e) = self.storage.insert_chunk_provenance(
-                    &chunk.id,
-                    &crate::provenance::ChunkProvenance {
-                        author: chunk.author,
-                        source_conv_id: attribution
-                            .parent_conversation_id
-                            .clone()
-                            .unwrap_or_else(|| chunk.conversation_id.clone()),
-                        supersedes: None,
-                    },
-                ) {
-                    eprintln!("CSR: chunk provenance persist error (non-fatal): {e}");
+                let stored = (|| -> Result<()> {
+                    self.storage
+                        .insert_chunk_with_source(chunk, &embedding, attribution.source)?;
+                    // Persist provenance: who authored this chunk + its source conv.
+                    // Supersession detection is deferred (None) — recall still gains
+                    // from author-authority weighting. Non-fatal on error.
+                    if let Err(e) = self.storage.insert_chunk_provenance(
+                        &chunk.id,
+                        &crate::provenance::ChunkProvenance {
+                            author: chunk.author,
+                            source_conv_id: attribution
+                                .parent_conversation_id
+                                .clone()
+                                .unwrap_or_else(|| chunk.conversation_id.clone()),
+                            supersedes: None,
+                        },
+                    ) {
+                        eprintln!("CSR: chunk provenance persist error (non-fatal): {e}");
+                    }
+                    if let Some(chunk_evidence) = evidence.get(&chunk.id) {
+                        self.storage.replace_chunk_evidence(chunk_evidence)?;
+                    }
+                    Ok(())
+                })();
+                match stored {
+                    Ok(()) => stored_now.push((chunk.id.clone(), embedding)),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
                 }
-                if let Some(chunk_evidence) = evidence.get(&chunk.id) {
-                    self.storage.replace_chunk_evidence(chunk_evidence)?;
+            }
+            {
+                let mut idx = self.search.write().await;
+                for (id, embedding) in stored_now {
+                    idx.insert_chunk(id, embedding);
                 }
-                idx.insert_chunk(chunk.id.clone(), embedding);
+            }
+            if let Some(error) = failure {
+                return Err(error);
             }
         }
 
@@ -1794,6 +1817,44 @@ mod tests {
     use super::*;
     use crate::import::ConversationChunk;
     use crate::provenance::Speaker;
+
+    fn write_guard_session(path: &Path) {
+        let lines = [
+            serde_json::json!({
+                "type": "user", "uuid": "u-1", "timestamp": "2026-10-14T10:00:00Z",
+                "message": {"content": "please look at the retry loop in the uploader"}
+            }),
+            serde_json::json!({
+                "type": "assistant", "uuid": "a-1", "timestamp": "2026-10-14T10:00:05Z",
+                "message": {"content": [{"type": "text", "text": "The uploader retries without backoff; I added exponential backoff."}]}
+            }),
+        ];
+        let body: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_never_waits_on_storage_under_the_index_write_guard() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(projects.join("-tmp-proj")).unwrap();
+        let src = projects.join("-tmp-proj").join("sess-guard.jsonl");
+        write_guard_session(&src);
+        let engine = Engine::from_parts_with_index_dir(
+            Arc::new(Storage::open_memory().unwrap()),
+            Arc::new(EmbeddingEngine::new().unwrap()),
+            Arc::new(RwLock::new(SearchEngine::new(64))),
+            projects,
+            tmp.path().join("index-v3"),
+        );
+        let (_probe, under_guard) = crate::storage::lock_probe::watch_index(engine.search.clone());
+        assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
+        assert_eq!(
+            under_guard.get(),
+            0,
+            "a storage call waited while the index write guard was held"
+        );
+    }
 
     fn insert_test_chunk(storage: &Storage, id: &str) {
         storage

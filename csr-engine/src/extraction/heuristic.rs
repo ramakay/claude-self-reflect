@@ -144,9 +144,13 @@ pub async fn enrich_conversation(
         let tags = vec!["narrative_heuristic".to_string(), format!("conv_{conv_id}")];
 
         storage.insert_reflection(&reflection_id, &content, &tags, &embedding)?;
-        let mut idx = search.write().await;
-        // The answer is not used, so a proxied engine does not wait for it.
-        idx.insert_reflection_unacked(reflection_id.clone(), embedding);
+        {
+            // Only the in-memory insert is under the guard (see
+            // `Engine::import_file_with_attribution`).
+            let mut idx = search.write().await;
+            // The answer is not used, so a proxied engine does not wait for it.
+            idx.insert_reflection_unacked(reflection_id.clone(), embedding);
+        }
 
         storage.mark_enrichment_completed(conv_id, "heuristic", &reflection_id)?;
 
