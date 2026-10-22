@@ -1943,6 +1943,29 @@ fn plist_program_span(text: &str) -> Option<std::ops::Range<usize>> {
     Some(open..close)
 }
 
+/// The byte range of the top-level `Program` string, which is the file launchd
+/// executes when it is present (ProgramArguments[0] is then only argv[0]).
+/// `value` is the parsed text of that key, so a same-named key nested in
+/// EnvironmentVariables is not mistaken for it.
+fn plist_program_key_span(text: &str, value: &str) -> Option<std::ops::Range<usize>> {
+    const KEY: &str = "<key>Program</key>";
+    let mut from = 0;
+    while let Some(found) = text[from..].find(KEY) {
+        let after = from + found + KEY.len();
+        let rest = &text[after..];
+        let gap = rest.len() - rest.trim_start().len();
+        if rest[gap..].starts_with("<string>") {
+            let open = after + gap + "<string>".len();
+            let close = open + text[open..].find("</string>")?;
+            if xml_unescape(&text[open..close]) == value {
+                return Some(open..close);
+            }
+        }
+        from = after;
+    }
+    None
+}
+
 /// Does the loaded job run what the agent file asks for? Same arguments, and
 /// every environment entry of the file present with the same value (launchd
 /// adds a few of its own, so the loaded side may hold more).
@@ -2353,21 +2376,64 @@ fn apply_daemon_agent(
         Some(text) if adopted || !text.contains(DAEMON_PLIST_MARKER) => {
             // nothing was merged into a file we do not write
             notes.retain(|n| n.starts_with("Another agent"));
-            let program = parse_plist(text)
-                .map(|p| agent_facts(&p).program_args)
+            let parsed = parse_plist(text);
+            let first_arg = parsed
+                .as_ref()
+                .map(|p| agent_facts(p).program_args)
                 .and_then(|args| args.into_iter().next());
-            match (program, plist_program_span(text)) {
-                (Some(program), Some(span)) if !Path::new(&program).exists() => {
+            let program_key = parsed
+                .as_ref()
+                .and_then(|p| p.get("Program"))
+                .and_then(|v| v.text())
+                .map(str::to_owned);
+            // launchd executes Program when there is one; otherwise argv[0].
+            // Whatever it would run, if gone, is repaired in place, and a dead
+            // argv[0] next to it is repaired with it. A live Program leaves a
+            // stale argv[0] label alone: it does not stop the daemon starting.
+            let dead = |path: &Option<String>| {
+                path.as_deref().filter(|p| !Path::new(p).exists()).is_some()
+            };
+            let runs_dead = match &program_key {
+                Some(_) => dead(&program_key),
+                None => dead(&first_arg),
+            };
+            if !runs_dead {
+                (true, text.to_owned())
+            } else {
+                let engine = xml_escape(&spec.engine.to_string_lossy());
+                let mut spans = Vec::new();
+                let mut gone = Vec::new();
+                if let Some(value) = &program_key {
+                    if let Some(span) = plist_program_key_span(text, value) {
+                        spans.push(span);
+                        gone.push(value.clone());
+                    }
+                }
+                if dead(&first_arg) {
+                    if let (Some(value), Some(span)) = (&first_arg, plist_program_span(text)) {
+                        spans.push(span);
+                        if !gone.contains(value) {
+                            gone.push(value.clone());
+                        }
+                    }
+                }
+                if spans.is_empty() {
+                    (true, text.to_owned())
+                } else {
                     notes.push(format!(
-                        "Your agent pointed at {program}, which is gone. Repaired that one path to {}; the rest of {} is unchanged.",
+                        "Your agent pointed at {}, which is gone. Repaired {} to {}; the rest of {} is unchanged.",
+                        gone.join(" and "),
+                        if spans.len() == 1 { "that one path" } else { "those paths" },
                         spec.engine.display(),
                         plist.display()
                     ));
+                    spans.sort_by_key(|span| std::cmp::Reverse(span.start));
                     let mut repaired = text.to_owned();
-                    repaired.replace_range(span, &xml_escape(&spec.engine.to_string_lossy()));
+                    for span in spans {
+                        repaired.replace_range(span, &engine);
+                    }
                     (true, repaired)
                 }
-                _ => (true, text.to_owned()),
             }
         }
         _ => (false, render_daemon_plist(spec)),
@@ -4270,6 +4336,68 @@ esac
             std::fs::read_to_string(spec.plist_path()).unwrap(),
             "bplist00\u{1}binary"
         );
+    }
+
+    #[test]
+    fn a_dead_program_key_is_repaired_where_launchd_reads_it() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let theirs = |program: &str, first: &str| {
+            format!(
+                "<?xml version=\"1.0\"?>
+<!-- mine -->
+<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+  <key>Program</key>
+  <string>{program}</string>
+  <key>ProgramArguments</key><array>
+    <string>{first}</string>
+    <string>--db-path</string><string>/data/mine.db</string>
+    <string>daemon</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>CSR_NO_DREAMING</key><string>1</string>
+  </dict>
+  <key>StartInterval</key><integer>77</integer>
+</dict></plist>
+"
+            )
+        };
+        let run = |text: &str| {
+            std::fs::create_dir_all(spec.plist_path().parent().unwrap()).unwrap();
+            std::fs::write(spec.plist_path(), text).unwrap();
+            let mut fake = FakeLaunchctl::new(false);
+            assert_eq!(install(&spec, &mut fake), DaemonOutcome::KeptExisting);
+            std::fs::read_to_string(spec.plist_path()).unwrap()
+        };
+        let engine = "/opt/csr/bin/csr-engine";
+
+        // Program and argv[0] both dead: launchd runs Program, so Program is
+        // repaired, and the argument with it.
+        let both = theirs("/old/place/csr-engine", "/old/place/csr-engine");
+        assert_eq!(run(&both), both.replace("/old/place/csr-engine", engine));
+
+        // Program dead, argv[0] a live name: launchd still runs Program.
+        let live = std::env::current_exe().unwrap();
+        let live = live.to_string_lossy();
+        let only_program = theirs("/old/place/csr-engine", &live);
+        assert_eq!(
+            run(&only_program),
+            only_program.replace("/old/place/csr-engine", engine)
+        );
+
+        // Program live: it is what runs, so a dead argv[0] label is left alone.
+        let fine = theirs(&live, "/old/place/csr-engine");
+        assert_eq!(run(&fine), fine);
+
+        // Program and no ProgramArguments at all.
+        let bare = "<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+  <key>Program</key><string>/old/place/csr-engine</string>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+";
+        assert_eq!(run(bare), bare.replace("/old/place/csr-engine", engine));
     }
 
     #[test]
