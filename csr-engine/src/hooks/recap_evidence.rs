@@ -297,9 +297,7 @@ pub(crate) fn closing_marker(text: &str) -> Option<(ClosingKind, String)> {
         if numbered || ((raw.starts_with('\t') || indent >= 4) && !bulleted) {
             continue;
         }
-        let body = body
-            .trim_start_matches(|c: char| c == '*' || c == '_')
-            .trim_start();
+        let body = body.trim_start_matches(['*', '_']).trim_start();
         let lower = body.to_lowercase();
         let Some((kind, content)) = marker_content(body, &lower) else {
             continue;
@@ -354,7 +352,7 @@ fn marker_content<'a>(body: &'a str, lower: &str) -> Option<(ClosingKind, &'a st
             continue;
         }
         // `Next:`, `**Next:**`, `**Next**:`, `Next move -`.
-        let rest = rest.trim_start_matches(|c: char| c == '*' || c == '_');
+        let rest = rest.trim_start_matches(['*', '_']);
         let rest_trimmed = rest.trim_start();
         let separator = rest_trimmed
             .strip_prefix(':')
@@ -362,10 +360,7 @@ fn marker_content<'a>(body: &'a str, lower: &str) -> Option<(ClosingKind, &'a st
             .or_else(|| rest_trimmed.strip_prefix("\u{2013}"))
             .or_else(|| rest_trimmed.strip_prefix("- "));
         if let Some(content) = separator {
-            return Some((
-                kind,
-                content.trim_start_matches(|c: char| c == '*' || c == '_'),
-            ));
+            return Some((kind, content.trim_start_matches(['*', '_'])));
         }
     }
     for (opener, drop_opener) in NEXT_PROSE {
