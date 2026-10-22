@@ -259,9 +259,8 @@ static ONELINE_COMMIT_RE: LazyLock<Regex> =
 
 /// What `gh pr view --json state,mergeCommit` prints for a merged PR:
 /// `MERGED <sha>` or `MERGED <mergedAt> <sha>`.
-static MERGED_PR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^MERGED[ \t]+(?:\S+Z[ \t]+)?([0-9a-f]{7,40})\b").unwrap()
-});
+static MERGED_PR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^MERGED[ \t]+(?:\S+Z[ \t]+)?([0-9a-f]{7,40})\b").unwrap());
 
 /// The commits one successful committing Bash call made, as `(sha, subject)`.
 ///
@@ -290,19 +289,21 @@ fn commits_made(command: &str, output: &str) -> Vec<(String, String)> {
 /// The PR number of the one `gh pr merge <N>` a Bash command runs, or `None`
 /// when it runs none or several (the output could not be told apart).
 fn merge_command_pr(command: &str) -> Option<String> {
-    let mut numbers = shell_simple_commands(command).into_iter().filter_map(|words| {
-        let at = words.iter().position(|w| w == "gh" || w.ends_with("/gh"))?;
-        let rest = &words[at + 1..];
-        (rest.first().map(String::as_str) == Some("pr")
-            && rest.get(1).map(String::as_str) == Some("merge"))
-        .then(|| {
-            rest[2..]
-                .iter()
-                .find(|w| !w.starts_with('-'))
-                .map(|w| w.rsplit('/').next().unwrap_or(w).to_string())
-                .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-        })
-    });
+    let mut numbers = shell_simple_commands(command)
+        .into_iter()
+        .filter_map(|words| {
+            let at = words.iter().position(|w| w == "gh" || w.ends_with("/gh"))?;
+            let rest = &words[at + 1..];
+            (rest.first().map(String::as_str) == Some("pr")
+                && rest.get(1).map(String::as_str) == Some("merge"))
+            .then(|| {
+                rest[2..]
+                    .iter()
+                    .find(|w| !w.starts_with('-'))
+                    .map(|w| w.rsplit('/').next().unwrap_or(w).to_string())
+                    .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+            })
+        });
     let first = numbers.next()??;
     numbers.next().is_none().then_some(first)
 }
@@ -517,6 +518,9 @@ struct TaskSegment {
     last_prompt_at: Option<chrono::DateTime<chrono::Utc>>,
     tool_calls: u32,
     commits: u32,
+    /// Files this task's successful Edit/Write/MultiEdit calls changed, one
+    /// entry per call, in call order.
+    edits: Vec<String>,
 }
 
 impl TaskSegment {
@@ -930,6 +934,9 @@ where
     let mut turn_finished = true;
     // Bash tool_use ids whose command can commit or merge, with the command.
     let mut git_calls: HashMap<String, String> = HashMap::new();
+    // Main-thread edit tool_use ids with the file they change; an entry
+    // becomes an edit receipt only when its result succeeds.
+    let mut edit_calls: HashMap<String, String> = HashMap::new();
     // The session's receipts, latest last, each with the index of the task
     // segment it was produced under (None before the first task).
     let mut completions: Vec<(CompletionReceipt, Option<usize>)> = Vec::new();
@@ -1148,6 +1155,12 @@ where
                                         }
                                         if write_tools.contains(name) {
                                             files_modified.insert(fp.to_string());
+                                            if let (false, Some(id)) = (
+                                                sidechain,
+                                                block.get("id").and_then(|v| v.as_str()),
+                                            ) {
+                                                edit_calls.insert(id.to_string(), fp.to_string());
+                                            }
                                         }
                                     }
                                 }
@@ -1251,6 +1264,11 @@ where
                             continue;
                         }
                         let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str());
+                        if let Some(path) = tool_use_id.and_then(|id| edit_calls.remove(id)) {
+                            if let (false, Some(task)) = (failed, segments.last_mut()) {
+                                task.edits.push(path);
+                            }
+                        }
                         if let Some(op) = tool_use_id.and_then(|id| tasks.pending.remove(id)) {
                             if !failed {
                                 for (claim, receipt) in tasks.apply(op, Some(&block_text)) {
@@ -1291,12 +1309,20 @@ where
         .find(|t| t.status != "completed")
         .map(|t| t.content.clone());
 
+    // The weakest receipt: the files a task's successful edits changed. It is
+    // shown only when the session has no commit and no completed task.
+    for (index, task) in segments.iter().enumerate() {
+        if let Some((claim, receipt)) = edit_receipt(&task.edits) {
+            push_completion(&mut completions, Some(index), &claim, &receipt);
+        }
+    }
+
     let (anchor_request, anchor_index) = anchor_segment(&segments);
     let (completions, origins): (Vec<CompletionReceipt>, Vec<Option<usize>>) =
         completions.into_iter().unzip();
     // Receipts read as the anchor's result only when every receipt the recap
     // shows was produced under the anchor segment; otherwise "Latest:".
-    let displayed = crate::hooks::recap::displayed_receipts(&completions);
+    let displayed = crate::hooks::recap::recap_receipts(&completions);
     let untied = |anchor: Option<usize>| {
         displayed
             .iter()
@@ -1363,7 +1389,46 @@ where
     }
 }
 
-/// Record a completion. Commit receipts and task/todo receipts are capped
+/// The receipt for one task's successful edits: `edited a.rs, b.rs and 2
+/// more` with `N edits` as the proof. Whole file names only; a list that would
+/// run past the recap's claim limit says how many files instead.
+fn edit_receipt(edits: &[String]) -> Option<(String, String)> {
+    const SHOWN_FILES: usize = 3;
+    const MAX_CLAIM_CHARS: usize = 100;
+    if edits.is_empty() {
+        return None;
+    }
+    let mut files: Vec<&str> = Vec::new();
+    for path in edits {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if !name.is_empty() && !files.contains(&name) {
+            files.push(name);
+        }
+    }
+    let listed = files
+        .iter()
+        .take(SHOWN_FILES)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let claim = match files.len() {
+        0 => return None,
+        n if n > SHOWN_FILES => format!("edited {listed} and {} more", n - SHOWN_FILES),
+        _ => format!("edited {listed}"),
+    };
+    let claim = if claim.chars().count() > MAX_CLAIM_CHARS {
+        format!("edited {} files", files.len())
+    } else {
+        claim
+    };
+    let count = edits.len();
+    Some((
+        claim,
+        format!("{count} edit{}", if count == 1 { "" } else { "s" }),
+    ))
+}
+
+/// Record a completion. Commit, task/todo and edit receipts are capped
 /// separately (`MAX_COMPLETIONS` each, oldest dropped), so a run of todo
 /// completions can never evict the session's commits.
 fn push_completion(
@@ -1376,7 +1441,14 @@ fn push_completion(
     if claim.is_empty() {
         return;
     }
-    let commit = crate::hooks::recap::is_commit_receipt(receipt);
+    let kind = crate::hooks::recap::receipt_kind(receipt);
+    // The same commit seen twice (a log run again, an amend printed twice) is
+    // one receipt.
+    if kind == crate::hooks::recap::ReceiptKind::Commit
+        && completions.iter().any(|(done, _)| done.receipt == receipt)
+    {
+        return;
+    }
     completions.push((
         CompletionReceipt {
             claim,
@@ -1385,7 +1457,7 @@ fn push_completion(
         segment,
     ));
     let same_kind = |(done, _): &(CompletionReceipt, Option<usize>)| {
-        crate::hooks::recap::is_commit_receipt(&done.receipt) == commit
+        crate::hooks::recap::receipt_kind(&done.receipt) == kind
     };
     if completions.iter().filter(|entry| same_kind(entry)).count() > MAX_COMPLETIONS {
         if let Some(oldest) = completions.iter().position(same_kind) {
@@ -4484,20 +4556,26 @@ mod tests {
 
     #[test]
     fn a_quiet_commit_is_a_receipt_when_the_log_line_names_its_own_subject() {
-        let command = r#"git add -A && git commit -q -m "fix(recap): subject" && git log --oneline -1"#;
+        let command =
+            r#"git add -A && git commit -q -m "fix(recap): subject" && git log --oneline -1"#;
         assert_eq!(
             bash_receipts(command, "1a2b3c4 fix(recap): subject", false),
             vec![receipt("fix(recap): subject", "1a2b3c4")]
         );
         // A heredoc message carries the subject on its first line.
-        let heredoc = "git commit -q -F - <<'EOF'\nfix(recap): subject\n\nbody\nEOF\ngit log --oneline -1";
+        let heredoc =
+            "git commit -q -F - <<'EOF'\nfix(recap): subject\n\nbody\nEOF\ngit log --oneline -1";
         assert_eq!(
             bash_receipts(heredoc, "1a2b3c4 fix(recap): subject", false),
             vec![receipt("fix(recap): subject", "1a2b3c4")]
         );
         // Hook chatter before the line changes nothing.
         assert_eq!(
-            bash_receipts(command, "no leaks found\n1a2b3c4 fix(recap): subject", false),
+            bash_receipts(
+                command,
+                "no leaks found\n1a2b3c4 fix(recap): subject",
+                false
+            ),
             vec![receipt("fix(recap): subject", "1a2b3c4")]
         );
     }
@@ -4525,10 +4603,37 @@ mod tests {
     }
 
     #[test]
+    fn the_same_commit_seen_twice_is_one_receipt() {
+        let ep = extract(&[
+            typed_line("land the recap fix", "typed"),
+            assistant_named_tool(
+                "Bash",
+                "c1",
+                serde_json::json!({"command": "git commit -m x"}),
+            ),
+            tool_result_bound("c1", "[main 1a2b3c4] fix(recap): subject"),
+            assistant_named_tool(
+                "Bash",
+                "c2",
+                serde_json::json!({"command": "git commit --amend --no-edit"}),
+            ),
+            tool_result_bound("c2", "[main 1a2b3c4] fix(recap): subject"),
+        ]);
+        assert_eq!(
+            ep.completions,
+            vec![receipt("fix(recap): subject", "1a2b3c4")]
+        );
+    }
+
+    #[test]
     fn a_merged_pr_is_a_receipt_only_with_the_merge_commit_in_the_output() {
         let command = "gh pr merge 76 --squash 2>&1 | tail -3; gh pr view 76 --json state,mergeCommit -q '.state+\" \"+.mergeCommit.oid'";
         assert_eq!(
-            bash_receipts(command, "MERGED a8f845882e5068d3eed6d2ca160b182a49c23b06", false),
+            bash_receipts(
+                command,
+                "MERGED a8f845882e5068d3eed6d2ca160b182a49c23b06",
+                false
+            ),
             vec![receipt("merged PR #76", "a8f8458")]
         );
         assert_eq!(
@@ -4539,11 +4644,78 @@ mod tests {
         assert!(bash_receipts(command, "OPEN ", false).is_empty());
         assert!(bash_receipts(command, "MERGED a8f8458", true).is_empty());
         // Two merges in one call cannot be told apart.
-        let two = "gh pr merge 1 --squash; gh pr merge 2 --squash; gh pr view 2 --json state,mergeCommit";
+        let two =
+            "gh pr merge 1 --squash; gh pr merge 2 --squash; gh pr view 2 --json state,mergeCommit";
         assert!(bash_receipts(two, "MERGED a8f8458", false).is_empty());
         // A view of an already merged PR is not a merge by this session.
-        assert!(bash_receipts("gh pr view 76 --json state,mergeCommit", "MERGED a8f8458", false)
-            .is_empty());
+        assert!(bash_receipts(
+            "gh pr view 76 --json state,mergeCommit",
+            "MERGED a8f8458",
+            false
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn successful_edits_are_the_weakest_receipt_and_failed_ones_are_not_counted() {
+        let edit = |id: &str, path: &str| {
+            assistant_named_tool("Edit", id, serde_json::json!({"file_path": path}))
+        };
+        let ep = extract(&[
+            typed_line("tighten the recap composer", "typed"),
+            edit("e1", "/repo/src/hooks/stop.rs"),
+            tool_result_bound("e1", "The file has been updated"),
+            edit("e2", "/repo/src/hooks/recap.rs"),
+            error_result("e2", "String to replace not found"),
+            edit("e3", "/repo/src/hooks/stop.rs"),
+            tool_result_bound("e3", "The file has been updated"),
+        ]);
+        assert_eq!(ep.completions, vec![receipt("edited stop.rs", "2 edits")]);
+        // An edit made by a subagent is not this session's.
+        let ep = extract(&[
+            typed_line("tighten the recap composer", "typed"),
+            sidechain(edit("e1", "/repo/src/hooks/stop.rs")),
+            sidechain(tool_result_bound("e1", "The file has been updated")),
+        ]);
+        assert!(ep.completions.is_empty());
+        let (claim, proof) = edit_receipt(&[
+            "/r/a.rs".into(),
+            "/r/b.rs".into(),
+            "/r/c.rs".into(),
+            "/r/d.rs".into(),
+            "/r/e.rs".into(),
+            "/r/a.rs".into(),
+        ])
+        .unwrap();
+        assert_eq!(claim, "edited a.rs, b.rs, c.rs and 2 more");
+        assert_eq!(proof, "6 edits");
+        let long = format!("/r/{}.rs", "n".repeat(100));
+        let (claim, _) = edit_receipt(&[long, "/r/b.rs".into()]).unwrap();
+        assert_eq!(claim, "edited 2 files");
+        assert_eq!(edit_receipt(&[]), None);
+    }
+
+    #[test]
+    fn edit_receipts_never_evict_the_sessions_commits() {
+        let mut rows = vec![typed_line("land the fix", "typed")];
+        for n in 0..8 {
+            let id = format!("e{n}");
+            rows.push(assistant_named_tool(
+                "Edit",
+                &id,
+                serde_json::json!({"file_path": format!("/r/f{n}.rs")}),
+            ));
+            rows.push(tool_result_bound(&id, "The file has been updated"));
+        }
+        rows.push(assistant_named_tool(
+            "Bash",
+            "c1",
+            serde_json::json!({"command": "git commit -m done"}),
+        ));
+        rows.push(tool_result_bound("c1", "[main 1a2b3c4] fix: done"));
+        let ep = extract(&rows);
+        assert!(ep.completions.iter().any(|done| done.receipt == "1a2b3c4"));
+        assert!(ep.completions.iter().any(|done| done.receipt == "8 edits"));
     }
 
     fn sidechain(line: String) -> String {

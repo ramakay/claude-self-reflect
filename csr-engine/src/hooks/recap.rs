@@ -752,10 +752,10 @@ pub(crate) fn is_request(text: &str) -> bool {
         && !(matches!(second, "this" | "that") && TIME_WORDS.contains(&third))
 }
 
-/// The completed clause: the receipts `displayed_receipts` picks, never
+/// The completed clause: the receipts `recap_receipts` picks, never
 /// assistant prose. Legacy episodes carry none and abstain.
 fn recap_completed(ep: &crate::hooks::stop::Episode) -> Option<String> {
-    let entries: Vec<String> = displayed_receipts(&ep.completions)
+    let entries: Vec<String> = recap_receipts(&ep.completions)
         .into_iter()
         .map(|(_, entry)| entry)
         .collect();
@@ -768,16 +768,66 @@ pub(crate) fn is_commit_receipt(receipt: &str) -> bool {
     (7..=40).contains(&receipt.len()) && receipt.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// The receipts the recap shows, oldest first, each with its index in
-/// `completions`: the latest two commit receipts, or the latest two task or
-/// todo receipts when the session made no commit. Entries are rendered
+/// What a receipt proves, strongest first. The recap shows the strongest
+/// kind the session has and nothing from the weaker ones.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ReceiptKind {
+    /// A commit or merge, proved by its SHA.
+    Commit,
+    /// A task or todo marked completed.
+    Task,
+    /// The files a task's successful edits changed (`3 edits`).
+    Edit,
+}
+
+pub(crate) fn receipt_kind(receipt: &str) -> ReceiptKind {
+    let receipt = receipt.trim();
+    if is_commit_receipt(receipt) {
+        return ReceiptKind::Commit;
+    }
+    let is_edit_count = receipt.split_once(' ').is_some_and(|(count, word)| {
+        !count.is_empty()
+            && count.chars().all(|c| c.is_ascii_digit())
+            && matches!(word, "edit" | "edits")
+    });
+    if is_edit_count {
+        ReceiptKind::Edit
+    } else {
+        ReceiptKind::Task
+    }
+}
+
+/// The receipts that show a session finished something, oldest first, each
+/// with its index in `completions`: the latest two commit receipts, or the
+/// latest two task or todo receipts when the session made no commit. Edit
+/// receipts are not among them (see [`recap_receipts`]). Entries are rendered
 /// whole as `<claim> (<receipt>)`; a claim over 100 chars is dropped, never
 /// cut.
 pub(crate) fn displayed_receipts(
     completions: &[crate::hooks::stop::CompletionReceipt],
 ) -> Vec<(usize, String)> {
+    pick_receipts(completions, &[ReceiptKind::Commit, ReceiptKind::Task])
+}
+
+/// What the recap's completed clause shows: [`displayed_receipts`], or, for a
+/// session that finished nothing, the files its edits changed.
+pub(crate) fn recap_receipts(
+    completions: &[crate::hooks::stop::CompletionReceipt],
+) -> Vec<(usize, String)> {
+    pick_receipts(
+        completions,
+        &[ReceiptKind::Commit, ReceiptKind::Task, ReceiptKind::Edit],
+    )
+}
+
+fn pick_receipts(
+    completions: &[crate::hooks::stop::CompletionReceipt],
+    kinds: &[ReceiptKind],
+) -> Vec<(usize, String)> {
     use crate::extraction::provenance::extractable;
     const MAX_ENTRIES: usize = 2;
+    /// Edits are the weakest proof: the latest task's alone, never a list.
+    const MAX_EDIT_ENTRIES: usize = 1;
     const MAX_CLAIM_CHARS: usize = 100;
     let render = |done: &crate::hooks::stop::CompletionReceipt| {
         let receipt = normalize_feed_text(&done.receipt);
@@ -790,19 +840,26 @@ pub(crate) fn displayed_receipts(
         (!receipt.is_empty() && has_substance(&claim) && claim.chars().count() <= MAX_CLAIM_CHARS)
             .then(|| format!("{} ({receipt})", claim.trim_end_matches(TRAILING_JUNK)))
     };
-    let pick = |commits: bool| -> Vec<(usize, String)> {
+    let pick = |kind: ReceiptKind| -> Vec<(usize, String)> {
         completions
             .iter()
             .enumerate()
             .rev()
-            .filter(|(_, done)| is_commit_receipt(done.receipt.trim()) == commits)
+            .filter(|(_, done)| receipt_kind(&done.receipt) == kind)
             .filter_map(|(index, done)| render(done).map(|entry| (index, entry)))
-            .take(MAX_ENTRIES)
+            .take(if kind == ReceiptKind::Edit {
+                MAX_EDIT_ENTRIES
+            } else {
+                MAX_ENTRIES
+            })
             .collect()
     };
-    let mut shown = pick(true);
-    if shown.is_empty() {
-        shown = pick(false);
+    let mut shown = Vec::new();
+    for &kind in kinds {
+        shown = pick(kind);
+        if !shown.is_empty() {
+            break;
+        }
     }
     shown.reverse();
     shown
@@ -2462,6 +2519,53 @@ mod tests {
             got,
             "recap [now]: Fix the recap composer: Write regression tests (task #3 completed). [[CSR:RECAP]]"
         );
+    }
+
+    #[test]
+    fn edit_receipts_are_the_weakest_and_never_a_finished_thing() {
+        let done = |claim: &str, receipt: &str| CompletionReceipt {
+            claim: claim.into(),
+            receipt: receipt.into(),
+        };
+        let mut ep = episode();
+        ep.todos.clear();
+        ep.next_steps = None;
+        ep.blockers = None;
+        ep.completions = vec![done("edited stop.rs, recap.rs", "7 edits")];
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: Fix the recap composer: edited stop.rs, recap.rs (7 edits). [[CSR:RECAP]]"
+        );
+        // The companion's repo recap reads "done" from these: edits are not.
+        assert!(displayed_receipts(&ep.completions).is_empty());
+        // Only the latest task's edits show.
+        ep.completions.push(done("edited recap.rs", "2 edits"));
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: Fix the recap composer: edited recap.rs (2 edits). [[CSR:RECAP]]"
+        );
+        ep.completions.pop();
+        // A completed task outranks them, a commit outranks both.
+        ep.completions
+            .push(done("Write regression tests", "task #3 completed"));
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: Fix the recap composer: Write regression tests (task #3 completed). [[CSR:RECAP]]"
+        );
+        ep.completions.push(done("fix(recap): subject", "abc1234"));
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: Fix the recap composer: fix(recap): subject (abc1234). [[CSR:RECAP]]"
+        );
+        assert_eq!(receipt_kind("12 edits"), ReceiptKind::Edit);
+        assert_eq!(receipt_kind("1 edit"), ReceiptKind::Edit);
+        assert_eq!(receipt_kind("todo completed"), ReceiptKind::Task);
+        assert_eq!(receipt_kind("task #4 completed"), ReceiptKind::Task);
+        assert_eq!(receipt_kind("deadbee"), ReceiptKind::Commit);
     }
 
     #[test]
