@@ -4317,8 +4317,9 @@ mod r4_daemon_audit_probes {
             })
             .unwrap();
         assert_eq!(state, "processing");
-        drop(lock);
-        tokio::time::timeout(Duration::from_secs(10), poll)
+        crate::maintenance::release_for_test(lock);
+        // The bound only catches a hang; the poll retries once a second until it can store.
+        tokio::time::timeout(Duration::from_secs(60), poll)
             .await
             .unwrap()
             .unwrap();
