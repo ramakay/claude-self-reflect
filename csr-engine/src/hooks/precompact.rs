@@ -30,6 +30,12 @@ pub(crate) struct CompactSnapshot {
     #[serde(default)]
     pub anchor_request: Option<String>,
     pub anchor: Option<super::stop::CompactAnchor>,
+    /// The session's last typed ask when the snapshot was taken, `None` when
+    /// there was none. It travels with the anchor: an ask saved with an older
+    /// task must not be shown after a newer one. A snapshot written before
+    /// this field existed reads as no ask.
+    #[serde(default)]
+    pub latest_ask: Option<String>,
     pub completions: Vec<super::stop::CompletionReceipt>,
     pub completions_untied: bool,
 }
@@ -83,6 +89,7 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
             let snapshot = CompactSnapshot {
                 anchor_request: episode.anchor_request,
                 anchor: episode.compact_anchor,
+                latest_ask: episode.latest_ask,
                 completions: episode.completions,
                 completions_untied: episode.completions_untied,
             };

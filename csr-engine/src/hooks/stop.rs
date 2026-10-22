@@ -701,6 +701,65 @@ fn ends_turn(val: &serde_json::Value, msg_type: &str) -> bool {
     }
 }
 
+/// `text` whole when it fits `max` bytes, else its leading paragraphs that do
+/// (cut only at a blank line), else `None`. The recap renders the first
+/// paragraph only, so a cut inside it would show a truncated ask: abstain.
+fn whole_paragraphs(text: &str, max: usize) -> Option<String> {
+    if text.len() <= max {
+        return Some(text.to_string());
+    }
+    let cut = text.floor_char_boundary(max);
+    let at = text[..cut].rfind("\n\n")?;
+    let head = text[..at].trim_end();
+    (!head.is_empty()).then(|| head.to_string())
+}
+
+/// Opening words of a thank-you or praise.
+const PRAISE_OPENERS: &[&str] = &[
+    "thanks",
+    "thank",
+    "thx",
+    "ty",
+    "great",
+    "nice",
+    "perfect",
+    "awesome",
+    "cool",
+    "good",
+    "excellent",
+    "amazing",
+    "wow",
+    "lgtm",
+    "love",
+    "appreciate",
+    "brilliant",
+    "wonderful",
+    "sweet",
+    "beautiful",
+    "fantastic",
+    "super",
+    "well",
+];
+
+/// A typed message that only reacts to the work ("Thanks for fixing the
+/// build"): it opens with praise, asks nothing, and has no clause that does.
+/// "Great. Now fix the tests" is a task.
+fn is_closing_remark(prose: &str) -> bool {
+    let first = prose
+        .split_whitespace()
+        .next()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .unwrap_or_default();
+    PRAISE_OPENERS.contains(&first.as_str())
+        && !prose.contains('?')
+        && !prose
+            .split(['.', ',', ';', '!', '\u{2014}', '\u{2013}'])
+            .any(|clause| crate::hooks::recap::is_request(clause.trim()))
+}
+
 /// Longest stored `latest_ask`, in bytes. The recap renders at most
 /// `INTENT_MAX_CHARS` of it, so the cut never reaches a rendered sentence.
 const LATEST_ASK_MAX_BYTES: usize = 400;
@@ -919,13 +978,19 @@ where
                     opening_seen = Some(crate::import::is_csr_agent_prompt(&text));
                 }
             }
-            if let Some(TypedPrompt { prose, note }) =
-                forwarded_note(raw_row).or_else(|| typed_prompt(val))
-            {
-                if !sidechain && opening_seen != Some(true) {
-                    latest_ask =
-                        (!note).then(|| truncate_str(&prose, LATEST_ASK_MAX_BYTES).to_string());
-                }
+            let typed = forwarded_note(raw_row).or_else(|| typed_prompt(val));
+            // The literal last typed row decides. One that leaves no usable
+            // prose (a pasted recap, a command-only wrapper) clears the
+            // candidate: an older question must not stand in for it.
+            if !sidechain && opening_seen != Some(true) && typed_row_text(val).is_some() {
+                latest_ask = match &typed {
+                    Some(TypedPrompt { prose, note: false }) => {
+                        whole_paragraphs(prose, LATEST_ASK_MAX_BYTES)
+                    }
+                    _ => None,
+                };
+            }
+            if let Some(TypedPrompt { prose, note }) = typed {
                 if opening_seen != Some(true) && (note || is_task_prompt(&prose)) {
                     let sent_at = val
                         .get("timestamp")
@@ -950,8 +1015,13 @@ where
                             }
                         }
                         _ => {
-                            late_errors = false;
-                            closing_text.clear();
+                            // A closing remark ("thanks for fixing the build")
+                            // is not a new task: it neither undoes the success
+                            // said before it nor forgives a failure.
+                            if !is_closing_remark(&prose) {
+                                late_errors = false;
+                                closing_text.clear();
+                            }
                             segments.push(TaskSegment {
                                 prose,
                                 note,
@@ -2747,6 +2817,96 @@ mod tests {
         assert!(extract(&[dur_done("2026-10-21T10:02:00Z")])
             .latest_ask
             .is_none());
+    }
+
+    #[test]
+    fn a_last_typed_row_without_prose_clears_the_ask_it_never_walks_back() {
+        let ask = "Why did the second worker finish so early?";
+        // A command-only wrapper typed after the question.
+        let ep = extract(&[
+            dur_typed(ask, "2026-10-21T10:00:00Z"),
+            dur_done("2026-10-21T10:02:00Z"),
+            dur_typed(
+                "<command-name>/clear</command-name>\n<command-message>clear</command-message>",
+                "2026-10-21T10:30:00Z",
+            ),
+        ]);
+        assert!(ep.latest_ask.is_none(), "{:?}", ep.latest_ask);
+        // A recap pasted back.
+        let ep = extract(&[
+            dur_typed(ask, "2026-10-21T10:00:00Z"),
+            dur_done("2026-10-21T10:02:00Z"),
+            dur_typed(
+                "recap [3m ago]: Fix the composer. [[CSR:RECAP]]",
+                "2026-10-21T10:30:00Z",
+            ),
+        ]);
+        assert!(ep.latest_ask.is_none(), "{:?}", ep.latest_ask);
+        // A tool result is not a typed row: the question stands.
+        let ep = extract(&[
+            dur_typed(ask, "2026-10-21T10:00:00Z"),
+            dur_result("ok", false, "2026-10-21T10:02:00Z"),
+        ]);
+        assert_eq!(ep.latest_ask.as_deref(), Some(ask));
+    }
+
+    #[test]
+    fn a_cut_ask_is_never_stored() {
+        let long = format!("Can you check {}?", "界".repeat(150));
+        assert!(long.len() > LATEST_ASK_MAX_BYTES);
+        let ep = extract(&[
+            dur_typed(&long, "2026-10-21T10:00:00Z"),
+            dur_done("2026-10-21T10:02:00Z"),
+        ]);
+        assert!(ep.latest_ask.is_none(), "{:?}", ep.latest_ask);
+        // A short first paragraph in front of a long message is kept whole.
+        let text = format!(
+            "Why did the second worker finish so early?\n\n{}",
+            "detail ".repeat(100)
+        );
+        let ep = extract(&[
+            dur_typed(&text, "2026-10-21T10:00:00Z"),
+            dur_done("2026-10-21T10:02:00Z"),
+        ]);
+        assert_eq!(
+            ep.latest_ask.as_deref(),
+            Some("Why did the second worker finish so early?")
+        );
+    }
+
+    #[test]
+    fn a_closing_remark_does_not_reset_the_outcome_but_a_new_task_does() {
+        let closing = |remark: &str| {
+            extract(&[
+                dur_typed(
+                    "Fix the login validation before the release",
+                    "2026-10-21T10:00:00Z",
+                ),
+                dur_timed(
+                    serde_json::json!({"type": "assistant", "message": {
+                        "content": [{"type": "text", "text": "Fixed. All tests pass."}],
+                        "stop_reason": "end_turn"
+                    }}),
+                    "2026-10-21T10:02:00Z",
+                ),
+                dur_typed(remark, "2026-10-21T10:10:00Z"),
+            ])
+        };
+        let ep = closing("Thanks for fixing the build");
+        assert!(ep.closing_success);
+        assert_eq!(ep.outcome, "success");
+        // A new task, even one that opens with praise, starts over.
+        let ep = closing("Great. Now update the changelog for that fix");
+        assert!(!ep.closing_success);
+        // A remark after a failure does not forgive it.
+        let ep = extract(&[
+            dur_typed("Run the release script and report", "2026-10-21T10:00:00Z"),
+            dur_result("Exit code 1", true, "2026-10-21T10:01:00Z"),
+            dur_done("2026-10-21T10:02:00Z"),
+            dur_typed("thanks, that was useful", "2026-10-21T10:10:00Z"),
+        ]);
+        assert!(ep.late_errors);
+        assert_eq!(ep.outcome, "failed");
     }
 
     #[test]

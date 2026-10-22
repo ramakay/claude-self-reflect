@@ -1232,6 +1232,9 @@ pub(crate) fn format_session_start_tier0_for_session(
 fn overlay_compact_snapshot(ep: &Episode, snapshot: super::precompact::CompactSnapshot) -> Episode {
     let mut current = ep.clone();
     current.compact_anchor = snapshot.anchor;
+    // The ask belongs with the anchor it was typed under, and the snapshot is
+    // the newer of the two: replace it, absence included.
+    current.latest_ask = snapshot.latest_ask;
     if snapshot.anchor_request.is_some() && snapshot.anchor_request == ep.anchor_request {
         current.completions = snapshot.completions;
         current.completions_untied = snapshot.completions_untied;
@@ -3548,6 +3551,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         }];
         let snapshot = |anchor_request: Option<&str>| super::super::precompact::CompactSnapshot {
             anchor_request: anchor_request.map(str::to_string),
+            latest_ask: None,
             anchor: Some(CompactAnchor {
                 request: "Now wire the staging endpoint.".into(),
                 completions_untied: true,
@@ -3574,6 +3578,34 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
                 Some("Now wire the staging endpoint.")
             );
         }
+    }
+
+    /// An ask saved with task A must not be shown after the compact anchor for
+    /// task B: the snapshot's ask (or its absence) replaces the stored one.
+    #[test]
+    fn a_compact_snapshot_replaces_the_stored_last_ask_absence_included() {
+        use crate::hooks::stop::CompactAnchor;
+        let mut ep = minimal_episode("Fix the auth middleware regression", "Fixed it", None);
+        ep.anchor_request = Some("Fix the auth middleware regression.".into());
+        ep.latest_ask = Some("Why did the second worker finish so early?".into());
+        let snapshot = |ask: Option<&str>| super::super::precompact::CompactSnapshot {
+            anchor_request: ep.anchor_request.clone(),
+            latest_ask: ask.map(str::to_string),
+            anchor: Some(CompactAnchor {
+                request: "Now wire the staging endpoint.".into(),
+                completions_untied: false,
+            }),
+            completions: vec![],
+            completions_untied: false,
+        };
+        let newer =
+            overlay_compact_snapshot(&ep, snapshot(Some("Which crate pulls in the old parser?")));
+        assert_eq!(
+            newer.latest_ask.as_deref(),
+            Some("Which crate pulls in the old parser?")
+        );
+        let none = overlay_compact_snapshot(&ep, snapshot(None));
+        assert!(none.latest_ask.is_none(), "{:?}", none.latest_ask);
     }
 
     /// Only text that can render decides: a completed todo never renders, so
