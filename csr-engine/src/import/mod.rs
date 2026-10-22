@@ -2007,20 +2007,27 @@ fn tool_result_text(item: &serde_json::Value) -> String {
 /// script's other output is lost with them, which is the price of the one
 /// structural signal there is.
 fn exec_script_calls_csr(item: &serde_json::Value, name: &str) -> bool {
+    static CALL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"tools(?:\.mcp__claude[_-]self[_-]reflect__\w+|\[\s*["']mcp__claude[_-]self[_-]reflect__\w+["']\s*\])\s*\("#,
+        )
+        .expect("csr call expression regex")
+    });
     name == "exec"
         && item
             .get("input")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|script| {
-                const CSR_NAMESPACES: [&str; 4] = [
-                    "tools.mcp__claude_self_reflect__",
-                    "tools.mcp__claude-self-reflect__",
-                    "tools[\"mcp__claude_self_reflect__",
-                    "tools[\"mcp__claude-self-reflect__",
-                ];
-                CSR_NAMESPACES
-                    .iter()
-                    .any(|namespace| script.contains(namespace))
+                // An actual call expression: a script that only quotes the
+                // namespace (an `rg` pattern, a comment, a string) is not one.
+                CALL.find_iter(script).any(|found| {
+                    let before = &script[..found.start()];
+                    let line = before.rsplit('\n').next().unwrap_or("");
+                    let quoted = before.ends_with(['"', '\'', '`']);
+                    let commented =
+                        line.trim_start().starts_with("//") || line.trim_start().starts_with('*');
+                    !quoted && !commented
+                })
             })
 }
 
@@ -3552,6 +3559,48 @@ mod tests {
         );
     }
 
+    /// A `Read` of CSR's own emitter and tool sources holds the format strings
+    /// and test fixtures verbatim. It is the code, not CSR's output: it must
+    /// survive import whole (the 552-legit-chunks over-match, again).
+    #[test]
+    fn a_read_of_the_emitter_source_survives_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-source.jsonl");
+        let sources = [
+            ("read-format", include_str!("../format/mod.rs")),
+            ("read-tools", include_str!("../mcp/tools.rs")),
+            (
+                "read-prose",
+                "The parser fails on <summary count=\"5\" relevance=\"partial\">.\nFix: escape attributes before decoding.",
+            ),
+        ];
+        let mut lines = Vec::new();
+        for (id, text) in &sources {
+            lines.push(serde_json::json!({
+                "type": "assistant", "timestamp": "2026-10-08T12:00:00Z",
+                "message": {"content": [{"type": "tool_use", "id": id, "name": "Read", "input": {"file_path": "/x/y.rs"}}]}
+            }));
+            lines.push(serde_json::json!({
+                "type": "user", "timestamp": "2026-10-08T12:00:01Z",
+                "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}
+            }));
+        }
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        for (_, text) in &sources {
+            assert!(!contamination::is_csr_tool_payload(text));
+        }
+        let parsed = parse_jsonl_file_with_stats(&path, "test").unwrap();
+        assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 0);
+    }
+
     #[test]
     fn a_codex_exec_script_that_calls_a_csr_tool_is_a_csr_tool_use() {
         let script = |source: &str| serde_json::json!({"type": "tool_use", "id": "x", "name": "exec", "input": source});
@@ -3565,6 +3614,16 @@ mod tests {
         }
         let other = script("text(await tools.exec_command({cmd:\"git status\"}));");
         assert!(!is_csr_tool_use(&other, "exec"));
+        // Quoting the namespace is not calling it.
+        for source in [
+            "text(await tools.exec_command({cmd:\"rg 'tools.mcp__claude_self_reflect__' src\"}));",
+            "text(await tools.exec_command({cmd:\"rg tools.mcp__claude_self_reflect__csr_why src\"}));",
+            "// await tools.mcp__claude_self_reflect__csr_why({query:\"q\"})\ntext(await tools.exec_command({cmd:\"ls\"}));",
+            "const note = \"tools.mcp__claude_self_reflect__csr_why(\";",
+        ] {
+            let item = script(source);
+            assert!(!is_csr_tool_use(&item, "exec"), "{source}");
+        }
         let bash = serde_json::json!({"type": "tool_use", "name": "Bash",
             "input": "tools.mcp__claude_self_reflect__csr_why"});
         assert!(!is_csr_tool_use(&bash, "Bash"));
