@@ -2101,6 +2101,7 @@ mod tests {
             completions: vec![],
             completions_untied: false,
             compact_anchor: None,
+            late_errors: false,
             anchors: vec![],
         };
         let verdicts = vec![
@@ -2165,6 +2166,7 @@ mod tests {
             completions: vec![],
             completions_untied: false,
             compact_anchor: None,
+            late_errors: false,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2h ago");
@@ -2208,6 +2210,7 @@ mod tests {
             completions: vec![],
             completions_untied: false,
             compact_anchor: None,
+            late_errors: false,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1w ago");
@@ -2253,6 +2256,7 @@ mod tests {
             completions: vec![],
             completions_untied: false,
             compact_anchor: None,
+            late_errors: false,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2m ago");
@@ -2299,6 +2303,7 @@ mod tests {
             completions: vec![],
             completions_untied: false,
             compact_anchor: None,
+            late_errors: false,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1m ago");
@@ -2607,6 +2612,7 @@ mod tests {
             completions: vec![],
             completions_untied: false,
             compact_anchor: None,
+            late_errors: false,
             anchors: vec![],
         }
     }

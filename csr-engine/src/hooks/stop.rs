@@ -120,6 +120,14 @@ pub struct Episode {
     /// no database migration or transcript read at SessionStart is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_anchor: Option<CompactAnchor>,
+    /// Whether a FAILED tool call (`is_error`) under the session's latest task
+    /// matched an error pattern. `error_signatures` spans the whole session and
+    /// any tool output, which for a long one is nearly always non-empty (a Read
+    /// of source that says `panic`, a quoted test name), so the outcome reads
+    /// only the closing task's failed calls. `false` for episodes written
+    /// before this existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub late_errors: bool,
 }
 
 /// A compact intent and whether the displayed receipts belong to that task.
@@ -827,6 +835,11 @@ where
     // The session's receipts, latest last, each with the index of the task
     // segment it was produced under (None before the first task).
     let mut completions: Vec<(CompletionReceipt, Option<usize>)> = Vec::new();
+    // First and last row times, for the session's real duration.
+    let mut first_row_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut last_row_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    // An error-pattern match in a tool result since the latest task began.
+    let mut late_errors = false;
 
     // Tool names whose file_path inputs count as "investigated"
     let read_tools: HashSet<&str> = ["Read", "Glob", "Grep"].into_iter().collect();
@@ -841,6 +854,14 @@ where
         let raw_row: &serde_json::Value = raw_row.borrow();
         let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
         message_count += 1;
+        if let Some(at) = val
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(crate::temporal::parse_timestamp)
+        {
+            first_row_at = Some(first_row_at.map_or(at, |first| first.min(at)));
+            last_row_at = Some(last_row_at.map_or(at, |last| last.max(at)));
+        }
         // A legacy in-file subagent row. It still counts toward tools/files,
         // but never toward the recap's task, turn or completion state.
         let sidechain = val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true);
@@ -903,12 +924,15 @@ where
                                 task.last_prompt_at = sent_at.or(task.last_prompt_at);
                             }
                         }
-                        _ => segments.push(TaskSegment {
-                            prose,
-                            note,
-                            last_prompt_at: sent_at,
-                            ..TaskSegment::default()
-                        }),
+                        _ => {
+                            late_errors = false;
+                            segments.push(TaskSegment {
+                                prose,
+                                note,
+                                last_prompt_at: sent_at,
+                                ..TaskSegment::default()
+                            });
+                        }
                     }
                 }
                 // Any typed prompt, an ack included, opens a turn: "go" after
@@ -1059,6 +1083,17 @@ where
                             .and_then(|v| v.as_str())
                             .is_some_and(|id| git_tool_ids.contains(id));
                         let failed = block.get("is_error").and_then(|v| v.as_bool()) == Some(true);
+                        // A tool call that FAILED and says why. Output that merely
+                        // contains the words (a Read or Grep of source, a quoted test
+                        // name) is not an error: that flagged most long sessions.
+                        if failed
+                            && !sidechain
+                            && error_patterns
+                                .iter()
+                                .any(|pattern| block_text.contains(pattern))
+                        {
+                            late_errors = true;
+                        }
                         if from_git && !failed && !sidechain {
                             for commit in GIT_COMMIT_LINE_RE.captures_iter(&block_text) {
                                 if let Some(task) = segments.last_mut() {
@@ -1135,7 +1170,13 @@ where
 
     // Determine outcome (task-aware: incomplete todos cap success at partial)
     let success_signal = crate::extraction::has_success_signal(&completed);
-    let outcome = compute_outcome(message_count, &error_signatures, success_signal, &todos);
+    let outcome = compute_outcome(message_count, late_errors, success_signal, &todos);
+    let duration_minutes = match (first_row_at, last_row_at) {
+        (Some(first), Some(last)) => {
+            u32::try_from((last - first).num_minutes().max(0)).unwrap_or(u32::MAX)
+        }
+        _ => 0,
+    };
 
     let mut investigated_vec: Vec<String> = investigated.into_iter().collect();
     investigated_vec.sort();
@@ -1159,7 +1200,7 @@ where
         tools_used: tools_used_vec,
         files_modified: files_modified_vec,
         message_count,
-        duration_minutes: 0, // Cannot reliably determine from transcript alone
+        duration_minutes,
         todos,
         approved_plan,
         prev_episode_id: None,
@@ -1175,6 +1216,7 @@ where
         completions,
         completions_untied,
         compact_anchor,
+        late_errors,
     }
 }
 
@@ -1216,16 +1258,19 @@ fn push_completion(
 /// success — unresolved task state means the session is not a clean win.
 fn compute_outcome(
     message_count: usize,
-    error_signatures: &[String],
+    late_errors: bool,
     success_signal: bool,
     todos: &[TodoItem],
 ) -> String {
     let outcome = if message_count < 3 {
         "interrupted".to_string()
-    } else if !error_signatures.is_empty() {
-        // Errors occurred, but a closing success signal means the session
-        // recovered — "partial", not "failed". A dev session that hits and
-        // fixes test failures should not be remembered as a failure.
+    } else if late_errors {
+        // The closing task had a failed call, but a closing success signal means
+        // the session recovered — "partial", not "failed". A dev session that
+        // hits and fixes test failures should not be remembered as a failure.
+        // Only the closing task counts: a long session's earlier errors were
+        // worked through, and scanning every tool output for error words
+        // labelled 18 of the 30 most recent stored episodes "failed".
         if success_signal {
             "partial".to_string()
         } else {
@@ -1556,7 +1601,7 @@ pub async fn extract_and_store_episode(
             let success_signal = crate::extraction::has_success_signal(&episode.completed);
             episode.outcome = compute_outcome(
                 episode.message_count,
-                &episode.error_signatures,
+                episode.late_errors,
                 success_signal,
                 &episode.todos,
             );
@@ -2331,16 +2376,6 @@ mod tests {
     }
 
     /// Build a JSONL line for a tool_result with error content.
-    fn tool_result_line(content: &str) -> String {
-        serde_json::json!({
-            "type": "tool_result",
-            "message": {
-                "content": [{"type": "tool_result", "content": content}]
-            }
-        })
-        .to_string()
-    }
-
     #[test]
     fn test_extract_episode_from_transcript() {
         let lines_owned = [
@@ -2392,7 +2427,11 @@ mod tests {
             user_line("Build the project"),
             assistant_text_line("Let me try building..."),
             assistant_tool_line(&[("Read", "/Cargo.toml")]),
-            tool_result_line("error[E0308]: mismatched types\n  --> src/main.rs:42"),
+            dur_result(
+                "error[E0308]: mismatched types\n  --> src/main.rs:42",
+                true,
+                "2026-10-21T10:00:00Z",
+            ),
             assistant_text_line("There was a compilation error."),
         ];
         let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
@@ -2405,6 +2444,127 @@ mod tests {
             .error_signatures
             .iter()
             .any(|s| s.contains("error[E0308]")));
+    }
+
+    fn dur_timed(row: serde_json::Value, at: &str) -> String {
+        let mut row = row;
+        row["timestamp"] = serde_json::json!(at);
+        row.to_string()
+    }
+
+    fn dur_typed(text: &str, at: &str) -> String {
+        dur_timed(
+            serde_json::json!({"type": "user", "promptSource": "typed", "message": {"content": text}}),
+            at,
+        )
+    }
+
+    fn dur_result(text: &str, is_error: bool, at: &str) -> String {
+        dur_timed(
+            serde_json::json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_x", "content": text, "is_error": is_error}
+            ]}}),
+            at,
+        )
+    }
+
+    fn dur_done(at: &str) -> String {
+        dur_timed(
+            serde_json::json!({"type": "assistant", "message": {
+                "content": [{"type": "text", "text": "I looked at the output."}],
+                "stop_reason": "end_turn"
+            }}),
+            at,
+        )
+    }
+
+    #[test]
+    fn duration_is_the_span_between_the_first_and_last_row_times() {
+        let ep = extract(&[
+            dur_typed(
+                "Fix the login validation before the release",
+                "2026-10-21T10:00:30Z",
+            ),
+            dur_done("2026-10-21T10:05:00Z"),
+            dur_typed(
+                "Now update the changelog for that fix",
+                "2026-10-21T12:15:00Z",
+            ),
+            dur_done("2026-10-21T12:20:45Z"),
+        ]);
+        assert_eq!(ep.duration_minutes, 140);
+        // Rows with no time say nothing: 0, never a guess.
+        let ep = extract(&[
+            typed_line("Fix the login validation before the release", "typed"),
+            assistant_text_line("Done."),
+        ]);
+        assert_eq!(ep.duration_minutes, 0);
+    }
+
+    #[test]
+    fn a_long_session_is_not_failed_by_errors_it_worked_through() {
+        let early_error = || {
+            [
+                dur_typed(
+                    "Build the project and fix what breaks",
+                    "2026-10-21T10:00:00Z",
+                ),
+                dur_result(
+                    "error[E0308]: mismatched types",
+                    true,
+                    "2026-10-21T10:01:00Z",
+                ),
+                dur_done("2026-10-21T10:02:00Z"),
+                dur_typed(
+                    "Now update the changelog for that fix",
+                    "2026-10-21T11:00:00Z",
+                ),
+            ]
+        };
+        // Errors only under the first task, a clean close: not "failed".
+        let mut rows = early_error().to_vec();
+        rows.push(dur_result(
+            "changelog written",
+            false,
+            "2026-10-21T11:01:00Z",
+        ));
+        rows.push(dur_timed(
+            serde_json::json!({"type": "assistant", "message": {
+                "content": [{"type": "text", "text": "Updated."}], "stop_reason": "end_turn"
+            }}),
+            "2026-10-21T11:02:00Z",
+        ));
+        let ep = extract(&rows);
+        assert!(!ep.error_signatures.is_empty(), "the signatures stay");
+        assert!(!ep.late_errors);
+        assert_eq!(ep.outcome, "partial");
+        // An error under the closing task, no success: still "failed".
+        let mut rows = early_error().to_vec();
+        rows.push(dur_result(
+            "error[E0599]: no method named x",
+            true,
+            "2026-10-21T11:01:00Z",
+        ));
+        let ep = extract(&rows);
+        assert!(ep.late_errors);
+        assert_eq!(ep.outcome, "failed");
+        // Output that merely contains the words (a Read of source) is not a failed call.
+        let mut rows = early_error().to_vec();
+        rows.push(dur_result(
+            "// Never panics. FAILED is a test name; Error: is a variant",
+            false,
+            "2026-10-21T11:01:00Z",
+        ));
+        assert!(!extract(&rows).late_errors);
+        // A typed prompt that merely mentions FAILED is the person's words.
+        let ep = extract(&[
+            dur_typed(
+                "Why does the suite print FAILED on windows",
+                "2026-10-21T11:00:00Z",
+            ),
+            dur_done("2026-10-21T11:01:00Z"),
+        ]);
+        assert!(!ep.late_errors);
     }
 
     #[test]
@@ -2493,7 +2653,11 @@ mod tests {
         // success signal recovered — "partial", not the contradictory "failed".
         let lines_owned = [
             user_line("Build and deploy the fix"),
-            tool_result_line("error[E0308]: mismatched types"),
+            dur_result(
+                "error[E0308]: mismatched types",
+                true,
+                "2026-10-21T10:00:00Z",
+            ),
             assistant_text_line("Fixed the type error; tests green, binary deployed."),
         ];
         let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
@@ -2594,6 +2758,7 @@ mod tests {
             completions: vec![],
             completions_untied: false,
             compact_anchor: None,
+            late_errors: false,
         };
 
         let json = serde_json::to_string(&ep).unwrap();
@@ -2651,6 +2816,7 @@ mod tests {
             completions: vec![],
             completions_untied: false,
             compact_anchor: None,
+            late_errors: false,
         };
 
         let tags = episode_tags(&ep);
@@ -3256,7 +3422,7 @@ mod tests {
             content: "x".into(),
             status: "pending".into(),
         }];
-        let outcome = compute_outcome(5, &[], true, &todos);
+        let outcome = compute_outcome(5, false, true, &todos);
         assert_eq!(outcome, "partial");
     }
 

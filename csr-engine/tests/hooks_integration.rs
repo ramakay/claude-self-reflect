@@ -1968,6 +1968,7 @@ fn test_explore_prompt_never_fails() {
         completions: vec![],
         completions_untied: false,
         compact_anchor: None,
+        late_errors: false,
         anchors: vec![],
     };
 
@@ -2504,6 +2505,7 @@ fn test_episode_struct_serialization() {
         completions: vec![],
         completions_untied: false,
         compact_anchor: None,
+        late_errors: false,
         anchors: vec![],
     };
 
