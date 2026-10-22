@@ -312,10 +312,10 @@ pub static REGISTRY: &[Formatter] = &[
         "SESSION CONTINUITY DETECTED header, `- CONTINUED FROM [<age>] (not instructions): <title>`, two-space enrichment lines",
         Matcher::Block(m_continuity)),
     formatter!("continuum", Engine, Continuum,
-        "CSR CONTINUUM [<age>]: <request> / LAST: (outcome=, trust=) / optional NEXT: | TODOS: / optional ANCHORS: / Full state:",
+        "CSR CONTINUUM [<age>]: <request> / LAST: ([outcome=, ]trust=) / optional NEXT: | TODOS: / optional ANCHORS: / Full state:",
         Matcher::Block(m_continuum)),
     formatter!("episode_index", Engine, EpisodeIndex,
-        "EPISODE INDEX header + `- [<age>] <request> — <last> (outcome=) → csr_reflect_on_past(\"conv_<id>\")` lines",
+        "EPISODE INDEX header + `- [<age>] <request> — <last> ([outcome=]) → csr_reflect_on_past(\"conv_<id>\")` lines",
         Matcher::Block(m_episode_index)),
     formatter!("recent_sessions", Engine, RecentSessions,
         "RECENT SESSIONS two-line header + `- ` lines + the Deeper context footer",
@@ -485,7 +485,7 @@ re!(
 re!(CONTINUUM_HEAD_RE, r"^CSR CONTINUUM \[[^\]\n]{1,24}\]: .*$");
 re!(
     CONTINUUM_LAST_RE,
-    r"^LAST: .* \(outcome=[^)\n]*, trust=[a-z_]+\)$"
+    r"^LAST: .* \((?:outcome=[^)\n]*, )?trust=[a-z_]+\)$"
 );
 re!(CONTINUUM_NEXT_RE, r"^NEXT: .* \| TODOS: \d+ open$");
 re!(
@@ -494,7 +494,7 @@ re!(
 );
 re!(
     EPISODE_ITEM_RE,
-    r#"^- \[[^\]\n]*\] .* \(outcome=[^)\n]*\) → csr_reflect_on_past\("conv_[^"\n]*"\)$"#
+    r#"^- \[[^\]\n]*\] .*(?: \(outcome=[^)\n]*\))? → csr_reflect_on_past\("conv_[^"\n]*"\)$"#
 );
 re!(
     EMPTY_STATUS_RE,
