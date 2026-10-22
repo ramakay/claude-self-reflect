@@ -403,19 +403,23 @@ fn failed_exec(
     }
     message
 }
+/// After a panic anywhere (the hook deleted every picture): the terminal is armed again and the
+/// next draw is a full repaint. True when that happened, and then the pane has to draw at once
+/// whatever its gates say, or it stays blank until its next deadline.
 fn recover_terminal(
     epoch: &AtomicUsize,
     seen: &mut usize,
     drawn: &mut Option<Drawn>,
     resume: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let current = epoch.load(Ordering::Acquire);
-    if current != *seen {
-        *drawn = None;
-        resume()?;
-        *seen = current;
+    if current == *seen {
+        return Ok(false);
     }
-    Ok(())
+    *drawn = None;
+    resume()?;
+    *seen = current;
+    Ok(true)
 }
 pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let running = std::env::current_exe()?;
@@ -481,7 +485,7 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
         while !ENDING.load(Ordering::Relaxed) {
             beat.alive();
             let now = paths::now();
-            recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
+            pressed |= recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
             if boundary.failures >= 3 {
                 restart_due.get_or_insert_with(|| Instant::now() + Duration::from_secs(30));
             } else {
@@ -560,6 +564,7 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                 let frame = boundary.run(&paths, now, || {
                     pane.frame(cols as usize, rows as usize, now)
                 });
+                // This draw is a full repaint already, and it clears `pressed`.
                 recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
                 if let Some(written) = frame {
                     if drawn.is_none() {
@@ -607,14 +612,15 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                 last = Instant::now();
                 wake.drew(last);
             }
-            recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
+            pressed |= recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
             // A wake that is waiting for its gathering or its spacing shortens the poll.
             let wait = wake.next().map_or(Duration::from_millis(200), |at| {
                 at.saturating_duration_since(Instant::now())
                     .clamp(Duration::from_millis(5), Duration::from_millis(200))
             });
             if terminal.raw && event::poll(wait)? {
-                recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
+                pressed |=
+                    recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
                 match event::read()? {
                     Event::Resize(_, _) => {
                         pressed = true;
@@ -916,11 +922,19 @@ mod reload_regressions {
             placed: vec![],
         });
         let mut resumed = false;
-        recover_terminal(&epoch, &mut seen, &mut drawn, || {
+        let recovered = recover_terminal(&epoch, &mut seen, &mut drawn, || {
             resumed = true;
             Ok(())
         })
         .unwrap();
+        assert!(
+            recovered,
+            "a recovery is a reason to draw, past both gates: the pictures are gone"
+        );
+        assert!(
+            !recover_terminal(&epoch, &mut seen, &mut drawn, || panic!("only once")).unwrap(),
+            "and only once"
+        );
         assert!(
             resumed,
             "raw mode and mouse capture must precede cards and input"
