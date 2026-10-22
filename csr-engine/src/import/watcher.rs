@@ -1230,7 +1230,11 @@ mod tests {
         // A reader holding the lock does not keep the flush from writing.
         let reader = search.clone().read_owned().await;
         let flushed = flush(search.clone(), dir.clone());
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The reader stays held until the files exist; a fixed sleep is a race on a loaded host.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !dir.join("manifest.json").exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
             dir.join("manifest.json").exists(),
             "files written while a reader searched"
