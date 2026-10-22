@@ -349,6 +349,26 @@ pub fn spawn_for_daemon(
                     return;
                 }
             };
+            // Renders read through their own connection, so a background loop
+            // holding the daemon's connection for a long statement cannot park
+            // a prompt behind it (see `Storage::open_prompt_lane`).
+            let (engine, lane) = match engine.storage().open_prompt_lane() {
+                Ok(Some(lane)) => (
+                    Arc::new(Engine::from_parts_with_index_dir(
+                        Arc::new(lane),
+                        engine.embeddings().clone(),
+                        engine.search().clone(),
+                        engine.projects_dir().to_path_buf(),
+                        engine.index_dir().to_path_buf(),
+                    )),
+                    true,
+                ),
+                Ok(None) => (engine, false),
+                Err(e) => {
+                    tracing::warn!(%e, "prompt lane unavailable, renders share the daemon connection");
+                    (engine, false)
+                }
+            };
             // Measure the frame vocabulary (`injection::specificity`) off the
             // prompt path: before the first prompt, then well inside each
             // validity window, so a render only ever reads the cached copy.
@@ -409,13 +429,26 @@ pub fn spawn_for_daemon(
                             if tokio::time::Instant::now() >= deadline {
                                 return None;
                             }
-                            let prepared = runtime
-                                .block_on(super::prompt_submit::prepare(
-                                    &request.input,
-                                    &engine,
-                                    &cwd,
-                                ))
-                                .ok()?;
+                            // Only the lane's own connection: lowering the timeout of
+                            // the shared one would queue on whoever holds it.
+                            if lane {
+                                let _ = engine.storage().set_busy_timeout(
+                                    crate::storage::Storage::PROMPT_LANE_BUSY_TIMEOUT,
+                                );
+                            }
+                            let prepared = runtime.block_on(super::prompt_submit::prepare(
+                                &request.input,
+                                &engine,
+                                &cwd,
+                            ));
+                            // Receipts and claim releases happen after this point and
+                            // may wait for a writer as long as any other connection.
+                            if lane {
+                                let _ = engine
+                                    .storage()
+                                    .set_busy_timeout(crate::storage::DEFAULT_BUSY_TIMEOUT);
+                            }
+                            let prepared = prepared.ok()?;
                             if tokio::time::Instant::now() >= deadline {
                                 return None;
                             }
@@ -463,7 +496,11 @@ mod tests {
     }
 
     fn fixture(dir: &Path) -> Arc<Engine> {
-        let storage = Arc::new(crate::storage::Storage::open_memory().unwrap());
+        fixture_over(dir, crate::storage::Storage::open_memory().unwrap())
+    }
+
+    fn fixture_over(dir: &Path, storage: crate::storage::Storage) -> Arc<Engine> {
+        let storage = Arc::new(storage);
         let project =
             crate::search::cross_project::resolve_project_from_cwd(&dir.to_string_lossy()).unwrap();
         let episode = serde_json::json!({
@@ -668,6 +705,56 @@ mod tests {
         })
         .await
         .unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Serializes process-wide policy environment during this test.
+    async fn render_is_served_while_the_daemon_connection_is_held() {
+        let _env = crate::daemon::dream_cadence::env_test_guard();
+        assert!(crate::storage::Storage::open_memory()
+            .unwrap()
+            .open_prompt_lane()
+            .unwrap()
+            .is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::open(&dir.path().join("csr-engine.db")).unwrap();
+        let engine = fixture_over(dir.path(), storage);
+        // Prime the renderer so the request below measures the held
+        // connection, not a cold first render against the budget.
+        let expected = super::super::prompt_submit::render(&input(dir.path()), &engine, dir.path())
+            .await
+            .unwrap();
+        let held = engine.storage().clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = spawn_for_daemon(engine, shutdown.clone());
+        ready(dir.path()).await;
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // A background loop in the middle of a long statement.
+        let holder = std::thread::spawn(move || {
+            held.with_connection(|_| {
+                locked_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        locked_rx.await.unwrap();
+        let mut served = None;
+        // The daemon drops a connection that arrives while it is still
+        // finishing the last one, so a loaded host may need a few tries.
+        for _ in 0..40 {
+            served = request(dir.path(), input(dir.path())).await;
+            if served.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(served, Some(expected));
         shutdown.store(true, Ordering::SeqCst);
         server.await.unwrap();
     }

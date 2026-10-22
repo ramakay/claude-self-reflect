@@ -253,6 +253,64 @@ impl Storage {
         })
     }
 
+    /// How long the prompt lane waits for another writer while a render is
+    /// being built. A render that cannot take a write lock in this time skips
+    /// that write rather than spend the hook's request budget on it. The lane
+    /// otherwise waits as long as any other connection (`DEFAULT_BUSY_TIMEOUT`),
+    /// so the receipts written once the reply is acknowledged are not dropped.
+    pub(crate) const PROMPT_LANE_BUSY_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_millis(250);
+
+    /// A second connection to this database for the prompt render path.
+    ///
+    /// Every method on a `Storage` takes one `Mutex<Connection>`, and the
+    /// daemon's background loops hold it across whole statements: a pass of
+    /// `get_unenriched_conversations` or the graph drain's `rank_rows` runs for
+    /// seconds on a multi-GB file. A prompt render queued on that mutex until
+    /// the 800 ms request budget expired and the hook injected nothing (a
+    /// `sample` of the daemon during three consecutive capped prompts showed the
+    /// render thread parked in `GuardedConnection::lock` for all of the
+    /// window). WAL readers never wait for a writer, so a render on its own
+    /// connection only ever waits for other renders, which are single-flight.
+    ///
+    /// No migrations run here: the connection opened from `self` already did.
+    /// `None` for an in-memory store, which has no file to open a second time.
+    pub(crate) fn open_prompt_lane(&self) -> Result<Option<Self>> {
+        let path = {
+            let conn = self
+                .conn
+                .inner
+                .lock()
+                .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            match conn.path() {
+                Some(path) if !path.is_empty() => PathBuf::from(path),
+                _ => return Ok(None),
+            }
+        };
+        let Some(data_dir) = self.conn.data_dir.clone() else {
+            return Ok(None);
+        };
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+        conn.execute_batch(
+            "PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;",
+        )?;
+        conn.execute_batch(READ_PATH_PRAGMAS)?;
+        Ok(Some(Self {
+            conn: GuardedConnection {
+                inner: Mutex::new(conn),
+                data_dir: Some(data_dir),
+                maintenance: self.conn.maintenance.clone(),
+            },
+            common_terms: Default::default(),
+        }))
+    }
+
     /// Open an existing database without running migrations or permitting writes.
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
