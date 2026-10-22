@@ -17,7 +17,7 @@ Single 78MB binary. Embedded SQLite, no database server. No containers. No API k
 > Dreaming checks old conclusions against your git history and marks a stale anchor with the commit that changed it. No LLM in that check.
 > CSR also reads plans, task state, Codex sessions, subagent transcripts, memory-file metadata and the session registry, and ships a companion plugin with a pane beside the session.
 > A live code map covers every definition in the repos your sessions work in, across main and every worktree, so CSR can answer for code no conversation touched.
-> Sub-millisecond search, 5,105 tests passing (4,642 lib, 463 across 20 integration targets, 19 more ignored; verified at commit 7a657b12), zero external dependencies.
+> Sub-millisecond search, 5,108 tests passing (4,645 lib, 463 across 20 integration targets, 19 more ignored; verified at commit 923e911b), zero external dependencies.
 > [Release notes](CHANGELOG.md)
 
 <img src="docs-site/public/images/csr-demo.gif" alt="CSR Demo — Setup, Search, and Hooks" width="800" />

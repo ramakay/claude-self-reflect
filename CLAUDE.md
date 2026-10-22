@@ -123,7 +123,7 @@ csr_transcript        — Structured facts from a session transcript JSONL (stat
 # Build
 cd csr-engine && cargo build --release
 
-# Test suite — 5,105 tests: 4,642 lib + 463 across 20 integration targets (verified at commit 7a657b12); `cargo test` runs all of them
+# Test suite — 5,108 tests: 4,645 lib + 463 across 20 integration targets (verified at commit 923e911b); `cargo test` runs all of them
 cargo test
 cargo test --test hooks_integration
 cargo test --test integration
