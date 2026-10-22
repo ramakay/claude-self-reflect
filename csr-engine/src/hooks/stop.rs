@@ -185,7 +185,7 @@ pub struct Episode {
 }
 
 /// A compact intent and whether the displayed receipts belong to that task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactAnchor {
     pub request: String,
     pub completions_untied: bool,
@@ -1175,6 +1175,8 @@ struct TaskSegment {
     /// When the segment's last JOINED prompt was sent, if the row had a time.
     last_prompt_at: Option<chrono::DateTime<chrono::Utc>>,
     tool_calls: u32,
+    /// File edits and writes (also counted in `tool_calls`).
+    edits: u32,
     commits: u32,
 }
 
@@ -1182,7 +1184,16 @@ impl TaskSegment {
     fn weight(&self) -> u32 {
         self.tool_calls + COMMIT_WEIGHT * self.commits
     }
+
+    /// How much work the task drove: every tool call counts once, a file edit
+    /// three more times and a commit ten more, so reads alone rarely win.
+    fn work(&self) -> u32 {
+        self.tool_calls + EDIT_WEIGHT * self.edits + COMMIT_WEIGHT * self.commits
+    }
 }
+
+/// Extra weight of a file edit over a read in [`TaskSegment::work`].
+const EDIT_WEIGHT: u32 = 3;
 
 /// Fewest words a heaviest-segment fallback intent may have.
 const MIN_FALLBACK_WORDS: usize = 6;
@@ -1238,6 +1249,25 @@ fn latest_typed_segment(segments: &[TaskSegment]) -> Option<(String, usize)> {
                 .filter(|intent| intent.split_whitespace().count() >= MIN_FALLBACK_WORDS)
                 .map(|intent| (intent, index))
         })
+}
+
+/// The ask that drove the most work in the session, for the recap's head: the
+/// non-note task with a usable, substantive rendering whose turn span (from
+/// its prompt to the next task's) holds the most tool calls, edits and
+/// commits. The later task wins a tie. `None` when no task drove any work, so
+/// the recap keeps the first task.
+fn work_segment(segments: &[TaskSegment]) -> Option<(String, usize)> {
+    segments
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| !task.note && task.work() > 0)
+        .filter_map(|(index, task)| {
+            crate::hooks::recap::anchor_intent(&task.prose)
+                .filter(|intent| intent.split_whitespace().count() >= MIN_FALLBACK_WORDS)
+                .map(|intent| (task.work(), index, intent))
+        })
+        .max_by_key(|(work, index, _)| (*work, *index))
+        .map(|(_, index, intent)| (intent, index))
 }
 
 /// A typed prompt's text for the recap, and whether it is a forwarded note.
@@ -1810,6 +1840,12 @@ where
                                 }
                                 if let (false, Some(task)) = (sidechain, segments.last_mut()) {
                                     task.tool_calls += 1;
+                                    if matches!(
+                                        name,
+                                        "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
+                                    ) {
+                                        task.edits += 1;
+                                    }
                                 }
 
                                 if name == "Bash" && !sidechain {
@@ -2098,6 +2134,12 @@ where
         receipts: Some(made_under(Some(index))),
     });
 
+    let work_anchor = work_segment(&segments).map(|(request, index)| CompactAnchor {
+        request,
+        completions_untied: untied(Some(index)),
+        receipts: Some(made_under(Some(index))),
+    });
+
     // Determine outcome (task-aware: incomplete todos cap success at partial)
     let closing_success = crate::extraction::has_success_signal(&closing_text);
     let late_errors = !open_failures.is_empty();
@@ -2129,6 +2171,7 @@ where
         gate_failure: gate_failures.last().map(|(_, failure)| failure.clone()),
         background_open,
         background_open_total,
+        work_anchor,
         ..Default::default()
     };
     // Only a turn that ended cleanly has a closing message to quote.
@@ -5090,7 +5133,7 @@ mod tests {
     }
 
     #[test]
-    fn recap_for_the_live_garble_shape_names_the_latest_task_and_no_prose() {
+    fn recap_for_the_live_garble_shape_names_the_whole_first_task_and_no_prose() {
         let ep = extract(&multi_topic_session());
         let got = crate::hooks::recap::compose_recap(
             &ep,
@@ -5105,17 +5148,13 @@ mod tests {
             "3h ago",
         )
         .unwrap();
-        // The latest substantive ask is the intent; the first topic's commit is
-        // a session fact on its own line, never this ask's result.
-        let head = got.lines().next().unwrap_or_default();
-        assert!(
-            head.starts_with("recap [3h ago]: How do we show cost as % of max plan"),
-            "{got}"
-        );
-        assert!(!head.contains("0aa11bb"), "{got}");
-        assert!(
-            got.contains("Settled: feat(pane): first topic commit (0aa11bb)"),
-            "{got}"
+        // The first topic drove the most work (a commit outweighs the later
+        // topic's six calls), so it stays the head and its commit its result.
+        assert_eq!(
+            got,
+            "recap [3h ago]: anthropics codemod, when github links are bought up or disccussed, \
+             can present a side pane (enhanced for herdr users) - thoughts? \
+             Latest: feat(pane): first topic commit (0aa11bb). [[CSR:RECAP]]"
         );
         assert!(!got.contains("How the share works"));
     }
@@ -5608,7 +5647,7 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_made_under_the_earlier_ask_is_settled_not_the_latest_asks_result() {
+    fn a_commit_made_under_the_earlier_ask_stays_with_it_and_the_later_remark_is_then() {
         let ep = extract(&[
             typed_line("land the fix for the stale lock in the daemon", "typed"),
             assistant_named_tool(
@@ -5623,10 +5662,13 @@ mod tests {
         ]);
         let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
         let head = got.lines().next().unwrap_or_default();
-        assert!(head.contains("explain how the watcher seals"), "{got}");
-        assert!(!head.contains("1a2b3c4"), "{got}");
         assert!(
-            got.contains("Settled: fix(daemon): stale lock (1a2b3c4)"),
+            head.starts_with("recap [now]: land the fix for the stale lock in the daemon"),
+            "{got}"
+        );
+        assert!(head.contains("fix(daemon): stale lock (1a2b3c4)"), "{got}");
+        assert!(
+            head.contains("Then: now explain how the watcher seals a conversation"),
             "{got}"
         );
     }
@@ -5769,6 +5811,7 @@ mod tests {
         let mut empty = ep.clone();
         empty.request = String::new();
         empty.anchor_request = None;
+        empty.recap_extras.work_anchor = None;
         empty.latest_ask = None;
         empty.completed = String::new();
         assert!(crate::hooks::recap::compose_recap(&empty, &no_feeds(), "now").is_none());
@@ -6233,6 +6276,113 @@ mod tests {
             git_commit(&id),
             tool_result_bound(&id, &format!("[main {sha}] {subject}")),
         ]
+    }
+
+    fn recap_head(lines: &[String]) -> String {
+        let ep = extract(lines);
+        crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now")
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn edit_call(prefix: &str) -> Vec<String> {
+        let id = format!("toolu_{prefix}_edit");
+        vec![
+            assistant_named_tool(
+                "Edit",
+                &id,
+                serde_json::json!({"file_path": "/x/a.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            tool_result_bound(&id, "ok"),
+        ]
+    }
+
+    #[test]
+    fn the_head_is_the_ask_that_drove_the_most_work_not_the_last_remark() {
+        let mut lines = vec![typed_line("go on", "typed")];
+        lines.extend(work("a", 1));
+        lines.push(assistant_stop_line("Done.", "end_turn"));
+        lines.push(typed_line(
+            "rework the stale lock handling in the daemon watcher loop",
+            "typed",
+        ));
+        lines.extend(work("b", 6));
+        lines.extend(edit_call("b"));
+        lines.push(assistant_stop_line("Reworked.", "end_turn"));
+        lines.push(typed_line("it should also tell them", "typed"));
+        lines.extend(work("c", 1));
+        lines.push(assistant_stop_line("Sent.", "end_turn"));
+        let head = recap_head(&lines);
+        assert!(
+            head.starts_with(
+                "recap [now]: rework the stale lock handling in the daemon watcher loop"
+            ),
+            "{head}"
+        );
+        assert!(!head.contains("tell them"), "{head}");
+    }
+
+    #[test]
+    fn an_ask_with_edits_outweighs_a_longer_run_of_reads() {
+        let mut lines = vec![typed_line(
+            "read through every file in the repository tree",
+            "typed",
+        )];
+        lines.extend(work("a", 4));
+        lines.push(assistant_stop_line("Read.", "end_turn"));
+        lines.push(typed_line(
+            "change the retry budget in the relay client",
+            "typed",
+        ));
+        lines.extend(work("b", 1));
+        lines.extend(edit_call("b"));
+        lines.push(assistant_stop_line("Changed.", "end_turn"));
+        assert!(
+            recap_head(&lines)
+                .starts_with("recap [now]: change the retry budget in the relay client"),
+            "{}",
+            recap_head(&lines)
+        );
+    }
+
+    #[test]
+    fn equal_work_goes_to_the_later_ask() {
+        let mut lines = vec![typed_line(
+            "check the first thing in the daemon logs",
+            "typed",
+        )];
+        lines.extend(work("a", 2));
+        lines.push(assistant_stop_line("Checked.", "end_turn"));
+        lines.push(typed_line(
+            "check the second thing in the relay logs",
+            "typed",
+        ));
+        lines.extend(work("b", 2));
+        lines.push(assistant_stop_line("Checked.", "end_turn"));
+        assert!(
+            recap_head(&lines).starts_with("recap [now]: check the second thing in the relay logs"),
+            "{}",
+            recap_head(&lines)
+        );
+    }
+
+    #[test]
+    fn with_no_work_in_any_ask_the_head_is_the_first_task() {
+        let lines = vec![
+            typed_line("explain how the watcher seals a conversation", "typed"),
+            assistant_stop_line("It seals on the next idle tick.", "end_turn"),
+            typed_line("and what about the sidechain files then", "typed"),
+            assistant_stop_line("They follow the parent.", "end_turn"),
+        ];
+        assert!(
+            recap_head(&lines)
+                .starts_with("recap [now]: explain how the watcher seals a conversation"),
+            "{}",
+            recap_head(&lines)
+        );
     }
 
     #[test]

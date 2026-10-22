@@ -1291,6 +1291,9 @@ fn overlay_compact_snapshot(
     let mut current = ep.clone();
     current.compact_anchor = snapshot.anchor;
     current.latest_ask = snapshot.latest_ask;
+    // The work-driven head's receipt indices were taken against the stored
+    // completions; a newer snapshot may have replaced them.
+    current.recap_extras.work_anchor = None;
     if snapshot.anchor_request.is_some() && snapshot.anchor_request == ep.anchor_request {
         current.completions = snapshot.completions;
         current.completions_untied = snapshot.completions_untied;
@@ -1327,6 +1330,8 @@ fn recap_episode<'a>(
                 current.anchor_request = Some(intent);
                 current.completions_untied = anchor.completions_untied;
                 current.anchor_receipts = anchor.receipts.clone();
+                // After a compaction the current task is the latest one.
+                current.recap_extras.work_anchor = None;
                 return std::borrow::Cow::Owned(current);
             }
         }
@@ -3031,28 +3036,28 @@ mod tests {
     }
 
     #[test]
-    fn startup_resume_clear_name_the_latest_task_after_compact_capture() {
+    fn startup_resume_clear_keep_first_task_after_compact_capture() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
         std::env::remove_var("CSR_NO_RECAP");
         let ep = compact_episode(&[]);
         for source in ["startup", "resume", "clear"] {
             let block = compact_block(&ep, source, Some("s"));
             assert!(
-                block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[2])),
+                block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[0])),
                 "{source}: {block}"
             );
         }
     }
 
     #[test]
-    fn compact_different_or_missing_session_names_the_latest_task() {
+    fn compact_different_or_missing_session_keeps_first_task() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
         std::env::remove_var("CSR_NO_RECAP");
         let ep = compact_episode(&[]);
         for session in [Some("different"), None] {
             let block = compact_block(&ep, "compact", session);
             assert!(
-                block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[2])),
+                block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[0])),
                 "{block}"
             );
         }

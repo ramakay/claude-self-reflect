@@ -34,6 +34,10 @@ pub struct RecapExtras {
     /// Total background tasks not closed (may exceed `background_open.len()`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub background_open_total: usize,
+    /// The ask that drove the most work in the session, with the receipts made
+    /// under it. The recap's head quotes it; absent when no ask drove any work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_anchor: Option<super::stop::CompactAnchor>,
 }
 
 fn is_zero(n: &usize) -> bool {
