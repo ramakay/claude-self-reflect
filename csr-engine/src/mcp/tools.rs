@@ -3550,18 +3550,16 @@ async fn get_more_results_in_scope(
         });
     }
 
-    // Enrich + resolution sink + validity partition ONCE over the FULL
-    // fixed window, THEN slice the page.
-    let enriched = enrich_results_with_active_forgetting(
+    // The window is ordered exactly as page one orders it: rows that carry no
+    // answer sink first, then resolved and demoted rows ([`settle_window`]),
+    // over the FULL fixed window, THEN the page is sliced.
+    let enriched = enrich_results_sinking(
         storage,
         &all_results,
         consumption_mode,
         active_forgetting,
+        |window| sink_non_answers(window),
     )?;
-    // The same non-answer sink as page one, over the same full window, so a
-    // question echo the first page pushed down is not what page two starts at.
-    let mut enriched = enriched;
-    sink_non_answers(&mut enriched);
     let total = enriched.len();
     let page: Vec<EnrichedResult> = enriched.into_iter().skip(offset).take(limit).collect();
     Ok(format::format_more_results(&page, query, offset, total))
@@ -4029,6 +4027,25 @@ fn enrich_results_with_active_forgetting(
     consumption_mode: ConsumptionMode,
     active_forgetting: bool,
 ) -> Result<Vec<EnrichedResult>> {
+    enrich_results_sinking(
+        storage,
+        results,
+        consumption_mode,
+        active_forgetting,
+        |_| {},
+    )
+}
+
+/// [`enrich_results_with_active_forgetting`] with a `before_settle` step that
+/// runs on the deduped window just before the resolved and demoted rows sink,
+/// so a caller's own sinks (the non-answer sink) come first, as on page one.
+fn enrich_results_sinking(
+    storage: &Arc<Storage>,
+    results: &[crate::search::SearchResult],
+    consumption_mode: ConsumptionMode,
+    active_forgetting: bool,
+    before_settle: impl FnOnce(&mut Vec<EnrichedResult>),
+) -> Result<Vec<EnrichedResult>> {
     let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
     let chunks = storage.get_chunks_by_ids(&ids)?;
 
@@ -4048,8 +4065,7 @@ fn enrich_results_with_active_forgetting(
         })
         .collect();
     format::dedupe_results(&mut enriched_vec);
-    apply_resolutions(&mut enriched_vec, storage);
-    apply_trust_labels(&mut enriched_vec, storage);
+    before_settle(&mut enriched_vec);
     let validity_chunks: Vec<crate::import::ConversationChunk> =
         enriched_vec.iter().map(|e| e.chunk.clone()).collect();
     let validity = resolve_validity_with(storage, &validity_chunks, consumption_mode);
@@ -4082,7 +4098,7 @@ fn enrich_results_with_active_forgetting(
             }
         }
     }
-    apply_validity_partition(&mut enriched_vec, &validity, active_forgetting);
+    settle_window(&mut enriched_vec, storage, &validity, active_forgetting);
     Ok(enriched_vec)
 }
 
@@ -4842,10 +4858,24 @@ fn apply_resolutions_before_limit(
     limit: usize,
     active_forgetting: bool,
 ) {
+    settle_window(enriched, storage, validity, active_forgetting);
+    enriched.truncate(limit);
+}
+
+/// The last ordering step of every result window, page one and every later
+/// page alike: confirmed-resolved rows sink, trust labels are stamped, and
+/// dream-demoted rows sink below the rest. It runs after the non-answer sink,
+/// so a verified-resolved row stays below an unresolved one, and both stay
+/// where the sinks before them put the rows that carry no answer.
+fn settle_window(
+    enriched: &mut Vec<EnrichedResult>,
+    storage: &Arc<Storage>,
+    validity: &HashMap<String, ConvValidity>,
+    active_forgetting: bool,
+) {
     apply_resolutions(enriched, storage);
     apply_trust_labels(enriched, storage);
     apply_validity_partition(enriched, validity, active_forgetting);
-    enriched.truncate(limit);
 }
 
 #[cfg(test)]
@@ -12277,6 +12307,134 @@ mod echo_recall_tests {
             second.contains("Checking past") && !second.contains("too painful"),
             "{second}"
         );
+    }
+
+    /// Page one and the pages after it order the window the same way: rows that
+    /// carry no answer sink, then a confirmed-resolved row sinks below the
+    /// unresolved ones. Walking get_more one row at a time must visit every
+    /// row page one returned exactly once, in page one's order.
+    #[tokio::test]
+    async fn page_one_and_get_more_cover_every_result_once_in_the_same_order() {
+        let phrases = [
+            "Checking past sessions",
+            "too painful",
+            "Resolved note",
+            "Phase 0 spike",
+        ];
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        for (row, vector) in [
+            chunk(
+                "echo-chunk",
+                "conv1",
+                0.95,
+                "why did we drop Docker and Qdrant for a single Rust binary?\n\nChecking past sessions for the actual reasoning.",
+            ),
+            chunk(
+                "answer-chunk",
+                "conv2",
+                0.90,
+                "Installing it was too painful, and the scale never needed a database server.",
+            ),
+            chunk(
+                "resolved-chunk",
+                "conv3",
+                0.92,
+                "Resolved note: the Qdrant container was removed in the v8 rewrite and verified.",
+            ),
+            chunk(
+                "plain-chunk",
+                "conv4",
+                0.85,
+                "A Phase 0 spike showed an embedded index was faster anyway.",
+            ),
+        ] {
+            storage.insert_chunk(&row, &vector).unwrap();
+            engine.insert_chunk(row.id.clone(), vector);
+        }
+        storage
+            .insert_resolutions(
+                &["resolved-chunk".to_string()],
+                "resolved",
+                "shipped and verified",
+                None,
+                "user_confirmed",
+            )
+            .unwrap();
+        let search = Arc::new(RwLock::new(engine));
+        let scope =
+            SearchProjectScope::resolve_with(&storage, Some("all"), Some("echoproj"), None, None)
+                .unwrap();
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+        let order_of = |text: &str| -> Vec<usize> {
+            let mut found: Vec<(usize, usize)> = phrases
+                .iter()
+                .enumerate()
+                .filter_map(|(at, phrase)| text.find(phrase).map(|pos| (pos, at)))
+                .collect();
+            found.sort();
+            found.into_iter().map(|(_, at)| at).collect()
+        };
+
+        let page_one = reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &q,
+            QUERY,
+            10,
+            0.0,
+            &scope,
+            0,
+            true,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        let first_page = order_of(&page_one);
+
+        let mut paged = Vec::new();
+        for offset in 0..4 {
+            let page = get_more_results_in_scope(
+                &storage,
+                &search,
+                &q,
+                QUERY,
+                offset,
+                1,
+                0.0,
+                &scope,
+                ConsumptionMode::Off,
+                false,
+            )
+            .await
+            .unwrap();
+            let seen = order_of(&page);
+            assert_eq!(seen.len(), 1, "offset {offset}: {page}");
+            paged.push(seen[0]);
+        }
+        let beyond = get_more_results_in_scope(
+            &storage,
+            &search,
+            &q,
+            QUERY,
+            4,
+            1,
+            0.0,
+            &scope,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(beyond.contains("No results"), "{beyond}");
+
+        let mut every_row = paged.clone();
+        every_row.sort();
+        assert_eq!(every_row, vec![0, 1, 2, 3], "each row once: {paged:?}");
+        assert_eq!(paged, first_page, "same order as page one");
+        // Echo (0) above the resolved row (2), both below the answers.
+        assert_eq!(&paged[2..], &[0, 2], "{paged:?}");
     }
 
     #[tokio::test]
