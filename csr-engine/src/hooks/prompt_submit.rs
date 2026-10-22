@@ -2470,7 +2470,7 @@ fn quoted_in_prompt(content: &str, pasted_words: &str) -> bool {
 /// The words alone prove nothing: `decision: bool` in a struct, `commit
 /// 3f9a2c1…` in a `git log`, and `test result: ok` in a cargo log are output
 /// and source. So a label counts only where it opens a line, a list item or a
-/// sentence and what follows reads as prose, not code. A bare test log is not a
+/// sentence and the line is a sentence, not source. A bare test log is not a
 /// receipt: it says what the run printed, not what the person concluded.
 fn statement_label() -> &'static regex::Regex {
     static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -2490,9 +2490,18 @@ fn change_reference() -> &'static regex::Regex {
     })
 }
 
-/// Syntax that prose does not use.
-fn code_like(text: &str) -> bool {
-    text.contains(['{', '}']) || ["=>", "->", "::", "()"].iter().any(|op| text.contains(op))
+/// The line is a declaration or a statement of source, not a sentence: it ends
+/// the way source lines end (`{`, `;`, `,`), or what follows its label is one
+/// typed token (`Vec<Receipt>`, `Verdict::Ok`). Prose that quotes a call or a
+/// path inside a sentence is not source.
+fn source_shaped(line: &str, tail: &str) -> bool {
+    if line.trim_end().ends_with(['{', ';', ',']) {
+        return true;
+    }
+    let token = tail.trim();
+    !token.is_empty()
+        && !token.contains(char::is_whitespace)
+        && token.contains(['<', '>', '[', ']', '&', '*'])
 }
 
 /// Words made of letters only (an apostrophe or hyphen inside is fine).
@@ -2508,22 +2517,34 @@ fn prose_words(text: &str) -> usize {
         .count()
 }
 
+/// A figure: a digit, or a hash (seven or more hex digits in one token).
+fn has_figure(text: &str) -> bool {
+    text.chars().any(|c| c.is_ascii_digit())
+        || text
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| token.len() >= 7 && token.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 fn states_decision_or_receipt(content: &str) -> bool {
     let labelled = statement_label().captures_iter(content).any(|found| {
+        let whole = found.get(0).map_or(0..0, |m| m.range());
         let tail = found.get(2).map_or("", |m| m.as_str());
-        if code_like(tail) {
+        // The whole line is judged, from its first character: a label inside a
+        // declaration is a field name.
+        let line_start = content[..whole.start].rfind('\n').map_or(0, |at| at + 1);
+        if source_shaped(&content[line_start..whole.end], tail) {
             return false;
         }
         // A receipts line is figures (sizes, counts, hashes), not sentences.
         if found[1].to_lowercase().starts_with("receipt") {
-            !tail.trim().is_empty()
+            has_figure(tail)
         } else {
             prose_words(tail) >= 3
         }
     });
     labelled
         || content.lines().any(|line| {
-            change_reference().is_match(line) && !code_like(line) && prose_words(line) >= 6
+            change_reference().is_match(line) && !source_shaped(line, "") && prose_words(line) >= 4
         })
 }
 
@@ -2867,7 +2888,7 @@ mod tests {
             "let verdict: Verdict = judge(&chunk);\nlet receipts: Vec<Receipt> = Vec::new();",
             "fn decide(x: &Input) -> Decision {\n    Decision { decision: x.ok }\n}",
             "commit 3f9a2c1d4e5f60718293a4b5c6d7e8f901234567\nAuthor: t <t@t>\nDate:   Wed Oct 21\n",
-            "#62 open fix scoring  PR #62  PR #63\n#63 open home bounce",
+            "commit 3f9a2c1d4e5f60718293a4b5c6d7e8f901234567\n\n    Merge PR #62\n",
         ] {
             assert!(is_tool_dump(Some(1.0), dump), "{dump}");
         }
@@ -2880,6 +2901,61 @@ mod tests {
         ] {
             assert!(!is_tool_dump(Some(1.0), kept), "{kept}");
         }
+    }
+
+    /// Prose quotes code all the time; only a declaration or source shape is
+    /// vetoed, not a call or a path inside a sentence.
+    #[test]
+    fn prose_that_quotes_code_is_still_a_statement() {
+        for kept in [
+            "Decision: call seal() after the watcher finishes reading",
+            "Decision: route it through Storage::chunk_trust_and_tool_share for the whole batch.",
+            "Root cause: the watcher returned early from import_session() before the flush.",
+        ] {
+            assert!(!is_tool_dump(Some(1.0), kept), "{kept}");
+        }
+        for dump in [
+            "decision: Option<Decision>,",
+            "Decision: handle_event(&mut self) {",
+            "verdict: Verdict::Ok;",
+        ] {
+            assert!(is_tool_dump(Some(1.0), dump), "{dump}");
+        }
+    }
+
+    /// A receipts label counts when the whole line is a statement and the tail
+    /// carries a figure; a struct field named `receipts` carries neither.
+    #[test]
+    fn a_receipts_field_in_source_is_not_a_receipt() {
+        for dump in [
+            "struct Policy {\n    receipts: Vec<Receipt>,\n}",
+            "pub struct Log {\n    pub receipts: [u8; 32],\n}",
+            "Receipts: none of it matters",
+            "receipts: Vec<Receipt>",
+        ] {
+            assert!(is_tool_dump(Some(1.0), dump), "{dump}");
+        }
+        for kept in [
+            "**Receipts:** 1440x2560, 60 fps, 5400 frames, 261 MB.",
+            "Receipts: built at 3f9a2c1d4e5f, audio md5 identical.",
+        ] {
+            assert!(!is_tool_dump(Some(1.0), kept), "{kept}");
+        }
+    }
+
+    /// A short sentence naming the change is a receipt.
+    #[test]
+    fn a_short_sentence_naming_a_pr_is_a_receipt() {
+        assert!(!is_tool_dump(Some(1.0), "merged in PR #62, tests green"));
+        assert!(!is_tool_dump(
+            Some(1.0),
+            "fixed in commit 3f9a2c1d, tests green"
+        ));
+        assert!(is_tool_dump(
+            Some(1.0),
+            "commit 3f9a2c1d4e5f60718293a4b5c6d7e8f901234567"
+        ));
+        assert!(is_tool_dump(Some(1.0), "    Merge PR #62"));
     }
 
     /// The first fifteen candidates are all dumps: the report ranked below
