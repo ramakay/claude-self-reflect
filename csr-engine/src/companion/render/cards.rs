@@ -1998,6 +1998,10 @@ mod tests {
     }
     #[test]
     fn every_kind_of_card_draws_in_under_five_milliseconds() {
+        // Measured on the Studio: cold draws 1.3 to 2.0 ms idle and at most 1.7 ms in 105 draws
+        // under 64 busy loops, warm medians at most 0.55 ms. 50 ms is far above all of that and
+        // far below a draw that really regressed.
+        const COLD_BOUND_MS: u64 = 50;
         let Some(f) = fonts() else {
             eprintln!("no usable font: skipped");
             return;
@@ -2066,12 +2070,18 @@ mod tests {
         let cell = (16, 34);
         for card in &cards {
             let rows = rows_of(card, 44, cell, f);
-            // The bound is on the best of several draws: a preempted run on a loaded host is
-            // not the draw's cost, but a draw that really got slower is slower on every run,
-            // so the minimum still rises past the bound.
-            let mut best = std::time::Duration::MAX;
+            // Two bounds. The first draw of each kind is cold (glyph caches, allocator) and gets a
+            // generous bound that a real regression still breaks; the warmed draws must have a
+            // median at or under the 5 ms the card is designed for, which one preempted sample
+            // cannot move.
+            let name = format!("{card:?}")
+                .split([' ', '(', '{'])
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let mut took = Vec::new();
             let mut drawn = None;
-            for _ in 0..25 {
+            for _ in 0..26 {
                 let start = std::time::Instant::now();
                 let pm = draw_card(
                     card,
@@ -2082,21 +2092,25 @@ mod tests {
                     f,
                 )
                 .unwrap();
-                best = best.min(start.elapsed());
+                took.push(start.elapsed());
                 drawn = Some(pm);
             }
+            let cold = took.remove(0);
+            took.sort();
+            let median = took[took.len() / 2];
+            eprintln!("{name}: cold {cold:?}, warm median {median:?}");
             let pm = drawn.unwrap();
-            eprintln!(
-                "{}: best of 25 {best:?}",
-                format!("{card:?}")
-                    .split([' ', '(', '{'])
-                    .next()
-                    .unwrap_or("")
-            );
             assert_eq!(pm.width(), 44 * 16);
             // debug builds are an order slower; the bound is the release one
             if !cfg!(debug_assertions) {
-                assert!(best.as_millis() < 5, "{best:?}");
+                assert!(
+                    cold < std::time::Duration::from_millis(COLD_BOUND_MS),
+                    "{name}: cold draw {cold:?}"
+                );
+                assert!(
+                    median <= std::time::Duration::from_millis(5),
+                    "{name}: warm median {median:?}"
+                );
             }
         }
         let pill = pill_of(
