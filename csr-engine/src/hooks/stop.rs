@@ -4736,8 +4736,8 @@ mod tests {
         assert_eq!(
             got,
             "recap [3h ago]: anthropics codemod, when github links are bought up or disccussed, \
-             can present a side pane (enhanced for herdr users) - thoughts?: \
-             feat(pane): first topic commit (0aa11bb). [[CSR:RECAP]]"
+             can present a side pane (enhanced for herdr users) - thoughts? \
+             Latest: feat(pane): first topic commit (0aa11bb). [[CSR:RECAP]]"
         );
         assert!(!got.contains("How the share works"));
     }
@@ -5177,7 +5177,7 @@ mod tests {
         let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
         assert_eq!(
             got,
-            "recap [now]: run the release checks and report: fix(recap): name the commit (1a2b3c4). [[CSR:RECAP]]"
+            "recap [now]: run the release checks and report. Latest: fix(recap): name the commit (1a2b3c4). [[CSR:RECAP]]"
         );
         // Everything it says is re-import suppressed.
         assert!(crate::extraction::provenance::is_csr_emission(&got));
@@ -5842,7 +5842,7 @@ mod tests {
         let got = crate::hooks::recap::compose_recap(&extract(&lines), &no_feeds(), "now").unwrap();
         assert_eq!(
             got,
-            "recap [now]: ship the auth fixes: fix(auth): one (1111111); fix(auth): two (2222222). [[CSR:RECAP]]"
+            "recap [now]: ship the auth fixes. Latest: fix(auth): one (1111111); fix(auth): two (2222222). [[CSR:RECAP]]"
         );
         // Five or more todo receipts never evict the stored commits.
         let mut lines = vec![typed_line("ship the auth fixes", "typed")];

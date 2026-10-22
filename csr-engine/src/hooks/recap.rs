@@ -155,11 +155,19 @@ fn compose_recap_inner(
     let mut recap = match (intent.as_deref(), completed.as_deref()) {
         // Receipts that are not the anchor's own completion get their own
         // clause, so the recap never reads them as what the anchor achieved.
-        (Some(intent), Some(completed)) if ep.completions_untied => format!(
-            "recap [{age}]: {} Latest: {}",
-            terminate_clause(intent),
-            terminate_clause(completed)
-        ),
+        // A commit, a merge or an edit made during the anchor's turn is not
+        // thereby its answer (a question about a workflow does not become
+        // "answered" by a merge the session made meanwhile); only a task the
+        // session marked finished reads as the anchor's result.
+        (Some(intent), Some(completed))
+            if ep.completions_untied || !completed_is_a_finished_task(ep) =>
+        {
+            format!(
+                "recap [{age}]: {} Latest: {}",
+                terminate_clause(intent),
+                terminate_clause(completed)
+            )
+        }
         (Some(intent), Some(completed)) => format!(
             "recap [{age}]: {}: {}",
             intent.trim_end().trim_end_matches(TRAILING_JUNK),
@@ -760,6 +768,15 @@ fn recap_completed(ep: &crate::hooks::stop::Episode) -> Option<String> {
         .map(|(_, entry)| entry)
         .collect();
     (!entries.is_empty()).then(|| entries.join("; "))
+}
+
+/// Whether the completed clause is a task the session marked finished (the
+/// receipts shown are all of one kind, the strongest the session has).
+fn completed_is_a_finished_task(ep: &crate::hooks::stop::Episode) -> bool {
+    recap_receipts(&ep.completions)
+        .first()
+        .and_then(|(index, _)| ep.completions.get(*index))
+        .is_some_and(|done| receipt_kind(&done.receipt) == ReceiptKind::Task)
 }
 
 /// A commit receipt: a short or full hex SHA (task and todo receipts read
@@ -1498,7 +1515,7 @@ mod tests {
         let got = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
         assert_eq!(
             got,
-            "recap [28m ago]: Fix the recap composer: Implemented deterministic recap output (abc1234). [[CSR:RECAP]]\n\
+            "recap [28m ago]: Fix the recap composer. Latest: Implemented deterministic recap output (abc1234). [[CSR:RECAP]]\n\
              Settled: schema is stable (810283b); queries are indexed (T2 2026-07-27).\n\
              Now: waiting for storage migration | Windows path behavior (91abcde) | 2 proposals awaiting csr_resolve | 1 todos open.\n\
              Learnt-then-retired while away: old schema assumption (superseded 2026-08-06, 77fedca).\n\
@@ -2513,7 +2530,7 @@ mod tests {
         // is dropped, never cut) outranks the newer task receipt.
         assert_eq!(
             got,
-            "recap [now]: Fix the recap composer: oldest (0000000). [[CSR:RECAP]]"
+            "recap [now]: Fix the recap composer. Latest: oldest (0000000). [[CSR:RECAP]]"
         );
         // With no commit at all, the latest task receipts show.
         ep.completions
@@ -2539,7 +2556,7 @@ mod tests {
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
         assert_eq!(
             got,
-            "recap [now]: Fix the recap composer: edited stop.rs, recap.rs (7 edits). [[CSR:RECAP]]"
+            "recap [now]: Fix the recap composer. Latest: edited stop.rs, recap.rs (7 edits). [[CSR:RECAP]]"
         );
         // The companion's repo recap reads "done" from these: edits are not.
         assert!(displayed_receipts(&ep.completions).is_empty());
@@ -2548,7 +2565,7 @@ mod tests {
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
         assert_eq!(
             got,
-            "recap [now]: Fix the recap composer: edited recap.rs (2 edits). [[CSR:RECAP]]"
+            "recap [now]: Fix the recap composer. Latest: edited recap.rs (2 edits). [[CSR:RECAP]]"
         );
         ep.completions.pop();
         // A completed task outranks them, a commit outranks both.
@@ -2563,7 +2580,7 @@ mod tests {
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
         assert_eq!(
             got,
-            "recap [now]: Fix the recap composer: fix(recap): subject (abc1234). [[CSR:RECAP]]"
+            "recap [now]: Fix the recap composer. Latest: fix(recap): subject (abc1234). [[CSR:RECAP]]"
         );
         assert_eq!(receipt_kind("12 edits"), ReceiptKind::Edit);
         assert_eq!(receipt_kind("1 edit"), ReceiptKind::Edit);

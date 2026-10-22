@@ -2800,7 +2800,7 @@ mod tests {
         );
 
         assert!(block.starts_with(
-            "recap [2h ago]: Fix the auth middleware regression: Fixed token validation (1a2b3c4)."
+            "recap [2h ago]: Fix the auth middleware regression. Latest: Fixed token validation (1a2b3c4)."
         ));
         assert!(block.contains("Settled: seeded fact (abcdef1)."));
         assert!(block.contains("1 proposals awaiting csr_resolve"));
