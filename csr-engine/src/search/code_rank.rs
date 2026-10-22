@@ -11,7 +11,6 @@
 //! a top-K gain.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
@@ -20,14 +19,6 @@ use rusqlite::{params, Connection};
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankStats {
     pub nodes_ranked: usize,
-}
-
-/// Outcome of a scoped rank pass.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ScopedRank {
-    pub stats: RankStats,
-    /// False when the deadline ended the pass before every node was reached.
-    pub complete: bool,
 }
 
 /// Recompute and persist degree ranks for every node in `project` (empty = all).
@@ -97,99 +88,6 @@ pub fn compute_code_rank(conn: &Connection, project: &str) -> Result<RankStats> 
 
     Ok(RankStats {
         nodes_ranked: ranked,
-    })
-}
-
-/// `compute_code_rank` for the nodes of `files`, the nodes named `names`, and
-/// the nodes `extra_ids` lists, all in `project`. Each node gets the rank the
-/// full pass would give it; nodes outside that set keep the rank they have.
-///
-/// The PostToolUse hook uses this: a full pass rewrites a row per node of the
-/// project (24k for this repo) on every edit, and the edit moves the degree of
-/// the edited file's nodes and of the nodes they call or are called as.
-///
-/// Stops once `deadline` passes, and says so: `complete` is false and the nodes
-/// not reached keep their rank.
-pub fn compute_code_rank_scoped(
-    conn: &Connection,
-    project: &str,
-    files: &[String],
-    names: &[String],
-    extra_ids: &[String],
-    deadline: Option<Instant>,
-) -> Result<ScopedRank> {
-    let mut ids: std::collections::BTreeSet<String> = extra_ids.iter().cloned().collect();
-    {
-        let mut by_file =
-            conn.prepare("SELECT id FROM code_nodes WHERE project = ?1 AND file = ?2")?;
-        for file in files {
-            for id in by_file.query_map(params![project, file], |row| row.get::<_, String>(0))? {
-                ids.insert(id?);
-            }
-        }
-        // `+project` keeps the planner on `idx_code_nodes_name`. Left to itself
-        // it picks the (project, file) index and walks every node of the
-        // project once per name (measured: 300 ms for a 180-name file).
-        let mut by_name =
-            conn.prepare("SELECT id FROM code_nodes WHERE name = ?2 AND +project = ?1")?;
-        for name in names {
-            for id in by_name.query_map(params![project, name], |row| row.get::<_, String>(0))? {
-                ids.insert(id?);
-            }
-        }
-    }
-
-    let mut in_scope =
-        conn.prepare("SELECT 1 FROM code_nodes WHERE id = ?1 AND (?2 = '' OR project = ?2)")?;
-    let mut out_degree = conn.prepare(
-        "SELECT COUNT(*) FROM code_edges WHERE src_id = ?1 AND kind IN ('calls', 'references')",
-    )?;
-    let mut in_degree = conn.prepare(
-        "SELECT COUNT(*) FROM code_edges
-         WHERE dst_id = ?1 AND kind IN ('calls', 'references') AND resolved = 1",
-    )?;
-    let mut write = conn.prepare(
-        "INSERT INTO code_node_rank (node_id, rank, in_degree, out_degree, computed_at)
-         VALUES (?1, ?2, ?3, ?4, datetime('now'))
-         ON CONFLICT(node_id) DO UPDATE SET
-             rank = excluded.rank,
-             in_degree = excluded.in_degree,
-             out_degree = excluded.out_degree,
-             computed_at = datetime('now')",
-    )?;
-    let own_transaction = conn.is_autocommit();
-    if own_transaction {
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-    }
-    let ranked = (|| -> Result<(usize, bool)> {
-        let mut ranked = 0usize;
-        for (seen, id) in ids.iter().enumerate() {
-            if seen % 32 == 0 && deadline.is_some_and(|d| Instant::now() >= d) {
-                return Ok((ranked, false));
-            }
-            if !in_scope.exists(params![id, project])? {
-                continue;
-            }
-            let ind: i64 = in_degree.query_row(params![id], |row| row.get(0))?;
-            let outd: i64 = out_degree.query_row(params![id], |row| row.get(0))?;
-            let rank = ind as f64 + 0.5 * outd as f64;
-            write.execute(params![id, rank, ind, outd])?;
-            ranked += 1;
-        }
-        Ok((ranked, true))
-    })();
-    if own_transaction {
-        match &ranked {
-            Ok(_) => conn.execute_batch("COMMIT")?,
-            Err(_) => {
-                let _ = conn.execute_batch("ROLLBACK");
-            }
-        }
-    }
-    let (nodes_ranked, complete) = ranked?;
-    Ok(ScopedRank {
-        stats: RankStats { nodes_ranked },
-        complete,
     })
 }
 

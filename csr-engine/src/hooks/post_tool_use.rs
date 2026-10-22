@@ -15,7 +15,6 @@
 //! Always returns Ok(()) — never blocks Claude Code (C-2 fix).
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -29,34 +28,6 @@ use crate::engine::Engine;
 /// [`bash_written_files`].
 pub fn is_acted_on_tool(tool_name: Option<&str>) -> bool {
     matches!(tool_name, Some("Edit") | Some("Write") | Some("MultiEdit"))
-}
-
-/// Wall-clock budget for the graph work of one PostToolUse run, counted from
-/// the start of [`handle`]: the resolve and rank passes check it per edge, and a
-/// file that cannot finish inside it is flagged for the daemon
-/// (`extraction::graph_catchup`) and the hook exits 0. Claude Code waits on this
-/// hook, and a run used to take 30 s on a large graph. The re-extraction
-/// itself is not budgeted: it is bounded by `MAX_GRAPH_FILE_BYTES`.
-///
-/// A backgrounded hook (`async: true`) is not the answer: a stalled one stays a
-/// live csr-engine process.
-pub const GRAPH_BUDGET: Duration = Duration::from_millis(300);
-
-/// Longest one hook write waits for the database write lock, and shortest. The
-/// storage default is 5 s, which would spend the whole budget on one statement
-/// whenever the daemon holds the lock.
-const MAX_WRITE_WAIT: Duration = Duration::from_millis(250);
-const MIN_WRITE_WAIT: Duration = Duration::from_millis(25);
-
-/// Cap the wait for the write lock at what is left of the budget. A failed set
-/// changes nothing worth stopping for.
-fn clamp_write_wait(engine: &Engine, deadline: Instant) {
-    let wait = deadline
-        .saturating_duration_since(Instant::now())
-        .clamp(MIN_WRITE_WAIT, MAX_WRITE_WAIT);
-    let _ = engine
-        .storage()
-        .with_connection(|conn| conn.busy_timeout(wait).map_err(Into::into));
 }
 
 /// Most files one Bash call may add to the file history. A script that rewrites
@@ -100,7 +71,6 @@ pub fn exits_before_engine(hook_name: &str, input: &HookInput) -> bool {
 /// Handle the post-tool-use hook.
 /// Always returns Ok(()) to never block Claude Code (C-2 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<()> {
-    let deadline = Instant::now() + GRAPH_BUDGET;
     let bash_files = bash_written_files(input);
     if input.tool_name.as_deref() == Some("Bash") && bash_files.is_empty() {
         return Ok(());
@@ -132,9 +102,6 @@ pub async fn handle(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<(
         if let Err(e) = enqueue_path_for_codemap(engine, file_path) {
             eprintln!("CSR: code map enqueue error (non-fatal): {}", e);
         }
-        // The enqueue put the storage default back; the writes below wait only
-        // as long as the budget has left.
-        clamp_write_wait(engine, deadline);
         if let Err(e) =
             track_code_evolution_for(input, engine, file_path, resolve_project_for_hook).await
         {
@@ -142,10 +109,7 @@ pub async fn handle(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<(
         }
         // v9.4 liveness path: re-extract the touched file into the code graph
         // so callers/callees/ledger reflect the edit immediately.
-        clamp_write_wait(engine, deadline);
-        if let Err(e) =
-            update_code_graph_for(input, engine, file_path, resolve_project_for_hook, deadline)
-        {
+        if let Err(e) = update_code_graph_for(input, engine, file_path, resolve_project_for_hook) {
             eprintln!("CSR: code graph update error (non-fatal): {}", e);
         }
     }
@@ -207,16 +171,10 @@ const MAX_GRAPH_FILE_BYTES: u64 = 256 * 1024;
 
 /// Re-extract the edited file into the code graph (v9.4 liveness path).
 /// Reads the on-disk file (post-edit), upserts nodes, replaces this file's edges,
-/// marks file state, then resolves + ranks that file's share of the graph.
+/// marks file state, then re-resolves + re-ranks the project.
 #[cfg(test)]
 fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
     update_code_graph_with(input, engine, resolve_project_for_hook)
-}
-
-/// A deadline no test run reaches.
-#[cfg(test)]
-fn far_deadline() -> Instant {
-    Instant::now() + Duration::from_secs(600)
 }
 
 /// `update_code_graph` with the project resolver passed in, so tests drive it
@@ -230,7 +188,7 @@ fn update_code_graph_with(
 ) -> Result<()> {
     let file_path =
         tool_file_path(input).ok_or_else(|| anyhow::anyhow!("no file_path in tool_input"))?;
-    update_code_graph_for(input, engine, file_path, resolve, far_deadline())
+    update_code_graph_for(input, engine, file_path, resolve)
 }
 
 /// Core of `update_code_graph` for one file: an Edit's `file_path` or one of
@@ -240,7 +198,6 @@ fn update_code_graph_for(
     engine: &Engine,
     file_path: &str,
     resolve: impl Fn(Option<&Path>, Option<&str>) -> String,
-    deadline: Instant,
 ) -> Result<()> {
     // Repo/project identity is derivable from `file_path` alone (no lang
     // needed), so compute it before the language gate — WP2 Stage 3 (H8
@@ -307,9 +264,6 @@ fn update_code_graph_for(
 
     let storage = engine.storage();
     let source_chunk_id = storage.latest_chunk_id_for_conversation(&conv_id)?;
-    // What the resolve and rank passes need from the file as it was, before the
-    // upserts and the edge replace below change it.
-    let before = storage.read_code_file_before(&project, &stored_path_str)?;
     for node in &fragment.nodes {
         let mut node = node.clone();
         node.repo_root = repo_root.clone();
@@ -341,35 +295,15 @@ fn update_code_graph_for(
     let content_hash = crate::extraction::anchors::hash_normalized(&source);
     storage.upsert_code_file_state(&project, &stored_path_str, &content_hash, false)?;
 
-    // Resolve + rank this file's share so the live graph is queryable right
-    // after the edit. Only the edited file: a project-wide pass cost 30 s here.
-    // Whatever the budget cuts off goes to the daemon.
-    let work = if Instant::now() >= deadline {
-        None
-    } else {
-        Some(storage.resolve_and_rank_code_file(
-            &project,
-            &stored_path_str,
-            &before,
-            Some(deadline),
-        ))
-    };
-    let outcome = match &work {
-        Some(Ok(w)) if w.complete => "complete".to_string(),
-        Some(Ok(w)) => format!("{} edges left for the daemon", w.resolve.deferred),
-        Some(Err(e)) => format!("failed ({e}), left for the daemon"),
-        None => "budget spent, left for the daemon".to_string(),
-    };
-    if !matches!(&work, Some(Ok(w)) if w.complete) {
-        storage.defer_code_file_graph(&project, &stored_path_str, &before)?;
-    }
+    // Re-resolve + re-rank so the live graph is queryable right after the edit.
+    let _ = storage.resolve_code_edges(&project)?;
+    let _ = storage.compute_code_rank(&project)?;
 
     eprintln!(
-        "CSR: code graph updated for {} ({} nodes, {} edges, resolve {})",
+        "CSR: code graph updated for {} ({} nodes, {} edges)",
         stored_path_str,
         fragment.nodes.len(),
-        fragment.edges.len(),
-        outcome
+        fragment.edges.len()
     );
 
     Ok(())
@@ -890,53 +824,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(projects, vec!["my-repo".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn graph_pass_past_its_budget_hands_the_file_to_the_daemon() {
-        let (engine, storage) = test_engine();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let file = tmp.path().join("budget.rs");
-        std::fs::write(&file, "fn caller() { callee(); }\nfn callee() {}\n").unwrap();
-        let path = file.to_string_lossy().to_string();
-        let input = write_input(&file, Some("/Users/x/projects/my-repo"));
-
-        // The budget is already spent when the resolve step is reached.
-        update_code_graph_for(&input, &engine, &path, resolve_without_env, Instant::now()).unwrap();
-        let state = |storage: &crate::storage::Storage| -> (i64, Vec<(String, String)>) {
-            storage
-                .with_connection(|c| {
-                    let pending: i64 = c.query_row(
-                        "SELECT COUNT(*) FROM code_edges WHERE resolved = 0 AND dst_id LIKE 'name:%'",
-                        [],
-                        |r| r.get(0),
-                    )?;
-                    Ok((
-                        pending,
-                        crate::storage::codegraph::dirty_files(c, 10)?,
-                    ))
-                })
-                .unwrap()
-        };
-        let (pending, dirty) = state(&storage);
-        assert_eq!(pending, 1, "the edge was extracted but not resolved");
-        assert_eq!(dirty.len(), 1, "the file is flagged for the daemon");
-        assert_eq!(dirty[0].0, "my-repo");
-
-        // The daemon's pass finishes it and clears the flag.
-        let done = storage
-            .with_connection(crate::extraction::graph_catchup::run)
-            .unwrap();
-        assert_eq!(done, 1);
-        let (pending, dirty) = state(&storage);
-        assert_eq!(pending, 0);
-        assert!(dirty.is_empty());
-
-        // With time left the hook finishes the file itself and flags nothing.
-        update_code_graph_for(&input, &engine, &path, resolve_without_env, far_deadline()).unwrap();
-        let (pending, dirty) = state(&storage);
-        assert_eq!(pending, 0);
-        assert!(dirty.is_empty());
     }
 
     #[tokio::test]
@@ -1675,14 +1562,7 @@ mod tests {
         track_code_evolution_for(&no_project, &engine, &path, resolve_without_env)
             .await
             .unwrap();
-        update_code_graph_for(
-            &no_project,
-            &engine,
-            &path,
-            resolve_without_env,
-            far_deadline(),
-        )
-        .unwrap();
+        update_code_graph_for(&no_project, &engine, &path, resolve_without_env).unwrap();
         assert!(graph_rows(&storage).iter().all(|(_, n)| *n == 0));
 
         // With one, the row lands under it.
