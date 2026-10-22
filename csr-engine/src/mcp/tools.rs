@@ -880,23 +880,30 @@ fn sink_out_of_family_under_explicit_scope(
 /// class keeps its fused order, so when an echo and an answer come from the
 /// same conversation the answer is what represents that conversation.
 fn sink_non_answers(enriched: &mut [EnrichedResult]) {
-    let class = |result: &EnrichedResult| -> u8 {
-        let content = result.chunk.content.as_str();
-        if crate::import::contamination::is_csr_tool_payload(content)
-            || crate::import::contamination::is_terminal_replay(content)
-        {
-            2
-        } else if crate::search::echo::is_question_echo(content) {
-            1
-        } else {
-            0
-        }
-    };
     let classes: HashMap<String, u8> = enriched
         .iter()
-        .map(|result| (result.chunk.id.clone(), class(result)))
+        .map(|result| {
+            (
+                result.chunk.id.clone(),
+                non_answer_class(&result.chunk.content),
+            )
+        })
         .collect();
     enriched.sort_by_key(|result| classes.get(&result.chunk.id).copied().unwrap_or(0));
+}
+
+/// 2 for CSR's own payload or a terminal replay, 1 for a question echo, 0 for a
+/// row that can answer.
+fn non_answer_class(content: &str) -> u8 {
+    if crate::import::contamination::is_csr_tool_payload(content)
+        || crate::import::contamination::is_terminal_replay(content)
+    {
+        2
+    } else if crate::search::echo::is_question_echo(content) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Move every id in `prefix_ids` that also appears in `order` to the front,
@@ -1171,6 +1178,7 @@ pub(crate) async fn reflect_for_bench_with_vec(
             query_vec,
             query,
             candidate_fetch,
+            candidate_fetch,
             -1.0,
             &scope,
             false,
@@ -1306,20 +1314,30 @@ struct FinalPage {
     search_ms: u64,
 }
 
-/// Candidates fetched from every lane (vector, keyword, reflections) to fill a
-/// page of `n` rows: four times the page, at least [`RECALL_POOL_MIN`]. The
-/// sinks (non-answers, resolved, out-of-family, demoted) only move or remove
-/// rows that were fetched, and the provenance rerank only lifts a row it was
-/// given, so a pool as wide as the page leaves the page short or answerless
-/// whenever they act. 60 is the least that put the flagship answer in a
-/// five-row page on the live corpus (30 left it at rank 8 to 12): the vector
-/// window has to reach past the earlier echoes of the question before the
-/// rerank can lift the answer.
+/// Candidates fetched from each keyword lane to fill a page of `n` rows: four
+/// times the page, at least [`RECALL_POOL_MIN`]. The sinks (non-answers,
+/// resolved, out-of-family, demoted) only move or remove rows that were
+/// fetched, so a pool as wide as the page leaves the page short or answerless
+/// whenever they act. The vector lanes fetch [`vector_pool`].
 fn recall_pool(n: usize) -> usize {
     n.saturating_mul(4).max(RECALL_POOL_MIN)
 }
 
 const RECALL_POOL_MIN: usize = 60;
+
+/// Candidates fetched from the vector lanes (chunks and reflections) for a page
+/// of `n`: twice the keyword pool. The provenance rerank can lift an answer
+/// only from a window that contains it, and the earlier askings of the
+/// question sit above it in cosine: on the live corpus the flagship answer is
+/// in the first 60 vector hits on some days and past them on others, and in the
+/// first 120 on both. The keyword lanes gain nothing from the extra depth and
+/// pay for every row (a verdict and ancestry lookup each), so they stay at
+/// [`recall_pool`].
+fn vector_pool(n: usize) -> usize {
+    n.saturating_mul(4).max(VECTOR_POOL_MIN)
+}
+
+const VECTOR_POOL_MIN: usize = 120;
 
 /// The settled candidate pool of one query: fused, sunk and settled, in final
 /// order, and not yet cut to a page. Page one cuts its first `limit` rows and
@@ -1330,8 +1348,6 @@ struct SettledPool {
     enriched: Vec<EnrichedResult>,
     display_rank_scores: Vec<DisplayRankScore>,
     search_ms: u64,
-    /// Candidates requested from each lane.
-    fetched: usize,
     /// No lane filled its window, so the pool holds every candidate there is.
     exhausted: bool,
 }
@@ -1382,7 +1398,11 @@ struct CachedPool {
 /// Pools kept for pagination. A page asked for after the first is served from
 /// the pool page one built, so the pages never disagree about the order; a
 /// pool older than [`POOL_TTL`] is rebuilt, which is the offset-pagination
-/// contract (stable while the data is).
+/// contract (stable while the data is). A pool that has to be rebuilt (expired,
+/// evicted, or shorter than the offset) is rebuilt by the same pipeline with
+/// the default rerank intent; the intent feeds only the opt-in trained
+/// reranker (`CSR_TRAINED_RERANK=1`), so under the default settings the order
+/// is the same.
 static POOL_CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<CachedPool>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 const POOL_TTL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -1392,17 +1412,28 @@ fn cache_pool(storage: &Arc<Storage>, key: PoolKey, pool: SettledPool) {
     let Ok(mut cache) = POOL_CACHE.lock() else {
         return;
     };
+    let same_storage = |entry: &CachedPool| {
+        entry
+            .storage
+            .upgrade()
+            .is_some_and(|held| Arc::ptr_eq(&held, storage))
+    };
+    // Drop what is expired, what belongs to a store that is gone, and the
+    // previous pool of this very query.
     cache.retain(|entry| {
         entry.at.elapsed() < POOL_TTL
             && entry.storage.upgrade().is_some()
-            && !(entry.key == key
-                && entry
-                    .storage
-                    .upgrade()
-                    .is_some_and(|held| Arc::ptr_eq(&held, storage)))
+            && !(entry.key == key && same_storage(entry))
     });
-    if cache.len() >= POOL_CACHE_ENTRIES {
-        cache.remove(0);
+    // The cap is per store: the oldest pool of THIS store goes, never another
+    // store's. A process serves one store, so this is the same cap there.
+    while cache.iter().filter(|entry| same_storage(entry)).count() >= POOL_CACHE_ENTRIES {
+        match cache.iter().position(&same_storage) {
+            Some(oldest) => {
+                cache.remove(oldest);
+            }
+            None => break,
+        }
     }
     cache.push(CachedPool {
         storage: Arc::downgrade(storage),
@@ -1412,7 +1443,8 @@ fn cache_pool(storage: &Arc<Storage>, key: PoolKey, pool: SettledPool) {
     });
 }
 
-/// The cached pool for `key`, if it still covers `need` rows.
+/// The cached pool for `key`, if it covers `need` rows: it holds that many, or
+/// it holds every candidate there is.
 fn cached_pool(storage: &Arc<Storage>, key: &PoolKey, need: usize) -> Option<SettledPool> {
     let cache = POOL_CACHE.lock().ok()?;
     cache
@@ -1424,7 +1456,7 @@ fn cached_pool(storage: &Arc<Storage>, key: &PoolKey, need: usize) -> Option<Set
                     .storage
                     .upgrade()
                     .is_some_and(|held| Arc::ptr_eq(&held, storage))
-                && (entry.pool.exhausted || entry.pool.fetched >= recall_pool(need))
+                && (entry.pool.exhausted || entry.pool.enriched.len() >= need)
         })
         .map(|entry| entry.pool.clone())
 }
@@ -1536,6 +1568,7 @@ async fn settled_pool(
         query_vec,
         query,
         first,
+        vector_pool(need),
         min_score,
         scope,
         partition_enabled,
@@ -1547,7 +1580,6 @@ async fn settled_pool(
     )
     .await?;
     let mut search_ms = pass.search_ms;
-    let mut fetched = first;
 
     // ADAPTIVE REFETCH (single, bounded): when demotions leave fewer than
     // `need` valid (non-demoted) results AND the first window came back
@@ -1569,6 +1601,7 @@ async fn settled_pool(
                 query_vec,
                 query,
                 refetch,
+                refetch,
                 min_score,
                 scope,
                 partition_enabled,
@@ -1580,7 +1613,6 @@ async fn settled_pool(
             )
             .await?;
             search_ms += pass.search_ms;
-            fetched = refetch;
         }
     }
 
@@ -1593,7 +1625,6 @@ async fn settled_pool(
         enriched,
         display_rank_scores: pass.display_rank_scores,
         search_ms,
-        fetched,
         exhausted: !pass.window_full,
     })
 }
@@ -1680,6 +1711,7 @@ async fn reflect_gather_pass(
     query_vec: &[f32],
     query: &str,
     fetch: usize,
+    vector_fetch: usize,
     min_score: f32,
     scope: &SearchProjectScope,
     partition_enabled: bool,
@@ -1706,15 +1738,16 @@ async fn reflect_gather_pass(
             for project in &scope.family_projects {
                 ids.extend(storage.get_chunk_ids_for_project(project)?);
             }
-            idx.search_chunks_filtered(query_vec, fetch, min_score, &ids)
+            idx.search_chunks_filtered(query_vec, vector_fetch, min_score, &ids)
         } else {
-            idx.search_chunks(query_vec, fetch, min_score)
+            idx.search_chunks(query_vec, vector_fetch, min_score)
         };
-        let reflections = idx.search_reflections(query_vec, fetch, min_score);
+        let reflections = idx.search_reflections(query_vec, vector_fetch, min_score);
         (chunks, reflections)
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
-    let mut window_full = chunk_results.len() == fetch || reflection_results.len() == fetch;
+    let mut window_full =
+        chunk_results.len() == vector_fetch || reflection_results.len() == vector_fetch;
 
     // Enrich chunk results with metadata
     let chunk_ids: Vec<String> = chunk_results.iter().map(|r| r.id.clone()).collect();
@@ -2252,9 +2285,21 @@ async fn reflect_gather_pass(
             // similarity is, so a weakly similar row the keyword lane also
             // lists can outrank a strongly similar row it does not. Such rows
             // go below the strong vector hits; none is dropped.
+            // Only rows that can answer set the best cosine: an earlier asking
+            // of the question sits at 0.9 and above, and a floor taken from it
+            // would call every real answer weak.
+            let text_of: HashMap<&str, &str> = enriched
+                .iter()
+                .map(|e| (e.chunk.id.as_str(), e.chunk.content.as_str()))
+                .collect();
             let raw_cosine: HashMap<&str, f32> = chunk_results
                 .iter()
                 .chain(reflection_results.iter())
+                .filter(|r| {
+                    text_of
+                        .get(r.id.as_str())
+                        .is_none_or(|text| non_answer_class(text) == 0)
+                })
                 .map(|r| (r.id.as_str(), r.score))
                 .collect();
             demote_weakly_similar_keyword_rows(
@@ -12883,6 +12928,80 @@ mod echo_recall_tests {
         assert!(!page.contains("LATE"), "{page}");
     }
 
+    /// Walk past the first fifteen rows at the default page size: page one at
+    /// limit 5 holds a sixty-row pool (seventy rows exist, so the window is
+    /// full), and offsets 5 to 25 are all slices of it.
+    /// Each row appears once, in page one's order, and a row that arrives after
+    /// page one never shows up.
+    #[tokio::test]
+    async fn a_walk_in_pages_of_five_stays_on_the_pool_page_one_built() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        for n in 0..70 {
+            let (row, vector) = chunk(
+                &format!("row-{n:02}"),
+                &format!("conv{n:02}"),
+                0.95 - n as f32 * 0.005,
+                &format!("ROW{n:02} the install was painful for reason number {n}."),
+            );
+            storage.insert_chunk(&row, &vector).unwrap();
+            engine.insert_chunk(row.id.clone(), vector);
+        }
+        let search = Arc::new(RwLock::new(engine));
+        let scope =
+            SearchProjectScope::resolve_with(&storage, Some("all"), Some("echoproj"), None, None)
+                .unwrap();
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+        let rows_in = |text: &str| -> Vec<usize> {
+            let mut found: Vec<(usize, usize)> = (0..70)
+                .filter_map(|n| text.find(&format!("ROW{n:02}")).map(|pos| (pos, n)))
+                .collect();
+            found.sort();
+            found.into_iter().map(|(_, n)| n).collect()
+        };
+        let first = reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &q,
+            QUERY,
+            5,
+            0.0,
+            &scope,
+            0,
+            true,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut walked = rows_in(&first);
+        assert_eq!(walked.len(), 5, "{first}");
+        let (late, late_vec) = chunk("row-late", "convlate", 0.99, "LATE the best row of all.");
+        storage.insert_chunk(&late, &late_vec).unwrap();
+        search.write().await.insert_chunk(late.id.clone(), late_vec);
+        for offset in (5..30).step_by(5) {
+            let page = get_more_results_in_scope(
+                &storage,
+                &search,
+                &q,
+                QUERY,
+                offset,
+                5,
+                0.0,
+                &scope,
+                ConsumptionMode::Off,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(!page.contains("LATE"), "offset {offset}: {page}");
+            let seen = rows_in(&page);
+            assert_eq!(seen.len(), 5, "offset {offset}: {page}");
+            walked.extend(seen);
+        }
+        assert_eq!(walked, (0..30).collect::<Vec<_>>(), "once each, in order");
+    }
+
     /// The keyword lane lists a stored reflection that the vector window ranks
     /// far below the best chunk. Position fusion would put it first; the floor
     /// keeps it below the strong vector hit. It is still on the page.
@@ -12903,6 +13022,34 @@ mod echo_recall_tests {
         let order = recall(&rows, &reflections).await;
         assert!(
             position(&order, "strong-chunk") < position(&order, "weak-reflection"),
+            "{order:?}"
+        );
+    }
+
+    /// The best cosine in the window belongs to an earlier asking of the
+    /// question. The floor is taken from the best row that can answer, so a
+    /// real answer at half that cosine is not called weak.
+    #[tokio::test]
+    async fn the_floor_is_taken_from_answers_not_from_echoes_of_the_question() {
+        let echo = "why did we drop Docker and Qdrant for a single Rust binary?\n\nChecking past sessions for the actual reasoning.";
+        let rows = vec![
+            chunk("echo-chunk", "conv1", 0.97, echo),
+            chunk(
+                "other-chunk",
+                "conv2",
+                0.60,
+                "The embedded index was faster, so the server went away.",
+            ),
+            chunk(
+                "answer-chunk",
+                "conv3",
+                0.45,
+                "Docker and Qdrant were dropped because installing them was painful.",
+            ),
+        ];
+        let order = recall(&rows, &[]).await;
+        assert!(
+            position(&order, "answer-chunk") < position(&order, "other-chunk"),
             "{order:?}"
         );
     }

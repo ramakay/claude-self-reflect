@@ -79,10 +79,16 @@ pub fn fuse_rrf(semantic_order: &[String], fts_order: &[String], k: usize) -> Ve
 }
 
 /// A row the keyword lane lists is "weakly similar" when its cosine is below
-/// this share of the best cosine in the query's vector window. Chosen from the
-/// ten live known-answer questions: the lowest an answer sits is 0.65 of the
-/// best cosine, the filler that outranked answers sits at 0.45 to 0.52.
-pub const KEYWORD_ROW_COSINE_FLOOR: f32 = 0.60;
+/// this share of the best cosine among the rows that can answer. Measured on
+/// the ten live known-answer questions with a 60-row vector window: the lowest
+/// an answer sits is 0.54 of that best (Q3's `9eabddaf`, 0.527 of 0.971), then
+/// 0.65, 0.67 and 0.73; the filler this catches is the `qdrant_v3_*` pair at
+/// 0.45 and 0.475. 0.60 was tried first and sank Q3's answer out of the top 30,
+/// so the margin to the lowest answer is 0.04 and the ratio does not separate
+/// filler from answers with any room. It does not catch `fcc7eb6e` (0.52) or a
+/// legacy uuid-id memory such as `2c9e0d3b` (0.70): that row is lifted by the
+/// explicit-memory standing in the rerank, not by the keyword lane.
+pub const KEYWORD_ROW_COSINE_FLOOR: f32 = 0.50;
 
 /// Move the weakly similar keyword rows of a fused order below every strongly
 /// similar vector hit, keeping the order inside each group.
