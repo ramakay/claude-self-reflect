@@ -491,3 +491,34 @@ fn a_pane_that_goes_from_plan_to_api_mode_is_quiet_again() {
         );
     }
 }
+
+/// Codex goes away after it was scanned: the files' fingerprint is zero, and the frame must hold
+/// zero too, or the gate rebuilds a frame at every check.
+#[test]
+fn removing_codex_after_its_first_scan_leaves_the_pane_quiet() {
+    let (_home, paths) = rich_home();
+    let folder = paths.home.join(".codex/sessions/2026/10/18");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(
+        folder.join("rollout-a.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"event_msg","timestamp":NOW - 5.,"payload":{
+                "type":"token_count","info":{"total_token_usage":{"total_tokens":9}},
+                "rate_limits":{"limit_id":"codex","secondary":{
+                    "window_minutes":10080,"used_percent":10,"resets_at":NOW + 86400.}}}})
+        ),
+    )
+    .unwrap();
+    let mut pane = pane_in(&paths);
+    pane.frame(76, 67, NOW);
+    fs::rename(paths.home.join(".codex"), paths.home.join(".codex-gone")).unwrap();
+    assert!(pane.due(NOW + 3.), "the folder going is news");
+    pane.frame(76, 67, NOW + 3.);
+    for at in [4., 5., 6., 8., 12.] {
+        assert!(
+            !pane.due(NOW + at),
+            "a pane with no Codex drew again at +{at}"
+        );
+    }
+}

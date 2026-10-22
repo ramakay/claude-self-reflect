@@ -368,6 +368,11 @@ impl Pane {
     /// Draw the page. Everything the frame reads is read now; what it read, and what it left
     /// running, is kept for `due`.
     pub fn frame(&mut self, cols: usize, rows: usize, now: f64) -> Vec<String> {
+        // Codex removed since the last scan: its scan state goes too, or the gate would find the
+        // files (none) different from the scan's (the old ones) at every check.
+        if !self.codex.present() {
+            self.codex.forget();
+        }
         // Looked at first, so a change made while the frame reads is seen by the next check.
         let (mut snapshot, mut version) = self.look(now);
         let found = self.session.as_ref().and_then(|s| s.path.clone());

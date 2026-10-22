@@ -232,6 +232,13 @@ impl CodexRolloutIndex {
     pub fn scanned(&self) -> u64 {
         self.scanned
     }
+    /// Codex is gone (its folder removed or renamed): what the scans read is forgotten, so the
+    /// fingerprint of no files, zero, is again what the last scan saw.
+    pub fn forget(&mut self) {
+        self.runs.clear();
+        self.checked = None;
+        self.scanned = 0;
+    }
     /// Files recorded but not yet read to their end: the next scan has work whatever the files do.
     pub fn behind(&self) -> bool {
         self.runs.values().any(|r| r.behind)
