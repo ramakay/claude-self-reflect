@@ -1939,6 +1939,17 @@ fn plist_program_span(text: &str) -> Option<std::ops::Range<usize>> {
     Some(open..close)
 }
 
+/// Does the loaded job run what the agent file asks for? Same arguments, and
+/// every environment entry of the file present with the same value (launchd
+/// adds a few of its own, so the loaded side may hold more).
+fn loaded_job_matches(wanted: &AgentFacts, loaded: &LoadedJob) -> bool {
+    wanted.program_args == loaded.arguments
+        && wanted
+            .env
+            .iter()
+            .all(|(key, value)| loaded.env.get(key) == Some(value))
+}
+
 /// Keys launchd adds to a loaded job's environment. They are not the agent's
 /// own configuration and must never be written back into a plist.
 const LAUNCHD_INJECTED_ENV: [&str; 2] = ["XPC_SERVICE_NAME", "OSLogRateLimit"];
@@ -2168,7 +2179,7 @@ fn install_daemon_agent(
     let outcome = apply_daemon_agent(
         &spec,
         existing,
-        loaded_text.is_some(),
+        loaded_text.as_ref().map(|_| loaded_job),
         uid,
         launchctl,
         pause,
@@ -2180,7 +2191,7 @@ fn install_daemon_agent(
 fn apply_daemon_agent(
     spec: &DaemonAgentSpec,
     existing: Option<String>,
-    loaded: bool,
+    loaded_job: Option<LoadedJob>,
     uid: u32,
     launchctl: &mut LaunchctlRun,
     pause: &dyn Fn(Duration),
@@ -2213,11 +2224,35 @@ fn apply_daemon_agent(
         _ => (false, render_daemon_plist(spec)),
     };
     let rewrite = existing.as_deref() != Some(wanted.as_str());
+    let loaded = loaded_job.is_some();
+    // The file can say one thing while launchd runs another (an earlier run
+    // wrote it and could not unload the old job). What counts is the job.
+    let current = loaded_job.as_ref().is_some_and(|job| {
+        parse_plist(&wanted).is_some_and(|p| loaded_job_matches(&agent_facts(&p), job))
+    });
 
     let domain = format!("gui/{uid}");
     let target = format!("{domain}/{DAEMON_LABEL}");
     let plist_arg = plist.to_string_lossy().into_owned();
 
+    if loaded && (rewrite || !current) {
+        // kickstart does not re-read the file: unload, and check it happened
+        // before anything is written, so the file never gets ahead of the job.
+        let _ = launchctl(&["bootout", &target]);
+        let mut unloaded = false;
+        for attempt in 0..10 {
+            pause(Duration::from_millis(if attempt == 0 { 500 } else { 300 }));
+            if launchctl(&["print", &target]).is_err() {
+                unloaded = true;
+                break;
+            }
+        }
+        if !unloaded {
+            return DaemonOutcome::Failed(format!(
+                "launchd still loaded {DAEMON_LABEL} after bootout, so the new settings were not applied. Run: launchctl bootout {target}"
+            ));
+        }
+    }
     if rewrite {
         if let Err(e) = std::fs::create_dir_all(spec.data_dir().join("logs")) {
             return DaemonOutcome::Failed(format!("could not create the log folder: {e}"));
@@ -2232,11 +2267,7 @@ fn apply_daemon_agent(
             let _ = std::fs::remove_file(&tmp);
             return DaemonOutcome::Failed(format!("could not write {}: {e}", plist.display()));
         }
-        if loaded {
-            let _ = launchctl(&["bootout", &target]);
-            pause(Duration::from_millis(500));
-        }
-    } else if loaded {
+    } else if loaded && current {
         // Unchanged and loaded: restart onto the current build.
         return match launchctl(&["kickstart", "-k", &target]) {
             Ok(_) if foreign => DaemonOutcome::KeptExisting,
@@ -3662,6 +3693,8 @@ esac
         /// What `print` answers while the job is loaded.
         print_text: String,
         bootstrap_fails: usize,
+        /// `bootout` exits 0 but the job stays loaded.
+        bootout_unloads: bool,
         calls: Vec<String>,
     }
 
@@ -3671,6 +3704,7 @@ esac
                 loaded,
                 print_text: String::new(),
                 bootstrap_fails: 0,
+                bootout_unloads: true,
                 calls: Vec::new(),
             }
         }
@@ -3688,12 +3722,29 @@ esac
                     Ok(String::new())
                 }
                 "bootout" => {
-                    self.loaded = false;
+                    self.loaded = !self.bootout_unloads;
                     Ok(String::new())
                 }
                 _ => Ok(String::new()),
             }
         }
+    }
+
+    /// What `launchctl print` would say for a job loaded from `spec`'s own plist.
+    fn print_for(spec: &DaemonAgentSpec, pid: u32) -> String {
+        let facts = agent_facts(&parse_plist(&render_daemon_plist(spec)).unwrap());
+        let mut text = String::from("gui/501/x = {\n\tstate = running\n\n\targuments = {\n");
+        for arg in &facts.program_args {
+            text.push_str(&format!("\t\t{arg}\n"));
+        }
+        text.push_str("\t}\n\n\tenvironment = {\n\t\tOSLogRateLimit => 64\n");
+        for (key, value) in &facts.env {
+            text.push_str(&format!("\t\t{key} => {value}\n"));
+        }
+        text.push_str(&format!(
+            "\t\tXPC_SERVICE_NAME => {DAEMON_LABEL}\n\t}}\n\n\tpid = {pid}\n}}\n"
+        ));
+        text
     }
 
     fn install_run(spec: &DaemonAgentSpec, fake: &mut FakeLaunchctl) -> DaemonRun {
@@ -3800,6 +3851,7 @@ esac
         std::thread::sleep(Duration::from_millis(30));
 
         let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&spec, 100);
         assert_eq!(
             install(&spec, &mut fake),
             DaemonOutcome::Running { rewritten: false }
@@ -3838,6 +3890,8 @@ esac
             vec![
                 "print gui/501/com.ramakay.csr-engine.daemon",
                 "bootout gui/501/com.ramakay.csr-engine.daemon",
+                // the unload is checked, not assumed
+                "print gui/501/com.ramakay.csr-engine.daemon",
                 "bootstrap gui/501"
             ]
         );
@@ -4192,10 +4246,78 @@ esac
         let before = std::fs::read(spec.plist_path()).unwrap();
         let mut fake = FakeLaunchctl::new(true);
         spec.env = Default::default();
+        let mut as_loaded = spec.clone();
+        as_loaded.env = env_of(&[("CSR_NO_DREAMING", "1"), ("CSR_DREAM_THREADS", "2")]);
+        fake.print_text = print_for(&as_loaded, 100);
         assert_eq!(
             install(&spec, &mut fake),
             DaemonOutcome::Running { rewritten: false }
         );
         assert_eq!(std::fs::read(spec.plist_path()).unwrap(), before);
+    }
+
+    // ----- reconciling the loaded job -----
+
+    #[test]
+    fn a_stale_loaded_job_is_reloaded_even_when_the_file_already_matches() {
+        // The previous run wrote the file but the old job stayed loaded. The
+        // file now looks right, so only the loaded arguments can show it.
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let mut stale = spec.clone();
+        stale.engine = "/opt/csr/old/csr-engine".into();
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&stale, 100);
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: false }
+        );
+        assert!(
+            fake.calls.iter().any(|c| c.starts_with("bootout")),
+            "{:?}",
+            fake.calls
+        );
+        assert!(!fake.calls.iter().any(|c| c.starts_with("kickstart")));
+        assert!(fake.calls.last().unwrap().starts_with("bootstrap"));
+
+        // The environment is compared too: a switch the job was loaded without.
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1")]);
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let mut without = spec.clone();
+        without.env = Default::default();
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&without, 100);
+        install(&spec, &mut fake);
+        assert!(
+            fake.calls.iter().any(|c| c.starts_with("bootout")),
+            "{:?}",
+            fake.calls
+        );
+    }
+
+    #[test]
+    fn a_job_that_will_not_unload_stops_the_install_and_leaves_the_file_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let before = std::fs::read_to_string(spec.plist_path()).unwrap();
+        let loaded_as = spec.clone();
+        spec.engine = "/opt/csr/new/csr-engine".into();
+
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&loaded_as, 100);
+        fake.bootout_unloads = false;
+        let outcome = install(&spec, &mut fake);
+        assert!(
+            matches!(&outcome, DaemonOutcome::Failed(why) if why.contains("still loaded")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(spec.plist_path()).unwrap(),
+            before,
+            "the file must keep describing the job that is loaded"
+        );
+        assert!(!fake.calls.iter().any(|c| c.starts_with("bootstrap")));
     }
 }
