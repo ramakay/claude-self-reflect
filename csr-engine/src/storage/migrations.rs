@@ -984,28 +984,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     // they stand would declare settled whatever an older drain left uncovered
     // (a repo scan that bumped a generation and queued no file), and nothing
     // would revisit it until another write.
-    let settled_exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'code_graph_project_settled')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !settled_exists {
-        conn.execute_batch(
-            "CREATE TABLE code_graph_project_settled (
-                 project    TEXT PRIMARY KEY,
-                 own        INTEGER NOT NULL DEFAULT 0,
-                 star       INTEGER NOT NULL DEFAULT 0,
-                 settled_at INTEGER NOT NULL DEFAULT 0
-             );
-             INSERT INTO code_graph_project_gen (project, gen)
-                 SELECT project, 1 FROM (
-                     SELECT DISTINCT project FROM code_nodes
-                     UNION SELECT DISTINCT project FROM repo_defs
-                     UNION SELECT DISTINCT project FROM code_graph_file_state
-                 ) WHERE project IS NOT NULL AND project != ''
-                 ON CONFLICT(project) DO UPDATE SET gen = gen + 1;",
-        )?;
-    }
+    create_settled_table(conn)?;
 
     // Migration: the edits a PostToolUse hook snapshots for the drain. The hook
     // does not extract: it records what it saw (the file's content, the
@@ -2449,6 +2428,47 @@ pub fn run(conn: &Connection) -> Result<()> {
 
     finish_chunks_fts_compaction(conn)?;
 
+    Ok(())
+}
+
+/// Create `code_graph_project_settled` and bump the counter of every project
+/// with graph content, so each is resolved once (see the migration above). The
+/// table's existence is what says the bump was done, so the two are ONE
+/// transaction: a process that dies between them would otherwise reopen to a
+/// table with no bump, and a project with only `repo_defs` would never be
+/// resolved. Up to date, it is a read and takes no write lock.
+fn create_settled_table(conn: &Connection) -> Result<()> {
+    let exists = |conn: &Connection| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'code_graph_project_settled')",
+            [],
+            |r| r.get(0),
+        )?)
+    };
+    if exists(conn)? {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Another process may have done it while this one waited for the lock.
+    if exists(&tx)? {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "CREATE TABLE code_graph_project_settled (
+             project    TEXT PRIMARY KEY,
+             own        INTEGER NOT NULL DEFAULT 0,
+             star       INTEGER NOT NULL DEFAULT 0,
+             settled_at INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT INTO code_graph_project_gen (project, gen)
+             SELECT project, 1 FROM (
+                 SELECT DISTINCT project FROM code_nodes
+                 UNION SELECT DISTINCT project FROM repo_defs
+                 UNION SELECT DISTINCT project FROM code_graph_file_state
+             ) WHERE project IS NOT NULL AND project != ''
+             ON CONFLICT(project) DO UPDATE SET gen = gen + 1;",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -5172,5 +5192,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pending, 0, "settled");
+    }
+
+    /// The settled table and the bump that gives every project its one pass are
+    /// atomic: when the bump cannot run, the table is not left behind (a reopen
+    /// would see it, skip the bump, and a repo-only project would never be
+    /// resolved). Proves the two statements commit or roll back together; it
+    /// does not kill a process, it makes the second statement fail.
+    #[test]
+    fn the_settled_table_is_never_left_without_its_bump() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO repo_defs (project, file, name, kind) VALUES ('scan-only', 'x.rs', 'f', 'function');
+             DROP TABLE code_graph_project_settled;
+             DELETE FROM code_graph_project_gen;
+             ALTER TABLE repo_defs RENAME TO repo_defs_away;",
+        )
+        .unwrap();
+        let table_exists = |c: &Connection| -> bool {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'code_graph_project_settled')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // The bump reads `repo_defs`, which is gone: the step fails ...
+        assert!(create_settled_table(&conn).is_err());
+        // ... and leaves nothing behind.
+        assert!(!table_exists(&conn), "table committed without its bump");
+
+        // The next open can do it whole.
+        conn.execute_batch("ALTER TABLE repo_defs_away RENAME TO repo_defs;")
+            .unwrap();
+        create_settled_table(&conn).unwrap();
+        assert!(table_exists(&conn));
+        let gen: i64 = conn
+            .query_row(
+                "SELECT gen FROM code_graph_project_gen WHERE project = 'scan-only'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(gen >= 1);
+        // And a later call changes nothing.
+        create_settled_table(&conn).unwrap();
+        let again: i64 = conn
+            .query_row(
+                "SELECT gen FROM code_graph_project_gen WHERE project = 'scan-only'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gen, again);
     }
 }
