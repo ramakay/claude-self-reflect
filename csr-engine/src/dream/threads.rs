@@ -1475,12 +1475,11 @@ mod tests {
     /// Serializes tests that touch process-global env vars this module
     /// reads (`CSR_DREAM_THREADS`, `CSR_DREAM_THREAD_MODEL`,
     /// `CSR_NIGHT_ACTOR_CMD`, `CSR_NO_AI_NARRATIVES`, `CSR_NO_DREAMING`,
-    /// `CSR_DREAM_THREADS_CAP`) — same idiom as
-    /// `daemon::dream_cadence::env_test_guard`.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    /// `CSR_DREAM_THREADS_CAP`). It must be the crate-wide guard: `clear_env`
+    /// removes `CSR_NO_DREAMING`, which the backfill `disabled_*` tests set and
+    /// read under `dream_cadence::env_test_guard`, and a module-local lock does
+    /// not exclude them.
+    use crate::daemon::dream_cadence::env_test_guard as env_guard;
 
     fn clear_env() {
         std::env::remove_var("CSR_DREAM_THREADS");

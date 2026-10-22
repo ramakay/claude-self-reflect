@@ -2833,6 +2833,8 @@ mod tests {
         // to spend — and a queued remainder rather than a silent skip.
         // (Nothing is invoked here: the exhausted check precedes the actor,
         // and the actor is wrapped by the budget besides.)
+        // CSR_DREAM_THREADS is read by the dream::threads tests under this same guard.
+        let _env = crate::daemon::dream_cadence::env_test_guard();
         let storage = Storage::open_memory().expect("storage");
         let previous = std::env::var("CSR_DREAM_THREADS").ok();
         std::env::set_var("CSR_DREAM_THREADS", "1");
@@ -2855,6 +2857,8 @@ mod tests {
     fn the_plan_pass_is_off_unless_explicitly_opted_in() {
         // `run_plan_pass` is a new LLM spend surface layered on the
         // deterministic dream pass, so it inherits the same default-OFF gate.
+        // CSR_DREAM_THREADS is read by the dream::threads tests under this same guard.
+        let _env = crate::daemon::dream_cadence::env_test_guard();
         let storage = Storage::open_memory().expect("storage");
         let previous = std::env::var("CSR_DREAM_THREADS").ok();
         std::env::remove_var("CSR_DREAM_THREADS");
