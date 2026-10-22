@@ -404,13 +404,22 @@ fn terminal_session(reload: bool) {
             }
         }
     };
+    let frames = |log: &std::path::Path| fs::read_to_string(log).map_or(0, |t| t.lines().count());
+    // The log records a frame when it is written out, not when it begins: wait for the first one
+    // (a loaded machine takes a while) before judging anything quiet.
+    let began = Instant::now();
+    while frames(&frame_log) == 0 {
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "the pane never finished its first frame"
+        );
+        drain(&mut master, &mut output, Duration::from_millis(50));
+    }
     quiet(&mut master, &mut output);
     while seconds() >= 52 {
         drain(&mut master, &mut output, Duration::from_millis(500));
     }
-    let frames = |log: &std::path::Path| fs::read_to_string(log).map_or(0, |t| t.lines().count());
     let settled = frames(&frame_log);
-    assert!(settled >= 1, "the pane drew its first frame");
     // Fifty wakes of each kind in half a second, written to the live pane: they draw it once at
     // the leading edge and once more for the rest, a second later; never fifty times.
     for _ in 0..50 {
@@ -426,7 +435,25 @@ fn terminal_session(reload: bool) {
         ));
         drain(&mut master, &mut output, Duration::from_millis(10));
     }
-    quiet(&mut master, &mut output);
+    // The first wake's frame, then the frames' count unchanged for longer than the spacing and a
+    // slow build together.
+    let began = Instant::now();
+    while frames(&frame_log) == settled {
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "100 wakes drew no frame"
+        );
+        drain(&mut master, &mut output, Duration::from_millis(50));
+    }
+    let mut count = frames(&frame_log);
+    let mut changed = Instant::now();
+    while changed.elapsed() < Duration::from_millis(3000) {
+        drain(&mut master, &mut output, Duration::from_millis(50));
+        if frames(&frame_log) != count {
+            count = frames(&frame_log);
+            changed = Instant::now();
+        }
+    }
     let drawn = frames(&frame_log) - settled;
     assert!(
         (1..=2).contains(&drawn),
@@ -2406,33 +2433,6 @@ fn a_pane_outside_herdrs_default_focus_still_draws_when_woken() {
     );
 }
 
-/// herdr's events, opt-in: with a fake herdr on a socket, the watching pane subscribes, and when
-/// herdr says the agent pane closed the pane ends by itself, cleanly, and removes its pid file.
-#[cfg(unix)]
-#[test]
-fn the_pane_ends_when_herdr_says_the_agent_pane_closed() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
-    };
-    use std::time::{Duration, Instant};
-    let (_home, paths) = home();
-    let socket = paths.home.join("herdr.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let (subscribed, closed) = mpsc::channel::<()>();
-    let (close, closing) = mpsc::channel::<()>();
-    let seen = Arc::new(AtomicBool::new(false));
-    let served = seen.clone();
-    std::thread::spawn(move || {
-        for conn in listener.incoming().flatten() {
-            let mut request = String::new();
-            BufReader::new(conn.try_clone().unwrap())
-                .read_line(&mut request)
-                .unwrap();
-            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
-            let mut conn = conn;
 /// Two panes of one session (a second terminal opened on it) each keep a wake pipe of their own:
 /// a wake reaches both, and when one ends the other still hears every wake.
 #[cfg(unix)]
@@ -2521,6 +2521,33 @@ fn two_panes_of_one_session_both_draw_when_woken_and_one_ending_leaves_the_other
     );
 }
 
+/// herdr's events, opt-in: with a fake herdr on a socket, the watching pane subscribes, and when
+/// herdr says the agent pane closed the pane ends by itself, cleanly, and removes its pid file.
+#[cfg(unix)]
+#[test]
+fn the_pane_ends_when_herdr_says_the_agent_pane_closed() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
+    use std::time::{Duration, Instant};
+    let (_home, paths) = home();
+    let socket = paths.home.join("herdr.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (subscribed, closed) = mpsc::channel::<()>();
+    let (close, closing) = mpsc::channel::<()>();
+    let seen = Arc::new(AtomicBool::new(false));
+    let served = seen.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let mut request = String::new();
+            BufReader::new(conn.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let mut conn = conn;
             if request["method"] == "events.subscribe" {
                 let listed: Vec<_> = request["params"]["subscriptions"]
                     .as_array()
