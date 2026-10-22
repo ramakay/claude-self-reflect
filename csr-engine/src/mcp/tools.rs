@@ -807,10 +807,7 @@ pub(crate) enum RecallRerankMode<'a> {
     Candidate(&'a crate::search::trained_rerank::LinearModel),
 }
 
-use crate::search::hybrid::{
-    demote_weakly_similar_keyword_rows, fuse_rrf, keyword_chunk_hits, KEYWORD_ROW_COSINE_FLOOR,
-    RRF_K,
-};
+use crate::search::hybrid::{fuse_rrf, keyword_chunk_hits, RRF_K};
 pub use crate::search::hybrid::{search_mode_from, SearchMode};
 
 /// An out-of-family reflection keeps its fused rank under an explicit project
@@ -2279,37 +2276,7 @@ async fn reflect_gather_pass(
     // while active forgetting may reorder only the demoted section by
     // accelerated decay in hybrid, vector, and FTS modes alike.
     let final_order = match search_mode {
-        SearchMode::Hybrid => {
-            let fused = fuse_rrf(&semantic_order, &fts_order, RRF_K);
-            // Position fusion counts a keyword rank the same whatever the row's
-            // similarity is, so a weakly similar row the keyword lane also
-            // lists can outrank a strongly similar row it does not. Such rows
-            // go below the strong vector hits; none is dropped.
-            // Only rows that can answer set the best cosine: an earlier asking
-            // of the question sits at 0.9 and above, and a floor taken from it
-            // would call every real answer weak.
-            let text_of: HashMap<&str, &str> = enriched
-                .iter()
-                .map(|e| (e.chunk.id.as_str(), e.chunk.content.as_str()))
-                .collect();
-            let raw_cosine: HashMap<&str, f32> = chunk_results
-                .iter()
-                .chain(reflection_results.iter())
-                .filter(|r| {
-                    text_of
-                        .get(r.id.as_str())
-                        .is_none_or(|text| non_answer_class(text) == 0)
-                })
-                .map(|r| (r.id.as_str(), r.score))
-                .collect();
-            demote_weakly_similar_keyword_rows(
-                fused,
-                &fts_order,
-                &raw_cosine,
-                |id| reflection_tags.contains_key(id),
-                KEYWORD_ROW_COSINE_FLOOR,
-            )
-        }
+        SearchMode::Hybrid => fuse_rrf(&semantic_order, &fts_order, RRF_K),
         SearchMode::Vector => order,
         SearchMode::Fts => fts_order,
     };
@@ -13002,62 +12969,10 @@ mod echo_recall_tests {
         assert_eq!(walked, (0..30).collect::<Vec<_>>(), "once each, in order");
     }
 
-    /// The keyword lane lists a stored reflection that the vector window ranks
-    /// far below the best chunk. Position fusion would put it first; the floor
-    /// keeps it below the strong vector hit. It is still on the page.
+    /// A memory whose text opens with the query is promoted ahead of fusion,
+    /// whatever its similarity.
     #[tokio::test]
-    async fn a_weakly_similar_keyword_reflection_stays_below_a_strong_vector_hit() {
-        let rows = vec![chunk(
-            "strong-chunk",
-            "conv1",
-            0.90,
-            "The embedded index was faster, so the server went away.",
-        )];
-        let reflections = vec![(
-            "weak-reflection",
-            &["narrative_extracted_v3", "project_echoproj"][..],
-            "Docker and Qdrant were dropped because installation was painful.".to_string(),
-            0.30,
-        )];
-        let order = recall(&rows, &reflections).await;
-        assert!(
-            position(&order, "strong-chunk") < position(&order, "weak-reflection"),
-            "{order:?}"
-        );
-    }
-
-    /// The best cosine in the window belongs to an earlier asking of the
-    /// question. The floor is taken from the best row that can answer, so a
-    /// real answer at half that cosine is not called weak.
-    #[tokio::test]
-    async fn the_floor_is_taken_from_answers_not_from_echoes_of_the_question() {
-        let echo = "why did we drop Docker and Qdrant for a single Rust binary?\n\nChecking past sessions for the actual reasoning.";
-        let rows = vec![
-            chunk("echo-chunk", "conv1", 0.97, echo),
-            chunk(
-                "other-chunk",
-                "conv2",
-                0.60,
-                "The embedded index was faster, so the server went away.",
-            ),
-            chunk(
-                "answer-chunk",
-                "conv3",
-                0.45,
-                "Docker and Qdrant were dropped because installing them was painful.",
-            ),
-        ];
-        let order = recall(&rows, &[]).await;
-        assert!(
-            position(&order, "answer-chunk") < position(&order, "other-chunk"),
-            "{order:?}"
-        );
-    }
-
-    /// The floor does not touch a memory whose text opens with the query: that
-    /// exact opener is promoted ahead of fusion, whatever its similarity.
-    #[tokio::test]
-    async fn an_exact_opener_memory_is_still_first_below_the_floor() {
+    async fn an_exact_opener_memory_is_first_whatever_its_similarity() {
         let rows = vec![chunk(
             "strong-chunk",
             "conv1",
