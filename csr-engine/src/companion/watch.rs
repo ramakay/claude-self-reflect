@@ -41,6 +41,8 @@ thread_local! {
     };
 }
 static ENDING: AtomicBool = AtomicBool::new(false);
+/// Counts the loop's turns, for the watchdog to see that it is going round.
+static TICKS: AtomicUsize = AtomicUsize::new(0);
 extern "C" fn ending(_: libc::c_int) {
     ENDING.store(true, Ordering::Relaxed);
 }
@@ -53,7 +55,8 @@ extern "C" fn ending(_: libc::c_int) {
 /// never gone.
 fn tty_gone() -> bool {
     unsafe {
-        libc::isatty(libc::STDIN_FILENO) == 1 && wait_for_input(Duration::ZERO) == Input::Gone
+        libc::isatty(libc::STDIN_FILENO) == 1
+            && wait_on(libc::STDIN_FILENO, Duration::ZERO) == Input::Gone
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,10 +65,10 @@ enum Input {
     Ready,
     Gone,
 }
-/// Wait up to `wait` for the terminal on stdin to have bytes for us, or to hang up.
-fn wait_for_input(wait: Duration) -> Input {
+/// Wait up to `wait` for the terminal `fd` to have bytes for us, or to hang up.
+fn wait_on(fd: libc::c_int, wait: Duration) -> Input {
     let mut tty = libc::pollfd {
-        fd: libc::STDIN_FILENO,
+        fd,
         events: libc::POLLIN,
         revents: 0,
     };
@@ -74,7 +77,12 @@ fn wait_for_input(wait: Duration) -> Input {
     if unsafe { libc::poll(&mut tty, 1, millis) } <= 0 {
         return Input::Quiet;
     }
-    if tty.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+    if tty.revents & libc::POLLNVAL != 0 {
+        // The descriptor cannot be polled (macOS says so of some live terminals): it is no
+        // evidence of anything, and poll would answer again at once. Sleep the wait out.
+        thread::sleep(wait);
+        Input::Quiet
+    } else if tty.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
         Input::Gone
     } else if tty.revents & libc::POLLIN != 0 {
         Input::Ready
@@ -89,6 +97,7 @@ const LOOK: Duration = Duration::from_millis(100);
 fn next_input(wait: Duration) -> io::Result<Input> {
     let start = Instant::now();
     loop {
+        TICKS.fetch_add(1, Ordering::Relaxed);
         if tty_gone() {
             return Ok(Input::Gone);
         }
@@ -100,7 +109,7 @@ fn next_input(wait: Duration) -> io::Result<Input> {
         if left.is_zero() || ENDING.load(Ordering::Relaxed) {
             return Ok(Input::Quiet);
         }
-        match wait_for_input(left.min(LOOK)) {
+        match wait_on(libc::STDIN_FILENO, left.min(LOOK)) {
             Input::Gone => return Ok(Input::Gone),
             Input::Ready if event::poll(Duration::ZERO)? => return Ok(Input::Ready),
             _ => (),
@@ -133,13 +142,19 @@ impl TerminalGuard {
         }
         let _ = terminal::disable_raw_mode();
         let mut out = io::stdout();
-        let _ = execute!(out, DisableMouseCapture);
+        let _ = out.write_all(&Self::giveback());
+        let _ = out.flush();
+    }
+    /// What the terminal is sent to be as it was found.
+    fn giveback() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let _ = execute!(bytes, DisableMouseCapture);
         let _ = writeln!(
-            out,
+            bytes,
             "{}\x1b]111\x1b\\\x1b[?25h\x1b]0;\x07",
             kitty::DELETE_ALL
         );
-        let _ = out.flush();
+        bytes
     }
 }
 impl Drop for TerminalGuard {
@@ -263,10 +278,86 @@ impl PidFile {
 impl Drop for PidFile {
     fn drop(&mut self) {
         if let Some(p) = &self.path {
-            if paths::read_json(p)["pid"] == std::process::id() {
-                let _ = fs::remove_file(p);
-            }
+            remove_pid_file(p);
         }
+    }
+}
+/// Remove the pid file at `path`, if it is this process's.
+fn remove_pid_file(path: &Path) {
+    if paths::read_json(path)["pid"] == std::process::id() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// How long the loop may go without turning, with the terminal gone or an end asked for, before
+/// the watchdog ends the pane.
+const STUCK: Duration = Duration::from_secs(2);
+/// The last resort of a pane whose loop cannot end it: something inside the loop never returns
+/// (crossterm's reader, on a terminal that hung up after the loop looked, spins on end of file
+/// and never comes back). A thread of its own sees that the loop has not turned for `STUCK`
+/// while the terminal is gone or an end was asked for, leaves what a clean exit leaves (no
+/// pipe, lock or pid file; the terminal given back if it is there) and exits. A pane that is
+/// only busy, with a live terminal and no end asked for, is never touched.
+struct Watchdog {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+impl Watchdog {
+    fn start(wake: Option<wake::Cleaner>, pid_file: Option<PathBuf>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let ended = stop.clone();
+        let thread = thread::spawn(move || {
+            let mut turns = TICKS.load(Ordering::Relaxed);
+            let mut still = Instant::now();
+            while !ended.load(Ordering::Relaxed) {
+                thread::park_timeout(Duration::from_millis(250));
+                let now = TICKS.load(Ordering::Relaxed);
+                if now != turns {
+                    (turns, still) = (now, Instant::now());
+                    continue;
+                }
+                let asked = ENDING.load(Ordering::Relaxed);
+                if still.elapsed() < STUCK || ended.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let gone = tty_gone();
+                if !asked && !gone {
+                    continue;
+                }
+                if let Some(wake) = &wake {
+                    wake.remove();
+                }
+                if let Some(path) = &pid_file {
+                    remove_pid_file(path);
+                }
+                if !gone {
+                    // The loop may hold the terminal's lock: no waiting on it for long.
+                    unsafe { libc::alarm(1) };
+                    let _ = terminal::disable_raw_mode();
+                    let bytes = TerminalGuard::giveback();
+                    unsafe {
+                        libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len());
+                    }
+                }
+                unsafe { libc::_exit(if asked { 0 } else { 1 }) };
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
+    }
+}
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 pub fn log_error(paths: &Paths, text: &str) {
@@ -518,6 +609,10 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
         Duration::from_secs(120),
     );
     let terminal = TerminalGuard::enter()?;
+    let mut watchdog = Watchdog::start(
+        wake_pipe.as_ref().and_then(wake::Listener::cleaner),
+        mine.path.clone(),
+    );
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Some(location) = info.location() {
@@ -548,13 +643,22 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let frame_log = std::env::var_os("CSR_PANE_FRAME_LOG").map(PathBuf::from);
     // Opt-in (`CSR_PANE_HERDR_EVENTS=1`): herdr says when the tab is out of sight.
     let events = HerdrEvents::from_env(args.agent.clone());
+    // For tests of the watchdog: make the loop stick, at once (`busy`) or where it would end
+    // (`ending`: the terminal is gone or an end was asked for), as a hang inside a call would.
+    let stick = std::env::var("CSR_PANE_TEST_STICK").ok();
     let result = (|| -> anyhow::Result<()> {
         while !ENDING.load(Ordering::Relaxed) {
+            if stick.as_deref() == Some("busy") {
+                loop {
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
             // Before any draw: a write to a hung-up terminal is an error `print!` panics on.
             if terminal.raw && tty_gone() {
                 break;
             }
             beat.alive();
+            TICKS.fetch_add(1, Ordering::Relaxed);
             let now = paths::now();
             pressed |= recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
             if boundary.failures >= 3 {
@@ -760,8 +864,14 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                 }
             }
         }
+        if stick.is_some() {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
         Ok(())
     })();
+    watchdog.stop();
     beat.stop();
     std::panic::set_hook(hook);
     drop(terminal);
@@ -847,6 +957,17 @@ mod tests {
             1 << 20
         );
         assert_eq!(fs::read_to_string(log).unwrap(), "after token=[redacted]\n");
+    }
+    #[test]
+    fn test_a_descriptor_poll_cannot_watch_is_slept_on_not_spun_on() {
+        // A descriptor number no process has open: poll answers POLLNVAL at once.
+        let start = Instant::now();
+        assert_eq!(wait_on(900_000, Duration::from_millis(150)), Input::Quiet);
+        assert!(
+            start.elapsed() >= Duration::from_millis(140),
+            "returned after {:?}: a busy wait",
+            start.elapsed()
+        );
     }
     #[test]
     fn test_the_heartbeat_stops_when_the_loop_stalls_and_when_stopped() {

@@ -303,13 +303,41 @@ impl Listener {
 }
 impl Drop for Listener {
     fn drop(&mut self) {
-        if fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id) {
-            let _ = fs::remove_file(&self.path);
-        }
-        // Still holding the lock: no pane can have taken the name in between.
-        if still_there(&self.lock, &self.lock_path) {
-            let _ = fs::remove_file(&self.lock_path);
-        }
+        remove_own(&self.path, self.id, &self.lock, &self.lock_path);
+    }
+}
+/// Remove this pane's pipe, if it is still the one made, and its lock.
+fn remove_own(path: &Path, id: (u64, u64), lock: &fs::File, lock_path: &Path) {
+    if fs::symlink_metadata(path).is_ok_and(|m| (m.dev(), m.ino()) == id) {
+        let _ = fs::remove_file(path);
+    }
+    // Still holding the lock: no pane can have taken the name in between.
+    if still_there(lock, lock_path) {
+        let _ = fs::remove_file(lock_path);
+    }
+}
+/// What the pane's `Listener` removes when it is dropped, for a thread that must clean up for a
+/// pane whose own thread is stuck. It holds the lock (a duplicate of the descriptor) as long as
+/// it lives.
+pub struct Cleaner {
+    path: PathBuf,
+    id: (u64, u64),
+    lock_path: PathBuf,
+    lock: fs::File,
+}
+impl Cleaner {
+    pub fn remove(&self) {
+        remove_own(&self.path, self.id, &self.lock, &self.lock_path);
+    }
+}
+impl Listener {
+    pub fn cleaner(&self) -> Option<Cleaner> {
+        Some(Cleaner {
+            path: self.path.clone(),
+            id: self.id,
+            lock_path: self.lock_path.clone(),
+            lock: self.lock.try_clone().ok()?,
+        })
     }
 }
 

@@ -45,6 +45,11 @@ impl Pane {
     /// controlling terminal in a session of its own, as in a terminal emulator: its hangup then
     /// also sends SIGHUP.
     fn start(controlling: bool) -> Self {
+        Self::start_as(controlling, None)
+    }
+    /// With `stick`, the pane's loop is made to stick (`CSR_PANE_TEST_STICK`), to see what the
+    /// watchdog does when the loop itself cannot end the pane.
+    fn start_as(controlling: bool, stick: Option<&str>) -> Self {
         let spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let (mut master, mut slave) = (0, 0);
@@ -88,6 +93,9 @@ impl Pane {
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap());
+        if let Some(stick) = stick {
+            command.env("CSR_PANE_TEST_STICK", stick);
+        }
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("HERDR") {
                 command.env_remove(key);
@@ -257,6 +265,20 @@ fn sighup_ends_a_pane_on_a_live_terminal_and_gives_it_back() {
     assert!(pane.restored_the_terminal());
 }
 
+/// The panes found spinning under launchd had been asked to end and had not: the hangup first,
+/// the SIGTERM straight after it.
+#[test]
+fn sigterm_straight_after_the_hangup_ends_the_pane() {
+    let mut pane = Pane::start(false);
+    pane.close_terminal();
+    pane.terminate();
+    assert!(
+        pane.ends_within(Duration::from_secs(3)).is_some(),
+        "SIGTERM straight after the hangup did not end the pane"
+    );
+    pane.left_nothing_behind();
+}
+
 #[test]
 fn sigterm_ends_a_pane_whose_terminal_is_gone() {
     let mut pane = Pane::start(false);
@@ -288,4 +310,40 @@ fn a_pane_on_a_live_terminal_stays_up_at_low_cpu() {
         start.elapsed()
     );
     assert!(exists(&pane.wake()) && exists(&pane.pid_file()));
+}
+
+/// The loop cannot end the pane when something inside it never returns (crossterm's reader on a
+/// hangup that came after the loop looked). The watchdog ends it, and cleans up as a clean exit does.
+#[test]
+fn a_pane_stuck_after_its_terminal_hung_up_is_ended_by_the_watchdog() {
+    let mut pane = Pane::start_as(false, Some("ending"));
+    pane.close_terminal();
+    assert!(
+        pane.ends_within(Duration::from_secs(6)).is_some(),
+        "a stuck pane outlived its terminal"
+    );
+    pane.left_nothing_behind();
+}
+
+#[test]
+fn a_stuck_pane_is_ended_by_the_watchdog_on_sigterm_and_gives_the_terminal_back() {
+    let mut pane = Pane::start_as(false, Some("ending"));
+    pane.terminate();
+    assert!(
+        pane.ends_within(Duration::from_secs(6)).is_some(),
+        "SIGTERM did not end a stuck pane"
+    );
+    pane.left_nothing_behind();
+    thread::sleep(Duration::from_millis(100));
+    assert!(pane.restored_the_terminal());
+}
+
+/// A pane that is only busy, with a live terminal and no end asked for, is never ended.
+#[test]
+fn a_busy_pane_on_a_live_terminal_is_left_alone() {
+    let mut pane = Pane::start_as(false, Some("busy"));
+    assert!(
+        pane.ends_within(Duration::from_secs(8)).is_none(),
+        "the watchdog ended a pane that was only busy"
+    );
 }
