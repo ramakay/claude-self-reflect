@@ -3080,6 +3080,29 @@ pub async fn graph_drain_tick(storage: Arc<Storage>, db_path: PathBuf, role: Dra
     }
 }
 
+/// Extract the edit snapshots hooks left, without the project-wide resolve (see
+/// `graph_drain::extract_waiting_snapshots`). Same follower rule as
+/// [`graph_drain_tick`]. A second of polling costs one indexed query and a
+/// directory listing.
+pub async fn graph_snapshot_tick(storage: Arc<Storage>, db_path: PathBuf, role: DrainRole) {
+    let result = tokio::task::spawn_blocking(move || {
+        use crate::extraction::graph_drain as gd;
+        if role.follower && gd::another_drainer_is_live(&storage, &role.owner) {
+            return Ok(None);
+        }
+        gd::extract_waiting_snapshots(&storage, &db_path)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(n))) if n > 0 => {
+            tracing::info!(extracted = n, "code graph snapshots extracted")
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!("code graph snapshots: {e:#}"),
+        Err(e) => tracing::warn!("code graph snapshots panicked: {e}"),
+    }
+}
+
 /// Who is draining: the heartbeat owner, and whether to stand down for another
 /// capable drainer.
 #[derive(Debug, Clone)]
@@ -3132,6 +3155,10 @@ pub async fn graph_drain_loop(
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            // Hooks leave edits as snapshots; extracting them is cheap and is
+            // what makes an edit's nodes show in `csr_code_graph`, so it does
+            // not wait for the full pass's interval.
+            graph_snapshot_tick(storage.clone(), db_path.clone(), role.clone()).await;
         }
     }
 }

@@ -9,6 +9,7 @@ pub mod codegraph;
 pub mod errors;
 pub mod file_extract;
 pub mod graph_drain;
+pub mod graph_spool;
 pub mod heuristic;
 pub mod index_builder;
 pub mod manifest;

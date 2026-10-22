@@ -2311,10 +2311,16 @@ impl Storage {
         codegraph::store_extraction(&conn, x)
     }
 
-    /// Whether a hook left any file for the drain to extract.
-    pub fn has_queued_code_extractions(&self) -> Result<bool> {
+    /// Whether a hook left any edit snapshot for the drain to extract.
+    pub fn has_queued_code_snapshots(&self) -> Result<bool> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        codegraph::has_queued_extractions(&conn)
+        codegraph::has_queued_snapshots(&conn)
+    }
+
+    /// Whether a hook snapshotted `file` since `since_ns`. See `codegraph::live_since`.
+    pub fn code_file_live_since(&self, project: &str, file: &str, since_ns: i64) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::live_since(&conn, project, file, since_ns)
     }
 
     /// Files an extraction changed that no resolve has covered yet.

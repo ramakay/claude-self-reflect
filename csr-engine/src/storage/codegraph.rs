@@ -260,7 +260,10 @@ fn in_tx<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Resu
     if !conn.is_autocommit() {
         return f(conn);
     }
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE: several of these start with a read, and a deferred transaction
+    // that reads and then writes fails outright when another writer committed in
+    // between instead of waiting for the lock.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let out = f(&tx)?;
     tx.commit()?;
     Ok(out)
@@ -463,125 +466,224 @@ pub struct Extraction<'a> {
     /// Only a clean parse may retire nodes and replace edges; `None` for a
     /// partial parse, which must leave both alone.
     pub edges: Option<&'a [EdgeRow]>,
-    /// The extract-queue entry (`seq`) this extraction answers. `None` for a
-    /// fresh edit, which supersedes any queue entry for the file.
-    pub claim: Option<i64>,
+    /// The snapshot (`seq`) this extraction answers: consumed in the same
+    /// transaction, and the extraction is not stored at all when a newer
+    /// snapshot of the file has been consumed already.
+    pub claim: i64,
 }
 
-/// A file waiting to be extracted by the drain.
+/// The most snapshots one file may have waiting. A drain that is not running
+/// must not let a hammered file pile up 256 KB per edit; past this the newest
+/// pending snapshot is replaced (the intermediate edit loses its attribution).
+pub const MAX_SNAPSHOTS_PER_FILE: i64 = 64;
+
+/// `kind` of a snapshot of a file the extractor cannot parse: the drain records
+/// the file-level `ast_status = 'unsupported'` row, the hook writes no graph row.
+pub const SNAPSHOT_UNSUPPORTED: &str = "unsupported";
+/// `kind` of a snapshot to extract.
+pub const SNAPSHOT_EXTRACT: &str = "extract";
+
+/// An edit as a hook saw it, before the drain extracts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueuedExtraction {
+pub struct Snapshot {
+    /// Capture time in unix nanoseconds (the order the drain extracts in).
+    pub seq: i64,
     pub project: String,
+    /// Canonical stored path.
     pub file: String,
+    /// The path the tool saw; read from disk only for a legacy row without content.
     pub read_path: String,
+    pub kind: String,
+    pub content: Option<String>,
     pub conv_id: String,
     pub session_id: String,
-    pub seq: i64,
+    pub source_chunk_id: Option<String>,
+    /// The spool file this came from, if it came through the spool.
+    pub origin: Option<String>,
 }
 
-/// Queue `file` for extraction by the drain and bump its `graph_gen`, in one
-/// transaction: a hook that ran out of budget calls this instead of extracting.
-/// A later queue call replaces the entry (newer `seq`).
-pub fn queue_extraction(
-    conn: &Connection,
-    project: &str,
-    file: &str,
-    read_path: &str,
-    conv_id: &str,
-    session_id: &str,
-) -> Result<()> {
+/// Unix nanoseconds now: the clock `Snapshot::seq` is on.
+pub fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64)
+}
+
+/// Add `s` to the snapshot queue. It takes `s.seq`, or the next free number
+/// when another snapshot holds it, and returns the `seq` it got. Writes no
+/// graph row: this is the hook's only graph write.
+pub fn insert_snapshot(conn: &Connection, s: &Snapshot) -> Result<i64> {
     in_tx(conn, |tx| {
-        tx.execute(
-            "INSERT INTO code_graph_file_state
-                (project, file, dirty, extracted_at, ast_status, graph_gen)
-             VALUES (?1, ?2, 0, datetime('now'), 'supported', 1)
-             ON CONFLICT(project, file) DO UPDATE SET graph_gen = graph_gen + 1",
-            params![project, file],
-        )?;
-        let seq: i64 = tx.query_row(
-            "SELECT graph_gen FROM code_graph_file_state WHERE project = ?1 AND file = ?2",
-            params![project, file],
+        if let Some(origin) = &s.origin {
+            let known: Option<i64> = tx
+                .query_row(
+                    "SELECT seq FROM code_graph_snapshots WHERE origin = ?1",
+                    params![origin],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(seq) = known {
+                return Ok(seq);
+            }
+        }
+        let depth: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM code_graph_snapshots WHERE project = ?1 AND file = ?2",
+            params![s.project, s.file],
             |r| r.get(0),
         )?;
+        if depth >= MAX_SNAPSHOTS_PER_FILE {
+            tx.execute(
+                "DELETE FROM code_graph_snapshots WHERE seq =
+                     (SELECT MAX(seq) FROM code_graph_snapshots WHERE project = ?1 AND file = ?2)",
+                params![s.project, s.file],
+            )?;
+        }
+        let mut seq = s.seq;
+        while tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM code_graph_snapshots WHERE seq = ?1)",
+            params![seq],
+            |r| r.get::<_, bool>(0),
+        )? {
+            seq += 1;
+        }
         tx.execute(
-            "INSERT OR REPLACE INTO code_graph_extract_queue
-                (project, file, read_path, conv_id, session_id, seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![project, file, read_path, conv_id, session_id, seq],
+            "INSERT INTO code_graph_snapshots
+                (seq, project, file, read_path, kind, content, conv_id, session_id,
+                 source_chunk_id, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                seq,
+                s.project,
+                s.file,
+                s.read_path,
+                s.kind,
+                s.content,
+                s.conv_id,
+                s.session_id,
+                s.source_chunk_id,
+                s.origin
+            ],
         )?;
-        Ok(())
+        Ok(seq)
     })
 }
 
-/// Files queued for extraction, oldest first.
-pub fn queued_extractions(conn: &Connection) -> Result<Vec<QueuedExtraction>> {
+/// The transcript chunk a conversation's newest edit belongs to: its latest
+/// chunk. `None` before the transcript has been imported.
+pub fn latest_chunk_id(conn: &Connection, conv_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM chunks WHERE conversation_id = ?1
+             ORDER BY COALESCE(seq, -1) DESC, rowid DESC LIMIT 1",
+            params![conv_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Every queued snapshot, in the order to extract them.
+pub fn queued_snapshots(conn: &Connection) -> Result<Vec<Snapshot>> {
     let mut stmt = conn.prepare(
-        "SELECT project, file, read_path, conv_id, session_id, seq
-         FROM code_graph_extract_queue ORDER BY project, seq",
+        "SELECT seq, project, file, read_path, kind, content, conv_id, session_id,
+                source_chunk_id, origin
+         FROM code_graph_snapshots ORDER BY seq",
     )?;
     let rows = stmt.query_map([], |r| {
-        Ok(QueuedExtraction {
-            project: r.get(0)?,
-            file: r.get(1)?,
-            read_path: r.get(2)?,
-            conv_id: r.get(3)?,
-            session_id: r.get(4)?,
-            seq: r.get(5)?,
+        Ok(Snapshot {
+            seq: r.get(0)?,
+            project: r.get(1)?,
+            file: r.get(2)?,
+            read_path: r.get(3)?,
+            kind: r.get(4)?,
+            content: r.get(5)?,
+            conv_id: r.get(6)?,
+            session_id: r.get(7)?,
+            source_chunk_id: r.get(8)?,
+            origin: r.get(9)?,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
 
-/// Whether any file waits to be extracted.
-pub fn has_queued_extractions(conn: &Connection) -> Result<bool> {
+/// Whether any snapshot waits for the drain.
+pub fn has_queued_snapshots(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM code_graph_extract_queue)",
+        "SELECT EXISTS(SELECT 1 FROM code_graph_snapshots)",
         [],
         |r| r.get(0),
     )?)
 }
 
-/// Drop a queue entry whose file cannot be read any more (deleted); the bumped
-/// `graph_gen` still gets the project resolved. Only the entry at `seq`.
-pub fn drop_queued_extraction(
-    conn: &Connection,
-    project: &str,
-    file: &str,
-    seq: i64,
-) -> Result<()> {
-    conn.execute(
-        "DELETE FROM code_graph_extract_queue WHERE project = ?1 AND file = ?2 AND seq = ?3",
-        params![project, file, seq],
-    )?;
-    Ok(())
+/// Whether a snapshot of a file in `project` waits for the drain.
+pub fn has_queued_snapshots_for(conn: &Connection, project: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM code_graph_snapshots WHERE project = ?1)",
+        params![project],
+        |r| r.get(0),
+    )?)
 }
 
-/// Store an extraction in ONE transaction: node upserts, retirement of the
-/// symbols the file lost, the file's edge replacement, and the `graph_gen`
-/// bump that queues the project-wide resolve. A process killed anywhere in it
-/// leaves the graph as it was before; there is no state with new edges and an
-/// unchanged generation.
+/// The highest snapshot `seq` consumed for the file (0 before any).
+pub fn snapshot_high_water(conn: &Connection, project: &str, file: &str) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT seq FROM code_graph_snap_hw WHERE project = ?1 AND file = ?2",
+            params![project, file],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// Whether the live hook path has touched `file` since `since_ns`: a snapshot
+/// of it is waiting, or one captured after that time has been consumed. A
+/// historical replay that read the file earlier must not write over it.
+pub fn live_since(conn: &Connection, project: &str, file: &str, since_ns: i64) -> Result<bool> {
+    if snapshot_high_water(conn, project, file)? > since_ns {
+        return Ok(true);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM code_graph_snapshots WHERE project = ?1 AND file = ?2)",
+        params![project, file],
+        |r| r.get(0),
+    )?)
+}
+
+/// Take snapshot `seq` off the queue and advance the file's high-water mark.
+/// `true` when it is fresh, i.e. nothing at or after it has been consumed for
+/// this file: a `false` snapshot arrived late (or is a replay) and must not be
+/// stored.
+pub fn consume_snapshot(conn: &Connection, project: &str, file: &str, seq: i64) -> Result<bool> {
+    in_tx(conn, |tx| {
+        let seen = snapshot_high_water(tx, project, file)?;
+        tx.execute(
+            "DELETE FROM code_graph_snapshots WHERE seq = ?1 AND project = ?2 AND file = ?3",
+            params![seq, project, file],
+        )?;
+        if seq <= seen {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO code_graph_snap_hw (project, file, seq) VALUES (?1, ?2, ?3)
+             ON CONFLICT(project, file) DO UPDATE SET seq = excluded.seq",
+            params![project, file, seq],
+        )?;
+        Ok(true)
+    })
+}
+
+/// Store an extraction in ONE transaction: the snapshot it answers is consumed,
+/// then node upserts, retirement of the symbols the file lost, the file's edge
+/// replacement, and the `graph_gen` bump that queues the project-wide resolve.
+/// A process killed anywhere in it leaves the graph and the queue as they were;
+/// there is no state with new edges and an unchanged generation.
 ///
-/// Returns `false`, storing nothing, when `x.claim` names a queue entry that is
-/// gone or replaced: a newer extraction of the file got there first.
+/// Returns `false`, storing nothing, when a snapshot of the file at or after
+/// `x.claim` was consumed already.
 pub fn store_extraction(conn: &Connection, x: &Extraction<'_>) -> Result<bool> {
     in_tx(conn, |tx| {
-        let taken = match x.claim {
-            Some(seq) => tx.execute(
-                "DELETE FROM code_graph_extract_queue
-                 WHERE project = ?1 AND file = ?2 AND seq = ?3",
-                params![x.project, x.file, seq],
-            )?,
-            None => {
-                tx.execute(
-                    "DELETE FROM code_graph_extract_queue WHERE project = ?1 AND file = ?2",
-                    params![x.project, x.file],
-                )?;
-                1
-            }
-        };
-        if taken == 0 {
+        if !consume_snapshot(tx, x.project, x.file, x.claim)? {
             return Ok(false);
         }
         for node in x.nodes {
@@ -604,6 +706,16 @@ pub fn store_extraction(conn: &Connection, x: &Extraction<'_>) -> Result<bool> {
     })
 }
 
+/// Consume an `unsupported` snapshot: record the file-level provenance row.
+pub fn store_unsupported(conn: &Connection, s: &Snapshot) -> Result<()> {
+    in_tx(conn, |tx| {
+        if consume_snapshot(tx, &s.project, &s.file, s.seq)? {
+            mark_file_unsupported(tx, &s.project, &s.file)?;
+        }
+        Ok(())
+    })
+}
+
 /// Files whose edges changed since the last resolve that covered them:
 /// `(project, file, graph_gen)`, oldest extraction first.
 pub fn pending_resolve_files(conn: &Connection) -> Result<Vec<(String, String, i64)>> {
@@ -613,6 +725,23 @@ pub fn pending_resolve_files(conn: &Connection) -> Result<Vec<(String, String, i
          ORDER BY project, extracted_at",
     )?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// [`pending_resolve_files`] for one project.
+pub fn pending_resolve_files_for(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<(String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT project, file, graph_gen FROM code_graph_file_state
+         WHERE project = ?1 AND graph_gen > resolved_gen
+         ORDER BY extracted_at",
+    )?;
+    let rows = stmt.query_map(params![project], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }

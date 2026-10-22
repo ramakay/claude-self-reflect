@@ -972,23 +972,63 @@ pub fn run(conn: &Connection) -> Result<()> {
          );",
     )?;
 
-    // Migration: files a PostToolUse hook could not extract inside its write
-    // budget. The hook queues the file here (and bumps its `graph_gen`, so the
-    // drain also resolves the project); the drain extracts it before resolving.
-    // `seq` is the file's `graph_gen` at queue time: an extraction takes its
-    // queue entry by `seq`, so a newer extraction is never overwritten by an
-    // older one.
+    // Migration: the edits a PostToolUse hook snapshots for the drain. The hook
+    // does not extract: it records what it saw (the file's content, the
+    // conversation / session / transcript chunk that edited it) and the drain
+    // extracts the snapshots in `seq` order, one at a time, each with its own
+    // attribution. `seq` is the capture time in unix nanoseconds, so the DB
+    // path and the lock-free spool (`extraction::graph_spool`) order on one
+    // clock. `content` NULL is a legacy queue row: the drain reads `read_path`.
+    // `origin` is the spool file a row came from (replay guard).
+    // `code_graph_snap_hw` is the highest `seq` the drain has consumed per
+    // file: a snapshot at or below it arrived late and is dropped, never
+    // allowed to put an older version over a newer one.
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS code_graph_extract_queue (
-             project    TEXT NOT NULL,
-             file       TEXT NOT NULL,
-             read_path  TEXT NOT NULL,
-             conv_id    TEXT NOT NULL DEFAULT '',
-             session_id TEXT NOT NULL DEFAULT '',
-             seq        INTEGER NOT NULL,
+        "CREATE TABLE IF NOT EXISTS code_graph_snapshots (
+             seq             INTEGER PRIMARY KEY,
+             project         TEXT NOT NULL,
+             file            TEXT NOT NULL,
+             read_path       TEXT NOT NULL,
+             kind            TEXT NOT NULL DEFAULT 'extract',
+             content         BLOB,
+             conv_id         TEXT NOT NULL DEFAULT '',
+             session_id      TEXT NOT NULL DEFAULT '',
+             source_chunk_id TEXT,
+             origin          TEXT
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_code_graph_snapshots_origin
+             ON code_graph_snapshots(origin) WHERE origin IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_code_graph_snapshots_file
+             ON code_graph_snapshots(project, file, seq);
+         CREATE TABLE IF NOT EXISTS code_graph_snap_hw (
+             project TEXT NOT NULL,
+             file    TEXT NOT NULL,
+             seq     INTEGER NOT NULL,
              PRIMARY KEY (project, file)
          );",
     )?;
+    // The queue this replaces (one row per file; its `seq` was that file's
+    // `graph_gen`, not a global order). Its rows become snapshots with no
+    // content, numbered 1..n in (old seq, project, file) order, below any
+    // capture time. Reads first: an up-to-date database takes no write lock.
+    let legacy_queue: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'code_graph_extract_queue')",
+        [],
+        |r| r.get(0),
+    )?;
+    if legacy_queue {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO code_graph_snapshots
+                 (project, file, read_path, kind, conv_id, session_id)
+             SELECT project, file, read_path, 'extract', conv_id, session_id
+             FROM code_graph_extract_queue ORDER BY seq, project, file",
+            [],
+        )?;
+        tx.execute("DROP TABLE code_graph_extract_queue", [])?;
+        tx.commit()?;
+    }
 
     // Migration: add project_name to code_evolution if missing (v9 cross-project fix)
     {
@@ -5009,5 +5049,93 @@ mod tests {
             before,
             "an existing column is only read"
         );
+    }
+
+    /// Rows the per-file queue of an earlier build left behind become snapshots
+    /// without content, numbered in (old seq, project, file) order: the old
+    /// `seq` was each file's `graph_gen`, so two files both at 1 must not
+    /// collide, and a second migration must not move them.
+    #[test]
+    fn a_legacy_extract_queue_becomes_snapshots_the_drain_reads_from_disk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().canonicalize().unwrap().join("queued.rs");
+        std::fs::write(
+            &file,
+            "fn queued_fn() { helper_fn(); }\nfn helper_fn() {}\n",
+        )
+        .unwrap();
+        let file = file.to_string_lossy().into_owned();
+        let other = dir.path().join("gone.rs").to_string_lossy().into_owned();
+
+        let conn = Connection::open(dir.path().join("csr-engine.db")).unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE code_graph_extract_queue (
+                 project TEXT NOT NULL, file TEXT NOT NULL, read_path TEXT NOT NULL,
+                 conv_id TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',
+                 seq INTEGER NOT NULL, PRIMARY KEY (project, file));",
+        )
+        .unwrap();
+        for (path, seq) in [(&file, 1), (&other, 1)] {
+            conn.execute(
+                "INSERT INTO code_graph_extract_queue VALUES ('proj', ?1, ?1, 'conv-old', 'sess-old', ?2)",
+                rusqlite::params![path, seq],
+            )
+            .unwrap();
+        }
+        run(&conn).unwrap();
+        let legacy_left: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'code_graph_extract_queue')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!legacy_left, "the old table is gone");
+        let seqs: Vec<i64> = conn
+            .prepare("SELECT seq FROM code_graph_snapshots ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(seqs, vec![1, 2]);
+        run(&conn).unwrap();
+        let again: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_graph_snapshots", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(again, 2, "a second run changes nothing");
+
+        // The drain reads the file from disk, skips the one that is gone, and
+        // resolves the project.
+        let report = crate::extraction::graph_drain::drain(&conn, &|f: &str| {
+            std::path::Path::new(f).exists()
+        })
+        .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let nodes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_nodes WHERE file = ?1 AND kind = 'function'",
+                [&file],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nodes, 2);
+        let waiting: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_graph_snapshots", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(waiting, 0);
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_graph_file_state WHERE graph_gen > resolved_gen",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0, "settled");
     }
 }

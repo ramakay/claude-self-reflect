@@ -1,27 +1,35 @@
-//! The project-wide edge resolve, off the hook path.
+//! The code graph's single writer: extraction and the project-wide resolve,
+//! off the hook path.
 //!
-//! A PostToolUse hook re-extracts the edited file and stops: its edges land as
-//! `name:<symbol>` placeholders, which the code-graph queries already read
-//! ("callers surface even before resolution", `storage::codegraph::
-//! query_callers`), and its `graph_gen` goes up by one. Binding those names
-//! across the whole project took 30 s inside the hook.
+//! A PostToolUse hook writes no graph row. It snapshots the edit it just saw
+//! (file content, conversation / session / transcript chunk, a capture-time
+//! `seq`) into `code_graph_snapshots`, or, when the database will not take the
+//! insert quickly, into the lock-free spool (`graph_spool`). The drain extracts
+//! the snapshots in `seq` order, one transaction each, with the attribution the
+//! hook captured, so the drain is the only writer of `code_nodes` / `code_edges`
+//! / rank that hooks cause. A snapshot at or below the file's high-water mark
+//! (`codegraph::consume_snapshot`) arrived late and is dropped.
 //!
-//! The drain does it later, wherever a long-lived csr-engine process runs: the
-//! daemon's main loop, or the MCP server when there is no daemon
-//! (`daemon::graph_drain_loop`). For each project with a pending file it runs
-//! the ordinary project-wide resolve and rank, and then settles those files.
+//! The drain then binds the `name:<symbol>` placeholder edges across the whole
+//! project (which took 30 s inside the hook), wherever a long-lived csr-engine
+//! process runs: the daemon's main loop, or the MCP server when there is no
+//! daemon (`daemon::graph_drain_loop`).
 //!
 //! The pass is planned without the write lock and applied under it:
 //!
-//! 1. Read the pending files and their generations.
+//! 1. Extract the queued snapshots (spool first), then read the project's
+//!    pending files and their generations.
 //! 2. In a read transaction, [`plan_resolve`] the project: every write the
 //!    resolve would make, none executed. This is nearly all of the time.
 //! 3. In one short write transaction, re-read the project's counter
-//!    (`codegraph::project_gen`, bumped by every write a resolve reads). If it
-//!    moved since the plan's snapshot a hook changed the graph, the plan is
-//!    dropped and made again; otherwise [`apply_planned`] the list. After
-//!    [`MAX_OPTIMISTIC_ATTEMPTS`] drops the project is drained in one write
-//!    transaction. Each replayed write is still guarded by the edge state it
+//!    (`codegraph::project_gen`, bumped by triggers on every table a resolve
+//!    reads) and look for queued work: a snapshot or spool record of the
+//!    project means an edit the plan knows nothing of, and resolving now could
+//!    bind a caller to a definition that edit is about to retire. If either
+//!    moved the plan is dropped, the new work extracted and the plan made again;
+//!    otherwise [`apply_planned`] the list. After [`MAX_OPTIMISTIC_ATTEMPTS`]
+//!    drops the project is drained in one write transaction that extracts what
+//!    is queued first. Each replayed write is still guarded by the edge state it
 //!    was planned from.
 //! 4. Plan the rank from the resolved edges and, in one short write
 //!    transaction under the same counter guard, write the rows that changed and
@@ -32,6 +40,12 @@
 //! is settled before the rank is written, and a process killed anywhere leaves
 //! the files pending, so the next pass runs the whole thing again. The apply
 //! transaction is atomic, so a kill never leaves half of a resolve.
+//!
+//! What this does not close: a snapshot that arrives after the apply commits and
+//! retires a definition a caller was just bound to leaves that edge resolved to
+//! a node that no longer exists. Retiring a node has never unbound the edges
+//! pointing at it, and the resolver never revisits a resolved edge; an edit that
+//! arrives after a settle does the same.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -39,6 +53,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use rusqlite::{Connection, TransactionBehavior};
 
+use super::graph_spool;
 use super::resolver::{apply_planned, plan_resolve};
 use crate::search::code_rank::{changed_rank_rows, rank_rows, write_rank_rows};
 use crate::storage::{codegraph, Storage};
@@ -160,10 +175,9 @@ pub fn drain_outcome(storage: &Storage, db_path: &Path) -> Result<Outcome> {
 }
 
 fn drain_unrecorded(storage: &Storage, db_path: &Path) -> Result<Outcome> {
-    // A queued extraction counts although its file may read as settled: the
-    // resolve of an earlier pass can have covered the generation the queue bumped
-    // before the extraction itself succeeded.
-    if storage.pending_resolve_files()?.is_empty() && !storage.has_queued_code_extractions()? {
+    // A queued snapshot counts although every file may read as settled: it has
+    // not been extracted, so no generation covers it yet.
+    if storage.pending_resolve_files()?.is_empty() && !snapshots_waiting(storage, db_path)? {
         return Ok(Outcome::Idle);
     }
     let data_dir = db_path.parent().unwrap_or(Path::new("."));
@@ -173,6 +187,46 @@ fn drain_unrecorded(storage: &Storage, db_path: &Path) -> Result<Outcome> {
     let own = Storage::open(db_path)?;
     own.with_connection(|conn| drain(conn, &|file| exists(file)))
         .map(Outcome::Drained)
+}
+
+/// Whether a hook left an edit (queued, or spooled without the database) that
+/// no pass has extracted.
+pub fn snapshots_waiting(storage: &Storage, db_path: &Path) -> Result<bool> {
+    if storage.has_queued_code_snapshots()? {
+        return Ok(true);
+    }
+    Ok(graph_spool::dir_for_db(db_path).is_some_and(|d| graph_spool::any_pending(&d)))
+}
+
+/// Extract the waiting snapshots and nothing else: no resolve, no rank. Cheap
+/// enough to run every second, which is how soon an edit's nodes and callers
+/// show in `csr_code_graph` once the hook stops extracting them itself. Takes
+/// the drain lock, so it never runs beside a full pass. `None` when nothing was
+/// waiting or the lock was taken; a failure is recorded in `meta` but a clean
+/// pass does not clear the full pass's error.
+pub fn extract_waiting_snapshots(storage: &Storage, db_path: &Path) -> Result<Option<usize>> {
+    if !snapshots_waiting(storage, db_path)? {
+        return Ok(None);
+    }
+    let data_dir = db_path.parent().unwrap_or(Path::new("."));
+    let Some(_lock) = DrainLock::try_acquire(data_dir)? else {
+        return Ok(None);
+    };
+    let own = Storage::open(db_path)?;
+    let spool = graph_spool::dir_for_db(db_path);
+    let mut out = GraphDrain::default();
+    own.with_connection(|conn| extract_snapshots(conn, spool.as_deref(), None, &mut out))?;
+    if !out.errors.is_empty() {
+        let message = out
+            .errors
+            .iter()
+            .map(|(p, e)| format!("{p}: {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        tracing::warn!("code graph snapshots: {message}");
+        let _ = storage.set_meta(ERROR_KEY, &message);
+    }
+    Ok(Some(out.extracted))
 }
 
 /// `meta` key holding the last drain failure, empty when the last pass was clean.
@@ -214,12 +268,15 @@ fn exists(file: &str) -> bool {
 
 /// Optimistic attempts before a project is drained under one write
 /// transaction. A plan is discarded when a hook changed the project's graph
-/// between planning and applying; a busy project could discard forever.
+/// (or queued an edit) between planning and applying; a busy project could
+/// discard forever.
 pub const MAX_OPTIMISTIC_ATTEMPTS: usize = 3;
 
 /// Points in a pass where a test can act as a concurrent hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    /// The queued snapshots are extracted, the pending files not yet read.
+    QueueExtracted,
     /// The resolve is planned, nothing applied (`attempt` counts from 0).
     ResolvePlanned { attempt: usize },
     /// The rank is planned, nothing written.
@@ -241,20 +298,27 @@ pub fn drain_with(
 ) -> Result<GraphDrain> {
     let started = Instant::now();
     let mut out = GraphDrain::default();
-    // Files a hook ran out of budget for are extracted first: they bump their
+    let spool = graph_spool::dir_for_conn(conn);
+    // The edits hooks snapshotted are extracted first: that bumps each file's
     // `graph_gen`, so the resolve below covers them.
-    extract_queued(conn, &mut out)?;
+    extract_snapshots(conn, spool.as_deref(), None, &mut out)?;
+    between(Phase::QueueExtracted);
     let pending = codegraph::pending_resolve_files(conn)?;
     let mut projects: Vec<&str> = pending.iter().map(|(p, _, _)| p.as_str()).collect();
     projects.dedup();
 
     for project in projects {
-        let files: Vec<&(String, String, i64)> =
-            pending.iter().filter(|(p, _, _)| p == project).collect();
         // One project failing must not starve the ones after it: its
         // transaction rolled back, its files stay pending, the next pass tries
         // it again.
-        match drain_project(conn, project, &files, file_exists, between, &mut out) {
+        match drain_project(
+            conn,
+            project,
+            spool.as_deref(),
+            file_exists,
+            between,
+            &mut out,
+        ) {
             Ok(()) => out.projects += 1,
             Err(e) => out.errors.push((project.to_string(), format!("{e:#}"))),
         }
@@ -263,51 +327,107 @@ pub fn drain_with(
     Ok(out)
 }
 
-/// Extract the files PostToolUse queued instead of extracting (its write budget
-/// was spent). Each is claimed by its queue `seq`, so a newer extraction of the
-/// same file (the next edit) is never overwritten by this older read. A file
-/// that cannot be read any more is dropped from the queue; its `graph_gen` was
-/// bumped at queue time, so the project is still resolved. A failure leaves the
-/// entry queued for the next pass and is reported with the project's errors.
-fn extract_queued(conn: &Connection, out: &mut GraphDrain) -> Result<()> {
-    use super::file_extract::{extract_and_store, Extracted, Job};
-    for q in codegraph::queued_extractions(conn)? {
-        let job = Job {
-            project: &q.project,
-            read_path: &q.read_path,
-            stored_path: &q.file,
-            conv_id: &q.conv_id,
-            session_id: &q.session_id,
-            claim: Some(q.seq),
-        };
-        match extract_and_store(conn, &job) {
-            Ok(Extracted::Stored { .. }) => out.extracted += 1,
-            // Nothing readable to store, or a newer extraction took the entry.
-            Ok(Extracted::Skipped) => {
-                codegraph::drop_queued_extraction(conn, &q.project, &q.file, q.seq)?
-            }
+/// Extract every queued snapshot (spool excluded) on `conn`, without resolving.
+/// For tests and tools that want the graph an edit leads to.
+pub fn extract_all_snapshots(conn: &Connection) -> Result<GraphDrain> {
+    let mut out = GraphDrain::default();
+    extract_snapshots(conn, None, None, &mut out)?;
+    Ok(out)
+}
+
+/// Ingest the spool into the snapshot queue and extract every queued snapshot
+/// (of `only` project, or all), oldest capture first. Each snapshot is its own
+/// transaction (inside the caller's, if it has one): consumed and stored
+/// together or not at all. With `fail_fast` the first failure is returned (the
+/// locked pass, whose transaction must roll back); otherwise it is reported with
+/// the project's errors, the snapshot stays queued, and the rest go on.
+fn extract_snapshots(
+    conn: &Connection,
+    spool: Option<&Path>,
+    only: Option<&str>,
+    out: &mut GraphDrain,
+) -> Result<()> {
+    extract_snapshots_with(conn, spool, only, out, false)
+}
+
+fn extract_snapshots_with(
+    conn: &Connection,
+    spool: Option<&Path>,
+    only: Option<&str>,
+    out: &mut GraphDrain,
+    fail_fast: bool,
+) -> Result<()> {
+    // Standalone only: the locked pass ingests inside its own transaction and
+    // passes no spool here.
+    if let Some(dir) = spool {
+        if conn.is_autocommit() && graph_spool::any_pending(dir) {
+            let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            let paths = graph_spool::ingest(&tx, dir)?;
+            tx.commit()?;
+            graph_spool::remove(&paths);
+        }
+    }
+    for s in codegraph::queued_snapshots(conn)? {
+        if only.is_some_and(|p| p != s.project) {
+            continue;
+        }
+        match extract_one(conn, &s) {
+            Ok(true) => out.extracted += 1,
+            Ok(false) => {}
+            Err(e) if fail_fast => return Err(e.context(format!("extract {}", s.file))),
             Err(e) => out
                 .errors
-                .push((q.project.clone(), format!("extract {}: {e:#}", q.file))),
+                .push((s.project.clone(), format!("extract {}: {e:#}", s.file))),
         }
     }
     Ok(())
 }
 
-/// One project: resolve, then rank, then settle `files`.
+/// Store one snapshot. `true` when it produced graph rows.
+fn extract_one(conn: &Connection, s: &codegraph::Snapshot) -> Result<bool> {
+    use super::file_extract::{extract_and_store, Extracted, Job};
+    if s.kind == codegraph::SNAPSHOT_UNSUPPORTED {
+        codegraph::store_unsupported(conn, s)?;
+        return Ok(false);
+    }
+    let job = Job {
+        project: &s.project,
+        read_path: &s.read_path,
+        stored_path: &s.file,
+        conv_id: &s.conv_id,
+        session_id: &s.session_id,
+        source_chunk_id: s.source_chunk_id.as_deref(),
+        content: s.content.as_deref(),
+        claim: s.seq,
+    };
+    Ok(matches!(
+        extract_and_store(conn, &job)?,
+        Extracted::Stored { .. }
+    ))
+}
+
+/// Whether an edit of `project` is waiting that a plan made now would not
+/// contain: a queued snapshot, or a spool record not ingested yet.
+fn edits_waiting(conn: &Connection, project: &str, spool: Option<&Path>) -> Result<bool> {
+    Ok(codegraph::has_queued_snapshots_for(conn, project)?
+        || spool.is_some_and(graph_spool::any_pending))
+}
+
+/// One project: resolve, then rank, then settle its pending files.
 ///
 /// Plan and apply are linearized by the project's generation counter
 /// (`codegraph::project_gen`): the plan is made in a read snapshot that also
 /// reads the counter; under the write lock the counter is read again and the
-/// plan is applied only if it has not moved. A hook that added a competing
-/// definition, retired the planned destination or re-extracted a caller in
-/// between has bumped it, so the plan is dropped and made again from the new
-/// state. After [`MAX_OPTIMISTIC_ATTEMPTS`] drops in a row the project is
-/// drained inside one write transaction, which no hook can interleave with.
+/// plan is applied only if it has not moved and no edit of the project is
+/// waiting. A hook or backfill that added a competing definition, retired the
+/// planned destination or re-extracted a caller in between has bumped it, so the
+/// plan is dropped and made again from the new state. After
+/// [`MAX_OPTIMISTIC_ATTEMPTS`] drops in a row the project is drained inside one
+/// write transaction, which no database writer can interleave with.
 fn drain_project(
     conn: &Connection,
     project: &str,
-    files: &[&(String, String, i64)],
+    spool: Option<&Path>,
     file_exists: &dyn Fn(&str) -> bool,
     between: &dyn Fn(Phase),
     out: &mut GraphDrain,
@@ -315,6 +435,16 @@ fn drain_project(
     // 2/3. Resolve.
     let mut applied = None;
     for attempt in 0..MAX_OPTIMISTIC_ATTEMPTS {
+        if attempt > 0 {
+            // Whatever made the last plan stale may have queued edits.
+            extract_snapshots(conn, spool, Some(project), out)?;
+        }
+        // Read after the extractions, so the generations settled below are the
+        // ones this plan covers.
+        let files = codegraph::pending_resolve_files_for(conn, project)?;
+        if files.is_empty() {
+            return Ok(());
+        }
         let read = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
         let seen = codegraph::project_gen(&read, project)?;
         let (_stats, writes) = plan_resolve(&read, project, file_exists)?;
@@ -323,7 +453,9 @@ fn drain_project(
 
         let lock_started = Instant::now();
         let write = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        if codegraph::project_gen(&write, project)? != seen {
+        if codegraph::project_gen(&write, project)? != seen
+            || edits_waiting(&write, project, spool)?
+        {
             drop(write);
             out.replans += 1;
             continue;
@@ -332,12 +464,13 @@ fn drain_project(
         write.commit()?;
         out.longest_lock_hold = out.longest_lock_hold.max(lock_started.elapsed());
         out.edge_writes += writes.len();
-        applied = Some(skipped);
+        applied = Some((files, skipped));
         break;
     }
-    let Some(skipped) = applied else {
-        return drain_project_locked(conn, project, files, file_exists, out);
+    let Some((files, skipped)) = applied else {
+        return drain_project_locked(conn, project, spool, file_exists, out);
     };
+    let files: Vec<&(String, String, i64)> = files.iter().collect();
 
     // 4. Rank from the resolved edges; write what changed and settle, under the
     // same counter guard.
@@ -356,7 +489,7 @@ fn drain_project(
             continue;
         }
         write_rank_rows(&write, &changed)?;
-        out.files += settle(&write, files, skipped)?;
+        out.files += settle(&write, &files, skipped)?;
         write.commit()?;
         out.longest_lock_hold = out.longest_lock_hold.max(lock_started.elapsed());
         out.rank_writes += changed.len();
@@ -365,27 +498,41 @@ fn drain_project(
     // The graph kept moving under the rank plan; the resolve above stands (a
     // file whose edges moved is pending again), so redo the whole project under
     // the lock rather than leave the ranks behind.
-    drain_project_locked(conn, project, files, file_exists, out)
+    drain_project_locked(conn, project, spool, file_exists, out)
 }
 
-/// The project drained inside one write transaction: plan, apply, rank, settle.
-/// Holds the write lock for the whole pass (seconds on a large project), which
-/// is why it is the last resort and not the path.
+/// The project drained inside one write transaction: ingest the spool, extract
+/// what is queued, then plan, apply, rank, settle. Holds the write lock for the
+/// whole pass (seconds on a large project), which is why it is the last resort
+/// and not the path. Hooks that cannot get the lock meanwhile spool, so the lock
+/// never stalls them; records that arrive after the in-transaction ingest are
+/// the next pass's.
 fn drain_project_locked(
     conn: &Connection,
     project: &str,
-    files: &[&(String, String, i64)],
+    spool: Option<&Path>,
     file_exists: &dyn Fn(&str) -> bool,
     out: &mut GraphDrain,
 ) -> Result<()> {
     let lock_started = Instant::now();
     let write = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let spooled = match spool {
+        Some(dir) => graph_spool::ingest(&write, dir)?,
+        None => Vec::new(),
+    };
+    let mut extraction = GraphDrain::default();
+    extract_snapshots_with(&write, None, Some(project), &mut extraction, true)?;
+    let files = codegraph::pending_resolve_files_for(&write, project)?;
+    let files: Vec<&(String, String, i64)> = files.iter().collect();
     let (_stats, writes) = plan_resolve(&write, project, file_exists)?;
     let skipped = apply_planned(&write, &writes)?;
     let changed = changed_rank_rows(&write, rank_rows(&write, project)?)?;
     write_rank_rows(&write, &changed)?;
-    out.files += settle(&write, files, skipped)?;
+    let settled = settle(&write, &files, skipped)?;
     write.commit()?;
+    graph_spool::remove(&spooled);
+    out.extracted += extraction.extracted;
+    out.files += settled;
     out.longest_lock_hold = out.longest_lock_hold.max(lock_started.elapsed());
     out.edge_writes += writes.len();
     out.rank_writes += changed.len();
@@ -668,7 +815,7 @@ mod tests {
             nodes: &nodes,
             source_chunk_id: None,
             edges: Some(&[]),
-            claim: None,
+            claim: 1,
         })
         .unwrap();
     }
@@ -850,5 +997,387 @@ mod tests {
             stored.starts_with("proj: ") && stored.contains("rank write failed"),
             "{stored}"
         );
+    }
+
+    /// What a hook leaves for the drain when an edit lands: the file is
+    /// rewritten and snapshotted. Nothing is extracted.
+    fn edit_and_snapshot(conn: &Connection, path: &str, src: &str) -> i64 {
+        std::fs::write(path, src).unwrap();
+        codegraph::insert_snapshot(
+            conn,
+            &codegraph::Snapshot {
+                seq: codegraph::now_ns(),
+                project: "proj".into(),
+                file: path.into(),
+                read_path: path.into(),
+                kind: codegraph::SNAPSHOT_EXTRACT.into(),
+                content: Some(src.into()),
+                conv_id: "c".into(),
+                session_id: "s".into(),
+                source_chunk_id: None,
+                origin: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Snapshot `name` under `dir` and extract it, as a drain pass does.
+    fn extract_file(conn: &Connection, dir: &Path, name: &str, src: &str) -> String {
+        let path = dir.join(name).to_string_lossy().into_owned();
+        edit_and_snapshot(conn, &path, src);
+        extract_all_snapshots(conn).unwrap();
+        path
+    }
+
+    fn dangling_resolved_edges(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.dst_id FROM code_edges e
+                 WHERE e.resolved = 1 AND e.dst_id NOT LIKE 'name:%'
+                   AND NOT EXISTS (SELECT 1 FROM code_nodes n WHERE n.id = e.dst_id)",
+            )
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.collect::<std::result::Result<_, _>>().unwrap()
+    }
+
+    fn drain_until_idle(conn: &Connection) {
+        for _ in 0..6 {
+            let d = drain(conn, &|f: &str| Path::new(f).exists()).unwrap();
+            assert!(d.errors.is_empty(), "{:?}", d.errors);
+            if conn
+                .query_row(
+                    "SELECT NOT EXISTS(SELECT 1 FROM code_graph_file_state WHERE graph_gen > resolved_gen)",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap()
+                && !codegraph::has_queued_snapshots(conn).unwrap()
+            {
+                return;
+            }
+        }
+        panic!("the drain did not settle in six passes");
+    }
+
+    fn function_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM code_nodes WHERE kind = 'function' ORDER BY name")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.collect::<std::result::Result<_, _>>().unwrap()
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf, Storage) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dir_path = dir.path().canonicalize().unwrap();
+        let storage = Storage::open(&dir_path.join("csr-engine.db")).unwrap();
+        (dir, dir_path, storage)
+    }
+
+    /// P1 (re-review 2): a hook snapshots a callee edit after the pass read the
+    /// queue and before it read the pending files. The resolve must not bind
+    /// the caller to the callee version the queued edit is about to retire:
+    /// resolved edges are never revisited, so a bind to a retired node is
+    /// permanent.
+    #[test]
+    fn a_callee_edit_queued_after_the_queue_read_is_not_bound_to_the_old_callee() {
+        let (_keep, dir, storage) = fixture();
+        storage
+            .with_connection(|conn| {
+                let callee = extract_file(conn, &dir, "a.rs", "fn callee() {}\n");
+                extract_file(conn, &dir, "b.rs", "fn caller() { callee(); }\n");
+                let fired = std::cell::Cell::new(false);
+                let d = drain_with(conn, &|f: &str| Path::new(f).exists(), &|phase| {
+                    if phase == Phase::QueueExtracted && !fired.replace(true) {
+                        edit_and_snapshot(conn, &callee, "fn callee_renamed() {}\n");
+                    }
+                })?;
+                assert!(fired.get());
+                assert!(d.errors.is_empty(), "{:?}", d.errors);
+                assert_eq!(d.replans, 1, "the resolve noticed the waiting edit");
+                drain_until_idle(conn);
+                assert_eq!(
+                    dangling_resolved_edges(conn),
+                    Vec::<String>::new(),
+                    "a caller is still bound to a callee the edit retired"
+                );
+                assert_eq!(function_names(conn), ["callee_renamed", "caller"]);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The same edit arriving while the plan is made (not before it).
+    #[test]
+    fn a_callee_edit_queued_during_the_plan_is_not_bound_to_the_old_callee() {
+        let (_keep, dir, storage) = fixture();
+        storage
+            .with_connection(|conn| {
+                let callee = extract_file(conn, &dir, "a.rs", "fn callee() {}\n");
+                extract_file(conn, &dir, "b.rs", "fn caller() { callee(); }\n");
+                let fired = std::cell::Cell::new(false);
+                drain_with(conn, &|f: &str| Path::new(f).exists(), &|phase| {
+                    if matches!(phase, Phase::ResolvePlanned { attempt: 0 }) && !fired.replace(true)
+                    {
+                        edit_and_snapshot(conn, &callee, "fn callee_renamed() {}\n");
+                    }
+                })?;
+                assert!(fired.get());
+                drain_until_idle(conn);
+                assert_eq!(dangling_resolved_edges(conn), Vec::<String>::new());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// P1 (re-review 2): hook A read the old source, edit B snapshotted a newer
+    /// version, and A's snapshot reaches the queue afterwards. The drain must not
+    /// leave the old version as the last word.
+    #[test]
+    fn an_older_snapshot_that_arrives_late_never_replaces_a_newer_one() {
+        let (_keep, dir, storage) = fixture();
+        storage
+            .with_connection(|conn| {
+                let path = dir.join("a.rs").to_string_lossy().into_owned();
+                let older = codegraph::now_ns();
+                // B captures and is drained first...
+                extract_file(conn, &dir, "a.rs", "fn new_name() {}\n");
+                // ...then A's older capture is published.
+                codegraph::insert_snapshot(
+                    conn,
+                    &codegraph::Snapshot {
+                        seq: older,
+                        project: "proj".into(),
+                        file: path.clone(),
+                        read_path: path,
+                        kind: codegraph::SNAPSHOT_EXTRACT.into(),
+                        content: Some("fn old_name() {}\n".into()),
+                        conv_id: "c-old".into(),
+                        session_id: "s".into(),
+                        source_chunk_id: None,
+                        origin: None,
+                    },
+                )?;
+                drain_until_idle(conn);
+                assert_eq!(function_names(conn), ["new_name"]);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Snapshots of one file are extracted in capture order, each with its own
+    /// attribution, whatever order they were inserted in.
+    #[test]
+    fn snapshots_extract_in_capture_order_with_their_own_attribution() {
+        let (_keep, dir, storage) = fixture();
+        storage
+            .with_connection(|conn| {
+                let path = dir.join("a.rs").to_string_lossy().into_owned();
+                let snap = |seq: i64, src: &str, conv: &str| codegraph::Snapshot {
+                    seq,
+                    project: "proj".into(),
+                    file: path.clone(),
+                    read_path: path.clone(),
+                    kind: codegraph::SNAPSHOT_EXTRACT.into(),
+                    content: Some(src.into()),
+                    conv_id: conv.into(),
+                    session_id: "s".into(),
+                    source_chunk_id: None,
+                    origin: None,
+                };
+                let t = codegraph::now_ns();
+                // Inserted newest first.
+                codegraph::insert_snapshot(conn, &snap(t + 2, "fn one() {}\nfn two() {}\n", "c2"))?;
+                codegraph::insert_snapshot(conn, &snap(t + 1, "fn one() {}\n", "c1"))?;
+                let out = extract_all_snapshots(conn)?;
+                assert_eq!(out.extracted, 2);
+                let credit = |name: &str| -> (String, String) {
+                    conn.query_row(
+                        "SELECT first_conv_id, last_conv_id FROM code_nodes WHERE name = ?1",
+                        [name],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap()
+                };
+                assert_eq!(credit("one"), ("c1".to_string(), "c2".to_string()));
+                assert_eq!(credit("two"), ("c2".to_string(), "c2".to_string()));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn snapshot_of(path: &str, seq: i64, src: &str, origin: Option<&str>) -> codegraph::Snapshot {
+        codegraph::Snapshot {
+            seq,
+            project: "proj".into(),
+            file: path.into(),
+            read_path: path.into(),
+            kind: codegraph::SNAPSHOT_EXTRACT.into(),
+            content: Some(src.into()),
+            conv_id: "c".into(),
+            session_id: "s".into(),
+            source_chunk_id: None,
+            origin: origin.map(str::to_string),
+        }
+    }
+
+    /// A spool record ingested and extracted, then replayed because the drain
+    /// died before deleting the file, changes nothing.
+    #[test]
+    fn a_spool_record_replayed_after_a_crash_is_a_no_op() {
+        let (_keep, dir, storage) = fixture();
+        let spool = dir.join("keep/graph-spool");
+        let path = dir.join("a.rs").to_string_lossy().into_owned();
+        let t = codegraph::now_ns();
+        graph_spool::write(
+            &spool,
+            &snapshot_of(&path, t, "fn first_version() {}\n", None),
+        )
+        .unwrap();
+        storage
+            .with_connection(|conn| {
+                let out = drain(conn, &|f: &str| Path::new(f).exists())?;
+                assert_eq!(out.extracted, 1);
+                assert_eq!(function_names(conn), ["first_version"]);
+                assert!(
+                    !graph_spool::any_pending(&spool),
+                    "deleted after the commit"
+                );
+                // The next edit lands, then the old record reappears (the
+                // unlink never happened).
+                extract_file(conn, &dir, "a.rs", "fn second_version() {}\n");
+                graph_spool::write(
+                    &spool,
+                    &snapshot_of(&path, t, "fn first_version() {}\n", None),
+                )
+                .unwrap();
+                drain_until_idle(conn);
+                assert_eq!(function_names(conn), ["second_version"]);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Spooled and queued edits of one file are extracted on one clock, whichever
+    /// path carried them.
+    #[test]
+    fn spooled_and_queued_snapshots_extract_in_capture_order() {
+        let (_keep, dir, storage) = fixture();
+        let spool = dir.join("keep/graph-spool");
+        let path = dir.join("a.rs").to_string_lossy().into_owned();
+        let t = codegraph::now_ns();
+        // The older edit went to the spool (the lock was held), the newer to the
+        // table; the table row is in the database before the drain ingests.
+        graph_spool::write(&spool, &snapshot_of(&path, t, "fn from_spool() {}\n", None)).unwrap();
+        storage
+            .with_connection(|conn| {
+                codegraph::insert_snapshot(
+                    conn,
+                    &snapshot_of(&path, t + 10, "fn from_table() {}\n", None),
+                )?;
+                drain_until_idle(conn);
+                assert_eq!(function_names(conn), ["from_table"]);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// An edit of the project waiting in the spool keeps a resolve from running,
+    /// and the locked pass takes it in the same transaction.
+    #[test]
+    fn a_hammered_project_falls_back_to_the_locked_pass_and_settles() {
+        let (_keep, dir, storage) = fixture();
+        let spool = dir.join("keep/graph-spool");
+        storage
+            .with_connection(|conn| {
+                let callee = extract_file(conn, &dir, "a.rs", "fn callee() {}\n");
+                extract_file(conn, &dir, "b.rs", "fn caller() { callee(); }\n");
+                // An edit arrives at every plan, so no optimistic attempt applies.
+                let n = std::cell::Cell::new(0u64);
+                let d = drain_with(conn, &|f: &str| Path::new(f).exists(), &|phase| {
+                    if matches!(phase, Phase::ResolvePlanned { .. }) {
+                        n.set(n.get() + 1);
+                        let src = format!("fn callee_v{}() {{}}\n", n.get());
+                        std::fs::write(&callee, &src).unwrap();
+                        graph_spool::write(
+                            &spool,
+                            &snapshot_of(&callee, codegraph::now_ns(), &src, None),
+                        )
+                        .unwrap();
+                    }
+                })?;
+                assert!(d.errors.is_empty(), "{:?}", d.errors);
+                assert_eq!(d.locked_passes, 1);
+                assert_eq!(d.replans, MAX_OPTIMISTIC_ATTEMPTS);
+                assert_eq!(dangling_resolved_edges(conn), Vec::<String>::new());
+                // The locked pass took the records that were there when it ran.
+                assert_eq!(function_names(conn), ["callee_v3", "caller"]);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// A file the extractor cannot parse leaves a file-level row, written by the
+    /// drain; the hook wrote nothing.
+    #[test]
+    fn an_unsupported_snapshot_records_the_file_level_row() {
+        let (_keep, dir, storage) = fixture();
+        storage
+            .with_connection(|conn| {
+                let path = dir.join("notes.md").to_string_lossy().into_owned();
+                let mut s = snapshot_of(&path, codegraph::now_ns(), "", None);
+                s.kind = codegraph::SNAPSHOT_UNSUPPORTED.into();
+                s.content = None;
+                codegraph::insert_snapshot(conn, &s)?;
+                assert_eq!(
+                    graph_rows_total(conn, "code_graph_file_state"),
+                    0,
+                    "nothing before the drain"
+                );
+                extract_all_snapshots(conn)?;
+                let status: String = conn.query_row(
+                    "SELECT ast_status FROM code_graph_file_state WHERE file = ?1",
+                    [&path],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(status, "unsupported");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn graph_rows_total(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// A file with 64 snapshots waiting keeps at most 64: the newest is replaced.
+    #[test]
+    fn a_file_cannot_pile_up_snapshots_without_bound() {
+        let (_keep, dir, storage) = fixture();
+        storage
+            .with_connection(|conn| {
+                let path = dir.join("a.rs").to_string_lossy().into_owned();
+                let t = codegraph::now_ns();
+                for i in 0..(codegraph::MAX_SNAPSHOTS_PER_FILE + 10) {
+                    codegraph::insert_snapshot(
+                        conn,
+                        &snapshot_of(&path, t + i, &format!("fn v{i}() {{}}\n"), None),
+                    )?;
+                }
+                assert_eq!(
+                    graph_rows_total(conn, "code_graph_snapshots"),
+                    codegraph::MAX_SNAPSHOTS_PER_FILE
+                );
+                extract_all_snapshots(conn)?;
+                // The last write wins: the final version is the one stored.
+                assert_eq!(
+                    function_names(conn),
+                    [format!("v{}", codegraph::MAX_SNAPSHOTS_PER_FILE + 9)]
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 }

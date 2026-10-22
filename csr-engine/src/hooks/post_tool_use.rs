@@ -32,13 +32,13 @@ pub fn is_acted_on_tool(tool_name: Option<&str>) -> bool {
 }
 
 /// Wall-clock budget for the database writes of one PostToolUse run, counted
-/// from the start of [`handle`]. The hook only extracts the edited file now (the
-/// project-wide edge resolve runs in the daemon, `extraction::graph_drain`), so
-/// its own work is milliseconds; what can stall it is the write lock, which the
-/// storage default would wait on for 5 s per statement. Each write phase waits
-/// only as long as the budget has left, and once it is spent the remaining
-/// graph work is skipped: the file is already queued for the code map (the
-/// enqueue is the first write), and the hook exits 0.
+/// from the start of [`handle`]. The hook does not extract the edited file or
+/// resolve anything: its graph write is one snapshot INSERT (or a spool file,
+/// `extraction::graph_spool`) and the drain does the rest. What can stall the
+/// hook is the write lock, which the storage default would wait on for 5 s per
+/// statement. Each write phase waits only as long as the budget has left and
+/// the snapshot never waits more than [`SNAPSHOT_WAIT`]; once the budget is
+/// spent the remaining file-history writes are skipped and the hook exits 0.
 ///
 /// Same idea as `prompt_transport::REQUEST_BUDGET`. A backgrounded hook
 /// (`async: true`) is not the answer: a stalled one stays a live csr-engine
@@ -102,11 +102,6 @@ pub async fn handle(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<(
     handle_with(input, engine, WRITE_BUDGET, resolve_project_for_hook).await
 }
 
-/// How long the last-gasp queue write may wait for the write lock once the
-/// budget is spent. Short: it is one small transaction, and the alternative is
-/// to lose the file from the graph.
-const QUEUE_GRACE: Duration = Duration::from_millis(250);
-
 /// [`handle`] with the write budget and the project resolver passed in.
 async fn handle_with(
     input: &HookInput,
@@ -139,75 +134,112 @@ async fn handle_with(
             .map(|f| f.to_string_lossy().into_owned())
             .collect()
     };
-    for (i, file_path) in touched.iter().enumerate() {
+    for file_path in &touched {
+        // The graph: the hook's only write to it is a snapshot of the edit
+        // (`codegraph::insert_snapshot`, or the lock-free spool when the
+        // database will not take it quickly). The drain extracts it
+        // (`extraction::graph_drain`), so the hook neither parses nor holds the
+        // write lock for more than that one INSERT, and first, so the slower
+        // steps below cannot delay or starve it.
+        snapshot_graph_edit(input, engine, file_path, &resolve, deadline);
         // Code map freshness: enqueue only, the daemon does the work. One
         // INSERT, no parse, no git; a failure (missing table, locked db) is
         // logged and never reaches Claude Code.
         if let Err(e) = enqueue_path_for_codemap(engine, file_path) {
             eprintln!("CSR: code map enqueue error (non-fatal): {}", e);
         }
-        // The enqueue put the storage default back; the writes below wait only
-        // as long as the budget has left.
+        // The writes above put the storage default back; the one below waits
+        // only as long as the budget has left.
         if !clamp_write_wait(engine, deadline) {
-            eprintln!("CSR: write budget spent, graph left to the drain (non-fatal)");
-            queue_graph_extractions(input, engine, &touched[i..], resolve);
+            eprintln!("CSR: write budget spent, file history skipped (non-fatal)");
             break;
         }
         if let Err(e) = track_code_evolution_for(input, engine, file_path, resolve).await {
             eprintln!("CSR: code evolution tracking error (non-fatal): {}", e);
-        }
-        // v9.4 liveness path: re-extract the touched file into the code graph so
-        // callers/callees/ledger reflect the edit immediately (edges as
-        // `name:` placeholders, which those queries read; the daemon binds them).
-        if !clamp_write_wait(engine, deadline) {
-            eprintln!("CSR: write budget spent, graph left to the drain (non-fatal)");
-            queue_graph_extractions(input, engine, &touched[i..], resolve);
-            break;
-        }
-        if let Err(e) = update_code_graph_for(input, engine, file_path, resolve) {
-            eprintln!("CSR: code graph update error (non-fatal): {}", e);
         }
     }
 
     Ok(())
 }
 
-/// Leave these files' graph extraction to the drain: the budget is spent, so
-/// each is queued (`codegraph::queue_extraction`, which also bumps its
-/// `graph_gen`) instead of extracted. The code map queue does not cover this:
-/// it rescans separate `codemap_*` tables, never `code_nodes`/`code_edges`. One
-/// small write per file under [`QUEUE_GRACE`]; a failure is logged, and the next
-/// edit of the file extracts it anyway.
-fn queue_graph_extractions(
+/// How long the snapshot INSERT may wait for the write lock. Short on purpose:
+/// the alternative to waiting is the spool, which costs one small file and no
+/// lock, so the hook never queues behind a long writer for the graph.
+const SNAPSHOT_WAIT: Duration = Duration::from_millis(150);
+
+/// Hand the edit of `file_path` to the graph drain: one snapshot row, or, when
+/// the database does not take it within [`SNAPSHOT_WAIT`] (or the remaining
+/// budget), one spool file. Never extracts, never parses, never fails the hook.
+fn snapshot_graph_edit(
     input: &HookInput,
     engine: &Engine,
-    files: &[String],
-    resolve: impl Fn(Option<&Path>, Option<&str>) -> String,
+    file_path: &str,
+    resolve: &impl Fn(Option<&Path>, Option<&str>) -> String,
+    deadline: Instant,
 ) {
-    let _ = engine
-        .storage()
-        .with_connection(|conn| conn.busy_timeout(QUEUE_GRACE).map_err(Into::into));
+    use crate::storage::codegraph::{self, Snapshot};
+    let Some((project, stored)) = graph_target(input, file_path, resolve) else {
+        return;
+    };
     let conv_id = conv_id_for(input);
     let session_id = input.session_id.clone().unwrap_or_default();
-    for file_path in files {
-        let Some((project, stored)) = graph_target(input, file_path, &resolve) else {
-            continue;
-        };
-        if crate::extraction::ast_analysis::lang_from_path_str(file_path).is_none() {
-            continue;
+    let supported = crate::extraction::ast_analysis::lang_from_path_str(file_path).is_some();
+    // The capture time is taken after the read: the text is at least as old as
+    // its `seq`, and a later edit of the file always has a larger one.
+    let content = if supported {
+        match crate::extraction::file_extract::read_for_snapshot(file_path) {
+            Some(text) => Some(text),
+            // Unreadable, not UTF-8 or too large: nothing to extract.
+            None => return,
         }
-        if let Err(e) = engine.storage().with_connection(|conn| {
-            crate::storage::codegraph::queue_extraction(
-                conn,
-                &project,
-                &stored,
-                file_path,
-                &conv_id,
-                &session_id,
-            )
-        }) {
-            eprintln!("CSR: graph extraction not queued (non-fatal): {e}");
+    } else {
+        None
+    };
+    let seq = codegraph::now_ns();
+    let source_chunk_id = if supported {
+        engine
+            .storage()
+            .with_connection(|conn| codegraph::latest_chunk_id(conn, &conv_id))
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let snapshot = Snapshot {
+        seq,
+        project,
+        file: stored,
+        read_path: file_path.to_string(),
+        kind: if supported {
+            codegraph::SNAPSHOT_EXTRACT
+        } else {
+            codegraph::SNAPSHOT_UNSUPPORTED
         }
+        .to_string(),
+        content,
+        conv_id,
+        session_id,
+        source_chunk_id,
+        origin: None,
+    };
+
+    let wait = SNAPSHOT_WAIT.min(deadline.saturating_duration_since(Instant::now()));
+    let inserted = engine.storage().with_connection(|conn| {
+        conn.busy_timeout(wait)?;
+        codegraph::insert_snapshot(conn, &snapshot)
+    });
+    let Err(db_error) = inserted else {
+        return;
+    };
+    let dir = engine
+        .storage()
+        .with_connection(|conn| Ok(crate::extraction::graph_spool::dir_for_conn(conn)))
+        .ok()
+        .flatten();
+    match dir.map(|d| crate::extraction::graph_spool::write(&d, &snapshot)) {
+        Some(Ok(_)) => eprintln!("CSR: graph snapshot spooled ({db_error:#}) (non-fatal)"),
+        Some(Err(e)) => eprintln!("CSR: graph snapshot lost: {db_error:#}; spool: {e:#}"),
+        None => eprintln!("CSR: graph snapshot lost: {db_error:#}; no spool directory"),
     }
 }
 
@@ -260,18 +292,13 @@ fn conv_id_for(input: &HookInput) -> String {
     input.session_id.clone().unwrap_or_default()
 }
 
-/// Re-extract the edited file into the code graph (v9.4 liveness path).
-/// Reads the on-disk file (post-edit), upserts nodes, replaces this file's edges,
-/// and marks file state, queuing the file for the daemon's project-wide resolve
-/// + rank (`extraction::graph_drain`).
+/// The hook's graph step followed by the extraction the drain would make of it
+/// a moment later, so tests can look at the graph an edit leads to.
 #[cfg(test)]
 fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
     update_code_graph_with(input, engine, resolve_project_for_hook)
 }
 
-/// `update_code_graph` with the project resolver passed in, so tests drive it
-/// without mutating process-global env vars. `resolve` takes the edited file's
-/// parent and the hook input's session cwd.
 #[cfg(test)]
 fn update_code_graph_with(
     input: &HookInput,
@@ -283,56 +310,31 @@ fn update_code_graph_with(
     update_code_graph_for(input, engine, file_path, resolve)
 }
 
-/// Core of `update_code_graph` for one file: an Edit's `file_path` or one of
-/// the files a Bash call wrote.
+#[cfg(test)]
 fn update_code_graph_for(
     input: &HookInput,
     engine: &Engine,
     file_path: &str,
     resolve: impl Fn(Option<&Path>, Option<&str>) -> String,
 ) -> Result<()> {
-    let Some((project, stored_path)) = graph_target(input, file_path, &resolve) else {
-        return Ok(());
-    };
+    snapshot_graph_edit(
+        input,
+        engine,
+        file_path,
+        &resolve,
+        Instant::now() + WRITE_BUDGET,
+    );
+    drain_snapshots_for_test(engine)
+}
 
-    if crate::extraction::ast_analysis::lang_from_path_str(file_path).is_none() {
-        // Unsupported language — record file-level provenance instead of
-        // dropping the file entirely (best-effort; never blocks the hook).
-        if let Err(e) = engine
-            .storage()
-            .mark_code_file_unsupported(&project, &stored_path)
-        {
-            eprintln!("CSR: ast_status=unsupported record error (non-fatal): {e}");
-        }
-        return Ok(());
-    }
-
-    // Read from the original path (worktree-local); store under the canonical
-    // main-repo path so worktree edits do not create duplicate nodes. One
-    // transaction for the whole extraction, ending with the `graph_gen` bump
-    // that queues the project-wide resolve for the drain
-    // (`extraction::graph_drain`): a kill between the steps can never leave new
-    // edges under a generation the drain already settled.
-    let conv_id = conv_id_for(input);
-    let session_id = input.session_id.clone().unwrap_or_default();
-    let stored = engine.storage().with_connection(|conn| {
-        crate::extraction::file_extract::extract_and_store(
-            conn,
-            &crate::extraction::file_extract::Job {
-                project: &project,
-                read_path: file_path,
-                stored_path: &stored_path,
-                conv_id: &conv_id,
-                session_id: &session_id,
-                claim: None,
-            },
-        )
-    })?;
-    if let crate::extraction::file_extract::Extracted::Stored { nodes, edges } = stored {
-        eprintln!("CSR: code graph updated for {stored_path} ({nodes} nodes, {edges} edges)");
-    }
-
-    Ok(())
+/// Run the extraction half of a drain pass (no resolve).
+#[cfg(test)]
+fn drain_snapshots_for_test(engine: &Engine) -> Result<()> {
+    engine.storage().with_connection(|conn| {
+        let out = crate::extraction::graph_drain::extract_all_snapshots(conn)?;
+        anyhow::ensure!(out.errors.is_empty(), "{:?}", out.errors);
+        Ok(())
+    })
 }
 
 /// The project and canonical stored path a graph write for `file_path` goes
@@ -983,81 +985,119 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn an_edit_that_finds_the_budget_spent_is_queued_and_the_drain_extracts_it() {
-        let (engine, storage) = test_engine();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let file = tmp.path().canonicalize().unwrap().join("late.rs");
-        std::fs::write(&file, "fn caller() { callee(); }\nfn callee() {}\n").unwrap();
-        let input = write_input(&file, Some("/Users/x/projects/my-repo"));
-
-        // No budget at all: the hook skips every graph write it would make.
-        handle_with(&input, &engine, Duration::ZERO, resolve_without_env)
-            .await
-            .unwrap();
-        assert_eq!(count_nodes(&storage), 0, "nothing was extracted");
-        let queued = storage
-            .with_connection(crate::storage::codegraph::queued_extractions)
-            .unwrap();
-        assert_eq!(queued.len(), 1, "the file was left for the drain");
-        assert_eq!(queued[0].project, "my-repo");
-        assert_eq!(queued[0].file, file.to_string_lossy());
-        assert_eq!(storage.pending_resolve_files().unwrap().len(), 1);
-
-        // The drain extracts it, resolves the project and settles the file.
-        let report = storage
-            .with_connection(|c| crate::extraction::graph_drain::drain(c, &|_: &str| true))
-            .unwrap();
-        assert_eq!(report.extracted, 1);
-        assert_eq!(count_nodes(&storage), 2);
-        assert!(storage.pending_resolve_files().unwrap().is_empty());
-        assert!(!storage.has_queued_code_extractions().unwrap());
-        let resolved: i64 = storage
+    fn snapshot_count(storage: &crate::storage::Storage) -> i64 {
+        storage
             .with_connection(|c| {
-                Ok(c.query_row(
-                    "SELECT COALESCE(SUM(resolved), 0) FROM code_edges WHERE kind = 'calls'",
-                    [],
-                    |r| r.get(0),
-                )?)
+                Ok(
+                    c.query_row("SELECT COUNT(*) FROM code_graph_snapshots", [], |r| {
+                        r.get(0)
+                    })?,
+                )
             })
-            .unwrap();
-        assert_eq!(resolved, 1);
+            .unwrap()
     }
 
+    fn file_engine(
+        db: &Path,
+    ) -> (
+        crate::engine::Engine,
+        std::sync::Arc<crate::storage::Storage>,
+    ) {
+        let storage = std::sync::Arc::new(crate::storage::Storage::open(db).unwrap());
+        let engine = crate::engine::Engine::from_parts(
+            storage.clone(),
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
+                100,
+            ))),
+            std::path::PathBuf::from("/tmp"),
+        );
+        (engine, storage)
+    }
+
+    /// The single-writer contract: the hook's only graph write is a snapshot.
+    /// It adds no node, edge or file state, whatever its budget, and the drain
+    /// extracts the edit afterwards with the attribution captured with it.
     #[tokio::test]
-    async fn a_queued_extraction_never_overwrites_a_newer_one() {
+    async fn an_edit_writes_only_a_snapshot_and_the_drain_extracts_it() {
+        for budget in [Duration::ZERO, WRITE_BUDGET] {
+            let (engine, storage) = test_engine();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let file = tmp.path().canonicalize().unwrap().join("late.rs");
+            std::fs::write(&file, "fn caller() { callee(); }\nfn callee() {}\n").unwrap();
+            let input = write_input(&file, Some("/Users/x/projects/my-repo"));
+
+            handle_with(&input, &engine, budget, resolve_without_env)
+                .await
+                .unwrap();
+            assert_eq!(snapshot_count(&storage), 1, "budget {budget:?}");
+            for table in ["code_nodes", "code_edges", "code_graph_file_state"] {
+                let rows = graph_rows_of(&storage, table);
+                assert_eq!(rows, 0, "{table} written by the hook (budget {budget:?})");
+            }
+            assert!(storage.pending_resolve_files().unwrap().is_empty());
+
+            // The drain extracts it, resolves the project and settles the file.
+            let report = storage
+                .with_connection(|c| crate::extraction::graph_drain::drain(c, &|_: &str| true))
+                .unwrap();
+            assert_eq!(report.extracted, 1);
+            assert_eq!(count_nodes(&storage), 2);
+            assert!(storage.pending_resolve_files().unwrap().is_empty());
+            assert_eq!(snapshot_count(&storage), 0);
+            let (resolved, conv): (i64, String) = storage
+                .with_connection(|c| {
+                    Ok(c.query_row(
+                        "SELECT (SELECT COALESCE(SUM(resolved), 0) FROM code_edges
+                                 WHERE kind = 'calls'),
+                                (SELECT last_conv_id FROM code_nodes WHERE name = 'callee')",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(resolved, 1);
+            assert_eq!(
+                conv, "nonexistent-test-transcript",
+                "the attribution captured by the hook"
+            );
+        }
+    }
+
+    fn graph_rows_of(storage: &crate::storage::Storage, table: &str) -> i64 {
+        graph_rows(storage)
+            .into_iter()
+            .find(|(t, _)| t == table)
+            .map(|(_, n)| n)
+            .unwrap_or_else(|| {
+                storage
+                    .with_connection(|c| {
+                        Ok(
+                            c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+                                r.get(0)
+                            })?,
+                        )
+                    })
+                    .unwrap()
+            })
+    }
+
+    /// Two edits of one file snapshot twice, and the drain extracts them in
+    /// order: the graph ends on the second version.
+    #[tokio::test]
+    async fn two_edits_of_a_file_leave_the_second_version() {
         let (engine, storage) = test_engine();
         let tmp = tempfile::TempDir::new().unwrap();
         let file = tmp.path().canonicalize().unwrap().join("race.rs");
-        std::fs::write(&file, "fn old_name() {}\n").unwrap();
-        let path = file.to_string_lossy().to_string();
         let input = write_input(&file, Some("/Users/x/projects/my-repo"));
-        handle_with(&input, &engine, Duration::ZERO, resolve_without_env)
-            .await
-            .unwrap();
-        let queued = storage
-            .with_connection(crate::storage::codegraph::queued_extractions)
-            .unwrap()
-            .remove(0);
-
-        // The next edit extracts the file in full before the drain gets to it.
-        std::fs::write(&file, "fn new_name() {}\n").unwrap();
-        update_code_graph_for(&input, &engine, &path, resolve_without_env).unwrap();
-        assert!(!storage.has_queued_code_extractions().unwrap());
-
-        // The drain's read of the older queue entry finds it taken.
-        let job = crate::extraction::file_extract::Job {
-            project: &queued.project,
-            read_path: &queued.read_path,
-            stored_path: &queued.file,
-            conv_id: &queued.conv_id,
-            session_id: &queued.session_id,
-            claim: Some(queued.seq),
-        };
-        let outcome = storage
-            .with_connection(|c| crate::extraction::file_extract::extract_and_store(c, &job))
-            .unwrap();
-        assert_eq!(outcome, crate::extraction::file_extract::Extracted::Skipped);
+        for src in ["fn old_name() {}\n", "fn new_name() {}\n"] {
+            std::fs::write(&file, src).unwrap();
+            handle_with(&input, &engine, WRITE_BUDGET, resolve_without_env)
+                .await
+                .unwrap();
+        }
+        assert_eq!(snapshot_count(&storage), 2);
+        drain_snapshots_for_test(&engine).unwrap();
         let names: Vec<String> = storage
             .with_connection(|c| {
                 let mut stmt =
@@ -1069,53 +1109,52 @@ mod tests {
         assert_eq!(names, vec!["new_name".to_string()]);
     }
 
-    #[test]
-    fn the_write_budget_bounds_the_wait_for_a_locked_database() {
+    /// M4: the hook never waits on the write lock for the graph. With the lock
+    /// held the snapshot goes to the spool in well under the budget, and the
+    /// drain ingests it once the lock is free.
+    #[tokio::test]
+    async fn a_locked_database_spools_the_snapshot_and_the_drain_ingests_it() {
         let dir = tempfile::TempDir::new().unwrap();
-        let db = dir.path().join("csr-engine.db");
-        let storage = std::sync::Arc::new(crate::storage::Storage::open(&db).unwrap());
-        let engine = crate::engine::Engine::from_parts(
-            storage.clone(),
-            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
-            std::sync::Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
-                100,
-            ))),
-            std::path::PathBuf::from("/tmp"),
-        );
-        let file = dir.path().join("locked.rs");
-        std::fs::write(&file, "fn a() { b(); }\nfn b() {}\n").unwrap();
-        let path = file.to_string_lossy().to_string();
+        let dir_path = dir.path().canonicalize().unwrap();
+        let db = dir_path.join("csr-engine.db");
+        let (engine, storage) = file_engine(&db);
+        let file = dir_path.join("locked.rs");
+        std::fs::write(&file, "fn caller() { callee(); }\nfn callee() {}\n").unwrap();
         let input = write_input(&file, Some("/Users/x/projects/my-repo"));
 
         // The daemon (or a drain) holds the write lock for longer than the budget.
         let holder = rusqlite::Connection::open(&db).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-        let budget = Duration::from_millis(300);
-        let deadline = Instant::now() + budget;
-        assert!(clamp_write_wait(&engine, deadline));
-        let waited: i64 = storage
-            .with_connection(|c| Ok(c.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?))
-            .unwrap();
-        assert!(
-            waited <= 300,
-            "the wait follows the budget, not the 5 s default: {waited}"
-        );
-
         let started = Instant::now();
-        let result = update_code_graph_for(&input, &engine, &path, resolve_without_env);
+        handle_with(
+            &input,
+            &engine,
+            Duration::from_millis(600),
+            resolve_without_env,
+        )
+        .await
+        .unwrap();
         let took = started.elapsed();
-        assert!(result.is_err(), "the write gave up on the lock");
         assert!(took < Duration::from_secs(2), "returned in {took:?}");
+        let spool = dir_path.join("keep/graph-spool");
+        let spooled: Vec<_> = std::fs::read_dir(&spool)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(spooled.len(), 1, "the edit is in the spool");
 
-        // Nothing left in the budget: the remaining graph work is skipped.
-        assert!(!clamp_write_wait(&engine, Instant::now()));
-
-        // Once the lock is free the same edit goes through.
+        // Once the lock is free the drain ingests and extracts it, then deletes it.
         holder.execute_batch("ROLLBACK").unwrap();
-        assert!(clamp_write_wait(&engine, Instant::now() + budget));
-        update_code_graph_for(&input, &engine, &path, resolve_without_env).unwrap();
-        assert_eq!(storage.pending_resolve_files().unwrap().len(), 1);
+        assert_eq!(snapshot_count(&storage), 0);
+        let report = storage
+            .with_connection(|c| crate::extraction::graph_drain::drain(c, &|_: &str| true))
+            .unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.extracted, 1);
+        assert_eq!(count_nodes(&storage), 2);
+        assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 0);
+        assert!(storage.pending_resolve_files().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1821,6 +1860,7 @@ mod tests {
         let input = bash_input(&command, Some("/Users/x/projects/my-repo"));
 
         handle(&input, &engine, tmp.path()).await.unwrap();
+        drain_snapshots_for_test(&engine).unwrap();
 
         let rows = evolution_rows(&storage);
         assert_eq!(rows.len(), 2, "{rows:?}");

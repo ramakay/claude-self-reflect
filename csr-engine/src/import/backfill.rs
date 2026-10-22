@@ -223,6 +223,10 @@ pub fn backfill_code_graph(
 /// Storage-level backfill (no embeddings needed — keeps tests light).
 fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Result<BackfillStats> {
     let mut stats = BackfillStats::default();
+    // Files are read early and flushed at the end. A hook that snapshotted one of
+    // them in between saw a newer version than this replay did, so the flush
+    // leaves its edges, state and nodes to the drain.
+    let started_ns = crate::storage::codegraph::now_ns();
 
     // 1. Enumerate every JSONL file across all project dirs, tagged with its
     //    project name and mtime.
@@ -386,6 +390,12 @@ fn backfill_into(storage: &Storage, projects_dir: &Path, dry_run: bool) -> Resul
     if !dry_run {
         // 3. Flush the newest edge set + file state + retire stale nodes per file.
         for ((project, file), edges) in &latest_edges {
+            if storage
+                .code_file_live_since(project, file, started_ns)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if let Err(e) = storage.replace_code_file_edges(project, file, edges) {
                 eprintln!("CSR backfill: edge replace error for {file} ({e})");
             }
@@ -1915,6 +1925,55 @@ mod tests {
             "foo should call bar after backfill; got {:?}",
             callees.iter().map(|n| &n.name).collect::<Vec<_>>()
         );
+    }
+
+    /// A file a hook snapshotted while the replay ran was read by the replay
+    /// before that edit: the flush must not put the older edges over it.
+    #[test]
+    fn backfill_leaves_a_file_the_live_hook_touched_since_it_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects_dir = synthetic_projects(tmp.path(), &edit_line());
+        let file = "/Users/me/projects/demo/src/lib.rs";
+        let live_edge = |storage: &Storage| -> bool {
+            storage
+                .with_connection(|c| {
+                    Ok(c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM code_edges WHERE dst_id = 'name:live_only')",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        for (touched, kept) in [(true, true), (false, false)] {
+            let storage = Storage::open_memory().unwrap();
+            storage
+                .with_connection(|c| {
+                    crate::storage::codegraph::replace_file_edges(
+                        c,
+                        "demo",
+                        file,
+                        &[EdgeRow {
+                            src_id: "live".into(),
+                            dst_id: "name:live_only".into(),
+                            kind: "calls".into(),
+                            src_file: file.into(),
+                            ..EdgeRow::default()
+                        }],
+                    )?;
+                    if touched {
+                        // Consumed after the replay began.
+                        c.execute(
+                            "INSERT INTO code_graph_snap_hw (project, file, seq) VALUES ('demo', ?1, ?2)",
+                            rusqlite::params![file, crate::storage::codegraph::now_ns() + 60_000_000_000],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            backfill_into(&storage, &projects_dir, false).unwrap();
+            assert_eq!(live_edge(&storage), kept, "touched = {touched}");
+        }
     }
 
     #[test]
