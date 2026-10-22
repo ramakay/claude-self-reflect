@@ -2130,6 +2130,13 @@ const MAX_PROMOTED_PREFIX_MATCHES: usize = 3;
 /// character immediately after the prefix is non-alphanumeric or the
 /// content ends there (a query for "...campaign" must not match
 /// "...campaigns").
+///
+/// Only deliberate memories are promoted. A pipeline-derived row (session
+/// story, episode, briefing, any `narrative_*` extraction) opens with the
+/// request that started its session, so an exact-prefix hit on one is the
+/// question coming back, not an answer: live 2026-10-22, the story of the
+/// session that asked "why did we drop Docker and Qdrant for a single Rust
+/// binary?" was forced to rank 1 for that query.
 pub fn fts5_reflection_prefix_matches(
     conn: &Connection,
     query: &str,
@@ -2152,26 +2159,45 @@ pub fn fts5_reflection_prefix_matches(
     let fetch_limit = (MAX_PROMOTED_PREFIX_MATCHES + 1).max(limit);
     let ledger_pat = ledger_tag_like_pattern();
     let mut stmt = conn.prepare(
-        "SELECT id, content FROM reflections
+        "SELECT id, content, tags FROM reflections
          WHERE content LIKE ?1 || '%' ESCAPE '\\'
-           AND (tags IS NULL OR tags NOT LIKE ?2)
+           AND (tags IS NULL OR (tags NOT LIKE ?2
+                AND tags NOT LIKE '%\"session_story\"%'
+                AND tags NOT LIKE '%\"session_episode\"%'
+                AND tags NOT LIKE '%\"session_briefing\"%'
+                AND tags NOT LIKE '%\"context_cache\"%'))
          ORDER BY timestamp DESC LIMIT ?3",
     )?;
     let rows = stmt
         .query_map(params![escaped, ledger_pat, fetch_limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let prefix_char_len = trimmed.chars().count();
     let matches: Vec<String> = rows
         .into_iter()
-        .filter(|(_, content)| {
+        // A pipeline-derived row (a session story, an episode) opens with the
+        // request that started its session, so an exact-prefix hit on one is
+        // the question coming back, not a memory someone wrote down under
+        // that name. Only deliberate memories are promoted.
+        .filter(|(_, _, tags)| {
+            let tags: Vec<String> = tags
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            !crate::mcp::tools::has_derived_reflection_tag(&tags)
+        })
+        .filter(|(_, content, _)| {
             content
                 .chars()
                 .nth(prefix_char_len)
                 .is_none_or(|c| !c.is_alphanumeric())
         })
-        .map(|(id, _)| id)
+        .map(|(id, _, _)| id)
         .collect();
     if matches.len() > MAX_PROMOTED_PREFIX_MATCHES {
         return Ok(Vec::new());
@@ -6053,6 +6079,59 @@ mod tests {
         assert_eq!(matches, vec!["newer".to_string(), "older".to_string()]);
     }
 
+    /// A session story opens with the request that started its session, so a
+    /// prefix hit on one is the question coming back. Only a deliberate memory
+    /// is promoted, and a story neither takes the promotion nor counts toward
+    /// the cap that withholds it.
+    #[test]
+    fn a_derived_row_is_not_promoted_by_its_prefix() {
+        let conn = mem();
+        let derived = |id: &str, tag: &str| {
+            insert_reflection(
+                &conn,
+                id,
+                "why did we drop Docker and Qdrant for a single Rust binary? --- Signature: {}",
+                &[tag.to_string(), "project_p".to_string()],
+                &[0.1; 4],
+            )
+            .unwrap();
+        };
+        for (i, tag) in [
+            "session_story",
+            "session_episode",
+            "session_briefing",
+            "context_cache",
+            "session_story",
+        ]
+        .iter()
+        .enumerate()
+        {
+            derived(&format!("story_{i}"), tag);
+        }
+        insert_reflection(
+            &conn,
+            "extracted_v3_x",
+            "why did we drop Docker and Qdrant? the extraction restates it",
+            &["narrative_extracted_v3".to_string()],
+            &[0.1; 4],
+        )
+        .unwrap();
+        insert_reflection(
+            &conn,
+            "5eb5aebb-65ab-4fba-9917-86cb83845154",
+            "why did we drop Docker and Qdrant: install burden",
+            &["csr:memory".to_string()],
+            &[0.1; 4],
+        )
+        .unwrap();
+        let matches =
+            fts5_reflection_prefix_matches(&conn, "why did we drop Docker and Qdrant", 10).unwrap();
+        assert_eq!(
+            matches,
+            vec!["5eb5aebb-65ab-4fba-9917-86cb83845154".to_string()]
+        );
+    }
+
     /// A prefix containing LIKE metacharacters must not act as a wildcard —
     /// `%` alone must never match every reflection.
     #[test]
@@ -8189,7 +8268,9 @@ mod tests {
         let prefix_hits =
             fts5_reflection_prefix_matches(&conn, "MEMORY-ARCHIVE shift-quarantine-token", 1)
                 .unwrap();
-        assert_eq!(prefix_hits, vec!["story-row".to_string()]);
+        // The ledger row is quarantined by its tag; the story row is a derived
+        // row, which an exact prefix no longer promotes.
+        assert!(prefix_hits.is_empty(), "{prefix_hits:?}");
 
         for tag in ["conv_x", "session_x", "project_csr", "narrative_shift"] {
             let rows = get_reflections_by_tag(&conn, tag, 1).unwrap();
