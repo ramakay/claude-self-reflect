@@ -52,9 +52,22 @@ use crate::search::cross_project::encode_project_folder;
 /// Conversation id to the labels its chunks may carry and still be recalled.
 pub(crate) type RepoConversations = HashMap<String, HashSet<String>>;
 
+/// The longest one evaluation may take.
+pub(crate) const PROMPT_CHECK_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// A conversation with more transcript files than this never widens. A real
 /// session has one; a stem shared across dozens of folders is not a session.
 pub(crate) const MAX_PATHS_PER_CONVERSATION: usize = 8;
+
+/// The answer of one evaluation, and which conversations it did not get to.
+/// A conversation is `unchecked` when the time ran out before every folder of
+/// it was judged, so its absence from `widened` is not a verdict and a later
+/// call may still ask.
+#[derive(Default)]
+pub(crate) struct RepoCheck {
+    pub(crate) widened: RepoConversations,
+    pub(crate) unchecked: HashSet<String>,
+}
 
 /// What one evaluation of the rule may spend, across all folders together.
 pub(crate) struct Budget {
@@ -64,12 +77,13 @@ pub(crate) struct Budget {
 }
 
 impl Budget {
-    /// One prompt: a real decode lists one directory per path component.
-    pub(crate) fn for_prompt() -> Self {
+    /// One prompt's budget (a real decode lists one directory per path
+    /// component), shortened to `limit` when less time is left.
+    pub(crate) fn within(limit: Duration) -> Self {
         Self {
             dir_reads: 64,
             git_calls: 3,
-            deadline: Instant::now() + Duration::from_millis(250),
+            deadline: Instant::now() + limit.min(PROMPT_CHECK_TIMEOUT),
         }
     }
 
@@ -101,8 +115,9 @@ pub(crate) fn conversations_in_asker_repo(
     paths_by_conversation: HashMap<String, Vec<String>>,
     projects_dir: &Path,
     asker_cwd: &Path,
-) -> RepoConversations {
-    let budget = Budget::for_prompt();
+    within: Duration,
+) -> RepoCheck {
+    let budget = Budget::within(within);
     within_deadline(paths_by_conversation, projects_dir, asker_cwd, budget)
 }
 
@@ -115,15 +130,20 @@ fn within_deadline(
     projects_dir: &Path,
     asker_cwd: &Path,
     budget: Budget,
-) -> RepoConversations {
+) -> RepoCheck {
     let deadline = budget.deadline;
+    let nothing_checked = |paths: &HashMap<String, Vec<String>>| RepoCheck {
+        widened: RepoConversations::new(),
+        unchecked: paths.keys().cloned().collect(),
+    };
     if budget.expired() {
-        return RepoConversations::new();
+        return nothing_checked(&paths_by_conversation);
     }
     let (projects_dir, asker_cwd) = (projects_dir.to_path_buf(), asker_cwd.to_path_buf());
+    let all_ids = nothing_checked(&paths_by_conversation);
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::Builder::new().spawn(move || {
-        let _ = tx.send(conversations_in_asker_repo_with(
+        let _ = tx.send(check_conversations(
             &paths_by_conversation,
             &projects_roots(&projects_dir),
             &asker_cwd,
@@ -133,10 +153,10 @@ fn within_deadline(
         ));
     });
     if worker.is_err() {
-        return RepoConversations::new();
+        return all_ids;
     }
     rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .unwrap_or_default()
+        .unwrap_or(all_ids)
 }
 
 /// Every spelling a stored transcript path may use for the configured projects
@@ -159,14 +179,36 @@ fn projects_roots(projects_dir: &Path) -> Vec<PathBuf> {
 
 /// The rule with the filesystem root and the identity probe supplied, so tests
 /// need neither a real `/Users` tree nor `git`.
+#[cfg(test)]
 pub(crate) fn conversations_in_asker_repo_with(
     paths_by_conversation: &HashMap<String, Vec<String>>,
     projects_roots: &[PathBuf],
     asker_cwd: &Path,
     fs_root: &Path,
     place_of: &dyn Fn(&Path, Instant) -> Option<GitPlace>,
-    mut budget: Budget,
+    budget: Budget,
 ) -> RepoConversations {
+    check_conversations(
+        paths_by_conversation,
+        projects_roots,
+        asker_cwd,
+        fs_root,
+        place_of,
+        budget,
+    )
+    .widened
+}
+
+/// [`conversations_in_asker_repo_with`], also saying which conversations the
+/// budget left unjudged.
+pub(crate) fn check_conversations(
+    paths_by_conversation: &HashMap<String, Vec<String>>,
+    projects_roots: &[PathBuf],
+    asker_cwd: &Path,
+    fs_root: &Path,
+    place_of: &dyn Fn(&Path, Instant) -> Option<GitPlace>,
+    mut budget: Budget,
+) -> RepoCheck {
     // Only conversations every one of whose files names a folder can pass, so
     // only their folders are worth judging. Sorted, so which folders get the
     // budget does not depend on hash order.
@@ -188,8 +230,10 @@ pub(crate) fn conversations_in_asker_repo_with(
 
     let mut asker: Option<Option<(String, Vec<PathBuf>)>> = None;
     let mut in_repo: HashSet<&str> = HashSet::new();
+    let mut failed: HashSet<&str> = HashSet::new();
     for folder in folders {
         // Once the budget is gone nothing further can pass: stop, do not decode.
+        // The folders not reached are neither in nor out of the repository.
         if budget.expired() || budget.git_calls == 0 {
             break;
         }
@@ -208,20 +252,30 @@ pub(crate) fn conversations_in_asker_repo_with(
         .is_some();
         if passed {
             in_repo.insert(folder);
+        } else if !budget.expired() {
+            // A "no" the clock did not cut short is a verdict.
+            failed.insert(folder);
         }
     }
 
-    candidates
-        .into_iter()
-        .filter(|(_, named)| named.iter().all(|folder| in_repo.contains(folder)))
-        .map(|(conversation_id, named)| {
+    let mut check = RepoCheck::default();
+    for (conversation_id, named) in candidates {
+        if named.iter().all(|folder| in_repo.contains(folder)) {
             let labels = named
                 .into_iter()
                 .map(crate::import::normalize_project_name)
                 .collect();
-            (conversation_id.clone(), labels)
-        })
-        .collect()
+            check.widened.insert(conversation_id.clone(), labels);
+        } else if named
+            .iter()
+            .any(|folder| !in_repo.contains(folder) && !failed.contains(folder))
+            && !named.iter().any(|folder| failed.contains(folder))
+        {
+            check.unchecked.insert(conversation_id.clone());
+        }
+    }
+    // A conversation that never named a folder cannot pass and is judged.
+    check
 }
 
 /// The asker's repository identity and the directories its project label
@@ -644,6 +698,53 @@ mod tests {
             ),
             ["journal=repo-sub"]
         );
+    }
+
+    /// A budget that is already spent judges nothing: the conversations are
+    /// reported unchecked, not as outside the repository. A "no" reached with
+    /// time to spare is a verdict.
+    #[test]
+    fn a_spent_budget_leaves_conversations_unchecked_and_a_no_is_judged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        mkdirs(
+            &root,
+            &["Users/u/projects/repo/.git", "Users/u/projects/repo/sub"],
+        );
+        let map: HashMap<String, Vec<String>> = [
+            (
+                "inside".to_string(),
+                vec!["/cc/projects/-Users-u-projects-repo-sub/s.jsonl".to_string()],
+            ),
+            (
+                "gone".to_string(),
+                vec!["/cc/projects/-Users-u-projects-nowhere/g.jsonl".to_string()],
+            ),
+        ]
+        .into();
+        let run = |budget: Budget| {
+            check_conversations(
+                &map,
+                &[PathBuf::from("/cc/projects")],
+                &root.join("Users/u/projects/repo"),
+                &root,
+                &nearest_git_dir,
+                budget,
+            )
+        };
+        let spent = run(Budget {
+            dir_reads: 64,
+            git_calls: 3,
+            deadline: Instant::now(),
+        });
+        assert!(spent.widened.is_empty());
+        let mut unchecked: Vec<_> = spent.unchecked.iter().cloned().collect();
+        unchecked.sort();
+        assert_eq!(unchecked, ["gone", "inside"]);
+
+        let full = run(roomy());
+        assert_eq!(full.widened.keys().collect::<Vec<_>>(), ["inside"]);
+        assert!(full.unchecked.is_empty(), "{:?}", full.unchecked);
     }
 
     #[test]

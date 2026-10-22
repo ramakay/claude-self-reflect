@@ -1571,7 +1571,14 @@ async fn search_chunks_with_vec(
         min_score,
         project,
         current_session,
-        |paths| super::scope_folder::conversations_in_asker_repo(paths, engine.projects_dir(), cwd),
+        |paths, within| {
+            super::scope_folder::conversations_in_asker_repo(
+                paths,
+                engine.projects_dir(),
+                cwd,
+                within,
+            )
+        },
     )
     .await
 }
@@ -1667,8 +1674,17 @@ const REPLENISH_CAP_FACTOR: usize = 4;
 /// embedding, reflections, pickup) needs the remainder.
 const CHUNK_SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(600);
 
-/// A refill is started only with at least this much of the budget left.
-const REFILL_MIN_REMAINING: std::time::Duration = std::time::Duration::from_millis(200);
+/// What a repository check may be given, at most
+/// ([`super::scope_folder::PROMPT_CHECK_TIMEOUT`]), and the part of the budget
+/// kept back from it for the retrieval and filtering of the same pass.
+const REPO_CHECK_MARGIN: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A refill is started only when the budget left covers its worst case: a
+/// full repository check plus the pass's own retrieval.
+const REFILL_MIN_REMAINING: std::time::Duration = std::time::Duration::from_millis(
+    super::scope_folder::PROMPT_CHECK_TIMEOUT.as_millis() as u64
+        + REPO_CHECK_MARGIN.as_millis() as u64,
+);
 
 /// [`search_chunks_with_vec`] with the repository test supplied, so unit tests
 /// decide which conversations widen without a filesystem or `git`. `same_repo`
@@ -1697,24 +1713,36 @@ async fn search_chunks_with_vec_core(
     min_score: f32,
     project: &str,
     current_session: Option<&str>,
-    mut same_repo: impl FnMut(HashMap<String, Vec<String>>) -> super::scope_folder::RepoConversations,
+    mut same_repo: impl FnMut(
+        HashMap<String, Vec<String>>,
+        std::time::Duration,
+    ) -> super::scope_folder::RepoCheck,
 ) -> Vec<RawResult> {
     let started = std::time::Instant::now();
     let cap = limit.saturating_mul(REPLENISH_CAP_FACTOR);
     let wanted = KEYWORD_FILL_SLOTS.min(limit);
     let mut fetch = limit;
     // A conversation is checked once per prompt, however many passes meet it:
-    // each check can spend its full time budget. A check that found nothing is
-    // remembered too, so a slow or failed one is not retried.
-    let mut asked: HashSet<String> = HashSet::new();
+    // each check can spend its full time budget. Only a completed check is
+    // remembered, "not this repository" included. A conversation the check ran
+    // out of time before judging stays askable, and is not asked at all once
+    // too little of the search budget is left to give a check any time.
+    let mut checked: HashSet<String> = HashSet::new();
     let mut widened: super::scope_folder::RepoConversations = HashMap::new();
     let mut checked_once = |paths: HashMap<String, Vec<String>>| {
         let fresh: HashMap<String, Vec<String>> = paths
             .into_iter()
-            .filter(|(conversation, _)| asked.insert(conversation.clone()))
+            .filter(|(conversation, _)| !checked.contains(conversation))
             .collect();
-        if !fresh.is_empty() {
-            widened.extend(same_repo(fresh));
+        let within = CHUNK_SEARCH_BUDGET
+            .saturating_sub(started.elapsed())
+            .saturating_sub(REPO_CHECK_MARGIN)
+            .min(super::scope_folder::PROMPT_CHECK_TIMEOUT);
+        if !fresh.is_empty() && !within.is_zero() {
+            let ids: Vec<String> = fresh.keys().cloned().collect();
+            let check = same_repo(fresh, within);
+            checked.extend(ids.into_iter().filter(|id| !check.unchecked.contains(id)));
+            widened.extend(check.widened);
         }
         widened.clone()
     };
@@ -2887,7 +2915,7 @@ mod tests {
             0.0,
             "project",
             None,
-            |_| HashMap::new(),
+            |_, _| Default::default(),
         )
         .await;
 
@@ -3117,7 +3145,7 @@ mod tests {
             0.55,
             "project",
             None,
-            |_| HashMap::new(),
+            |_, _| Default::default(),
         )
         .await;
         let ids: Vec<_> = results
@@ -3226,9 +3254,9 @@ mod tests {
             0.55,
             "project",
             None,
-            |_| {
+            |_, _| {
                 calls.set(calls.get() + 1);
-                HashMap::new()
+                Default::default()
             },
         )
         .await;
@@ -3253,10 +3281,10 @@ mod tests {
             0.55,
             "project",
             None,
-            |_| {
+            |_, _| {
                 calls.set(calls.get() + 1);
                 std::thread::sleep(std::time::Duration::from_millis(250));
-                HashMap::new()
+                Default::default()
             },
         )
         .await;
@@ -3266,6 +3294,68 @@ mod tests {
             "{:?}",
             began.elapsed()
         );
+    }
+
+    /// Checks of 190, 190 and 250 ms add up to 630 ms: a pass must not start
+    /// unless the budget left covers the worst check, so the whole search
+    /// stays inside 600 ms.
+    #[tokio::test]
+    async fn checks_of_190_190_and_250_ms_stay_inside_the_budget() {
+        let (engine, _root) = refill_engine(|i| format!("conv-dump-{i}")).await;
+        let delays = [190u64, 190, 250];
+        let calls = std::cell::Cell::new(0usize);
+        let began = std::time::Instant::now();
+        let _ = search_chunks_with_vec_core(
+            &engine,
+            "",
+            crate::search::hybrid::SearchMode::Vector,
+            &[1.0, 0.0],
+            15,
+            0.55,
+            "project",
+            None,
+            |_, within| {
+                let at = calls.get();
+                calls.set(at + 1);
+                assert!(within <= std::time::Duration::from_millis(250));
+                std::thread::sleep(std::time::Duration::from_millis(delays[at.min(2)]));
+                Default::default()
+            },
+        )
+        .await;
+        assert!(
+            began.elapsed() <= std::time::Duration::from_millis(600),
+            "{:?} over {} checks",
+            began.elapsed(),
+            calls.get()
+        );
+    }
+
+    /// A check that ran out of time judged nothing: its conversations are not
+    /// "not this repository", and a later pass asks again.
+    #[tokio::test]
+    async fn a_conversation_the_check_never_reached_is_asked_again() {
+        let (engine, _root) = refill_engine(|_| "conv-shared".into()).await;
+        let calls = std::cell::Cell::new(0usize);
+        let _ = search_chunks_with_vec_core(
+            &engine,
+            "",
+            crate::search::hybrid::SearchMode::Vector,
+            &[1.0, 0.0],
+            15,
+            0.55,
+            "project",
+            None,
+            |paths, _| {
+                calls.set(calls.get() + 1);
+                super::super::scope_folder::RepoCheck {
+                    widened: Default::default(),
+                    unchecked: paths.keys().cloned().collect(),
+                }
+            },
+        )
+        .await;
+        assert!(calls.get() >= 2, "{} checks", calls.get());
     }
 
     /// Four external-floor chunks match the query equally. The one that only
@@ -3335,7 +3425,7 @@ mod tests {
             0.0,
             "project",
             None,
-            |_| HashMap::new(),
+            |_, _| Default::default(),
         )
         .await;
         let mut ids: Vec<_> = results
@@ -3471,7 +3561,7 @@ mod tests {
             0.5,
             "project",
             Some("current-session"),
-            |_| HashMap::new(),
+            |_, _| Default::default(),
         )
         .await
         .into_iter()
@@ -3652,7 +3742,7 @@ mod tests {
             0.0,
             "project",
             None,
-            |_| HashMap::new(),
+            |_, _| Default::default(),
         )
         .await;
         let ids: Vec<_> = results
@@ -3703,7 +3793,7 @@ mod tests {
             0.0,
             "project",
             None,
-            |_| HashMap::new(),
+            |_, _| Default::default(),
         )
         .await;
         let ids: Vec<_> = results
@@ -3841,7 +3931,7 @@ mod tests {
                     0.0,
                     "project",
                     session,
-                    |_| HashMap::new(),
+                    |_, _| Default::default(),
                 )
                 .await
                 .into_iter()
@@ -3913,12 +4003,15 @@ mod tests {
             0.0,
             project,
             None,
-            |paths| {
+            |paths, _| {
                 *seen.borrow_mut() = Some(paths.clone());
-                widen
-                    .iter()
-                    .map(|(id, label)| (id.to_string(), HashSet::from([label.to_string()])))
-                    .collect()
+                super::super::scope_folder::RepoCheck {
+                    widened: widen
+                        .iter()
+                        .map(|(id, label)| (id.to_string(), HashSet::from([label.to_string()])))
+                        .collect(),
+                    unchecked: HashSet::new(),
+                }
             },
         )
         .await
