@@ -2481,11 +2481,12 @@ const GEN_BUMP_PROJECT: &str = "INSERT INTO code_graph_project_gen (project, gen
 /// a body, so a changed body needs a new revision to be swapped in once.
 const GRAPH_GEN_TRIGGERS_REV_KEY: &str = "graph_gen_triggers_rev";
 
-/// Revision 2: no write bumps every project any more (see below).
-const GRAPH_GEN_TRIGGERS_REV: &str = "2";
+/// Revision 3: no write bumps every project any more, and the co-edit counters
+/// live in their own table (see below).
+const GRAPH_GEN_TRIGGERS_REV: &str = "3";
 
-/// Triggers whose body changed in revision 2.
-const GRAPH_GEN_TRIGGERS_REV2: [&str; 6] = [
+/// Triggers whose body changed since revision 1.
+const GRAPH_GEN_TRIGGERS_CHANGED: [&str; 6] = [
     "code_edges_gen_ai",
     "code_edges_gen_au",
     "code_edges_gen_ad",
@@ -2518,32 +2519,55 @@ fn edge_orphan_dst_bump(row: &str) -> String {
     )
 }
 
-/// Co-edit evidence written for file `file`: bump the co-edit counter of each
-/// project that has a node in that file. The key is `COEDIT_GEN_PREFIX` + the
-/// project; `codegraph::project_gen` adds it to the project's counter and
-/// `codegraph::dirty_projects` holds a project dirtied only by it off for
-/// `STAR_ONLY_COOLDOWN_SECS`.
+/// SQL for the last path component of `p`, a path expression. A path with no
+/// `/` is its own last component. The same expression on `code_nodes.file` is
+/// the key of `idx_code_nodes_basename`, so the two sides must stay spelled alike.
+fn basename_sql(p: &str) -> String {
+    format!("substr({p}, length(rtrim({p}, replace({p}, '/', ''))) + 1)")
+}
+
+/// Co-edit evidence written by a `code_evolution` row (`file`, `project`
+/// expressions): bump the co-edit counter of every project that may read it.
 ///
-/// Why per file is enough: the co-edit tier (`resolver::coedit_weight`) scores a
-/// pair of files `(f, d)` of ONE project by the sessions that touched both, so a
-/// row for file `x` changes the answer only where `x` is `f` or `d`, and both
-/// are files of the project's own nodes. The row's `project_name` does not
-/// matter (the row still counts for whichever project owns the file), and a row
-/// for a file no project has nodes in changes nothing; if a node appears there
-/// later, the node's own trigger bumps the project. `file_path` is stored as the
-/// canonical repo path and the resolver compares it with the canonical spelling
-/// of the node's file; `/tmp`, `/var` and `/etc` are symlinks into `/private`, so
-/// both spellings are matched.
-fn coedit_bump(file: &str) -> String {
+/// What is read: the co-edit tier (`resolver::coedit_weight`) scores a pair of
+/// files `(f, d)` of ONE project by the sessions that touched both, comparing the
+/// row's `file_path` with `canon_path(node.file)`. So a row for path `x` changes
+/// the answer of project `P` only if `canon(f)` or `canon(d)` is `x` for some node
+/// file of `P`. The trigger cannot call `canon`, and it depends on the file system
+/// (a linked worktree's `.git` file), so it covers every spelling `canon` can
+/// give instead: `canon` keeps the repo-relative tail of a path when it maps a
+/// linked worktree onto its main checkout, and resolves directory symlinks
+/// (`/tmp` to `/private/tmp`), so the last path component of a node's file is the
+/// last path component of its canonical form. A project is bumped when
+///
+///   1. one of its nodes' files ends in the row's last path component, or
+///   2. it is the project the row is labelled with (`project_name`), which is the
+///      project the hook resolved the edited path to; this also covers a legacy
+///      node stored under a symlink whose target has another name.
+///
+/// That is a superset of what the tier reads. It over-bumps (a row for `mod.rs`
+/// reaches every project with a `mod.rs`), which costs at most one pass per
+/// project per `STAR_ONLY_COOLDOWN_SECS`, because these counters only ask for a
+/// pass after the cooldown. Both lookups are indexed (`idx_code_nodes_basename`).
+///
+/// A node that appears in the file later is covered by the node's own trigger.
+///
+/// The counters are rows of `code_graph_project_coedit`, not of
+/// `code_graph_project_gen`: a binary from before this table lists the project
+/// counter rows as projects, and would treat these as projects.
+fn coedit_bump(file: &str, project: &str) -> String {
+    let base = basename_sql(file);
+    let node_base = basename_sql("n.file");
     format!(
-        "INSERT INTO code_graph_project_gen (project, gen)
-           SELECT '{prefix}' || n.project, 1 FROM code_nodes n
-           WHERE n.file IN ({file}, '/private' || {file},
-                            CASE WHEN {file} LIKE '/private/%' THEN substr({file}, 9) END)
+        "INSERT INTO code_graph_project_coedit (project, gen)
+           SELECT n.project, 1 FROM code_nodes n
+           WHERE {node_base} = {base}
              AND n.project IS NOT NULL AND n.project != ''
            GROUP BY n.project
-           ON CONFLICT(project) DO UPDATE SET gen = gen + 1;",
-        prefix = crate::storage::codegraph::COEDIT_GEN_PREFIX,
+           ON CONFLICT(project) DO UPDATE SET gen = gen + 1;
+         INSERT INTO code_graph_project_coedit (project, gen)
+           SELECT {project}, 1 WHERE {project} IS NOT NULL AND {project} != ''
+           ON CONFLICT(project) DO UPDATE SET gen = gen + 1;"
     )
 }
 
@@ -2562,6 +2586,20 @@ fn coedit_bump(file: &str) -> String {
 /// between rows, so the drain never went idle. Each write now bumps the
 /// projects it can change the answer of (see [`edge_src_bump`] and
 /// [`coedit_bump`] for the argument).
+///
+/// Coexistence with a binary from before revision 3. Such a binary reads only a
+/// project's own counter and `'*'` when it checks a plan, so it cannot see a
+/// co-edit bump. Who can drain: the daemon, every MCP server (as a follower,
+/// when no capable drainer has a fresh heartbeat) and `csr-engine codegraph
+/// drain`; the post-tool-use hook only queues. An MCP server of the old build
+/// stays up for hours after an install, so the swap pins the heartbeat the old
+/// build reads (`graph_drain::LEGACY_HEARTBEAT_PIN`, in the same transaction)
+/// and the new build re-pins it on every beat: an old follower always finds a
+/// capable drainer and stands down. The new build reads its own key. What is
+/// left is an old daemon (the install stops it first) or a hand-run old CLI; a
+/// plan of theirs that races a co-edit row can bind from stale weights, and
+/// since they settle a project with an every-project value that lacks the
+/// project's co-edit counter, the new build re-resolves it after the cooldown.
 ///
 /// The resolver's own edge updates fire the edge trigger too: the plan they
 /// belong to has been applied, and the rank plan reads its counter after the
@@ -2638,7 +2676,7 @@ fn create_graph_gen_triggers(conn: &Connection) -> Result<()> {
         "code_evolution_gen_ai",
         "INSERT",
         "code_evolution",
-        coedit_bump("NEW.file_path"),
+        coedit_bump("NEW.file_path", "NEW.project_name"),
     );
     trigger(
         "code_evolution_gen_au",
@@ -2646,17 +2684,27 @@ fn create_graph_gen_triggers(conn: &Connection) -> Result<()> {
         "code_evolution",
         format!(
             "{} {}",
-            coedit_bump("OLD.file_path"),
-            coedit_bump("NEW.file_path")
+            coedit_bump("OLD.file_path", "OLD.project_name"),
+            coedit_bump("NEW.file_path", "NEW.project_name")
         ),
     );
     trigger(
         "code_evolution_gen_ad",
         "DELETE",
         "code_evolution",
-        coedit_bump("OLD.file_path"),
+        coedit_bump("OLD.file_path", "OLD.project_name"),
     );
 
+    // The co-edit counters (see `coedit_bump`) and the index its lookup uses.
+    // Both are additive and `IF NOT EXISTS`, so up to date they write nothing.
+    let schema = format!(
+        "CREATE TABLE IF NOT EXISTS code_graph_project_coedit (
+             project TEXT PRIMARY KEY,
+             gen     INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS idx_code_nodes_basename ON code_nodes ({});",
+        basename_sql("file")
+    );
     let rev = |c: &Connection| -> Result<Option<String>> {
         Ok(c.query_row(
             "SELECT value FROM meta WHERE key = ?1",
@@ -2667,6 +2715,7 @@ fn create_graph_gen_triggers(conn: &Connection) -> Result<()> {
     };
     if rev(conn)?.as_deref() == Some(GRAPH_GEN_TRIGGERS_REV) {
         // Up to date; recreates a trigger someone dropped, otherwise a no-op.
+        conn.execute_batch(&schema)?;
         conn.execute_batch(&sql)?;
         return Ok(());
     }
@@ -2675,10 +2724,25 @@ fn create_graph_gen_triggers(conn: &Connection) -> Result<()> {
     if rev(&tx)?.as_deref() == Some(GRAPH_GEN_TRIGGERS_REV) {
         return Ok(());
     }
-    for name in GRAPH_GEN_TRIGGERS_REV2 {
+    for name in GRAPH_GEN_TRIGGERS_CHANGED {
         tx.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))?;
     }
+    tx.execute_batch(&schema)?;
     tx.execute_batch(&sql)?;
+    // A build that never shipped kept these in the project counter table.
+    tx.execute(
+        "DELETE FROM code_graph_project_gen WHERE substr(project, 1, 8) = '*coedit:'",
+        [],
+    )?;
+    // Old drainers stand down (see above); same transaction as the new bodies.
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [
+            crate::extraction::graph_drain::LEGACY_HEARTBEAT_KEY,
+            crate::extraction::graph_drain::LEGACY_HEARTBEAT_PIN,
+        ],
+    )?;
     // After the new triggers exist, so each delete bumps the edge's destination
     // project.
     tx.execute(

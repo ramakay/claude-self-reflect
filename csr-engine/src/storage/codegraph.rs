@@ -150,20 +150,29 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
     })
 }
 
-/// Prefix of the `code_graph_project_gen` rows that count the co-edit evidence
-/// written for each project's files: `COEDIT_GEN_PREFIX` + project. A project
-/// name never starts with `*`, so these cannot be mistaken for projects.
-pub const COEDIT_GEN_PREFIX: &str = "*coedit:";
+/// The project's co-edit counter (`code_graph_project_coedit`, 0 before any
+/// co-edit row for one of its files).
+fn coedit_gen(conn: &Connection, project: &str) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT gen FROM code_graph_project_coedit WHERE project = ?1",
+            params![project],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
 
 /// The project's resolve-input counter (0 before any write): its own row, the
 /// every-project row (`'*'`, which no trigger bumps now) and its co-edit row.
 pub fn project_gen(conn: &Connection, project: &str) -> Result<i64> {
-    Ok(conn.query_row(
+    let rows: i64 = conn.query_row(
         "SELECT COALESCE(SUM(gen), 0) FROM code_graph_project_gen
-         WHERE project = ?1 OR project = '*' OR project = ?2",
-        params![project, format!("{COEDIT_GEN_PREFIX}{project}")],
+         WHERE project = ?1 OR project = '*'",
+        params![project],
         |r| r.get(0),
-    )?)
+    )?;
+    Ok(rows + coedit_gen(conn, project)?)
 }
 
 /// Unix seconds now.
@@ -197,7 +206,7 @@ fn gen_row(conn: &Connection, project: &str) -> Result<i64> {
 pub fn project_gen_parts(conn: &Connection, project: &str) -> Result<GenParts> {
     Ok(GenParts {
         own: gen_row(conn, project)?,
-        star: gen_row(conn, "*")? + gen_row(conn, &format!("{COEDIT_GEN_PREFIX}{project}"))?,
+        star: gen_row(conn, "*")? + coedit_gen(conn, project)?,
     })
 }
 
@@ -239,15 +248,14 @@ pub fn dirty_projects(conn: &Connection, now_secs: i64) -> Result<Vec<String>> {
     let star = gen_row(conn, "*")?;
     let mut stmt = conn.prepare(
         "SELECT g.project, g.gen, COALESCE(s.own, 0), COALESCE(s.star, 0), COALESCE(s.settled_at, 0),
-                COALESCE((SELECT c.gen FROM code_graph_project_gen c
-                          WHERE c.project = ?1 || g.project), 0)
+                COALESCE(c.gen, 0)
          FROM code_graph_project_gen g
          LEFT JOIN code_graph_project_settled s ON s.project = g.project
+         LEFT JOIN code_graph_project_coedit c ON c.project = g.project
          WHERE g.project != '*' AND g.project != ''
-           AND substr(g.project, 1, length(?1)) != ?1
          ORDER BY g.project",
     )?;
-    let rows = stmt.query_map(params![COEDIT_GEN_PREFIX], |r| {
+    let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)?,
@@ -2663,8 +2671,9 @@ mod tests {
         .unwrap();
     }
 
-    /// A co-edit row moves the counters of the projects with a node in its file,
-    /// and no other: not every project, not the project it is labelled with.
+    /// A co-edit row moves the counters of the projects with a node in its file
+    /// (or one that ends in the same file name) and of the project it is
+    /// labelled with, and no other: not every project.
     #[test]
     fn a_coedit_row_moves_only_the_projects_that_own_its_file() {
         let conn = fresh_db();
@@ -2678,7 +2687,7 @@ mod tests {
 
         // A file no project has nodes in, labelled with p.
         conn.execute(
-            "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES ('e0', 's', 'p', '/r/none.rs')",
+            "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES ('e0', 's', 'nobody', '/r/none.rs')",
             [],
         )
         .unwrap();
@@ -2690,9 +2699,9 @@ mod tests {
             (p0, q0)
         );
 
-        // p's file, labelled with q: p moves, q does not.
+        // p's file, labelled with nobody: p moves, q does not.
         conn.execute(
-            "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES ('e1', 's', 'q', '/r/a.rs')",
+            "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES ('e1', 's', 'nobody', '/r/a.rs')",
             [],
         )
         .unwrap();
@@ -2876,5 +2885,94 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM code_edges", [], |r| r.get(0))
             .unwrap();
         assert_eq!(edges, 2, "an up-to-date database is not swept again");
+    }
+
+    /// A node stored under a linked worktree's path, a row stored under the
+    /// canonical main path: the resolver canonicalizes the node's file onto the
+    /// row's, so the trigger has to reach it by the shared tail.
+    #[test]
+    fn a_coedit_row_under_the_main_path_reaches_a_node_stored_under_a_worktree() {
+        let conn = fresh_db();
+        plain_node(&conn, "n1", "p", "/wt/.claude/worktrees/x/src/deep/b.rs");
+        plain_node(&conn, "n2", "q", "/elsewhere/src/other.rs");
+        let (p0, q0) = (
+            project_gen(&conn, "p").unwrap(),
+            project_gen(&conn, "q").unwrap(),
+        );
+        evolution_for(&conn, "e1", "nobody", "/main/src/deep/b.rs");
+        assert!(project_gen(&conn, "p").unwrap() > p0);
+        assert_eq!(project_gen(&conn, "q").unwrap(), q0);
+        // A file with no slash is its own last component.
+        plain_node(&conn, "n3", "q", "lone.rs");
+        let q1 = project_gen(&conn, "q").unwrap();
+        evolution_for(&conn, "e2", "nobody", "lone.rs");
+        assert!(project_gen(&conn, "q").unwrap() > q1);
+        // The lookup is by index.
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM code_nodes n WHERE substr(n.file, length(rtrim(n.file, replace(n.file, '/', ''))) + 1) = 'b.rs'",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("idx_code_nodes_basename"), "{plan}");
+    }
+
+    fn evolution_for(conn: &Connection, id: &str, label: &str, file: &str) {
+        conn.execute(
+            "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES (?1, 's', ?2, ?3)",
+            params![id, label, file],
+        )
+        .unwrap();
+    }
+
+    /// The swap pins the heartbeat a build from before the co-edit counters
+    /// reads, in the same step as the new trigger bodies, and removes the
+    /// counter rows an earlier revision kept among the projects.
+    #[test]
+    fn the_swap_makes_an_old_follower_stand_down() {
+        let conn = fresh_db();
+        let pin = |c: &Connection| -> Option<String> {
+            c.query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [crate::extraction::graph_drain::LEGACY_HEARTBEAT_KEY],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        let stored = pin(&conn);
+        // What the old build does with the stored beat: it is a fresh, capable
+        // drainer that is not itself.
+        assert!(crate::extraction::graph_drain::other_drainer_is_live(
+            stored.as_deref(),
+            "mcp-1-0",
+            now_secs() as u64
+        ));
+
+        // An older revision: the beat is an old daemon's, and a counter row sits
+        // among the projects.
+        conn.execute("DELETE FROM meta WHERE key = 'graph_gen_triggers_rev'", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE meta SET value = '1 1 daemon-1-0' WHERE key = ?1",
+            [crate::extraction::graph_drain::LEGACY_HEARTBEAT_KEY],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_graph_project_gen (project, gen) VALUES ('*coedit:p', 4)",
+            [],
+        )
+        .unwrap();
+        crate::storage::migrations::run(&conn).unwrap();
+        assert_eq!(pin(&conn), stored);
+        let leftovers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_graph_project_gen WHERE project LIKE '*coedit:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0);
     }
 }

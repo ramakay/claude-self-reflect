@@ -70,7 +70,17 @@ const LOCK_FILE: &str = "graph-drain.lock";
 pub const DRAIN_CAPABILITY: u32 = 1;
 
 /// `meta` key of the drainer heartbeat: `<unix seconds> <capability> <owner>`.
-pub const HEARTBEAT_KEY: &str = "graph_drain_heartbeat";
+pub const HEARTBEAT_KEY: &str = "graph_drain_heartbeat_v2";
+
+/// The key a build from before the co-edit counters read. Those builds cannot
+/// see a co-edit bump when they check a plan, so they must not drain: this key
+/// holds [`LEGACY_HEARTBEAT_PIN`], a beat that never goes stale, written by the
+/// trigger swap and re-written by every beat of this build. A build that reads
+/// it stands down for a capable drainer that is always there.
+pub const LEGACY_HEARTBEAT_KEY: &str = "graph_drain_heartbeat";
+
+/// A capable drainer's beat dated 2100-01-01.
+pub const LEGACY_HEARTBEAT_PIN: &str = "4102444800 1 csr-engine-coedit-counters";
 
 /// How old a heartbeat may be and still count as a live drainer.
 pub const HEARTBEAT_FRESH_SECS: u64 = 60;
@@ -87,6 +97,16 @@ pub fn beat(storage: &Storage, owner: &str) {
     let value = format!("{} {} {}", unix_now(), DRAIN_CAPABILITY, owner);
     if let Err(e) = storage.set_meta(HEARTBEAT_KEY, &value) {
         tracing::debug!("graph drain heartbeat not written: {e}");
+    }
+    // An old daemon's own beat overwrites the pin; put it back.
+    if storage
+        .get_meta(LEGACY_HEARTBEAT_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some(LEGACY_HEARTBEAT_PIN)
+    {
+        let _ = storage.set_meta(LEGACY_HEARTBEAT_KEY, LEGACY_HEARTBEAT_PIN);
     }
 }
 
@@ -1610,7 +1630,7 @@ mod tests {
                 .with_connection(|c| {
                     c.execute(
                         "INSERT INTO code_evolution (id, session_id, project_name, file_path)
-                         VALUES (?1, 's', 'proj', ?2)",
+                         VALUES (?1, 's', 'unrelated', ?2)",
                         rusqlite::params![format!("e{i}"), file],
                     )?;
                     Ok(())
@@ -1630,7 +1650,7 @@ mod tests {
                 )?;
                 c.execute(
                     "INSERT INTO code_evolution (id, session_id, project_name, file_path)
-                     VALUES ('e9', 's', 'proj', 'z.rs')",
+                     VALUES ('e9', 's', 'unrelated', 'z.rs')",
                     [],
                 )?;
                 Ok(())
@@ -1692,6 +1712,130 @@ mod tests {
         assert!(drain_if_pending(&storage, &db).unwrap().is_none());
         age_settled(&storage);
         assert!(drain_if_pending(&storage, &db).unwrap().is_none());
+    }
+
+    /// A linked worktree's nodes, the co-edit rows under the canonical main
+    /// paths (what the hook stores). A plan made with weights A=2, B=1 binds the
+    /// call to A; B's second shared session lands before the plan is applied, so
+    /// the weights are 2:2 and the plan must be dropped, not applied.
+    #[test]
+    fn a_coedit_row_under_the_main_path_drops_a_plan_made_from_worktree_nodes() {
+        use std::io::Write;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (main, wt) = (tmp.path().join("main"), tmp.path().join("wt"));
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        for f in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(main.join("src").join(f), b"").unwrap();
+        }
+        writeln!(
+            std::fs::File::create(wt.join(".git")).unwrap(),
+            "gitdir: {}/.git/worktrees/wt",
+            main.display()
+        )
+        .unwrap();
+        let canonical = |f: &str| {
+            std::fs::canonicalize(main.join("src").join(f))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let wt_file = |f: &str| wt.join("src").join(f).to_string_lossy().into_owned();
+
+        let db = tmp.path().join("csr-engine.db");
+        let storage = Storage::open(&db).unwrap();
+        storage
+            .with_connection(|c| {
+                upsert_node(c, &def("tgt_a", &wt_file("a.rs"), "target"))?;
+                upsert_node(c, &def("tgt_b", &wt_file("b.rs"), "target"))?;
+                upsert_node(c, &def("caller", &wt_file("c.rs"), "caller"))?;
+                codegraph::replace_file_edges(
+                    c,
+                    "proj",
+                    &wt_file("c.rs"),
+                    &[call("caller", "target", &wt_file("c.rs"))],
+                )?;
+                for (session, file) in [
+                    ("s1", "c.rs"),
+                    ("s1", "a.rs"),
+                    ("s1", "b.rs"),
+                    ("s2", "c.rs"),
+                    ("s2", "a.rs"),
+                ] {
+                    c.execute(
+                        "INSERT INTO code_evolution (id, session_id, project_name, file_path)
+                         VALUES (?1, ?2, 'unrelated', ?3)",
+                        rusqlite::params![format!("{session}:{file}"), session, canonical(file)],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .upsert_code_file_state_pending("proj", &wt_file("c.rs"), "h")
+            .unwrap();
+
+        let hook = Storage::open(&db).unwrap();
+        let landed = std::cell::Cell::new(false);
+        let report = storage
+            .with_connection(|c| {
+                drain_with(
+                    c,
+                    &|_: &str| true,
+                    &|phase| {
+                        if matches!(phase, Phase::ResolvePlanned { .. }) && !landed.replace(true) {
+                            hook.with_connection(|h| {
+                                h.execute(
+                                    "INSERT INTO code_evolution (id, session_id, project_name, file_path)
+                                     VALUES ('s2:b.rs', 's2', 'unrelated', ?1)",
+                                    [canonical("b.rs")],
+                                )?;
+                                Ok(())
+                            })
+                            .unwrap();
+                        }
+                    },
+                )
+            })
+            .unwrap();
+        assert!(landed.get());
+        assert!(report.replans >= 1, "the plan made at 2:1 was applied");
+        let (dst, resolved): (String, i64) = storage
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT dst_id, resolved FROM code_edges WHERE src_id = 'caller'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            (dst.as_str(), resolved),
+            ("name:target", 0),
+            "2:2 binds nothing"
+        );
+    }
+
+    /// The beat is written for this build's followers and the legacy key keeps
+    /// the pin an old build reads, even after an old daemon overwrote it.
+    #[test]
+    fn a_beat_keeps_the_legacy_heartbeat_pinned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::open(&dir.path().join("csr-engine.db")).unwrap();
+        storage
+            .set_meta(
+                LEGACY_HEARTBEAT_KEY,
+                &format!("{} 1 daemon-9-9", unix_now()),
+            )
+            .unwrap();
+        beat(&storage, "daemon-1-1");
+        assert_eq!(
+            storage.get_meta(LEGACY_HEARTBEAT_KEY).unwrap().as_deref(),
+            Some(LEGACY_HEARTBEAT_PIN)
+        );
+        assert!(another_drainer_is_live(&storage, "mcp-2-2"));
+        assert!(!another_drainer_is_live(&storage, "daemon-1-1"));
     }
 
     /// Upgrading from a build with no settled table: the old drain settled every
