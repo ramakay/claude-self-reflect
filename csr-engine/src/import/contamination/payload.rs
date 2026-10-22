@@ -9,6 +9,13 @@
 //! format_search_results` and `format_why_labeled`), including a chunk-sized
 //! fragment cut anywhere inside it and the JSON-escaped form a wrapper leaves.
 //!
+//! Two strengths. [`is_csr_emission`] is exact: a complete search-result
+//! envelope, a `csr_why` result in its emitted shape, or a bare call marker.
+//! Import drops only those, so a quoted token or attribute in prose or code is
+//! never data loss. [`is_csr_tool_payload`] adds the density and fragment rules
+//! for search, which only ever re-orders: a chunk cut from the middle of an
+//! emission, or one row of a dump, sinks without being dropped.
+//!
 //! A token can occur in prose, in source code and in a test that quotes the
 //! format, and a whole tool result (a `Read` of `format/mod.rs`, a diff) must
 //! not be taken for CSR's output because it holds one. So the grammar has to
@@ -38,8 +45,21 @@ token!(PERFORMANCE_LINE, r"⚡ PERFORMANCE: \d+ms \(");
 // chunk cut inside the element.
 token!(
     SUMMARY_OPEN,
-    r#"(?:<summary count=\\?"\d+\\?" )?relevance=\\?"(?:keyword\\?"|[a-z ]+\\?" top-score=\\?"\d)"#
+    r#"<summary count=\\?"\d+\\?" relevance=\\?"keyword\\?"|relevance=\\?"[a-z ]+\\?" top-score=\\?"\d"#
 );
+// A complete search-result envelope, header to closing tag. The excerpts in
+// between can be any length and hold anything, quoted CSR output included.
+token!(
+    ENVELOPE,
+    r"(?s)\x{1F3AF} RESULTS: \d+ match[^\n]*\n(?:\x{26A1} PERFORMANCE: \d+ms[^\n]*\n)?\n<search>\n.*</search>"
+);
+// A `csr_why` result from its first line: the header, a blank line, then
+// either the empty answer or a conversation group whose first line is an item.
+token!(
+    WHY_COMPLETE,
+    r"(?s)\A\s*WHY: [^\n]*\n\n(?:No evidence chain found\.|conv_[0-9a-f]{8}-[0-9a-f-]{27}:\n\s+(?:best_via=[a-z_]+ reached_by=\S+ route_scores=\S* score=\d|via=\S+ score=\d\.\d+ \[))"
+);
+
 token!(RESULT_OPEN, r#"<r rank=\\?"\d+\\?">"#);
 token!(EXCERPT_OPEN, r"<excerpt><!\[CDATA\[[^{]");
 token!(TRUST_TAG, r"<trust>[a-z_]+</trust>");
@@ -80,14 +100,58 @@ const CALL_ONLY_RESIDUE_CHARS: usize = 40;
 /// format carries a handful in thousands of characters.
 const DENSITY_CHARS: usize = 400;
 
+/// Text allowed around a complete envelope (a shell's `Exit code` line, a
+/// wrapper's label) before it is no longer the emission but something that
+/// holds one.
+const ENVELOPE_RESIDUE_BYTES: usize = 200;
+
 /// A lone line of an emitter's grammar makes a short fragment a payload only
 /// when it is at least this share (as 1/n) of the fragment: a chunk cut inside
 /// the XML is mostly the grammar, a sentence that quotes it is not.
 const FRAGMENT_SHARE_DENOM: usize = 4;
 
+/// Whether `text` is, whole, something CSR emitted: a complete search-result
+/// envelope, a `csr_why` result in its emitted shape, or the bare rendering of
+/// a CSR tool call. Nothing short of the whole emission qualifies.
+pub fn is_csr_emission(text: &str) -> bool {
+    if text.len() < 12 {
+        return false;
+    }
+    // A wrapper that serialises the result leaves its line breaks as `\n`.
+    let unescaped;
+    let text = if !text.contains('\n') && text.contains("\\n") {
+        unescaped = text.replace("\\n", "\n").replace("\\\"", "\"");
+        unescaped.as_str()
+    } else {
+        text
+    };
+    if let Some(found) = ENVELOPE.find(text) {
+        let body = found.as_str();
+        let residue = text.len() - found.len();
+        if residue <= ENVELOPE_RESIDUE_BYTES
+            && body.contains("<meta>")
+            && body.contains("<results>")
+            && body.contains("</results>")
+        {
+            return true;
+        }
+    }
+    if WHY_COMPLETE.is_match(text) {
+        return true;
+    }
+    CSR_CALL_MARKER.is_match(text) && {
+        let residue = ANY_TOOL_MARKER.replace_all(text, "");
+        residue.trim().chars().count() <= CALL_ONLY_RESIDUE_CHARS
+    }
+}
+
 /// Whether `text` (or a fragment of a chunk) is CSR's own search-result or
-/// `csr_why` output, or the bare rendering of a CSR tool call.
+/// `csr_why` output: a whole emission ([`is_csr_emission`]), or text the
+/// emitter grammar dominates. For ordering only; import never drops on this.
 pub fn is_csr_tool_payload(text: &str) -> bool {
+    if is_csr_emission(text) {
+        return true;
+    }
     if text.len() < 12 {
         return false;
     }
@@ -118,16 +182,8 @@ pub fn is_csr_tool_payload(text: &str) -> bool {
         .map(|token| token.find_iter(text).count())
         .sum();
     let hits = strong_hits + loose_hits;
-    if hits >= 2 && hits * DENSITY_CHARS >= text.len() {
-        return true;
-    }
-    if strong_hits == 1 && loose_hits == 0 && strong_span * FRAGMENT_SHARE_DENOM >= text.len() {
-        return true;
-    }
-    CSR_CALL_MARKER.is_match(text) && {
-        let residue = ANY_TOOL_MARKER.replace_all(text, "");
-        residue.trim().chars().count() <= CALL_ONLY_RESIDUE_CHARS
-    }
+    (hits >= 2 && hits * DENSITY_CHARS >= text.len())
+        || (strong_hits == 1 && loose_hits == 0 && strong_span * FRAGMENT_SHARE_DENOM >= text.len())
 }
 
 #[cfg(test)]
@@ -221,6 +277,48 @@ mod tests {
     fn a_dense_search_result_block_is_still_a_payload() {
         let block = format!("{SEARCH_HEAD}\n  <meta><q>why did we drop Qdrant</q></meta>\n  <results>\n    <r rank=\"1\">\n      <s>0.683</s>\n      <excerpt><![CDATA[why did we drop Docker and Qdrant for a single Rust binary?]]></excerpt>\n      <cid>story_c95f</cid>\n      <trust>external</trust>\n    </r>\n    <r rank=\"2\">\n      <s>0.746</s>\n      <excerpt><![CDATA[Checking past sessions.]]></excerpt>\n      <cid>c95f</cid>\n      <trust>user_history</trust>\n    </r>");
         assert!(is_csr_tool_payload(&block));
+    }
+
+    /// Finding 5: one quoted attribute in a sentence is not output.
+    #[test]
+    fn a_quoted_keyword_attribute_in_prose_is_not_a_payload() {
+        let fix = "Fix: escape relevance=\"keyword\" before decoding.";
+        assert!(!is_csr_tool_payload(fix));
+        assert!(!is_csr_emission(fix));
+        assert!(!is_csr_emission(
+            "The parser fails on <summary count=\"5\" relevance=\"partial\">.\nFix: escape attributes before decoding."
+        ));
+    }
+
+    /// Finding 6: a complete envelope is recognised whatever the excerpt length.
+    #[test]
+    fn a_complete_envelope_with_a_long_excerpt_is_an_emission() {
+        let excerpt = "Decision detail. ".repeat(250);
+        let envelope = format!(
+            "\u{1F3AF} RESULTS: 1 matches (high relevance, top score: 0.900)\n\u{26A1} PERFORMANCE: 6ms (1 collection searched)\n\n<search>\n  <summary count=\"1\" relevance=\"high\" top-score=\"0.900\" rank1-score=\"0.900\" margin=\"n/a\">\n    <preview>Decision detail.</preview>\n  </summary>\n  <meta>\n    <q>why</q>\n  </meta>\n  <results>\n    <r rank=\"1\">\n      <s>0.900</s>\n      <excerpt><![CDATA[{excerpt}]]></excerpt>\n      <cid>c1</cid>\n      <id>i1</id>\n      <trust>unknown</trust>\n    </r>\n  </results>\n</search>\n"
+        );
+        assert!(envelope.len() > 4000);
+        assert!(is_csr_emission(&envelope));
+        assert!(is_csr_tool_payload(&envelope));
+        // The same envelope serialised with escaped line breaks and quotes.
+        let escaped = envelope.replace('\n', "\\n").replace('"', "\\\"");
+        assert!(is_csr_emission(&escaped));
+        // An envelope quoted inside a long message is something that holds one.
+        let wrapped = format!(
+            "{}\n{envelope}\n{}",
+            "Here is what I saw. ".repeat(40),
+            "And so on. ".repeat(40)
+        );
+        assert!(!is_csr_emission(&wrapped));
+        // A truncated envelope is not a whole emission.
+        assert!(!is_csr_emission(&envelope[..envelope.len() - 300]));
+    }
+
+    #[test]
+    fn a_csr_why_result_is_an_emission_only_from_its_first_line() {
+        assert!(is_csr_emission(WHY_HEAD));
+        assert!(is_csr_emission("WHY: needle\n\nNo evidence chain found.\n"));
+        assert!(!is_csr_emission(&format!("I ran it and got:\n{WHY_HEAD}")));
     }
 
     #[test]
