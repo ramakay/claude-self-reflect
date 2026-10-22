@@ -174,6 +174,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_hook_line_with_a_trailing_tool() {
+        let line = "2026-10-21T20:30:00Z CSR hook post-tool-use [claude-self-reflect]: stdin=0ms setup=0ms hook=212ms flush=0ms total=214ms tool=Edit";
+        let entry = parse_line(line).expect("line with a tool key parses");
+        match entry {
+            Entry::Hook {
+                name,
+                project,
+                total_ms,
+                hook_ms,
+                ..
+            } => {
+                assert_eq!(name, "post-tool-use");
+                assert_eq!(project.as_deref(), Some("claude-self-reflect"));
+                assert_eq!(total_ms, 214);
+                assert_eq!(hook_ms, 212);
+            }
+            _ => panic!("expected a hook entry"),
+        }
+    }
+
+    #[test]
     fn parses_hook_without_project() {
         let line = "2026-05-31T02:53:07Z CSR hook post-tool-use: stdin=0ms setup=0ms hook=4ms flush=0ms total=4ms";
         let e = parse_line(line).unwrap();

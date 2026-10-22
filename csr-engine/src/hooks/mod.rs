@@ -841,6 +841,25 @@ pub fn try_start(db_path: &Path) -> Option<crate::maintenance::SharedLock> {
         .flatten()
 }
 
+/// ` tool=<name>` for the timing line, or nothing when the hook names no tool.
+/// A trailing key, so `telemetry::parser` (which reads `total=` and `hook=` by
+/// key) is unaffected, and a later split by tool needs only this token. Kept to
+/// the characters a tool name uses (`mcp__server__tool` included) so one odd
+/// name cannot break the line.
+fn tool_suffix(tool_name: Option<&str>) -> String {
+    let name: String = tool_name
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        .take(64)
+        .collect();
+    if name.is_empty() {
+        String::new()
+    } else {
+        format!(" tool={name}")
+    }
+}
+
 /// Main hook dispatcher: routes the parsed input to its handler.
 ///
 /// `input` is read by the caller, ahead of engine construction, because
@@ -921,7 +940,7 @@ pub async fn dispatch_hook(
     let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
 
     let timing_line = format!(
-        "CSR hook {} [{}]: stdin={}ms setup={}ms hook={}ms flush={}ms total={}ms",
+        "CSR hook {} [{}]: stdin={}ms setup={}ms hook={}ms flush={}ms total={}ms{}",
         hook_name,
         project,
         t_stdin.as_millis(),
@@ -929,6 +948,7 @@ pub async fn dispatch_hook(
         (t_hook - t_setup).as_millis(),
         (t_total - t_hook).as_millis(),
         t_total.as_millis(),
+        tool_suffix(input.tool_name.as_deref()),
     );
     eprintln!("{}", timing_line);
 
@@ -941,6 +961,23 @@ pub async fn dispatch_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timing_line_names_the_tool_only_when_there_is_one() {
+        assert_eq!(tool_suffix(Some("Edit")), " tool=Edit");
+        assert_eq!(
+            tool_suffix(Some("mcp__claude-self-reflect__csr_why")),
+            " tool=mcp__claude-self-reflect__csr_why"
+        );
+        assert_eq!(tool_suffix(None), "");
+        assert_eq!(tool_suffix(Some("")), "");
+        // Whitespace and control characters cannot split the line.
+        assert_eq!(tool_suffix(Some("Ed it\n total=1ms")), " tool=Edittotal1ms");
+        assert_eq!(
+            tool_suffix(Some(&"x".repeat(200))).len(),
+            " tool=".len() + 64
+        );
+    }
 
     #[test]
     fn subagent_is_decided_by_agent_id_then_by_transcript_path() {
