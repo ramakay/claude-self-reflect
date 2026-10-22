@@ -478,7 +478,7 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     let mut stored_now: Vec<(String, Vec<f32>)> = Vec::with_capacity(new_chunks.len());
     let mut failure = None;
     // Read before the commits (see `SearchEngine::defers_to_sync`).
-    let fence = storage.change_fence();
+    let fence = storage.change_fence()?;
     for (chunk, embedding) in new_chunks.iter().zip(embeddings.iter()) {
         let stored = (|| -> Result<()> {
             storage.insert_chunk_with_source(chunk, embedding, "plan")?;

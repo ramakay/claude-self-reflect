@@ -210,6 +210,68 @@ pub(crate) mod lock_probe {
         })
     }
 
+    thread_local! {
+        static FENCE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static BEFORE_REFLECTION_APPLY: RefCell<Option<ApplyHook>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(crate) struct FenceFailing;
+
+    /// Make `Storage::change_fence` fail on this thread while the guard lives.
+    pub(crate) fn fail_fence_reads() -> FenceFailing {
+        FENCE_FAILS.with(|f| f.set(true));
+        FenceFailing
+    }
+
+    impl Drop for FenceFailing {
+        fn drop(&mut self) {
+            FENCE_FAILS.with(|f| f.set(false));
+        }
+    }
+
+    pub(super) fn fence_read_fails() -> bool {
+        FENCE_FAILS.with(|f| f.get())
+    }
+
+    pub(crate) struct InstalledReflectionApply;
+
+    /// Like [`on_before_index_apply`], for a writer of one reflection: the hook
+    /// gets its id between the commit and the index write guard.
+    pub(crate) fn on_before_reflection_apply(
+        hook: impl FnMut(&[String]) + 'static,
+    ) -> InstalledReflectionApply {
+        BEFORE_REFLECTION_APPLY.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        InstalledReflectionApply
+    }
+
+    impl Drop for InstalledReflectionApply {
+        fn drop(&mut self) {
+            BEFORE_REFLECTION_APPLY.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// The reflection twin of [`delete_then_sync`].
+    pub(crate) fn delete_reflection_then_sync(
+        storage: std::sync::Arc<super::Storage>,
+        search: std::sync::Arc<tokio::sync::RwLock<crate::search::SearchEngine>>,
+    ) -> InstalledReflectionApply {
+        on_before_reflection_apply(move |ids| {
+            for id in ids {
+                storage.delete_reflection(id).unwrap();
+            }
+            crate::daemon::index_sync::replay_for_test(&storage, &search);
+        })
+    }
+
+    pub(crate) fn before_reflection_apply(id: &str) {
+        let hook = BEFORE_REFLECTION_APPLY.with(|slot| slot.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(&[id.to_string()]);
+            BEFORE_REFLECTION_APPLY.with(|slot| *slot.borrow_mut() = Some(hook));
+        }
+    }
+
     pub(crate) fn before_index_apply(ids: &[String]) {
         // Taken out while it runs: the hook itself calls storage.
         let hook = BEFORE_INDEX_APPLY.with(|slot| slot.borrow_mut().take());
@@ -1372,12 +1434,17 @@ impl Storage {
     }
 
     /// The journal sequence an importer reads before its storage commits and
-    /// hands to [`crate::search::SearchEngine::defers_to_sync`] after them. A
-    /// failed read gives -1, which leaves the mutation to the index sync: the
-    /// commit is in the journal, so the sync applies it; a lost direct insert
-    /// heals, a resurrected vector would not.
-    pub fn change_fence(&self) -> i64 {
-        self.latest_embedding_change_seq().unwrap_or(-1)
+    /// hands to [`crate::search::SearchEngine::defers_to_sync`] after them.
+    /// A failed read is an error the caller returns BEFORE it commits: any
+    /// stand-in fence is wrong for some process (-1 would make a foreground
+    /// engine with no sync loop skip every insert for good, a high value
+    /// would apply over a delete the sync already replayed).
+    pub fn change_fence(&self) -> Result<i64> {
+        #[cfg(test)]
+        if lock_probe::fence_read_fails() {
+            anyhow::bail!("journal read failed (test)");
+        }
+        self.latest_embedding_change_seq()
     }
 
     /// See [`embedding_changes::count_after`].

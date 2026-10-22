@@ -751,7 +751,7 @@ pub(crate) async fn import_file_content_diff(
         let mut stored_now: Vec<(String, Vec<f32>)> = Vec::with_capacity(pending.len());
         let mut failure = None;
         // Read before the commits (see `SearchEngine::defers_to_sync`).
-        let fence = storage.change_fence();
+        let fence = storage.change_fence()?;
         for (chunk, embedding) in pending.iter().zip(embeddings_out) {
             let stored = (|| -> Result<()> {
                 storage.insert_chunk_with_source(chunk, &embedding, attribution.source)?;

@@ -1072,6 +1072,12 @@ async fn store_story(
     ];
     tags.extend(extra_tags);
 
+    // Read before the story is stored and the old ones deleted, so a failed
+    // read stops the write (see `SearchEngine::defers_to_sync`).
+    let fence = match prior {
+        Some(_) => Some(engine.storage().change_fence()?),
+        None => None,
+    };
     crate::mcp::tools::store_reflection_internal(
         engine.storage(),
         engine.embeddings(),
@@ -1082,9 +1088,7 @@ async fn store_story(
     .await?;
 
     // The new story replaces the old: one story per session, the latest
-    if let Some(prior) = prior {
-        // Read before the deletes (see `SearchEngine::defers_to_sync`).
-        let fence = engine.storage().change_fence();
+    if let (Some(prior), Some(fence)) = (prior, fence) {
         for old in &prior.ids {
             let _ = engine.storage().delete_reflection(old);
         }

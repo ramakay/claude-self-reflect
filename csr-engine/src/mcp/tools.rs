@@ -2184,11 +2184,17 @@ async fn store_embedded_reflection(
     embedding: Vec<f32>,
 ) -> Result<String> {
     let _operation = storage.operation_lock()?;
+    // Read before the commit (see `SearchEngine::defers_to_sync`).
+    let fence = storage.change_fence()?;
     storage.insert_reflection(&id, content, tags, &embedding)?;
 
+    #[cfg(test)]
+    crate::storage::lock_probe::before_reflection_apply(&id);
     let acknowledged = {
         let mut idx = search.write().await;
-        idx.insert_reflection(id.clone(), embedding)
+        // Past the fence the index sync applies the row from SQLite, in order;
+        // it has not been indexed yet, so the answer is "pending".
+        !idx.defers_to_sync(true, fence) && idx.insert_reflection(id.clone(), embedding)
     };
     let status = if acknowledged {
         "Reflection stored successfully."
@@ -11477,6 +11483,45 @@ mod tests {
         assert!(out.contains("abc123-one"));
         assert!(out.contains("abc123-two"));
     }
+    #[tokio::test]
+    async fn a_stored_reflection_deleted_before_its_index_insert_stays_out_of_the_index() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(8)));
+        let _race = crate::storage::lock_probe::delete_reflection_then_sync(
+            storage.clone(),
+            search.clone(),
+        );
+        store_embedded_reflection(
+            &storage,
+            &search,
+            "gone".into(),
+            "quartzgone",
+            &[],
+            vec![0.1; 384],
+        )
+        .await
+        .unwrap();
+        assert!(!search.read().await.has_reflection("gone"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_fence_read_stops_a_reflection_before_it_commits() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(8)));
+        let _fail = crate::storage::lock_probe::fail_fence_reads();
+        assert!(store_embedded_reflection(
+            &storage,
+            &search,
+            "x".into(),
+            "quartzx",
+            &[],
+            vec![0.1; 384]
+        )
+        .await
+        .is_err());
+        assert_eq!(storage.count_reflection_embeddings().unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn r3_missing_store_ack_reports_pending_id_and_reflection_fts_finds_it() {
         use crate::search::vector_ipc::{ProxyTimings, VectorClient, VectorProxy};

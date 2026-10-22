@@ -143,13 +143,19 @@ pub async fn enrich_conversation(
         let reflection_id = format!("heuristic_{conv_id}");
         let tags = vec!["narrative_heuristic".to_string(), format!("conv_{conv_id}")];
 
+        // Read before the commit (see `SearchEngine::defers_to_sync`).
+        let fence = storage.change_fence()?;
         storage.insert_reflection(&reflection_id, &content, &tags, &embedding)?;
+        #[cfg(test)]
+        crate::storage::lock_probe::before_reflection_apply(&reflection_id);
         {
             // Only the in-memory insert is under the guard (see
             // `Engine::import_file_with_attribution`).
             let mut idx = search.write().await;
             // The answer is not used, so a proxied engine does not wait for it.
-            idx.insert_reflection_unacked(reflection_id.clone(), embedding);
+            if !idx.defers_to_sync(true, fence) {
+                idx.insert_reflection_unacked(reflection_id.clone(), embedding);
+            }
         }
 
         storage.mark_enrichment_completed(conv_id, "heuristic", &reflection_id)?;
@@ -164,6 +170,77 @@ pub async fn enrich_conversation(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn heuristic_fixture(
+        tmp: &tempfile::TempDir,
+    ) -> (
+        std::path::PathBuf,
+        std::sync::Arc<crate::storage::Storage>,
+        std::sync::Arc<crate::embeddings::EmbeddingEngine>,
+        std::sync::Arc<tokio::sync::RwLock<crate::search::SearchEngine>>,
+    ) {
+        let path = tmp.path().join("sess-heuristic.jsonl");
+        let lines = [
+            json!({
+                "type": "user", "uuid": "u-1", "timestamp": "2026-10-14T10:00:00Z",
+                "message": {"content": "please look at the retry loop in the uploader"}
+            }),
+            json!({
+                "type": "assistant", "uuid": "a-1", "timestamp": "2026-10-14T10:00:05Z",
+                "message": {"content": [{"type": "text", "text": "The uploader retries without backoff; I added exponential backoff."}]}
+            }),
+        ];
+        let body: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        std::fs::write(&path, body).unwrap();
+        (
+            path,
+            std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap()),
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
+                64,
+            ))),
+        )
+    }
+
+    #[tokio::test]
+    async fn heuristic_enrichment_leaves_a_reflection_deleted_after_its_commit_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, storage, embeddings, search) = heuristic_fixture(&tmp);
+        let _race = crate::storage::lock_probe::delete_reflection_then_sync(
+            storage.clone(),
+            search.clone(),
+        );
+        enrich_conversation(&path, "conv-h", "proj", &storage, &embeddings, &search)
+            .await
+            .unwrap();
+        assert!(
+            !search.read().await.has_reflection("heuristic_conv-h"),
+            "the index holds a reflection SQLite deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn heuristic_enrichment_indexes_when_the_sync_has_not_moved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, storage, embeddings, search) = heuristic_fixture(&tmp);
+        enrich_conversation(&path, "conv-h", "proj", &storage, &embeddings, &search)
+            .await
+            .unwrap();
+        assert!(search.read().await.has_reflection("heuristic_conv-h"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_fence_read_stops_heuristic_enrichment_before_it_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, storage, embeddings, search) = heuristic_fixture(&tmp);
+        let _fail = crate::storage::lock_probe::fail_fence_reads();
+        assert!(
+            enrich_conversation(&path, "conv-h", "proj", &storage, &embeddings, &search)
+                .await
+                .is_err()
+        );
+        assert_eq!(storage.count_reflection_embeddings().unwrap(), 0);
+    }
 
     #[test]
     fn test_extracts_files() {

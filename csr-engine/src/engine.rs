@@ -681,7 +681,7 @@ impl Engine {
             // Read before the commits: the index sync may replay past them
             // (and past another connection's delete of one) before the guard
             // is taken; see `SearchEngine::defers_to_sync`.
-            let fence = self.storage.change_fence();
+            let fence = self.storage.change_fence()?;
             for (chunk, embedding) in batch.iter().zip(embeddings) {
                 let stored = (|| -> Result<()> {
                     self.storage
@@ -1912,6 +1912,16 @@ mod tests {
             0,
             "the index holds a vector SQLite deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_fence_read_fails_the_import_before_anything_commits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (engine, src) = fence_engine(&tmp);
+        let _fail = crate::storage::lock_probe::fail_fence_reads();
+        assert!(engine.import_file(&src, "proj").await.is_err());
+        assert!(chunk_ids(&engine.storage).is_empty(), "a batch committed");
+        assert_eq!(engine.search.read().await.chunk_count(), 0);
     }
 
     #[tokio::test]
