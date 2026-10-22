@@ -7,6 +7,7 @@ pub mod anchors;
 pub mod ast_analysis;
 pub mod codegraph;
 pub mod errors;
+pub mod graph_catchup;
 pub mod heuristic;
 pub mod index_builder;
 pub mod manifest;

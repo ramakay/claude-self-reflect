@@ -2341,6 +2341,41 @@ impl Storage {
         crate::extraction::resolver::resolve_edges(&conn, project, file_exists)
     }
 
+    /// The graph work of one edited file, under a deadline: resolve the edges in
+    /// scope of `file` and rank the nodes its edges touch. See
+    /// `extraction::graph_catchup`.
+    pub fn resolve_and_rank_code_file(
+        &self,
+        project: &str,
+        file: &str,
+        before: &crate::extraction::graph_catchup::Before,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<crate::extraction::graph_catchup::FileWork> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        crate::extraction::graph_catchup::resolve_and_rank(&conn, project, file, before, deadline)
+    }
+
+    /// What the graph pass needs from `file` before an edit replaces its nodes.
+    pub fn read_code_file_before(
+        &self,
+        project: &str,
+        file: &str,
+    ) -> Result<crate::extraction::graph_catchup::Before> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        crate::extraction::graph_catchup::read_before(&conn, project, file)
+    }
+
+    /// Hand `file`'s unfinished graph pass to the daemon.
+    pub fn defer_code_file_graph(
+        &self,
+        project: &str,
+        file: &str,
+        before: &crate::extraction::graph_catchup::Before,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        crate::extraction::graph_catchup::defer(&conn, project, file, before)
+    }
+
     /// Recompute degree ranks for a project.
     pub fn compute_code_rank(&self, project: &str) -> Result<crate::search::code_rank::RankStats> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;

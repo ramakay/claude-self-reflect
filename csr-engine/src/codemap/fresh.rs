@@ -902,6 +902,17 @@ impl<'a> Pump<'a> {
             Ok(None) => {}
             Err(e) => ctx.log(&format!("paths via=queue failed: {}", short_err(&e))),
         }
+        // The edit hook's code-graph pass has a time budget; what it left undone
+        // is flagged on the file's graph state and finished here, on the hook's
+        // own tick.
+        match self
+            .storage
+            .with_connection(|conn| crate::extraction::graph_catchup::run(conn))
+        {
+            Ok(0) => {}
+            Ok(n) => ctx.log(&format!("graph catch-up files={n}")),
+            Err(e) => ctx.log(&format!("graph catch-up failed: {}", short_err(&e))),
+        }
     }
 
     /// One scheduler step at time `now`.

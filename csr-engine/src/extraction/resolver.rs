@@ -143,6 +143,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Instant;
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
@@ -296,6 +297,202 @@ pub fn resolve_edges(
     project: &str,
     file_exists: &dyn Fn(&str) -> bool,
 ) -> Result<ResolveStats> {
+    Ok(resolve_edges_inner(conn, project, file_exists, None)?.stats)
+}
+
+/// What a scoped pass looks at. A pending edge is in scope when its source
+/// node lives in one of `files`, or when its placeholder names a symbol that
+/// `files` define now or defined before the edit (`removed_names`): a new def
+/// can bind an edge elsewhere, and a removed one can leave that edge with a
+/// single candidate. Every other pending edge keeps the answer it has.
+pub struct ResolveScope<'a> {
+    /// Stored (canonical) paths, as in `code_nodes.file`.
+    pub files: &'a [String],
+    /// Names `files` defined before the edit, read by the caller ahead of the
+    /// node retire. Names they define now are read here.
+    pub removed_names: &'a [String],
+    /// Stop taking edges once this passes; the rest is reported as deferred.
+    pub deadline: Option<Instant>,
+}
+
+/// Outcome of a scoped pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedResolve {
+    /// Counts for the edges the pass took (`total` excludes `deferred`).
+    pub stats: ResolveStats,
+    /// In-scope edges left untouched because the deadline passed.
+    pub deferred: usize,
+}
+
+/// `resolve_edges`, narrowed to the edges `scope` names. Each edge gets the
+/// verdict the full pass gives it: the loaders below only drop rows no
+/// in-scope edge reads, and no tier reads another edge's state.
+pub fn resolve_edges_scoped(
+    conn: &Connection,
+    project: &str,
+    file_exists: &dyn Fn(&str) -> bool,
+    scope: &ResolveScope<'_>,
+) -> Result<ScopedResolve> {
+    resolve_edges_inner(conn, project, file_exists, Some(scope))
+}
+
+/// Rows of `sql` for `project`. `{scope}` in `sql` becomes `clause` when
+/// `filter` (a JSON array bound as `?2`) is given, and nothing otherwise.
+fn scoped_rows<T>(
+    conn: &Connection,
+    sql: &str,
+    clause: &str,
+    project: &str,
+    filter: Option<&str>,
+    map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Vec<T>> {
+    let sql = sql.replace("{scope}", if filter.is_some() { clause } else { "" });
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = match filter {
+        Some(json) => stmt
+            .query_map(params![project, json], map)?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        None => stmt
+            .query_map(params![project], map)?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    };
+    Ok(rows)
+}
+
+fn json_list<'a>(items: impl IntoIterator<Item = &'a String>) -> String {
+    serde_json::to_string(&items.into_iter().collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into())
+}
+
+/// A pending edge as read, before the per-file lookups that complete it.
+type RawPending = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+/// Pending edges, deterministically ordered. With a scope: the edges whose
+/// source node is in `scope_files` first, then the ones that only name a
+/// symbol in `scope_names`.
+fn load_pending_rows(
+    conn: &Connection,
+    project: &str,
+    scope: Option<(&BTreeSet<String>, &BTreeSet<String>)>,
+) -> Result<Vec<RawPending>> {
+    const COLUMNS: &str = "SELECT e.src_id, e.dst_id, e.kind, n.file, n.project, e.callee_kind, e.evidence, e.boundary, n.name
+             FROM code_edges e JOIN code_nodes n ON n.id = e.src_id
+             WHERE e.resolved = 0 AND e.dst_id LIKE 'name:%'
+               AND (?1 = '' OR n.project = ?1)";
+    let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<RawPending> {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+        ))
+    };
+    let Some((files, names)) = scope else {
+        return scoped_rows(
+            conn,
+            &format!("{COLUMNS} ORDER BY e.src_id, e.dst_id, e.kind"),
+            "",
+            project,
+            None,
+            map,
+        );
+    };
+    let files_json = json_list(files);
+    let placeholders: Vec<String> = names.iter().map(|n| format!("name:{n}")).collect();
+    let names_json = json_list(&placeholders);
+    let mut rows = scoped_rows(
+        conn,
+        &format!(
+            "{COLUMNS} AND n.file IN (SELECT value FROM json_each(?2)) ORDER BY e.src_id, e.dst_id, e.kind"
+        ),
+        "",
+        project,
+        Some(&files_json),
+        map,
+    )?;
+    let by_name = {
+        let mut stmt = conn.prepare(&format!(
+            "{COLUMNS} AND e.dst_id IN (SELECT value FROM json_each(?2))
+               AND n.file NOT IN (SELECT value FROM json_each(?3))
+             ORDER BY e.src_id, e.dst_id, e.kind"
+        ))?;
+        let found = stmt
+            .query_map(params![project, names_json, files_json], map)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        found
+    };
+    rows.extend(by_name);
+    Ok(rows)
+}
+
+/// The names of the definitions `files` hold now.
+fn defined_names(
+    conn: &Connection,
+    project: &str,
+    files: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let rows = scoped_rows(
+        conn,
+        "SELECT DISTINCT name FROM code_nodes
+         WHERE kind IN ('function', 'type', 'method', 'const') AND (?1 = '' OR project = ?1){scope}",
+        " AND file IN (SELECT value FROM json_each(?2))",
+        project,
+        Some(&json_list(files)),
+        |row| row.get::<_, String>(0),
+    )?;
+    Ok(rows.into_iter().collect())
+}
+
+fn resolve_edges_inner(
+    conn: &Connection,
+    project: &str,
+    file_exists: &dyn Fn(&str) -> bool,
+    scope: Option<&ResolveScope<'_>>,
+) -> Result<ScopedResolve> {
+    // Pass 0: the pending edges, and with a scope the files and names the
+    // loaders below narrow to. Read first so the loaders need not guess.
+    let scope_files: BTreeSet<String> = scope
+        .map(|s| s.files.iter().cloned().collect())
+        .unwrap_or_default();
+    let raw_pending = match scope {
+        Some(s) => {
+            let mut names = defined_names(conn, project, &scope_files)?;
+            names.extend(s.removed_names.iter().cloned());
+            load_pending_rows(conn, project, Some((&scope_files, &names)))?
+        }
+        None => load_pending_rows(conn, project, None)?,
+    };
+    let (files_json, names_json, src_ids_json) = if scope.is_some() {
+        let files: BTreeSet<&String> = raw_pending.iter().map(|r| &r.3).collect();
+        let names: BTreeSet<String> = raw_pending
+            .iter()
+            .map(|r| r.1.strip_prefix("name:").unwrap_or(&r.1).to_string())
+            .collect();
+        let src_ids: BTreeSet<&String> = raw_pending.iter().map(|r| &r.0).collect();
+        (
+            Some(json_list(files)),
+            Some(json_list(&names)),
+            Some(json_list(src_ids)),
+        )
+    } else {
+        (None, None, None)
+    };
+    let files_json = files_json.as_deref();
+
     // Pass 1: name -> sorted [(file, id)] for definition nodes
     // (function/type/method/const — 'const' added WCR Phase 7, TASK C: a
     // top-level TS/JS/TSX const/let/var is a real, bindable def node now,
@@ -304,23 +501,23 @@ pub fn resolve_edges(
     // even though `extraction::codegraph::extract_inner` now emits a def
     // node for it).
     let mut by_name: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT id, file, name FROM code_nodes
-             WHERE kind IN ('function', 'type', 'method', 'const') AND (?1 = '' OR project = ?1)
-             ORDER BY name, file, id",
-        )?;
-        let rows = stmt.query_map(params![project], |row| {
+    for (id, file, name) in scoped_rows(
+        conn,
+        "SELECT id, file, name FROM code_nodes
+         WHERE kind IN ('function', 'type', 'method', 'const') AND (?1 = '' OR project = ?1){scope}
+         ORDER BY name, file, id",
+        " AND name IN (SELECT value FROM json_each(?2))",
+        project,
+        names_json.as_deref(),
+        |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
             ))
-        })?;
-        for r in rows {
-            let (id, file, name) = r?;
-            by_name.entry(name).or_default().push((file, id));
-        }
+        },
+    )? {
+        by_name.entry(name).or_default().push((file, id));
     }
 
     // Pass 1b: per-file import symbol sets. Covers both still-placeholder
@@ -329,24 +526,22 @@ pub fn resolve_edges(
     // node's name). This is the textual "N was imported here" evidence the
     // B1 and X1 tiers key off.
     let mut imports_by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT n.file,
-                    CASE WHEN e.dst_id LIKE 'name:%' THEN substr(e.dst_id, 6) ELSE n2.name END
-             FROM code_edges e
-             JOIN code_nodes n ON n.id = e.src_id
-             LEFT JOIN code_nodes n2 ON n2.id = e.dst_id
-             WHERE e.kind = 'imports' AND (?1 = '' OR n.project = ?1)",
-        )?;
-        let rows = stmt.query_map(params![project], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?;
-        for r in rows {
-            let (file, sym) = r?;
-            if let Some(sym) = sym {
-                if !sym.is_empty() {
-                    imports_by_file.entry(file).or_default().insert(sym);
-                }
+    for (file, sym) in scoped_rows(
+        conn,
+        "SELECT n.file,
+                CASE WHEN e.dst_id LIKE 'name:%' THEN substr(e.dst_id, 6) ELSE n2.name END
+         FROM code_edges e
+         JOIN code_nodes n ON n.id = e.src_id
+         LEFT JOIN code_nodes n2 ON n2.id = e.dst_id
+         WHERE e.kind = 'imports' AND (?1 = '' OR n.project = ?1){scope}",
+        " AND n.file IN (SELECT value FROM json_each(?2))",
+        project,
+        files_json,
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )? {
+        if let Some(sym) = sym {
+            if !sym.is_empty() {
+                imports_by_file.entry(file).or_default().insert(sym);
             }
         }
     }
@@ -360,29 +555,29 @@ pub fn resolve_edges(
     // the tier's own evidence string, so any module data it carried is only
     // reliable for THIS pass, read before the main loop mutates anything.
     let mut imports_module_by_file: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT n.file, substr(e.dst_id, 6), e.evidence
-             FROM code_edges e JOIN code_nodes n ON n.id = e.src_id
-             WHERE e.kind = 'imports' AND e.dst_id LIKE 'name:%' AND e.evidence LIKE 'from:%'
-               AND (?1 = '' OR n.project = ?1)",
-        )?;
-        let rows = stmt.query_map(params![project], |row| {
+    for (file, sym, evidence) in scoped_rows(
+        conn,
+        "SELECT n.file, substr(e.dst_id, 6), e.evidence
+         FROM code_edges e JOIN code_nodes n ON n.id = e.src_id
+         WHERE e.kind = 'imports' AND e.dst_id LIKE 'name:%' AND e.evidence LIKE 'from:%'
+           AND (?1 = '' OR n.project = ?1){scope}",
+        " AND n.file IN (SELECT value FROM json_each(?2))",
+        project,
+        files_json,
+        |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
             ))
-        })?;
-        for r in rows {
-            let (file, sym, evidence) = r?;
-            if let Some(module) = evidence.strip_prefix("from:") {
-                if !sym.is_empty() && !module.is_empty() {
-                    imports_module_by_file
-                        .entry(file)
-                        .or_default()
-                        .insert(sym, module.to_string());
-                }
+        },
+    )? {
+        if let Some(module) = evidence.strip_prefix("from:") {
+            if !sym.is_empty() && !module.is_empty() {
+                imports_module_by_file
+                    .entry(file)
+                    .or_default()
+                    .insert(sym, module.to_string());
             }
         }
     }
@@ -403,25 +598,25 @@ pub fn resolve_edges(
     // X4 block and `chain_prefix_matches` for the prefix check this feeds.
     let mut local_bindings: BTreeMap<(String, String), BTreeSet<(String, String)>> =
         BTreeMap::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT project, file, scope, name FROM local_bindings WHERE (?1 = '' OR project = ?1)",
-        )?;
-        let rows = stmt.query_map(params![project], |row| {
+    for (proj, file, scope_chain, name) in scoped_rows(
+        conn,
+        "SELECT project, file, scope, name FROM local_bindings WHERE (?1 = '' OR project = ?1){scope}",
+        " AND file IN (SELECT value FROM json_each(?2))",
+        project,
+        files_json,
+        |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
             ))
-        })?;
-        for r in rows {
-            let (proj, file, scope, name) = r?;
-            local_bindings
-                .entry((proj, file))
-                .or_default()
-                .insert((scope, name));
-        }
+        },
+    )? {
+        local_bindings
+            .entry((proj, file))
+            .or_default()
+            .insert((scope_chain, name));
     }
 
     // Pass 1e (Codex round 4 adversarial review, Finding 1): every fresh
@@ -439,53 +634,33 @@ pub fn resolve_edges(
     // order, which is exactly what the Finding 1 "test both orders"
     // regression needs).
     let mut edge_scope_chains: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT src_id, dst_id, kind, chain FROM edge_scope_chains
-             WHERE (?1 = '' OR project = ?1)
-             ORDER BY src_id, dst_id, kind, chain",
-        )?;
-        let rows = stmt.query_map(params![project], |row| {
+    for (src_id, dst_id, kind, chain) in scoped_rows(
+        conn,
+        "SELECT src_id, dst_id, kind, chain FROM edge_scope_chains
+         WHERE (?1 = '' OR project = ?1){scope}
+         ORDER BY src_id, dst_id, kind, chain",
+        " AND src_id IN (SELECT value FROM json_each(?2))",
+        project,
+        src_ids_json.as_deref(),
+        |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
             ))
-        })?;
-        for r in rows {
-            let (src_id, dst_id, kind, chain) = r?;
-            edge_scope_chains
-                .entry((src_id, dst_id, kind))
-                .or_default()
-                .push(chain);
-        }
+        },
+    )? {
+        edge_scope_chains
+            .entry((src_id, dst_id, kind))
+            .or_default()
+            .push(chain);
     }
 
-    // Pass 2: collect placeholder edges (calls + imports), deterministically.
+    // Pass 2: build the placeholder edges (calls + imports) read in pass 0.
     let mut pending: Vec<Pending> = Vec::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT e.src_id, e.dst_id, e.kind, n.file, n.project, e.callee_kind, e.evidence, e.boundary, n.name
-             FROM code_edges e JOIN code_nodes n ON n.id = e.src_id
-             WHERE e.resolved = 0 AND e.dst_id LIKE 'name:%'
-               AND (?1 = '' OR n.project = ?1)
-             ORDER BY e.src_id, e.dst_id, e.kind",
-        )?;
-        let rows = stmt.query_map(params![project], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-            ))
-        })?;
-        for r in rows {
+        for r in raw_pending {
             let (
                 src_id,
                 dst_id,
@@ -496,7 +671,7 @@ pub fn resolve_edges(
                 evidence,
                 boundary,
                 src_name,
-            ) = r?;
+            ) = r;
             let name = dst_id.strip_prefix("name:").unwrap_or(&dst_id).to_string();
             // Second X4 adversarial review, Finding 4; upgraded to a Vec by
             // Finding 1 (Codex round 4): when `edge_scope_chains` has at
@@ -533,7 +708,8 @@ pub fn resolve_edges(
         }
     }
 
-    let total = pending.len();
+    let mut total = pending.len();
+    let mut deferred = 0usize;
     let mut resolved = 0usize;
     let mut external = 0usize;
     let mut method = 0usize;
@@ -546,8 +722,18 @@ pub fn resolve_edges(
     // across the whole pass — a DB query, and many pending edges typically
     // share a project.
     let mut memo = Memo::default();
+    let deadline = scope.and_then(|s| s.deadline);
+    let mut writes = PassWrites::begin(conn, !pending.is_empty())?;
 
-    for p in &pending {
+    for (taken, p) in pending.iter().enumerate() {
+        // Scoped pass out of time: the edges from here on keep the verdict they
+        // have, and the caller hands them to the daemon.
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            deferred = pending.len() - taken;
+            total = taken;
+            break;
+        }
+        writes.tick()?;
         // --- drifted (WCR Phase 8, TASK B): already classified externally,
         // before this pass ever ran — skip every tier, including B0. See
         // the module doc comment's "drifted" tier and `Pending::boundary`.
@@ -752,6 +938,8 @@ pub fn resolve_edges(
         }
     }
 
+    writes.finish()?;
+
     let unexplained =
         total - resolved - external - method - stale - internal_module - drifted - local;
     let closure_rate = if total == 0 {
@@ -768,21 +956,84 @@ pub fn resolve_edges(
         resolved as f64 / internal_denominator as f64
     };
 
-    Ok(ResolveStats {
-        total,
-        resolved,
-        bound: resolved,
-        external,
-        method,
-        stale,
-        internal_module,
-        drifted,
-        local,
-        unexplained,
-        ambiguous_remaining,
-        closure_rate,
-        internal_binding_rate,
+    Ok(ScopedResolve {
+        stats: ResolveStats {
+            total,
+            resolved,
+            bound: resolved,
+            external,
+            method,
+            stale,
+            internal_module,
+            drifted,
+            local,
+            unexplained,
+            ambiguous_remaining,
+            closure_rate,
+            internal_binding_rate,
+        },
+        deferred,
     })
+}
+
+/// Edges a pass writes per transaction. A pass on a project with tens of
+/// thousands of pending edges used to commit once per edge.
+const WRITES_PER_TRANSACTION: usize = 256;
+
+/// The writes of one pass, committed in batches when the caller holds no
+/// transaction of its own (a caller that does keeps its transaction). Dropping
+/// it without `finish` rolls the open batch back.
+struct PassWrites<'a> {
+    conn: &'a Connection,
+    open: bool,
+    owned: bool,
+    since_commit: usize,
+}
+
+impl<'a> PassWrites<'a> {
+    fn begin(conn: &'a Connection, any_edges: bool) -> Result<Self> {
+        let owned = any_edges && conn.is_autocommit();
+        if owned {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        Ok(Self {
+            conn,
+            open: owned,
+            owned,
+            since_commit: 0,
+        })
+    }
+
+    fn tick(&mut self) -> Result<()> {
+        if !self.owned {
+            return Ok(());
+        }
+        self.since_commit += 1;
+        if self.since_commit >= WRITES_PER_TRANSACTION {
+            self.conn.execute_batch("COMMIT")?;
+            self.open = false;
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            self.open = true;
+            self.since_commit = 0;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        if self.open {
+            self.conn.execute_batch("COMMIT")?;
+            self.open = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PassWrites<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
 }
 
 /// X0: language-defined prelude/builtin/global tier. The caller only reaches
@@ -4318,5 +4569,314 @@ mod tests {
             )
             .unwrap();
         assert_eq!(boundary, "local");
+    }
+
+    // ---- scoped resolve -------------------------------------------------
+
+    /// A project in the state a full pass would have left it, with one file
+    /// (`f.rs`) about to be edited. Covers a bind by co-edit weight, a method
+    /// call, a def an edge elsewhere is waiting for (`fresh`), and a def whose
+    /// removal leaves an edge elsewhere with one candidate (`gone`).
+    fn scoped_fixture(conn: &Connection) {
+        for (id, file, name) in [
+            ("f_main", "f.rs", "f_main"),
+            ("f_stay", "f.rs", "stay"),
+            ("f_gone", "f.rs", "gone"),
+            ("g_fn", "g.rs", "g_fn"),
+            ("g_helper", "g.rs", "helper"),
+            ("g_save", "g.rs", "save"),
+            ("h_helper", "h.rs", "helper"),
+            ("k_gone", "k.rs", "gone"),
+            ("x_fn", "x.rs", "x_fn"),
+            ("u_fn", "u.rs", "u_fn"),
+        ] {
+            upsert_node(conn, &def(id, file, name)).unwrap();
+        }
+        let method_call = EdgeRow {
+            callee_kind: "method".into(),
+            evidence: "via:thing".into(),
+            ..call_edge("f_main", "save", "f.rs")
+        };
+        codegraph::replace_file_edges(
+            conn,
+            "proj",
+            "f.rs",
+            &[
+                call_edge("f_main", "helper", "f.rs"),
+                call_edge("f_main", "stay", "f.rs"),
+                call_edge("f_main", "gone", "f.rs"),
+                call_edge("f_main", "no_such_fn", "f.rs"),
+                method_call,
+            ],
+        )
+        .unwrap();
+        codegraph::replace_file_edges(
+            conn,
+            "proj",
+            "g.rs",
+            &[
+                call_edge("g_fn", "fresh", "g.rs"),
+                call_edge("g_fn", "no_such_fn", "g.rs"),
+            ],
+        )
+        .unwrap();
+        codegraph::replace_file_edges(conn, "proj", "x.rs", &[call_edge("x_fn", "gone", "x.rs")])
+            .unwrap();
+        codegraph::replace_file_edges(
+            conn,
+            "proj",
+            "u.rs",
+            &[call_edge("u_fn", "no_such_fn", "u.rs")],
+        )
+        .unwrap();
+        for s in ["s1", "s2", "s3"] {
+            insert_evolution(conn, s, "f.rs");
+            insert_evolution(conn, s, "g.rs");
+        }
+        insert_evolution(conn, "s9", "h.rs");
+    }
+
+    /// The edit: `f.rs` loses `gone` and gains `fresh`, and its edges are
+    /// replaced with fresh placeholders, as the hook does.
+    fn scoped_edit(conn: &Connection) {
+        upsert_node(conn, &def("f_fresh", "f.rs", "fresh")).unwrap();
+        codegraph::retire_missing_nodes(
+            conn,
+            "proj",
+            "f.rs",
+            &["f_main".into(), "f_stay".into(), "f_fresh".into()],
+        )
+        .unwrap();
+        let method_call = EdgeRow {
+            callee_kind: "method".into(),
+            evidence: "via:thing".into(),
+            ..call_edge("f_main", "save", "f.rs")
+        };
+        codegraph::replace_file_edges(
+            conn,
+            "proj",
+            "f.rs",
+            &[
+                call_edge("f_main", "helper", "f.rs"),
+                call_edge("f_main", "stay", "f.rs"),
+                call_edge("f_main", "fresh", "f.rs"),
+                call_edge("f_main", "no_such_fn", "f.rs"),
+                method_call,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn edge_table(conn: &Connection) -> Vec<(String, String, String, i64, String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT src_id, dst_id, kind, resolved, boundary, evidence FROM code_edges
+                 ORDER BY src_id, dst_id, kind",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    fn rank_table(conn: &Connection) -> Vec<(String, f64, i64, i64)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT node_id, rank, in_degree, out_degree FROM code_node_rank ORDER BY node_id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// The settled project before the edit: a full resolve and rank, as the
+    /// hook ran after every earlier edit.
+    fn settled() -> Connection {
+        let conn = mem();
+        scoped_fixture(&conn);
+        resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        crate::search::code_rank::compute_code_rank(&conn, "proj").unwrap();
+        conn
+    }
+
+    #[test]
+    fn scoped_resolve_gives_the_edges_the_full_resolve_gives() {
+        let full = settled();
+        let scoped = settled();
+        assert_eq!(edge_table(&full), edge_table(&scoped));
+        // Sanity: the fixture really holds the cases the pass has to get right.
+        let before = edge_table(&scoped);
+        assert!(
+            before
+                .iter()
+                .any(|e| e.0 == "x_fn" && e.1 == "name:gone" && e.3 == 0),
+            "gone is ambiguous before the edit"
+        );
+
+        // Full: edit, then resolve and rank the whole project.
+        scoped_edit(&full);
+        resolve_edges(&full, "proj", &|_: &str| true).unwrap();
+        crate::search::code_rank::compute_code_rank(&full, "proj").unwrap();
+
+        // Scoped: read the file first, edit, then take only its share.
+        let names = codegraph::def_names_in_file(&scoped, "proj", "f.rs").unwrap();
+        let targets = codegraph::call_targets_from_file(&scoped, "proj", "f.rs").unwrap();
+        scoped_edit(&scoped);
+        let files = ["f.rs".to_string()];
+        let out = resolve_edges_scoped(
+            &scoped,
+            "proj",
+            &|_: &str| true,
+            &ResolveScope {
+                files: &files,
+                removed_names: &names,
+                deadline: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.deferred, 0);
+        // f.rs's 5 edges, g_fn -> fresh and x_fn -> gone; u_fn's edge and g_fn's
+        // no_such_fn edge are not in scope... except that no_such_fn is a name
+        // f.rs's own edge uses, which is not a def, so neither is taken.
+        assert_eq!(out.stats.total, 7, "{:?}", out.stats);
+        let mut targets = targets;
+        targets.extend(codegraph::call_targets_from_file(&scoped, "proj", "f.rs").unwrap());
+        let mut all_names = codegraph::def_names_in_file(&scoped, "proj", "f.rs").unwrap();
+        all_names.extend(names);
+        let rank = crate::search::code_rank::compute_code_rank_scoped(
+            &scoped, "proj", &files, &all_names, &targets, None,
+        )
+        .unwrap();
+        assert!(rank.complete);
+
+        assert_eq!(edge_table(&full), edge_table(&scoped));
+        assert_eq!(rank_table(&full), rank_table(&scoped));
+
+        // And the cases the fixture is for really changed.
+        let after = edge_table(&scoped);
+        let find = |src: &str, kind_dst: &str| {
+            after
+                .iter()
+                .find(|e| e.0 == src && (e.1 == kind_dst || e.5.contains(kind_dst)))
+                .cloned()
+        };
+        assert!(
+            after
+                .iter()
+                .any(|e| e.0 == "x_fn" && e.1 == "k_gone" && e.5 == "unique_def"),
+            "removing gone from f.rs left x_fn one candidate: {after:?}"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|e| e.0 == "g_fn" && e.1 == "f_fresh" && e.5 == "unique_def"),
+            "the new fresh def binds g_fn's waiting edge: {after:?}"
+        );
+        assert!(
+            find("f_main", "g_helper").is_some_and(|e| e.5 == "coedit:3"),
+            "helper binds by co-edit weight: {after:?}"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|e| e.0 == "f_main" && e.1 == "name:save" && e.3 == 0),
+            "a method call stays unbound: {after:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_resolve_leaves_edges_outside_its_scope_alone() {
+        let conn = settled();
+        let before = edge_table(&conn);
+        let files = ["u.rs".to_string()];
+        let out = resolve_edges_scoped(
+            &conn,
+            "proj",
+            &|_: &str| true,
+            &ResolveScope {
+                files: &files,
+                removed_names: &[],
+                deadline: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.stats.total, 1, "only u.rs's own edge");
+        assert_eq!(edge_table(&conn), before);
+    }
+
+    #[test]
+    fn scoped_resolve_past_its_deadline_takes_nothing_and_reports_the_rest() {
+        let conn = settled();
+        scoped_edit(&conn);
+        let before = edge_table(&conn);
+        let files = ["f.rs".to_string()];
+        let out = resolve_edges_scoped(
+            &conn,
+            "proj",
+            &|_: &str| true,
+            &ResolveScope {
+                files: &files,
+                removed_names: &["gone".to_string()],
+                deadline: Some(Instant::now()),
+            },
+        )
+        .unwrap();
+        assert_eq!(out.stats.total, 0);
+        assert_eq!(out.stats.resolved, 0);
+        assert_eq!(out.deferred, 7);
+        assert_eq!(edge_table(&conn), before, "nothing was written");
+    }
+
+    #[test]
+    fn coedit_weight_matches_the_self_join_it_replaced() {
+        let conn = mem();
+        for (session, file) in [
+            ("s1", "a.rs"),
+            ("s1", "b.rs"),
+            ("s2", "a.rs"),
+            ("s2", "b.rs"),
+            ("s2", "c.rs"),
+            ("s3", "b.rs"),
+            ("s3", "c.rs"),
+        ] {
+            insert_evolution(&conn, session, file);
+        }
+        let mut memo = Memo::default();
+        for (f, d) in [
+            ("a.rs", "b.rs"),
+            ("a.rs", "c.rs"),
+            ("a.rs", "a.rs"),
+            ("b.rs", "c.rs"),
+            ("c.rs", "a.rs"),
+            ("a.rs", "nowhere.rs"),
+            ("nowhere.rs", "a.rs"),
+        ] {
+            let joined: i64 = conn
+                .query_row(
+                    "SELECT COUNT(DISTINCT a.session_id) FROM code_evolution a
+                     JOIN code_evolution b ON a.session_id = b.session_id
+                     WHERE a.file_path = ?1 AND b.file_path = ?2",
+                    params![f, d],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                coedit_weight(&conn, f, d, &mut memo).unwrap(),
+                joined,
+                "{f} {d}"
+            );
+        }
     }
 }

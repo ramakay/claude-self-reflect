@@ -414,6 +414,53 @@ pub fn mark_file_dirty(conn: &Connection, project: &str, file: &str) -> Result<(
     Ok(())
 }
 
+/// Clear the dirty flag of one file.
+pub fn mark_file_clean(conn: &Connection, project: &str, file: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE code_graph_file_state SET dirty = 0 WHERE project = ?1 AND file = ?2",
+        params![project, file],
+    )?;
+    Ok(())
+}
+
+/// Files flagged dirty, oldest extraction first: `(project, file)`.
+pub fn dirty_files(conn: &Connection, limit: usize) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT project, file FROM code_graph_file_state WHERE dirty = 1
+         ORDER BY extracted_at LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Names of the definitions (function, type, method, const) `file` holds.
+pub fn def_names_in_file(conn: &Connection, project: &str, file: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT name FROM code_nodes
+         WHERE project = ?1 AND file = ?2 AND kind IN ('function', 'type', 'method', 'const')
+         ORDER BY name",
+    )?;
+    let rows = stmt.query_map(params![project, file], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Ids the resolved `calls`/`references` edges of `file`'s nodes point at.
+pub fn call_targets_from_file(conn: &Connection, project: &str, file: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT e.dst_id FROM code_nodes n JOIN code_edges e ON e.src_id = n.id
+         WHERE n.project = ?1 AND n.file = ?2
+           AND e.kind IN ('calls', 'references') AND e.resolved = 1
+         ORDER BY e.dst_id",
+    )?;
+    let rows = stmt.query_map(params![project, file], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Record that `file` was seen by an extraction write path (hook
 /// `update_code_graph`, `import::backfill`) but skipped because its
 /// extension is outside the six AST-supported languages (WP2 Stage 3, H8
