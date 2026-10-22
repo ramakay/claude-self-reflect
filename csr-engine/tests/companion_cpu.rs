@@ -364,9 +364,24 @@ fn a_deadline_makes_the_pane_due_and_the_floor_bounds_every_wait() {
     let mut pane = pane_in(&paths);
     pane.frame(76, 67, NOW);
     assert!(pane.due(NOW + 31.), "nothing goes unread for half a minute");
-    if let Some(t) = pane.next_change.filter(|t| *t < NOW + 25.) {
-        assert!(pane.due(t));
-    }
+    // A frame a quarter minute before the fixture's next label edge: its clocks name that edge,
+    // which is nearer than the floor.
+    let mut pane = pane_in(&paths);
+    let drawn = NOW + 75.;
+    pane.frame(76, 67, drawn);
+    pane.frame(76, 67, drawn + 1.);
+    let edge = pane
+        .next_change
+        .expect("a frame that shows clocks names when it changes next");
+    assert!(
+        edge > drawn + 6. && edge < drawn + 25.,
+        "an edge nearer than the floor, got +{}",
+        edge - drawn
+    );
+    assert!(!pane.due(edge - 5.), "quiet before its deadline");
+    assert!(!pane.due(edge - 3.), "and still");
+    assert!(pane.due(edge), "due at the deadline");
+    assert!(pane.due(edge + 0.2), "and after it");
 }
 
 #[test]
