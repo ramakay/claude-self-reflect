@@ -137,6 +137,25 @@ where
         .map_err(|e| anyhow::anyhow!("off-worker job failed: {e}"))
 }
 
+/// The lib test binary never runs `main`, so nothing raised its descriptor ceiling: it ran under
+/// the shell's soft limit (256 on macOS). Tests run in parallel, each holding a SQLite database
+/// (three files), runtimes and sockets, and the ceiling was hit by whichever test opened the
+/// next file: an `EMFILE` that showed up as a `hnsw_rs` "could not open file" panic or a failed
+/// runtime build in an unrelated test. Only the later tests were safe, once
+/// `raise_fd_limit_lifts_the_soft_limit` had run. This lifts the limit before the first test, as
+/// `main` does for the binary.
+#[cfg(all(test, unix))]
+mod test_fd_limit {
+    extern "C" fn raise() {
+        super::raise_fd_limit();
+    }
+
+    #[used]
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__mod_init_func")]
+    #[cfg_attr(not(target_vendor = "apple"), link_section = ".init_array")]
+    static RAISE_AT_LOAD: extern "C" fn() = raise;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +221,19 @@ mod tests {
         with_env(Some(&MAX_THREAD_OVERRIDE.to_string()), || {
             assert_eq!(resolve_tokio_workers(), MAX_THREAD_OVERRIDE);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_test_binary_starts_with_the_limit_already_raised() {
+        // Run alone, nothing else has called `raise_fd_limit`: only the load-time hook can have.
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: reads this process's RLIMIT_NOFILE into a valid struct.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        assert!(lim.rlim_cur >= std::cmp::min(lim.rlim_max, 10_240 as libc::rlim_t));
     }
 
     #[cfg(unix)]
