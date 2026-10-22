@@ -384,6 +384,24 @@ fn a_deadline_makes_the_pane_due_and_the_floor_bounds_every_wait() {
     assert!(pane.due(edge + 0.2), "and after it");
 }
 
+/// The week reads sources no file watch covers (the narrative's query, the transcripts the spend
+/// adds up). Drawing every second read them every minute; skipping frames must not stretch that
+/// to a minute and the floor on top of it.
+#[test]
+fn the_week_s_own_sources_are_read_again_a_minute_after_they_were_not_a_floor_later() {
+    let (_home, paths) = rich_home();
+    let mut pane = pane_in(&paths);
+    pane.frame(76, 67, NOW);
+    // Another reason to draw comes just before the minute: it does not read the week again.
+    pane.frame(76, 67, NOW + 59.5);
+    assert!(
+        pane.due(NOW + 60.1),
+        "the week's minute is up; the floor would say +89"
+    );
+    pane.frame(76, 67, NOW + 60.1);
+    assert!(!pane.due(NOW + 62.), "and read, it is quiet again");
+}
+
 #[test]
 fn a_page_that_is_not_the_main_one_is_drawn_every_second_as_before() {
     let (_home, paths) = rich_home();

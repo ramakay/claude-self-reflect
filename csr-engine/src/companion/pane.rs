@@ -274,6 +274,8 @@ pub struct Pane {
     pub encodes: usize,
     pub reused: usize,
 }
+/// How long the narrative's week query is kept.
+const WEEK_EVERY: f64 = 60.;
 /// The gate's name for the rollout files' fingerprint.
 const CODEX_ROLLOUTS: &str = "codex rollouts";
 impl Pane {
@@ -403,13 +405,19 @@ impl Pane {
             || self.compacting
     }
     /// The first moment the drawing changes by itself: what the instrument frame named, the
-    /// six-second windows of a sent or answered row, and the Shift Map's fold.
+    /// six-second windows of a sent or answered row, the Shift Map's fold, and the minute the
+    /// week's own sources are read again.
     fn deadline(&self) -> Option<f64> {
         [
             self.next_change,
             self.sent[2].as_f64().map(|at| at + 6.),
             self.answered.as_ref().map(|a| a.2 + 6.),
             self.map.due,
+            // What the week shows from sources the gate does not watch is read again this
+            // often, as it was when every second drew: the narrative's query, and the listing of
+            // the transcripts the spend adds up.
+            self.narrative.as_ref().map(|n| n.1 + WEEK_EVERY),
+            self.spend.as_ref().and_then(value::Spend::next_listing),
         ]
         .into_iter()
         .flatten()
@@ -1297,7 +1305,7 @@ impl Pane {
         };
         let stale = narrative_kept
             .as_ref()
-            .is_none_or(|(key, at, _)| *key != week || now - at >= 60.);
+            .is_none_or(|(key, at, _)| *key != week || now - at >= WEEK_EVERY);
         if stale {
             let narrative = db
                 .map(|db| value::narrative_week(db, num(&plan["start"])))

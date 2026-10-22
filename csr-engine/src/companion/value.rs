@@ -615,6 +615,11 @@ impl Spend {
         true
     }
     /// Read on for at most `budget`; true once every transcript has been read to its end.
+    /// When the transcripts are listed again: a new file, or a long-quiet one written to, is only
+    /// found then, and nothing in the pane's gate sees them.
+    pub fn next_listing(&self) -> Option<f64> {
+        self.listed.map(|at| at + SCAN_LIST_EVERY)
+    }
     pub fn step(&mut self, start: f64, now: f64, budget: Duration) -> bool {
         let began = Instant::now();
         if self.start != Some(start) {
