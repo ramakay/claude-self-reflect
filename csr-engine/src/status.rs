@@ -2044,6 +2044,12 @@ fn gather_recent_dreams(storage: &Storage, db_path: &Path) -> DreamRecent {
     }
 }
 
+/// A dream or batch record, with or without spaces around the separators:
+/// older lines of the log were written with them, newer ones without.
+static DREAM_KIND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#""kind"\s*:\s*"(?:dream|batch)""#).expect("a fixed pattern")
+});
+
 /// Distinct companion dreams at or after `since` (epoch seconds), counted the
 /// way the pane counts them (`companion::dreams::load_dream_log`: batches
 /// expanded, one entry per id). Lines that cannot be a dream are skipped
@@ -2056,7 +2062,7 @@ fn companion_dreams_since(logs: &[std::path::PathBuf], since: f64) -> i64 {
             continue;
         };
         for line in String::from_utf8_lossy(&bytes).lines() {
-            if !(line.contains("\"kind\":\"dream\"") || line.contains("\"kind\":\"batch\"")) {
+            if !DREAM_KIND.is_match(line) {
                 continue;
             }
             if let Ok(row) = serde_json::from_str::<serde_json::Value>(line) {
@@ -3576,6 +3582,11 @@ mod tests {
                 r#"{{"kind":"dream","id":"d","line":"w","at":{}}}"#,
                 now - 30. * 86400.
             ),
+            // older lines of the log carry spaces around the separators
+            format!(
+                r#"{{"kind": "dream", "id": "e", "line": "v", "at": {}}}"#,
+                now - 5.
+            ),
             format!(r#"{{"kind":"look","at":{}}}"#, now),
             "not json".to_owned(),
         ];
@@ -3583,10 +3594,10 @@ mod tests {
         let recent = gather_recent_dreams(&storage, &db_path);
         assert_eq!(recent.stored, 1, "the August row is outside the window");
         assert_eq!(
-            recent.companion, 3,
-            "a, b and c; not the old one, not a look"
+            recent.companion, 4,
+            "a, b, c and the spaced e; not the old one, not a look"
         );
-        assert_eq!(recent.total(), 4);
+        assert_eq!(recent.total(), 5);
     }
 
     #[test]
