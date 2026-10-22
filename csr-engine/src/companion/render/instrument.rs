@@ -633,8 +633,11 @@ impl Composition {
         }
         if let Some(quotas) = cut.figure["quotas"].as_array_mut() {
             for q in quotas {
-                if q["pace"].is_number() {
-                    q["pace"] = json!(text::ahead_of_pace(q));
+                // Both predicates are drawn: the caption's `»` (used past pace) and the text
+                // row's mark (used past pace by five points). Each is a bool in the key.
+                if let Some(pace) = q["pace"].as_f64() {
+                    let caption = num(&q["used"]) / 100. > pace;
+                    q["pace"] = json!([caption, text::ahead_of_pace(q)]);
                 }
             }
         }
@@ -700,7 +703,10 @@ impl Composition {
             };
             // Pace appears when the window opens; "ahead" ends when the pace catches up.
             due.push(resets - len);
+            // Each mark ends when the pace reaches the figure it is measured against: the
+            // caption's `»` at the used share, the text row's mark five points below it.
             if let Some(used) = q["used"].as_f64() {
+                due.push(resets - len * (1. - used / 100.));
                 due.push(resets - len * (1. - (used / 100. - 0.05)));
             }
         }
@@ -4588,6 +4594,33 @@ mod tests {
         };
         assert_eq!(quota(0.10), quota(0.11));
         assert_ne!(quota(0.10), quota(0.60));
+    }
+
+    /// The caption draws `»` when used is past pace, with no margin; the text row's mark has a
+    /// five-point one. A pace between them changes the caption and must change the key, and the
+    /// schedule must name the moment the pace reaches the used share.
+    #[test]
+    fn the_key_and_the_schedule_follow_the_caption_s_own_threshold() {
+        let now = 1_800_000_000.;
+        // A 5H window that is 58% elapsed: it resets in 7560 s.
+        let quota = |pace: f64| {
+            let mut c = Composition::build(&json!({}), &json!({"id":"q"}), now);
+            c.figure["quotas"] = json!([{"code":"5H","used":60.,"pace":pace,"resets":now + 7560.}]);
+            c
+        };
+        let (ahead, caught_up) = (quota(0.58), quota(0.61));
+        assert_eq!(quota_caption(&ahead, &ahead.figure["quotas"][0]), "5H »");
+        assert_eq!(
+            quota_caption(&caught_up, &caught_up.figure["quotas"][0]),
+            "5H"
+        );
+        assert_ne!(
+            ahead.draw_key(Open::default()),
+            caught_up.draw_key(Open::default())
+        );
+        // The pace reaches 60% of the window 360 s from now: the `»` goes then.
+        let due = ahead.next_change_at(Open::default()).unwrap();
+        assert!((due - (now + 360.01)).abs() < 1e-6, "due in {}", due - now);
     }
 
     #[test]
