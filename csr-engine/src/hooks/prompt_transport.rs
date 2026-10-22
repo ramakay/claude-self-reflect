@@ -351,27 +351,30 @@ pub fn spawn_for_daemon(
             };
             // Renders read through their own connection, so a background loop
             // holding the daemon's connection for a long statement cannot park
-            // a prompt behind it (see `Storage::open_prompt_lane`).
-            let (engine, lane) = match engine.storage().open_prompt_lane() {
-                Ok(Some(lane)) => (
-                    Arc::new(Engine::from_parts_with_index_dir(
-                        Arc::new(lane),
-                        engine.embeddings().clone(),
-                        engine.search().clone(),
-                        engine.projects_dir().to_path_buf(),
-                        engine.index_dir().to_path_buf(),
-                    )),
-                    true,
-                ),
-                Ok(None) => (engine, false),
+            // a prompt behind it (see `Storage::open_prompt_lane`). Writes that
+            // must not be lost, and may wait, stay on the daemon's connection:
+            // `receipts`.
+            let receipts = engine.storage().clone();
+            let render_engine = match engine.storage().open_prompt_lane() {
+                Ok(Some(lane)) => Arc::new(Engine::from_parts_with_index_dir(
+                    Arc::new(lane),
+                    engine.embeddings().clone(),
+                    engine.search().clone(),
+                    engine.projects_dir().to_path_buf(),
+                    engine.index_dir().to_path_buf(),
+                )),
+                Ok(None) => engine.clone(),
                 Err(e) => {
                     tracing::warn!(%e, "prompt lane unavailable, renders share the daemon connection");
-                    (engine, false)
+                    engine.clone()
                 }
             };
             // Measure the frame vocabulary (`injection::specificity`) off the
             // prompt path: before the first prompt, then well inside each
-            // validity window, so a render only ever reads the cached copy.
+            // validity window, so a render only ever reads the cached copy. It
+            // runs on the daemon's connection (reads, then one meta write that
+            // may wait for another writer) and publishes into the cache the lane
+            // shares; the lane's own mutex is never held for that.
             {
                 let engine = engine.clone();
                 let shutdown = shutdown.clone();
@@ -386,6 +389,7 @@ pub fn spawn_for_daemon(
                     }
                 });
             }
+            let engine = render_engine;
             let slots = Arc::new(Semaphore::new(1));
             while !shutdown.load(Ordering::SeqCst) {
                 let accepted = tokio::select! {
@@ -399,6 +403,7 @@ pub fn spawn_for_daemon(
                     continue;
                 };
                 let engine = engine.clone();
+                let receipts = receipts.clone();
                 let database = database.clone();
                 tokio::spawn(async move {
                     let deadline = tokio::time::Instant::now() + REQUEST_BUDGET;
@@ -422,41 +427,37 @@ pub fn spawn_for_daemon(
                         }
                         let runtime = tokio::runtime::Handle::current();
                         tokio::task::spawn_blocking(move || {
-                            // The worker owns admission until rendering, delivery,
-                            // and receipt commit/rollback have actually finished.
-                            let _slot = slot;
+                            // The worker owns admission until rendering and delivery
+                            // have finished. It lets go before anything that can wait
+                            // for a database writer: the retrieval events and the
+                            // release of an unshown dream claim, which go to the
+                            // daemon's connection, not the render's.
+                            let mut permit = Some(slot);
                             let _operation = engine.storage().operation_lock().ok()?;
                             if tokio::time::Instant::now() >= deadline {
                                 return None;
                             }
-                            // Only the lane's own connection: lowering the timeout of
-                            // the shared one would queue on whoever holds it.
-                            if lane {
-                                let _ = engine.storage().set_busy_timeout(
-                                    crate::storage::Storage::PROMPT_LANE_BUSY_TIMEOUT,
-                                );
-                            }
-                            let prepared = runtime.block_on(super::prompt_submit::prepare(
-                                &request.input,
-                                &engine,
-                                &cwd,
-                            ));
-                            // Receipts and claim releases happen after this point and
-                            // may wait for a writer as long as any other connection.
-                            if lane {
-                                let _ = engine
-                                    .storage()
-                                    .set_busy_timeout(crate::storage::DEFAULT_BUSY_TIMEOUT);
-                            }
+                            let prepared =
+                                runtime.block_on(super::prompt_submit::prepare_with_receipts(
+                                    &request.input,
+                                    &engine,
+                                    &cwd,
+                                    receipts,
+                                ));
                             let prepared = prepared.ok()?;
                             if tokio::time::Instant::now() >= deadline {
+                                drop(permit.take());
+                                drop(prepared);
                                 return None;
                             }
-                            let bytes = serde_json::to_vec(&Response {
+                            let Ok(bytes) = serde_json::to_vec(&Response {
                                 version: VERSION,
                                 injection: prepared.text.clone(),
-                            })
-                            .ok()?;
+                            }) else {
+                                drop(permit.take());
+                                drop(prepared);
+                                return None;
+                            };
                             let delivered = runtime.block_on(async {
                                 tokio::time::timeout_at(deadline, async {
                                     write_frame(&mut stream, &bytes).await?;
@@ -467,11 +468,14 @@ pub fn spawn_for_daemon(
                                 .flatten()
                             });
                             if delivered.is_some() {
-                                prepared.delivered();
+                                prepared.delivered_releasing(|| drop(permit.take()));
+                            } else {
+                                // An unacknowledged plan drops here, on this blocking
+                                // worker: speculative dream claims are released and
+                                // unshown exposures are discarded, never on a Tokio worker.
+                                drop(permit.take());
+                                drop(prepared);
                             }
-                            // An unacknowledged plan drops here, on this blocking
-                            // worker: speculative dream claims are released and
-                            // unshown exposures are discarded, never on a Tokio worker.
                             delivered
                         })
                         .await
@@ -755,6 +759,99 @@ mod tests {
         release_tx.send(()).unwrap();
         holder.join().unwrap();
         assert_eq!(served, Some(expected));
+        shutdown.store(true, Ordering::SeqCst);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Serializes process-wide policy environment during this test.
+    async fn receipts_wait_for_the_writer_without_holding_admission() {
+        let _env = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let engine = fixture_over(dir.path(), crate::storage::Storage::open(&db).unwrap());
+        let mut input = input(dir.path());
+        input.prompt =
+            Some("authentication timeout regression in token validation needs a fix".into());
+        let vector = engine
+            .embeddings()
+            .embed_single(input.prompt.as_deref().unwrap())
+            .unwrap();
+        engine
+            .storage()
+            .insert_reflection(
+                "solution",
+                "Token validation regression was fixed by refreshing expired credentials before retry.",
+                &["solution".into()],
+                &vector,
+            )
+            .unwrap();
+        engine
+            .search()
+            .write()
+            .await
+            .insert_reflection("solution".into(), vector);
+        let expected = super::super::prompt_submit::render(&input, &engine, dir.path())
+            .await
+            .unwrap();
+        assert!(
+            expected.contains("refreshing expired credentials"),
+            "{expected}"
+        );
+        let storage = engine.storage().clone();
+        let events = |storage: &crate::storage::Storage| -> i64 {
+            storage
+                .with_connection(|conn| {
+                    Ok(
+                        conn.query_row("SELECT COUNT(*) FROM retrieval_events", [], |row| {
+                            row.get(0)
+                        })?,
+                    )
+                })
+                .unwrap()
+        };
+        let before = events(&storage);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = spawn_for_daemon(engine, shutdown.clone());
+        ready(dir.path()).await;
+
+        // A daemon write transaction is open. Receipts for the first reply have
+        // to wait for it; the second prompt must not.
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut first = None;
+        for _ in 0..40 {
+            first = request(dir.path(), input.clone()).await;
+            if first.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(first, Some(expected));
+        let started = Instant::now();
+        let mut second = None;
+        while started.elapsed() < Duration::from_millis(1500) {
+            second = request(dir.path(), input.clone()).await;
+            if second.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            second.is_some(),
+            "a prompt was refused while receipts waited for the writer"
+        );
+        assert_eq!(events(&storage), before, "receipts cannot have landed yet");
+
+        // Once the writer commits, the receipts land: none were dropped.
+        writer.execute_batch("COMMIT").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events(&storage) <= before {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the retrieval events of the first reply were written");
         shutdown.store(true, Ordering::SeqCst);
         server.await.unwrap();
     }

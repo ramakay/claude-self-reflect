@@ -60,7 +60,11 @@ pub struct Storage {
     conn: GuardedConnection,
     /// Frame terms measured over this store's reflections (see
     /// `injection::specificity`), with when they were measured.
-    common_terms: vocabulary::CommonTermsCache,
+    common_terms: std::sync::Arc<vocabulary::CommonTermsCache>,
+    /// Whether a measurement made here is written to meta for other
+    /// processes. The prompt lane never writes: a write waits behind the
+    /// daemon's transactions, and the lane's mutex is the render's.
+    vocabulary_writes: bool,
 }
 
 /// v3: the count means CSR text labeled by the grammar detector, not text
@@ -250,14 +254,17 @@ impl Storage {
                 maintenance: maintenance.cloned(),
             },
             common_terms: Default::default(),
+            vocabulary_writes: true,
         })
     }
 
-    /// How long the prompt lane waits for another writer while a render is
-    /// being built. A render that cannot take a write lock in this time skips
-    /// that write rather than spend the hook's request budget on it. The lane
-    /// otherwise waits as long as any other connection (`DEFAULT_BUSY_TIMEOUT`),
-    /// so the receipts written once the reply is acknowledged are not dropped.
+    /// How long the prompt lane waits for another writer. It is the lane's
+    /// busy timeout for good, not only while a render is built: the lane's
+    /// mutex belongs to the next render, so nothing may hold it for the
+    /// 5 s other connections wait (`DEFAULT_BUSY_TIMEOUT`). A write that cannot
+    /// start in this time is skipped. The writes that must not be lost, the
+    /// receipts after delivery and the release of a dream claim, go through
+    /// the daemon's connection instead (see `prompt_transport`).
     pub(crate) const PROMPT_LANE_BUSY_TIMEOUT: std::time::Duration =
         std::time::Duration::from_millis(250);
 
@@ -296,7 +303,7 @@ impl Storage {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
-        conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+        conn.busy_timeout(Self::PROMPT_LANE_BUSY_TIMEOUT)?;
         conn.execute_batch(
             "PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;",
         )?;
@@ -307,7 +314,10 @@ impl Storage {
                 data_dir: Some(data_dir),
                 maintenance: self.conn.maintenance.clone(),
             },
-            common_terms: Default::default(),
+            // One cache for both connections: the daemon's refresh publishes
+            // here and a render only ever reads it.
+            common_terms: self.common_terms.clone(),
+            vocabulary_writes: false,
         }))
     }
 
@@ -322,6 +332,7 @@ impl Storage {
                 maintenance: None,
             },
             common_terms: Default::default(),
+            vocabulary_writes: true,
         })
     }
 
@@ -337,6 +348,7 @@ impl Storage {
                 maintenance: None,
             },
             common_terms: Default::default(),
+            vocabulary_writes: true,
         })
     }
 

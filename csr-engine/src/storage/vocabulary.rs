@@ -44,13 +44,14 @@ impl super::Storage {
     }
 
     fn common_terms_cached_or_measured(&self, remeasure: bool) -> Arc<CommonTerms> {
-        let mut cache = self
-            .common_terms
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((at, terms)) = cache.as_ref() {
-            if !remeasure && at.elapsed() < REMEASURE_AFTER {
-                return terms.clone();
+        // The cache lock covers the lookup and the publish only. The reads and
+        // the write below can wait for SQLite, and a render reading the cache
+        // must never queue behind them.
+        if !remeasure {
+            if let Some((at, terms)) = self.cached_terms() {
+                if at.elapsed() < REMEASURE_AFTER {
+                    return terms;
+                }
             }
         }
         let now = chrono::Utc::now();
@@ -69,19 +70,32 @@ impl super::Storage {
             Some(stored) => Arc::new(CommonTerms::from_measurement(stored.terms, stored.excerpts)),
             None => {
                 let measured = Arc::new(self.measure_common_terms());
-                let stored = Stored {
-                    measured_at: now.to_rfc3339(),
-                    excerpts: measured.excerpts,
-                    terms: measured.terms().map(str::to_owned).collect(),
-                };
-                if let Ok(raw) = serde_json::to_string(&stored) {
-                    let _ = self.set_meta(META_KEY, &raw);
+                if self.vocabulary_writes {
+                    let stored = Stored {
+                        measured_at: now.to_rfc3339(),
+                        excerpts: measured.excerpts,
+                        terms: measured.terms().map(str::to_owned).collect(),
+                    };
+                    if let Ok(raw) = serde_json::to_string(&stored) {
+                        let _ = self.set_meta(META_KEY, &raw);
+                    }
                 }
                 measured
             }
         };
-        *cache = Some((Instant::now(), terms.clone()));
+        *self
+            .common_terms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((Instant::now(), terms.clone()));
         terms
+    }
+
+    fn cached_terms(&self) -> Option<(Instant, Arc<CommonTerms>)> {
+        self.common_terms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn measure_common_terms(&self) -> CommonTerms {
@@ -105,6 +119,7 @@ impl super::Storage {
 #[cfg(test)]
 mod tests {
     use crate::storage::Storage;
+    use std::time::Instant;
 
     #[test]
     fn one_measurement_is_shared_through_meta() {
@@ -138,5 +153,104 @@ mod tests {
         assert_eq!(storage.reflection_common_terms().excerpts, 250);
         assert_eq!(storage.refresh_reflection_common_terms().excerpts, 251);
         assert_eq!(storage.reflection_common_terms().excerpts, 251);
+    }
+
+    fn file_store_with_reflections(dir: &std::path::Path, n: usize) -> Storage {
+        let storage = Storage::open(&dir.join("csr-engine.db")).unwrap();
+        for i in 0..n {
+            storage
+                .insert_reflection(
+                    &format!("r{i}"),
+                    &format!("Session in demo project using Bash, Read, Edit about item{i}"),
+                    &["session_story".to_string()],
+                    &[0.0; 4],
+                )
+                .unwrap();
+        }
+        storage
+    }
+
+    /// Holds the database write lock from another connection for `hold`.
+    fn hold_writer(
+        dir: &std::path::Path,
+        hold: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let path = dir.join("csr-engine.db");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(hold);
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        ready_rx.recv().unwrap();
+        handle
+    }
+
+    #[test]
+    fn the_prompt_lane_never_waits_on_a_writer_to_publish_the_vocabulary() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = file_store_with_reflections(dir.path(), 250);
+        let lane = storage.open_prompt_lane().unwrap().unwrap();
+        let writer = hold_writer(dir.path(), std::time::Duration::from_millis(2500));
+
+        // A render on a cold cache measures from reads. Writing the result to
+        // meta would wait for the held transaction, with the lane's mutex held.
+        let started = Instant::now();
+        let terms = lane.reflection_common_terms();
+        let took = started.elapsed();
+        // The mutex is free for the next render's own statements.
+        let again = Instant::now();
+        lane.set_busy_timeout(Storage::PROMPT_LANE_BUSY_TIMEOUT)
+            .unwrap();
+        let mutex_wait = again.elapsed();
+        writer.join().unwrap();
+
+        assert_eq!(terms.excerpts, 250);
+        assert!(took < std::time::Duration::from_millis(1000), "{took:?}");
+        assert!(
+            mutex_wait < std::time::Duration::from_millis(500),
+            "{mutex_wait:?}"
+        );
+        assert!(
+            storage.get_meta(super::META_KEY).unwrap().is_none(),
+            "the lane must not write the shared measurement"
+        );
+    }
+
+    #[test]
+    fn a_refresh_on_the_daemon_connection_publishes_to_the_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = file_store_with_reflections(dir.path(), 250);
+        let lane = storage.open_prompt_lane().unwrap().unwrap();
+        assert_eq!(storage.refresh_reflection_common_terms().excerpts, 250);
+
+        // The refresh also wrote meta, so rows added afterwards are not what
+        // the lane reads: it serves the published copy.
+        storage
+            .insert_reflection("late", "fresh words here", &[], &[0.0; 4])
+            .unwrap();
+        let writer = hold_writer(dir.path(), std::time::Duration::from_millis(1500));
+        let started = Instant::now();
+        let terms = lane.reflection_common_terms();
+        let took = started.elapsed();
+        writer.join().unwrap();
+        assert_eq!(terms.excerpts, 250);
+        assert!(took < std::time::Duration::from_millis(300), "{took:?}");
+    }
+
+    #[test]
+    fn the_prompt_lane_waits_a_bounded_time_for_a_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = file_store_with_reflections(dir.path(), 1);
+        let lane = storage.open_prompt_lane().unwrap().unwrap();
+        let timeout: i64 = lane
+            .with_connection(|conn| Ok(conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(
+            timeout,
+            Storage::PROMPT_LANE_BUSY_TIMEOUT.as_millis() as i64
+        );
     }
 }

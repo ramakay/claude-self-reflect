@@ -113,13 +113,20 @@ pub fn injection_with_id_for_prompt(
         // emit. An already-delivered dream loses here and the loop moves on
         // to the next matching conclusion rather than emitting nothing at
         // all — a second, genuinely unseen dream is still worth showing.
-        if dream_delivery::claim_delivery(
+        match dream_delivery::try_claim_delivery(
             storage,
             &headline.id,
             DeliveryChannel::Prompt,
             session_id,
         ) {
-            return Some((headline.id.clone(), format_line(headline, token)));
+            dream_delivery::Claim::Won => {
+                return Some((headline.id.clone(), format_line(headline, token)));
+            }
+            dream_delivery::Claim::Lost => {}
+            // A writer holds the database. Every further claim would wait out
+            // its own busy timeout, and together they would pass the hook's
+            // request budget: one wait per render, then the line is skipped.
+            dream_delivery::Claim::Contended => return None,
         }
     }
     None
@@ -132,6 +139,7 @@ mod tests {
     use crate::storage::witness_ledger::{self, WitnessLedgerRow};
     use crate::storage::witness_verdicts::{self, VerdictKind, WitnessVerdictRow};
     use rusqlite::params;
+    use std::time::Duration;
 
     fn seed(storage: &Storage, project: &str, file: &str, symbol: Option<&str>, receipt: &str) {
         storage
@@ -366,6 +374,59 @@ mod tests {
         assert_eq!(
             injection_for_prompt(&storage, "proj", "run_thread_extraction?", None),
             None
+        );
+    }
+
+    #[test]
+    fn a_writer_holding_the_database_costs_one_wait_not_one_per_conclusion() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csr-engine.db");
+        let storage = Storage::open(&path).unwrap();
+        for (symbol, receipt) in [
+            ("alpha_one", "a111111"),
+            ("beta_two", "b222222"),
+            ("gamma_three", "c333333"),
+            ("delta_four", "d444444"),
+        ] {
+            seed(
+                &storage,
+                "proj",
+                "/repo/src/dream/policy.rs",
+                Some(symbol),
+                receipt,
+            );
+        }
+        let lane = storage.open_prompt_lane().unwrap().unwrap();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(writer_path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(10));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        ready_rx.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        let line =
+            injection_for_prompt(&lane, "proj", "look at dream/policy.rs please", Some("s1"));
+        let took = started.elapsed();
+        let _ = done_tx.send(());
+        writer.join().unwrap();
+
+        // Nothing was recorded, so nothing is shown, and the four matching
+        // conclusions together cost one busy wait (250 ms), not four.
+        assert_eq!(line, None);
+        assert!(took < Duration::from_millis(600), "{took:?}");
+        // The lane did not mark any of them delivered: the next prompt, with the
+        // writer gone, claims one.
+        assert!(
+            injection_for_prompt(&lane, "proj", "look at dream/policy.rs please", Some("s1"))
+                .is_some()
         );
     }
 }

@@ -162,7 +162,20 @@ pub(super) struct PreparedPrompt {
 
 impl PreparedPrompt {
     pub fn delivered(mut self) -> String {
-        self.effects.commit();
+        self.effects.commit_exposures();
+        self.effects.commit_retrievals();
+        self.text
+    }
+
+    /// Like [`delivered`](Self::delivered), calling `release` between the
+    /// receipts that never wait and the ones that can. The daemon gives up its
+    /// single-flight permit there: a retrieval event waits for the database
+    /// writer as long as any connection does, and no later prompt may queue
+    /// behind that.
+    pub fn delivered_releasing(mut self, release: impl FnOnce()) -> String {
+        self.effects.commit_exposures();
+        release();
+        self.effects.commit_retrievals();
         self.text
     }
 }
@@ -174,10 +187,24 @@ pub(super) async fn prepare(
     engine: &Engine,
     cwd: &Path,
 ) -> Result<PreparedPrompt> {
+    prepare_with_receipts(input, engine, cwd, engine.storage().clone()).await
+}
+
+/// [`prepare`] with the writes that must not be lost, retrieval events and the
+/// release of a dream claim, going to `receipts` instead of the engine's own
+/// storage. The daemon renders on a bounded-wait connection and passes its
+/// long-wait one here.
+pub(super) async fn prepare_with_receipts(
+    input: &HookInput,
+    engine: &Engine,
+    cwd: &Path,
+    receipts: std::sync::Arc<crate::storage::Storage>,
+) -> Result<PreparedPrompt> {
     let mut prepared = PreparedPrompt {
         text: String::new(),
         effects: PendingEffects {
             storage: engine.storage().clone(),
+            receipts,
             impressions: Vec::new(),
             retrievals: Vec::new(),
             dream_claims: Vec::new(),
@@ -205,7 +232,12 @@ struct PendingImpression {
 }
 
 struct PendingEffects {
+    /// Where the render read. Exposure rows go here and are dropped, not
+    /// waited for, when the database is busy.
     storage: std::sync::Arc<crate::storage::Storage>,
+    /// Retrieval events and claim releases: written however long the writer
+    /// takes, from a thread that holds no admission permit.
+    receipts: std::sync::Arc<crate::storage::Storage>,
     impressions: Vec<PendingImpression>,
     retrievals: Vec<(String, String, String)>,
     dream_claims: Vec<(String, Option<String>)>,
@@ -234,14 +266,10 @@ impl PendingEffects {
         });
     }
 
-    fn commit(&mut self) {
+    /// Exposure rows never wait (`try_record_rerank_exposure`).
+    fn commit_exposures(&mut self) {
         // The claims are now receipts and must survive this value's drop.
         self.dream_claims.clear();
-        for (id, source, session) in self.retrievals.drain(..) {
-            let _ = self
-                .storage
-                .log_retrieval_event(&id, &source, "prompt_submit", &session);
-        }
         for item in self.impressions.drain(..) {
             super::exposure::record_impression(
                 &self.storage,
@@ -255,16 +283,25 @@ impl PendingEffects {
             );
         }
     }
+
+    fn commit_retrievals(&mut self) {
+        for (id, source, session) in self.retrievals.drain(..) {
+            let _ = self
+                .receipts
+                .log_retrieval_event(&id, &source, "prompt_submit", &session);
+        }
+    }
 }
 
 impl Drop for PendingEffects {
     fn drop(&mut self) {
         // Only claims won by this render are listed. Keep the claim throughout
         // rendering to preserve cross-process dedupe, but release it if no full
-        // response was acknowledged. On the daemon this always runs on its one
-        // blocking render worker, with the admission permits still held.
+        // response was acknowledged. On the daemon this runs on its blocking
+        // render worker after the admission permit is released, on the
+        // receipts connection.
         for (id, session) in self.dream_claims.drain(..) {
-            let _ = self.storage.with_connection(|conn| {
+            let _ = self.receipts.with_connection(|conn| {
                 conn.execute("DELETE FROM dream_deliveries WHERE dream_id = ?1 AND channel = 'prompt' AND session_id IS ?2",
                     rusqlite::params![id, session])?;
                 Ok(())
@@ -287,12 +324,14 @@ fn undelivered_dream_claim_is_released_but_acknowledged_claim_survives() {
         ));
         let mut pending = PendingEffects {
             storage: storage.clone(),
+            receipts: storage.clone(),
             impressions: Vec::new(),
             retrievals: Vec::new(),
             dream_claims: vec![("dream".into(), Some("session".into()))],
         };
         if delivered {
-            pending.commit();
+            pending.commit_exposures();
+            pending.commit_retrievals();
         }
         drop(pending);
         assert_eq!(

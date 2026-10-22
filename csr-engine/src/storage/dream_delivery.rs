@@ -306,18 +306,53 @@ pub fn record_delivery(
     Ok(changed > 0)
 }
 
-/// Claim `dream_id` for `channel` on a `Storage` handle, fail-soft. `false`
-/// on any storage error — a delivery that could not be recorded must not be
-/// shown, or it would repeat forever.
+/// What a claim attempt found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// This call recorded the delivery and may emit.
+    Won,
+    /// Already delivered (or the write failed for another reason): not shown.
+    Lost,
+    /// Another connection held the write lock for the whole busy wait. Nothing
+    /// was recorded, and a retry on the same connection would wait again.
+    Contended,
+}
+
+/// Claim `dream_id` for `channel` on a `Storage` handle, fail-soft. A delivery
+/// that could not be recorded must not be shown, or it would repeat forever.
+pub fn try_claim_delivery(
+    storage: &Storage,
+    dream_id: &str,
+    channel: DeliveryChannel,
+    session_id: Option<&str>,
+) -> Claim {
+    match storage.with_connection(|conn| record_delivery(conn, dream_id, channel, session_id)) {
+        Ok(true) => Claim::Won,
+        Ok(false) => Claim::Lost,
+        Err(error) if is_busy(&error) => Claim::Contended,
+        Err(_) => Claim::Lost,
+    }
+}
+
+fn is_busy(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(code, _))
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// [`try_claim_delivery`] as a yes/no: `false` on any storage error.
 pub fn claim_delivery(
     storage: &Storage,
     dream_id: &str,
     channel: DeliveryChannel,
     session_id: Option<&str>,
 ) -> bool {
-    storage
-        .with_connection(|conn| record_delivery(conn, dream_id, channel, session_id))
-        .unwrap_or(false)
+    try_claim_delivery(storage, dream_id, channel, session_id) == Claim::Won
 }
 
 /// Conclusion ids of the dreams the journal page lists as active and that no
