@@ -67,6 +67,9 @@ pub struct StatusReport {
     pub csr_self_suppressed: i64,
     pub csr_tool_blocks_suppressed: i64,
     pub csr_hook_wrappers_scrubbed: i64,
+    /// Why the code-graph drain last failed (it lists projects that failed or a
+    /// lock that cannot be opened); `None` while it runs clean.
+    pub graph_drain_error: Option<String>,
     /// Credentials redacted from imported text before chunking. Counts only.
     pub secrets_redacted: SecretsRedactedStatus,
     /// The transcript mirror, read from its state table (no directory walk).
@@ -1376,6 +1379,7 @@ fn gather_status_with(
             csr_self_suppressed: 0,
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
+            graph_drain_error: None,
             secrets_redacted: SecretsRedactedStatus::default(),
             mirror: MirrorStatus::default(),
             codemap: CodemapStatusBlock {
@@ -1424,6 +1428,11 @@ fn gather_status_with(
     let csr_self_suppressed = storage.get_csr_self_suppressed().unwrap_or(0);
     let csr_tool_blocks_suppressed = storage.get_csr_tool_blocks_suppressed().unwrap_or(0);
     let csr_hook_wrappers_scrubbed = storage.get_csr_hook_wrappers_scrubbed().unwrap_or(0);
+    let graph_drain_error = storage
+        .get_meta(crate::extraction::graph_drain::ERROR_KEY)
+        .ok()
+        .flatten()
+        .filter(|e| !e.is_empty());
     let secrets_redacted = SecretsRedactedStatus::read(&storage);
     let mirror = MirrorStatus::read(&storage);
     let codemap = if with_codemap {
@@ -1538,6 +1547,7 @@ fn gather_status_with(
         csr_self_suppressed,
         csr_tool_blocks_suppressed,
         csr_hook_wrappers_scrubbed,
+        graph_drain_error,
         secrets_redacted,
         mirror,
         codemap,
@@ -2867,6 +2877,7 @@ mod tests {
             csr_self_suppressed: 0,
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
+            graph_drain_error: None,
             secrets_redacted: SecretsRedactedStatus::default(),
             mirror: MirrorStatus::default(),
             codemap: CodemapStatusBlock::default(),
@@ -3955,6 +3966,25 @@ mod tests {
         assert_eq!(value["csr_tool_blocks_suppressed"], 4);
         assert_eq!(value["csr_hook_wrappers_scrubbed"], 2);
         assert_eq!(value["csr_self_suppressed"], 6);
+    }
+
+    #[test]
+    fn status_shows_why_the_graph_drain_last_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        let status = || {
+            serde_json::to_value(gather_status(&db_path, &projects_dir, false).unwrap()).unwrap()
+        };
+        assert!(status()["graph_drain_error"].is_null());
+        storage
+            .set_meta("graph_drain_error", "lock cannot be opened")
+            .unwrap();
+        assert_eq!(status()["graph_drain_error"], "lock cannot be opened");
+        storage.set_meta("graph_drain_error", "").unwrap();
+        assert!(status()["graph_drain_error"].is_null(), "cleared");
     }
 
     #[test]

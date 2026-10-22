@@ -1830,11 +1830,23 @@ async fn run(
     }) = args.command
     {
         let storage = csr_engine::storage::Storage::open(&args.db_path)?;
-        let report = match csr_engine::extraction::graph_drain::drain_if_pending(
-            &storage,
-            &args.db_path,
-        )? {
-            Some(drain) => serde_json::json!({
+        use csr_engine::extraction::graph_drain::{drain_outcome, Outcome};
+        let mut failed = false;
+        let report = match drain_outcome(&storage, &args.db_path) {
+            Err(e) => {
+                failed = true;
+                serde_json::json!({ "drained": false, "error": format!("{e:#}") })
+            }
+            Ok(Outcome::Idle) => {
+                serde_json::json!({ "drained": false, "reason": "nothing pending" })
+            }
+            Ok(Outcome::Contended) => serde_json::json!({
+                "drained": false,
+                "reason": "another process is draining (the drain lock is held)",
+            }),
+            Ok(Outcome::Drained(drain)) => {
+                failed = !drain.errors.is_empty();
+                serde_json::json!({
                 "drained": true,
                 "projects": drain.projects,
                 "files": drain.files,
@@ -1845,10 +1857,13 @@ async fn run(
                 "failed_projects": drain.errors.iter().map(|(p, e)| serde_json::json!({"project": p, "error": e})).collect::<Vec<_>>(),
                 "ms": drain.elapsed.as_millis() as u64,
                 "longest_lock_hold_ms": drain.longest_lock_hold.as_millis() as u64,
-            }),
-            None => serde_json::json!({ "drained": false }),
+                })
+            }
         };
         println!("{report}");
+        if failed {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 

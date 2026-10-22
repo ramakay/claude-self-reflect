@@ -125,17 +125,81 @@ pub struct GraphDrain {
 /// never run two passes at once. `storage` answers the cheap pending check; the
 /// pass uses a connection of its own, so it does not hold up what else the
 /// calling process does with `storage`.
+///
+/// A lock that cannot be opened or taken for a reason other than another
+/// process holding it is an error, not contention: it is returned, written to
+/// `meta` (`graph_drain_error`, which `csr-engine status` shows) and so cannot
+/// silently stop the drain.
 pub fn drain_if_pending(storage: &Storage, db_path: &Path) -> Result<Option<GraphDrain>> {
+    match drain_outcome(storage, db_path)? {
+        Outcome::Drained(drain) => Ok(Some(drain)),
+        Outcome::Idle | Outcome::Contended => Ok(None),
+    }
+}
+
+/// Why a drain call did or did not run a pass.
+#[derive(Debug)]
+pub enum Outcome {
+    /// Nothing was pending.
+    Idle,
+    /// Another process holds the drain lock and is draining.
+    Contended,
+    /// A pass ran. `GraphDrain::errors` lists projects that failed.
+    Drained(GraphDrain),
+}
+
+/// [`drain_if_pending`] saying which of the three it was, and recording the
+/// result in `meta`.
+pub fn drain_outcome(storage: &Storage, db_path: &Path) -> Result<Outcome> {
+    let result = drain_unrecorded(storage, db_path);
+    record_error(storage, &result);
+    result
+}
+
+fn drain_unrecorded(storage: &Storage, db_path: &Path) -> Result<Outcome> {
     if storage.pending_resolve_files()?.is_empty() {
-        return Ok(None);
+        return Ok(Outcome::Idle);
     }
     let data_dir = db_path.parent().unwrap_or(Path::new("."));
-    let Some(_lock) = DrainLock::try_acquire(data_dir) else {
-        return Ok(None);
+    let Some(_lock) = DrainLock::try_acquire(data_dir)? else {
+        return Ok(Outcome::Contended);
     };
     let own = Storage::open(db_path)?;
     own.with_connection(|conn| drain(conn, &|file| exists(file)))
-        .map(Some)
+        .map(Outcome::Drained)
+}
+
+/// `meta` key holding the last drain failure, empty when the last pass was clean.
+pub const ERROR_KEY: &str = "graph_drain_error";
+
+/// Keep `graph_drain_error` in step with what just happened: set on a failure,
+/// cleared by a clean pass or an idle check, untouched by contention (that says
+/// nothing about whether the lock works).
+fn record_error(storage: &Storage, result: &Result<Outcome>) {
+    let message = match result {
+        Err(e) => format!("{e:#}"),
+        Ok(Outcome::Drained(d)) if !d.errors.is_empty() => d
+            .errors
+            .iter()
+            .map(|(p, e)| format!("{p}: {e}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+        Ok(Outcome::Contended) => return,
+        Ok(_) => String::new(),
+    };
+    if storage
+        .get_meta(ERROR_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        == message
+    {
+        return;
+    }
+    if !message.is_empty() {
+        tracing::warn!("code graph drain: {message}");
+    }
+    let _ = storage.set_meta(ERROR_KEY, &message);
 }
 
 fn exists(file: &str) -> bool {
@@ -309,16 +373,28 @@ struct DrainLock {
 }
 
 impl DrainLock {
-    fn try_acquire(data_dir: &Path) -> Option<Self> {
+    /// `Ok(None)` when another process holds the lock. Anything else that goes
+    /// wrong (the file cannot be created or opened, the filesystem has no
+    /// locks) is an `Err`: it will not clear by itself.
+    fn try_acquire(data_dir: &Path) -> Result<Option<Self>> {
+        let path = data_dir.join(LOCK_FILE);
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(data_dir.join(LOCK_FILE))
-            .ok()?;
-        fs2::FileExt::try_lock_exclusive(&file).ok()?;
-        Some(Self { _file: file })
+            .open(&path)
+            .map_err(|e| {
+                anyhow::anyhow!("graph drain lock {} cannot be opened: {e}", path.display())
+            })?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(None),
+            Err(e) => Err(anyhow::anyhow!(
+                "graph drain lock {} cannot be taken: {e}",
+                path.display()
+            )),
+        }
     }
 }
 
@@ -504,7 +580,7 @@ mod tests {
     #[test]
     fn only_one_drain_runs_at_a_time() {
         let (dir, db, storage) = extracted();
-        let held = DrainLock::try_acquire(dir.path()).unwrap();
+        let held = DrainLock::try_acquire(dir.path()).unwrap().unwrap();
         assert!(drain_if_pending(&storage, &db).unwrap().is_none());
         assert_eq!(pending(&storage).len(), 1, "left for the lock holder");
         drop(held);
@@ -678,5 +754,60 @@ mod tests {
         assert!(!live("999990 0 daemon-7", "mcp-3"), "no capability");
         assert!(!live("garbage", "mcp-3"));
         assert!(!other_drainer_is_live(None, "mcp-3", now));
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_opened_is_an_error_not_contention() {
+        let (dir, db, storage) = extracted();
+        // The lock path is a directory: opening it for write fails for good.
+        std::fs::create_dir(dir.path().join(LOCK_FILE)).unwrap();
+        let err = drain_if_pending(&storage, &db).unwrap_err();
+        assert!(format!("{err:#}").contains("cannot be opened"), "{err:#}");
+        // Recorded for `csr-engine status`.
+        let stored = storage.get_meta(ERROR_KEY).unwrap().unwrap();
+        assert!(stored.contains("cannot be opened"), "{stored}");
+        assert_eq!(pending(&storage).len(), 1, "nothing drained");
+
+        // Once the cause is gone the next pass drains and clears the error.
+        std::fs::remove_dir(dir.path().join(LOCK_FILE)).unwrap();
+        assert!(drain_if_pending(&storage, &db).unwrap().is_some());
+        assert_eq!(storage.get_meta(ERROR_KEY).unwrap().unwrap(), "");
+    }
+
+    #[test]
+    fn contention_is_not_an_error_and_leaves_the_recorded_error_alone() {
+        let (dir, db, storage) = extracted();
+        storage.set_meta(ERROR_KEY, "an earlier failure").unwrap();
+        let held = DrainLock::try_acquire(dir.path()).unwrap().unwrap();
+        assert!(matches!(
+            drain_outcome(&storage, &db).unwrap(),
+            Outcome::Contended
+        ));
+        assert_eq!(
+            storage.get_meta(ERROR_KEY).unwrap().unwrap(),
+            "an earlier failure"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn a_failed_project_is_recorded_for_status() {
+        let (_dir, db, storage) = extracted();
+        storage
+            .with_connection(|c| {
+                c.execute_batch(
+                    "CREATE TRIGGER rank_fails BEFORE INSERT ON code_node_rank
+                     BEGIN SELECT RAISE(ABORT, 'rank write failed'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let report = drain_if_pending(&storage, &db).unwrap().unwrap();
+        assert_eq!(report.errors.len(), 1);
+        let stored = storage.get_meta(ERROR_KEY).unwrap().unwrap();
+        assert!(
+            stored.starts_with("proj: ") && stored.contains("rank write failed"),
+            "{stored}"
+        );
     }
 }
