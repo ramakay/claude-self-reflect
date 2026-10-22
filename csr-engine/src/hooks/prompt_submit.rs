@@ -1662,6 +1662,14 @@ async fn hybrid_chunk_candidates(
 /// when the content gates keep emptying it.
 const REPLENISH_CAP_FACTOR: usize = 4;
 
+/// What the whole chunk search may spend. The daemon answers a prompt within
+/// 800 ms (`prompt_transport::REQUEST_BUDGET`); the rest of the prompt (query
+/// embedding, reflections, pickup) needs the remainder.
+const CHUNK_SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// A refill is started only with at least this much of the budget left.
+const REFILL_MIN_REMAINING: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// [`search_chunks_with_vec`] with the repository test supplied, so unit tests
 /// decide which conversations widen without a filesystem or `git`. `same_repo`
 /// is called at most once per pass, and only when some candidate's label
@@ -1691,9 +1699,25 @@ async fn search_chunks_with_vec_core(
     current_session: Option<&str>,
     mut same_repo: impl FnMut(HashMap<String, Vec<String>>) -> super::scope_folder::RepoConversations,
 ) -> Vec<RawResult> {
+    let started = std::time::Instant::now();
     let cap = limit.saturating_mul(REPLENISH_CAP_FACTOR);
     let wanted = KEYWORD_FILL_SLOTS.min(limit);
     let mut fetch = limit;
+    // A conversation is checked once per prompt, however many passes meet it:
+    // each check can spend its full time budget. A check that found nothing is
+    // remembered too, so a slow or failed one is not retried.
+    let mut asked: HashSet<String> = HashSet::new();
+    let mut widened: super::scope_folder::RepoConversations = HashMap::new();
+    let mut checked_once = |paths: HashMap<String, Vec<String>>| {
+        let fresh: HashMap<String, Vec<String>> = paths
+            .into_iter()
+            .filter(|(conversation, _)| asked.insert(conversation.clone()))
+            .collect();
+        if !fresh.is_empty() {
+            widened.extend(same_repo(fresh));
+        }
+        widened.clone()
+    };
     loop {
         let (raw_results, candidates, gated) = chunk_candidates_pass(
             engine,
@@ -1704,10 +1728,15 @@ async fn search_chunks_with_vec_core(
             min_score,
             project,
             current_session,
-            &mut same_repo,
+            &mut checked_once,
         )
         .await;
         if gated == 0 || raw_results.len() >= wanted || candidates < fetch || fetch >= cap {
+            return raw_results;
+        }
+        // One deadline for the whole search: a refill that could not finish
+        // inside it would cost the prompt its injection.
+        if started.elapsed() + REFILL_MIN_REMAINING > CHUNK_SEARCH_BUDGET {
             return raw_results;
         }
         fetch = fetch.saturating_mul(2).min(cap);
@@ -3029,6 +3058,147 @@ mod tests {
             .filter_map(|r| r.memory_id.as_deref())
             .collect();
         assert_eq!(ids, ["report"]);
+    }
+
+    /// Forty-five dumps, alternately under the asker's label and another, then
+    /// three reports under the asker's: reaching a report takes the whole
+    /// refill. `conversation_of` names the session of each dump filed under the
+    /// other label.
+    async fn refill_engine(
+        conversation_of: impl Fn(usize) -> String,
+    ) -> (Engine, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(128);
+        let mut rows: Vec<(String, String, String, f32)> = (0..45)
+            .map(|i| {
+                (
+                    format!("dump-{i:02}"),
+                    if i % 2 == 1 {
+                        conversation_of(i)
+                    } else {
+                        format!("conv-home-{i}")
+                    },
+                    format!("{i}: let value_{i} = table[{i}];"),
+                    1.0 - 0.002 * i as f32,
+                )
+            })
+            .collect();
+        for r in 0..3 {
+            rows.push((
+                format!("report-{r}"),
+                format!("conv-report-{r}"),
+                format!("Cleanup {r} is done. The simulator folder dropped from 284 GB to 67 GB."),
+                0.7,
+            ));
+        }
+        for (seq, (id, conversation, content, cosine)) in rows.iter().enumerate() {
+            let is_dump = id.starts_with("dump");
+            let vec = [*cosine, (1.0 - cosine * cosine).sqrt()];
+            let chunk = crate::import::ConversationChunk {
+                id: id.clone(),
+                conversation_id: conversation.clone(),
+                project_name: if is_dump && seq % 2 == 1 {
+                    "other"
+                } else {
+                    "project"
+                }
+                .into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: content.clone(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &vec).unwrap();
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "UPDATE chunks SET min_trust=1, tool_result_share=?2 WHERE id=?1",
+                        rusqlite::params![id, if is_dump { 1.0 } else { 0.0 }],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            if is_dump && seq % 2 == 1 {
+                storage
+                    .upsert_import_state_explicit(
+                        &format!("/cc/projects/-u-projects-other/{conversation}.jsonl"),
+                        conversation,
+                        1,
+                        "0",
+                    )
+                    .unwrap();
+            }
+            search.insert_chunk(id.clone(), vec.to_vec());
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        (engine, root)
+    }
+
+    /// The repository check is the slow part of a pass. The refill runs up to
+    /// three passes, so a conversation is checked once per prompt, not once
+    /// per pass.
+    #[tokio::test]
+    async fn the_refill_checks_a_conversation_once() {
+        let (engine, _root) = refill_engine(|_| "conv-shared".into()).await;
+        let calls = std::cell::Cell::new(0);
+        let results = search_chunks_with_vec_core(
+            &engine,
+            "",
+            crate::search::hybrid::SearchMode::Vector,
+            &[1.0, 0.0],
+            15,
+            0.55,
+            "project",
+            None,
+            |_| {
+                calls.set(calls.get() + 1);
+                HashMap::new()
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 1, "one conversation, one check");
+        assert_eq!(results.len(), 3, "the refill still reaches the reports");
+    }
+
+    /// Every pass meets new conversations, and each check costs its full
+    /// 250 ms. The refill stops when too little of the budget is left, so
+    /// three passes cannot spend the 800 ms a prompt has.
+    #[tokio::test]
+    async fn the_refill_stops_when_the_checks_have_spent_the_budget() {
+        let (engine, _root) = refill_engine(|i| format!("conv-dump-{i}")).await;
+        let calls = std::cell::Cell::new(0);
+        let began = std::time::Instant::now();
+        let _ = search_chunks_with_vec_core(
+            &engine,
+            "",
+            crate::search::hybrid::SearchMode::Vector,
+            &[1.0, 0.0],
+            15,
+            0.55,
+            "project",
+            None,
+            |_| {
+                calls.set(calls.get() + 1);
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                HashMap::new()
+            },
+        )
+        .await;
+        assert!(calls.get() <= 2, "{} checks", calls.get());
+        assert!(
+            began.elapsed() < std::time::Duration::from_millis(650),
+            "{:?}",
+            began.elapsed()
+        );
     }
 
     /// Four external-floor chunks match the query equally. The one that only
