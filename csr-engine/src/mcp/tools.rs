@@ -3558,6 +3558,10 @@ async fn get_more_results_in_scope(
         consumption_mode,
         active_forgetting,
     )?;
+    // The same non-answer sink as page one, over the same full window, so a
+    // question echo the first page pushed down is not what page two starts at.
+    let mut enriched = enriched;
+    sink_non_answers(&mut enriched);
     let total = enriched.len();
     let page: Vec<EnrichedResult> = enriched.into_iter().skip(offset).take(limit).collect();
     Ok(format::format_more_results(&page, query, offset, total))
@@ -12229,6 +12233,50 @@ mod echo_recall_tests {
             ),
         ];
         (rows, reflections)
+    }
+
+    #[tokio::test]
+    async fn pagination_keeps_the_sink_order_of_page_one() {
+        let echo = "why did we drop Docker and Qdrant for a single Rust binary?\n\nChecking past sessions for the actual reasoning.";
+        let answer = "Installing it was too painful, and the scale never needed a database server.";
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        for (row, vector) in [
+            chunk("echo-chunk", "conv1", 0.90, echo),
+            chunk("answer-chunk", "conv2", 0.80, answer),
+        ] {
+            storage.insert_chunk(&row, &vector).unwrap();
+            engine.insert_chunk(row.id.clone(), vector);
+        }
+        let search = Arc::new(RwLock::new(engine));
+        let scope =
+            SearchProjectScope::resolve_with(&storage, Some("all"), Some("echoproj"), None, None)
+                .unwrap();
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+        let page = |offset: usize| {
+            get_more_results_in_scope(
+                &storage,
+                &search,
+                &q,
+                QUERY,
+                offset,
+                1,
+                0.0,
+                &scope,
+                ConsumptionMode::Off,
+                false,
+            )
+        };
+        let first = page(0).await.unwrap();
+        let second = page(1).await.unwrap();
+        assert!(
+            first.contains("too painful") && !first.contains("Checking past"),
+            "{first}"
+        );
+        assert!(
+            second.contains("Checking past") && !second.contains("too painful"),
+            "{second}"
+        );
     }
 
     #[tokio::test]
