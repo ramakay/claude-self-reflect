@@ -45,6 +45,69 @@ extern "C" fn ending(_: libc::c_int) {
     ENDING.store(true, Ordering::Relaxed);
 }
 
+/// The terminal on stdin hung up: its emulator or multiplexer is gone and the kernel says so
+/// with POLLHUP. Nothing else tells a pane: the terminal's reads return end of file, which
+/// crossterm's reader takes for "nothing yet" and retries at once, so a pane that is inside its
+/// `poll` when this happens never comes back out of it (and never sees SIGTERM's flag). So every
+/// call into crossterm is made only after this has said no. A stdin that is not a terminal is
+/// never gone.
+fn tty_gone() -> bool {
+    unsafe {
+        libc::isatty(libc::STDIN_FILENO) == 1 && wait_for_input(Duration::ZERO) == Input::Gone
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Input {
+    Quiet,
+    Ready,
+    Gone,
+}
+/// Wait up to `wait` for the terminal on stdin to have bytes for us, or to hang up.
+fn wait_for_input(wait: Duration) -> Input {
+    let mut tty = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = wait.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // An interrupted wait (a signal came) is a quiet one: the loop looks at its flag next.
+    if unsafe { libc::poll(&mut tty, 1, millis) } <= 0 {
+        return Input::Quiet;
+    }
+    if tty.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        Input::Gone
+    } else if tty.revents & libc::POLLIN != 0 {
+        Input::Ready
+    } else {
+        Input::Quiet
+    }
+}
+/// How long a wait for input goes before crossterm is asked about what it holds already (a
+/// resize arrives by a signal, not on the terminal) and the terminal is looked at again.
+const LOOK: Duration = Duration::from_millis(100);
+/// Crossterm's events, up to `wait`, with the terminal looked at before every call into it.
+fn next_input(wait: Duration) -> io::Result<Input> {
+    let start = Instant::now();
+    loop {
+        if tty_gone() {
+            return Ok(Input::Gone);
+        }
+        // Events crossterm parsed already, and a resize, wait in it and not on the terminal.
+        if event::poll(Duration::ZERO)? {
+            return Ok(Input::Ready);
+        }
+        let left = wait.saturating_sub(start.elapsed());
+        if left.is_zero() || ENDING.load(Ordering::Relaxed) {
+            return Ok(Input::Quiet);
+        }
+        match wait_for_input(left.min(LOOK)) {
+            Input::Gone => return Ok(Input::Gone),
+            Input::Ready if event::poll(Duration::ZERO)? => return Ok(Input::Ready),
+            _ => (),
+        }
+    }
+}
+
 pub struct TerminalGuard {
     raw: bool,
 }
@@ -64,6 +127,10 @@ impl TerminalGuard {
         io::stdout().flush()
     }
     pub fn restore() {
+        // A terminal that is gone has nothing to restore, and a write to it would only fail.
+        if tty_gone() {
+            return;
+        }
         let _ = terminal::disable_raw_mode();
         let mut out = io::stdout();
         let _ = execute!(out, DisableMouseCapture);
@@ -77,7 +144,7 @@ impl TerminalGuard {
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        if self.raw {
+        if self.raw && !tty_gone() {
             let _ = terminal::disable_raw_mode();
         }
         Self::restore();
@@ -483,6 +550,10 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let events = HerdrEvents::from_env(args.agent.clone());
     let result = (|| -> anyhow::Result<()> {
         while !ENDING.load(Ordering::Relaxed) {
+            // Before any draw: a write to a hung-up terminal is an error `print!` panics on.
+            if terminal.raw && tty_gone() {
+                break;
+            }
             beat.alive();
             let now = paths::now();
             pressed |= recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
@@ -619,7 +690,16 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                 at.saturating_duration_since(Instant::now())
                     .clamp(Duration::from_millis(5), Duration::from_millis(200))
             });
-            if terminal.raw && event::poll(wait)? {
+            let input = if terminal.raw {
+                next_input(wait)?
+            } else {
+                thread::sleep(wait);
+                Input::Quiet
+            };
+            if input == Input::Gone {
+                break;
+            }
+            if input == Input::Ready {
                 pressed |=
                     recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
                 match event::read()? {
@@ -678,8 +758,6 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                     }
                     _ => (),
                 }
-            } else if !terminal.raw {
-                thread::sleep(wait);
             }
         }
         Ok(())
