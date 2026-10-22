@@ -13,6 +13,7 @@ pub mod dreams;
 mod envelopes;
 pub mod feed;
 pub mod flight;
+pub mod gate;
 pub mod hook_json;
 pub mod infinite;
 pub mod info;

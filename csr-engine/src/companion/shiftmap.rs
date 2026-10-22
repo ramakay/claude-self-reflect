@@ -673,6 +673,10 @@ impl MapState {
         self.due = due.map(|d| now + d);
         Some(open)
     }
+    /// A refresh of the story is running.
+    pub fn refreshing(&self) -> bool {
+        self.refresh.is_some()
+    }
     /// (seconds for the loop to wait, whether to draw a frame now): a frame once the map's hold
     /// is up and it folds.
     pub fn wait(&self, now: f64) -> (f64, bool) {

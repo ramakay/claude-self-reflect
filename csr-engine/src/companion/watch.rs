@@ -493,6 +493,7 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                     exe = target;
                 }
             }
+            let reloading = reload_error.clone();
             match reload.poll(&exe, Instant::now(), force) {
                 Ok(true) => {
                     if stopping() {
@@ -514,12 +515,15 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                 Ok(false) if reload.settled() => reload_error = None,
                 Ok(false) => (),
             }
+            // The error card comes and goes with the reload's error: draw when it does.
+            pressed |= reload_error != reloading;
             // The Shift Map's hold is up and it folds: draw it now.
             pressed |= pane.map_wait(now).1;
             // A compaction ended: draw it now.
             pressed |= pane.compaction_gone();
             if (boundary.failures > 0 && (boundary.ready(now) || pressed))
-                || (boundary.failures == 0 && (pressed || last.elapsed() >= Duration::from_secs(1)))
+                || (boundary.failures == 0
+                    && (pressed || (last.elapsed() >= Duration::from_secs(1) && pane.due(now))))
             {
                 let (cols, rows) = terminal::size().unwrap_or((60, 30));
                 let frame = boundary.run(&paths, now, || {
@@ -585,13 +589,14 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                             }
                             pressed = true;
                         }
-                        MouseEventKind::ScrollUp => {
-                            pane.scroll(-3);
-                            pressed = true;
-                        }
-                        MouseEventKind::ScrollDown => {
-                            pane.scroll(3);
-                            pressed = true;
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                            let mark = pane.ui_mark();
+                            pane.scroll(if m.kind == MouseEventKind::ScrollUp {
+                                -3
+                            } else {
+                                3
+                            });
+                            pressed |= pane.ui_mark() != mark;
                         }
                         _ => (),
                     },
@@ -615,14 +620,17 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                         let typing =
                             last_key.is_some_and(|t: Instant| t.elapsed() < Duration::from_secs(1));
                         last_key = Some(Instant::now());
+                        // A key the pane does not answer leaves the page as it was: no frame.
+                        let mark = pane.ui_mark();
                         if !(key == "q" && typing) && !pane.key(&key) {
                             ENDING.store(true, Ordering::Relaxed);
                             break;
                         }
                         if let Some(text) = pane.take_copy() {
                             copy_to_clipboard(&text);
+                            pressed = true;
                         }
-                        pressed = true;
+                        pressed |= pane.ui_mark() != mark;
                     }
                     _ => (),
                 }

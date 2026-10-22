@@ -13,8 +13,8 @@ pub struct Db {
     recaps: std::cell::RefCell<RecapCache>,
     shifts: std::cell::RefCell<BTreeMap<std::path::PathBuf, (std::time::Instant, Vec<Value>)>>,
 
-    #[cfg(test)]
-    pub(super) queries: std::sync::atomic::AtomicUsize,
+    /// Statements run, for the idle checks: a pane with nothing new to read runs none.
+    queries: std::sync::atomic::AtomicUsize,
 }
 impl Db {
     pub fn open(paths: &Paths) -> anyhow::Result<Self> {
@@ -30,7 +30,6 @@ impl Db {
             storage,
             recaps: Default::default(),
             shifts: Default::default(),
-            #[cfg(test)]
             queries: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -83,11 +82,22 @@ impl Db {
         }
         out
     }
+    pub fn queries(&self) -> usize {
+        self.queries.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// SQLite's `data_version` on the retained connection: it moves when another connection
+    /// commits, a WAL commit included, though the main file does not.
+    pub fn version(&self) -> Option<i64> {
+        self.storage
+            .with_connection(|con| {
+                Ok(con.pragma_query_value(None, "data_version", |row| row.get(0))?)
+            })
+            .ok()
+    }
     pub fn query(&self, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
         self.try_query(sql, params).unwrap_or_default()
     }
     pub fn try_query(&self, sql: &str, params: &[Value]) -> anyhow::Result<Vec<Vec<Value>>> {
-        #[cfg(test)]
         self.queries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.storage.with_connection(|con| {

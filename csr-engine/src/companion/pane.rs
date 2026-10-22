@@ -266,6 +266,7 @@ pub struct Pane {
     /// Text for the watch loop to put on the clipboard.
     copy_out: Option<String>,
     instrument_kept: Option<Instrument>,
+    gate: super::gate::Gate,
     /// When the picture next changes with no new data, as the last instrument frame saw it.
     pub next_change: Option<f64>,
     /// Pictures rasterised, PNGs encoded and frames served from the kept one, since the start.
@@ -346,6 +347,7 @@ impl Pane {
             popup_copy: None,
             copy_out: None,
             instrument_kept: None,
+            gate: Default::default(),
             next_change: None,
             rasters: 0,
             encodes: 0,
@@ -356,7 +358,83 @@ impl Pane {
     pub fn enable_cards(&mut self) {
         self.cards = self.pixels && super::render::cards::fonts().is_some();
     }
+    /// Draw the page. Everything the frame reads is read now; what it read, and what it left
+    /// running, is kept for `due`.
     pub fn frame(&mut self, cols: usize, rows: usize, now: f64) -> Vec<String> {
+        // Looked at first, so a change made while the frame reads is seen by the next check.
+        let (mut snapshot, mut version) = self.look();
+        let found = self.session.as_ref().and_then(|s| s.path.clone());
+        let out = self.build_frame(cols, rows, now);
+        // The first frame finds the transcript: it was not in the first look.
+        if self.session.as_ref().and_then(|s| s.path.clone()) != found {
+            (snapshot, version) = self.look();
+        }
+        let settled = self.view == "main" && self.db.is_some() && !self.busy();
+        self.gate.saw(snapshot, version, now, settled);
+        out
+    }
+    fn look(&self) -> (super::gate::Snapshot, Option<i64>) {
+        let transcript = self.session.as_ref().and_then(|s| s.path.as_deref());
+        (
+            super::gate::Snapshot::take(&self.paths, &self.sid, transcript),
+            self.db.as_ref().and_then(Db::version),
+        )
+    }
+    /// Statements the pane has run on its database since it started.
+    pub fn queries(&self) -> usize {
+        self.db.as_ref().map_or(0, Db::queries)
+    }
+    /// Work still in flight: its progress shows with no file or row changing.
+    fn busy(&self) -> bool {
+        self.spend.as_ref().is_some_and(|s| !s.ready)
+            || (self.carry.started() && self.carry.done().is_none())
+            || self.map.refreshing()
+            || self.compacting
+    }
+    /// The first moment the drawing changes by itself: what the instrument frame named, the
+    /// six-second windows of a sent or answered row, and the Shift Map's fold.
+    fn deadline(&self) -> Option<f64> {
+        [
+            self.next_change,
+            self.sent[2].as_f64().map(|at| at + 6.),
+            self.answered.as_ref().map(|a| a.2 + 6.),
+            self.map.due,
+        ]
+        .into_iter()
+        .flatten()
+        .min_by(f64::total_cmp)
+    }
+    /// Whether a frame at `now` would read or draw anything the last one did not: Gate 1. The
+    /// watch loop asks every pass and draws when this is true, a key or click changed the page,
+    /// or a wake came.
+    pub fn due(&mut self, now: f64) -> bool {
+        let deadline = self.deadline();
+        let mut gate = std::mem::take(&mut self.gate);
+        let due = gate.due(now, deadline, || self.look());
+        self.gate = gate;
+        due
+    }
+    /// What the page is showing of the pane's own state: a key or click that leaves it as it was
+    /// has nothing to draw.
+    pub fn ui_mark(&self) -> String {
+        format!(
+            "{:?}",
+            (
+                &self.view,
+                self.instrument_open,
+                self.theme,
+                self.popup.as_ref().map(|p| (p.0 as usize, &p.1, p.2)),
+                &self.open,
+                &self.sent,
+                &self.answered,
+                &self.folds,
+                (self.top, self.threads_top, self.summary_top, self.tall),
+                (self.phone.zoomed, self.hold.is_some(), self.loaded),
+                &self.offer_notice,
+            )
+        )
+    }
+    fn build_frame(&mut self, cols: usize, rows: usize, now: f64) -> Vec<String> {
         self.placed.clear();
         let cols = cols.max(1);
         let rows = rows.max(1);

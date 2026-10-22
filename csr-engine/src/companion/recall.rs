@@ -548,6 +548,6 @@ mod tests {
         let rows = remembered(&db, &s);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["title"], "Past work");
-        assert_eq!(db.queries.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert_eq!(db.queries(), 4);
     }
 }

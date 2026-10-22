@@ -191,3 +191,171 @@ fn a_reused_picture_is_the_picture_a_fresh_pane_draws() {
     }
     assert!(reused > 0);
 }
+
+/// Frames from `NOW` on in one-second steps until `due` says so or `limit` seconds have gone.
+fn idle_until_due(pane: &mut Pane, limit: f64) -> f64 {
+    let mut at = NOW + 1.;
+    while at < NOW + limit && !pane.due(at) {
+        at += 1.;
+    }
+    at
+}
+
+#[test]
+fn a_quiet_pane_is_not_due_and_reads_nothing_until_a_deadline() {
+    let (_home, paths) = rich_home();
+    let mut pane = pane_in(&paths);
+    pane.frame(76, 67, NOW);
+    let (queries, rasters, encodes) = (pane.queries(), pane.rasters, pane.encodes);
+    let due = idle_until_due(&mut pane, 25.);
+    // Quiet files, one connection, nothing in flight: not due until the picture's own deadline
+    // (the fixture's next change is a minute edge or later) or the floor.
+    let named = pane.next_change.map_or(f64::MAX, |t| t - NOW);
+    assert!(
+        (due - NOW - named.min(30.)).abs() <= 1.01 || due - NOW >= 25.,
+        "due at +{}, deadline +{named}",
+        due - NOW
+    );
+    assert_eq!(pane.queries(), queries, "the probe is not a query");
+    assert_eq!((pane.rasters, pane.encodes), (rasters, encodes));
+}
+
+#[test]
+fn a_change_to_what_the_frame_reads_makes_the_pane_due() {
+    let (_home, paths) = rich_home();
+    let mut pane = pane_in(&paths);
+    pane.frame(76, 67, NOW);
+    let transcript = paths.projects.join("fixture/sess-now.jsonl");
+    let keep_agents = paths.keep.join("agents");
+    let step = |pane: &mut Pane, at: f64, what: &str| {
+        assert!(pane.due(at), "{what} is news");
+        pane.frame(76, 67, at);
+        assert!(!pane.due(at + 1.5), "{what} read once is quiet again");
+    };
+    let mut at = NOW + 2.;
+    let original = fs::read(&transcript).unwrap();
+    let mut longer = original.clone();
+    longer.extend_from_slice(b"\n");
+    fs::write(&transcript, &longer).unwrap();
+    step(&mut pane, at, "an append");
+    at += 3.;
+    fs::write(&transcript, &original[..original.len() - 1]).unwrap();
+    step(&mut pane, at, "a truncate");
+    at += 3.;
+    let aside = paths.projects.join("fixture/aside");
+    fs::write(&aside, &original).unwrap();
+    fs::rename(&aside, &transcript).unwrap();
+    step(&mut pane, at, "an atomic replace");
+    at += 3.;
+    fs::remove_file(&transcript).unwrap();
+    step(&mut pane, at, "a delete");
+    at += 3.;
+    fs::write(&transcript, &original).unwrap();
+    step(&mut pane, at, "a recreate");
+    at += 3.;
+    fs::create_dir_all(&keep_agents).unwrap();
+    fs::write(keep_agents.join("someone-else.json"), "{}").unwrap();
+    step(&mut pane, at, "a new member of a kept folder");
+}
+
+#[test]
+fn the_pane_heartbeat_is_not_news() {
+    let (_home, paths) = rich_home();
+    fs::create_dir_all(paths.keep.join("panes")).unwrap();
+    let mut pane = pane_in(&paths);
+    pane.frame(76, 67, NOW);
+    for beat in 0..4 {
+        fs::write(paths.keep.join("panes/sess-now.json"), format!("{beat}")).unwrap();
+        assert!(!pane.due(NOW + 2. + beat as f64 * 2.));
+    }
+}
+
+#[test]
+fn a_commit_that_only_reaches_the_wal_makes_the_pane_due() {
+    let (_home, paths) = rich_home();
+    let writer = rusqlite::Connection::open(&paths.db).unwrap();
+    let mode: String = writer
+        .query_row("pragma journal_mode=wal", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    writer.execute_batch("pragma wal_autocheckpoint=0").unwrap();
+    let mut pane = pane_in(&paths);
+    pane.frame(76, 67, NOW);
+    let main = fs::metadata(&paths.db).unwrap();
+    assert!(!pane.due(NOW + 6.));
+    writer
+        .execute_batch("create table if not exists wal_only(x); insert into wal_only values (1);")
+        .unwrap();
+    let after = fs::metadata(&paths.db).unwrap();
+    assert_eq!(
+        (main.len(), main.modified().unwrap()),
+        (after.len(), after.modified().unwrap()),
+        "the main file did not move"
+    );
+    assert!(pane.due(NOW + 8.), "the retained connection saw a commit");
+    pane.frame(76, 67, NOW + 8.);
+    assert!(!pane.due(NOW + 10.));
+}
+
+#[test]
+fn work_in_flight_keeps_the_pane_due_until_it_lands() {
+    let (_home, paths) = rich_home();
+    let mut args = args(76, 67);
+    args.frame = false;
+    let mut pane = Pane::new(paths.clone(), &args);
+    pane.pixels = true;
+    pane.enable_cards();
+    let release = pane.hold_carry();
+    pane.frame(76, 67, NOW);
+    for beat in 1..4 {
+        assert!(
+            pane.due(NOW + beat as f64 * 1.1),
+            "the carry is still working"
+        );
+    }
+    drop(release);
+    let mut at = NOW + 5.;
+    let landed = loop {
+        pane.frame(76, 67, at);
+        if !pane.due(at + 1.5) || at > NOW + 30. {
+            break at;
+        }
+        at += 1.5;
+    };
+    assert!(landed <= NOW + 30., "the carry landed and the pane settled");
+}
+
+#[test]
+fn a_deadline_makes_the_pane_due_and_the_floor_bounds_every_wait() {
+    let (_home, paths) = rich_home();
+    let mut pane = pane_in(&paths);
+    pane.frame(76, 67, NOW);
+    assert!(pane.due(NOW + 31.), "nothing goes unread for half a minute");
+    if let Some(t) = pane.next_change.filter(|t| *t < NOW + 25.) {
+        assert!(pane.due(t));
+    }
+}
+
+#[test]
+fn a_page_that_is_not_the_main_one_is_drawn_every_second_as_before() {
+    let (_home, paths) = rich_home();
+    let mut pane = pane_in(&paths);
+    pane.key("s");
+    assert_eq!(pane.view, "summary");
+    pane.frame(76, 67, NOW);
+    assert!(pane.due(NOW + 1.1));
+}
+
+#[test]
+fn an_ignored_key_changes_nothing_the_page_shows() {
+    let (_home, paths) = rich_home();
+    let mut pane = pane_in(&paths);
+    pane.frame(76, 67, NOW);
+    let mark = pane.ui_mark();
+    for key in ["w", "x", "9", "y"] {
+        pane.key(key);
+    }
+    assert_eq!(pane.ui_mark(), mark);
+    pane.key("b");
+    assert_ne!(pane.ui_mark(), mark);
+}
