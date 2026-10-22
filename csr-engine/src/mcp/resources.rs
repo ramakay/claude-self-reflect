@@ -84,7 +84,7 @@ mod tests {
         assert!(health["chunks_indexed"].is_null());
         assert!(health["reflections_indexed"].is_null());
         assert!(health["error"].as_str().unwrap().contains("maintenance"));
-        drop(owner);
+        crate::maintenance::release_for_test(owner);
         let after: serde_json::Value =
             serde_json::from_str(&system_health(&storage, &search, "db", "index-v3").await)
                 .unwrap();

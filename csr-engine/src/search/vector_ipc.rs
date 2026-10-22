@@ -2145,7 +2145,7 @@ mod tests {
             )
         };
         assert!(!wait());
-        drop(owner);
+        crate::maintenance::release_for_test(owner);
         assert!(wait());
     }
 

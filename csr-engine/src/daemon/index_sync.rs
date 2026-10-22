@@ -212,7 +212,7 @@ mod tests {
         let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
         assert!(sync_batch(&storage, &search, &shutdown, cursor, Some(generation)).is_err());
         assert_eq!(search.blocking_read().change_cursor(), cursor);
-        drop(owner);
+        crate::maintenance::release_for_test(owner);
         sync_batch(&storage, &search, &shutdown, cursor, Some(generation)).unwrap();
         let index = search.blocking_read();
         assert!(index.change_cursor() > cursor);
@@ -232,7 +232,7 @@ mod tests {
         assert!(sync_batch(&storage, &search, &shutdown, 0, None).is_err());
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(!search.blocking_read().has_chunk("pending"));
-        drop(owner);
+        crate::maintenance::release_for_test(owner);
         sync_batch(&storage, &search, &shutdown, 0, None).unwrap();
         assert!(search.blocking_read().has_chunk("pending"));
     }

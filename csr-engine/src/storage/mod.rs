@@ -4244,7 +4244,7 @@ mod maintenance_probes {
             })
             .is_err());
         assert!(Storage::open(&db).is_err());
-        drop(owner);
+        crate::maintenance::release_for_test(owner);
         assert_eq!(storage.count_reflection_embeddings().unwrap(), 0);
         storage
             .insert_reflection("late-hook", "retry", &[], &vec![0.1; 384])

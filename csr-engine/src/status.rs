@@ -3050,7 +3050,7 @@ mod tests {
             reader.get_meta("integrity_checked_at").unwrap().as_deref(),
             Some(stale)
         );
-        drop(_owner);
+        crate::maintenance::release_for_test(_owner);
         assert_eq!(
             gather_status(&db, dir.path(), false).unwrap().healthy,
             Some(true)

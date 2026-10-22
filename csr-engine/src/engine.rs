@@ -2885,7 +2885,7 @@ mod maintenance_probes {
         let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
         assert!(remap_published_generation(&storage, &search, &index).is_err());
         assert!(!index.join("needs_compaction").exists());
-        drop(owner);
+        crate::maintenance::release_for_test(owner);
         remap_published_generation(&storage, &search, &index).unwrap();
         assert!(index.join("needs_compaction").exists());
     }
@@ -2910,7 +2910,7 @@ mod maintenance_probes {
         );
         assert_eq!(engine.search.blocking_read().generation(), generation);
         assert_eq!(fresh.change_cursor(), 0);
-        drop(owner);
+        crate::maintenance::release_for_test(owner);
         catch_up_replacement(&storage, &mut fresh, &engine.search.blocking_read()).unwrap();
         assert!(fresh.has_reflection("r"));
         assert!(remap_published_generation(&storage, &engine.search, engine.index_dir()).unwrap());
@@ -2972,7 +2972,7 @@ mod maintenance_probes {
             .insert_reflection("r3", "clean vector", &[], &vec![0.2; 384])
             .unwrap();
         drop(storage);
-        drop(owner);
+        crate::maintenance::release_for_test(owner);
         let engine = Engine::new(&db, &dir.path().join("projects")).unwrap();
         assert!(engine.index_freshly_rebuilt());
         assert_eq!(
@@ -3010,7 +3010,7 @@ mod maintenance_probes {
             .blocking_read()
             .publish_to_disk(&dir.path().join("index-v3"), 1, 0)
             .is_err());
-        drop(owner);
+        crate::maintenance::release_for_test(owner);
         assert_eq!(
             engine.storage().get_chunk_vectors_by_ids(&ids).unwrap(),
             before

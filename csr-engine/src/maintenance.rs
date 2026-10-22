@@ -156,6 +156,30 @@ pub fn active(data_dir: &Path) -> Option<MaintenanceHolder> {
     }
 }
 
+/// Drop `lock` and return only once the OS lock is really free.
+///
+/// Closing our descriptor does not release an flock while another process holds a copy of the
+/// open file description. A process a concurrent test is spawning holds one until its exec
+/// closes it, which on a loaded host is long enough for the next single-attempt
+/// `Storage::open` or `shared()` to be refused.
+#[cfg(test)]
+pub(crate) fn release_for_test(lock: MaintenanceLock) {
+    let dir = lock
+        .path()
+        .parent()
+        .expect("lock file has a directory")
+        .to_path_buf();
+    drop(lock);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match try_shared(&dir) {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            other => panic!("maintenance lock was not released: {other:?}"),
+        }
+    }
+}
+
 /// Exclusive ownership of a maintenance run. Clones retain the same OS lock.
 /// The file is never removed or renamed, including on errors and process exit.
 #[derive(Debug, Clone)]
