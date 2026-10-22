@@ -924,6 +924,41 @@ pub fn run(conn: &Connection) -> Result<()> {
             "CREATE INDEX IF NOT EXISTS idx_code_graph_file_state_pending
                  ON code_graph_file_state(project) WHERE graph_gen > resolved_gen;",
         );
+        // A build that resolved only the edited file left the rest of the work
+        // as `dirty = 1` plus a `graph_catchup:*` hint in `meta`, for a catch-up
+        // that no longer exists. Queue those files for the drain and drop the
+        // hints. A file the drain has settled is no longer at 0/0, so this does
+        // not requeue it on the next start.
+        // Reads first: an up-to-date database must migrate without taking the
+        // write lock.
+        let stranded: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM code_graph_file_state
+                 WHERE dirty = 1 AND graph_gen = 0 AND resolved_gen = 0)",
+            [],
+            |r| r.get(0),
+        )?;
+        if stranded {
+            conn.execute(
+                "UPDATE code_graph_file_state SET graph_gen = 1, dirty = 0
+                 WHERE dirty = 1 AND graph_gen = 0 AND resolved_gen = 0",
+                [],
+            )?;
+        }
+        let has_meta: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_meta {
+            let hints: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key LIKE 'graph_catchup:%')",
+                [],
+                |r| r.get(0),
+            )?;
+            if hints {
+                conn.execute("DELETE FROM meta WHERE key LIKE 'graph_catchup:%'", [])?;
+            }
+        }
     }
 
     // Migration: one counter per project, bumped by every write a resolve reads
@@ -4591,6 +4626,49 @@ mod tests {
             )
             .expect("non-NULL prerelease provenance must survive");
         assert_eq!(provenance, r#"{"receipt":true}"#);
+    }
+
+    #[test]
+    fn work_a_scoped_build_left_dirty_is_queued_for_the_drain() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        // What the scoped build left: a dirty file with a catch-up hint, and an
+        // ordinary extracted file.
+        conn.execute_batch(
+            "INSERT INTO code_graph_file_state (project, file, dirty) VALUES ('p', 'stranded.rs', 1);
+             INSERT INTO code_graph_file_state (project, file, dirty) VALUES ('p', 'clean.rs', 0);
+             INSERT INTO meta (key, value) VALUES
+                 ('graph_catchup:p\u{1f}stranded.rs', '{\"names\":[]}'),
+                 ('unrelated', 'kept');",
+        )
+        .unwrap();
+        run(&conn).unwrap();
+
+        let pending = crate::storage::codegraph::pending_resolve_files(&conn).unwrap();
+        assert_eq!(pending, vec![("p".into(), "stranded.rs".into(), 1)]);
+        let hints: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meta WHERE key LIKE 'graph_catchup:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hints, 0);
+        let kept: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'unrelated'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, "kept");
+
+        // Settled by the drain, it stays settled across a restart.
+        assert!(
+            crate::storage::codegraph::settle_resolved_gen(&conn, "p", "stranded.rs", 1).unwrap()
+        );
+        run(&conn).unwrap();
+        assert!(crate::storage::codegraph::pending_resolve_files(&conn)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
