@@ -1645,6 +1645,10 @@ struct DaemonAgentSpec {
     /// setup process, merged with what an existing agent already had. launchd
     /// does not inherit the shell, so a switch that is not written here is off.
     env: std::collections::BTreeMap<String, String>,
+    /// Pid recorded in `daemon.lock` while something holds it, else `None`. A
+    /// daemon nobody asked launchd to run (a terminal, another label) is seen
+    /// through this, so setup does not start a second one beside it.
+    lock_holder: Option<u32>,
 }
 
 impl DaemonAgentSpec {
@@ -1950,6 +1954,56 @@ fn loaded_job_matches(wanted: &AgentFacts, loaded: &LoadedJob) -> bool {
             .all(|(key, value)| loaded.env.get(key) == Some(value))
 }
 
+/// A launchd agent file that runs `csr-engine daemon`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonAgentFile {
+    pub label: String,
+    pub path: std::path::PathBuf,
+}
+
+/// Every `*.plist` under `<home>/Library/LaunchAgents` whose arguments run
+/// `csr-engine daemon`, whatever it is called.
+pub(crate) fn daemon_agents_on_disk(home: &Path) -> Vec<DaemonAgentFile> {
+    let Ok(entries) = std::fs::read_dir(home.join("Library/LaunchAgents")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<DaemonAgentFile> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        // exactly `.plist`: `x.plist.bak-2026` is a saved copy launchd never loads
+        .filter(|path| path.extension().is_some_and(|ext| ext == "plist"))
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(&path).ok()?;
+            if text.len() > 1 << 20 {
+                return None;
+            }
+            let plist = parse_plist(&text)?;
+            let args = agent_facts(&plist).program_args;
+            let program = Path::new(args.first()?).file_name()?.to_str()?.to_owned();
+            if program != "csr-engine" || !args.iter().skip(1).any(|a| a == "daemon") {
+                return None;
+            }
+            let label = plist
+                .get("Label")
+                .and_then(PlistValue::text)
+                .map(str::to_owned)
+                .or_else(|| path.file_stem()?.to_str().map(str::to_owned))?;
+            Some(DaemonAgentFile { label, path })
+        })
+        .collect();
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found
+}
+
+/// The pid in `daemon.lock` while something holds the lock.
+fn daemon_lock_holder(home: &Path) -> Option<u32> {
+    let lock = home.join(".claude-self-reflect/daemon.lock");
+    crate::daemon::lock_file_held(&lock)
+        .then(|| std::fs::read_to_string(&lock).ok())
+        .flatten()
+        .and_then(|text| text.trim().parse().ok())
+}
+
 /// Keys launchd adds to a loaded job's environment. They are not the agent's
 /// own configuration and must never be written back into a plist.
 const LAUNCHD_INJECTED_ENV: [&str; 2] = ["XPC_SERVICE_NAME", "OSLogRateLimit"];
@@ -2093,6 +2147,9 @@ pub enum DaemonOutcome {
     Running { rewritten: bool },
     /// An agent somebody wrote by hand was kept and started.
     KeptExisting,
+    /// A daemon is running that launchd does not own under any label setup
+    /// knows. Setup added no second one.
+    AlreadyRunning { pid: u32 },
     /// A step failed; the text is the exact reason.
     Failed(String),
 }
@@ -2104,6 +2161,8 @@ type LaunchctlRun<'a> = dyn FnMut(&[&str]) -> std::result::Result<String, String
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonRun {
     pub outcome: DaemonOutcome,
+    /// The launchd label the daemon job runs under: ours, or one found.
+    pub label: String,
     /// Extra lines for the summary (what was carried, what was replaced).
     pub notes: Vec<String>,
 }
@@ -2146,10 +2205,62 @@ fn install_daemon_agent(
     launchctl: &mut LaunchctlRun,
     pause: &dyn Fn(Duration),
 ) -> DaemonRun {
-    let plist = spec.plist_path();
-    let existing = std::fs::read_to_string(&plist).ok();
-    let target = format!("gui/{uid}/{DAEMON_LABEL}");
-    let loaded_text = launchctl(&["print", &target]).ok();
+    // Which job is the daemon? Ours by default. A hand-installed agent under
+    // another label is the daemon already: adopt it rather than add a second
+    // job that would fight it for the lock.
+    let canonical = AgentTarget {
+        label: DAEMON_LABEL.to_owned(),
+        plist: spec.plist_path(),
+    };
+    let canonical_text = std::fs::read_to_string(&canonical.plist).ok();
+    let canonical_loaded = launchctl(&["print", &canonical.job(uid)]);
+    let others: Vec<DaemonAgentFile> = daemon_agents_on_disk(&spec.home)
+        .into_iter()
+        .filter(|agent| agent.path != canonical.plist)
+        .collect();
+    let mut notes = Vec::new();
+    let (target, adopted) = if canonical_text.is_none() && canonical_loaded.is_err() {
+        match others.first() {
+            Some(agent) => (
+                AgentTarget {
+                    label: agent.label.clone(),
+                    plist: agent.path.clone(),
+                },
+                true,
+            ),
+            None => {
+                if let Some(pid) = spec.lock_holder {
+                    return DaemonRun {
+                        outcome: DaemonOutcome::AlreadyRunning { pid },
+                        label: canonical.label,
+                        notes,
+                    };
+                }
+                (canonical, false)
+            }
+        }
+    } else {
+        (canonical, false)
+    };
+    for other in others.iter().filter(|o| o.path != target.plist) {
+        notes.push(format!(
+            "Another agent also runs the daemon: {} ({}). Two jobs compete for the one daemon lock; keep one: launchctl bootout gui/{uid}/{}",
+            other.label,
+            other.path.display(),
+            other.label
+        ));
+    }
+    let plist = target.plist.clone();
+    let existing = if adopted {
+        std::fs::read_to_string(&plist).ok()
+    } else {
+        canonical_text
+    };
+    let loaded_text = if adopted {
+        launchctl(&["print", &target.job(uid)]).ok()
+    } else {
+        canonical_loaded.ok()
+    };
 
     // What an existing agent already carries must survive: launchd does not
     // inherit the shell, so a dropped kill switch silently turns the work on.
@@ -2173,11 +2284,17 @@ fn install_daemon_agent(
         .get("PATH")
         .or_else(|| loaded_job.env.get("PATH"))
         .cloned();
-    let notes = carried_notes(&merged, old_path.as_deref(), &spec.path_env(), &plist);
+    notes.extend(carried_notes(
+        &merged,
+        old_path.as_deref(),
+        &spec.path_env(),
+        &plist,
+    ));
 
-    let mut notes = notes;
     let outcome = apply_daemon_agent(
         &spec,
+        &target,
+        adopted,
         existing,
         loaded_text.as_ref().map(|_| loaded_job),
         uid,
@@ -2185,11 +2302,30 @@ fn install_daemon_agent(
         pause,
         &mut notes,
     );
-    DaemonRun { outcome, notes }
+    DaemonRun {
+        outcome,
+        label: target.label,
+        notes,
+    }
 }
 
+/// The launchd job a run installs or adopts.
+struct AgentTarget {
+    label: String,
+    plist: std::path::PathBuf,
+}
+
+impl AgentTarget {
+    fn job(&self, uid: u32) -> String {
+        format!("gui/{uid}/{}", self.label)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_daemon_agent(
     spec: &DaemonAgentSpec,
+    agent: &AgentTarget,
+    adopted: bool,
     existing: Option<String>,
     loaded_job: Option<LoadedJob>,
     uid: u32,
@@ -2197,13 +2333,14 @@ fn apply_daemon_agent(
     pause: &dyn Fn(Duration),
     notes: &mut Vec<String>,
 ) -> DaemonOutcome {
-    let plist = spec.plist_path();
+    let plist = agent.plist.clone();
     // A plist without our marker is the user's. It is never regenerated: while
     // its binary exists (or setup cannot read it) it is only started; when the
     // binary is gone, that one path is repaired and nothing else is touched.
     let (foreign, wanted) = match existing.as_deref() {
-        Some(text) if !text.contains(DAEMON_PLIST_MARKER) => {
-            notes.clear(); // nothing was merged into a file we do not write
+        Some(text) if adopted || !text.contains(DAEMON_PLIST_MARKER) => {
+            // nothing was merged into a file we do not write
+            notes.retain(|n| n.starts_with("Another agent"));
             let program = parse_plist(text)
                 .map(|p| agent_facts(&p).program_args)
                 .and_then(|args| args.into_iter().next());
@@ -2232,7 +2369,7 @@ fn apply_daemon_agent(
     });
 
     let domain = format!("gui/{uid}");
-    let target = format!("{domain}/{DAEMON_LABEL}");
+    let target = agent.job(uid);
     let plist_arg = plist.to_string_lossy().into_owned();
 
     if loaded && (rewrite || !current) {
@@ -2249,7 +2386,8 @@ fn apply_daemon_agent(
         }
         if !unloaded {
             return DaemonOutcome::Failed(format!(
-                "launchd still loaded {DAEMON_LABEL} after bootout, so the new settings were not applied. Run: launchctl bootout {target}"
+                "launchd still loaded {} after bootout, so the new settings were not applied. Run: launchctl bootout {target}",
+                agent.label
             ));
         }
     }
@@ -2308,6 +2446,7 @@ fn daemon_step(
 ) -> DaemonRun {
     let bare = |outcome| DaemonRun {
         outcome,
+        label: DAEMON_LABEL.to_owned(),
         notes: Vec::new(),
     };
     if opted_out {
@@ -2335,6 +2474,7 @@ fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
         projects_dir: absolute(projects_dir),
         claude_dir: find_on_path("claude").and_then(|p| p.parent().map(Path::to_path_buf)),
         env: carried_process_env(std::env::vars()),
+        lock_holder: daemon_lock_holder(&home),
     };
     // SAFETY: getuid has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
@@ -2346,7 +2486,7 @@ fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
         &mut real_launchctl,
         &std::thread::sleep,
     );
-    let mut text = daemon_report(&run.outcome, &engine);
+    let mut text = daemon_report(&run, &engine);
     for note in &run.notes {
         text.push_str(&format!("  {note}\n"));
     }
@@ -2412,12 +2552,13 @@ fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
 }
 
 /// The lines setup prints for each outcome (stderr, like every other step).
-fn daemon_report(outcome: &DaemonOutcome, engine: &Path) -> String {
+fn daemon_report(run: &DaemonRun, engine: &Path) -> String {
+    let label = &run.label;
     let manual = format!(
         "  To run it by hand: {} daemon   (keep it running; it does the overnight dreams)\n",
         engine.display()
     );
-    match outcome {
+    match &run.outcome {
         DaemonOutcome::OptedOut => {
             "  Daemon skipped (CSR_NO_DAEMON is set). Dreams and background enrichment need it.\n"
                 .to_owned()
@@ -2427,11 +2568,14 @@ fn daemon_report(outcome: &DaemonOutcome, engine: &Path) -> String {
             "  No launchd on this system, so setup does not start the daemon.\n".to_owned() + &manual
         }
         DaemonOutcome::Running { rewritten } => format!(
-            "  Daemon agent {} and started: {DAEMON_LABEL}\n  Stop it with: launchctl bootout gui/$(id -u)/{DAEMON_LABEL}\n",
+            "  Daemon agent {} and started: {label}\n  Stop it with: launchctl bootout gui/$(id -u)/{label}\n",
             if *rewritten { "installed" } else { "already installed" },
         ),
-        DaemonOutcome::KeptExisting => format!(
-            "  Kept your existing {DAEMON_LABEL} agent and started it.\n"
+        DaemonOutcome::KeptExisting => {
+            format!("  Kept your existing {label} agent and started it.\n")
+        }
+        DaemonOutcome::AlreadyRunning { pid } => format!(
+            "  A daemon is already running (pid {pid}) and launchd does not manage it, so setup added no second one.\n  To have launchd run it: stop that process (kill {pid}), then run: csr-engine setup\n"
         ),
         DaemonOutcome::Failed(why) => format!(
             "  The daemon did not start: {why}\n  Setup is otherwise complete. Retry with: csr-engine setup\n{manual}"
@@ -3720,6 +3864,7 @@ esac
             projects_dir: home.join(".claude/projects"),
             claude_dir: Some("/opt/claude/bin".into()),
             env: Default::default(),
+            lock_holder: None,
         }
     }
 
@@ -3732,7 +3877,11 @@ esac
         bootstrap_fails: usize,
         /// `bootout` exits 0 but the job stays loaded.
         bootout_unloads: bool,
+        /// When set, only this label is loaded; any other `print` fails.
+        only_label: Option<String>,
         calls: Vec<String>,
+        /// Every call with all its arguments.
+        full: Vec<String>,
     }
 
     impl FakeLaunchctl {
@@ -3742,13 +3891,20 @@ esac
                 print_text: String::new(),
                 bootstrap_fails: 0,
                 bootout_unloads: true,
+                only_label: None,
                 calls: Vec::new(),
+                full: Vec::new(),
             }
         }
         fn run(&mut self, args: &[&str]) -> std::result::Result<String, String> {
             self.calls.push(args[..args.len().min(2)].join(" "));
+            self.full.push(args.join(" "));
+            let wrong_label = self
+                .only_label
+                .as_ref()
+                .is_some_and(|label| !args.last().is_some_and(|a| a.ends_with(label.as_str())));
             match args[0] {
-                "print" if self.loaded => Ok(self.print_text.clone()),
+                "print" if self.loaded && !wrong_label => Ok(self.print_text.clone()),
                 "print" => Err("not loaded".into()),
                 "bootstrap" if self.bootstrap_fails > 0 => {
                     self.bootstrap_fails -= 1;
@@ -3769,7 +3925,11 @@ esac
 
     /// What `launchctl print` would say for a job loaded from `spec`'s own plist.
     fn print_for(spec: &DaemonAgentSpec, pid: u32) -> String {
-        let facts = agent_facts(&parse_plist(&render_daemon_plist(spec)).unwrap());
+        print_of(&render_daemon_plist(spec), pid)
+    }
+
+    fn print_of(plist_text: &str, pid: u32) -> String {
+        let facts = agent_facts(&parse_plist(plist_text).unwrap());
         let mut text = String::from("gui/501/x = {\n\tstate = running\n\n\targuments = {\n");
         for arg in &facts.program_args {
             text.push_str(&format!("\t\t{arg}\n"));
@@ -3964,7 +4124,14 @@ esac
             outcome,
             DaemonOutcome::Failed("Bootstrap failed: 5: Input/output error".into())
         );
-        let report = daemon_report(&outcome, Path::new("/opt/csr/bin/csr-engine"));
+        let report = daemon_report(
+            &DaemonRun {
+                outcome,
+                label: DAEMON_LABEL.into(),
+                notes: vec![],
+            },
+            Path::new("/opt/csr/bin/csr-engine"),
+        );
         assert!(report.contains("Bootstrap failed: 5"), "{report}");
         assert!(
             report.contains("/opt/csr/bin/csr-engine daemon"),
@@ -4066,12 +4233,17 @@ esac
         assert_eq!(calls, 0, "no launchctl call");
         assert!(!spec.plist_path().exists());
 
-        let out = daemon_report(&DaemonOutcome::OptedOut, Path::new("/x/csr-engine"));
+        let run_of = |outcome| DaemonRun {
+            outcome,
+            label: DAEMON_LABEL.into(),
+            notes: vec![],
+        };
+        let out = daemon_report(&run_of(DaemonOutcome::OptedOut), Path::new("/x/csr-engine"));
         assert!(
             out.contains("CSR_NO_DAEMON") && out.contains("/x/csr-engine daemon"),
             "{out}"
         );
-        let manual = daemon_report(&DaemonOutcome::Manual, Path::new("/x/csr-engine"));
+        let manual = daemon_report(&run_of(DaemonOutcome::Manual), Path::new("/x/csr-engine"));
         assert!(manual.contains("/x/csr-engine daemon"), "{manual}");
     }
 
@@ -4403,5 +4575,157 @@ esac
         assert_eq!(shim, running);
         // nothing to go on
         assert_eq!(stable_engine_path(None, cwd, None, &running), running);
+    }
+
+    // ----- agents under another label -----
+
+    /// An executable named `csr-engine` that exists, for an agent to point at.
+    fn live_engine(home: &Path) -> std::path::PathBuf {
+        let path = home.join("bin/csr-engine");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        path
+    }
+
+    fn write_agent(home: &Path, file: &str, label: &str, args: &[&str]) -> std::path::PathBuf {
+        let dir = home.join("Library/LaunchAgents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let items: String = args
+            .iter()
+            .map(|a| format!("<string>{a}</string>"))
+            .collect();
+        let path = dir.join(file);
+        std::fs::write(
+            &path,
+            format!("<plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array>{items}</array></dict></plist>"),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn only_a_plist_that_runs_csr_engine_daemon_counts_as_a_daemon_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let csr = "/usr/local/bin/csr-engine";
+        write_agent(
+            home.path(),
+            "mine.plist",
+            "me.csr",
+            &[csr, "--db-path", "/x.db", "daemon"],
+        );
+        write_agent(
+            home.path(),
+            "other.plist",
+            "other",
+            &["/usr/bin/other", "daemon"],
+        );
+        write_agent(home.path(), "serve.plist", "serve", &[csr, "serve"]);
+        // a saved copy is not an agent launchd loads
+        write_agent(
+            home.path(),
+            "mine.plist.bak-20260921",
+            "me.csr.bak",
+            &[csr, "daemon"],
+        );
+        write_agent(home.path(), "mine.plist~", "me.csr.tilde", &[csr, "daemon"]);
+        let found = daemon_agents_on_disk(home.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].label, "me.csr");
+    }
+
+    #[test]
+    fn a_daemon_agent_under_another_label_is_adopted_not_duplicated() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let theirs = write_agent(
+            home.path(),
+            "me.csr.plist",
+            "me.csr",
+            &[live_engine(home.path()).to_str().unwrap(), "daemon"],
+        );
+        let before = std::fs::read_to_string(&theirs).unwrap();
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_of(&before, 77);
+        fake.only_label = Some("me.csr".into());
+        let run = install_run(&spec, &mut fake);
+        assert_eq!(run.outcome, DaemonOutcome::KeptExisting);
+        assert_eq!(run.label, "me.csr");
+        assert!(!spec.plist_path().exists(), "no second job");
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), before);
+        assert!(
+            fake.full.iter().any(|c| c == "kickstart -k gui/501/me.csr"),
+            "{:?}",
+            fake.full
+        );
+        assert!(!fake.full.iter().any(|c| c.starts_with("bootstrap")));
+        let report = daemon_report(&run, Path::new("/opt/csr/bin/csr-engine"));
+        assert!(report.contains("me.csr"), "{report}");
+    }
+
+    #[test]
+    fn an_adopted_agent_that_is_not_loaded_is_loaded_from_its_own_file() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let theirs = write_agent(
+            home.path(),
+            "me.csr.plist",
+            "me.csr",
+            &[live_engine(home.path()).to_str().unwrap(), "daemon"],
+        );
+        let mut fake = FakeLaunchctl::new(false);
+        let run = install_run(&spec, &mut fake);
+        assert_eq!(run.outcome, DaemonOutcome::KeptExisting);
+        assert!(!spec.plist_path().exists());
+        let want = format!("bootstrap gui/501 {}", theirs.display());
+        assert!(fake.full.contains(&want), "{:?}", fake.full);
+    }
+
+    #[test]
+    fn a_daemon_launchd_does_not_own_is_not_doubled() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.lock_holder = Some(4242);
+        let mut fake = FakeLaunchctl::new(false);
+        let run = install_run(&spec, &mut fake);
+        assert_eq!(run.outcome, DaemonOutcome::AlreadyRunning { pid: 4242 });
+        assert!(!spec.plist_path().exists());
+        assert!(!fake.calls.iter().any(|c| c.starts_with("bootstrap")));
+        let report = daemon_report(&run, Path::new("/opt/csr/bin/csr-engine"));
+        assert!(
+            report.contains("4242") && report.contains("no second one"),
+            "{report}"
+        );
+
+        // ... but our own agent being loaded is the normal case, lock or not.
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&spec, 4242);
+        install(&agent_spec(home.path()), &mut FakeLaunchctl::new(false));
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: false }
+        );
+    }
+
+    #[test]
+    fn a_second_agent_beside_ours_is_named_not_adopted() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        write_agent(
+            home.path(),
+            "me.csr.plist",
+            "me.csr",
+            &["/usr/local/bin/csr-engine", "daemon"],
+        );
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&spec, 1);
+        let run = install_run(&spec, &mut fake);
+        assert_eq!(run.outcome, DaemonOutcome::Running { rewritten: false });
+        assert_eq!(run.label, DAEMON_LABEL);
+        let said = run.notes.join("\n");
+        assert!(
+            said.contains("me.csr") && said.contains("bootout"),
+            "{said}"
+        );
     }
 }

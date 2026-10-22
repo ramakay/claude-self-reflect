@@ -709,10 +709,12 @@ fn gather_daemon(home: Option<&Path>) -> DaemonStatus {
             .then(|| std::fs::read_to_string(&lock).ok())
             .flatten()
             .and_then(|text| text.trim().parse().ok()),
+        // Ours, or a hand-installed agent that runs the daemon under another label.
         agent_installed: home
             .join("Library/LaunchAgents")
             .join(format!("{}.plist", crate::setup::DAEMON_LABEL))
-            .exists(),
+            .exists()
+            || !crate::setup::daemon_agents_on_disk(home).is_empty(),
     }
 }
 
@@ -3516,6 +3518,28 @@ mod tests {
             !gather_daemon(None).up,
             "no home proves nothing; it reads as down"
         );
+    }
+
+    #[test]
+    fn a_daemon_agent_under_another_label_counts_as_installed() {
+        let home = tempfile::tempdir().unwrap();
+        let agents = home.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        assert!(!gather_daemon(Some(home.path())).agent_installed);
+        // unrelated agents and saved copies are not the daemon's agent
+        std::fs::write(agents.join("com.other.plist"), "x").unwrap();
+        std::fs::write(
+            agents.join("mine.plist.bak"),
+            "<plist version=\"1.0\"><dict><key>ProgramArguments</key><array><string>/bin/csr-engine</string><string>daemon</string></array></dict></plist>",
+        )
+        .unwrap();
+        assert!(!gather_daemon(Some(home.path())).agent_installed);
+        std::fs::write(
+            agents.join("mine.plist"),
+            "<plist version=\"1.0\"><dict><key>Label</key><string>me.csr</string><key>ProgramArguments</key><array><string>/bin/csr-engine</string><string>daemon</string></array></dict></plist>",
+        )
+        .unwrap();
+        assert!(gather_daemon(Some(home.path())).agent_installed);
     }
 
     #[test]
