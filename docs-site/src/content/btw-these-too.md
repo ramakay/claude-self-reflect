@@ -56,6 +56,8 @@ Open `http://127.0.0.1:7373/`. `CSR_JOURNAL_PORT` moves the port and `CSR_NO_JOU
 
 ## Companion pane, beyond the five axes
 
+The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew install herdr`).
+
 - **How Claude read you:** spots shorthand Claude misread, such as "dknr" read as "done".
 - **Your rules:** corrections you typed, kept in your own words, never Claude's.
 - **CSR told Claude, Last session, Todos left:** cards showing the injected recap, the previous session and carry-over todos.

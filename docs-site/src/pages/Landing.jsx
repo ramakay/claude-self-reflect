@@ -861,7 +861,7 @@ function WhatsNewCard() {
           <strong>Code map</strong>: a per-worktree map of every definition in the repos your sessions are in, so <code>csr_search_by_file</code> and <code>csr_code_graph</code> answer for code no conversation touched
         </li>
         <li>
-          <strong>Companion plugin</strong>: a pane beside the session shows what memory handed Claude and which code changed since your past sessions
+          <strong>Companion plugin</strong>: a pane beside the session (it needs the herdr terminal multiplexer, <code>brew install herdr</code>) shows what memory handed Claude and which code changed since your past sessions
         </li>
       </ul>
       <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/blob/main/CHANGELOG.md" target="_blank" rel="noopener noreferrer">Full changelog →</a>
@@ -885,7 +885,7 @@ function MultiSourceCard() {
 
   return (
     <BentoCard className="card--multisource" delay={600}>
-      <CardKicker number="—" label="V9.4 — MULTI-SOURCE" accent="sage" />
+      <CardKicker number="—" label="MULTI-SOURCE" accent="sage" />
       <h2 className="type-hl-sm">More Than Transcripts</h2>
       <p className="type-dateline mt-2">Tasks, plans, and session history — absorbed where they belong.</p>
       <div className="multisource-layout">
@@ -1291,7 +1291,7 @@ export default function Landing() {
 
       <main className="landing-main">
         <p className="type-dateline landing-dateline" style={{ opacity: datelineVisible ? 1 : 0 }}>
-          Claude Self-Reflect / v9.5.2 / Rust Engine / Local Memory Archive
+          Claude Self-Reflect / v10.1.0 / Rust Engine / Local Memory Archive
         </p>
 
         <section className="bento-grid" aria-label="Claude Self-Reflect overview">

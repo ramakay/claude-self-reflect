@@ -4,7 +4,7 @@ title: Architecture
 
 ## Overview
 
-CSR is a single 78MB Rust binary. Everything — storage, search, embeddings, MCP server, hooks, and enrichment — runs in one process. No database servers, no containers, no network services. The one background process is optional: `csr-engine daemon` does enrichment and dreaming (a launchd plist is in `scripts/launchd/`), and hooks and the MCP server run without it.
+CSR is a single 78MB Rust binary. Everything — storage, search, embeddings, MCP server, hooks, and enrichment — runs in one process. No database servers, no containers, no network services. The one background process is `csr-engine daemon`, which does enrichment and dreaming. On macOS `csr-engine setup` installs it as a launchd agent and starts it (`CSR_NO_DAEMON=1` skips that; `scripts/launchd/` holds a template for doing it by hand). Hooks and the MCP server run without it.
 
 ![CSR Architecture Diagram](/claude-self-reflect/images/arch-diagram.png)
 
@@ -38,7 +38,7 @@ Hierarchical Navigable Small World graph for approximate nearest neighbor search
 | Operation | Latency |
 |-----------|---------|
 | Search (p95) | < 1ms |
-| Cached startup | ~150ms (p50, 54K-chunk index) |
+| Cached startup | 7.1s with an 834K-chunk index; scales with index size |
 | Cold startup | ~14s (rebuild from SQLite) |
 
 Staleness detection via `IndexManifest` — rebuilds only when DB has new data.

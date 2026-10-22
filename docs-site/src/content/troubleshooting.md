@@ -40,7 +40,7 @@ csr-engine eval      # Diagnostics
 ## Performance
 
 ### Slow first startup (~14s)
-Normal — rebuilding HNSW index. Subsequent: ~150ms.
+Normal — rebuilding HNSW index. Later starts load the cached index; that takes about 7s at 834K chunks and less for a smaller index.
 
 ### Inspecting the DB with system sqlite3 (macOS)
 macOS's bundled `sqlite3` can't load the FTS5 module, so it silently skips the `chunks_fts` table — integrity checks look ~10x faster than reality and FTS repairs won't work from the CLI. Use `csr-engine status --deep` for a true integrity check, or a Homebrew sqlite3.

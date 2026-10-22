@@ -78,13 +78,13 @@ SessionStart (`startup`, `resume`) prints one separate line after the Tier-0 blo
 
 ```bash
 csr-engine                     # Start MCP server (default)
-csr-engine setup               # Import + register MCP + install hooks
+csr-engine setup               # Import + register MCP + install hooks + start the daemon (macOS launchd agent; CSR_NO_DAEMON=1 skips)
 csr-engine status              # System status (JSON)
 csr-engine status --compact    # Statusline output
-csr-engine daemon              # Background enrichment + dream cycle; keep it alive with scripts/launchd/com.ramakay.csr-engine.daemon.plist
+csr-engine daemon              # Background enrichment + dream cycle; setup installs its launchd agent (scripts/launchd/ holds the hand-install template)
 csr-engine hook install --apply # Install/update hooks
-csr-engine eval                # Quick eval (5 tests, ~7ms)
-csr-engine eval --full         # Full eval (24 results plus a census line)
+csr-engine eval                # Quick eval (6 checks, ~20ms after the index loads)
+csr-engine eval --full         # Full eval (24 results plus a census line; 44s on a 10GB database, most of it the integrity check)
 csr-engine quality <file>      # AST code quality analysis
 ```
 
@@ -123,7 +123,7 @@ csr_transcript        — Structured facts from a session transcript JSONL (stat
 # Build
 cd csr-engine && cargo build --release
 
-# Test suite — 3,600+ lib tests (verified at commit ffbbf11b), plus separate hooks and integration suites
+# Test suite — 5,078 tests: 4,616 lib + 462 across 19 integration targets (verified at commit f1791bda); `cargo test` runs all of them
 cargo test
 cargo test --test hooks_integration
 cargo test --test integration

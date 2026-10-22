@@ -46,6 +46,6 @@ CSR also maps the repo you work in, so it can answer where a function lives even
 ## Run Evaluation
 
 ```bash
-csr-engine eval        # Quick (5 tests, <1s)
+csr-engine eval        # Quick (6 checks, ~20ms after the index loads)
 csr-engine eval --full # Full (24 results)
 ```

@@ -8,7 +8,7 @@ title: CLI Reference
 Starts MCP server (stdio mode).
 
 ### setup
-One-shot: import + MCP registration + hook installation + the csr-companion plugin (written by this binary as a local marketplace and installed from it through Claude Code's plugin CLI; retry with `csr-engine companion plugin install`).
+One-shot: import + MCP registration + hook installation + the background daemon (a launchd agent on macOS; `CSR_NO_DAEMON=1` skips it) + the csr-companion plugin (written by this binary as a local marketplace and installed from it through Claude Code's plugin CLI; retry with `csr-engine companion plugin install`).
 ```bash
 csr-engine setup
 csr-engine setup --no-companion   # skip the plugin
@@ -27,14 +27,14 @@ csr-engine hook session-start    # Run specific hook (called by Claude Code)
 ```
 
 ### daemon
-Background enrichment for Layer 3 AI narratives.
+Background enrichment for Layer 3 AI narratives, and the dreams. `csr-engine setup` installs it as a launchd agent on macOS.
 ```bash
 csr-engine daemon --batch-size 10 --no-ai
 ```
 
 ### eval
 ```bash
-csr-engine eval                   # Quick (5 tests)
+csr-engine eval                   # Quick (6 checks, ~20ms after the index loads)
 csr-engine eval --full            # Full (24 results)
 csr-engine eval --continuity-live # Live continuity probe vs the real index
 ```

@@ -7,7 +7,7 @@ title: Installation
 - **macOS** (Apple Silicon) or **Linux** (x86_64 / ARM64)
 - **Claude Code** CLI installed
 - ~78 MB disk for the binary, ~87 MB for the embedding model (downloaded on first run); the database grows with your history
-- For the optional companion pane: Claude Code 2.1.296 or later
+- For the optional companion pane: Claude Code 2.1.296 or later, and the [herdr](https://herdr.dev) terminal multiplexer (`brew install herdr`)
 
 No Docker, no API keys, and no Node, TypeScript or Python at run time: the companion pane runs inside the `csr-engine` binary.
 
@@ -17,7 +17,7 @@ No Docker, no API keys, and no Node, TypeScript or Python at run time: the compa
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
 ```
 
-Downloads the binary (SHA256-verified) and then **asks before activating**. Setup, which imports conversations, registers the MCP server, installs all 6 hooks and installs the csr-companion plugin, only runs after you confirm at the prompt.
+Downloads the binary (SHA256-verified) and then **asks before activating**. Setup, which imports conversations, registers the MCP server, installs all 6 hooks, installs the csr-companion plugin and, on macOS, installs and starts the background daemon, only runs after you confirm at the prompt.
 
 Non-interactive installs (CI, scripts) never activate automatically. Control the behavior with:
 
@@ -25,6 +25,7 @@ Non-interactive installs (CI, scripts) never activate automatically. Control the
 |----------|--------|
 | `CSR_AUTO_SETUP=1` | Run setup without prompting |
 | `CSR_SKIP_SETUP=1` | Download only, never run setup |
+| `CSR_NO_DAEMON=1` | Setup does not install or start the daemon (dreams and background enrichment then need `csr-engine daemon` run by hand) |
 
 ### npm
 
@@ -37,7 +38,7 @@ By default `npm install` only downloads the checksummed binary — it does not m
 
 ### The companion plugin
 
-After the other steps succeed, setup installs csr-companion (the pane beside the session), under the same consent as the rest of setup. The binary writes the plugin as a local marketplace under `~/.claude-self-reflect/csr-companion/marketplace`, and Claude Code's own plugin CLI installs it from there, so the plugin's version is always the engine's. The plugin is one generated file that starts `csr-engine companion serve`. Then run `/reload-plugins` in Claude Code, or restart it.
+After the other steps succeed, setup installs csr-companion (the pane beside the session, which needs the [herdr](https://herdr.dev) terminal multiplexer: `brew install herdr`), under the same consent as the rest of setup. The binary writes the plugin as a local marketplace under `~/.claude-self-reflect/csr-companion/marketplace`, and Claude Code's own plugin CLI installs it from there, so the plugin's version is always the engine's. The plugin is one generated file that starts `csr-engine companion serve`. Then run `/reload-plugins` in Claude Code, or restart it.
 
 - `csr-engine setup --no-companion` skips the plugin.
 - If the install fails or is skipped, setup prints the reason and the command that retries it: `csr-engine companion plugin install`.
@@ -84,7 +85,7 @@ ln -s /mnt/c/Users/<windows-user>/.claude ~/.claude
 There is no `uninstall` command. `npm uninstall` does not touch your Claude Code settings, and `csr-engine hook install --apply` only adds hooks. Remove the hooks and the daemon by hand:
 
 ```bash
-# 1. Stop the daemon LaunchAgent, if you installed it (macOS)
+# 1. Stop the daemon LaunchAgent that setup installed (macOS)
 launchctl bootout gui/$(id -u)/com.ramakay.csr-engine.daemon
 rm ~/Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist
 

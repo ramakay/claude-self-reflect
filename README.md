@@ -17,7 +17,7 @@ Single 78MB binary. Embedded SQLite, no database server. No containers. No API k
 > Dreaming checks old conclusions against your git history and marks a stale anchor with the commit that changed it. No LLM in that check.
 > CSR also reads plans, task state, Codex sessions, subagent transcripts, memory-file metadata and the session registry, and ships a companion plugin with a pane beside the session.
 > A live code map covers every definition in the repos your sessions work in, across main and every worktree, so CSR can answer for code no conversation touched.
-> Sub-millisecond search, ~150ms cached startup, 3,600+ tests (lib, verified at commit ffbbf11b), zero external dependencies.
+> Sub-millisecond search, 5,078 tests passing (4,616 lib, 462 across 19 integration targets, 19 more ignored; verified at commit f1791bda), zero external dependencies.
 > [Release notes](CHANGELOG.md)
 
 <img src="docs-site/public/images/csr-demo.gif" alt="CSR Demo — Setup, Search, and Hooks" width="800" />
@@ -178,6 +178,8 @@ Open `http://127.0.0.1:7373/`. `CSR_JOURNAL_PORT` moves the port and `CSR_NO_JOU
 
 ### Companion pane, beyond the five axes
 
+The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew install herdr`).
+
 - **How Claude read you:** spots shorthand Claude misread, such as "dknr" read as "done".
 - **Your rules:** corrections you typed, kept in your own words, never Claude's.
 - **CSR told Claude, Last session, Todos left:** cards showing the injected recap, the previous session and carry-over todos.
@@ -227,7 +229,7 @@ Open `http://127.0.0.1:7373/`. `CSR_JOURNAL_PORT` moves the port and `CSR_NO_JOU
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
 ```
 
-Downloads the binary (SHA256-verified), then asks before activating. Setup registers the MCP server, installs 6 hooks, imports your conversations and installs the companion plugin, and it only runs with your consent. Restart Claude Code after.
+Downloads the binary (SHA256-verified), then asks before activating. Setup registers the MCP server, installs 6 hooks, imports your conversations, installs the companion plugin and, on macOS, installs and starts the background daemon (a launchd agent that runs dreams and enrichment; `CSR_NO_DAEMON=1` skips it). It only runs with your consent. Restart Claude Code after.
 
 Non-interactive installs never activate on their own: set `CSR_AUTO_SETUP=1` to opt in, or run `csr-engine setup` yourself.
 
@@ -265,7 +267,7 @@ csr-engine setup
 
 ### The companion pane (optional)
 
-A Claude Code plugin that sits beside the session: what your memory handed Claude, the agents and Codex runs in flight, the dreamer's "what if...?", and a compaction coach. It needs Claude Code 2.1.296 or later. It runs inside `csr-engine` itself: the plugin is one generated file that starts `csr-engine companion serve`, so it needs no Node, TypeScript or Python. `csr-engine setup` writes that plugin and installs it through Claude Code's own plugin CLI, after the same consent. `csr-engine setup --no-companion` skips it. If setup cannot install it, it prints why, and you can retry with one command:
+A Claude Code plugin that sits beside the session. The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew install herdr`). It shows what your memory handed Claude, the agents and Codex runs in flight, the dreamer's "what if...?", and a compaction coach. It needs Claude Code 2.1.296 or later. It runs inside `csr-engine` itself: the plugin is one generated file that starts `csr-engine companion serve`, so it needs no Node, TypeScript or Python. `csr-engine setup` writes that plugin and installs it through Claude Code's own plugin CLI, after the same consent. `csr-engine setup --no-companion` skips it. If setup cannot install it, it prints why, and you can retry with one command:
 
 ```bash
 csr-engine companion plugin install
@@ -284,11 +286,11 @@ No special syntax. No commands. CSR finds relevant past context and injects it a
 </details>
 
 <details>
-<summary><strong>Performance</strong> — sub-millisecond search, ~150ms cached startup</summary>
+<summary><strong>Performance</strong> — sub-millisecond search</summary>
 
 | Metric | Value |
 |--------|-------|
-| **Cached startup** | ~150ms (p50, 54K-chunk index) |
+| **Cached startup** | 7.1s with an 834K-chunk index (`csr-engine eval` startup line); scales with index size |
 | **Search latency (p95)** | <1ms |
 | **Binary size** | 78MB |
 | **Import speed** | ~20 conversations/sec |
@@ -392,8 +394,8 @@ csr-engine status              System status (JSON)
 csr-engine status --compact    One-line statusline output
 csr-engine daemon              Background enrichment daemon
 csr-engine hook install --apply Install Claude Code hooks
-csr-engine eval                Quick eval (5 tests)
-csr-engine eval --full         Full eval (24 results)
+csr-engine eval                Quick eval (6 checks, ~20ms after the index loads)
+csr-engine eval --full         Full eval (24 results plus a census line; 44s on a 10GB database, most of it the integrity check)
 csr-engine quality <file>      AST-based code quality analysis
 ```
 
@@ -421,7 +423,7 @@ Your conversation data (`~/.claude/projects/`) is untouched. The new engine re-i
 | No search results | Run `csr-engine setup` |
 | MCP tools not available | Run `csr-engine setup`, restart Claude Code |
 | "spawn ENOENT" in MCP | Ensure `csr-engine` is in PATH |
-| Slow first startup | Normal (~14s for index rebuild, subsequent: ~150ms) |
+| Slow first startup | Normal (~14s for index rebuild; a cached load grows with the index, 7s at 834K chunks) |
 
 Full guide: [Documentation](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
@@ -433,7 +435,7 @@ Full guide: [Documentation](https://ramakay.github.io/claude-self-reflect/#/docs
 There is no `uninstall` command. `npm uninstall` does not touch your Claude Code settings, and `csr-engine hook install --apply` only adds hooks. Remove the hooks and the daemon by hand:
 
 ```bash
-# 1. Stop the daemon LaunchAgent, if you installed it (macOS)
+# 1. Stop the daemon LaunchAgent that setup installed (macOS)
 launchctl bootout gui/$(id -u)/com.ramakay.csr-engine.daemon
 rm ~/Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist
 
