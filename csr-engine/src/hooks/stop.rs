@@ -5164,6 +5164,55 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_committed_composes_a_recap_from_the_commit() {
+        let ep = closing_run(
+            vec![bash_step(
+                "c",
+                "git commit -q -m 'fix(recap): name the commit'",
+                "[main 1a2b3c4] fix(recap): name the commit\n 1 file changed",
+                false,
+            )],
+            "Committed.",
+        );
+        let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: run the release checks and report: fix(recap): name the commit (1a2b3c4). [[CSR:RECAP]]"
+        );
+        // Everything it says is re-import suppressed.
+        assert!(crate::extraction::provenance::is_csr_emission(&got));
+        assert!(crate::extraction::provenance::extractable(&got).is_none());
+    }
+
+    #[test]
+    fn a_session_with_no_receipt_composes_no_completed_clause() {
+        // A question answered from reads: nothing was committed, edited or
+        // finished, so the recap says what was asked and nothing more.
+        let ep = closing_run(
+            vec![bash_step(
+                "r",
+                "git log --oneline -3",
+                "1a2b3c4 older",
+                false,
+            )],
+            "The last three commits are listed.",
+        );
+        assert!(ep.completions.is_empty());
+        let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: run the release checks and report. [[CSR:RECAP]]"
+        );
+        // And with no typed request at all there is nothing to compose.
+        let mut empty = ep.clone();
+        empty.request = String::new();
+        empty.anchor_request = None;
+        empty.latest_ask = None;
+        empty.completed = String::new();
+        assert!(crate::hooks::recap::compose_recap(&empty, &no_feeds(), "now").is_none());
+    }
+
+    #[test]
     fn a_failed_call_that_was_run_again_and_passed_is_not_a_failure() {
         let ep = closing_run(
             vec![
