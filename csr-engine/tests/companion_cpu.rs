@@ -522,3 +522,31 @@ fn removing_codex_after_its_first_scan_leaves_the_pane_quiet() {
         );
     }
 }
+
+/// The Codex week's figure goes at its reset like the Claude quotas' do: a quiet pane draws the
+/// moment it passes, not up to the floor later.
+#[test]
+fn a_quiet_pane_draws_when_the_codex_week_passes_its_reset() {
+    let (_home, paths) = rich_home();
+    let folder = paths.home.join(".codex/sessions/2026/10/18");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(
+        folder.join("rollout-a.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"event_msg","timestamp":NOW - 5.,"payload":{
+                "type":"token_count","info":{"total_token_usage":{"total_tokens":9}},
+                "rate_limits":{"limit_id":"codex","secondary":{
+                    "window_minutes":10080,"used_percent":40,"resets_at":NOW + 15.}}}})
+        ),
+    )
+    .unwrap();
+    let mut pane = pane_in(&paths);
+    pane.frame(76, 67, NOW);
+    // The floor's thirty seconds end after the reset, not before it.
+    assert!(!pane.due(NOW + 14.), "nothing is due before the reset");
+    assert!(
+        pane.due(NOW + 15.5),
+        "the Codex week passed its reset and the pane still shows its figure"
+    );
+}

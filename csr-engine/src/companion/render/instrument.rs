@@ -715,6 +715,8 @@ impl Composition {
                 due.push(resets - len * (1. - (used / 100. - 0.05)));
             }
         }
+        // The Codex week passes its reset on its own clock too: the figure it shows goes with it.
+        due.extend(self.codex_week["resets_at"].as_f64());
         if quotas.iter().any(|q| q["resets"].is_number())
             || (open.threads && !self.river.is_empty())
         {
