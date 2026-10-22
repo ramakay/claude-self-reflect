@@ -70,6 +70,18 @@ pub fn canonical_repo_path_cold(path: &Path) -> PathBuf {
     lookup_uncached(path).0
 }
 
+/// `canonical_repo_path` as it answers once the directory has been seen,
+/// whichever call this is. For a path in a tree with no `.git` the plain
+/// function spells a directory's first lookup as given and every later one
+/// symlink- and `..`-resolved, so two lookups of one file in one process can
+/// differ. A caller that compares or memoizes spellings (the resolver) uses this
+/// so the answer does not depend on which lookup came first.
+pub fn canonical_repo_path_warm(path: &Path) -> PathBuf {
+    // The first call fills the directory's cache entry; the second reads it.
+    let _ = canonical_repo_path(path);
+    canonical_repo_path(path)
+}
+
 /// Walk the ancestors of `path` looking for `.git`. Returns the canonical
 /// path and the cache entry to keep for its parent directory, if any.
 fn lookup_uncached(path: &Path) -> (PathBuf, Option<WorktreeRewrite>) {

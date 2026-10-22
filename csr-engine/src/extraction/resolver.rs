@@ -1875,7 +1875,11 @@ fn canon_path(s: &str, memo: &mut Memo) -> String {
     if let Some(c) = memo.canon.get(s) {
         return c.clone();
     }
-    let c = super::repo_path::canonical_repo_path(Path::new(s))
+    // The warm spelling, always: the plain lookup spells the first path seen in
+    // a directory with no `.git` as given and later ones resolved, so memoizing
+    // it would pin whichever came first for every edge that repeats the path,
+    // and pairs of paths for one file would compare unequal.
+    let c = super::repo_path::canonical_repo_path_warm(Path::new(s))
         .to_string_lossy()
         .into_owned();
     memo.canon.insert(s.to_string(), c.clone());
@@ -3455,6 +3459,49 @@ mod tests {
             "binds to the file the import names, not styles_b"
         );
         assert_eq!(evidence, "module_bind:ComponentA.styles.ts");
+    }
+
+    #[test]
+    fn a_module_path_with_dotdot_binds_the_same_on_a_first_resolve_as_on_a_warm_one() {
+        // A package tree with no `.git`: the plain path lookup spells the first
+        // path it sees in a directory as given (`src/../shared.ts`) and every
+        // later one resolved (`shared.ts`). An import and a call that both name
+        // `../shared` must bind alike, whichever of them is looked up first.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("shared.ts"), "// shared\n").unwrap();
+        std::fs::write(root.join("other.ts"), "// other\n").unwrap();
+        let shared = root.join("shared.ts").to_string_lossy().to_string();
+        let other = root.join("other.ts").to_string_lossy().to_string();
+        let main = root.join("src/main.ts").to_string_lossy().to_string();
+
+        let conn = mem();
+        upsert_node(&conn, &def("helper_shared", &shared, "helper")).unwrap();
+        upsert_node(&conn, &def("helper_other", &other, "helper")).unwrap();
+        upsert_node(&conn, &def("run", &main, "run")).unwrap();
+        upsert_node(&conn, &module_node("main_mod", &main)).unwrap();
+        codegraph::replace_file_edges(
+            &conn,
+            "proj",
+            &main,
+            &[
+                import_edge_from("main_mod", "helper", &main, "../shared"),
+                call_edge("run", "helper", &main),
+            ],
+        )
+        .unwrap();
+
+        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
+        assert_eq!(stats.resolved, 2, "both edges bind to ../shared: {stats:?}");
+        let dsts: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT dst_id FROM code_edges ORDER BY src_id, kind")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(dsts, vec!["helper_shared", "helper_shared"]);
     }
 
     #[test]
