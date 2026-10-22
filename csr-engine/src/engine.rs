@@ -717,7 +717,10 @@ impl Engine {
             }
             #[cfg(test)]
             crate::storage::lock_probe::before_index_apply(
-                &stored_now.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+                &stored_now
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>(),
             );
             {
                 let mut idx = self.search.write().await;
@@ -1900,7 +1903,10 @@ mod tests {
             engine.search.clone(),
         );
         assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
-        assert!(chunk_ids(&engine.storage).is_empty(), "the delete did not run");
+        assert!(
+            chunk_ids(&engine.storage).is_empty(),
+            "the delete did not run"
+        );
         assert_eq!(
             engine.search.read().await.chunk_count(),
             0,
@@ -1917,7 +1923,10 @@ mod tests {
         assert!(!ids.is_empty());
         let search = engine.search.read().await;
         for id in &ids {
-            assert!(search.has_chunk(id), "the importer's own insert was skipped");
+            assert!(
+                search.has_chunk(id),
+                "the importer's own insert was skipped"
+            );
         }
     }
 

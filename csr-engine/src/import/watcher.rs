@@ -783,7 +783,10 @@ pub(crate) async fn import_file_content_diff(
         }
         #[cfg(test)]
         crate::storage::lock_probe::before_index_apply(
-            &stored_now.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            &stored_now
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>(),
         );
         {
             let mut idx = search.write().await;
@@ -1382,8 +1385,7 @@ mod maintenance_probes {
         let storage = Arc::new(Storage::open_memory().unwrap());
         let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
         let search = Arc::new(RwLock::new(SearchEngine::new(64)));
-        let _race =
-            crate::storage::lock_probe::delete_then_sync(storage.clone(), search.clone());
+        let _race = crate::storage::lock_probe::delete_then_sync(storage.clone(), search.clone());
         import_file_content_diff(&storage, &embeddings, &search, &projects, &src)
             .await
             .unwrap();

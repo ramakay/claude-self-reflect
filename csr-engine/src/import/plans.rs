@@ -512,7 +512,10 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     }
     #[cfg(test)]
     crate::storage::lock_probe::before_index_apply(
-        &stored_now.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        &stored_now
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
     );
     {
         // tokio::sync::RwLock has no plain (non-async) writer; blocking_write is its

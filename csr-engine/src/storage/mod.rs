@@ -172,8 +172,10 @@ pub(crate) mod lock_probe {
         (installed, held)
     }
 
+    type ApplyHook = Box<dyn FnMut(&[String])>;
+
     thread_local! {
-        static BEFORE_INDEX_APPLY: RefCell<Option<Box<dyn FnMut(&[String])>>> =
+        static BEFORE_INDEX_APPLY: RefCell<Option<ApplyHook>> =
             const { RefCell::new(None) };
     }
 
