@@ -333,6 +333,18 @@ impl Storage {
         .map_err(Into::into)
     }
 
+    /// `dreams_v1` rows created at or after `since` (`YYYY-MM-DD HH:MM:SS`
+    /// UTC, the form `created_at` is stored in).
+    pub fn count_dreams_since(&self, since: &str) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM dreams_v1 WHERE created_at >= ?1",
+            [since],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
     pub fn count_session_intent_events(
         &self,
         session_id: &str,

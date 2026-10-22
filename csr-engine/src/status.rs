@@ -677,9 +677,36 @@ pub struct DreamCategoryTotals {
     pub supersession: i64,
 }
 
-impl DreamCategoryTotals {
+/// How far back the compact line counts dreams. A dream older than this is
+/// history, not something the status line should present as current.
+const RECENT_DREAM_DAYS: i64 = 7;
+
+/// Dreams produced inside the last [`RECENT_DREAM_DAYS`] days, by where they
+/// are stored. `dreams` (all time) counts only `dreams_v1`; the companion's
+/// what-if dreamer writes `csr-companion/dreams.jsonl` instead, so a count
+/// that read only the table sat frozen while the live dreamer ran.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DreamRecent {
+    pub window_days: i64,
+    /// `dreams_v1` rows created inside the window.
+    pub stored: i64,
+    /// Distinct companion dreams (`dreams.jsonl`) inside the window.
+    pub companion: i64,
+}
+
+impl Default for DreamRecent {
+    fn default() -> Self {
+        Self {
+            window_days: RECENT_DREAM_DAYS,
+            stored: 0,
+            companion: 0,
+        }
+    }
+}
+
+impl DreamRecent {
     fn total(&self) -> i64 {
-        self.unfinished + self.strategy + self.supersession
+        self.stored + self.companion
     }
 }
 
@@ -703,6 +730,9 @@ pub struct DreamStatus {
     pub verdict_events_total: i64,
     pub by_verdict: DreamVerdictTotals,
     pub dreams: DreamCategoryTotals,
+    /// Dreams inside the last week, stored and companion; the compact line
+    /// shows this, not the all-time `dreams`.
+    pub dreams_recent: DreamRecent,
     pub corrections_7d: i64,
     pub demoted_symbols: i64,
     /// Total durable witnesses available for a first dream cycle.
@@ -865,6 +895,7 @@ impl Default for DreamStatus {
             verdict_events_total: 0,
             by_verdict: DreamVerdictTotals::default(),
             dreams: DreamCategoryTotals::default(),
+            dreams_recent: DreamRecent::default(),
             corrections_7d: 0,
             demoted_symbols: 0,
             witnesses_ledgered: 0,
@@ -1442,7 +1473,8 @@ fn gather_status_with(
     }
 
     let aux = gather_aux(&storage, projects_dir, settings);
-    let dream = gather_dream(&storage);
+    let mut dream = gather_dream(&storage);
+    dream.dreams_recent = gather_recent_dreams(&storage, db_path);
     let dream_threads = gather_dream_threads(&storage);
     let memory_registry = gather_memory_registry(&storage);
     let trained_rerank = gather_trained_rerank(&storage);
@@ -1931,6 +1963,8 @@ fn gather_dream_with(
             strategy,
             supersession: supersession_dreams,
         },
+        // Filled by `gather_status_with`, which knows the data directory.
+        dreams_recent: DreamRecent::default(),
         corrections_7d,
         demoted_symbols,
         witnesses_ledgered,
@@ -1946,6 +1980,53 @@ fn gather_dream_with(
         spend: gather_dream_spend(storage),
         server: gather_journal_server(),
     }
+}
+
+/// Count the dreams of the last [`RECENT_DREAM_DAYS`] days: `dreams_v1` rows
+/// plus the companion dreamer's log. The log sits next to the database, so a
+/// test database or `--db-path` reads its own companion data. The former
+/// `csr-shifts/dreams.jsonl` is read too, as the companion itself does.
+fn gather_recent_dreams(storage: &Storage, db_path: &Path) -> DreamRecent {
+    let since = chrono::Utc::now() - chrono::Duration::days(RECENT_DREAM_DAYS);
+    let stored = storage
+        .count_dreams_since(&since.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or(0);
+    let data_dir = db_path.parent().unwrap_or(Path::new("."));
+    let logs = [
+        data_dir.join("csr-companion/dreams.jsonl"),
+        data_dir.join("csr-shifts/dreams.jsonl"),
+    ];
+    DreamRecent {
+        window_days: RECENT_DREAM_DAYS,
+        stored,
+        companion: companion_dreams_since(&logs, since.timestamp() as f64),
+    }
+}
+
+/// Distinct companion dreams at or after `since` (epoch seconds), counted the
+/// way the pane counts them (`companion::dreams::load_dream_log`: batches
+/// expanded, one entry per id). Lines that cannot be a dream are skipped
+/// before parsing, because the log holds thousands of other records and this
+/// runs on the statusline's refresh.
+fn companion_dreams_since(logs: &[std::path::PathBuf], since: f64) -> i64 {
+    let mut records = Vec::new();
+    for log in logs {
+        let Ok(bytes) = std::fs::read(log) else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            if !(line.contains("\"kind\":\"dream\"") || line.contains("\"kind\":\"batch\"")) {
+                continue;
+            }
+            if let Ok(row) = serde_json::from_str::<serde_json::Value>(line) {
+                records.push(row);
+            }
+        }
+    }
+    crate::companion::dreams::load_dream_log(&records, "")
+        .iter()
+        .filter(|d| d["at"].as_f64().unwrap_or(0.) >= since)
+        .count() as i64
 }
 
 /// Journal v4 P5 cadence block. Every field is either a configured value or
@@ -2435,7 +2516,7 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
             report.provenance_coverage.source_unmatched,
         ));
     }
-    let dream_total = report.dream.dreams.total();
+    let dream_total = report.dream.dreams_recent.total();
     let dream_segment_open = dream_total > 0 || report.dream.corrections_7d > 0;
     if dream_segment_open {
         out.push_str(&format!(" | ☾ {dream_total} dreams"));
@@ -2459,8 +2540,10 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
     // something unread. It joins the dreams segment when one is open — one
     // moon per line, not two.
     if let Some(unread) = report.dream.badge.unread.filter(|&count| count > 0) {
+        // The unread count is the journal's (verdict findings), a different
+        // unit from the dreams counted before it; say so when they share a segment.
         out.push_str(if dream_segment_open {
-            " · "
+            " · journal: "
         } else {
             " | ☾ "
         });
@@ -3270,6 +3353,10 @@ mod tests {
                 strategy: 1,
                 supersession: 0,
             },
+            dreams_recent: DreamRecent {
+                stored: 3,
+                ..DreamRecent::default()
+            },
             demoted_symbols: 3,
             witnesses_ledgered: 0,
             ancestry_cached_conversations: 0,
@@ -3293,13 +3380,12 @@ mod tests {
         let mut report = base_report();
         report.dream.events_total = 545;
         report.dream.verdict_events_total = 545;
-        report.dream.dreams.unfinished = 4;
-        report.dream.dreams.supersession = 2;
+        report.dream.dreams_recent.stored = 6;
         report.dream.corrections_7d = 3;
         let line = format_compact(&report, 0);
         assert!(
             line.contains("☾ 6 dreams · 3 corrections"),
-            "the compact line must count dreams_v1 and recent corrections: {line:?}"
+            "the compact line must count recent dreams and recent corrections: {line:?}"
         );
         assert!(
             !line.contains("545 dreams"),
@@ -3332,9 +3418,72 @@ mod tests {
     }
 
     #[test]
+    fn compact_does_not_present_all_time_dreams_as_current() {
+        let mut report = base_report();
+        report.dream.dreams.unfinished = 5;
+        let line = format_compact(&report, 0);
+        assert!(
+            !line.contains("dreams"),
+            "dreams older than the window must not read as current: {line:?}"
+        );
+    }
+
+    #[test]
+    fn recent_dreams_count_the_companion_log_and_ignore_old_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("csr-engine.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                for (id, created) in [("old", "2026-08-17 21:01:25"), ("new", "2999-01-01 00:00:00")] {
+                    conn.execute(
+                        "INSERT INTO dreams_v1 (dream_id, project, category, subject_key, revision_hash, prose, created_at)
+                         VALUES (?1, 'p', 'unfinished', ?1, 'h', 'prose', ?2)",
+                        rusqlite::params![id, created],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let now = chrono::Utc::now().timestamp() as f64;
+        let keep = dir.path().join("csr-companion");
+        std::fs::create_dir_all(&keep).unwrap();
+        let rows = [
+            // a plain dream, the same id answered later (one dream), a batch of
+            // two, an old dream, and records that are not dreams at all.
+            format!(
+                r#"{{"kind":"dream","id":"a","line":"x","at":{}}}"#,
+                now - 60.
+            ),
+            format!(
+                r#"{{"kind":"dream","id":"a","line":"x","at":{}}}"#,
+                now - 30.
+            ),
+            format!(
+                r#"{{"kind":"batch","at":{},"dreams":[{{"id":"b","line":"y"}},{{"id":"c","line":"z"}}]}}"#,
+                now - 10.
+            ),
+            format!(
+                r#"{{"kind":"dream","id":"d","line":"w","at":{}}}"#,
+                now - 30. * 86400.
+            ),
+            format!(r#"{{"kind":"look","at":{}}}"#, now),
+            "not json".to_owned(),
+        ];
+        std::fs::write(keep.join("dreams.jsonl"), rows.join("\n") + "\n").unwrap();
+        let recent = gather_recent_dreams(&storage, &db_path);
+        assert_eq!(recent.stored, 1, "the August row is outside the window");
+        assert_eq!(
+            recent.companion, 3,
+            "a, b and c; not the old one, not a look"
+        );
+        assert_eq!(recent.total(), 4);
+    }
+
+    #[test]
     fn test_compact_never_asks_for_an_mcp_reconnect() {
         let mut report = base_report();
-        report.dream.dreams.unfinished = 2;
+        report.dream.dreams_recent.stored = 2;
         report.mcp_binary_stale = true;
         let line = format_compact(&report, 0);
         assert!(line.contains("☾ 2 dreams"), "{line:?}");
@@ -3824,13 +3973,13 @@ mod tests {
     #[test]
     fn compact_badge_joins_the_dreams_segment_instead_of_adding_a_second_moon() {
         let mut report = base_report();
-        report.dream.dreams.unfinished = 5;
+        report.dream.dreams_recent.stored = 5;
         report.dream.corrections_7d = 4;
         report.dream.badge.unread = Some(6);
         report.dream.server.url = Some("http://127.0.0.1:7373/".into());
         let line = format_compact(&report, 0);
         assert!(
-            line.contains("☾ 5 dreams · 4 corrections · 6 unread http://127.0.0.1:7373/"),
+            line.contains("☾ 5 dreams · 4 corrections · journal: 6 unread http://127.0.0.1:7373/"),
             "{line}"
         );
         assert_eq!(line.matches('☾').count(), 1, "{line}");
@@ -4223,6 +4372,10 @@ mod tests {
         assert_eq!(report.dream.dreams.unfinished, 1);
         assert_eq!(report.dream.dreams.strategy, 1);
         assert_eq!(report.dream.dreams.supersession, 1);
+        assert_eq!(
+            report.dream.dreams_recent.stored, 3,
+            "rows created just now are inside the recent window"
+        );
         assert_eq!(report.dream.corrections_7d, 2);
         assert_eq!(
             report.dream.demoted_symbols, 0,
