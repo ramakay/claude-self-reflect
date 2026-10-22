@@ -4184,6 +4184,15 @@ mod r4_daemon_audit_probes {
         drop(lock);
         drop(storage);
         drop(search);
+        // Dropping the guard closes our descriptor, but the exclusive flock belongs to the open
+        // file description. A process another test is spawning at this moment holds a copy of it
+        // until its exec closes it, so on a loaded host the release is not instant, and
+        // `Storage::open` makes a single attempt. Wait for the release, then reopen.
+        drop(
+            crate::maintenance::wait_shared(dir.path(), Duration::from_secs(60))
+                .await
+                .unwrap(),
+        );
 
         let storage = Arc::new(Storage::open(&db).unwrap());
         let search = Arc::new(RwLock::new(SearchEngine::new(16)));
