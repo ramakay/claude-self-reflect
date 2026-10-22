@@ -15,6 +15,7 @@
 //! Always returns Ok(()) — never blocks Claude Code (C-2 fix).
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -28,6 +29,33 @@ use crate::engine::Engine;
 /// [`bash_written_files`].
 pub fn is_acted_on_tool(tool_name: Option<&str>) -> bool {
     matches!(tool_name, Some("Edit") | Some("Write") | Some("MultiEdit"))
+}
+
+/// Wall-clock budget for the database writes of one PostToolUse run, counted
+/// from the start of [`handle`]. The hook only extracts the edited file now (the
+/// project-wide edge resolve runs in the daemon, `extraction::graph_drain`), so
+/// its own work is milliseconds; what can stall it is the write lock, which the
+/// storage default would wait on for 5 s per statement. Each write phase waits
+/// only as long as the budget has left, and once it is spent the remaining
+/// graph work is skipped: the file is already queued for the code map (the
+/// enqueue is the first write), and the hook exits 0.
+///
+/// Same idea as `prompt_transport::REQUEST_BUDGET`. A backgrounded hook
+/// (`async: true`) is not the answer: a stalled one stays a live csr-engine
+/// process.
+pub const WRITE_BUDGET: Duration = Duration::from_millis(1500);
+
+/// Cap the wait for the write lock at what is left of the budget; `false` once
+/// nothing is left.
+fn clamp_write_wait(engine: &Engine, deadline: Instant) -> bool {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return false;
+    }
+    let _ = engine
+        .storage()
+        .with_connection(|conn| conn.busy_timeout(left).map_err(Into::into));
+    true
 }
 
 /// Most files one Bash call may add to the file history. A script that rewrites
@@ -71,6 +99,7 @@ pub fn exits_before_engine(hook_name: &str, input: &HookInput) -> bool {
 /// Handle the post-tool-use hook.
 /// Always returns Ok(()) to never block Claude Code (C-2 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<()> {
+    let deadline = Instant::now() + WRITE_BUDGET;
     let bash_files = bash_written_files(input);
     if input.tool_name.as_deref() == Some("Bash") && bash_files.is_empty() {
         return Ok(());
@@ -102,13 +131,24 @@ pub async fn handle(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<(
         if let Err(e) = enqueue_path_for_codemap(engine, file_path) {
             eprintln!("CSR: code map enqueue error (non-fatal): {}", e);
         }
+        // The enqueue put the storage default back; the writes below wait only
+        // as long as the budget has left.
+        if !clamp_write_wait(engine, deadline) {
+            eprintln!("CSR: write budget spent, left to the code map queue (non-fatal)");
+            break;
+        }
         if let Err(e) =
             track_code_evolution_for(input, engine, file_path, resolve_project_for_hook).await
         {
             eprintln!("CSR: code evolution tracking error (non-fatal): {}", e);
         }
-        // v9.4 liveness path: re-extract the touched file into the code graph
-        // so callers/callees/ledger reflect the edit immediately.
+        // v9.4 liveness path: re-extract the touched file into the code graph so
+        // callers/callees/ledger reflect the edit immediately (edges as
+        // `name:` placeholders, which those queries read; the daemon binds them).
+        if !clamp_write_wait(engine, deadline) {
+            eprintln!("CSR: write budget spent, graph update skipped (non-fatal)");
+            break;
+        }
         if let Err(e) = update_code_graph_for(input, engine, file_path, resolve_project_for_hook) {
             eprintln!("CSR: code graph update error (non-fatal): {}", e);
         }
@@ -171,7 +211,8 @@ const MAX_GRAPH_FILE_BYTES: u64 = 256 * 1024;
 
 /// Re-extract the edited file into the code graph (v9.4 liveness path).
 /// Reads the on-disk file (post-edit), upserts nodes, replaces this file's edges,
-/// marks file state, then re-resolves + re-ranks the project.
+/// and marks file state, queuing the file for the daemon's project-wide resolve
+/// + rank (`extraction::graph_drain`).
 #[cfg(test)]
 fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
     update_code_graph_with(input, engine, resolve_project_for_hook)
@@ -293,11 +334,9 @@ fn update_code_graph_for(
     }
 
     let content_hash = crate::extraction::anchors::hash_normalized(&source);
-    storage.upsert_code_file_state(&project, &stored_path_str, &content_hash, false)?;
-
-    // Re-resolve + re-rank so the live graph is queryable right after the edit.
-    let _ = storage.resolve_code_edges(&project)?;
-    let _ = storage.compute_code_rank(&project)?;
+    // The last write of the extraction, and it queues the file for the daemon's
+    // project-wide resolve (bumps `graph_gen`) in the same statement.
+    storage.upsert_code_file_state_pending(&project, &stored_path_str, &content_hash)?;
 
     eprintln!(
         "CSR: code graph updated for {} ({} nodes, {} edges)",
@@ -824,6 +863,96 @@ mod tests {
             })
             .unwrap();
         assert_eq!(projects, vec!["my-repo".to_string()]);
+    }
+
+    #[test]
+    fn an_edit_extracts_the_file_and_queues_the_resolve_it_does_not_run() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The canonical form, so both edits store the same path.
+        let file = tmp.path().canonicalize().unwrap().join("queue.rs");
+        std::fs::write(&file, "fn caller() { callee(); }\nfn callee() {}\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        let input = write_input(&file, Some("/Users/x/projects/my-repo"));
+
+        update_code_graph_for(&input, &engine, &path, resolve_without_env).unwrap();
+        let edges = |storage: &crate::storage::Storage| -> (i64, i64) {
+            storage
+                .with_connection(|c| {
+                    Ok(c.query_row(
+                        "SELECT COUNT(*), COALESCE(SUM(resolved), 0) FROM code_edges
+                         WHERE kind = 'calls'",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?)
+                })
+                .unwrap()
+        };
+        // The call is there for the queries that read placeholders, unresolved.
+        assert_eq!(edges(&storage), (1, 0));
+        let pending = storage.pending_resolve_files().unwrap();
+        assert_eq!(pending.len(), 1, "queued for the drain");
+        assert_eq!(pending[0].0, "my-repo");
+
+        // A second edit of the same file moves the generation on.
+        update_code_graph_for(&input, &engine, &path, resolve_without_env).unwrap();
+        assert_eq!(storage.pending_resolve_files().unwrap()[0].2, 2);
+
+        // The drain binds the call and settles the file.
+        storage
+            .with_connection(|c| crate::extraction::graph_drain::drain(c, &|_: &str| true))
+            .unwrap();
+        assert_eq!(edges(&storage), (1, 1));
+        assert!(storage.pending_resolve_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_write_budget_bounds_the_wait_for_a_locked_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = std::sync::Arc::new(crate::storage::Storage::open(&db).unwrap());
+        let engine = crate::engine::Engine::from_parts(
+            storage.clone(),
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
+                100,
+            ))),
+            std::path::PathBuf::from("/tmp"),
+        );
+        let file = dir.path().join("locked.rs");
+        std::fs::write(&file, "fn a() { b(); }\nfn b() {}\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        let input = write_input(&file, Some("/Users/x/projects/my-repo"));
+
+        // The daemon (or a drain) holds the write lock for longer than the budget.
+        let holder = rusqlite::Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let budget = Duration::from_millis(300);
+        let deadline = Instant::now() + budget;
+        assert!(clamp_write_wait(&engine, deadline));
+        let waited: i64 = storage
+            .with_connection(|c| Ok(c.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?))
+            .unwrap();
+        assert!(
+            waited <= 300,
+            "the wait follows the budget, not the 5 s default: {waited}"
+        );
+
+        let started = Instant::now();
+        let result = update_code_graph_for(&input, &engine, &path, resolve_without_env);
+        let took = started.elapsed();
+        assert!(result.is_err(), "the write gave up on the lock");
+        assert!(took < Duration::from_secs(2), "returned in {took:?}");
+
+        // Nothing left in the budget: the remaining graph work is skipped.
+        assert!(!clamp_write_wait(&engine, Instant::now()));
+
+        // Once the lock is free the same edit goes through.
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert!(clamp_write_wait(&engine, Instant::now() + budget));
+        update_code_graph_for(&input, &engine, &path, resolve_without_env).unwrap();
+        assert_eq!(storage.pending_resolve_files().unwrap().len(), 1);
     }
 
     #[tokio::test]

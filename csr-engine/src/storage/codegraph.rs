@@ -403,6 +403,60 @@ pub fn upsert_file_state(
     Ok(())
 }
 
+/// `upsert_file_state(.., dirty = false)` that also bumps the file's
+/// `graph_gen`, in the same statement: the file's edges changed, so the
+/// project-wide resolve has work for it. The last write of an extraction.
+pub fn upsert_file_state_pending(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    content_hash: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO code_graph_file_state
+            (project, file, content_hash, dirty, extracted_at, ast_status, graph_gen)
+         VALUES (?1, ?2, ?3, 0, datetime('now'), 'supported', 1)
+         ON CONFLICT(project, file) DO UPDATE SET
+             content_hash = excluded.content_hash,
+             dirty = 0,
+             extracted_at = datetime('now'),
+             ast_status = 'supported',
+             graph_gen = graph_gen + 1",
+        params![project, file, content_hash],
+    )?;
+    Ok(())
+}
+
+/// Files whose edges changed since the last resolve that covered them:
+/// `(project, file, graph_gen)`, oldest extraction first.
+pub fn pending_resolve_files(conn: &Connection) -> Result<Vec<(String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT project, file, graph_gen FROM code_graph_file_state
+         WHERE graph_gen > resolved_gen
+         ORDER BY project, extracted_at",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Record that a resolve covered `file` as of generation `seen`. Compare and
+/// set: a file extracted again since `seen` keeps its newer `graph_gen` and
+/// stays pending. Returns whether the file was settled.
+pub fn settle_resolved_gen(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    seen: i64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE code_graph_file_state SET resolved_gen = ?3
+         WHERE project = ?1 AND file = ?2 AND graph_gen = ?3 AND resolved_gen < ?3",
+        params![project, file, seen],
+    )?;
+    Ok(changed == 1)
+}
+
 /// Mark a file dirty (needs re-extraction) without touching its hash.
 pub fn mark_file_dirty(conn: &Connection, project: &str, file: &str) -> Result<()> {
     conn.execute(
@@ -2014,5 +2068,40 @@ mod tests {
             storage.code_get_node_rank(&beta_id).unwrap().is_none(),
             "code_node_rank for beta must be deleted with the node"
         );
+    }
+
+    #[test]
+    fn an_extraction_queues_the_file_and_only_the_generation_it_saw_settles() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::storage::migrations::run(&conn).unwrap();
+
+        // Rows from before the columns existed are not pending.
+        conn.execute(
+            "INSERT INTO code_graph_file_state (project, file, content_hash, dirty)
+             VALUES ('p', 'old.rs', 'h', 0)",
+            [],
+        )
+        .unwrap();
+        assert!(pending_resolve_files(&conn).unwrap().is_empty());
+
+        upsert_file_state_pending(&conn, "p", "a.rs", "h1").unwrap();
+        assert_eq!(
+            pending_resolve_files(&conn).unwrap(),
+            [("p".to_string(), "a.rs".to_string(), 1)]
+        );
+
+        // The file is extracted again while a pass that saw generation 1 runs.
+        upsert_file_state_pending(&conn, "p", "a.rs", "h2").unwrap();
+        assert!(!settle_resolved_gen(&conn, "p", "a.rs", 1).unwrap());
+        assert_eq!(pending_resolve_files(&conn).unwrap()[0].2, 2);
+
+        // A pass that saw the current generation settles it, once.
+        assert!(settle_resolved_gen(&conn, "p", "a.rs", 2).unwrap());
+        assert!(pending_resolve_files(&conn).unwrap().is_empty());
+        assert!(!settle_resolved_gen(&conn, "p", "a.rs", 2).unwrap());
+
+        // Marking clean for re-extraction is a different flag and queues nothing.
+        upsert_file_state(&conn, "p", "a.rs", "h3", false).unwrap();
+        assert!(pending_resolve_files(&conn).unwrap().is_empty());
     }
 }

@@ -566,6 +566,19 @@ impl Daemon {
         };
         tracing::info!("registry loop started (history.jsonl → session_registry)");
 
+        // Graph drain loop: the project-wide edge resolve + rank for files
+        // PostToolUse extracted. The hook does none of it; this is its only
+        // caller in the daemon, and it does not depend on the code map
+        // (`CSR_NO_CODEMAP=1` leaves it running).
+        let graph_drain_handle = graph_drain_interval().map(|interval| {
+            tokio::spawn(graph_drain_loop(
+                self.storage.clone(),
+                db_path.clone(),
+                interval,
+                shutdown.clone(),
+            ))
+        });
+
         // Plans loop: every 30 minutes, (re)import changed ~/.claude/plans/*.md docs
         // as source='plan' chunks. Runs AFTER registry ingest has had a chance to
         // populate session windows (correlation's Strategy 2 needs them, but waives
@@ -1637,6 +1650,9 @@ impl Daemon {
         let _ = tokio::time::timeout(timeout, consolidation_handle).await;
         let _ = tokio::time::timeout(timeout, maintenance_handle).await;
         let _ = tokio::time::timeout(timeout, registry_handle).await;
+        if let Some(handle) = graph_drain_handle {
+            let _ = tokio::time::timeout(timeout, handle).await;
+        }
         // Plans imports write the HNSW index the flush below persists. A timeout
         // here would DETACH the task, not stop it — it could then mutate the
         // index after dump_to_disk read its state (Codex). The loop stops
@@ -3001,6 +3017,79 @@ fn resolve_enrich_initial_delay() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// `CSR_GRAPH_DRAIN_INTERVAL_SECS` overrides the pending-check cadence of
+/// `graph_drain_loop`; `CSR_NO_GRAPH_DRAIN=1` turns the loop off.
+fn graph_drain_interval() -> Option<std::time::Duration> {
+    if std::env::var("CSR_NO_GRAPH_DRAIN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let secs = std::env::var("CSR_GRAPH_DRAIN_INTERVAL_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok());
+    Some(
+        secs.map_or(crate::extraction::graph_drain::DRAIN_INTERVAL, |s| {
+            std::time::Duration::from_secs(s.max(1))
+        }),
+    )
+}
+
+/// One pass of the graph drain on a blocking thread: the project-wide edge
+/// resolve + rank for files PostToolUse extracted since the last one. A cheap
+/// pending check first; `extraction::graph_drain` explains the rest.
+pub async fn graph_drain_tick(storage: Arc<Storage>, db_path: PathBuf) {
+    let result = tokio::task::spawn_blocking(move || {
+        crate::extraction::graph_drain::drain_if_pending(&storage, &db_path)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(drain))) => tracing::info!(
+            projects = drain.projects,
+            files = drain.files,
+            edge_writes = drain.edge_writes,
+            rank_writes = drain.rank_writes,
+            ms = drain.elapsed.as_millis() as u64,
+            lock_ms = drain.longest_lock_hold.as_millis() as u64,
+            "code graph drained"
+        ),
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) => tracing::warn!("code graph drain failed: {e}"),
+        Err(e) => tracing::warn!("code graph drain panicked: {e}"),
+    }
+}
+
+/// The graph drain loop. Runs in the daemon's main loop and, when no daemon is
+/// live, in the MCP server (`spawn_enrichment_loops`). Not tied to the code map:
+/// `CSR_NO_CODEMAP=1` leaves it running.
+pub async fn graph_drain_loop(
+    storage: Arc<Storage>,
+    db_path: PathBuf,
+    interval: std::time::Duration,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        graph_drain_tick(storage.clone(), db_path.clone()).await;
+        for _ in 0..interval.as_secs().max(1) {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// Path of the database a storage handle has open.
+fn storage_db_path(storage: &Storage) -> Option<PathBuf> {
+    storage
+        .with_connection(|conn| Ok(conn.path().filter(|p| !p.is_empty()).map(PathBuf::from)))
+        .ok()?
+}
+
 /// Hold an MCP-side enrichment loop back for `delay` before its first tick.
 /// Every loop `spawn_enrichment_loops` starts goes through this — extraction,
 /// narration and consolidation all embed (consolidation runs before its
@@ -3011,6 +3100,22 @@ async fn delayed<F: std::future::Future<Output = ()>>(delay: std::time::Duration
         tokio::time::sleep(delay).await;
     }
     fut.await;
+}
+
+/// The MCP server's graph drain: the loop the daemon would run, for a session
+/// with no daemon (fresh installs have none). Its first tick is at once, so a
+/// file an earlier hook left pending is resolved as the session starts. Embeds
+/// nothing, hence no initial delay. `None` when the drain is switched off or the
+/// database has no path (in memory).
+pub fn spawn_graph_drain(storage: Arc<Storage>) -> Option<tokio::task::JoinHandle<()>> {
+    let interval = graph_drain_interval()?;
+    let db_path = storage_db_path(&storage)?;
+    Some(tokio::spawn(graph_drain_loop(
+        storage,
+        db_path,
+        interval,
+        Arc::new(AtomicBool::new(false)),
+    )))
 }
 
 /// Spawn enrichment loops as background tokio tasks (for embedding in MCP server).
@@ -3073,6 +3178,9 @@ pub fn spawn_enrichment_loops(
     if let Some(h) = narrator_handle {
         handles.push(h);
     }
+    // No daemon is live (the caller skips this function when one is), so the
+    // MCP server drains the code graph.
+    handles.extend(spawn_graph_drain(storage));
     handles
 }
 
@@ -4102,6 +4210,80 @@ mod tests {
                 "narrative prompt lost {retained}"
             );
         }
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_mcp_server_drains_the_graph_when_no_daemon_does() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        storage
+            .with_connection(|c| {
+                for (id, file, name) in [("callee", "a.rs", "callee"), ("caller", "b.rs", "caller")]
+                {
+                    crate::storage::codegraph::upsert_node(
+                        c,
+                        &crate::storage::codegraph::NodeRow {
+                            id: id.into(),
+                            repo: "r".into(),
+                            project: "proj".into(),
+                            file: file.into(),
+                            lang: "rust".into(),
+                            kind: "function".into(),
+                            name: name.into(),
+                            first_conv_id: "c".into(),
+                            last_conv_id: "c".into(),
+                            ..Default::default()
+                        },
+                    )?;
+                }
+                crate::storage::codegraph::replace_file_edges(
+                    c,
+                    "proj",
+                    "b.rs",
+                    &[crate::storage::codegraph::EdgeRow {
+                        src_id: "caller".into(),
+                        dst_id: "name:callee".into(),
+                        kind: "calls".into(),
+                        src_file: "b.rs".into(),
+                        weight: 1.0,
+                        ..Default::default()
+                    }],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .upsert_code_file_state_pending("proj", "b.rs", "h")
+            .unwrap();
+        assert_eq!(storage.pending_resolve_files().unwrap().len(), 1);
+
+        let handle = spawn_graph_drain(storage.clone()).expect("a file database drains");
+        let mut waited = 0;
+        while !storage.pending_resolve_files().unwrap().is_empty() && waited < 100 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            waited += 1;
+        }
+        handle.abort();
+        assert!(
+            storage.pending_resolve_files().unwrap().is_empty(),
+            "the first tick drained the pending file"
+        );
+        let dst: String = storage
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT dst_id FROM code_edges WHERE src_id = 'caller'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(dst, "callee");
+    }
+
+    #[tokio::test]
+    async fn an_in_memory_database_has_nothing_to_drain_to() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        assert!(spawn_graph_drain(storage).is_none());
     }
 }
 

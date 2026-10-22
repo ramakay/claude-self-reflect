@@ -2293,6 +2293,24 @@ impl Storage {
         codegraph::upsert_file_state(&conn, project, file, content_hash, dirty)
     }
 
+    /// `upsert_code_file_state(.., false)` that also queues the file for the
+    /// project-wide resolve (`graph_gen` + 1). See `extraction::graph_drain`.
+    pub fn upsert_code_file_state_pending(
+        &self,
+        project: &str,
+        file: &str,
+        content_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::upsert_file_state_pending(&conn, project, file, content_hash)
+    }
+
+    /// Files an extraction changed that no resolve has covered yet.
+    pub fn pending_resolve_files(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::pending_resolve_files(&conn)
+    }
+
     pub fn mark_code_file_dirty(&self, project: &str, file: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         codegraph::mark_file_dirty(&conn, project, file)

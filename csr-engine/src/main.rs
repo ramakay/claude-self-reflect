@@ -740,6 +740,10 @@ enum CodegraphAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Run the project-wide edge resolve + rank for every file an edit hook
+    /// extracted since the last one, and settle those files. What the daemon's
+    /// graph drain loop does on a timer; prints the result as JSON.
+    Drain,
     /// Backfill `repo_root` (git toplevel) on existing code_nodes /
     /// code_evolution rows that predate the column (WP2 Stage 1, H8 finding).
     BackfillRepoRoot {
@@ -1818,6 +1822,28 @@ async fn run(
         let stats =
             csr_engine::import::backfill::backfill_code_graph(&eng, &args.projects_dir, dry_run)?;
         print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::Codegraph {
+        action: CodegraphAction::Drain,
+    }) = args.command
+    {
+        let storage = csr_engine::storage::Storage::open(&args.db_path)?;
+        let report =
+            match csr_engine::extraction::graph_drain::drain_if_pending(&storage, &args.db_path)? {
+                Some(drain) => serde_json::json!({
+                    "drained": true,
+                    "projects": drain.projects,
+                    "files": drain.files,
+                    "edge_writes": drain.edge_writes,
+                    "rank_writes": drain.rank_writes,
+                    "ms": drain.elapsed.as_millis() as u64,
+                    "longest_lock_hold_ms": drain.longest_lock_hold.as_millis() as u64,
+                }),
+                None => serde_json::json!({ "drained": false }),
+            };
+        println!("{report}");
         return Ok(());
     }
 

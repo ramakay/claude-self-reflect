@@ -907,6 +907,25 @@ pub fn run(conn: &Connection) -> Result<()> {
         );
     }
 
+    // Migration: per-file resolve generations on code_graph_file_state. An
+    // extraction bumps `graph_gen`; the drain (`extraction::graph_drain`) runs
+    // the project-wide resolve and then sets `resolved_gen` to the generation it
+    // read before it started, only if the file has not moved on since. A file
+    // is pending while `graph_gen > resolved_gen`. Both start at 0, so no
+    // existing row is pending and the upgrade queues no work.
+    {
+        if !has_column(conn, "code_graph_file_state", "graph_gen")? {
+            add_column(conn, "code_graph_file_state", "graph_gen", "ALTER TABLE code_graph_file_state ADD COLUMN graph_gen INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        if !has_column(conn, "code_graph_file_state", "resolved_gen")? {
+            add_column(conn, "code_graph_file_state", "resolved_gen", "ALTER TABLE code_graph_file_state ADD COLUMN resolved_gen INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_code_graph_file_state_pending
+                 ON code_graph_file_state(project) WHERE graph_gen > resolved_gen;",
+        );
+    }
+
     // Migration: add project_name to code_evolution if missing (v9 cross-project fix)
     {
         let has_project_col: bool = conn
