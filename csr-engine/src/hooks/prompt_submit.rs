@@ -1669,12 +1669,16 @@ const REPLENISH_CAP_FACTOR: usize = 4;
 /// candidates all match by label costs nothing; any other costs one batched
 /// query first.
 ///
-/// The content gates (CSR text, age, tool-output dump) run after retrieval, so
-/// a run of top-ranked candidates they reject would leave the slots empty while
-/// eligible ones sit just below the cut. When a gate rejected something and
-/// fewer than `limit` chunks survived, the retrieval is repeated with twice the
-/// limit, up to [`REPLENISH_CAP_FACTOR`] times `limit` or until the index has
-/// no more candidates above the floor. A prompt no gate touched searches once.
+/// The content gates (CSR text, tool-output dump) run after retrieval, so a run
+/// of top-ranked candidates they reject would leave the slots empty while
+/// eligible ones sit just below the cut. When one of them rejected something
+/// and fewer chunks survived than the prompt renders ([`KEYWORD_FILL_SLOTS`]),
+/// the retrieval is repeated with twice the limit, up to
+/// [`REPLENISH_CAP_FACTOR`] times `limit` or until the index has no more
+/// candidates above the floor. A prompt neither gate touched, or one that
+/// still fills its slots, searches once. The age gate does not trigger a
+/// refill: old candidates are common, and a refill on them adds a retrieval to
+/// most prompts.
 #[allow(clippy::too_many_arguments)]
 async fn search_chunks_with_vec_core(
     engine: &Engine,
@@ -1688,6 +1692,7 @@ async fn search_chunks_with_vec_core(
     mut same_repo: impl FnMut(HashMap<String, Vec<String>>) -> super::scope_folder::RepoConversations,
 ) -> Vec<RawResult> {
     let cap = limit.saturating_mul(REPLENISH_CAP_FACTOR);
+    let wanted = KEYWORD_FILL_SLOTS.min(limit);
     let mut fetch = limit;
     loop {
         let (raw_results, candidates, gated) = chunk_candidates_pass(
@@ -1702,7 +1707,7 @@ async fn search_chunks_with_vec_core(
             &mut same_repo,
         )
         .await;
-        if gated == 0 || raw_results.len() >= limit || candidates < fetch || fetch >= cap {
+        if gated == 0 || raw_results.len() >= wanted || candidates < fetch || fetch >= cap {
             return raw_results;
         }
         fetch = fetch.saturating_mul(2).min(cap);
@@ -1711,7 +1716,7 @@ async fn search_chunks_with_vec_core(
 
 /// One retrieval and filtering pass at `limit` candidates. Returns the chunks
 /// that survive, how many candidates retrieval produced, and how many the
-/// content gates rejected.
+/// refill gates (CSR text, tool-output dump) rejected.
 #[allow(clippy::too_many_arguments)]
 async fn chunk_candidates_pass(
     engine: &Engine,
@@ -1845,7 +1850,6 @@ async fn chunk_candidates_pass(
                     let age_days = (now - ts).num_days();
                     // Reject future-dated chunks (clock skew) and stale chunks
                     if !(0..=MAX_CHUNK_AGE_DAYS).contains(&age_days) {
-                        gated += 1;
                         continue;
                     }
                 }
