@@ -55,6 +55,21 @@ const MAX_CHUNK_AGE_DAYS: i64 = 21;
 /// are admitted only up to this many chunks in total, after the vector hits.
 const KEYWORD_FILL_SLOTS: usize = 5;
 
+/// A chunk whose characters are at least this share tool output (the cached
+/// `chunks.tool_result_share`) is a dump of what a tool printed, not an
+/// account of the work. Chunks are about 900 characters and a span is one
+/// message, so the column is nearly always 0.0 or 1.0 (of the 175,000 chunks
+/// since 2026-10-01 with a recorded floor, 160,000 sit at exactly 0 or 1 and
+/// 947 between 0.2 and 0.5); 0.5 splits the two kinds without a tuned edge.
+///
+/// The trust floor does not: an assistant message takes the floor of the
+/// context before it, so a plain report written after any web fetch or shell
+/// output is labelled `external` at share 0.0. Hand-rated 40 `[chunk|external]`
+/// items from the 7 days to 2026-10-22: of the 22 at share 0.5 or more, 19
+/// were listings, file or code dumps, scraped pages and logs; of the 18 below
+/// it, 13 were reports, decisions and receipts.
+const TOOL_DUMP_SHARE: f64 = 0.5;
+
 /// A derived reflection (session story, v3 extract, heuristic narrative,
 /// context cache, convention fact) summarises a conversation and ages like
 /// that conversation's chunks: past [`MAX_CHUNK_AGE_DAYS`] it is handed over
@@ -1720,6 +1735,10 @@ async fn search_chunks_with_vec_core(
     // The detector's answer for every fetched chunk, in one batched read: a
     // legacy chunk with no provenance row has an unknown author and is checked.
     let csr_text = storage.csr_text_hits(&fetched);
+    // The cached floor and tool-result share of every hit in one query.
+    let trust_and_share = storage
+        .chunk_trust_and_tool_share(&chunk_ids)
+        .unwrap_or_default();
     let mut chunk_by_id: std::collections::HashMap<String, _> =
         fetched.into_iter().map(|c| (c.id.clone(), c)).collect();
 
@@ -1758,6 +1777,16 @@ async fn search_chunks_with_vec_core(
                     continue;
                 }
 
+                // A dump of tool output is what the tool printed, not memory of
+                // the work: the session that ran it already read it.
+                let (min_trust, tool_result_share) = trust_and_share
+                    .get(&chunk.id)
+                    .copied()
+                    .unwrap_or((crate::provenance::TrustTier::Unknown, None));
+                if is_tool_dump(tool_result_share, &chunk.content) {
+                    continue;
+                }
+
                 // Hard age gate: skip chunks older than MAX_CHUNK_AGE_DAYS
                 // Prevents stale conversations from winning on semantic similarity alone
                 if let Some(ts) = crate::temporal::parse_timestamp(&chunk.timestamp) {
@@ -1782,9 +1811,7 @@ async fn search_chunks_with_vec_core(
                     conversation_id: Some(chunk.conversation_id),
                     memory_id: Some(result.id.clone()),
                     author: Some(chunk.author),
-                    min_trust: storage
-                        .get_chunk_min_trust(&result.id)
-                        .unwrap_or(crate::provenance::TrustTier::Unknown),
+                    min_trust,
                 });
             }
         }
@@ -2378,6 +2405,27 @@ fn quoted_in_prompt(content: &str, pasted_words: &str) -> bool {
     key.len() >= MIN_OPENING_KEY_CHARS && pasted_words.contains(&key)
 }
 
+/// What a tool-dominated chunk must carry to be worth handing back: a stated
+/// decision or verdict, a receipts line, a PR or commit reference, or a passing
+/// test summary. Anything else in a tool dump is the tool's output, which the
+/// session that ran the tool already read.
+fn receipt_pattern() -> &'static regex::Regex {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PATTERN.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\bPR\s?#\d+|\bcommit\s+[0-9a-f]{7,40}\b|\b(?:receipts?|decisions?|decided|verdict|root cause)\s*:|test result: ok|\b\d+ passed; 0 failed",
+        )
+        .expect("receipt pattern compiles")
+    })
+}
+
+/// The chunk is mostly tool output and states no decision or receipt. A chunk
+/// with no recorded share (imported before spans were) is judged as before.
+fn is_tool_dump(tool_result_share: Option<f64>, content: &str) -> bool {
+    tool_result_share.is_some_and(|share| share >= TOOL_DUMP_SHARE)
+        && !receipt_pattern().is_match(content)
+}
+
 /// Check if content is self-referential noise about CSR internals.
 /// Prevents the tool's own development history from polluting its output (Bug 4/5).
 /// CSR's own emitted blocks (probe reports, CONTINUUM/briefing echoes) are
@@ -2667,6 +2715,112 @@ mod tests {
             results[0].min_trust,
             crate::provenance::TrustTier::UserHistory
         );
+    }
+
+    #[test]
+    fn a_tool_dump_is_told_from_a_report_and_from_a_decision() {
+        let listing = "34:**LUT tournament prototype** renders 28 LUTs\n35:  let grid = []\n36:  for lut in luts { run(lut) }";
+        let decision =
+            "Decision: keep the floor on the label; the share decides what is handed back.";
+        assert!(is_tool_dump(Some(1.0), listing));
+        assert!(is_tool_dump(Some(0.5), listing));
+        assert!(!is_tool_dump(Some(0.49), listing));
+        assert!(!is_tool_dump(Some(0.0), listing));
+        assert!(!is_tool_dump(None, listing));
+        assert!(!is_tool_dump(Some(1.0), decision));
+        assert!(!is_tool_dump(Some(1.0), "merged in PR #62, tests green"));
+        assert!(!is_tool_dump(Some(1.0), "fixed at commit 3f9a2c1d"));
+        assert!(!is_tool_dump(
+            Some(1.0),
+            "test result: ok. 1153 passed; 0 failed"
+        ));
+        // A bare word is not a receipt: only the labelled form is.
+        assert!(is_tool_dump(
+            Some(1.0),
+            "the decision was documented upstream"
+        ));
+    }
+
+    /// Four external-floor chunks match the query equally. The one that only
+    /// prints a tool's output is not handed back; the report written after a
+    /// tool ran, the dump that states a decision, and the legacy chunk with no
+    /// recorded share all are.
+    #[tokio::test]
+    async fn a_tool_dump_is_not_injected_and_a_decision_or_report_is() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        let rows: [(&str, &str, Option<f64>); 4] = [
+            (
+                "dump",
+                "12:    dot: $('[data-part=\"dot\"]'),\n13:    test: $('[data-mode=\"test\"]'),\n14:    steps: $$(\"[data-step]\"),",
+                Some(1.0),
+            ),
+            (
+                "decision",
+                "Decision: the hook keeps the trust label and filters on the share.",
+                Some(1.0),
+            ),
+            (
+                "report",
+                "Cleanup is done. The simulator folder dropped from 284 GB to 67 GB.",
+                Some(0.0),
+            ),
+            ("legacy", "an older chunk imported before spans existed", None),
+        ];
+        for (seq, (id, content, share)) in rows.iter().enumerate() {
+            let chunk = crate::import::ConversationChunk {
+                id: (*id).into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: "project".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: (*content).into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "UPDATE chunks SET min_trust=1, tool_result_share=?2 WHERE id=?1",
+                        rusqlite::params![id, share],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            search.insert_chunk((*id).to_string(), vec![1.0, 0.0]);
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        let results = search_chunks_with_vec_core(
+            &engine,
+            "",
+            crate::search::hybrid::SearchMode::Vector,
+            &[1.0, 0.0],
+            5,
+            0.0,
+            "project",
+            None,
+            |_| HashMap::new(),
+        )
+        .await;
+        let mut ids: Vec<_> = results
+            .iter()
+            .filter_map(|r| r.memory_id.as_deref())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["decision", "legacy", "report"]);
+        // The trust label is unchanged: the floor still reads external.
+        assert!(results
+            .iter()
+            .all(|r| r.min_trust == crate::provenance::TrustTier::External));
     }
 
     /// Hybrid fixture: one strong semantic chunk, and several chunks that only the

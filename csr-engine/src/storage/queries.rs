@@ -974,6 +974,34 @@ pub fn chunk_authors(
     Ok(authors)
 }
 
+/// The cached trust floor and tool-result share of some chunks, one query per
+/// 500 ids. A chunk the table does not hold is absent from the map; a chunk
+/// imported before spans were recorded has a `None` share.
+pub fn chunk_trust_and_tool_share(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<HashMap<String, (TrustTier, Option<f64>)>> {
+    let mut found = HashMap::new();
+    for batch in ids.chunks(500) {
+        let marks = vec!["?"; batch.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, min_trust, tool_result_share FROM chunks WHERE id IN ({marks})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, trust, share) = row?;
+            found.insert(id, (TrustTier::from_db(trust), share));
+        }
+    }
+    Ok(found)
+}
+
 pub fn insert_reflection(
     conn: &Connection,
     id: &str,

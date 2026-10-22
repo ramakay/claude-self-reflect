@@ -409,6 +409,17 @@ impl Storage {
         queries::parent_provenance_context(&conn, conversation_id, message_key)
     }
 
+    /// The cached floor and tool-result share of many chunks in one query.
+    /// Cached columns only: retrieval must never join the event tables.
+    pub fn chunk_trust_and_tool_share(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (crate::provenance::TrustTier, Option<f64>)>>
+    {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::chunk_trust_and_tool_share(&conn, ids)
+    }
+
     /// Read only the cached chunk floor. Retrieval must never join the event
     /// tables on its hot path.
     pub fn get_chunk_min_trust(&self, chunk_id: &str) -> Result<crate::provenance::TrustTier> {
