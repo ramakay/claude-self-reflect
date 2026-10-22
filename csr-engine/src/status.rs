@@ -117,6 +117,8 @@ pub struct StatusReport {
     /// v10 "dreaming" summary (`crate::dream`) — actual `dreams_v1` output,
     /// recent corrections, compatibility verdict totals, and demotions.
     pub dream: DreamStatus,
+    /// The background daemon: whether a process holds its lock right now.
+    pub daemon: DaemonStatus,
     /// Journal v3 Phase 1.5 "dream threads" summary (`crate::dream::threads`)
     /// — night-pass propose-verify extraction. See `gather_dream_threads`.
     pub dream_threads: DreamThreadStatus,
@@ -675,6 +677,43 @@ pub struct DreamCategoryTotals {
     pub unfinished: i64,
     pub strategy: i64,
     pub supersession: i64,
+}
+
+/// Is the daemon (`csr-engine daemon`) running? Measured, not configured:
+/// `up` is whether a process holds `~/.claude-self-reflect/daemon.lock` (an
+/// flock probe, so a recycled pid cannot fake it). `agent_installed` says
+/// whether launchd has a plist to start it from; a daemon that is down with no
+/// agent is fixed by `csr-engine setup`.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct DaemonStatus {
+    pub up: bool,
+    pub pid: Option<u32>,
+    pub agent_installed: bool,
+}
+
+/// The daemon's state under `home`. The lock path is home-based because the
+/// daemon takes it there whatever `--db-path` it serves.
+fn gather_daemon(home: Option<&Path>) -> DaemonStatus {
+    let Some(home) = home else {
+        return DaemonStatus {
+            up: false,
+            pid: None,
+            agent_installed: false,
+        };
+    };
+    let lock = home.join(".claude-self-reflect/daemon.lock");
+    let up = crate::daemon::lock_file_held(&lock);
+    DaemonStatus {
+        up,
+        pid: up
+            .then(|| std::fs::read_to_string(&lock).ok())
+            .flatten()
+            .and_then(|text| text.trim().parse().ok()),
+        agent_installed: home
+            .join("Library/LaunchAgents")
+            .join(format!("{}.plist", crate::setup::DAEMON_LABEL))
+            .exists(),
+    }
 }
 
 /// How far back the compact line counts dreams. A dream older than this is
@@ -1360,6 +1399,7 @@ fn gather_status_with(
             aux: AuxStatus::default(),
             memory_registry: MemoryRegistryStatus::default(),
             dream: DreamStatus::default(),
+            daemon: gather_daemon(dirs::home_dir().as_deref()),
             dream_threads: DreamThreadStatus::default(),
             trained_rerank: empty_trained_rerank_status(),
             backfill: BackfillStatus::default(),
@@ -1515,6 +1555,7 @@ fn gather_status_with(
         aux,
         memory_registry,
         dream,
+        daemon: gather_daemon(dirs::home_dir().as_deref()),
         dream_threads,
         trained_rerank,
         backfill,
@@ -2581,6 +2622,15 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
     if let Some(holder) = &report.maintenance {
         out.push_str(&format!(" | maintenance (pid {})", holder.pid));
     }
+    // Only a down daemon speaks up; the dreams and enrichment it runs stop
+    // while it is down, and the line would otherwise look healthy.
+    if !report.daemon.up {
+        out.push_str(if report.daemon.agent_installed {
+            " | daemon down"
+        } else {
+            " | daemon down (run: csr-engine setup)"
+        });
+    }
     // `mcp_binary_stale` is deliberately not rendered here. The stamp behind it
     // is one file shared by every session's MCP server, last writer wins, so
     // the marker lit up in every session on each local reinstall and cleared
@@ -2751,6 +2801,11 @@ mod tests {
             aux: AuxStatus::default(),
             memory_registry: MemoryRegistryStatus::default(),
             dream: DreamStatus::default(),
+            daemon: DaemonStatus {
+                up: true,
+                pid: Some(1),
+                agent_installed: true,
+            },
             dream_threads: DreamThreadStatus::default(),
             trained_rerank: empty_trained_rerank_status(),
             backfill: BackfillStatus::default(),
@@ -3414,6 +3469,60 @@ mod tests {
         assert!(
             !line.contains('☾'),
             "not yet due must stay silent: {line:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_status_reads_the_lock_not_a_pid_or_a_plist() {
+        use fs2::FileExt;
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join(".claude-self-reflect");
+        std::fs::create_dir_all(&data).unwrap();
+
+        let down = gather_daemon(Some(home.path()));
+        assert!(
+            !down.up && down.pid.is_none() && !down.agent_installed,
+            "{down:?}"
+        );
+
+        // A pid in the file with nobody holding the lock is a daemon that died.
+        std::fs::write(data.join("daemon.lock"), std::process::id().to_string()).unwrap();
+        assert!(!gather_daemon(Some(home.path())).up);
+
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(data.join("daemon.lock"))
+            .unwrap();
+        FileExt::try_lock_exclusive(&held).unwrap();
+        let agents = home.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("com.ramakay.csr-engine.daemon.plist"), "x").unwrap();
+        let up = gather_daemon(Some(home.path()));
+        assert_eq!(
+            up,
+            DaemonStatus {
+                up: true,
+                pid: Some(std::process::id()),
+                agent_installed: true
+            }
+        );
+        assert!(
+            !gather_daemon(None).up,
+            "no home proves nothing; it reads as down"
+        );
+    }
+
+    #[test]
+    fn compact_says_daemon_down_only_when_it_is_down() {
+        let mut report = base_report();
+        assert!(!format_compact(&report, 0).contains("daemon"));
+        report.daemon.up = false;
+        assert!(format_compact(&report, 0).ends_with(" | daemon down"));
+        report.daemon.agent_installed = false;
+        assert!(
+            format_compact(&report, 0).ends_with(" | daemon down (run: csr-engine setup)"),
+            "{}",
+            format_compact(&report, 0)
         );
     }
 

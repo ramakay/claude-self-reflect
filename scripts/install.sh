@@ -684,7 +684,9 @@ Build from source instead:
         printf '\n  Setup registers the MCP server, installs 6 Claude Code hooks\n' > /dev/tty
         printf '  into ~/.claude/settings.json, imports your conversations\n' > /dev/tty
         printf '  from ~/.claude/projects/ into a local index, and installs the\n' > /dev/tty
-        printf "  csr-companion plugin through Claude Code's plugin CLI.\n\n" > /dev/tty
+        printf "  csr-companion plugin through Claude Code's plugin CLI. On macOS it\n" > /dev/tty
+        printf '  also installs and starts the background daemon (a launchd agent;\n' > /dev/tty
+        printf '  CSR_NO_DAEMON=1 skips it).\n\n' > /dev/tty
         printf '  \033[1mRun setup now? [Y/n]\033[0m ' > /dev/tty
         answer=""
         # A failed read is not consent — only a successful (possibly empty)

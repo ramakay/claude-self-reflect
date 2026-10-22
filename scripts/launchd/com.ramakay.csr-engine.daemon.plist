@@ -4,7 +4,12 @@
   Keeps `csr-engine daemon` running under the logged-in user so the file
   watcher, enrichment loops and the v10 dream cycle run without a terminal.
 
-  Install (macOS):
+  `csr-engine setup` writes and loads an agent like this one for you (with the
+  binary's real path and your home folder); CSR_NO_DAEMON=1 skips that. This
+  file is the template for installing or customizing one by hand. setup keeps a
+  hand-written agent whose binary still exists.
+
+  Install by hand (macOS):
     mkdir -p ~/.claude-self-reflect/logs
     cp scripts/launchd/com.ramakay.csr-engine.daemon.plist ~/Library/LaunchAgents/
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist

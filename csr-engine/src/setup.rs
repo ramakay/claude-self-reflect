@@ -48,13 +48,13 @@ pub async fn handle(
     // Claude's config, so a failed download never leaves setup half-applied.
     let csr_dir = db_path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(csr_dir)?;
-    eprintln!("[1/7] Database directory ready: {}", csr_dir.display());
+    eprintln!("[1/8] Database directory ready: {}", csr_dir.display());
     let eng = Engine::new(db_path, projects_dir)?;
     eng.embeddings().warm()?;
     eprintln!("  Embedding model ready");
 
     // Step 2: Register as MCP server
-    eprintln!("[2/7] Registering MCP server...");
+    eprintln!("[2/8] Registering MCP server...");
     // A registration failure must not cost the user hooks and import, but it
     // must not be reported as success either: note it here, finish the rest,
     // and print the details once at the end. The returned error is deliberately
@@ -65,13 +65,13 @@ pub async fn handle(
     }
 
     // Step 3: Install hooks
-    eprintln!("[3/7] Installing hooks...");
+    eprintln!("[3/8] Installing hooks...");
     // Like the MCP step: a failure does not cost the user the import, but it
     // is carried to the summary instead of being dropped after this warning.
     let hook_error = hook_install_step(|| hooks::install::handle(true));
 
     // Step 4: Import conversations
-    eprintln!("[4/7] Importing conversations...");
+    eprintln!("[4/8] Importing conversations...");
 
     // Count JSONL files for progress
     let total_files = count_total_files(projects_dir);
@@ -266,7 +266,7 @@ pub async fn handle(
     }
 
     // Step 5: Run enrichment
-    eprintln!("[5/7] Running heuristic enrichment...");
+    eprintln!("[5/8] Running heuristic enrichment...");
     let (backfilled, enriched) = eng.backfill_and_enrich().await?;
     if backfilled > 0 {
         eprintln!("  Backfilled {} import_state rows", backfilled);
@@ -275,11 +275,11 @@ pub async fn handle(
 
     // Step 6: Save Anthropic API key if provided
     if let Some(key) = &anthropic_key {
-        eprintln!("[6/7] Saving Anthropic API key...");
+        eprintln!("[6/8] Saving Anthropic API key...");
         save_anthropic_key(csr_dir, key)?;
         eprintln!("  Saved to {}", csr_dir.join(".env").display());
     } else {
-        eprintln!("[6/7] Skipping AI narratives (no --anthropic-key provided)");
+        eprintln!("[6/8] Skipping AI narratives (no --anthropic-key provided)");
     }
 
     // Step 7: Dreaming consent (Journal v4 P5, locked decision 15). Presented
@@ -287,6 +287,17 @@ pub async fn handle(
     // that was just imported — i.e. from real numbers, shown BEFORE the
     // question is asked.
     dreaming_consent_step(eng.storage())?;
+
+    // Step 8: the background daemon. Last, so it never races the import above
+    // for the database. Dreams are on by default and only the daemon runs them.
+    eprintln!("[8/8] Starting the background daemon...");
+    let daemon_text = {
+        let (db, projects) = (db_path.to_path_buf(), projects_dir.to_path_buf());
+        tokio::task::spawn_blocking(move || daemon_step_live(&db, &projects))
+            .await
+            .unwrap_or_else(|e| format!("  The daemon step did not finish: {e}\n"))
+    };
+    eprint!("{daemon_text}");
 
     // Summary
     let conversations = eng.storage().count_conversations().unwrap_or(0);
@@ -1075,7 +1086,7 @@ fn dreaming_consent_step(storage: &Storage) -> Result<bool> {
     let tier = policy::effort_tier();
     let estimate = night_estimate(storage, tier);
 
-    eprintln!("[7/7] Dreaming (overnight review of your open work)");
+    eprintln!("[7/8] Dreaming (overnight review of your open work)");
     eprintln!("  While Claude Code is idle, CSR re-checks open todos and blockers");
     eprintln!("  against the code as it stands now, and writes what it can prove.");
     eprintln!("  Cost: {}", estimate.label(tier));
@@ -1603,6 +1614,380 @@ fn count_total_files(projects_dir: &Path) -> usize {
         }
     }
     count
+}
+
+// ---------------------------------------------------------------------------
+// The background daemon (launchd agent)
+// ---------------------------------------------------------------------------
+
+/// The launchd label the daemon runs under. `scripts/launchd/`, the installers
+/// (`kickstart`) and `vector_ipc::launchd_database` all name this file.
+pub const DAEMON_LABEL: &str = "com.ramakay.csr-engine.daemon";
+
+/// First line of a plist this module wrote. A plist without it was written by a
+/// person (the manual steps older docs describe) and is left alone while its
+/// binary still exists.
+const DAEMON_PLIST_MARKER: &str = "<!-- Written by `csr-engine setup`; setup rewrites this file when the install changes. Hand edits belong in a plist without this line. -->";
+
+/// Everything the agent plist depends on. Plain data, so the rendering is a pure
+/// function and a test never touches the real `~/Library/LaunchAgents`.
+#[derive(Debug, Clone)]
+struct DaemonAgentSpec {
+    /// Absolute path of the running engine binary.
+    engine: std::path::PathBuf,
+    home: std::path::PathBuf,
+    db_path: std::path::PathBuf,
+    projects_dir: std::path::PathBuf,
+    /// Where `claude` resolved when setup ran, if anywhere. The daemon's
+    /// narratives and dream passes run it, and launchd starts with a bare PATH.
+    claude_dir: Option<std::path::PathBuf>,
+    /// Setup itself ran with `CSR_NO_CODEX_IMPORT=1`; the daemon keeps that choice.
+    no_codex_import: bool,
+}
+
+impl DaemonAgentSpec {
+    fn plist_path(&self) -> std::path::PathBuf {
+        self.home
+            .join("Library/LaunchAgents")
+            .join(format!("{DAEMON_LABEL}.plist"))
+    }
+
+    fn data_dir(&self) -> std::path::PathBuf {
+        self.home.join(".claude-self-reflect")
+    }
+
+    /// PATH for the daemon: where `claude` is, where this binary is, then the
+    /// usual places. Any `CSR_NO_*` key in the plist shows up in the pane as an
+    /// inhibited feature, so the only one written is the one setup was given.
+    fn path_env(&self) -> String {
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        dirs.extend(self.claude_dir.clone());
+        dirs.extend(self.engine.parent().map(Path::to_path_buf));
+        dirs.push(self.home.join(".local/bin"));
+        for fixed in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+            dirs.push(fixed.into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        dirs.retain(|d| seen.insert(d.clone()));
+        dirs.iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The agent plist. Every path is absolute. The database and projects folder are
+/// always passed explicitly, because `vector_ipc::launchd_database` reads the
+/// database the daemon serves from `--db-path`.
+fn render_daemon_plist(spec: &DaemonAgentSpec) -> String {
+    let s = |p: &Path| xml_escape(&p.to_string_lossy());
+    let data_dir = spec.data_dir();
+    let codex = if spec.no_codex_import {
+        "    <key>CSR_NO_CODEX_IMPORT</key>\n    <string>1</string>\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+{DAEMON_PLIST_MARKER}
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{DAEMON_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{engine}</string>
+    <string>--db-path</string>
+    <string>{db}</string>
+    <string>--projects-dir</string>
+    <string>{projects}</string>
+    <string>daemon</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+{codex}    <key>PATH</key>
+    <string>{path}</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>{data}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>{out}</string>
+  <key>StandardErrorPath</key>
+  <string>{err}</string>
+</dict>
+</plist>
+"#,
+        engine = s(&spec.engine),
+        db = s(&spec.db_path),
+        projects = s(&spec.projects_dir),
+        path = xml_escape(&spec.path_env()),
+        data = s(&data_dir),
+        out = s(&data_dir.join("logs/daemon.out.log")),
+        err = s(&data_dir.join("logs/daemon.err.log")),
+    )
+}
+
+/// The first `ProgramArguments` string of a plist: the binary launchd would run.
+fn plist_program(text: &str) -> Option<&str> {
+    let rest = &text[text.find("<key>ProgramArguments</key>")?..];
+    let rest = &rest[rest.find("<string>")? + "<string>".len()..];
+    Some(&rest[..rest.find("</string>")?])
+}
+
+/// What the daemon step did, for the one summary line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonOutcome {
+    /// `CSR_NO_DAEMON` is set: nothing was written or started.
+    OptedOut,
+    /// Not macOS: nothing was written; the run command is printed.
+    Manual,
+    /// The agent is installed and launchd was told to run it.
+    Running { rewritten: bool },
+    /// An agent somebody wrote by hand was kept and started.
+    KeptExisting,
+    /// A step failed; the text is the exact reason.
+    Failed(String),
+}
+
+/// One `launchctl` call: `Ok(())` when it exited 0, otherwise its stderr.
+type LaunchctlRun<'a> = dyn FnMut(&[&str]) -> std::result::Result<(), String> + 'a;
+
+/// `CSR_NO_DAEMON=1` (or `true`) is the opt-out.
+fn daemon_opted_out() -> bool {
+    std::env::var("CSR_NO_DAEMON").is_ok_and(|v| matches!(v.trim(), "1" | "true"))
+}
+
+fn real_launchctl(args: &[&str]) -> std::result::Result<(), String> {
+    let out = Command::new("launchctl")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run launchctl: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&out.stderr);
+        Err(format!(
+            "launchctl {} failed ({}): {}",
+            args.join(" "),
+            out.status,
+            detail.trim()
+        ))
+    }
+}
+
+/// Write the agent plist when it differs, load it, and make sure the daemon runs.
+///
+/// Idempotent: an identical plist is not rewritten. A changed one is booted out
+/// first, because `kickstart` does not re-read the file. `bootstrap` right after
+/// `bootout` can fail while launchd tears the old job down, so it is retried.
+/// A job that is already loaded and unchanged is restarted with `kickstart -k`
+/// so a new binary build is the one running. A fresh `bootstrap` starts the job
+/// itself (`RunAtLoad`), so it gets no second start.
+fn install_daemon_agent(
+    spec: &DaemonAgentSpec,
+    uid: u32,
+    launchctl: &mut LaunchctlRun,
+    pause: &dyn Fn(Duration),
+) -> DaemonOutcome {
+    let plist = spec.plist_path();
+    let wanted = render_daemon_plist(spec);
+    let existing = std::fs::read_to_string(&plist).ok();
+
+    // A hand-written agent whose binary still exists is the user's. It is
+    // started if it is not loaded, never rewritten.
+    let foreign = existing.as_deref().is_some_and(|text| {
+        !text.contains(DAEMON_PLIST_MARKER)
+            && plist_program(text).is_some_and(|program| Path::new(program).exists())
+    });
+    let rewrite = !foreign && existing.as_deref() != Some(wanted.as_str());
+
+    let domain = format!("gui/{uid}");
+    let target = format!("{domain}/{DAEMON_LABEL}");
+    let plist_arg = plist.to_string_lossy().into_owned();
+    let loaded = launchctl(&["print", &target]).is_ok();
+
+    if rewrite {
+        if let Err(e) = std::fs::create_dir_all(spec.data_dir().join("logs")) {
+            return DaemonOutcome::Failed(format!("could not create the log folder: {e}"));
+        }
+        if let Some(dir) = plist.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                return DaemonOutcome::Failed(format!("could not create {}: {e}", dir.display()));
+            }
+        }
+        let tmp = plist.with_extension("plist.tmp");
+        if let Err(e) = std::fs::write(&tmp, &wanted).and_then(|()| std::fs::rename(&tmp, &plist)) {
+            let _ = std::fs::remove_file(&tmp);
+            return DaemonOutcome::Failed(format!("could not write {}: {e}", plist.display()));
+        }
+        if loaded {
+            let _ = launchctl(&["bootout", &target]);
+            pause(Duration::from_millis(500));
+        }
+    } else if loaded {
+        // Unchanged and loaded: restart onto the current build.
+        return match launchctl(&["kickstart", "-k", &target]) {
+            Ok(()) if foreign => DaemonOutcome::KeptExisting,
+            Ok(()) => DaemonOutcome::Running { rewritten: false },
+            Err(e) => DaemonOutcome::Failed(e),
+        };
+    }
+
+    // Not loaded (fresh, or just booted out): load it, which starts it.
+    let mut last = String::new();
+    for attempt in 0..6 {
+        if attempt > 0 {
+            pause(Duration::from_millis(500));
+        }
+        match launchctl(&["bootstrap", &domain, &plist_arg]) {
+            Ok(()) => {
+                return if foreign {
+                    DaemonOutcome::KeptExisting
+                } else {
+                    DaemonOutcome::Running { rewritten: rewrite }
+                };
+            }
+            Err(e) => last = e,
+        }
+    }
+    DaemonOutcome::Failed(last)
+}
+
+/// The daemon step of setup. Never fails setup: the daemon is what keeps dreams
+/// and enrichment going, but every other part of the install works without it.
+fn daemon_step(
+    spec: &DaemonAgentSpec,
+    opted_out: bool,
+    macos: bool,
+    uid: u32,
+    launchctl: &mut LaunchctlRun,
+    pause: &dyn Fn(Duration),
+) -> DaemonOutcome {
+    if opted_out {
+        DaemonOutcome::OptedOut
+    } else if !macos {
+        DaemonOutcome::Manual
+    } else {
+        install_daemon_agent(spec, uid, launchctl, pause)
+    }
+}
+
+/// [`daemon_step`] against the real machine, returning the text to print.
+fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
+    let home = dirs::home_dir().unwrap_or_default();
+    let exe = std::env::current_exe().unwrap_or_default();
+    let engine = exe.canonicalize().unwrap_or(exe);
+    let spec = DaemonAgentSpec {
+        engine: engine.clone(),
+        home: home.clone(),
+        db_path: absolute(db_path),
+        projects_dir: absolute(projects_dir),
+        claude_dir: find_on_path("claude").and_then(|p| p.parent().map(Path::to_path_buf)),
+        no_codex_import: crate::daemon::codex_import_disabled(),
+    };
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let outcome = daemon_step(
+        &spec,
+        daemon_opted_out(),
+        cfg!(target_os = "macos"),
+        uid,
+        &mut real_launchctl,
+        &std::thread::sleep,
+    );
+    let mut text = daemon_report(&outcome, &engine);
+    if matches!(
+        outcome,
+        DaemonOutcome::Running { .. } | DaemonOutcome::KeptExisting
+    ) {
+        text.push_str(if wait_for_daemon(&home, Duration::from_secs(20)) {
+            "  Daemon is running.\n"
+        } else {
+            "  launchd has the daemon, but it has not taken its lock yet (a large corpus loads slowly). Check: csr-engine status\n"
+        });
+    }
+    text
+}
+
+fn absolute(path: &Path) -> std::path::PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The first executable called `name` on PATH.
+fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|p| {
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// The lines setup prints for each outcome (stderr, like every other step).
+fn daemon_report(outcome: &DaemonOutcome, engine: &Path) -> String {
+    let manual = format!(
+        "  To run it by hand: {} daemon   (keep it running; it does the overnight dreams)\n",
+        engine.display()
+    );
+    match outcome {
+        DaemonOutcome::OptedOut => {
+            "  Daemon skipped (CSR_NO_DAEMON is set). Dreams and background enrichment need it.\n"
+                .to_owned()
+                + &manual
+        }
+        DaemonOutcome::Manual => {
+            "  No launchd on this system, so setup does not start the daemon.\n".to_owned() + &manual
+        }
+        DaemonOutcome::Running { rewritten } => format!(
+            "  Daemon agent {} and started: {DAEMON_LABEL}\n  Stop it with: launchctl bootout gui/$(id -u)/{DAEMON_LABEL}\n",
+            if *rewritten { "installed" } else { "already installed" },
+        ),
+        DaemonOutcome::KeptExisting => format!(
+            "  Kept your existing {DAEMON_LABEL} agent and started it.\n"
+        ),
+        DaemonOutcome::Failed(why) => format!(
+            "  The daemon did not start: {why}\n  Setup is otherwise complete. Retry with: csr-engine setup\n{manual}"
+        ),
+    }
+}
+
+/// After a successful load, wait briefly for the daemon to hold its lock, so the
+/// summary can say whether it is up. A large corpus can take longer than the
+/// wait; then it says so rather than claim success.
+fn wait_for_daemon(home: &Path, wait: Duration) -> bool {
+    let lock = home.join(".claude-self-reflect/daemon.lock");
+    let deadline = Instant::now() + wait;
+    loop {
+        if crate::daemon::lock_file_held(&lock) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 #[cfg(test)]
@@ -2857,5 +3242,306 @@ esac
         assert!(fake.calls().is_empty());
         assert_eq!(std::fs::read_dir(fake.home.path()).unwrap().count(), before);
         assert!(next_steps(None).contains("companion: skipped (--no-companion)"));
+    }
+
+    // ----- daemon agent -----
+
+    fn agent_spec(home: &Path) -> DaemonAgentSpec {
+        DaemonAgentSpec {
+            engine: "/opt/csr/bin/csr-engine".into(),
+            home: home.to_path_buf(),
+            db_path: home.join(".claude-self-reflect/csr-engine.db"),
+            projects_dir: home.join(".claude/projects"),
+            claude_dir: Some("/opt/claude/bin".into()),
+            no_codex_import: false,
+        }
+    }
+
+    /// A launchctl stand-in: `loaded` answers `print`, `bootstrap_fails` the
+    /// first N bootstraps. Records every call.
+    struct FakeLaunchctl {
+        loaded: bool,
+        bootstrap_fails: usize,
+        calls: Vec<String>,
+    }
+
+    impl FakeLaunchctl {
+        fn new(loaded: bool) -> Self {
+            Self {
+                loaded,
+                bootstrap_fails: 0,
+                calls: Vec::new(),
+            }
+        }
+        fn run(&mut self, args: &[&str]) -> std::result::Result<(), String> {
+            self.calls.push(args[..args.len().min(2)].join(" "));
+            match args[0] {
+                "print" if self.loaded => Ok(()),
+                "print" => Err("not loaded".into()),
+                "bootstrap" if self.bootstrap_fails > 0 => {
+                    self.bootstrap_fails -= 1;
+                    Err("Bootstrap failed: 5: Input/output error".into())
+                }
+                "bootstrap" => {
+                    self.loaded = true;
+                    Ok(())
+                }
+                "bootout" => {
+                    self.loaded = false;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
+    fn install(spec: &DaemonAgentSpec, fake: &mut FakeLaunchctl) -> DaemonOutcome {
+        install_daemon_agent(spec, 501, &mut |args| fake.run(args), &|_| {})
+    }
+
+    #[test]
+    fn the_daemon_plist_uses_absolute_paths_and_the_real_binary() {
+        let spec = agent_spec(Path::new("/Users/someone"));
+        let text = render_daemon_plist(&spec);
+        assert!(
+            text.contains("<string>/opt/csr/bin/csr-engine</string>"),
+            "{text}"
+        );
+        assert!(text.contains("<string>--db-path</string>"), "{text}");
+        assert!(
+            text.contains("<string>/Users/someone/.claude-self-reflect/csr-engine.db</string>"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "<string>/Users/someone/.claude-self-reflect/logs/daemon.out.log</string>"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("<string>~"), "no tilde paths: {text}");
+        assert!(
+            !text.contains("ramakrishnanannaswamy"),
+            "no owner paths: {text}"
+        );
+        // claude's folder first, then the binary's, then the fixed places.
+        assert!(
+            text.contains("<string>/opt/claude/bin:/opt/csr/bin:/Users/someone/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>"),
+            "{text}"
+        );
+        // A CSR_NO_* key reads as an inhibited feature in the pane.
+        assert!(!text.contains("CSR_NO_"), "{text}");
+        let mut spec = spec;
+        spec.no_codex_import = true;
+        assert!(render_daemon_plist(&spec).contains("<key>CSR_NO_CODEX_IMPORT</key>"));
+    }
+
+    #[test]
+    fn the_daemon_plist_escapes_xml_in_paths() {
+        let mut spec = agent_spec(Path::new("/Users/a&b"));
+        spec.engine = "/Users/a&b/<bin>/csr-engine".into();
+        let text = render_daemon_plist(&spec);
+        assert!(
+            text.contains("/Users/a&amp;b/&lt;bin&gt;/csr-engine"),
+            "{text}"
+        );
+        assert!(!text.contains("a&b"), "{text}");
+    }
+
+    #[test]
+    fn the_plist_names_the_database_the_daemon_serves() {
+        // `vector_ipc::launchd_database` is what ties a client to this daemon.
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(false);
+        install(&spec, &mut fake);
+        assert!(crate::search::vector_ipc::daemon_configured_for_database(
+            &spec.db_path,
+            Some(home.path()),
+        ));
+    }
+
+    #[test]
+    fn a_fresh_install_writes_the_plist_and_bootstraps_it_once() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(false);
+        let outcome = install(&spec, &mut fake);
+        assert_eq!(outcome, DaemonOutcome::Running { rewritten: true });
+        assert_eq!(
+            std::fs::read_to_string(spec.plist_path()).unwrap(),
+            render_daemon_plist(&spec)
+        );
+        assert!(home.path().join(".claude-self-reflect/logs").is_dir());
+        // bootstrap runs the job (RunAtLoad); a kickstart on top would restart it.
+        assert_eq!(
+            fake.calls,
+            vec![
+                "print gui/501/com.ramakay.csr-engine.daemon",
+                "bootstrap gui/501"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_run_leaves_the_file_alone_and_restarts_the_job() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let first = std::fs::metadata(spec.plist_path())
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let mut fake = FakeLaunchctl::new(true);
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: false }
+        );
+        let second = std::fs::metadata(spec.plist_path())
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(first, second, "an identical plist must not be rewritten");
+        assert_eq!(
+            fake.calls,
+            vec![
+                "print gui/501/com.ramakay.csr-engine.daemon",
+                "kickstart -k"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_changed_install_reloads_the_job_because_kickstart_does_not_reread_it() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        spec.engine = "/opt/csr/new/csr-engine".into();
+
+        let mut fake = FakeLaunchctl::new(true);
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: true }
+        );
+        assert!(std::fs::read_to_string(spec.plist_path())
+            .unwrap()
+            .contains("/opt/csr/new/csr-engine"));
+        assert_eq!(
+            fake.calls,
+            vec![
+                "print gui/501/com.ramakay.csr-engine.daemon",
+                "bootout gui/501/com.ramakay.csr-engine.daemon",
+                "bootstrap gui/501"
+            ]
+        );
+    }
+
+    #[test]
+    fn bootstrap_is_retried_while_launchd_tears_the_old_job_down() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(false);
+        fake.bootstrap_fails = 2;
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: true }
+        );
+        assert_eq!(
+            fake.calls
+                .iter()
+                .filter(|c| c.starts_with("bootstrap"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_bootstrap_that_keeps_failing_reports_the_launchctl_error() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(false);
+        fake.bootstrap_fails = 99;
+        let outcome = install(&spec, &mut fake);
+        assert_eq!(
+            outcome,
+            DaemonOutcome::Failed("Bootstrap failed: 5: Input/output error".into())
+        );
+        let report = daemon_report(&outcome, Path::new("/opt/csr/bin/csr-engine"));
+        assert!(report.contains("Bootstrap failed: 5"), "{report}");
+        assert!(
+            report.contains("/opt/csr/bin/csr-engine daemon"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_hand_written_agent_with_a_live_binary_is_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let exe = std::env::current_exe().unwrap();
+        let theirs = format!(
+            "<plist><dict><key>ProgramArguments</key><array><string>{}</string><string>daemon</string></array><key>EnvironmentVariables</key><dict><key>CSR_NO_RECAP</key><string>1</string></dict></dict></plist>",
+            exe.display()
+        );
+        std::fs::create_dir_all(spec.plist_path().parent().unwrap()).unwrap();
+        std::fs::write(spec.plist_path(), &theirs).unwrap();
+
+        let mut fake = FakeLaunchctl::new(true);
+        assert_eq!(install(&spec, &mut fake), DaemonOutcome::KeptExisting);
+        assert_eq!(std::fs::read_to_string(spec.plist_path()).unwrap(), theirs);
+
+        // The same file pointing at a binary that is gone is not worth keeping.
+        let dead = theirs.replace(&exe.display().to_string(), "/nowhere/csr-engine");
+        std::fs::write(spec.plist_path(), dead).unwrap();
+        assert_eq!(
+            install(&spec, &mut FakeLaunchctl::new(false)),
+            DaemonOutcome::Running { rewritten: true }
+        );
+        assert_eq!(
+            std::fs::read_to_string(spec.plist_path()).unwrap(),
+            render_daemon_plist(&spec)
+        );
+    }
+
+    #[test]
+    fn the_opt_out_and_other_platforms_touch_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut calls = 0;
+        let mut count = |_: &[&str]| {
+            calls += 1;
+            Ok(())
+        };
+        assert_eq!(
+            daemon_step(&spec, true, true, 501, &mut count, &|_| {}),
+            DaemonOutcome::OptedOut
+        );
+        assert_eq!(
+            daemon_step(&spec, false, false, 501, &mut count, &|_| {}),
+            DaemonOutcome::Manual
+        );
+        assert_eq!(calls, 0, "no launchctl call");
+        assert!(!spec.plist_path().exists());
+
+        let out = daemon_report(&DaemonOutcome::OptedOut, Path::new("/x/csr-engine"));
+        assert!(
+            out.contains("CSR_NO_DAEMON") && out.contains("/x/csr-engine daemon"),
+            "{out}"
+        );
+        let manual = daemon_report(&DaemonOutcome::Manual, Path::new("/x/csr-engine"));
+        assert!(manual.contains("/x/csr-engine daemon"), "{manual}");
+    }
+
+    #[test]
+    fn csr_no_daemon_is_read_from_the_environment() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_DAEMON");
+        assert!(!daemon_opted_out());
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("", false)] {
+            std::env::set_var("CSR_NO_DAEMON", value);
+            assert_eq!(daemon_opted_out(), expected, "CSR_NO_DAEMON={value:?}");
+        }
+        std::env::remove_var("CSR_NO_DAEMON");
     }
 }

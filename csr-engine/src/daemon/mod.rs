@@ -55,7 +55,7 @@ pub fn codex_import_disabled() -> bool {
 /// file, or any error but contention, is "not held". Called through the fs2
 /// trait: std's inherent `File::try_lock_shared` would win a method call and
 /// report a different error type.
-fn lock_file_held(path: &std::path::Path) -> bool {
+pub(crate) fn lock_file_held(path: &std::path::Path) -> bool {
     use fs2::FileExt;
 
     let Ok(file) = std::fs::File::open(path) else {

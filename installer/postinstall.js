@@ -217,8 +217,8 @@ function runOrExplainActivation(destPath, pathBinary) {
 
   if (process.env.CSR_AUTO_SETUP !== '1') {
     console.log('\n  \x1b[1mTo activate\x1b[0m (registers the MCP server, installs hooks,');
-    console.log("  imports your conversations, and installs the csr-companion plugin");
-    console.log("  through Claude Code's plugin CLI), run:");
+    console.log("  imports your conversations, installs the csr-companion plugin through");
+    console.log("  Claude Code's plugin CLI, and starts the background daemon on macOS), run:");
     console.log(`\n    \x1b[1;32m${command} setup\x1b[0m\n`);
     console.log('  Then restart Claude Code.\n');
     return;
@@ -230,7 +230,9 @@ function runOrExplainActivation(destPath, pathBinary) {
   // found it already there. Running it is the consented action, not a probe.
   console.log('  CSR_AUTO_SETUP=1 — running setup...');
   try {
-    execFileSync(destPath, ['setup'], { stdio: 'inherit', timeout: 60000 });
+    // The first import reads every transcript and the model may download, so a
+    // minute is not enough; a setup killed there never reaches the daemon step.
+    execFileSync(destPath, ['setup'], { stdio: 'inherit', timeout: 30 * 60 * 1000 });
   } catch {
     console.log(`\n  Setup failed. Run manually: ${command} setup\n`);
     process.exitCode = 1;
