@@ -184,6 +184,8 @@ fn compose_recap_inner(
     recap.push(' ');
     recap.push_str(RECAP_SENTINEL);
 
+    // User-confirmed verdicts first, then what the session itself landed
+    // (commits and merges, by OID) that the head clause does not already name.
     let settled_entries: Vec<String> = feeds
         .settled
         .iter()
@@ -191,8 +193,9 @@ fn compose_recap_inner(
         .filter(|fact| fact.source == "user_confirmed")
         .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
         .filter(|fact| !has_csr_text(&normalize_feed_text(&fact.claim)))
-        .take(3)
         .map(format_fact)
+        .chain(session_settled(ep))
+        .take(3)
         .collect();
 
     let mut now_parts = Vec::new();
@@ -205,6 +208,9 @@ fn compose_recap_inner(
     {
         now_parts.push(blocker);
     }
+    now_parts.extend(gate_failure_entry(ep));
+    now_parts.extend(closing_open_entry(ep));
+    now_parts.extend(background_entry(ep));
     now_parts.extend(
         feeds
             .still_open
@@ -240,7 +246,8 @@ fn compose_recap_inner(
                 .iter()
                 .filter(|todo| todo.status != "completed")
                 .find_map(|todo| next_preview(&todo.content))
-        });
+        })
+        .or_else(|| closing_next_entry(ep));
 
     let retired_entries: Vec<String> = feeds
         .retired_while_away
@@ -432,11 +439,11 @@ fn next_preview(text: &str) -> Option<String> {
 /// Evidence requires at least one alphanumeric character: values like "…",
 /// "/", or "-*-" are punctuation-only sentinels, not content, and every
 /// clause gate must treat them as absent (abstention-first).
-fn has_substance(text: &str) -> bool {
+pub(crate) fn has_substance(text: &str) -> bool {
     text.chars().any(char::is_alphanumeric)
 }
 
-fn is_no_evidence_next(text: &str) -> bool {
+pub(crate) fn is_no_evidence_next(text: &str) -> bool {
     if !has_substance(text) {
         return true;
     }
@@ -756,6 +763,94 @@ pub(crate) fn is_request(text: &str) -> bool {
         && words.len() >= 2
         && (COMMAND_FOLLOWERS.contains(&second) || second.starts_with(['/', '`']))
         && !(matches!(second, "this" | "that") && TIME_WORDS.contains(&third))
+}
+
+/// What the session itself landed: its strongest, latest receipts (commits and
+/// merged PRs by OID, else completed tasks) that the head clause does not
+/// already carry, as `<claim> (<receipt>)`. Needs no ledger verdict: a receipt
+/// is a commit the transcript saw succeed.
+fn session_settled(ep: &crate::hooks::stop::Episode) -> Vec<String> {
+    let shown: Vec<String> = {
+        let own = anchor_completions(ep);
+        displayed_receipts(&own)
+            .into_iter()
+            .filter_map(|(index, _)| own.get(index).map(|done| done.receipt.clone()))
+            .collect()
+    };
+    displayed_receipts(&ep.completions)
+        .into_iter()
+        .filter(|(index, _)| {
+            ep.completions
+                .get(*index)
+                .is_some_and(|done| !shown.contains(&done.receipt))
+        })
+        .map(|(_, entry)| entry)
+        .collect()
+}
+
+/// A verification command the latest task left failing: the command and the
+/// exit code its result printed are the receipt.
+fn gate_failure_entry(ep: &crate::hooks::stop::Episode) -> Option<String> {
+    let failure = ep.recap_extras.gate_failure.as_ref()?;
+    let command = normalize_feed_text(&failure.command);
+    (has_substance(&command) && !crate::import::contamination::has_csr_text(&command)).then(|| {
+        format!(
+            "last gate `{command}` failed (exit {}), not rerun green",
+            failure.exit_code
+        )
+    })
+}
+
+/// The closing message's own "Still open:" line, quoted with its row.
+fn closing_open_entry(ep: &crate::hooks::stop::Episode) -> Option<String> {
+    let line = ep.recap_extras.closing_open.as_ref()?;
+    let text = closing_text(line)?;
+    Some(format!(
+        "closing note, still open: {text} (msg {})",
+        line.row
+    ))
+}
+
+/// Background tasks the transcript never shows finishing.
+fn background_entry(ep: &crate::hooks::stop::Episode) -> Option<String> {
+    let extras = &ep.recap_extras;
+    let newest = extras.background_open.first()?;
+    let label = normalize_feed_text(&newest.label);
+    let id = normalize_feed_text(&newest.id);
+    if id.is_empty() || !has_substance(&label) || crate::import::contamination::has_csr_text(&label)
+    {
+        return None;
+    }
+    let total = extras
+        .background_open_total
+        .max(extras.background_open.len());
+    Some(if total > 1 {
+        format!("{total} background tasks not reported finished, newest: {label} ({id})")
+    } else {
+        format!("background task not reported finished: {label} ({id})")
+    })
+}
+
+/// The closing message's own "Next:" line, quoted with its row. Behind the
+/// structured todo `Next:`, which is authored as a task.
+fn closing_next_entry(ep: &crate::hooks::stop::Episode) -> Option<String> {
+    let line = ep.recap_extras.closing_next.as_ref()?;
+    let text = closing_text(line)?;
+    Some(format!("{text} (msg {})", line.row))
+}
+
+/// A stored closing line, re-checked at composition: the stored text must
+/// still be substantive, whole, and not CSR's own words, and the receipt must
+/// be present.
+fn closing_text(line: &crate::hooks::recap_evidence::ClosingLine) -> Option<String> {
+    let text = normalize_feed_text(&line.text);
+    let text = text.trim_end_matches(['.', '!']).trim().to_string();
+    (!line.row.trim().is_empty()
+        && has_substance(&text)
+        && !is_no_evidence_next(&text)
+        && !crate::import::contamination::has_csr_text(&text)
+        && !crate::extraction::provenance::is_csr_emission(&text))
+    .then_some(text)
 }
 
 /// The receipts the recap may show: those produced under the task the intent
@@ -1177,8 +1272,257 @@ mod tests {
             outcome_version: None,
             latest_ask: None,
             watermark: None,
+            recap_extras: Default::default(),
             anchors: vec![],
         }
+    }
+
+    // ---- session evidence clauses (hooks::recap_evidence) ----
+
+    use crate::hooks::recap_evidence::{BackgroundTask, ClosingLine, GateFailure};
+
+    fn bare_feeds() -> RecapFeeds {
+        RecapFeeds {
+            settled: vec![],
+            still_open: vec![],
+            retired_while_away: vec![],
+            corrections: vec![],
+            open_proposals: 0,
+            top_dream: None,
+        }
+    }
+
+    /// An episode with an intent and nothing else: no completions, todos,
+    /// blockers or extras. Every clause below must come from what a test adds.
+    fn bare_episode() -> Episode {
+        let mut ep = episode();
+        ep.completions.clear();
+        ep.todos.clear();
+        ep.next_steps = None;
+        ep.blockers = None;
+        ep.anchor_receipts = Some(vec![]);
+        ep.completions_untied = false;
+        ep
+    }
+
+    fn receipt(claim: &str, sha: &str) -> CompletionReceipt {
+        CompletionReceipt {
+            claim: claim.into(),
+            receipt: sha.into(),
+        }
+    }
+
+    fn lines_of(text: &str) -> Vec<&str> {
+        text.lines().collect()
+    }
+
+    #[test]
+    fn no_evidence_means_no_settled_now_or_next_clause() {
+        let text = compose_recap(&bare_episode(), &bare_feeds(), "1h ago").unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        for clause in ["Settled:", "Now:", "Next:"] {
+            assert!(!text.contains(clause), "{clause}: {text}");
+        }
+    }
+
+    #[test]
+    fn settled_names_session_commits_the_head_clause_does_not_carry() {
+        let mut ep = bare_episode();
+        ep.completions = vec![
+            receipt("fix(auth): keep form errors", "abc1234"),
+            receipt("merged PR #78", "def5678"),
+        ];
+        // Neither commit was made under the anchor's own task.
+        ep.completions_untied = true;
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        let settled = lines_of(&text)
+            .into_iter()
+            .find(|line| line.starts_with("Settled: "))
+            .unwrap_or_else(|| panic!("no Settled clause: {text}"));
+        assert_eq!(
+            settled,
+            "Settled: fix(auth): keep form errors (abc1234); merged PR #78 (def5678)."
+        );
+    }
+
+    #[test]
+    fn settled_skips_a_commit_the_head_clause_already_names() {
+        let mut ep = bare_episode();
+        ep.completions = vec![
+            receipt("fix(auth): keep form errors", "abc1234"),
+            receipt("merged PR #78", "def5678"),
+        ];
+        ep.anchor_receipts = Some(vec![0]);
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        assert!(
+            text.contains("Latest: fix(auth): keep form errors (abc1234)"),
+            "{text}"
+        );
+        assert!(text.contains("Settled: merged PR #78 (def5678)."), "{text}");
+        assert_eq!(text.matches("abc1234").count(), 1, "{text}");
+        // When the head clause names every receipt, there is nothing to settle.
+        ep.anchor_receipts = Some(vec![0, 1]);
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        assert!(!text.contains("Settled:"), "{text}");
+    }
+
+    #[test]
+    fn a_receiptless_session_commit_is_never_settled() {
+        let mut ep = bare_episode();
+        ep.completions = vec![receipt("fix(auth): keep form errors", "")];
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        assert!(!text.contains("Settled:"), "{text}");
+    }
+
+    #[test]
+    fn now_names_a_failed_gate_with_its_command_and_exit_code() {
+        let mut ep = bare_episode();
+        ep.recap_extras.gate_failure = Some(GateFailure {
+            command: "cargo test --release --lib".into(),
+            exit_code: 101,
+        });
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        assert!(
+            text.contains(
+                "Now: last gate `cargo test --release --lib` failed (exit 101), not rerun green."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn now_names_background_tasks_never_reported_finished() {
+        let mut ep = bare_episode();
+        ep.recap_extras.background_open = vec![BackgroundTask {
+            id: "bq2".into(),
+            label: "upload build".into(),
+        }];
+        ep.recap_extras.background_open_total = 1;
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        assert!(
+            text.contains("Now: background task not reported finished: upload build (bq2)."),
+            "{text}"
+        );
+        ep.recap_extras.background_open_total = 4;
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        assert!(
+            text.contains("4 background tasks not reported finished, newest: upload build (bq2)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn now_and_next_quote_the_closing_message_with_its_row() {
+        let mut ep = bare_episode();
+        ep.recap_extras.closing_open = Some(ClosingLine {
+            text: "the gcloud login, so I can check traffic.".into(),
+            row: "3f9a1c2b".into(),
+        });
+        ep.recap_extras.closing_next = Some(ClosingLine {
+            text: "listen to the first 3 seconds on a phone.".into(),
+            row: "77aa00cc".into(),
+        });
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        assert!(
+            text.contains(
+                "Now: closing note, still open: the gcloud login, so I can check traffic (msg 3f9a1c2b)."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Next: listen to the first 3 seconds on a phone (msg 77aa00cc)."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_structured_todo_next_outranks_the_closing_message_next() {
+        let mut ep = bare_episode();
+        ep.todos = vec![TodoItem {
+            content: "wire session start".into(),
+            status: "pending".into(),
+        }];
+        ep.next_steps = Some("wire session start".into());
+        ep.recap_extras.closing_next = Some(ClosingLine {
+            text: "something else entirely.".into(),
+            row: "77aa00cc".into(),
+        });
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        assert!(text.contains("Next: wire session start."), "{text}");
+        assert!(!text.contains("something else"), "{text}");
+    }
+
+    #[test]
+    fn stored_evidence_without_a_receipt_or_with_csr_text_is_dropped() {
+        let mut ep = bare_episode();
+        ep.recap_extras.closing_next = Some(ClosingLine {
+            text: "recap [2h ago]: fix login. [[CSR:RECAP]]".into(),
+            row: "77aa00cc".into(),
+        });
+        ep.recap_extras.closing_open = Some(ClosingLine {
+            text: "wait for review.".into(),
+            row: String::new(),
+        });
+        ep.recap_extras.background_open = vec![BackgroundTask {
+            id: String::new(),
+            label: "upload build".into(),
+        }];
+        ep.recap_extras.gate_failure = Some(GateFailure {
+            command: "recap [2h ago]: x [[CSR:RECAP]]".into(),
+            exit_code: 1,
+        });
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        for clause in ["Settled:", "Now:", "Next:"] {
+            assert!(!text.contains(clause), "{clause}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_recap_with_every_evidence_clause_stays_in_budget_and_trips_the_guard() {
+        let mut ep = bare_episode();
+        ep.completions = vec![
+            receipt(
+                "fix(auth): keep form errors until the next submitted request",
+                "abc1234",
+            ),
+            receipt("merged PR #78", "def5678"),
+        ];
+        ep.completions_untied = true;
+        ep.recap_extras.gate_failure = Some(GateFailure {
+            command: "cargo clippy --release --lib --tests".into(),
+            exit_code: 101,
+        });
+        ep.recap_extras.background_open = vec![BackgroundTask {
+            id: "bq2".into(),
+            label: "upload build".into(),
+        }];
+        ep.recap_extras.background_open_total = 1;
+        ep.recap_extras.closing_open = Some(ClosingLine {
+            text: "your spend OK on the new opener.".into(),
+            row: "3f9a1c2b".into(),
+        });
+        ep.recap_extras.closing_next = Some(ClosingLine {
+            text: "listen to the first 3 seconds on a phone.".into(),
+            row: "77aa00cc".into(),
+        });
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        for clause in ["Settled:", "Now:", "Next:"] {
+            assert!(text.contains(clause), "{clause}: {text}");
+        }
+        assert!(
+            text.chars().count() <= MAX_CHARS,
+            "{}: {text}",
+            text.chars().count()
+        );
+        assert!(text.starts_with("recap [1h ago]: "), "{text}");
+        // The self-contamination guard: the new grammar is still CSR's own.
+        assert!(crate::extraction::provenance::is_csr_emission(&text));
+        assert!(crate::extraction::provenance::contains_machine_sentinel(
+            &text
+        ));
+        assert!(extractable(&text).is_none());
+        let no_sentinel = text.replace(RECAP_SENTINEL, "");
+        assert!(crate::extraction::provenance::is_csr_emission(&no_sentinel));
     }
 
     #[test]
@@ -2527,6 +2871,9 @@ mod tests {
             claim: claim.into(),
             receipt: receipt.into(),
         };
+        // The head line is the intent and what was made under it; what the
+        // session made under other asks is `Settled:`, never beside the intent.
+        let head = |text: &str| text.lines().next().unwrap().to_string();
         let mut ep = episode();
         ep.todos.clear();
         ep.next_steps = None;
@@ -2538,27 +2885,41 @@ mod tests {
         ];
         // Only the anchor's own commit stands beside its intent.
         ep.anchor_receipts = Some(vec![1]);
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
         assert_eq!(
-            compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap(),
+            head(&got),
             "recap [now]: Fix the recap composer. Latest: fix(b): under the anchor (bbbbbbb). [[CSR:RECAP]]"
         );
-        // The anchor made none: the recap says what was asked and nothing more.
-        ep.anchor_receipts = Some(vec![]);
         assert_eq!(
-            compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap(),
+            got.lines().nth(1),
+            Some("Settled: fix(c): under a later ask (ccccccc).")
+        );
+        // The anchor made none: the head says what was asked and nothing more.
+        ep.anchor_receipts = Some(vec![]);
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert_eq!(
+            head(&got),
             "recap [now]: Fix the recap composer. [[CSR:RECAP]]"
         );
+        assert_eq!(
+            got.lines().nth(1),
+            Some(
+                "Settled: fix(b): under the anchor (bbbbbbb); fix(c): under a later ask (ccccccc)."
+            )
+        );
         // An episode stored before the tie was recorded: its receipts are the
-        // anchor's own, or they are not shown at all.
+        // anchor's own, or they are not shown beside the intent at all.
         ep.anchor_receipts = None;
         ep.completions_untied = true;
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
         assert_eq!(
-            compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap(),
+            head(&got),
             "recap [now]: Fix the recap composer. [[CSR:RECAP]]"
         );
         ep.completions_untied = false;
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
         assert!(got.contains("(bbbbbbb); fix(c): under a later ask (ccccccc)"));
+        assert!(!got.contains("Settled:"), "{got}");
         // A task the session marked completed reads as the anchor's result.
         ep.completions = vec![done("Write regression tests", "task #3 completed")];
         ep.anchor_receipts = Some(vec![0]);
@@ -2601,9 +2962,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_untied_receipts_are_not_shown() {
+    fn legacy_untied_receipts_are_not_shown_beside_the_intent() {
         // An episode stored before the tie was recorded, whose receipts were
-        // not the anchor's own: they stand beside neither the intent nor alone.
+        // not the anchor's own: they stand beside the intent never, and are
+        // only the commits the session made, under `Settled:`.
         let mut ep = episode();
         ep.anchor_request = Some("Fix the recap composer".into());
         ep.completions_untied = true;
@@ -2612,7 +2974,10 @@ mod tests {
         ep.todos.clear();
         ep.blockers = None;
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
-        assert_eq!(got, "recap [now]: Fix the recap composer. [[CSR:RECAP]]");
+        assert_eq!(
+            got,
+            "recap [now]: Fix the recap composer. [[CSR:RECAP]]\nSettled: Implemented deterministic recap output (abc1234)."
+        );
         assert!(crate::extraction::provenance::is_csr_emission(&got));
         // Without an intent there is nothing left to say.
         ep.anchor_request = None;

@@ -1046,6 +1046,7 @@ mod tests {
             outcome_version: None,
             latest_ask: None,
             watermark: None,
+            recap_extras: Default::default(),
             anchors: vec![],
         };
         let feeds = RecapFeeds {

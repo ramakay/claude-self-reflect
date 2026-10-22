@@ -2194,6 +2194,7 @@ mod tests {
             outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
+            recap_extras: Default::default(),
             anchors: vec![],
         };
         let verdicts = vec![
@@ -2267,6 +2268,7 @@ mod tests {
             outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
+            recap_extras: Default::default(),
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2h ago");
@@ -2319,6 +2321,7 @@ mod tests {
             outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
+            recap_extras: Default::default(),
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1w ago");
@@ -2373,6 +2376,7 @@ mod tests {
             outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
+            recap_extras: Default::default(),
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2m ago");
@@ -2428,6 +2432,7 @@ mod tests {
             outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
+            recap_extras: Default::default(),
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1m ago");
@@ -2745,6 +2750,7 @@ mod tests {
             outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
+            recap_extras: Default::default(),
             anchors: vec![],
         }
     }
@@ -3745,9 +3751,12 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         };
         let text = crate::hooks::recap::compose_recap(&shown, &feeds, "1h ago")
             .expect("the anchor still composes");
-        assert!(text.contains("Now wire the staging endpoint"), "{text}");
-        assert!(!text.contains("1111111"), "{text}");
-        assert!(!text.contains("2222222"), "{text}");
+        let head = text.lines().next().unwrap_or_default();
+        assert!(head.contains("Now wire the staging endpoint"), "{text}");
+        // Neither receipt is shown beside the intent; the Settled clause is
+        // session evidence and sits on its own line.
+        assert!(!head.contains("1111111"), "{text}");
+        assert!(!head.contains("2222222"), "{text}");
         // The same anchor moves its receipts together with the snapshot's.
         let mut same = snapshot_at(
             Some(LATER),
@@ -3762,8 +3771,9 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         let overlaid = overlay_compact_snapshot(&ep, same).expect("ahead");
         let shown = recap_episode(&overlaid, Some("compact"), Some(ep.session_id.as_str()));
         let text = crate::hooks::recap::compose_recap(&shown, &feeds, "1h ago").expect("composes");
+        let head = text.lines().next().unwrap_or_default();
         assert!(
-            text.contains("2222222") && !text.contains("1111111"),
+            head.contains("2222222") && !head.contains("1111111"),
             "{text}"
         );
     }

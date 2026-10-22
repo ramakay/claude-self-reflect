@@ -18,6 +18,9 @@ pub mod prompt_submit;
 pub mod prompt_transport;
 pub mod reaction;
 pub mod recap;
+pub mod recap_evidence;
+#[cfg(test)]
+mod recap_replay;
 pub(crate) mod resume_lineage;
 mod scope_folder;
 pub mod session_briefing;

@@ -1979,6 +1979,7 @@ fn test_explore_prompt_never_fails() {
         outcome_version: None,
         latest_ask: None,
         watermark: None,
+        recap_extras: Default::default(),
         anchors: vec![],
     };
 
@@ -2524,6 +2525,7 @@ fn test_episode_struct_serialization() {
         outcome_version: None,
         latest_ask: None,
         watermark: None,
+        recap_extras: Default::default(),
         anchors: vec![],
     };
 

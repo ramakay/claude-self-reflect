@@ -3866,6 +3866,7 @@ mod tests {
                 outcome_version: None,
                 latest_ask: None,
                 watermark: None,
+                recap_extras: Default::default(),
                 anchors: vec![],
             };
             storage
@@ -4611,6 +4612,7 @@ mod tests {
             outcome_version: Some(1),
             latest_ask: None,
             watermark: None,
+            recap_extras: Default::default(),
             anchors: vec![crate::extraction::anchors::FunctionAnchor {
                 file: "src/radio/RadioSheet.swift".into(),
                 node_kind: "file".into(),

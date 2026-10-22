@@ -173,6 +173,15 @@ pub struct Episode {
     /// one session can be ordered by it, which their wall clocks cannot do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermark: Option<String>,
+    /// Deterministic recap evidence read from the transcript at Stop time (see
+    /// `hooks::recap_evidence`): the verification failure the latest task left
+    /// open, background tasks never reported finished, and the markers the
+    /// closing message opens with. Empty for episodes written before it existed.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::hooks::recap_evidence::RecapExtras::is_empty"
+    )]
+    pub recap_extras: crate::hooks::recap_evidence::RecapExtras,
 }
 
 /// A compact intent and whether the displayed receipts belong to that task.
@@ -921,6 +930,39 @@ const HARNESS_USER_ROW_PREFIXES: [&str; 4] = [
     "This session is being continued from a previous conversation",
 ];
 
+/// Longest closing message kept whole for its marker lines, in bytes.
+const CLOSING_MESSAGE_MAX_BYTES: usize = 12_000;
+
+/// The first 8 characters of a row's `uuid`: the receipt a quoted line carries.
+fn row_uuid(val: &serde_json::Value) -> Option<String> {
+    let uuid = val.get("uuid").and_then(|v| v.as_str())?;
+    let short: String = uuid.chars().take(8).collect();
+    (short.len() == 8).then_some(short)
+}
+
+/// The text of a row that may carry a `<task-notification>`: a queued
+/// notification, a queued-command attachment, or the harness's own user row
+/// (read from the raw twin, since the search sanitizer blanks those).
+fn notification_text<'a>(
+    val: &'a serde_json::Value,
+    raw: &'a serde_json::Value,
+    msg_type: &str,
+) -> Option<&'a str> {
+    match msg_type {
+        "queue-operation" => val.get("content").and_then(|v| v.as_str()),
+        "attachment" => val
+            .get("attachment")
+            .filter(|a| a.get("type").and_then(|t| t.as_str()) == Some("queued_command"))
+            .and_then(|a| a.get("prompt"))
+            .and_then(|v| v.as_str()),
+        "user" | "human" => raw
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str()),
+        _ => None,
+    }
+}
+
 /// Most completions kept per session for each receipt kind (commits, and
 /// task/todo receipts); the recap renders at most two.
 const MAX_COMPLETIONS: usize = 5;
@@ -1575,6 +1617,13 @@ where
     let mut closing_text = String::new();
     // The literal last typed message (a forwarded note clears it).
     let mut latest_ask: Option<String> = None;
+    // Recap evidence (`hooks::recap_evidence`): background tasks and what
+    // closed them; the failed verification commands of the latest task, with
+    // their exit codes, oldest first; the assistant's latest main-session text
+    // whole, with its row's uuid (`None` when that text was CSR's own words).
+    let mut background = crate::hooks::recap_evidence::BackgroundTracker::default();
+    let mut gate_failures: Vec<(String, crate::hooks::recap_evidence::GateFailure)> = Vec::new();
+    let mut closing_message: Option<(String, Option<String>)> = None;
 
     // Tool names whose file_path inputs count as "investigated"
     let read_tools: HashSet<&str> = ["Read", "Glob", "Grep"].into_iter().collect();
@@ -1603,6 +1652,11 @@ where
         // A legacy in-file subagent row. It still counts toward tools/files,
         // but never toward the recap's task, turn or completion state.
         let sidechain = val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true);
+        if !sidechain {
+            if let Some(text) = notification_text(val, raw_row, msg_type) {
+                background.notification(text);
+            }
+        }
 
         // Extract request from the first user message that survives provenance
         // filtering — command wrappers, caveats, and pasted CSR output are
@@ -1688,6 +1742,7 @@ where
                             // one's state, the cost of one fail-closed rule.
                             if crate::hooks::recap::is_request(&prose) {
                                 open_failures.clear();
+                                gate_failures.clear();
                                 final_failed = false;
                                 closing_receipt = false;
                                 closing_text.clear();
@@ -1750,6 +1805,9 @@ where
                                     );
                                 }
                                 tools_used.insert(name.to_string());
+                                if !sidechain {
+                                    background.tool_use(block);
+                                }
                                 if let (false, Some(task)) = (sidechain, segments.last_mut()) {
                                     task.tool_calls += 1;
                                 }
@@ -1825,9 +1883,17 @@ where
                         // contributes only its genuine prose (or nothing).
                         if block_type == "text" {
                             if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                if let Some(cleaned) =
-                                    crate::extraction::provenance::extractable(text)
-                                {
+                                let cleaned = crate::extraction::provenance::extractable(text);
+                                if !sidechain {
+                                    closing_message = cleaned.as_ref().map(|whole| {
+                                        (
+                                            truncate_str(whole, CLOSING_MESSAGE_MAX_BYTES)
+                                                .to_string(),
+                                            row_uuid(val),
+                                        )
+                                    });
+                                }
+                                if let Some(cleaned) = cleaned {
                                     completed = truncate_str(&cleaned, 300).to_string();
                                     if !sidechain {
                                         closing_text = completed.clone();
@@ -1839,7 +1905,16 @@ where
                 }
                 // Also handle plain string content
                 if let Some(text) = content.as_str() {
-                    if let Some(cleaned) = crate::extraction::provenance::extractable(text) {
+                    let cleaned = crate::extraction::provenance::extractable(text);
+                    if !sidechain {
+                        closing_message = cleaned.as_ref().map(|whole| {
+                            (
+                                truncate_str(whole, CLOSING_MESSAGE_MAX_BYTES).to_string(),
+                                row_uuid(val),
+                            )
+                        });
+                    }
+                    if let Some(cleaned) = cleaned {
                         completed = truncate_str(&cleaned, 300).to_string();
                         if !sidechain {
                             closing_text = completed.clone();
@@ -1909,7 +1984,20 @@ where
                                 },
                             };
                             if let Some(key) = call.failure_key {
+                                gate_failures.retain(|(open, _)| open != &key);
                                 if failed {
+                                    if let (Some(command), Some(exit_code)) = (
+                                        crate::hooks::recap_evidence::gate_command(&key),
+                                        crate::hooks::recap_evidence::exit_code(&block_text),
+                                    ) {
+                                        gate_failures.push((
+                                            key.clone(),
+                                            crate::hooks::recap_evidence::GateFailure {
+                                                command,
+                                                exit_code,
+                                            },
+                                        ));
+                                    }
                                     open_failures.insert(key);
                                     final_failed = true;
                                 } else {
@@ -1942,6 +2030,9 @@ where
                             continue;
                         }
                         let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str());
+                        if let Some(id) = tool_use_id {
+                            background.tool_result(id, &block_text, failed);
+                        }
                         if let Some(op) = tool_use_id.and_then(|id| tasks.pending.remove(id)) {
                             if !failed {
                                 let current = segments.len().checked_sub(1);
@@ -2033,6 +2124,28 @@ where
         _ => 0,
     };
 
+    let (background_open, background_open_total) = background.open();
+    let mut recap_extras = crate::hooks::recap_evidence::RecapExtras {
+        gate_failure: gate_failures.last().map(|(_, failure)| failure.clone()),
+        background_open,
+        background_open_total,
+        ..Default::default()
+    };
+    // Only a turn that ended cleanly has a closing message to quote.
+    if let (true, Some((text, Some(row)))) = (closing_ended, closing_message) {
+        if let Some((kind, text)) = crate::hooks::recap_evidence::closing_marker(&text) {
+            let line = crate::hooks::recap_evidence::ClosingLine { text, row };
+            match kind {
+                crate::hooks::recap_evidence::ClosingKind::Next => {
+                    recap_extras.closing_next = Some(line);
+                }
+                crate::hooks::recap_evidence::ClosingKind::Open => {
+                    recap_extras.closing_open = Some(line);
+                }
+            }
+        }
+    }
+
     let mut investigated_vec: Vec<String> = investigated.into_iter().collect();
     investigated_vec.sort();
     let mut files_modified_vec: Vec<String> = files_modified.into_iter().collect();
@@ -2080,6 +2193,7 @@ where
         closing_success,
         latest_ask,
         watermark: watermark.map(|at| at.to_rfc3339()),
+        recap_extras,
     }
 }
 
@@ -3921,6 +4035,7 @@ mod tests {
             outcome_version: None,
             latest_ask: None,
             watermark: None,
+            recap_extras: Default::default(),
         };
 
         let json = serde_json::to_string(&ep).unwrap();
@@ -3987,6 +4102,7 @@ mod tests {
             outcome_version: None,
             latest_ask: None,
             watermark: None,
+            recap_extras: Default::default(),
         };
 
         let tags = episode_tags(&ep);
@@ -5466,8 +5582,14 @@ mod tests {
         );
         assert_eq!(ep.anchor_receipts, Some(vec![]));
         let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
-        assert!(got.starts_with("recap [now]: run the release checks and report."));
-        assert!(!got.contains("1a2b3c4"), "{got}");
+        let head = got.lines().next().unwrap_or_default();
+        assert!(head.starts_with("recap [now]: run the release checks and report."));
+        assert!(!head.contains("1a2b3c4"), "{got}");
+        // The commit is session evidence and is shown on its own Settled line.
+        assert!(
+            got.contains("Settled: fix(daemon): stale lock (1a2b3c4)"),
+            "{got}"
+        );
         // The commit stays on the episode for the companion's own reading.
         assert_eq!(
             crate::hooks::recap::displayed_receipts(&ep.completions).len(),
@@ -6377,8 +6499,13 @@ mod tests {
         let ep = extract(&lines);
         let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
         assert_eq!(
-            got,
+            got.lines().next().unwrap_or_default(),
             "recap [now]: Review the new billing dashboard implementation. [[CSR:RECAP]]"
+        );
+        // The earlier commit is shown as a session fact, never as this ask's result.
+        assert!(
+            got.contains("Settled: fix(auth): validate checkout (abc1234)"),
+            "{got}"
         );
     }
 
@@ -6688,6 +6815,233 @@ mod tests {
             let late = crate::import::transcript_inputs_limited(&storage, &live, "s", snapshot_len)
                 .unwrap();
             assert_eq!(format!("{late:?}"), expected_inputs);
+        }
+    }
+
+    /// Recap evidence read at Stop time (`hooks::recap_evidence`).
+    mod recap_extras {
+        use super::*;
+        use crate::hooks::recap_evidence::{BackgroundTask, ClosingLine, GateFailure};
+
+        fn assistant_row(text: &str, uuid: &str, stop_reason: &str) -> String {
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": uuid,
+                "message": {"content": [{"type": "text", "text": text}], "stop_reason": stop_reason}
+            })
+            .to_string()
+        }
+
+        fn with_closing(text: &str) -> Episode {
+            extract(&[
+                typed_line("run the release checks and report", "typed"),
+                assistant_row(text, "3f9a1c2b-0000-4000-8000-000000000001", "end_turn"),
+            ])
+        }
+
+        #[test]
+        fn a_failed_gate_is_kept_with_its_command_and_exit_code() {
+            let ep = closing_run(
+                vec![bash_step(
+                    "a",
+                    "cd /repo && cargo test --release --lib 2>&1 | tail -5",
+                    "Exit code 101\nerror[E0432]: unresolved import",
+                    true,
+                )],
+                "The tests are red.",
+            );
+            assert_eq!(
+                ep.recap_extras.gate_failure,
+                Some(GateFailure {
+                    command: "cargo test --release --lib".into(),
+                    exit_code: 101,
+                })
+            );
+        }
+
+        #[test]
+        fn a_green_rerun_a_later_task_or_a_probe_leaves_no_gate_failure() {
+            let red = |id: &str| bash_step(id, "cargo test --lib", "Exit code 101", true);
+            let green = |id: &str| bash_step(id, "cargo test --lib", "test result: ok", false);
+            assert_eq!(
+                closing_run(vec![red("a"), green("b")], "ok")
+                    .recap_extras
+                    .gate_failure,
+                None
+            );
+            // A failure from an earlier task is not the latest task's.
+            let mut rows = vec![typed_line("run the release checks and report", "typed")];
+            rows.extend(red("a"));
+            rows.push(assistant_stop_line("red", "end_turn"));
+            rows.push(typed_line("now rename the module please", "typed"));
+            rows.push(assistant_stop_line("renamed", "end_turn"));
+            assert_eq!(extract(&rows).recap_extras.gate_failure, None);
+            // A grep that finds nothing is a finding, not a failed gate.
+            let ep = closing_run(
+                vec![bash_step("a", "grep -rn foo src", "Exit code 1", true)],
+                "none",
+            );
+            assert_eq!(ep.recap_extras.gate_failure, None);
+            // No exit code printed: no receipt, no clause.
+            let ep = closing_run(
+                vec![bash_step(
+                    "a",
+                    "cargo test --lib",
+                    "something went wrong",
+                    true,
+                )],
+                "red",
+            );
+            assert_eq!(ep.recap_extras.gate_failure, None);
+        }
+
+        fn background_launch(id: &str, task: &str) -> Vec<String> {
+            vec![
+                serde_json::json!({"type": "assistant", "message": {
+                    "content": [{"type": "tool_use", "id": id, "name": "Bash",
+                                 "input": {"command": "sleep 900", "description": "upload build",
+                                           "run_in_background": true}}],
+                    "stop_reason": "tool_use"
+                }})
+                .to_string(),
+                tool_result_bound(
+                    id,
+                    &format!("Command running in background with ID: {task}. Output is being written to: /tmp/x.output"),
+                ),
+            ]
+        }
+
+        fn notification(task: &str) -> String {
+            format!(
+                "<task-notification>\n<task-id>{task}</task-id>\n<status>completed</status>\n<summary>done</summary>\n</task-notification>"
+            )
+        }
+
+        #[test]
+        fn a_background_task_never_reported_finished_is_kept_with_its_id() {
+            let ep = closing_run(vec![background_launch("b1", "bq2")], "Started the upload.");
+            assert_eq!(
+                ep.recap_extras.background_open,
+                vec![BackgroundTask {
+                    id: "bq2".into(),
+                    label: "upload build".into()
+                }]
+            );
+            assert_eq!(ep.recap_extras.background_open_total, 1);
+        }
+
+        #[test]
+        fn each_notification_shape_closes_a_background_task() {
+            let queued = serde_json::json!({"type": "queue-operation", "operation": "enqueue",
+                "content": notification("bq2")})
+            .to_string();
+            let attached = serde_json::json!({"type": "attachment", "attachment": {
+                "type": "queued_command", "prompt": notification("bq2")}})
+            .to_string();
+            let user_row = serde_json::json!({"type": "user", "promptSource": "system",
+                "origin": {"kind": "task-notification"},
+                "message": {"content": notification("bq2")}})
+            .to_string();
+            for row in [queued, attached, user_row] {
+                let ep = closing_run(
+                    vec![background_launch("b1", "bq2"), vec![row.clone()]],
+                    "Upload finished.",
+                );
+                assert!(ep.recap_extras.background_open.is_empty(), "{row}");
+            }
+            // A notification for another task closes nothing here.
+            let other =
+                serde_json::json!({"type": "queue-operation", "content": notification("zz9")})
+                    .to_string();
+            let ep = closing_run(vec![background_launch("b1", "bq2"), vec![other]], "x");
+            assert_eq!(ep.recap_extras.background_open_total, 1);
+        }
+
+        #[test]
+        fn a_closing_next_line_is_kept_with_the_row_it_came_from() {
+            let ep = with_closing("Built and installed.\n\n- **Next:** pull the tap log from the phone after you use it.");
+            assert_eq!(
+                ep.recap_extras.closing_next,
+                Some(ClosingLine {
+                    text: "pull the tap log from the phone after you use it.".into(),
+                    row: "3f9a1c2b".into(),
+                })
+            );
+            let ep = with_closing("Done.\n- **Still open:** the Part VII post link.");
+            assert_eq!(
+                ep.recap_extras.closing_open,
+                Some(ClosingLine {
+                    text: "the Part VII post link.".into(),
+                    row: "3f9a1c2b".into(),
+                })
+            );
+            assert_eq!(ep.recap_extras.closing_next, None);
+        }
+
+        #[test]
+        fn a_marker_in_prose_code_or_a_cut_off_turn_is_not_quoted() {
+            // Mid-sentence, as CSR-on-CSR sessions write it.
+            assert_eq!(
+                with_closing("The recap's Next: clause is reserved above the list clauses.")
+                    .recap_extras,
+                Default::default()
+            );
+            // Inside a code block.
+            assert_eq!(
+                with_closing("Here is the grammar:\n\n```\nNext: <step>\nSettled: <claim>\n```\n")
+                    .recap_extras,
+                Default::default()
+            );
+            // The turn did not end: the assistant was cut off mid-work.
+            let ep = extract(&[
+                typed_line("run the release checks and report", "typed"),
+                assistant_row(
+                    "Next: ship it.",
+                    "3f9a1c2b-0000-4000-8000-000000000001",
+                    "tool_use",
+                ),
+            ]);
+            assert_eq!(ep.recap_extras.closing_next, None);
+            // The row has no uuid: no receipt, no quote.
+            let ep = extract(&[
+                typed_line("run the release checks and report", "typed"),
+                assistant_stop_line("Next: ship it.", "end_turn"),
+            ]);
+            assert_eq!(ep.recap_extras.closing_next, None);
+        }
+
+        #[test]
+        fn an_older_marker_is_not_quoted_once_a_later_message_has_none() {
+            let ep = extract(&[
+                typed_line("run the release checks and report", "typed"),
+                assistant_row(
+                    "Next: ship it.",
+                    "aaaaaaaa-0000-4000-8000-000000000001",
+                    "end_turn",
+                ),
+                typed_line("what did you run last", "typed"),
+                assistant_row(
+                    "I ran the lib tests.",
+                    "bbbbbbbb-0000-4000-8000-000000000002",
+                    "end_turn",
+                ),
+            ]);
+            assert_eq!(ep.recap_extras.closing_next, None);
+        }
+
+        #[test]
+        fn extras_serialize_only_when_present_and_old_episodes_still_load() {
+            let ep = with_closing("Nothing special here.");
+            let json = serde_json::to_string(&ep).unwrap();
+            assert!(!json.contains("recap_extras"), "{json}");
+            let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            value.as_object_mut().unwrap().remove("recap_extras");
+            let back: Episode = serde_json::from_value(value).unwrap();
+            assert!(back.recap_extras.is_empty());
+            let ep = with_closing("Done.\n**Next:** ship the build.");
+            let json = serde_json::to_string(&ep).unwrap();
+            let back: Episode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.recap_extras, ep.recap_extras);
         }
     }
 }
