@@ -926,6 +926,13 @@ mod tests {
         let lock = crate::maintenance::MaintenanceLock::acquire(temp.path()).unwrap();
         assert!(engine.import_file(&source, "project").await.is_err());
         drop(lock);
+        // Our descriptor is closed, but a process another test is spawning holds a copy of the
+        // open file description until its exec, so the flock frees a moment later. Wait for it.
+        drop(
+            crate::maintenance::wait_shared(temp.path(), std::time::Duration::from_secs(60))
+                .await
+                .unwrap(),
+        );
         assert!(
             !storage.is_file_imported(&source).unwrap(),
             "the file stays for the watcher"
