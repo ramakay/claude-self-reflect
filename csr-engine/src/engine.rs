@@ -420,6 +420,27 @@ impl Engine {
         self.proxied
     }
 
+    /// The background loops an MCP server runs. The enrichment loops (embedding,
+    /// narration, consolidation) are the daemon's when this engine is proxied to
+    /// one. The graph drain is not tied to that: a plist on disk does not mean a
+    /// daemon is up, and a daemon from before the drain existed never drains, so
+    /// the drain always runs here, as a follower that yields to a drainer with a
+    /// fresh heartbeat (`extraction::graph_drain::another_drainer_is_live`).
+    pub(crate) fn background_handles(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut handles = if self.proxied {
+            Vec::new()
+        } else {
+            crate::daemon::spawn_enrichment_loops(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir().to_path_buf(),
+            )
+        };
+        handles.extend(crate::daemon::spawn_graph_drain(self.storage.clone()));
+        handles
+    }
+
     /// Test seam: the same engine, marked as built by `new_proxied` (whose
     /// in-memory index is empty by design).
     #[cfg(test)]
@@ -1130,16 +1151,7 @@ impl Engine {
         let proxy = self.search.read().await.proxy().cloned();
         // Spawn enrichment loops as background tasks (extraction, narrator,
         // consolidation) — unless the daemon is live and already runs them.
-        let enrichment_handles = if self.proxied {
-            Vec::new()
-        } else {
-            crate::daemon::spawn_enrichment_loops(
-                self.storage.clone(),
-                self.embeddings.clone(),
-                self.search.clone(),
-                self.projects_dir().to_path_buf(),
-            )
-        };
+        let enrichment_handles = self.background_handles();
 
         let server = CsrServer::new(
             self.storage,
@@ -3024,5 +3036,42 @@ mod maintenance_probes {
             "Keep the rollback plan and freeze the deployment."
         );
         assert!(!dir.path().join("index-v3/manifest.json").exists());
+    }
+}
+
+#[cfg(test)]
+mod graph_drain_wiring_tests {
+    use super::*;
+
+    /// A daemon plist on disk makes the engine proxied even when the daemon is
+    /// down; the MCP server must still drain the code graph.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_proxied_mcp_server_drains_the_graph_when_no_drainer_beats() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        crate::daemon::seed_pending_graph(&storage);
+        let engine = Engine::from_parts(
+            storage.clone(),
+            Arc::new(EmbeddingEngine::new().unwrap()),
+            Arc::new(RwLock::new(SearchEngine::new(16))),
+            dir.path().to_path_buf(),
+        )
+        .proxied_for_test();
+        assert!(engine.is_proxied());
+
+        let handles = engine.background_handles();
+        let mut waited = 0;
+        while !storage.pending_resolve_files().unwrap().is_empty() && waited < 100 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            waited += 1;
+        }
+        for h in handles {
+            h.abort();
+        }
+        assert!(
+            storage.pending_resolve_files().unwrap().is_empty(),
+            "a proxied server drained the pending file"
+        );
     }
 }

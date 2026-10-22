@@ -49,6 +49,53 @@ pub const DRAIN_INTERVAL: Duration = Duration::from_secs(15);
 
 const LOCK_FILE: &str = "graph-drain.lock";
 
+/// What a drainer's heartbeat says it can do. A binary that wrote this has the
+/// generation drain (this module); an older daemon writes no heartbeat at all,
+/// so "no heartbeat with the capability" means nobody is consuming generations.
+pub const DRAIN_CAPABILITY: u32 = 1;
+
+/// `meta` key of the drainer heartbeat: `<unix seconds> <capability> <owner>`.
+pub const HEARTBEAT_KEY: &str = "graph_drain_heartbeat";
+
+/// How old a heartbeat may be and still count as a live drainer.
+pub const HEARTBEAT_FRESH_SECS: u64 = 60;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Record that `owner` is draining as of now. Best effort: a locked database
+/// means the beat is skipped and the next tick writes it.
+pub fn beat(storage: &Storage, owner: &str) {
+    let value = format!("{} {} {}", unix_now(), DRAIN_CAPABILITY, owner);
+    if let Err(e) = storage.set_meta(HEARTBEAT_KEY, &value) {
+        tracing::debug!("graph drain heartbeat not written: {e}");
+    }
+}
+
+/// Whether a drainer other than `own` beat recently with the drain capability.
+/// `value` is the stored heartbeat, `now` unix seconds.
+pub fn other_drainer_is_live(value: Option<&str>, own: &str, now: u64) -> bool {
+    let Some(value) = value else { return false };
+    let mut parts = value.splitn(3, ' ');
+    let (Some(at), Some(capability), Some(owner)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let (Ok(at), Ok(capability)) = (at.parse::<u64>(), capability.parse::<u32>()) else {
+        return false;
+    };
+    owner != own && capability >= DRAIN_CAPABILITY && now.saturating_sub(at) < HEARTBEAT_FRESH_SECS
+}
+
+/// [`other_drainer_is_live`] against the stored heartbeat and the clock.
+pub fn another_drainer_is_live(storage: &Storage, own: &str) -> bool {
+    let stored = storage.get_meta(HEARTBEAT_KEY).ok().flatten();
+    other_drainer_is_live(stored.as_deref(), own, unix_now())
+}
+
 /// What one drain did.
 #[derive(Debug, Default, Clone)]
 pub struct GraphDrain {
@@ -619,5 +666,17 @@ mod tests {
         let left = pending(&storage);
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].0, "aaa", "the failed project stays pending");
+    }
+
+    #[test]
+    fn a_heartbeat_counts_only_when_fresh_foreign_and_capable() {
+        let now = 1_000_000;
+        let live = |v: &str, own: &str| other_drainer_is_live(Some(v), own, now);
+        assert!(live("999990 1 daemon-7", "mcp-3"));
+        assert!(!live("999990 1 mcp-3", "mcp-3"), "own beat");
+        assert!(!live("999900 1 daemon-7", "mcp-3"), "stale");
+        assert!(!live("999990 0 daemon-7", "mcp-3"), "no capability");
+        assert!(!live("garbage", "mcp-3"));
+        assert!(!other_drainer_is_live(None, "mcp-3", now));
     }
 }

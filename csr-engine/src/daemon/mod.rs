@@ -576,6 +576,7 @@ impl Daemon {
                 db_path.clone(),
                 interval,
                 shutdown.clone(),
+                DrainRole::daemon(),
             ))
         });
 
@@ -3039,9 +3040,19 @@ fn graph_drain_interval() -> Option<std::time::Duration> {
 /// One pass of the graph drain on a blocking thread: the project-wide edge
 /// resolve + rank for files PostToolUse extracted since the last one. A cheap
 /// pending check first; `extraction::graph_drain` explains the rest.
-pub async fn graph_drain_tick(storage: Arc<Storage>, db_path: PathBuf) {
+///
+/// A follower (the MCP server) drains only when no other drainer has a fresh
+/// heartbeat with the drain capability; the daemon always does. Either way the
+/// tick writes its own heartbeat first, so followers stand down while a
+/// capable drainer is up and take over within a minute of it going away.
+pub async fn graph_drain_tick(storage: Arc<Storage>, db_path: PathBuf, role: DrainRole) {
     let result = tokio::task::spawn_blocking(move || {
-        crate::extraction::graph_drain::drain_if_pending(&storage, &db_path)
+        use crate::extraction::graph_drain as gd;
+        if role.follower && gd::another_drainer_is_live(&storage, &role.owner) {
+            return Ok(None);
+        }
+        gd::beat(&storage, &role.owner);
+        gd::drain_if_pending(&storage, &db_path)
     })
     .await;
     match result {
@@ -3068,20 +3079,53 @@ pub async fn graph_drain_tick(storage: Arc<Storage>, db_path: PathBuf) {
     }
 }
 
-/// The graph drain loop. Runs in the daemon's main loop and, when no daemon is
-/// live, in the MCP server (`spawn_enrichment_loops`). Not tied to the code map:
+/// Who is draining: the heartbeat owner, and whether to stand down for another
+/// capable drainer.
+#[derive(Debug, Clone)]
+pub struct DrainRole {
+    pub owner: String,
+    pub follower: bool,
+}
+
+impl DrainRole {
+    fn new(follower: bool) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let owner = format!(
+            "{}-{}-{nanos}",
+            if follower { "mcp" } else { "daemon" },
+            std::process::id()
+        );
+        Self { owner, follower }
+    }
+
+    /// The daemon: drains whenever the lock is free.
+    pub fn daemon() -> Self {
+        Self::new(false)
+    }
+
+    /// The MCP server: drains only when no capable drainer is beating.
+    pub fn follower() -> Self {
+        Self::new(true)
+    }
+}
+
+/// The graph drain loop. Runs in the daemon's main loop and in every MCP server
+/// as a follower (`Engine::background_handles`). Not tied to the code map:
 /// `CSR_NO_CODEMAP=1` leaves it running.
 pub async fn graph_drain_loop(
     storage: Arc<Storage>,
     db_path: PathBuf,
     interval: std::time::Duration,
     shutdown: Arc<AtomicBool>,
+    role: DrainRole,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        graph_drain_tick(storage.clone(), db_path.clone()).await;
+        graph_drain_tick(storage.clone(), db_path.clone(), role.clone()).await;
         for _ in 0..interval.as_secs().max(1) {
             if shutdown.load(Ordering::SeqCst) {
                 return;
@@ -3110,8 +3154,10 @@ async fn delayed<F: std::future::Future<Output = ()>>(delay: std::time::Duration
     fut.await;
 }
 
-/// The MCP server's graph drain: the loop the daemon would run, for a session
-/// with no daemon (fresh installs have none). Its first tick is at once, so a
+/// The MCP server's graph drain: the loop the daemon would run, as a follower
+/// that stands down while another drainer has a fresh heartbeat. Covers a fresh
+/// install (no daemon), a daemon that is down although its plist is present, and
+/// an older daemon that never drains. Its first tick is at once, so a
 /// file an earlier hook left pending is resolved as the session starts. Embeds
 /// nothing, hence no initial delay. `None` when the drain is switched off or the
 /// database has no path (in memory).
@@ -3123,6 +3169,7 @@ pub fn spawn_graph_drain(storage: Arc<Storage>) -> Option<tokio::task::JoinHandl
         db_path,
         interval,
         Arc::new(AtomicBool::new(false)),
+        DrainRole::follower(),
     )))
 }
 
@@ -3186,9 +3233,6 @@ pub fn spawn_enrichment_loops(
     if let Some(h) = narrator_handle {
         handles.push(h);
     }
-    // No daemon is live (the caller skips this function when one is), so the
-    // MCP server drains the code graph.
-    handles.extend(spawn_graph_drain(storage));
     handles
 }
 
@@ -3198,6 +3242,51 @@ pub fn prompt_hash(content: &str) -> String {
     hasher.update(content.as_bytes());
     let result = hasher.finalize();
     result.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// A file database with `caller` (b.rs) calling `callee` (a.rs), extracted and
+/// not resolved, b.rs pending: what a PostToolUse hook leaves for the drain.
+#[cfg(test)]
+pub(crate) fn seed_pending_graph(storage: &Storage) {
+    storage
+        .with_connection(|c| {
+            for (id, file, name) in [("callee", "a.rs", "callee"), ("caller", "b.rs", "caller")] {
+                crate::storage::codegraph::upsert_node(
+                    c,
+                    &crate::storage::codegraph::NodeRow {
+                        id: id.into(),
+                        repo: "r".into(),
+                        project: "proj".into(),
+                        file: file.into(),
+                        lang: "rust".into(),
+                        kind: "function".into(),
+                        name: name.into(),
+                        first_conv_id: "c".into(),
+                        last_conv_id: "c".into(),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            crate::storage::codegraph::replace_file_edges(
+                c,
+                "proj",
+                "b.rs",
+                &[crate::storage::codegraph::EdgeRow {
+                    src_id: "caller".into(),
+                    dst_id: "name:callee".into(),
+                    kind: "calls".into(),
+                    src_file: "b.rs".into(),
+                    weight: 1.0,
+                    ..Default::default()
+                }],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    storage
+        .upsert_code_file_state_pending("proj", "b.rs", "h")
+        .unwrap();
+    assert_eq!(storage.pending_resolve_files().unwrap().len(), 1);
 }
 
 #[cfg(test)]
@@ -4224,46 +4313,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("csr-engine.db");
         let storage = Arc::new(Storage::open(&db).unwrap());
-        storage
-            .with_connection(|c| {
-                for (id, file, name) in [("callee", "a.rs", "callee"), ("caller", "b.rs", "caller")]
-                {
-                    crate::storage::codegraph::upsert_node(
-                        c,
-                        &crate::storage::codegraph::NodeRow {
-                            id: id.into(),
-                            repo: "r".into(),
-                            project: "proj".into(),
-                            file: file.into(),
-                            lang: "rust".into(),
-                            kind: "function".into(),
-                            name: name.into(),
-                            first_conv_id: "c".into(),
-                            last_conv_id: "c".into(),
-                            ..Default::default()
-                        },
-                    )?;
-                }
-                crate::storage::codegraph::replace_file_edges(
-                    c,
-                    "proj",
-                    "b.rs",
-                    &[crate::storage::codegraph::EdgeRow {
-                        src_id: "caller".into(),
-                        dst_id: "name:callee".into(),
-                        kind: "calls".into(),
-                        src_file: "b.rs".into(),
-                        weight: 1.0,
-                        ..Default::default()
-                    }],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        storage
-            .upsert_code_file_state_pending("proj", "b.rs", "h")
-            .unwrap();
-        assert_eq!(storage.pending_resolve_files().unwrap().len(), 1);
+        seed_pending_graph(&storage);
 
         let handle = spawn_graph_drain(storage.clone()).expect("a file database drains");
         let mut waited = 0;
@@ -4286,6 +4336,62 @@ mod tests {
             })
             .unwrap();
         assert_eq!(dst, "callee");
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// One follower tick against a database with a heartbeat of `beat` written
+    /// by someone else; whether it drained.
+    async fn follower_drains_given(beat: Option<String>) -> bool {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        seed_pending_graph(&storage);
+        if let Some(beat) = beat {
+            storage
+                .set_meta(crate::extraction::graph_drain::HEARTBEAT_KEY, &beat)
+                .unwrap();
+        }
+        graph_drain_tick(storage.clone(), db, DrainRole::follower()).await;
+        storage.pending_resolve_files().unwrap().is_empty()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_follower_yields_only_to_a_fresh_heartbeat_with_the_drain_capability() {
+        let now = now_secs();
+        // Nobody has ever drained (a fresh install, or an older daemon that
+        // writes no heartbeat): the follower drains.
+        assert!(follower_drains_given(None).await);
+        // A capable drainer beat a few seconds ago: the follower stands down.
+        assert!(!follower_drains_given(Some(format!("{} 1 daemon-1-0", now - 5))).await);
+        // The same drainer, gone for more than a minute: the follower drains.
+        assert!(follower_drains_given(Some(format!("{} 1 daemon-1-0", now - 120))).await);
+        // A heartbeat without the capability (a different, older writer): drains.
+        assert!(follower_drains_given(Some(format!("{} 0 daemon-1-0", now - 1))).await);
+        // Garbage in the key is not a drainer.
+        assert!(follower_drains_given(Some("not a heartbeat".into())).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_tick_writes_the_heartbeat_followers_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let daemon = DrainRole::daemon();
+        graph_drain_tick(storage.clone(), db, daemon.clone()).await;
+        assert!(crate::extraction::graph_drain::another_drainer_is_live(
+            &storage,
+            &DrainRole::follower().owner
+        ));
+        assert!(
+            !crate::extraction::graph_drain::another_drainer_is_live(&storage, &daemon.owner),
+            "a drainer does not yield to its own beat"
+        );
     }
 
     #[tokio::test]
