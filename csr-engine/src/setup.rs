@@ -1930,6 +1930,15 @@ fn agent_facts(plist: &PlistValue) -> AgentFacts {
     }
 }
 
+/// Where the first `ProgramArguments` string sits in the raw text, so a repair
+/// can replace those bytes and leave the rest of the user's file untouched.
+fn plist_program_span(text: &str) -> Option<std::ops::Range<usize>> {
+    let key = text.find("<key>ProgramArguments</key>")?;
+    let open = key + text[key..].find("<string>")? + "<string>".len();
+    let close = open + text[open..].find("</string>")?;
+    Some(open..close)
+}
+
 /// Keys launchd adds to a loaded job's environment. They are not the agent's
 /// own configuration and must never be written back into a plist.
 const LAUNCHD_INJECTED_ENV: [&str; 2] = ["XPC_SERVICE_NAME", "OSLogRateLimit"];
@@ -2155,6 +2164,7 @@ fn install_daemon_agent(
         .cloned();
     let notes = carried_notes(&merged, old_path.as_deref(), &spec.path_env(), &plist);
 
+    let mut notes = notes;
     let outcome = apply_daemon_agent(
         &spec,
         existing,
@@ -2162,13 +2172,9 @@ fn install_daemon_agent(
         uid,
         launchctl,
         pause,
+        &mut notes,
     );
-    let kept = matches!(outcome, DaemonOutcome::KeptExisting);
-    DaemonRun {
-        outcome,
-        // A kept hand-written agent is not rewritten, so nothing was carried.
-        notes: if kept { Vec::new() } else { notes },
-    }
+    DaemonRun { outcome, notes }
 }
 
 fn apply_daemon_agent(
@@ -2178,19 +2184,35 @@ fn apply_daemon_agent(
     uid: u32,
     launchctl: &mut LaunchctlRun,
     pause: &dyn Fn(Duration),
+    notes: &mut Vec<String>,
 ) -> DaemonOutcome {
     let plist = spec.plist_path();
-    let wanted = render_daemon_plist(spec);
-    // A hand-written agent whose binary still exists is the user's. It is
-    // started if it is not loaded, never rewritten.
-    let foreign = existing.as_deref().is_some_and(|text| {
-        !text.contains(DAEMON_PLIST_MARKER)
-            && parse_plist(text)
+    // A plist without our marker is the user's. It is never regenerated: while
+    // its binary exists (or setup cannot read it) it is only started; when the
+    // binary is gone, that one path is repaired and nothing else is touched.
+    let (foreign, wanted) = match existing.as_deref() {
+        Some(text) if !text.contains(DAEMON_PLIST_MARKER) => {
+            notes.clear(); // nothing was merged into a file we do not write
+            let program = parse_plist(text)
                 .map(|p| agent_facts(&p).program_args)
-                .and_then(|args| args.into_iter().next())
-                .is_some_and(|program| Path::new(&program).exists())
-    });
-    let rewrite = !foreign && existing.as_deref() != Some(wanted.as_str());
+                .and_then(|args| args.into_iter().next());
+            match (program, plist_program_span(text)) {
+                (Some(program), Some(span)) if !Path::new(&program).exists() => {
+                    notes.push(format!(
+                        "Your agent pointed at {program}, which is gone. Repaired that one path to {}; the rest of {} is unchanged.",
+                        spec.engine.display(),
+                        plist.display()
+                    ));
+                    let mut repaired = text.to_owned();
+                    repaired.replace_range(span, &xml_escape(&spec.engine.to_string_lossy()));
+                    (true, repaired)
+                }
+                _ => (true, text.to_owned()),
+            }
+        }
+        _ => (false, render_daemon_plist(spec)),
+    };
+    let rewrite = existing.as_deref() != Some(wanted.as_str());
 
     let domain = format!("gui/{uid}");
     let target = format!("{domain}/{DAEMON_LABEL}");
@@ -3875,19 +3897,61 @@ esac
         assert_eq!(install(&spec, &mut fake), DaemonOutcome::KeptExisting);
         assert_eq!(std::fs::read_to_string(spec.plist_path()).unwrap(), theirs);
 
-        // The same file pointing at a binary that is gone is not worth keeping,
-        // but what the user put in it is: their switch is carried across.
+        // The same file pointing at a binary that is gone gets that one path
+        // repaired. Everything else in it is the user's and stays byte for byte.
         let dead = theirs.replace(&exe.display().to_string(), "/nowhere/csr-engine");
-        std::fs::write(spec.plist_path(), dead).unwrap();
-        assert_eq!(
-            install(&spec, &mut FakeLaunchctl::new(false)),
-            DaemonOutcome::Running { rewritten: true }
-        );
-        let mut carried = spec.clone();
-        carried.env.insert("CSR_NO_RECAP".into(), "1".into());
+        std::fs::write(spec.plist_path(), &dead).unwrap();
+        let run = install_run(&spec, &mut FakeLaunchctl::new(false));
+        assert_eq!(run.outcome, DaemonOutcome::KeptExisting);
         assert_eq!(
             std::fs::read_to_string(spec.plist_path()).unwrap(),
-            render_daemon_plist(&carried)
+            dead.replace("/nowhere/csr-engine", "/opt/csr/bin/csr-engine")
+        );
+        assert!(
+            run.notes.iter().any(|n| n.contains("/nowhere/csr-engine")),
+            "{:?}",
+            run.notes
+        );
+    }
+
+    #[test]
+    fn repairing_a_dead_binary_keeps_every_other_choice_in_a_hand_written_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let theirs = "<?xml version=\"1.0\"?>
+<!-- mine -->
+<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+  <key>ProgramArguments</key><array>
+    <string>/old/place/csr-engine</string>
+    <string>--db-path</string><string>/data/mine.db</string>
+    <string>--projects-dir</string><string>/data/projects</string>
+    <string>daemon</string><string>--no-ai</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>CSR_NO_DREAMING</key><string>1</string>
+    <key>CSR_NARRATIVE_MODEL</key><string>haiku</string>
+  </dict>
+  <key>StartInterval</key><integer>77</integer>
+</dict></plist>
+";
+        std::fs::create_dir_all(spec.plist_path().parent().unwrap()).unwrap();
+        std::fs::write(spec.plist_path(), theirs).unwrap();
+        let mut fake = FakeLaunchctl::new(false);
+        assert_eq!(install(&spec, &mut fake), DaemonOutcome::KeptExisting);
+        let after = std::fs::read_to_string(spec.plist_path()).unwrap();
+        assert_eq!(
+            after,
+            theirs.replace("/old/place/csr-engine", "/opt/csr/bin/csr-engine")
+        );
+        assert!(fake.calls.iter().any(|c| c.starts_with("bootstrap")));
+
+        // A plist setup cannot read is the user's too: it is never overwritten.
+        std::fs::write(spec.plist_path(), "bplist00\u{1}binary").unwrap();
+        install(&spec, &mut FakeLaunchctl::new(false));
+        assert_eq!(
+            std::fs::read_to_string(spec.plist_path()).unwrap(),
+            "bplist00\u{1}binary"
         );
     }
 
