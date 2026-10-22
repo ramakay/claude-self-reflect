@@ -2462,20 +2462,29 @@ fn two_panes_of_one_session_both_draw_when_woken_and_one_ending_leaves_the_other
     };
     let first_log = paths.home.join("first.log");
     let second_log = paths.home.join("second.log");
-    let mut first = spawn(&first_log);
-    let mut second = spawn(&second_log);
+    // A failed assertion must not leave a pane running.
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut first = Reap(spawn(&first_log));
+    let second = Reap(spawn(&second_log));
+    let (first_id, second_id) = (first.0.id(), second.0.id());
     let frames = |log: &std::path::Path| fs::read_to_string(log).map_or(0, |t| t.lines().count());
     let pipe = |pid: u32| paths.keep.join(format!("panes/sess-now.{pid}.wake"));
     let start = Instant::now();
     while (frames(&first_log) == 0
         || frames(&second_log) == 0
-        || !pipe(first.id()).exists()
-        || !pipe(second.id()).exists())
+        || !pipe(first_id).exists()
+        || !pipe(second_id).exists())
         && start.elapsed() < Duration::from_secs(60)
     {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let both_listening = pipe(first.id()).exists() && pipe(second.id()).exists();
+    let both_listening = pipe(first_id).exists() && pipe(second_id).exists();
     // Let the first frames settle and the debounce's spacing pass.
     std::thread::sleep(Duration::from_millis(2500));
     let wake = |before: (usize, usize)| {
@@ -2494,8 +2503,8 @@ fn two_panes_of_one_session_both_draw_when_woken_and_one_ending_leaves_the_other
     let before = (frames(&first_log), frames(&second_log));
     wake(before);
     let after_both = (frames(&first_log), frames(&second_log));
-    let _ = first.kill();
-    let _ = first.wait();
+    let _ = first.0.kill();
+    let _ = first.0.wait();
     std::thread::sleep(Duration::from_millis(2500));
     let lone = frames(&second_log);
     assert!(csr_engine::companion::wake::notify(
@@ -2508,8 +2517,7 @@ fn two_panes_of_one_session_both_draw_when_woken_and_one_ending_leaves_the_other
         std::thread::sleep(Duration::from_millis(20));
     }
     let after_lone = frames(&second_log);
-    let _ = second.kill();
-    let _ = second.wait();
+    drop(second);
     assert!(both_listening, "each pane keeps a wake pipe of its own");
     assert!(
         after_both.0 > before.0 && after_both.1 > before.1,
