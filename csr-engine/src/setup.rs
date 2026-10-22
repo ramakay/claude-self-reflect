@@ -2072,20 +2072,23 @@ fn parse_launchctl_print(text: &str) -> LoadedJob {
     job
 }
 
-/// The agent's environment after setup: what the job already had (loaded, then
-/// the file on disk), then what this run was given. PATH is setup's alone. Every
-/// other key survives; the second value says where each came from.
+/// The agent's environment after setup. The file on disk is what the user can
+/// read and edit, so when it exists and parses it is the whole truth about
+/// which keys the agent has: a key deleted from it while the job is still
+/// loaded stays deleted. The loaded job's environment is the fallback only when
+/// there is no readable file. Then what this run was given overrides. PATH is
+/// setup's alone. The second value says where each came from.
 fn merge_agent_env(
     loaded: &std::collections::BTreeMap<String, String>,
-    on_disk: &std::collections::BTreeMap<String, String>,
+    on_disk: Option<&std::collections::BTreeMap<String, String>>,
     this_run: &std::collections::BTreeMap<String, String>,
 ) -> std::collections::BTreeMap<String, (String, &'static str)> {
     let mut merged = std::collections::BTreeMap::new();
-    for (source, label) in [
-        (loaded, "the loaded agent"),
-        (on_disk, "the existing agent"),
-        (this_run, "this run"),
-    ] {
+    let earlier = match on_disk {
+        Some(file) => (file, "the existing agent"),
+        None => (loaded, "the loaded agent"),
+    };
+    for (source, label) in [earlier, (this_run, "this run")] {
         for (key, value) in source {
             if key != "PATH" && !LAUNCHD_INJECTED_ENV.contains(&key.as_str()) {
                 merged.insert(key.clone(), (value.clone(), label));
@@ -2275,17 +2278,20 @@ fn install_daemon_agent(
     let on_disk = existing
         .as_deref()
         .and_then(parse_plist)
-        .map(|p| agent_facts(&p))
-        .unwrap_or_default();
-    let merged = merge_agent_env(&loaded_job.env, &on_disk.env, &spec.env);
+        .map(|p| agent_facts(&p));
+    let merged = merge_agent_env(
+        &loaded_job.env,
+        on_disk.as_ref().map(|facts| &facts.env),
+        &spec.env,
+    );
     let mut spec = spec.clone();
     spec.env = merged
         .iter()
         .map(|(key, (value, _))| (key.clone(), value.clone()))
         .collect();
     let old_path = on_disk
-        .env
-        .get("PATH")
+        .as_ref()
+        .and_then(|facts| facts.env.get("PATH"))
         .or_else(|| loaded_job.env.get("PATH"))
         .cloned();
     notes.extend(carried_notes(
@@ -4460,6 +4466,46 @@ esac
         // a non-CSR value is named, never printed
         assert!(said.contains("ANTHROPIC_BASE_URL (from"), "{said}");
         assert!(!said.contains("http://x"), "{said}");
+    }
+
+    #[test]
+    fn a_key_removed_from_the_file_is_not_brought_back_by_the_loaded_job() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1"), ("CSR_NARRATIVE_MODEL", "haiku")]);
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let before = std::fs::read_to_string(spec.plist_path()).unwrap();
+
+        // The user deletes the switch from the file; the job is still loaded
+        // with it, because nothing reloaded it yet.
+        let edited = before.replace(
+            "    <key>CSR_NO_DREAMING</key>\n    <string>1</string>\n",
+            "",
+        );
+        assert_ne!(edited, before, "the fixture must have changed");
+        std::fs::write(spec.plist_path(), &edited).unwrap();
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_of(&before, 77);
+
+        spec.env = Default::default();
+        install(&spec, &mut fake);
+        let facts = agent_facts(
+            &parse_plist(&std::fs::read_to_string(spec.plist_path()).unwrap()).unwrap(),
+        );
+        assert!(
+            !facts.env.contains_key("CSR_NO_DREAMING"),
+            "the deleted key came back: {:?}",
+            facts.env
+        );
+        assert_eq!(facts.env["CSR_NARRATIVE_MODEL"], "haiku");
+
+        // This run's own value still wins over the file.
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1")]);
+        install(&spec, &mut FakeLaunchctl::new(true));
+        let facts = agent_facts(
+            &parse_plist(&std::fs::read_to_string(spec.plist_path()).unwrap()).unwrap(),
+        );
+        assert_eq!(facts.env["CSR_NO_DREAMING"], "1");
     }
 
     #[test]
