@@ -358,3 +358,45 @@ fn the_canary_generates_every_dream_card_emitter() {
     assert!(before.failures.is_empty(), "{:#?}", before.failures);
     assert!(before.generated >= 4 && before.generated == before.correctly_detected);
 }
+
+/// Every line shape the continuum and the episode index can write, with and
+/// without an outcome label, is CSR's own text when it is pasted alone.
+#[test]
+fn each_emitted_continuum_and_index_line_is_an_emission_on_its_own() {
+    let mut seen = std::collections::BTreeSet::new();
+    for output in engine_outputs()
+        .into_iter()
+        .filter(|output| matches!(output.formatter, "continuum" | "episode_index"))
+    {
+        for line in output.text.lines() {
+            let shape = if line.starts_with("- [") {
+                "index entry"
+            } else if line.starts_with("LAST: ") {
+                "last line"
+            } else {
+                continue;
+            };
+            let labeled = line.contains("(outcome=") || line.contains("outcome=");
+            seen.insert((shape, labeled));
+            assert!(
+                crate::extraction::provenance::is_csr_emission(line),
+                "{}: `{line}` pasted alone reads as prose",
+                output.id
+            );
+            assert!(
+                crate::extraction::provenance::extractable(line).is_none(),
+                "{}: `{line}` is extractable",
+                output.id
+            );
+        }
+    }
+    let expected: std::collections::BTreeSet<_> = [
+        ("index entry", false),
+        ("index entry", true),
+        ("last line", false),
+        ("last line", true),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(seen, expected, "a shape has no canary output");
+}

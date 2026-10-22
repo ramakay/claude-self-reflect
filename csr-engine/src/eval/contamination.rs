@@ -515,6 +515,25 @@ pub fn engine_outputs() -> Vec<Output> {
         ]),
     ));
 
+    // The outcome label is shown only for an episode the current rule
+    // labeled and a receipt backs; every other episode's lines have none.
+    let trusted = fixture_episode(serde_json::json!({
+        "outcome_version": 1,
+        "closing_receipt": true,
+    }));
+    out.push(output(
+        "continuum-trusted-outcome",
+        "continuum",
+        R::Continuum,
+        tier0(&trusted, &[]),
+    ));
+    out.push(output(
+        "episode-index-trusted-outcome",
+        "episode_index",
+        R::EpisodeIndex,
+        session_start::format_episode_index(&[(trusted, "2h ago".to_string())]),
+    ));
+
     // SessionStart pieces
     out.push(output(
         "manifest",

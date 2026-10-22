@@ -313,6 +313,11 @@ pub fn is_csr_emission(text: &str) -> bool {
             return true;
         }
     }
+    // Single lines the formatters write that carry too few field tokens to
+    // trip the count below once the outcome label is withheld.
+    if INDEX_ENTRY_LINE.is_match(text) || CONTINUUM_LAST_LINE.is_match(text) {
+        return true;
+    }
     EMISSION_FIELD_TOKENS
         .iter()
         .filter(|t| text.contains(**t))
@@ -939,6 +944,23 @@ static INJECTED_ITEM_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLo
     .expect("injected item regex")
 });
 
+/// An EPISODE INDEX entry pasted alone, as `format_episode_index` writes it:
+/// `- [<age>] <request> — <last>[ (outcome=<label>)] → csr_reflect_on_past("conv_<id>")`.
+/// The outcome label is withheld when it cannot be trusted, so the entry has
+/// to be recognized with or without it.
+static INDEX_ENTRY_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?m)^[ \t]*- \[[^\]\n]*\] .+ → csr_reflect_on_past\("conv_[^"\n]*"\)[ \t]*$"#,
+    )
+    .expect("index entry regex")
+});
+
+/// A CONTINUUM `LAST:` line pasted alone: `LAST: <text> ([outcome=<label>, ]trust=<tier>)`.
+static CONTINUUM_LAST_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*LAST: .+ \((?:outcome=[^)\n]*, )?trust=[a-z_]+\)[ \t]*$")
+        .expect("continuum last regex")
+});
+
 /// Byte offset just past the ellipsis `one_line` appends when it cut a send
 /// text that starts at `start`, if it did.
 fn pane_truncation_end(line: &str, start: usize) -> Option<usize> {
@@ -1285,6 +1307,33 @@ mod tests {
             mine.unwrap_or(""),
             "strip_csr_emissions: {input}"
         );
+    }
+
+    /// An index item or a LAST line pasted alone is CSR's own line, with the
+    /// outcome label or without it: the label is withheld when it cannot be
+    /// trusted, and that must not make the line look like prose.
+    #[test]
+    fn a_pasted_index_item_or_last_line_is_an_emission_with_or_without_an_outcome() {
+        for line in [
+            "- [1h ago] Fix auth \u{2014} Investigated \u{2192} csr_reflect_on_past(\"conv_s\")",
+            "- [1h ago] Fix auth \u{2014} Investigated (outcome=success) \u{2192} csr_reflect_on_past(\"conv_s\")",
+            "LAST: Notes shipped. (trust=user_history)",
+            "LAST: Notes shipped. (outcome=partial, trust=unknown)",
+        ] {
+            assert!(is_csr_emission(line), "{line}");
+            assert!(extractable(line).is_none(), "{line}");
+            // Behind a line of the person's own words it is still found.
+            let mixed = format!("please look at this\n{line}");
+            assert!(extractable(&mixed).is_none() || is_csr_emission(&mixed), "{line}");
+        }
+        // Prose that merely talks about the same words stays the person's.
+        for prose in [
+            "The last line, LAST: is a label we print.",
+            "- [ ] write the test, then csr_reflect_on_past is what we call",
+            "Run it and note that trust=user_history appears in status.",
+        ] {
+            assert!(!is_csr_emission(prose), "{prose}");
+        }
     }
 
     /// Extraction and import must not diverge silently on a mention: where
