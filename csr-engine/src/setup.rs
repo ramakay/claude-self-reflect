@@ -1641,8 +1641,10 @@ struct DaemonAgentSpec {
     /// Where `claude` resolved when setup ran, if anywhere. The daemon's
     /// narratives and dream passes run it, and launchd starts with a bare PATH.
     claude_dir: Option<std::path::PathBuf>,
-    /// Setup itself ran with `CSR_NO_CODEX_IMPORT=1`; the daemon keeps that choice.
-    no_codex_import: bool,
+    /// Environment the agent carries besides PATH: the `CSR_*` choices of the
+    /// setup process, merged with what an existing agent already had. launchd
+    /// does not inherit the shell, so a switch that is not written here is off.
+    env: std::collections::BTreeMap<String, String>,
 }
 
 impl DaemonAgentSpec {
@@ -1657,8 +1659,7 @@ impl DaemonAgentSpec {
     }
 
     /// PATH for the daemon: where `claude` is, where this binary is, then the
-    /// usual places. Any `CSR_NO_*` key in the plist shows up in the pane as an
-    /// inhibited feature, so the only one written is the one setup was given.
+    /// usual places. Setup owns PATH; every other key comes from `env`.
     fn path_env(&self) -> String {
         let mut dirs: Vec<std::path::PathBuf> = Vec::new();
         dirs.extend(self.claude_dir.clone());
@@ -1688,11 +1689,19 @@ fn xml_escape(text: &str) -> String {
 fn render_daemon_plist(spec: &DaemonAgentSpec) -> String {
     let s = |p: &Path| xml_escape(&p.to_string_lossy());
     let data_dir = spec.data_dir();
-    let codex = if spec.no_codex_import {
-        "    <key>CSR_NO_CODEX_IMPORT</key>\n    <string>1</string>\n"
-    } else {
-        ""
-    };
+    let mut env = spec.env.clone();
+    env.insert("PATH".to_owned(), spec.path_env());
+    // Sorted (BTreeMap), so an unchanged install renders byte-identical text.
+    let env: String = env
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "    <key>{}</key>\n    <string>{}</string>\n",
+                xml_escape(key),
+                xml_escape(value)
+            )
+        })
+        .collect();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1712,9 +1721,7 @@ fn render_daemon_plist(spec: &DaemonAgentSpec) -> String {
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-{codex}    <key>PATH</key>
-    <string>{path}</string>
-  </dict>
+{env}  </dict>
   <key>WorkingDirectory</key>
   <string>{data}</string>
   <key>RunAtLoad</key>
@@ -1740,18 +1747,319 @@ fn render_daemon_plist(spec: &DaemonAgentSpec) -> String {
         engine = s(&spec.engine),
         db = s(&spec.db_path),
         projects = s(&spec.projects_dir),
-        path = xml_escape(&spec.path_env()),
         data = s(&data_dir),
         out = s(&data_dir.join("logs/daemon.out.log")),
         err = s(&data_dir.join("logs/daemon.err.log")),
     )
 }
 
-/// The first `ProgramArguments` string of a plist: the binary launchd would run.
-fn plist_program(text: &str) -> Option<&str> {
-    let rest = &text[text.find("<key>ProgramArguments</key>")?..];
-    let rest = &rest[rest.find("<string>")? + "<string>".len()..];
-    Some(&rest[..rest.find("</string>")?])
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// A value in an XML property list, as far as the daemon agent needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlistValue {
+    Text(String),
+    List(Vec<PlistValue>),
+    Dict(Vec<(String, PlistValue)>),
+    /// `<true/>`, `<integer>`, ...: present, not needed.
+    Other,
+}
+
+impl PlistValue {
+    fn get(&self, key: &str) -> Option<&PlistValue> {
+        match self {
+            PlistValue::Dict(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn text(&self) -> Option<&str> {
+        match self {
+            PlistValue::Text(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// Split XML into tags and text. Comments, the XML declaration and the doctype
+/// are dropped.
+fn plist_tokens(xml: &str) -> Vec<(bool, &str)> {
+    // (is_tag, content)
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while !rest.is_empty() {
+        if let Some(stripped) = rest.strip_prefix("<!--") {
+            rest = stripped.find("-->").map_or("", |i| &stripped[i + 3..]);
+        } else if rest.starts_with("<?") || rest.starts_with("<!") {
+            rest = rest.find('>').map_or("", |i| &rest[i + 1..]);
+        } else if let Some(stripped) = rest.strip_prefix('<') {
+            let Some(end) = stripped.find('>') else { break };
+            out.push((true, &stripped[..end]));
+            rest = &stripped[end + 1..];
+        } else {
+            let end = rest.find('<').unwrap_or(rest.len());
+            out.push((false, &rest[..end]));
+            rest = &rest[end..];
+        }
+    }
+    out
+}
+
+fn plist_value(tokens: &[(bool, &str)], at: &mut usize) -> Option<PlistValue> {
+    while *at < tokens.len() && !tokens[*at].0 {
+        *at += 1; // whitespace between elements
+    }
+    let (_, tag) = *tokens.get(*at)?;
+    *at += 1;
+    if tag.ends_with('/') {
+        return Some(PlistValue::Other);
+    }
+    match tag {
+        "string" => {
+            let mut text = String::new();
+            while let Some(&(is_tag, content)) = tokens.get(*at) {
+                *at += 1;
+                if is_tag {
+                    break; // </string>
+                }
+                text.push_str(content);
+            }
+            Some(PlistValue::Text(xml_unescape(&text)))
+        }
+        "array" => {
+            let mut items = Vec::new();
+            loop {
+                while *at < tokens.len() && !tokens[*at].0 {
+                    *at += 1;
+                }
+                match tokens.get(*at) {
+                    Some((true, "/array")) => {
+                        *at += 1;
+                        return Some(PlistValue::List(items));
+                    }
+                    Some(_) => items.push(plist_value(tokens, at)?),
+                    None => return None,
+                }
+            }
+        }
+        "dict" => {
+            let mut pairs = Vec::new();
+            loop {
+                while *at < tokens.len() && !tokens[*at].0 {
+                    *at += 1;
+                }
+                match tokens.get(*at) {
+                    Some((true, "/dict")) => {
+                        *at += 1;
+                        return Some(PlistValue::Dict(pairs));
+                    }
+                    Some((true, "key")) => {
+                        *at += 1;
+                        let key = match tokens.get(*at) {
+                            Some((false, text)) => {
+                                *at += 1;
+                                xml_unescape(text)
+                            }
+                            _ => String::new(),
+                        };
+                        *at += 1; // </key>
+                        pairs.push((key, plist_value(tokens, at)?));
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        _ => {
+            // <integer>, <real>, <date>, <data>: skip to the closing tag.
+            while let Some(&(is_tag, content)) = tokens.get(*at) {
+                *at += 1;
+                if is_tag && content.starts_with('/') {
+                    break;
+                }
+            }
+            Some(PlistValue::Other)
+        }
+    }
+}
+
+/// The top-level dictionary of an XML property list. `None` for anything else
+/// (a binary plist, a truncated file).
+fn parse_plist(xml: &str) -> Option<PlistValue> {
+    let tokens = plist_tokens(xml);
+    let mut at = 0;
+    while at < tokens.len() && !(tokens[at].0 && tokens[at].1.starts_with("plist")) {
+        at += 1;
+    }
+    at += 1;
+    plist_value(&tokens, &mut at).filter(|v| matches!(v, PlistValue::Dict(_)))
+}
+
+/// The parts of a launchd agent that setup compares and carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AgentFacts {
+    program_args: Vec<String>,
+    env: std::collections::BTreeMap<String, String>,
+}
+
+fn agent_facts(plist: &PlistValue) -> AgentFacts {
+    let strings = |value: Option<&PlistValue>| -> Vec<String> {
+        match value {
+            Some(PlistValue::List(items)) => items
+                .iter()
+                .filter_map(|i| i.text().map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let env = match plist.get("EnvironmentVariables") {
+        Some(PlistValue::Dict(pairs)) => pairs
+            .iter()
+            .filter_map(|(k, v)| v.text().map(|t| (k.clone(), t.to_owned())))
+            .collect(),
+        _ => Default::default(),
+    };
+    AgentFacts {
+        program_args: strings(plist.get("ProgramArguments")),
+        env,
+    }
+}
+
+/// Keys launchd adds to a loaded job's environment. They are not the agent's
+/// own configuration and must never be written back into a plist.
+const LAUNCHD_INJECTED_ENV: [&str; 2] = ["XPC_SERVICE_NAME", "OSLogRateLimit"];
+
+/// `CSR_*` variables that describe the setup run, not the daemon.
+const SETUP_ONLY_ENV: [&str; 3] = ["CSR_AUTO_SETUP", "CSR_SKIP_SETUP", "CSR_NO_DAEMON"];
+
+/// The `CSR_*` choices of the setup process that the daemon should keep.
+fn carried_process_env(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> std::collections::BTreeMap<String, String> {
+    vars.into_iter()
+        .filter(|(key, _)| {
+            key.starts_with("CSR_")
+                && !SETUP_ONLY_ENV.contains(&key.as_str())
+                && !key.starts_with("CSR_BUILD_")
+        })
+        .collect()
+}
+
+/// What `launchctl print gui/<uid>/<label>` says about a loaded job.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LoadedJob {
+    pid: Option<u32>,
+    arguments: Vec<String>,
+    env: std::collections::BTreeMap<String, String>,
+}
+
+/// Parse `launchctl print` output. Only the top-level `arguments`,
+/// `environment` and `pid` entries count: `inherited environment` and `default
+/// environment` blocks sit beside them and are not the job's own.
+fn parse_launchctl_print(text: &str) -> LoadedJob {
+    let mut job = LoadedJob::default();
+    let mut block: Option<&str> = None;
+    for line in text.lines() {
+        let depth = line.len() - line.trim_start_matches('\t').len();
+        let body = line.trim();
+        if let Some(open) = block {
+            if depth <= 1 {
+                block = None; // the closing brace, or the next top-level entry
+            } else {
+                match open {
+                    "arguments" => job.arguments.push(body.to_owned()),
+                    _ => {
+                        if let Some((key, value)) = body.split_once(" => ") {
+                            job.env.insert(key.to_owned(), value.to_owned());
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        if depth != 1 {
+            continue;
+        }
+        if body == "arguments = {" {
+            block = Some("arguments");
+        } else if body == "environment = {" {
+            block = Some("environment");
+        } else if let Some(pid) = body.strip_prefix("pid = ") {
+            job.pid = pid.trim().parse().ok();
+        }
+    }
+    job.env
+        .retain(|key, _| !LAUNCHD_INJECTED_ENV.contains(&key.as_str()));
+    job
+}
+
+/// The agent's environment after setup: what the job already had (loaded, then
+/// the file on disk), then what this run was given. PATH is setup's alone. Every
+/// other key survives; the second value says where each came from.
+fn merge_agent_env(
+    loaded: &std::collections::BTreeMap<String, String>,
+    on_disk: &std::collections::BTreeMap<String, String>,
+    this_run: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, (String, &'static str)> {
+    let mut merged = std::collections::BTreeMap::new();
+    for (source, label) in [
+        (loaded, "the loaded agent"),
+        (on_disk, "the existing agent"),
+        (this_run, "this run"),
+    ] {
+        for (key, value) in source {
+            if key != "PATH" && !LAUNCHD_INJECTED_ENV.contains(&key.as_str()) {
+                merged.insert(key.clone(), (value.clone(), label));
+            }
+        }
+    }
+    merged
+}
+
+/// The sentences setup prints about what it carried into the agent.
+fn carried_notes(
+    merged: &std::collections::BTreeMap<String, (String, &'static str)>,
+    old_path: Option<&str>,
+    new_path: &str,
+    plist: &Path,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !merged.is_empty() {
+        let items: Vec<String> = merged
+            .iter()
+            .map(|(key, (value, source))| {
+                if key.starts_with("CSR_") {
+                    format!("{key}={value} (from {source})")
+                } else {
+                    format!("{key} (from {source})")
+                }
+            })
+            .collect();
+        notes.push(format!(
+            "Carried into the daemon agent: {}.",
+            items.join(", ")
+        ));
+    }
+    if let Some(old) = old_path.filter(|old| *old != new_path) {
+        notes.push(format!(
+            "PATH in the agent was replaced (setup owns it): {old} -> {new_path}"
+        ));
+    }
+    if merged
+        .get("CSR_NO_DREAMING")
+        .is_some_and(|(v, _)| matches!(v.trim(), "1" | "true"))
+    {
+        notes.push(format!(
+            "CSR_NO_DREAMING is set, so the daemon will not dream whatever you answered at step 7. Remove that key from {} to turn dreaming on.",
+            plist.display()
+        ));
+    }
+    notes
 }
 
 /// What the daemon step did, for the one summary line.
@@ -1769,22 +2077,30 @@ pub enum DaemonOutcome {
     Failed(String),
 }
 
-/// One `launchctl` call: `Ok(())` when it exited 0, otherwise its stderr.
-type LaunchctlRun<'a> = dyn FnMut(&[&str]) -> std::result::Result<(), String> + 'a;
+/// One `launchctl` call: its stdout when it exited 0, otherwise its stderr.
+type LaunchctlRun<'a> = dyn FnMut(&[&str]) -> std::result::Result<String, String> + 'a;
+
+/// What the daemon step did, and what it has to tell the user besides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonRun {
+    pub outcome: DaemonOutcome,
+    /// Extra lines for the summary (what was carried, what was replaced).
+    pub notes: Vec<String>,
+}
 
 /// `CSR_NO_DAEMON=1` (or `true`) is the opt-out.
 fn daemon_opted_out() -> bool {
     std::env::var("CSR_NO_DAEMON").is_ok_and(|v| matches!(v.trim(), "1" | "true"))
 }
 
-fn real_launchctl(args: &[&str]) -> std::result::Result<(), String> {
+fn real_launchctl(args: &[&str]) -> std::result::Result<String, String> {
     let out = Command::new("launchctl")
         .args(args)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("could not run launchctl: {e}"))?;
     if out.status.success() {
-        Ok(())
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         let detail = String::from_utf8_lossy(&out.stderr);
         Err(format!(
@@ -1809,23 +2125,76 @@ fn install_daemon_agent(
     uid: u32,
     launchctl: &mut LaunchctlRun,
     pause: &dyn Fn(Duration),
+) -> DaemonRun {
+    let plist = spec.plist_path();
+    let existing = std::fs::read_to_string(&plist).ok();
+    let target = format!("gui/{uid}/{DAEMON_LABEL}");
+    let loaded_text = launchctl(&["print", &target]).ok();
+
+    // What an existing agent already carries must survive: launchd does not
+    // inherit the shell, so a dropped kill switch silently turns the work on.
+    let loaded_job = loaded_text
+        .as_deref()
+        .map(parse_launchctl_print)
+        .unwrap_or_default();
+    let on_disk = existing
+        .as_deref()
+        .and_then(parse_plist)
+        .map(|p| agent_facts(&p))
+        .unwrap_or_default();
+    let merged = merge_agent_env(&loaded_job.env, &on_disk.env, &spec.env);
+    let mut spec = spec.clone();
+    spec.env = merged
+        .iter()
+        .map(|(key, (value, _))| (key.clone(), value.clone()))
+        .collect();
+    let old_path = on_disk
+        .env
+        .get("PATH")
+        .or_else(|| loaded_job.env.get("PATH"))
+        .cloned();
+    let notes = carried_notes(&merged, old_path.as_deref(), &spec.path_env(), &plist);
+
+    let outcome = apply_daemon_agent(
+        &spec,
+        existing,
+        loaded_text.is_some(),
+        uid,
+        launchctl,
+        pause,
+    );
+    let kept = matches!(outcome, DaemonOutcome::KeptExisting);
+    DaemonRun {
+        outcome,
+        // A kept hand-written agent is not rewritten, so nothing was carried.
+        notes: if kept { Vec::new() } else { notes },
+    }
+}
+
+fn apply_daemon_agent(
+    spec: &DaemonAgentSpec,
+    existing: Option<String>,
+    loaded: bool,
+    uid: u32,
+    launchctl: &mut LaunchctlRun,
+    pause: &dyn Fn(Duration),
 ) -> DaemonOutcome {
     let plist = spec.plist_path();
     let wanted = render_daemon_plist(spec);
-    let existing = std::fs::read_to_string(&plist).ok();
-
     // A hand-written agent whose binary still exists is the user's. It is
     // started if it is not loaded, never rewritten.
     let foreign = existing.as_deref().is_some_and(|text| {
         !text.contains(DAEMON_PLIST_MARKER)
-            && plist_program(text).is_some_and(|program| Path::new(program).exists())
+            && parse_plist(text)
+                .map(|p| agent_facts(&p).program_args)
+                .and_then(|args| args.into_iter().next())
+                .is_some_and(|program| Path::new(&program).exists())
     });
     let rewrite = !foreign && existing.as_deref() != Some(wanted.as_str());
 
     let domain = format!("gui/{uid}");
     let target = format!("{domain}/{DAEMON_LABEL}");
     let plist_arg = plist.to_string_lossy().into_owned();
-    let loaded = launchctl(&["print", &target]).is_ok();
 
     if rewrite {
         if let Err(e) = std::fs::create_dir_all(spec.data_dir().join("logs")) {
@@ -1848,8 +2217,8 @@ fn install_daemon_agent(
     } else if loaded {
         // Unchanged and loaded: restart onto the current build.
         return match launchctl(&["kickstart", "-k", &target]) {
-            Ok(()) if foreign => DaemonOutcome::KeptExisting,
-            Ok(()) => DaemonOutcome::Running { rewritten: false },
+            Ok(_) if foreign => DaemonOutcome::KeptExisting,
+            Ok(_) => DaemonOutcome::Running { rewritten: false },
             Err(e) => DaemonOutcome::Failed(e),
         };
     }
@@ -1861,7 +2230,7 @@ fn install_daemon_agent(
             pause(Duration::from_millis(500));
         }
         match launchctl(&["bootstrap", &domain, &plist_arg]) {
-            Ok(()) => {
+            Ok(_) => {
                 return if foreign {
                     DaemonOutcome::KeptExisting
                 } else {
@@ -1883,11 +2252,15 @@ fn daemon_step(
     uid: u32,
     launchctl: &mut LaunchctlRun,
     pause: &dyn Fn(Duration),
-) -> DaemonOutcome {
+) -> DaemonRun {
+    let bare = |outcome| DaemonRun {
+        outcome,
+        notes: Vec::new(),
+    };
     if opted_out {
-        DaemonOutcome::OptedOut
+        bare(DaemonOutcome::OptedOut)
     } else if !macos {
-        DaemonOutcome::Manual
+        bare(DaemonOutcome::Manual)
     } else {
         install_daemon_agent(spec, uid, launchctl, pause)
     }
@@ -1904,11 +2277,11 @@ fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
         db_path: absolute(db_path),
         projects_dir: absolute(projects_dir),
         claude_dir: find_on_path("claude").and_then(|p| p.parent().map(Path::to_path_buf)),
-        no_codex_import: crate::daemon::codex_import_disabled(),
+        env: carried_process_env(std::env::vars()),
     };
     // SAFETY: getuid has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
-    let outcome = daemon_step(
+    let run = daemon_step(
         &spec,
         daemon_opted_out(),
         cfg!(target_os = "macos"),
@@ -1916,9 +2289,12 @@ fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
         &mut real_launchctl,
         &std::thread::sleep,
     );
-    let mut text = daemon_report(&outcome, &engine);
+    let mut text = daemon_report(&run.outcome, &engine);
+    for note in &run.notes {
+        text.push_str(&format!("  {note}\n"));
+    }
     if matches!(
-        outcome,
+        run.outcome,
         DaemonOutcome::Running { .. } | DaemonOutcome::KeptExisting
     ) {
         text.push_str(if wait_for_daemon(&home, Duration::from_secs(20)) {
@@ -3253,7 +3629,7 @@ esac
             db_path: home.join(".claude-self-reflect/csr-engine.db"),
             projects_dir: home.join(".claude/projects"),
             claude_dir: Some("/opt/claude/bin".into()),
-            no_codex_import: false,
+            env: Default::default(),
         }
     }
 
@@ -3261,6 +3637,8 @@ esac
     /// first N bootstraps. Records every call.
     struct FakeLaunchctl {
         loaded: bool,
+        /// What `print` answers while the job is loaded.
+        print_text: String,
         bootstrap_fails: usize,
         calls: Vec<String>,
     }
@@ -3269,14 +3647,15 @@ esac
         fn new(loaded: bool) -> Self {
             Self {
                 loaded,
+                print_text: String::new(),
                 bootstrap_fails: 0,
                 calls: Vec::new(),
             }
         }
-        fn run(&mut self, args: &[&str]) -> std::result::Result<(), String> {
+        fn run(&mut self, args: &[&str]) -> std::result::Result<String, String> {
             self.calls.push(args[..args.len().min(2)].join(" "));
             match args[0] {
-                "print" if self.loaded => Ok(()),
+                "print" if self.loaded => Ok(self.print_text.clone()),
                 "print" => Err("not loaded".into()),
                 "bootstrap" if self.bootstrap_fails > 0 => {
                     self.bootstrap_fails -= 1;
@@ -3284,19 +3663,23 @@ esac
                 }
                 "bootstrap" => {
                     self.loaded = true;
-                    Ok(())
+                    Ok(String::new())
                 }
                 "bootout" => {
                     self.loaded = false;
-                    Ok(())
+                    Ok(String::new())
                 }
-                _ => Ok(()),
+                _ => Ok(String::new()),
             }
         }
     }
 
-    fn install(spec: &DaemonAgentSpec, fake: &mut FakeLaunchctl) -> DaemonOutcome {
+    fn install_run(spec: &DaemonAgentSpec, fake: &mut FakeLaunchctl) -> DaemonRun {
         install_daemon_agent(spec, 501, &mut |args| fake.run(args), &|_| {})
+    }
+
+    fn install(spec: &DaemonAgentSpec, fake: &mut FakeLaunchctl) -> DaemonOutcome {
+        install_run(spec, fake).outcome
     }
 
     #[test]
@@ -3328,10 +3711,11 @@ esac
             text.contains("<string>/opt/claude/bin:/opt/csr/bin:/Users/someone/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>"),
             "{text}"
         );
-        // A CSR_NO_* key reads as an inhibited feature in the pane.
+        // A CSR_NO_* key reads as an inhibited feature in the pane, so none
+        // appears unless somebody set one.
         assert!(!text.contains("CSR_NO_"), "{text}");
         let mut spec = spec;
-        spec.no_codex_import = true;
+        spec.env.insert("CSR_NO_CODEX_IMPORT".into(), "1".into());
         assert!(render_daemon_plist(&spec).contains("<key>CSR_NO_CODEX_IMPORT</key>"));
     }
 
@@ -3491,16 +3875,19 @@ esac
         assert_eq!(install(&spec, &mut fake), DaemonOutcome::KeptExisting);
         assert_eq!(std::fs::read_to_string(spec.plist_path()).unwrap(), theirs);
 
-        // The same file pointing at a binary that is gone is not worth keeping.
+        // The same file pointing at a binary that is gone is not worth keeping,
+        // but what the user put in it is: their switch is carried across.
         let dead = theirs.replace(&exe.display().to_string(), "/nowhere/csr-engine");
         std::fs::write(spec.plist_path(), dead).unwrap();
         assert_eq!(
             install(&spec, &mut FakeLaunchctl::new(false)),
             DaemonOutcome::Running { rewritten: true }
         );
+        let mut carried = spec.clone();
+        carried.env.insert("CSR_NO_RECAP".into(), "1".into());
         assert_eq!(
             std::fs::read_to_string(spec.plist_path()).unwrap(),
-            render_daemon_plist(&spec)
+            render_daemon_plist(&carried)
         );
     }
 
@@ -3511,14 +3898,14 @@ esac
         let mut calls = 0;
         let mut count = |_: &[&str]| {
             calls += 1;
-            Ok(())
+            Ok(String::new())
         };
         assert_eq!(
-            daemon_step(&spec, true, true, 501, &mut count, &|_| {}),
+            daemon_step(&spec, true, true, 501, &mut count, &|_| {}).outcome,
             DaemonOutcome::OptedOut
         );
         assert_eq!(
-            daemon_step(&spec, false, false, 501, &mut count, &|_| {}),
+            daemon_step(&spec, false, false, 501, &mut count, &|_| {}).outcome,
             DaemonOutcome::Manual
         );
         assert_eq!(calls, 0, "no launchctl call");
@@ -3543,5 +3930,208 @@ esac
             assert_eq!(daemon_opted_out(), expected, "CSR_NO_DAEMON={value:?}");
         }
         std::env::remove_var("CSR_NO_DAEMON");
+    }
+
+    // ----- what the agent carries -----
+
+    /// `launchctl print` of the live agent (trimmed), the shape launchd emits.
+    const LAUNCHCTL_PRINT: &str = "gui/501/com.ramakay.csr-engine.daemon = {
+\tactive count = 1
+\tpath = /Users/someone/Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist
+\ttype = LaunchAgent
+\tstate = running
+
+\tprogram = /usr/local/bin/csr-engine
+\targuments = {
+\t\t/usr/local/bin/csr-engine
+\t\t--db-path
+\t\t/Users/someone/.claude-self-reflect/csr-engine.db
+\t\tdaemon
+\t}
+
+\tworking directory = /Users/someone/.claude-self-reflect
+
+\tinherited environment = {
+\t\tSSH_AUTH_SOCK => /var/run/com.apple.launchd.QpoyKfCwZJ/Listeners
+\t}
+
+\tdefault environment = {
+\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin
+\t}
+
+\tenvironment = {
+\t\tOSLogRateLimit => 64
+\t\tPATH => /Users/someone/.local/bin:/usr/bin:/bin
+\t\tCSR_NO_RATIFICATION => 1
+\t\tXPC_SERVICE_NAME => com.ramakay.csr-engine.daemon
+\t}
+
+\tdomain = gui/501 [100026]
+\tminimum runtime = 30
+\tpid = 24453
+\timmediate reason = semaphore
+}
+";
+
+    fn env_of(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn launchctl_print_is_read_from_the_top_level_blocks_only() {
+        let job = parse_launchctl_print(LAUNCHCTL_PRINT);
+        assert_eq!(job.pid, Some(24453));
+        assert_eq!(
+            job.arguments,
+            vec![
+                "/usr/local/bin/csr-engine",
+                "--db-path",
+                "/Users/someone/.claude-self-reflect/csr-engine.db",
+                "daemon"
+            ]
+        );
+        // not SSH_AUTH_SOCK (inherited), not the default PATH, not launchd's own keys
+        assert_eq!(
+            job.env,
+            env_of(&[
+                ("PATH", "/Users/someone/.local/bin:/usr/bin:/bin"),
+                ("CSR_NO_RATIFICATION", "1"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_plist_is_read_back_into_its_arguments_and_environment() {
+        let mut spec = agent_spec(Path::new("/Users/a&b"));
+        spec.env
+            .insert("CSR_NARRATIVE_MODEL".into(), "a<b&c".into());
+        let facts = agent_facts(&parse_plist(&render_daemon_plist(&spec)).unwrap());
+        assert_eq!(facts.program_args[0], "/opt/csr/bin/csr-engine");
+        assert_eq!(
+            facts.program_args.last().map(String::as_str),
+            Some("daemon")
+        );
+        assert_eq!(facts.env["CSR_NARRATIVE_MODEL"], "a<b&c");
+        assert_eq!(facts.env["PATH"], spec.path_env());
+        assert!(parse_plist("bplist00garbage").is_none());
+    }
+
+    #[test]
+    fn the_kill_switches_a_run_was_given_reach_the_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.env = carried_process_env(
+            [
+                ("CSR_NO_DREAMING", "1"),
+                ("CSR_NO_AI_NARRATIVES", "1"),
+                ("CSR_NARRATIVE_MODEL", "haiku"),
+                ("CSR_DREAM_INTERVAL_SECS", "7200"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+        let run = install_run(&spec, &mut FakeLaunchctl::new(false));
+        let facts = agent_facts(
+            &parse_plist(&std::fs::read_to_string(spec.plist_path()).unwrap()).unwrap(),
+        );
+        assert_eq!(facts.env["CSR_NO_DREAMING"], "1");
+        assert_eq!(facts.env["CSR_NO_AI_NARRATIVES"], "1");
+        assert_eq!(facts.env["CSR_NARRATIVE_MODEL"], "haiku");
+        assert_eq!(facts.env["CSR_DREAM_INTERVAL_SECS"], "7200");
+        let said = run.notes.join("\n");
+        assert!(said.contains("CSR_NO_DREAMING=1 (from this run)"), "{said}");
+        // an accepted consent does not outrank a kill switch, and the user is told
+        assert!(said.contains("will not dream"), "{said}");
+    }
+
+    #[test]
+    fn setup_only_variables_are_not_written_into_the_agent() {
+        let carried = carried_process_env(
+            [
+                ("CSR_AUTO_SETUP", "1"),
+                ("CSR_SKIP_SETUP", "1"),
+                ("CSR_NO_DAEMON", "0"),
+                ("CSR_BUILD_GIT_SHA", "abc"),
+                ("HOME", "/Users/x"),
+                ("CSR_NO_RECAP", "1"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+        assert_eq!(carried, env_of(&[("CSR_NO_RECAP", "1")]));
+    }
+
+    #[test]
+    fn a_rerun_without_the_variables_keeps_what_the_agent_had() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1"), ("ANTHROPIC_BASE_URL", "http://x")]);
+        install(&spec, &mut FakeLaunchctl::new(false));
+
+        // The next run has a clean shell. Nothing that was there may disappear.
+        spec.env = Default::default();
+        let run = install_run(&spec, &mut FakeLaunchctl::new(true));
+        let facts = agent_facts(
+            &parse_plist(&std::fs::read_to_string(spec.plist_path()).unwrap()).unwrap(),
+        );
+        assert_eq!(facts.env["CSR_NO_DREAMING"], "1");
+        assert_eq!(facts.env["ANTHROPIC_BASE_URL"], "http://x");
+        let said = run.notes.join("\n");
+        assert!(
+            said.contains("CSR_NO_DREAMING=1 (from the existing agent)"),
+            "{said}"
+        );
+        // a non-CSR value is named, never printed
+        assert!(said.contains("ANTHROPIC_BASE_URL (from"), "{said}");
+        assert!(!said.contains("http://x"), "{said}");
+    }
+
+    #[test]
+    fn a_loaded_job_with_no_file_still_gives_up_its_environment() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = LAUNCHCTL_PRINT.to_owned();
+        install(&spec, &mut fake);
+        let facts = agent_facts(
+            &parse_plist(&std::fs::read_to_string(spec.plist_path()).unwrap()).unwrap(),
+        );
+        assert_eq!(facts.env["CSR_NO_RATIFICATION"], "1");
+        // launchd's own keys are not configuration
+        assert!(!facts.env.contains_key("XPC_SERVICE_NAME"));
+        assert!(!facts.env.contains_key("OSLogRateLimit"));
+        // PATH is setup's: replaced, and said so
+        assert_eq!(facts.env["PATH"], spec.path_env());
+    }
+
+    #[test]
+    fn a_replaced_path_is_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = LAUNCHCTL_PRINT.to_owned();
+        let said = install_run(&spec, &mut fake).notes.join("\n");
+        assert!(said.contains("PATH in the agent was replaced"), "{said}");
+        assert!(
+            said.contains("/Users/someone/.local/bin:/usr/bin:/bin"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn carried_keys_do_not_make_the_next_run_rewrite_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1"), ("CSR_DREAM_THREADS", "2")]);
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let before = std::fs::read(spec.plist_path()).unwrap();
+        let mut fake = FakeLaunchctl::new(true);
+        spec.env = Default::default();
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: false }
+        );
+        assert_eq!(std::fs::read(spec.plist_path()).unwrap(), before);
     }
 }
