@@ -2476,10 +2476,76 @@ fn create_settled_table(conn: &Connection) -> Result<()> {
 const GEN_BUMP_PROJECT: &str = "INSERT INTO code_graph_project_gen (project, gen) VALUES ({p}, 1)
      ON CONFLICT(project) DO UPDATE SET gen = gen + 1;";
 
-/// Every project at once: the `'*'` row is added to each project's own counter
-/// by `codegraph::project_gen`.
-const GEN_BUMP_ALL: &str = "INSERT INTO code_graph_project_gen (project, gen) VALUES ('*', 1)
-     ON CONFLICT(project) DO UPDATE SET gen = gen + 1;";
+/// `meta` key holding the revision of the trigger bodies installed by
+/// [`create_graph_gen_triggers`]. `CREATE TRIGGER IF NOT EXISTS` never replaces
+/// a body, so a changed body needs a new revision to be swapped in once.
+const GRAPH_GEN_TRIGGERS_REV_KEY: &str = "graph_gen_triggers_rev";
+
+/// Revision 2: no write bumps every project any more (see below).
+const GRAPH_GEN_TRIGGERS_REV: &str = "2";
+
+/// Triggers whose body changed in revision 2.
+const GRAPH_GEN_TRIGGERS_REV2: [&str; 6] = [
+    "code_edges_gen_ai",
+    "code_edges_gen_au",
+    "code_edges_gen_ad",
+    "code_evolution_gen_ai",
+    "code_evolution_gen_au",
+    "code_evolution_gen_ad",
+];
+
+/// Edge write: bump the source node's project. An edge with no source node is
+/// read by no resolve (every edge read in `resolver::resolve_edges` joins
+/// `code_nodes` on `src_id`) but it still counts toward its destination's
+/// in-degree in `code_rank::rank_rows`, so the bump goes to the destination's
+/// project instead of to every project.
+fn edge_src_bump(row: &str) -> String {
+    format!(
+        "INSERT INTO code_graph_project_gen (project, gen)
+           SELECT n.project, 1 FROM code_nodes n WHERE n.id = {row}.src_id
+           ON CONFLICT(project) DO UPDATE SET gen = gen + 1;"
+    )
+}
+
+/// The destination-project bump of an edge whose source node is gone.
+fn edge_orphan_dst_bump(row: &str) -> String {
+    format!(
+        "INSERT INTO code_graph_project_gen (project, gen)
+           SELECT d.project, 1 FROM code_nodes d
+           WHERE d.id = {row}.dst_id
+             AND NOT EXISTS (SELECT 1 FROM code_nodes s WHERE s.id = {row}.src_id)
+           ON CONFLICT(project) DO UPDATE SET gen = gen + 1;"
+    )
+}
+
+/// Co-edit evidence written for file `file`: bump the co-edit counter of each
+/// project that has a node in that file. The key is `COEDIT_GEN_PREFIX` + the
+/// project; `codegraph::project_gen` adds it to the project's counter and
+/// `codegraph::dirty_projects` holds a project dirtied only by it off for
+/// `STAR_ONLY_COOLDOWN_SECS`.
+///
+/// Why per file is enough: the co-edit tier (`resolver::coedit_weight`) scores a
+/// pair of files `(f, d)` of ONE project by the sessions that touched both, so a
+/// row for file `x` changes the answer only where `x` is `f` or `d`, and both
+/// are files of the project's own nodes. The row's `project_name` does not
+/// matter (the row still counts for whichever project owns the file), and a row
+/// for a file no project has nodes in changes nothing; if a node appears there
+/// later, the node's own trigger bumps the project. `file_path` is stored as the
+/// canonical repo path and the resolver compares it with the canonical spelling
+/// of the node's file; `/tmp`, `/var` and `/etc` are symlinks into `/private`, so
+/// both spellings are matched.
+fn coedit_bump(file: &str) -> String {
+    format!(
+        "INSERT INTO code_graph_project_gen (project, gen)
+           SELECT '{prefix}' || n.project, 1 FROM code_nodes n
+           WHERE n.file IN ({file}, '/private' || {file},
+                            CASE WHEN {file} LIKE '/private/%' THEN substr({file}, 9) END)
+             AND n.project IS NOT NULL AND n.project != ''
+           GROUP BY n.project
+           ON CONFLICT(project) DO UPDATE SET gen = gen + 1;",
+        prefix = crate::storage::codegraph::COEDIT_GEN_PREFIX,
+    )
+}
 
 /// `code_graph_project_gen` triggers. The drain plans a project's resolve
 /// without the write lock and applies it only if the project's counter has not
@@ -2490,16 +2556,22 @@ const GEN_BUMP_ALL: &str = "INSERT INTO code_graph_project_gen (project, gen) VA
 /// that does not call it; a trigger bumps inside the statement's own
 /// transaction and cannot be bypassed.
 ///
-/// `code_edges` rows carry no project, so it comes from the source node; when
-/// that node is gone the bump goes to every project. `code_evolution` is read by
-/// the co-edit tier without a project filter (a row labelled for another
-/// project, or for none, can change the winner), so it always bumps every
-/// project. The resolver's own edge updates fire the edge trigger too: the plan
-/// they belong to has been applied, and the rank plan reads its counter after
-/// the apply commits.
+/// Nothing bumps every project. Revision 1 did, for a `code_evolution` row and
+/// for an edge with no source node, and a live database then re-resolved all of
+/// its projects after each one: a pass over them took longer than the interval
+/// between rows, so the drain never went idle. Each write now bumps the
+/// projects it can change the answer of (see [`edge_src_bump`] and
+/// [`coedit_bump`] for the argument).
 ///
-/// `IF NOT EXISTS` makes this a no-op on an up-to-date database, which takes no
-/// write lock.
+/// The resolver's own edge updates fire the edge trigger too: the plan they
+/// belong to has been applied, and the rank plan reads its counter after the
+/// apply commits.
+///
+/// Up to date, this is a read and takes no write lock. A database on an older
+/// revision gets the revision-2 bodies in one transaction, and the edges whose
+/// source node is gone are deleted in it (a dangling edge has nothing to
+/// resolve; `replace_file_edges` would have swept it at the next extraction of
+/// its file).
 fn create_graph_gen_triggers(conn: &Connection) -> Result<()> {
     let mut sql = String::new();
     let mut trigger = |name: &str, event: &str, table: &str, body: String| {
@@ -2537,52 +2609,89 @@ fn create_graph_gen_triggers(conn: &Connection) -> Result<()> {
             GEN_BUMP_PROJECT.replace("{p}", &format!("OLD.{col}")),
         );
     }
-    // Edges: the source node's project, else everyone.
-    let edge_bump = |row: &str| {
-        format!(
-            "INSERT INTO code_graph_project_gen (project, gen)
-               SELECT n.project, 1 FROM code_nodes n WHERE n.id = {row}.src_id
-               ON CONFLICT(project) DO UPDATE SET gen = gen + 1;
-             {}",
-            // No source node: bump all. The WHEN-less form keeps the trigger
-            // one statement list; the extra bump when the node exists is the
-            // cost of one row.
-            GEN_BUMP_ALL.replace(
-                "VALUES ('*', 1)",
-                &format!(
-                    "SELECT '*', 1 WHERE NOT EXISTS (SELECT 1 FROM code_nodes n WHERE n.id = {row}.src_id)"
-                )
-            )
-        )
-    };
+    // Edges: the source node's project; with no source node, the destination's.
     trigger(
         "code_edges_gen_ai",
         "INSERT",
         "code_edges",
-        edge_bump("NEW"),
+        format!("{} {}", edge_src_bump("NEW"), edge_orphan_dst_bump("NEW")),
     );
     trigger(
         "code_edges_gen_au",
         "UPDATE",
         "code_edges",
-        edge_bump("NEW"),
+        format!(
+            "{} {} {}",
+            edge_src_bump("NEW"),
+            edge_orphan_dst_bump("NEW"),
+            edge_orphan_dst_bump("OLD")
+        ),
     );
     trigger(
         "code_edges_gen_ad",
         "DELETE",
         "code_edges",
-        edge_bump("OLD"),
+        format!("{} {}", edge_src_bump("OLD"), edge_orphan_dst_bump("OLD")),
     );
-    // Co-edit evidence: every project.
-    for (suffix, event) in [("ai", "INSERT"), ("au", "UPDATE"), ("ad", "DELETE")] {
-        trigger(
-            &format!("code_evolution_gen_{suffix}"),
-            event,
-            "code_evolution",
-            GEN_BUMP_ALL.to_string(),
-        );
+    // Co-edit evidence: the projects with a node in the row's file.
+    trigger(
+        "code_evolution_gen_ai",
+        "INSERT",
+        "code_evolution",
+        coedit_bump("NEW.file_path"),
+    );
+    trigger(
+        "code_evolution_gen_au",
+        "UPDATE",
+        "code_evolution",
+        format!(
+            "{} {}",
+            coedit_bump("OLD.file_path"),
+            coedit_bump("NEW.file_path")
+        ),
+    );
+    trigger(
+        "code_evolution_gen_ad",
+        "DELETE",
+        "code_evolution",
+        coedit_bump("OLD.file_path"),
+    );
+
+    let rev = |c: &Connection| -> Result<Option<String>> {
+        Ok(c.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [GRAPH_GEN_TRIGGERS_REV_KEY],
+            |r| r.get(0),
+        )
+        .optional()?)
+    };
+    if rev(conn)?.as_deref() == Some(GRAPH_GEN_TRIGGERS_REV) {
+        // Up to date; recreates a trigger someone dropped, otherwise a no-op.
+        conn.execute_batch(&sql)?;
+        return Ok(());
     }
-    conn.execute_batch(&sql)?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Another process may have done it while this one waited for the lock.
+    if rev(&tx)?.as_deref() == Some(GRAPH_GEN_TRIGGERS_REV) {
+        return Ok(());
+    }
+    for name in GRAPH_GEN_TRIGGERS_REV2 {
+        tx.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))?;
+    }
+    tx.execute_batch(&sql)?;
+    // After the new triggers exist, so each delete bumps the edge's destination
+    // project.
+    tx.execute(
+        "DELETE FROM code_edges
+         WHERE NOT EXISTS (SELECT 1 FROM code_nodes n WHERE n.id = code_edges.src_id)",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [GRAPH_GEN_TRIGGERS_REV_KEY, GRAPH_GEN_TRIGGERS_REV],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

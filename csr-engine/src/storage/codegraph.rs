@@ -150,12 +150,18 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
     })
 }
 
-/// The project's resolve-input counter (0 before any write).
+/// Prefix of the `code_graph_project_gen` rows that count the co-edit evidence
+/// written for each project's files: `COEDIT_GEN_PREFIX` + project. A project
+/// name never starts with `*`, so these cannot be mistaken for projects.
+pub const COEDIT_GEN_PREFIX: &str = "*coedit:";
+
+/// The project's resolve-input counter (0 before any write): its own row, the
+/// every-project row (`'*'`, which no trigger bumps now) and its co-edit row.
 pub fn project_gen(conn: &Connection, project: &str) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT COALESCE(SUM(gen), 0) FROM code_graph_project_gen
-         WHERE project = ?1 OR project = '*'",
-        params![project],
+         WHERE project = ?1 OR project = '*' OR project = ?2",
+        params![project, format!("{COEDIT_GEN_PREFIX}{project}")],
         |r| r.get(0),
     )?)
 }
@@ -167,8 +173,9 @@ pub fn now_secs() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// A project's resolve-input counter, split: its own row and the every-project
-/// row (`'*'`) that is added to it.
+/// A project's resolve-input counter, split: its own row, and the rows that
+/// only ask for a pass after a cooldown (the every-project row `'*'` and the
+/// project's co-edit row), added together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GenParts {
     pub own: i64,
@@ -190,7 +197,7 @@ fn gen_row(conn: &Connection, project: &str) -> Result<i64> {
 pub fn project_gen_parts(conn: &Connection, project: &str) -> Result<GenParts> {
     Ok(GenParts {
         own: gen_row(conn, project)?,
-        star: gen_row(conn, "*")?,
+        star: gen_row(conn, "*")? + gen_row(conn, &format!("{COEDIT_GEN_PREFIX}{project}"))?,
     })
 }
 
@@ -209,40 +216,53 @@ pub fn mark_project_settled(conn: &Connection, project: &str, covered: GenParts)
     Ok(())
 }
 
-/// How long a project must have been settled before a change only the
-/// every-project counter saw (a `code_evolution` row, which every edit writes)
-/// asks for another pass. The resolver reads `code_evolution` for co-edit
-/// evidence without a project filter, so such a row can change a project's
-/// answer, but a pass per project per edit is not worth it.
-pub const STAR_ONLY_COOLDOWN_SECS: i64 = 60;
+/// How long a project must have been settled before a change only its co-edit
+/// counter saw (a `code_evolution` row for one of its files) asks for another
+/// pass.
+///
+/// Chosen over a shorter wait because the only reader of that evidence is the
+/// resolver's B3 tier (`coedit_weight`), which decides between definitions the
+/// graph alone cannot tell apart and needs a 2x margin to bind: one more session
+/// seldom moves it, and a project being edited gets passes for its own edits
+/// anyway. An in-flight plan is not affected by this wait: the co-edit counter is
+/// part of `project_gen`, so a plan made before such a row is dropped and made
+/// again. At 60 s, the previous value, an actively edited project was re-resolved
+/// every minute for evidence that rarely changed an answer.
+pub const STAR_ONLY_COOLDOWN_SECS: i64 = 900;
 
 /// Projects whose resolve inputs changed since the last pass that covered them
 /// and that no pending file or queued snapshot accounts for: the counter of the
-/// project's own row is ahead of the settled one, or the every-project row is
-/// and `STAR_ONLY_COOLDOWN_SECS` have passed since the project last settled.
+/// project's own row is ahead of the settled one, or its co-edit/every-project
+/// counter is and `STAR_ONLY_COOLDOWN_SECS` have passed since the project last
+/// settled.
 pub fn dirty_projects(conn: &Connection, now_secs: i64) -> Result<Vec<String>> {
     let star = gen_row(conn, "*")?;
     let mut stmt = conn.prepare(
-        "SELECT g.project, g.gen, COALESCE(s.own, 0), COALESCE(s.star, 0), COALESCE(s.settled_at, 0)
+        "SELECT g.project, g.gen, COALESCE(s.own, 0), COALESCE(s.star, 0), COALESCE(s.settled_at, 0),
+                COALESCE((SELECT c.gen FROM code_graph_project_gen c
+                          WHERE c.project = ?1 || g.project), 0)
          FROM code_graph_project_gen g
          LEFT JOIN code_graph_project_settled s ON s.project = g.project
          WHERE g.project != '*' AND g.project != ''
+           AND substr(g.project, 1, length(?1)) != ?1
          ORDER BY g.project",
     )?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map(params![COEDIT_GEN_PREFIX], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)?,
             r.get::<_, i64>(2)?,
             r.get::<_, i64>(3)?,
             r.get::<_, i64>(4)?,
+            r.get::<_, i64>(5)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (project, own, settled_own, settled_star, settled_at) = row?;
+        let (project, own, settled_own, settled_star, settled_at, coedit) = row?;
         let own_moved = own > settled_own;
-        let star_moved = star > settled_star && now_secs - settled_at >= STAR_ONLY_COOLDOWN_SECS;
+        let star_moved =
+            star + coedit > settled_star && now_secs - settled_at >= STAR_ONLY_COOLDOWN_SECS;
         if own_moved || star_moved {
             out.push(project);
         }
@@ -470,10 +490,20 @@ pub fn retire_missing_nodes(
                 "DELETE FROM code_node_attribution WHERE node_id = ?1",
                 params![id],
             )?;
-            tx.execute(
+            let gone = tx.execute(
                 "DELETE FROM code_nodes WHERE id = ?1 AND project = ?2 AND file = ?3",
                 params![id, project, file],
             )?;
+            if gone > 0 {
+                // The node's edges go with it: left behind they dangle (nothing
+                // resolves them, and a resolved one still counts toward its
+                // destination's in-degree) until the file is extracted again.
+                tx.execute(
+                    "DELETE FROM code_edges WHERE src_id = ?1
+                       AND NOT EXISTS (SELECT 1 FROM code_nodes WHERE id = ?1)",
+                    params![id],
+                )?;
+            }
         }
         Ok(stale_ids.len())
     })
@@ -2573,7 +2603,7 @@ mod tests {
             ("insert local_bindings", "INSERT INTO local_bindings (project, file, scope, name) VALUES ('p', 'a.rs', 's', 'x')"),
             ("insert edge_scope_chains", "INSERT INTO edge_scope_chains (project, file, src_id, dst_id, kind, chain) VALUES ('p', 'a.rs', 'n1', 'name:g', 'calls', 'c')"),
             ("insert code_evolution", "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES ('e1', 's', 'p', 'a.rs')"),
-            ("code_evolution under another label", "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES ('e2', 's', 'q', 'a.rs')"),
+            ("code_evolution under another label (it is the file that counts)", "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES ('e2', 's', 'q', 'a.rs')"),
             ("delete node", "DELETE FROM code_nodes WHERE id = 'n1'"),
         ];
         for (what, sql) in steps {
@@ -2584,7 +2614,13 @@ mod tests {
                 "{what}: the counter did not move"
             );
         }
-        // The co-edit replay's own entry point.
+        // The co-edit replay's own entry point, for a file the project has a node in.
+        conn.execute(
+            "INSERT INTO code_nodes (id, project, file, kind, name) \
+             VALUES ('n3', 'p', 'b.rs', 'function', 'h')",
+            [],
+        )
+        .unwrap();
         let before = project_gen(&conn, "p").unwrap();
         assert!(crate::storage::queries::insert_code_evolution_backfill(
             &conn,
@@ -2599,5 +2635,246 @@ mod tests {
         )
         .unwrap());
         assert!(project_gen(&conn, "p").unwrap() > before, "co-edit replay");
+    }
+
+    fn gen_of(conn: &Connection, key: &str) -> i64 {
+        gen_row(conn, key).unwrap()
+    }
+
+    fn fresh_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::storage::migrations::run(&conn).unwrap();
+        conn
+    }
+
+    fn plain_node(conn: &Connection, id: &str, project: &str, file: &str) {
+        conn.execute(
+            "INSERT INTO code_nodes (id, project, file, kind, name) VALUES (?1, ?2, ?3, 'function', ?1)",
+            params![id, project, file],
+        )
+        .unwrap();
+    }
+
+    fn evolution(conn: &Connection, id: &str, file: &str) {
+        conn.execute(
+            "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES (?1, 's', 'label', ?2)",
+            params![id, file],
+        )
+        .unwrap();
+    }
+
+    /// A co-edit row moves the counters of the projects with a node in its file,
+    /// and no other: not every project, not the project it is labelled with.
+    #[test]
+    fn a_coedit_row_moves_only_the_projects_that_own_its_file() {
+        let conn = fresh_db();
+        plain_node(&conn, "n1", "p", "/r/a.rs");
+        plain_node(&conn, "n2", "q", "/r/c.rs");
+        let (p0, q0, star0) = (
+            project_gen(&conn, "p").unwrap(),
+            project_gen(&conn, "q").unwrap(),
+            gen_of(&conn, "*"),
+        );
+
+        // A file no project has nodes in, labelled with p.
+        conn.execute(
+            "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES ('e0', 's', 'p', '/r/none.rs')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                project_gen(&conn, "p").unwrap(),
+                project_gen(&conn, "q").unwrap()
+            ),
+            (p0, q0)
+        );
+
+        // p's file, labelled with q: p moves, q does not.
+        conn.execute(
+            "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES ('e1', 's', 'q', '/r/a.rs')",
+            [],
+        )
+        .unwrap();
+        assert!(project_gen(&conn, "p").unwrap() > p0);
+        assert_eq!(project_gen(&conn, "q").unwrap(), q0);
+        assert_eq!(gen_of(&conn, "*"), star0, "no write bumps every project");
+        assert_eq!(
+            gen_of(&conn, "p"),
+            1,
+            "the project's own row is for its own writes"
+        );
+
+        // Update and delete reach the old and the new file.
+        let (p1, q1) = (
+            project_gen(&conn, "p").unwrap(),
+            project_gen(&conn, "q").unwrap(),
+        );
+        conn.execute(
+            "UPDATE code_evolution SET file_path = '/r/c.rs' WHERE id = 'e1'",
+            [],
+        )
+        .unwrap();
+        assert!(project_gen(&conn, "p").unwrap() > p1 && project_gen(&conn, "q").unwrap() > q1);
+        let q2 = project_gen(&conn, "q").unwrap();
+        conn.execute("DELETE FROM code_evolution WHERE id = 'e1'", [])
+            .unwrap();
+        assert!(project_gen(&conn, "q").unwrap() > q2);
+    }
+
+    /// `/tmp` is a symlink into `/private`: the resolver may spell the node's file
+    /// either way against the row's.
+    #[test]
+    fn a_coedit_row_matches_a_node_file_under_either_private_spelling() {
+        let conn = fresh_db();
+        plain_node(&conn, "n1", "p", "/tmp/x/a.rs");
+        plain_node(&conn, "n2", "q", "/private/tmp/x/b.rs");
+        let (p0, q0) = (
+            project_gen(&conn, "p").unwrap(),
+            project_gen(&conn, "q").unwrap(),
+        );
+        evolution(&conn, "e1", "/private/tmp/x/a.rs");
+        evolution(&conn, "e2", "/tmp/x/b.rs");
+        assert!(project_gen(&conn, "p").unwrap() > p0);
+        assert!(project_gen(&conn, "q").unwrap() > q0);
+    }
+
+    /// An edge with no source node bumps no project's resolve input but the
+    /// destination's in-degree: never every project.
+    #[test]
+    fn a_dangling_edge_moves_no_counter_but_its_destinations() {
+        let conn = fresh_db();
+        plain_node(&conn, "d1", "p", "a.rs");
+        plain_node(&conn, "n2", "q", "c.rs");
+        let (p0, q0, star0) = (
+            project_gen(&conn, "p").unwrap(),
+            project_gen(&conn, "q").unwrap(),
+            gen_of(&conn, "*"),
+        );
+        // Unresolved, to a name: nothing reads it.
+        conn.execute(
+            "INSERT INTO code_edges (src_id, dst_id, kind, src_file) VALUES ('ghost', 'name:x', 'calls', 'g.rs')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE code_edges SET evidence = 'e' WHERE src_id = 'ghost'",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM code_edges WHERE src_id = 'ghost'", [])
+            .unwrap();
+        assert_eq!(
+            (
+                project_gen(&conn, "p").unwrap(),
+                project_gen(&conn, "q").unwrap()
+            ),
+            (p0, q0)
+        );
+        assert_eq!(gen_of(&conn, "*"), star0);
+
+        // Resolved, to a node of p: p's rank input moved, q's did not.
+        conn.execute(
+            "INSERT INTO code_edges (src_id, dst_id, kind, src_file, resolved) VALUES ('ghost', 'd1', 'calls', 'g.rs', 1)",
+            [],
+        )
+        .unwrap();
+        assert!(project_gen(&conn, "p").unwrap() > p0);
+        assert_eq!(project_gen(&conn, "q").unwrap(), q0);
+        assert_eq!(gen_of(&conn, "*"), star0);
+        let p1 = project_gen(&conn, "p").unwrap();
+        conn.execute("DELETE FROM code_edges WHERE src_id = 'ghost'", [])
+            .unwrap();
+        assert!(project_gen(&conn, "p").unwrap() > p1);
+        assert_eq!(gen_of(&conn, "*"), star0);
+    }
+
+    /// Retiring a node takes its edges with it, so none dangle.
+    #[test]
+    fn retiring_a_node_leaves_no_dangling_edge() {
+        let conn = fresh_db();
+        plain_node(&conn, "keep", "p", "a.rs");
+        plain_node(&conn, "gone", "p", "a.rs");
+        for src in ["keep", "gone"] {
+            conn.execute(
+                "INSERT INTO code_edges (src_id, dst_id, kind, src_file) VALUES (?1, 'name:x', 'calls', 'a.rs')",
+                [src],
+            )
+            .unwrap();
+        }
+        let star0 = gen_of(&conn, "*");
+        assert_eq!(
+            retire_missing_nodes(&conn, "p", "a.rs", &["keep".to_string()]).unwrap(),
+            1
+        );
+        let srcs: Vec<String> = conn
+            .prepare("SELECT src_id FROM code_edges")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(srcs, ["keep"]);
+        assert_eq!(gen_of(&conn, "*"), star0);
+    }
+
+    /// A database on the first trigger revision (every project bumped by a
+    /// co-edit row or a dangling edge) gets the new bodies once, and its
+    /// dangling edges are deleted.
+    #[test]
+    fn a_database_on_the_old_triggers_is_upgraded_once() {
+        let conn = fresh_db();
+        let bump_all = "INSERT INTO code_graph_project_gen (project, gen) VALUES ('*', 1) \
+                        ON CONFLICT(project) DO UPDATE SET gen = gen + 1;";
+        for (name, event, table) in [
+            ("code_evolution_gen_ai", "INSERT", "code_evolution"),
+            ("code_edges_gen_ai", "INSERT", "code_edges"),
+        ] {
+            conn.execute_batch(&format!(
+                "DROP TRIGGER {name}; CREATE TRIGGER {name} AFTER {event} ON {table} BEGIN {bump_all} END;"
+            ))
+            .unwrap();
+        }
+        conn.execute("DELETE FROM meta WHERE key = 'graph_gen_triggers_rev'", [])
+            .unwrap();
+        plain_node(&conn, "n1", "p", "a.rs");
+        conn.execute(
+            "INSERT INTO code_edges (src_id, dst_id, kind, src_file) VALUES ('ghost', 'name:x', 'calls', 'g.rs')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_edges (src_id, dst_id, kind, src_file) VALUES ('n1', 'name:x', 'calls', 'a.rs')",
+            [],
+        )
+        .unwrap();
+        let star_old = gen_of(&conn, "*");
+        assert!(star_old > 0, "the old trigger bumps every project");
+
+        crate::storage::migrations::run(&conn).unwrap();
+        let edges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(edges, 1, "the dangling edge is gone, the live one stays");
+        evolution(&conn, "e1", "/r/unrelated.rs");
+        conn.execute(
+            "INSERT INTO code_edges (src_id, dst_id, kind, src_file) VALUES ('ghost', 'name:y', 'calls', 'g.rs')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            gen_of(&conn, "*"),
+            star_old,
+            "the new triggers bump no every-project row"
+        );
+
+        // A second open changes nothing.
+        let before = gen_of(&conn, "p");
+        crate::storage::migrations::run(&conn).unwrap();
+        assert_eq!(gen_of(&conn, "p"), before);
+        let edges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(edges, 2, "an up-to-date database is not swept again");
     }
 }

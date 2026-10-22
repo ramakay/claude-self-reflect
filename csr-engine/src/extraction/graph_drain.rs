@@ -1528,9 +1528,9 @@ mod tests {
         assert!(drain_if_pending(&storage, &db).unwrap().is_none());
     }
 
-    /// A co-edit replay (`code_evolution` bumps every project) asks for a pass
-    /// only once the project has been settled for `STAR_ONLY_COOLDOWN_SECS`: a
-    /// row per edit must not re-resolve every project per edit.
+    /// A co-edit row for a file of the project asks for a pass only once the
+    /// project has been settled for `STAR_ONLY_COOLDOWN_SECS`: a row per edit
+    /// must not re-resolve the project per edit.
     #[test]
     fn an_evolution_row_asks_for_a_pass_only_after_the_cooldown() {
         let (_dir, db, storage) = extracted();
@@ -1562,6 +1562,135 @@ mod tests {
             })
             .unwrap();
         assert!(drain_if_pending(&storage, &db).unwrap().is_some());
+        assert!(drain_if_pending(&storage, &db).unwrap().is_none());
+    }
+
+    fn every_project_counter(storage: &Storage) -> i64 {
+        storage
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT COALESCE(SUM(gen), 0) FROM code_graph_project_gen WHERE project = '*'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    fn age_settled(storage: &Storage) {
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "UPDATE code_graph_project_settled SET settled_at = settled_at - ?1",
+                    [codegraph::STAR_ONLY_COOLDOWN_SECS + 1],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Co-edit rows reach only the projects that own the row's file, however old
+    /// the settled mark is: a row for a file nobody has nodes in, however many,
+    /// never asks for a pass; a row for another project's file asks for that
+    /// project's pass and no one else's.
+    #[test]
+    fn an_evolution_row_dirties_only_the_project_that_owns_its_file() {
+        let (_dir, db, storage) = extracted();
+        storage
+            .with_connection(|c| {
+                let mut other = def("other-fn", "z.rs", "other_fn");
+                other.project = "other".into();
+                upsert_node(c, &other)?;
+                Ok(())
+            })
+            .unwrap();
+        while drain_if_pending(&storage, &db).unwrap().is_some() {}
+        for (i, file) in ["nowhere.rs", "also-nowhere.rs"].iter().enumerate() {
+            storage
+                .with_connection(|c| {
+                    c.execute(
+                        "INSERT INTO code_evolution (id, session_id, project_name, file_path)
+                         VALUES (?1, 's', 'proj', ?2)",
+                        rusqlite::params![format!("e{i}"), file],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        age_settled(&storage);
+        assert!(storage.dirty_graph_projects().unwrap().is_empty());
+        assert!(drain_if_pending(&storage, &db).unwrap().is_none());
+
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "UPDATE code_graph_project_settled
+                     SET settled_at = CAST(strftime('%s', 'now') AS INTEGER)",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO code_evolution (id, session_id, project_name, file_path)
+                     VALUES ('e9', 's', 'proj', 'z.rs')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            storage.dirty_graph_projects().unwrap().is_empty(),
+            "inside the cooldown"
+        );
+        age_settled(&storage);
+        assert_eq!(
+            storage.dirty_graph_projects().unwrap(),
+            ["other".to_string()]
+        );
+        let report = drain_if_pending(&storage, &db).unwrap().unwrap();
+        assert_eq!(report.projects, 1);
+        assert!(drain_if_pending(&storage, &db).unwrap().is_none());
+    }
+
+    /// The drain's own work never makes a project it settled dirty again, and
+    /// dangling edges (which nothing resolves) neither cost a pass nor move the
+    /// every-project counter.
+    #[test]
+    fn a_drain_over_dangling_edges_settles_and_leaves_the_every_project_counter() {
+        let (_dir, db, storage) = extracted();
+        storage
+            .with_connection(|c| {
+                // Dangling: unresolved names, as a retired node leaves them.
+                for (i, name) in ["a", "b", "c"].iter().enumerate() {
+                    c.execute(
+                        "INSERT INTO code_edges (src_id, dst_id, kind, src_file)
+                         VALUES (?1, ?2, 'calls', 'ghost.rs')",
+                        rusqlite::params![format!("ghost{i}"), format!("name:{name}")],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let star = every_project_counter(&storage);
+        let report = drain_if_pending(&storage, &db).unwrap().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(every_project_counter(&storage), star, "the pass bumped it");
+        assert!(storage.dirty_graph_projects().unwrap().is_empty());
+        assert!(drain_if_pending(&storage, &db).unwrap().is_none());
+
+        // More dangling edges, written and swept by a re-extraction: still idle.
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT INTO code_edges (src_id, dst_id, kind, src_file)
+                     VALUES ('ghost9', 'name:z', 'calls', 'ghost.rs')",
+                    [],
+                )?;
+                codegraph::replace_file_edges(c, "proj", "ghost.rs", &[])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(every_project_counter(&storage), star);
+        assert!(drain_if_pending(&storage, &db).unwrap().is_none());
+        age_settled(&storage);
         assert!(drain_if_pending(&storage, &db).unwrap().is_none());
     }
 
