@@ -4,7 +4,9 @@
 //! facts for the watch loop:
 //!
 //! - wake: the agent's status changed (draw soon).
-//! - gone: the agent pane closed or exited, and so does this pane.
+//! - gone: the agent pane closed or exited, and so does this pane. An event says so; and since a
+//!   stream that was lost or reconnected replays nothing, each new subscription is followed by one
+//!   `session.snapshot`, and an agent pane that is not in it counts as gone too.
 //!
 //! There is no "hidden": herdr says which tab its default focus is on, but each attached client
 //! has a place of its own and the API does not list them, so a tab that is not the default focus
@@ -145,6 +147,12 @@ fn session(shared: &Shared, socket: &Path, agent: Option<&str>) -> std::io::Resu
                         return Ok(false);
                     }
                     started = true;
+                    // The stream does not replay what happened while there was none: read the
+                    // layout once now, after the subscription so nothing falls between.
+                    if agent_pane_missing(socket, agent) {
+                        shared.gone.store(true, Ordering::Relaxed);
+                        return Ok(started);
+                    }
                     continue;
                 }
                 // `events_lost`, or any other error: this subscription is over.
@@ -165,6 +173,29 @@ fn session(shared: &Shared, socket: &Path, agent: Option<&str>) -> std::io::Resu
         }
     }
     Ok(started)
+}
+
+/// True when herdr's snapshot is readable and the agent pane is not in it: closed or exited
+/// (herdr drops a pane that ends) while no event reached us. Unreadable, or no agent to look for,
+/// is not missing.
+fn agent_pane_missing(socket: &Path, agent: Option<&str>) -> bool {
+    let Some(agent) = agent else {
+        return false;
+    };
+    let read = || -> Option<bool> {
+        let stream = UnixStream::connect(socket).ok()?;
+        stream.set_read_timeout(Some(IO_LIMIT)).ok()?;
+        stream.set_write_timeout(Some(IO_LIMIT)).ok()?;
+        (&stream)
+            .write_all(b"{\"id\":\"csr-snapshot\",\"method\":\"session.snapshot\",\"params\":{}}\n")
+            .ok()?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).ok()?;
+        let value: Value = serde_json::from_str(&line).ok()?;
+        let panes = value["result"]["snapshot"]["panes"].as_array()?;
+        Some(!panes.iter().any(|pane| pane["pane_id"] == agent))
+    };
+    read().unwrap_or(false)
 }
 
 /// True when the agent pane is gone.
@@ -196,6 +227,8 @@ mod tests {
         lines: Arc<Mutex<VecDeque<String>>>,
         requests: Arc<Mutex<Vec<Value>>>,
         stop: Arc<AtomicBool>,
+        /// The panes a snapshot lists; None: herdr cannot be read.
+        panes: Arc<Mutex<Option<Vec<&'static str>>>>,
     }
     impl Fake {
         fn new() -> Self {
@@ -207,16 +240,21 @@ mod tests {
                 lines: Arc::default(),
                 requests: Arc::default(),
                 stop: Arc::default(),
+                panes: Arc::new(Mutex::new(Some(vec!["w1:p2", "w1:p3"]))),
             };
-            let (lines, requests, stop) =
-                (fake.lines.clone(), fake.requests.clone(), fake.stop.clone());
+            let (lines, requests, stop, panes) = (
+                fake.lines.clone(),
+                fake.requests.clone(),
+                fake.stop.clone(),
+                fake.panes.clone(),
+            );
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((conn, _)) => {
-                            let (lines, requests, stop) =
-                                (lines.clone(), requests.clone(), stop.clone());
-                            thread::spawn(move || serve(conn, lines, requests, stop));
+                            let (lines, requests, stop, panes) =
+                                (lines.clone(), requests.clone(), stop.clone(), panes.clone());
+                            thread::spawn(move || serve(conn, lines, requests, stop, panes));
                         }
                         Err(_) => thread::sleep(Duration::from_millis(5)),
                     }
@@ -229,6 +267,11 @@ mod tests {
         }
         fn push(&self, line: Value) {
             self.lines.lock().unwrap().push_back(line.to_string());
+        }
+        fn snapshots(&self) -> usize {
+            (self.requests.lock().unwrap().iter())
+                .filter(|r| r["method"] == "session.snapshot")
+                .count()
         }
         fn subscriptions(&self) -> usize {
             (self.requests.lock().unwrap().iter())
@@ -246,6 +289,7 @@ mod tests {
         lines: Arc<Mutex<VecDeque<String>>>,
         requests: Arc<Mutex<Vec<Value>>>,
         stop: Arc<AtomicBool>,
+        panes: Arc<Mutex<Option<Vec<&'static str>>>>,
     ) {
         conn.set_nonblocking(false).unwrap();
         let mut request = String::new();
@@ -255,7 +299,17 @@ mod tests {
         let request: Value = serde_json::from_str(&request).unwrap();
         requests.lock().unwrap().push(request.clone());
         let mut out = conn;
-        if request["method"] == "events.subscribe" {
+        if request["method"] == "session.snapshot" {
+            let answer = match panes.lock().unwrap().clone() {
+                Some(panes) => json!({ "id": request["id"], "result": {
+                    "type": "session_snapshot",
+                    "snapshot": { "panes": panes.iter()
+                        .map(|p| json!({ "pane_id": p, "tab_id": "w1:t1" })).collect::<Vec<_>>() },
+                }}),
+                None => json!({ "id": request["id"], "error": { "code": "unavailable" } }),
+            };
+            let _ = writeln!(out, "{answer}");
+        } else if request["method"] == "events.subscribe" {
             let ack = json!({ "id": request["id"], "result": { "type": "subscription_started" }});
             if writeln!(out, "{ack}").is_err() {
                 return;
@@ -364,12 +418,58 @@ mod tests {
     }
 
     #[test]
-    fn events_lost_subscribes_again() {
+    fn events_lost_subscribes_again_and_reads_the_layout_again() {
         let fake = Fake::new();
-        let _watch = watch(&fake);
+        let watch = watch(&fake);
         assert!(until(|| fake.subscriptions() == 1));
+        assert!(
+            until(|| fake.snapshots() == 1),
+            "read after the first subscription"
+        );
         fake.push(json!({ "id": "csr", "error": { "code": "events_lost" } }));
         assert!(until(|| fake.subscriptions() == 2), "a new subscription");
+        assert!(until(|| fake.snapshots() == 2), "and a new snapshot");
+        assert!(!watch.agent_gone(), "the agent pane is still there");
+    }
+
+    #[test]
+    fn an_agent_pane_that_closed_while_no_event_reached_us_ends_the_pane() {
+        // Already gone when the pane first looks.
+        let fake = Fake::new();
+        *fake.panes.lock().unwrap() = Some(vec!["w1:p3"]);
+        let watch = watch(&fake);
+        assert!(
+            until(|| watch.agent_gone()),
+            "missing at the first snapshot"
+        );
+        // Gone in the gap between a lost stream and the next one.
+        let fake = Fake::new();
+        let watch = self::watch(&fake);
+        assert!(until(|| fake.snapshots() == 1));
+        assert!(!watch.agent_gone());
+        *fake.panes.lock().unwrap() = Some(vec!["w1:p3"]);
+        fake.push(json!({ "id": "csr", "error": { "code": "events_lost" } }));
+        assert!(
+            until(|| watch.agent_gone()),
+            "missing after the resubscription"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_that_cannot_be_read_does_not_end_the_pane() {
+        let fake = Fake::new();
+        *fake.panes.lock().unwrap() = None;
+        let watch = watch(&fake);
+        assert!(until(|| fake.snapshots() == 1));
+        thread::sleep(Duration::from_millis(200));
+        assert!(!watch.agent_gone());
+        // And with no agent to look for there is nothing to be missing.
+        let fake = Fake::new();
+        *fake.panes.lock().unwrap() = Some(vec![]);
+        let watch = Watcher::start(fake.socket(), || None);
+        assert!(until(|| fake.subscriptions() == 1));
+        thread::sleep(Duration::from_millis(200));
+        assert!(!watch.agent_gone());
     }
 
     #[test]
