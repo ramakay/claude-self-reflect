@@ -36,6 +36,10 @@ pub(crate) struct CompactSnapshot {
     /// this field existed reads as no ask.
     #[serde(default)]
     pub latest_ask: Option<String>,
+    /// When the snapshot was taken (RFC 3339). The overlay applies only to a
+    /// stored episode that is not newer; a snapshot without it is ignored.
+    #[serde(default)]
+    pub taken_at: Option<String>,
     pub completions: Vec<super::stop::CompletionReceipt>,
     pub completions_untied: bool,
 }
@@ -90,6 +94,7 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
                 anchor_request: episode.anchor_request,
                 anchor: episode.compact_anchor,
                 latest_ask: episode.latest_ask,
+                taken_at: Some(chrono::Utc::now().to_rfc3339()),
                 completions: episode.completions,
                 completions_untied: episode.completions_untied,
             };

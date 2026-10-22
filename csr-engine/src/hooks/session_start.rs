@@ -1189,7 +1189,7 @@ pub(crate) fn format_session_start_tier0_for_session(
                     serde_json::from_str::<super::precompact::CompactSnapshot>(&json).ok()
                 })
             {
-                refreshed = Some(overlay_compact_snapshot(ep, snapshot));
+                refreshed = overlay_compact_snapshot(ep, snapshot);
             }
         }
         let recap_ep = recap_episode(refreshed.as_ref().unwrap_or(ep), source, target_session_id);
@@ -1229,7 +1229,22 @@ pub(crate) fn format_session_start_tier0_for_session(
 /// their `completions_untied` flag are relative to an anchor, so they replace
 /// the stored ones only when the snapshot was taken against the same anchor;
 /// otherwise they would sit under a task they were not made for.
-fn overlay_compact_snapshot(ep: &Episode, snapshot: super::precompact::CompactSnapshot) -> Episode {
+fn overlay_compact_snapshot(
+    ep: &Episode,
+    snapshot: super::precompact::CompactSnapshot,
+) -> Option<Episode> {
+    // A snapshot older than the stored episode describes an earlier state of
+    // the session (the next PreCompact could not read its transcript, so the
+    // old one survived): ignore it, ask and anchor alike. One with no time, or
+    // a time that does not parse, cannot show it is current.
+    let taken = snapshot
+        .taken_at
+        .as_deref()
+        .and_then(crate::temporal::parse_timestamp)?;
+    let stored = crate::temporal::parse_timestamp(&ep.timestamp)?;
+    if taken < stored {
+        return None;
+    }
     let mut current = ep.clone();
     current.compact_anchor = snapshot.anchor;
     // The ask belongs with the anchor it was typed under, and the snapshot is
@@ -1240,7 +1255,7 @@ fn overlay_compact_snapshot(ep: &Episode, snapshot: super::precompact::CompactSn
         current.completions_untied = snapshot.completions_untied;
     }
     current.recap_evidence_version = Some(super::stop::RECAP_EVIDENCE_VERSION);
-    current
+    Some(current)
 }
 
 /// Only the recap changes after compaction; fragment fallback and the episode
@@ -3552,6 +3567,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         let snapshot = |anchor_request: Option<&str>| super::super::precompact::CompactSnapshot {
             anchor_request: anchor_request.map(str::to_string),
             latest_ask: None,
+            taken_at: Some("2026-07-08T00:00:00Z".into()),
             anchor: Some(CompactAnchor {
                 request: "Now wire the staging endpoint.".into(),
                 completions_untied: true,
@@ -3564,13 +3580,14 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         };
         // Same anchor: the fresher receipts are used.
         let same =
-            overlay_compact_snapshot(&ep, snapshot(Some("Fix the auth middleware regression.")));
+            overlay_compact_snapshot(&ep, snapshot(Some("Fix the auth middleware regression.")))
+                .expect("a current snapshot");
         assert_eq!(same.completions[0].receipt, "2222222");
         assert!(same.completions_untied);
         // A different anchor, or a snapshot that predates the field: the stored
         // receipts stay, the compact anchor still arrives.
         for other in [Some("Something else entirely."), None] {
-            let kept = overlay_compact_snapshot(&ep, snapshot(other));
+            let kept = overlay_compact_snapshot(&ep, snapshot(other)).expect("current");
             assert_eq!(kept.completions[0].receipt, "1111111", "{other:?}");
             assert!(!kept.completions_untied, "{other:?}");
             assert_eq!(
@@ -3591,6 +3608,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         let snapshot = |ask: Option<&str>| super::super::precompact::CompactSnapshot {
             anchor_request: ep.anchor_request.clone(),
             latest_ask: ask.map(str::to_string),
+            taken_at: Some("2026-07-08T00:00:00Z".into()),
             anchor: Some(CompactAnchor {
                 request: "Now wire the staging endpoint.".into(),
                 completions_untied: false,
@@ -3599,13 +3617,49 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
             completions_untied: false,
         };
         let newer =
-            overlay_compact_snapshot(&ep, snapshot(Some("Which crate pulls in the old parser?")));
+            overlay_compact_snapshot(&ep, snapshot(Some("Which crate pulls in the old parser?")))
+                .expect("current");
         assert_eq!(
             newer.latest_ask.as_deref(),
             Some("Which crate pulls in the old parser?")
         );
-        let none = overlay_compact_snapshot(&ep, snapshot(None));
+        let none = overlay_compact_snapshot(&ep, snapshot(None)).expect("current");
         assert!(none.latest_ask.is_none(), "{:?}", none.latest_ask);
+    }
+
+    /// Snapshot S1, then a newer ask and its Stop episode. If the next
+    /// PreCompact cannot read its transcript, S1 survives: it must not bring
+    /// back its older ask or anchor over the newer episode.
+    #[test]
+    fn a_stale_compact_snapshot_is_ignored_ask_and_anchor_alike() {
+        use crate::hooks::stop::CompactAnchor;
+        let mut ep = minimal_episode("Fix the auth middleware regression", "Fixed it", None);
+        ep.timestamp = "2026-07-08T12:00:00Z".into();
+        ep.anchor_request = Some("Fix the auth middleware regression.".into());
+        ep.latest_ask = Some("Which crate pulls in the old parser?".into());
+        let snapshot = |taken_at: Option<&str>| super::super::precompact::CompactSnapshot {
+            anchor_request: ep.anchor_request.clone(),
+            latest_ask: Some("Why did the second worker finish so early?".into()),
+            taken_at: taken_at.map(str::to_string),
+            anchor: Some(CompactAnchor {
+                request: "Now wire the staging endpoint.".into(),
+                completions_untied: false,
+            }),
+            completions: vec![],
+            completions_untied: false,
+        };
+        // S1 was taken before the stored episode was written.
+        assert!(overlay_compact_snapshot(&ep, snapshot(Some("2026-07-08T09:00:00Z"))).is_none());
+        // No time, or an unreadable one: it cannot show it is current.
+        assert!(overlay_compact_snapshot(&ep, snapshot(None)).is_none());
+        assert!(overlay_compact_snapshot(&ep, snapshot(Some("yesterday"))).is_none());
+        // One taken after the episode applies.
+        let fresh = overlay_compact_snapshot(&ep, snapshot(Some("2026-07-08T13:00:00Z")))
+            .expect("a snapshot taken after the episode");
+        assert_eq!(
+            fresh.latest_ask.as_deref(),
+            Some("Why did the second worker finish so early?")
+        );
     }
 
     /// Only text that can render decides: a completed todo never renders, so

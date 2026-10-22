@@ -742,22 +742,20 @@ const PRAISE_OPENERS: &[&str] = &[
 ];
 
 /// A typed message that only reacts to the work ("Thanks for fixing the
-/// build"): it opens with praise, asks nothing, and has no clause that does.
-/// "Great. Now fix the tests" is a task.
+/// build"): it opens with praise and nothing after the praise word asks,
+/// instructs or questions. Anything that does ("Great now fix the tests",
+/// "Thanks! Can you also bump the version?") is a new task.
 fn is_closing_remark(prose: &str) -> bool {
-    let first = prose
-        .split_whitespace()
-        .next()
-        .map(|word| {
-            word.trim_matches(|c: char| !c.is_alphanumeric())
-                .to_lowercase()
-        })
-        .unwrap_or_default();
+    let words: Vec<&str> = prose.split_whitespace().collect();
+    let Some(first) = words.first().map(|word| {
+        word.trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase()
+    }) else {
+        return false;
+    };
     PRAISE_OPENERS.contains(&first.as_str())
         && !prose.contains('?')
-        && !prose
-            .split(['.', ',', ';', '!', '\u{2014}', '\u{2013}'])
-            .any(|clause| crate::hooks::recap::is_request(clause.trim()))
+        && !(1..words.len()).any(|at| crate::hooks::recap::is_request(&words[at..].join(" ")))
 }
 
 /// Longest stored `latest_ask`, in bytes. The recap renders at most
@@ -982,7 +980,13 @@ where
             // The literal last typed row decides. One that leaves no usable
             // prose (a pasted recap, a command-only wrapper) clears the
             // candidate: an older question must not stand in for it.
-            if !sidechain && opening_seen != Some(true) && typed_row_text(val).is_some() {
+            // Only a real typed message can clear it, judged on the row as
+            // written: not a tool-result carrier (the sanitizer may leave one
+            // with an empty content array), and not a row with nothing in it.
+            // A command wrapper the sanitizer empties out is still typed.
+            let real_typed_row =
+                typed_row_text(raw_row).is_some_and(|text| !text.trim().is_empty());
+            if !sidechain && opening_seen != Some(true) && real_typed_row {
                 latest_ask = match &typed {
                     Some(TypedPrompt { prose, note: false }) => {
                         whole_paragraphs(prose, LATEST_ASK_MAX_BYTES)
@@ -2851,6 +2855,30 @@ mod tests {
     }
 
     #[test]
+    fn a_sanitized_tool_result_carrier_does_not_clear_the_ask() {
+        let ask = "Why did the second worker finish so early?";
+        let csr_call = serde_json::json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "csr-1", "name": "csr_reflect_on_past", "input": {"query": "history"}}
+        ], "stop_reason": "end_turn"}});
+        // The sanitizer drops this CSR-only result and leaves an empty content array.
+        let carrier = serde_json::json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "csr-1", "content": "Error: not found in CSR memory"}
+        ]}});
+        let ep = extract(&[
+            dur_typed(ask, "2026-10-21T10:00:00Z"),
+            dur_timed(csr_call, "2026-10-21T10:01:00Z"),
+            dur_timed(carrier, "2026-10-21T10:02:00Z"),
+        ]);
+        assert_eq!(ep.latest_ask.as_deref(), Some(ask));
+        // A typed row with nothing in it is not a message either.
+        let ep = extract(&[
+            dur_typed(ask, "2026-10-21T10:00:00Z"),
+            dur_typed("   ", "2026-10-21T10:02:00Z"),
+        ]);
+        assert_eq!(ep.latest_ask.as_deref(), Some(ask));
+    }
+
+    #[test]
     fn a_cut_ask_is_never_stored() {
         let long = format!("Can you check {}?", "界".repeat(150));
         assert!(long.len() > LATEST_ASK_MAX_BYTES);
@@ -2896,8 +2924,15 @@ mod tests {
         assert!(ep.closing_success);
         assert_eq!(ep.outcome, "success");
         // A new task, even one that opens with praise, starts over.
-        let ep = closing("Great. Now update the changelog for that fix");
-        assert!(!ep.closing_success);
+        for task in [
+            "Great. Now update the changelog for that fix",
+            "Great now fix the tests",
+            "Great\nNow fix the tests",
+            "Thanks! Can you also bump the version?",
+        ] {
+            let ep = closing(task);
+            assert!(!ep.closing_success, "{task}");
+        }
         // A remark after a failure does not forgive it.
         let ep = extract(&[
             dur_typed("Run the release script and report", "2026-10-21T10:00:00Z"),
