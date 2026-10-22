@@ -421,7 +421,9 @@ fn terminal_session(reload: bool) {
     }
     let settled = frames(&frame_log);
     // Fifty wakes of each kind in half a second, written to the live pane: they draw it once at
-    // the leading edge and once more for the rest, a second later; never fifty times.
+    // the leading edge and once more for the rest, a second later; never fifty times. A loaded
+    // machine can stretch the burst past the spacing, which earns one more draw per spacing.
+    let burst = Instant::now();
     for _ in 0..50 {
         assert!(csr_engine::companion::wake::notify(
             &paths.keep,
@@ -435,6 +437,9 @@ fn terminal_session(reload: bool) {
         ));
         drain(&mut master, &mut output, Duration::from_millis(10));
     }
+    let burst = burst.elapsed();
+    let stretched =
+        (burst.as_secs_f64() / csr_engine::companion::wake::SPACING.as_secs_f64()) as usize;
     // The first wake's frame, then the frames' count unchanged for longer than the spacing and a
     // slow build together.
     let began = Instant::now();
@@ -456,8 +461,10 @@ fn terminal_session(reload: bool) {
     }
     let drawn = frames(&frame_log) - settled;
     assert!(
-        (1..=2).contains(&drawn),
-        "100 wakes drew {drawn} frames, want 1 or 2 (settled at {settled}, log {:?})",
+        (1..=2 + stretched).contains(&drawn),
+        "100 wakes drew {drawn} frames, want 1 to {} (burst took {:?}, settled at {settled}, log {:?})",
+        2 + stretched,
+        burst,
         fs::read_to_string(&frame_log)
     );
     assert!(
