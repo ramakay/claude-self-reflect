@@ -98,6 +98,8 @@ pub struct RecapFeeds {
 /// claim the user was shown something they were not.
 pub const DREAM_CLAUSE_PREFIX: &str = "Dreamt: ";
 pub const CORRECTION_CLAUSE_PREFIX: &str = "Corrected: ";
+/// The recap's character budget, sentinel included.
+const MAX_CHARS: usize = 700;
 /// The clause naming the session's literal last typed message.
 pub const THEN_CLAUSE_PREFIX: &str = "Then: ";
 
@@ -120,11 +122,12 @@ pub fn compose_recap_with_deliveries(
     // line of the recap comes out exactly as it would without it.
     if let Some(then) = then_clause(ep) {
         if let Some(with) = compose_recap_inner(ep, feeds, age, Some(&then)) {
-            if with
-                .text
-                .split('\n')
-                .skip(1)
-                .eq(base.text.split('\n').skip(1))
+            if with.text.chars().count() <= MAX_CHARS
+                && with
+                    .text
+                    .split('\n')
+                    .skip(1)
+                    .eq(base.text.split('\n').skip(1))
                 && with.corrections == base.corrections
             {
                 return Some(with);
@@ -140,8 +143,6 @@ fn compose_recap_inner(
     age: &str,
     then: Option<&str>,
 ) -> Option<ComposedRecap> {
-    const MAX_CHARS: usize = 700;
-
     use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
     use crate::import::contamination::has_csr_text;
 
@@ -634,9 +635,9 @@ const COMMAND_OPENERS: &[&str] = &[
     "look",
 ];
 
-/// Words a command may be followed by: a determiner, pronoun, particle or
-/// wh-word. A noun phrase that happens to start with a command word ("Update
-/// available for the CLI", "Build passes now") has something else here.
+/// Words a command may be followed by: a determiner, pronoun or wh-word.
+/// Prepositions and particles are left out: "Push to main failed" and "Fix
+/// for the login bug landed" are remarks that open with a command word.
 const COMMAND_FOLLOWERS: &[&str] = &[
     "the",
     "a",
@@ -658,20 +659,8 @@ const COMMAND_FOLLOWERS: &[&str] = &[
     "each",
     "any",
     "some",
-    "up",
-    "out",
-    "on",
-    "in",
-    "into",
-    "over",
-    "off",
-    "back",
-    "down",
-    "for",
-    "with",
-    "from",
-    "at",
-    "to",
+    "everything",
+    "anything",
     "if",
     "whether",
     "what",
@@ -681,11 +670,24 @@ const COMMAND_FOLLOWERS: &[&str] = &[
     "when",
     "which",
     "who",
-    "both",
-    "only",
-    "everything",
-    "anything",
-    "again",
+];
+
+/// Words that turn "<command> this ..." into a noun phrase about a time:
+/// "Run this morning took two minutes".
+const TIME_WORDS: &[&str] = &[
+    "morning",
+    "afternoon",
+    "evening",
+    "night",
+    "week",
+    "weekend",
+    "month",
+    "year",
+    "time",
+    "session",
+    "round",
+    "run",
+    "one",
 ];
 
 /// Leading words that carry no ask of their own: "ok so now fix the build".
@@ -701,7 +703,7 @@ const REQUEST_FILLERS: &[&str] = &[
 /// a question whose FIRST sentence ends in `?` and opens with a question word;
 /// `can/could/would/will you|we ...` and `I want|need you to ...`; and an
 /// instruction that opens with a command verb followed by a determiner,
-/// pronoun or particle (or a path). A question word buried inside a statement
+/// pronoun or wh-word (or a path). A question word buried inside a statement
 /// ("I already know how many workers finished") never counts, and neither
 /// does a noun phrase that opens with a command word.
 pub(crate) fn is_request(text: &str) -> bool {
@@ -743,9 +745,11 @@ pub(crate) fn is_request(text: &str) -> bool {
     if (opener == "let's" || opener == "lets") && words.len() >= 3 {
         return true;
     }
+    let third = words.get(2).map(String::as_str).unwrap_or("");
     COMMAND_OPENERS.contains(&opener)
         && words.len() >= 2
         && (COMMAND_FOLLOWERS.contains(&second) || second.starts_with(['/', '`']))
+        && !(matches!(second, "this" | "that") && TIME_WORDS.contains(&third))
 }
 
 /// The completed clause: the receipts `displayed_receipts` picks, never
@@ -1159,6 +1163,7 @@ mod tests {
             "Change the subagent setting please",
             "see if anything happened since the last push",
             "Share the final build with me on mobile",
+            "Share it on mobile",
             "Tell me which crate pulls in the old parser",
             "Please fix the build before the release",
             "I want you to rewrite the intro section",
@@ -1175,6 +1180,14 @@ mod tests {
             // A command word opening a noun phrase.
             "Work on the pane is finally finished",
             "Build is green again.",
+            "Fix for the login bug landed",
+            "Push to main failed",
+            "Update on the release: it shipped",
+            "Build for the release is green",
+            "Run on the studio finished in two minutes",
+            "Set up of the pane is done",
+            "Run this morning took two minutes",
+            "Share on mobile",
             "Update available for the CLI",
             "Push failed with a lock error",
             "Test results look fine to me",
@@ -1228,7 +1241,62 @@ mod tests {
                 old.split('\n').skip(1).collect::<Vec<_>>()
             );
         }
-        assert!(new.chars().count() <= 700 + 160, "{new}");
+        assert!(new.chars().count() <= 700, "{new}");
+    }
+
+    #[test]
+    fn then_clause_never_pushes_the_paragraph_past_the_budget() {
+        // `n` characters of plain words.
+        let words = |n: usize| {
+            let mut text = String::new();
+            for word in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+                .iter()
+                .cycle()
+            {
+                if text.len() + word.len() + 1 > n {
+                    break;
+                }
+                text.push_str(word);
+                text.push(' ');
+            }
+            text.trim_end().to_string()
+        };
+        let mut ep = episode();
+        ep.anchor_request = Some(format!("Rework {}.", words(148)));
+        ep.completions = vec![
+            CompletionReceipt {
+                claim: format!("Rewrote {}", words(88)),
+                receipt: "a".repeat(40),
+            },
+            CompletionReceipt {
+                claim: format!("Added {}", words(90)),
+                receipt: "b".repeat(40),
+            },
+        ];
+        ep.todos.clear();
+        ep.blockers = None;
+        ep.next_steps = Some(format!("Run {}", words(120)));
+        let feeds = RecapFeeds::empty();
+        let base = compose_recap(&ep, &feeds, "2 weeks ago").expect("recap");
+        let ask = format!("Why did {}?", words(147));
+        // The preconditions that make this test mean something.
+        assert!(base.chars().count() <= 700, "{}", base.chars().count());
+        assert!(
+            base.chars().count() + ask.chars().count() > 700,
+            "{}: {base}",
+            base.chars().count()
+        );
+        ep.latest_ask = Some(ask);
+        let with = compose_recap(&ep, &feeds, "2 weeks ago").expect("recap");
+        assert!(
+            with.chars().count() <= 700,
+            "{}: {with}",
+            with.chars().count()
+        );
+        assert_eq!(
+            with, base,
+            "an over-budget clause is dropped, not squeezed in"
+        );
     }
 
     #[test]
