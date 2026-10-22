@@ -142,6 +142,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
@@ -544,7 +545,7 @@ pub fn resolve_edges(
     // TASK E (WCR Phase 6): memoizes `repo_scan::project_roots` per project
     // across the whole pass — a DB query, and many pending edges typically
     // share a project.
-    let mut roots_cache: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut memo = Memo::default();
 
     for p in &pending {
         // --- drifted (WCR Phase 8, TASK B): already classified externally,
@@ -599,7 +600,7 @@ pub fn resolve_edges(
                 has_import,
                 module_evidence,
                 &imports_module_by_file,
-                &mut roots_cache,
+                &mut memo,
                 file_exists,
                 zero_defs_anywhere,
                 &local_bindings,
@@ -630,7 +631,8 @@ pub fn resolve_edges(
             p,
             module_evidence,
             defs,
-            &project_roots_for(conn, &p.project, &mut roots_cache),
+            &project_roots_for(conn, &p.project, &mut memo),
+            &mut memo,
         )? {
             bind(conn, p, &dst, &evidence)?;
             resolved += 1;
@@ -662,7 +664,7 @@ pub fn resolve_edges(
                 // with (no code_nodes signal, that's the branch we're in) —
                 // genuinely ambiguous, never guess. Unless the file itself is
                 // gone (TASK C): then the ambiguity is moot, it's history.
-                if resolve_stale_or_unexplained(conn, p, file_exists)? {
+                if resolve_stale_or_unexplained(conn, p, file_exists, &mut memo)? {
                     stale += 1;
                 } else {
                     ambiguous_remaining += 1;
@@ -680,7 +682,7 @@ pub fn resolve_edges(
                     has_import,
                     module_evidence,
                     &imports_module_by_file,
-                    &mut roots_cache,
+                    &mut memo,
                     file_exists,
                     true,
                     &local_bindings,
@@ -728,11 +730,11 @@ pub fn resolve_edges(
         }
 
         // B3: corpus-witnessed via co-edit weight, strict 2x margin.
-        let f_canon = canon_path(&p.src_file);
+        let f_canon = canon_path(&p.src_file, &mut memo);
         let mut scored: Vec<(&String, i64)> = Vec::with_capacity(distinct.len());
         for (file, id) in &distinct {
-            let d_canon = canon_path(file);
-            let weight = coedit_weight(conn, &f_canon, &d_canon)?;
+            let d_canon = canon_path(file, &mut memo);
+            let weight = coedit_weight(conn, &f_canon, &d_canon, &mut memo)?;
             scored.push((id, weight));
         }
         // `distinct` iterates file-sorted; a stable sort by weight desc keeps
@@ -743,7 +745,7 @@ pub fn resolve_edges(
         if weight_top >= 2 && weight_top >= 2 * weight_runnerup {
             bind(conn, p, top_id, &format!("coedit:{weight_top}"))?;
             resolved += 1;
-        } else if resolve_stale_or_unexplained(conn, p, file_exists)? {
+        } else if resolve_stale_or_unexplained(conn, p, file_exists, &mut memo)? {
             stale += 1;
         } else {
             ambiguous_remaining += 1;
@@ -932,7 +934,7 @@ fn classify_only(
     has_import: bool,
     module: Option<&str>,
     imports_module_by_file: &BTreeMap<String, BTreeMap<String, String>>,
-    roots_cache: &mut BTreeMap<String, Vec<PathBuf>>,
+    memo: &mut Memo,
     file_exists: &dyn Fn(&str) -> bool,
     zero_defs_anywhere: bool,
     local_bindings: &BTreeMap<(String, String), BTreeSet<(String, String)>>,
@@ -943,7 +945,7 @@ fn classify_only(
         classify_edge(conn, p, &boundary, &evidence)?;
         return Ok(Some("external"));
     }
-    if let Some((boundary, evidence)) = qualifier_tier(conn, p)? {
+    if let Some((boundary, evidence)) = qualifier_tier(conn, p, memo)? {
         // X1b (TASK B): `via:<qualifier>` evidence classifies purely from
         // the qualifier's root, independent of import evidence.
         classify_edge(conn, p, &boundary, &evidence)?;
@@ -956,7 +958,7 @@ fn classify_only(
     // (alongside `from:`), so a second pass over an unchanged DB re-derives
     // the SAME classification from the SAME module value instead of losing
     // it. See `module_for_pending`'s own doc comment.
-    let ns = external_ns_for(conn, &p.src_file, &p.project, roots_cache);
+    let ns = external_ns_for(conn, &p.src_file, &p.project, memo);
     if let Some((boundary, evidence)) = qualifier_import_tier(p, imports_module_by_file, &ns) {
         // X1c (WCR Phase 7, TASK A): qualifier -> import two-hop chain — the
         // qualifier's root itself is an imported symbol, join through its
@@ -973,7 +975,7 @@ fn classify_only(
         }));
     }
     if let Some((boundary, evidence)) =
-        internal_module_tier(p, &project_roots_for(conn, &p.project, roots_cache))
+        internal_module_tier(p, &project_roots_for(conn, &p.project, memo))
     {
         // WCR Phase 7, TASK E: relative/alias import module resolves to a
         // real on-disk file — explained, but not a symbol-level bind (see
@@ -1034,7 +1036,7 @@ fn classify_only(
             }
         }
     }
-    if resolve_stale_or_unexplained(conn, p, file_exists)? {
+    if resolve_stale_or_unexplained(conn, p, file_exists, memo)? {
         return Ok(Some("stale"));
     }
     Ok(None)
@@ -1069,40 +1071,72 @@ fn chain_prefix_matches(binding_chain: &str, call_chain: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('>'))
 }
 
+/// Lookups a resolve pass would otherwise repeat for every pending edge. A
+/// pass is single-threaded and sees the tables it reads unchanged (the loop
+/// only rewrites `code_edges`), so each answer is computed once and kept.
+///
+/// Measured 2026-10-21 on the owner's 9.9 GB database: one pass over a 56-edge
+/// file took 32 s, 70% of it in `coedit_weight`'s self-join and 17% in
+/// `repo_has_module_named` re-reading every file of the project per edge.
+#[derive(Default)]
+struct Memo {
+    /// `repo_scan::project_roots` per project (see `project_roots_for`).
+    roots: BTreeMap<String, Vec<PathBuf>>,
+    /// Per project, every file stem and directory name of its `repo_defs` and
+    /// `code_nodes` files: the answer set of `repo_has_module_named`.
+    module_names: BTreeMap<String, BTreeSet<String>>,
+    /// Per project, the base names of its Python `repo_defs` files.
+    python_files: BTreeMap<String, BTreeSet<String>>,
+    /// `canon_path` per input.
+    canon: BTreeMap<String, String>,
+    /// The caller's `file_exists` answer per `Pending::src_file`.
+    src_file_exists: BTreeMap<String, bool>,
+    /// `external_ns_for` per `(src_file, project)`.
+    ns: BTreeMap<(String, String), Rc<manifest::ExternalNs>>,
+    /// Per canonical file `f`, every file edited in a session that also edited
+    /// `f`, with the count of those sessions (see `coedit_weight`).
+    coedit: BTreeMap<String, BTreeMap<String, i64>>,
+}
+
 /// Memoized `repo_scan::project_roots` lookup shared by `external_ns_for`
 /// (X1's manifest fallback, WCR Phase 6 TASK E) and `internal_module_tier`
 /// (WCR Phase 7 TASK E's alias-module resolution) — both need "this
 /// project's known roots" and a resolve pass typically has many pending
 /// edges sharing a project, so the DB query only runs once per project.
-fn project_roots_for(
-    conn: &Connection,
-    project: &str,
-    roots_cache: &mut BTreeMap<String, Vec<PathBuf>>,
-) -> Vec<PathBuf> {
-    if !roots_cache.contains_key(project) {
+fn project_roots_for(conn: &Connection, project: &str, memo: &mut Memo) -> Vec<PathBuf> {
+    if !memo.roots.contains_key(project) {
         let roots = repo_scan::project_roots(conn, project).unwrap_or_default();
-        roots_cache.insert(project.to_string(), roots);
+        memo.roots.insert(project.to_string(), roots);
     }
-    roots_cache.get(project).cloned().unwrap_or_default()
+    memo.roots.get(project).cloned().unwrap_or_default()
 }
 
 /// TASK E (WCR Phase 6): resolve the external namespaces reachable from a
 /// pending edge's file, falling back to the project's other known roots
 /// when the direct single-file ancestor walk finds no manifest at all.
 /// `roots_cache` memoizes `repo_scan::project_roots` per project across the
-/// whole resolve pass (see `project_roots_for`).
+/// whole resolve pass (see `project_roots_for`); the answer itself is kept per
+/// `(src_file, project)`.
 fn external_ns_for(
     conn: &Connection,
     src_file: &str,
     project: &str,
-    roots_cache: &mut BTreeMap<String, Vec<PathBuf>>,
-) -> manifest::ExternalNs {
-    let ns = manifest::external_namespaces(Path::new(src_file));
-    if !ns.rust_deps.is_empty() || !ns.js_deps.is_empty() {
-        return ns;
+    memo: &mut Memo,
+) -> Rc<manifest::ExternalNs> {
+    let key = (src_file.to_string(), project.to_string());
+    if let Some(ns) = memo.ns.get(&key) {
+        return Rc::clone(ns);
     }
-    let roots = project_roots_for(conn, project, roots_cache);
-    manifest::apply_project_root_fallback(ns, &roots)
+    let ns = manifest::external_namespaces(Path::new(src_file));
+    let ns = if !ns.rust_deps.is_empty() || !ns.js_deps.is_empty() {
+        ns
+    } else {
+        let roots = project_roots_for(conn, project, memo);
+        manifest::apply_project_root_fallback(ns, &roots)
+    };
+    let ns = Rc::new(ns);
+    memo.ns.insert(key, Rc::clone(&ns));
+    ns
 }
 
 /// The root segment of a qualifier path: everything before the first `::`
@@ -1246,7 +1280,11 @@ const PY_RECEIVER_NAMES: &[&str] = &["self", "cls"];
 /// self-contradictory real-world code (you'd call it bare, not qualified,
 /// if you'd imported the trailing name), so the two tiers' inputs don't
 /// realistically overlap.
-fn qualifier_tier(conn: &Connection, p: &Pending) -> Result<Option<(String, String)>> {
+fn qualifier_tier(
+    conn: &Connection,
+    p: &Pending,
+    memo: &mut Memo,
+) -> Result<Option<(String, String)>> {
     if p.kind != "calls" {
         return Ok(None);
     }
@@ -1268,7 +1306,7 @@ fn qualifier_tier(conn: &Connection, p: &Pending) -> Result<Option<(String, Stri
     let lang_key = manifest::builtin_lang_key_from_file(&p.src_file);
     let is_external = match lang_key {
         Some("rust") => {
-            if repo_has_module_named(conn, &p.project, root)? {
+            if repo_has_module_named(conn, &p.project, root, memo)? {
                 false
             } else {
                 let ns = manifest::external_namespaces(Path::new(&p.src_file));
@@ -1280,7 +1318,8 @@ fn qualifier_tier(conn: &Connection, p: &Pending) -> Result<Option<(String, Stri
                 false
             } else {
                 let ns = manifest::external_namespaces(Path::new(&p.src_file));
-                ns.py_stdlib.contains(root) || !repo_has_python_file_named(conn, &p.project, root)?
+                ns.py_stdlib.contains(root)
+                    || !repo_has_python_file_named(conn, &p.project, root, memo)?
             }
         }
         _ => false,
@@ -1366,45 +1405,71 @@ fn qualifier_import_tier(
 /// module path (a local `src/fs.rs` wrapper's `fs::helper()`) as an external
 /// stdlib/dependency reference just because the root segment happens to
 /// collide with a builtin/dep namespace name.
-fn repo_has_module_named(conn: &Connection, project: &str, root: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT file FROM repo_defs WHERE project = ?1
-         UNION
-         SELECT file FROM code_nodes WHERE project = ?1",
-    )?;
-    let files = stmt.query_map(params![project], |row| row.get::<_, String>(0))?;
-    for file in files {
-        let file = file?;
-        let path = Path::new(&file);
-        if path.file_stem().and_then(|s| s.to_str()) == Some(root) {
-            return Ok(true);
+fn repo_has_module_named(
+    conn: &Connection,
+    project: &str,
+    root: &str,
+    memo: &mut Memo,
+) -> Result<bool> {
+    if !memo.module_names.contains_key(project) {
+        let mut names = BTreeSet::new();
+        let mut stmt = conn.prepare(
+            "SELECT file FROM repo_defs WHERE project = ?1
+             UNION
+             SELECT file FROM code_nodes WHERE project = ?1",
+        )?;
+        let files = stmt.query_map(params![project], |row| row.get::<_, String>(0))?;
+        for file in files {
+            let file = file?;
+            let path = Path::new(&file);
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                names.insert(stem.to_string());
+            }
+            for component in path.components() {
+                if let std::path::Component::Normal(n) = component {
+                    if let Some(n) = n.to_str() {
+                        names.insert(n.to_string());
+                    }
+                }
+            }
         }
-        let hit = path
-            .components()
-            .any(|c| matches!(c, std::path::Component::Normal(n) if n.to_str() == Some(root)));
-        if hit {
-            return Ok(true);
-        }
+        memo.module_names.insert(project.to_string(), names);
     }
-    Ok(false)
+    Ok(memo
+        .module_names
+        .get(project)
+        .is_some_and(|names| names.contains(root)))
 }
 
 /// True when `repo_defs` (for `project`) has a Python file whose basename is
 /// exactly `<root>.py`. Backs `qualifier_tier`'s Python rule: the absence of
 /// such a file is (conservative) positive evidence the qualifier root is not
 /// a local module the repo itself defines.
-fn repo_has_python_file_named(conn: &Connection, project: &str, root: &str) -> Result<bool> {
-    let target = format!("{root}.py");
-    let mut stmt =
-        conn.prepare("SELECT DISTINCT file FROM repo_defs WHERE project = ?1 AND lang = 'python'")?;
-    let files = stmt.query_map(params![project], |row| row.get::<_, String>(0))?;
-    for file in files {
-        let file = file?;
-        if Path::new(&file).file_name().and_then(|n| n.to_str()) == Some(target.as_str()) {
-            return Ok(true);
+fn repo_has_python_file_named(
+    conn: &Connection,
+    project: &str,
+    root: &str,
+    memo: &mut Memo,
+) -> Result<bool> {
+    if !memo.python_files.contains_key(project) {
+        let mut names = BTreeSet::new();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT file FROM repo_defs WHERE project = ?1 AND lang = 'python'",
+        )?;
+        let files = stmt.query_map(params![project], |row| row.get::<_, String>(0))?;
+        for file in files {
+            let file = file?;
+            if let Some(name) = Path::new(&file).file_name().and_then(|n| n.to_str()) {
+                names.insert(name.to_string());
+            }
         }
+        memo.python_files.insert(project.to_string(), names);
     }
-    Ok(false)
+    let target = format!("{root}.py");
+    Ok(memo
+        .python_files
+        .get(project)
+        .is_some_and(|names| names.contains(&target)))
 }
 
 /// File extensions/index-suffixes tried, in order, when resolving a
@@ -1503,6 +1568,7 @@ fn module_bind_tier(
     module: Option<&str>,
     defs: Option<&Vec<(String, String)>>,
     project_roots: &[PathBuf],
+    memo: &mut Memo,
 ) -> Result<Option<(String, String)>> {
     let Some(module) = module else {
         return Ok(None);
@@ -1513,19 +1579,19 @@ fn module_bind_tier(
     let Some(resolved) = resolve_module_file(&p.src_file, module, project_roots) else {
         return Ok(None);
     };
-    let resolved_canon = canon_path(&resolved.to_string_lossy());
+    let resolved_canon = canon_path(&resolved.to_string_lossy(), memo);
     let evidence = format!("module_bind:{}", basename(&resolved.to_string_lossy()));
 
     if let Some(defs) = defs {
         for (file, id) in defs {
-            if canon_path(file) == resolved_canon {
+            if canon_path(file, memo) == resolved_canon {
                 return Ok(Some((id.clone(), evidence)));
             }
         }
     }
 
     for (file, _kind) in crate::storage::codegraph::lookup_repo_defs(conn, &p.project, &p.name)? {
-        if canon_path(&file) == resolved_canon {
+        if canon_path(&file, memo) == resolved_canon {
             return Ok(Some((p.dst_id.clone(), evidence)));
         }
     }
@@ -1631,8 +1697,13 @@ fn resolve_stale_or_unexplained(
     conn: &Connection,
     p: &Pending,
     file_exists: &dyn Fn(&str) -> bool,
+    memo: &mut Memo,
 ) -> Result<bool> {
-    if file_exists(&p.src_file) {
+    let exists = *memo
+        .src_file_exists
+        .entry(p.src_file.clone())
+        .or_insert_with(|| file_exists(&p.src_file));
+    if exists {
         clear_edge(conn, p)?;
         Ok(false)
     } else {
@@ -1653,10 +1724,15 @@ fn repo_candidate_files(conn: &Connection, project: &str, name: &str) -> Result<
 /// `code_evolution.file_path` (which is written as an absolute path) aren't
 /// thrown off by worktree-relative differences. A no-op for paths that don't
 /// exist on disk (e.g. synthetic test paths) — falls back to the input.
-fn canon_path(s: &str) -> String {
-    super::repo_path::canonical_repo_path(Path::new(s))
+fn canon_path(s: &str, memo: &mut Memo) -> String {
+    if let Some(c) = memo.canon.get(s) {
+        return c.clone();
+    }
+    let c = super::repo_path::canonical_repo_path(Path::new(s))
         .to_string_lossy()
-        .into_owned()
+        .into_owned();
+    memo.canon.insert(s.to_string(), c.clone());
+    c
 }
 
 fn basename(s: &str) -> &str {
@@ -1668,15 +1744,35 @@ fn basename(s: &str) -> &str {
 
 /// Number of distinct `code_evolution.session_id`s with a row for both `f`
 /// and `d` (already-canonicalized absolute paths).
-fn coedit_weight(conn: &Connection, f: &str, d: &str) -> Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(DISTINCT a.session_id) FROM code_evolution a
-         JOIN code_evolution b ON a.session_id = b.session_id
-         WHERE a.file_path = ?1 AND b.file_path = ?2",
-        params![f, d],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
+///
+/// One grouped query per `f` per pass instead of one self-join per candidate:
+/// every file edited in a session that also edited `f`, with its session
+/// count. The count for `d` is the same number the old
+/// `a.file_path = f AND b.file_path = d AND a.session_id = b.session_id`
+/// join returned, and 0 when `d` shares no session with `f`.
+fn coedit_weight(conn: &Connection, f: &str, d: &str, memo: &mut Memo) -> Result<i64> {
+    if !memo.coedit.contains_key(f) {
+        let mut stmt = conn.prepare(
+            "SELECT file_path, COUNT(DISTINCT session_id) FROM code_evolution
+             WHERE session_id IN (SELECT session_id FROM code_evolution WHERE file_path = ?1)
+             GROUP BY file_path",
+        )?;
+        let rows = stmt.query_map(params![f], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut by_file = BTreeMap::new();
+        for r in rows {
+            let (file, n) = r?;
+            by_file.insert(file, n);
+        }
+        memo.coedit.insert(f.to_string(), by_file);
+    }
+    Ok(memo
+        .coedit
+        .get(f)
+        .and_then(|by_file| by_file.get(d))
+        .copied()
+        .unwrap_or(0))
 }
 
 #[cfg(test)]
