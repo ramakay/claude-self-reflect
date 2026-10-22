@@ -541,6 +541,13 @@ fn test_embedding_dimensions(embeddings: &Arc<EmbeddingEngine>) -> EvalResult {
     }
 }
 
+/// A side is consistent when its gap between SQLite and the index is no
+/// larger than the changes written after the index's cursor. Those rows are
+/// in flight (the index was loaded before they landed), not drift.
+fn index_gap_in_flight(db: usize, idx: usize, pending: usize) -> bool {
+    db.abs_diff(idx) <= pending
+}
+
 async fn test_search_index_consistency(
     storage: &Arc<Storage>,
     search: &Arc<RwLock<SearchEngine>>,
@@ -552,18 +559,35 @@ async fn test_search_index_consistency(
     let se = search.read().await;
     let idx_chunks = se.chunk_count();
     let idx_reflections = se.reflection_count();
+    let chunk_cursor = se.side_cursor(false);
+    let reflection_cursor = se.side_cursor(true);
     drop(se);
 
-    let ms = t.elapsed().as_secs_f64() * 1000.0;
-    let chunks_match = db_chunks == idx_chunks;
-    let reflections_match = db_reflections == idx_reflections;
+    // Read after the DB counts, so a row landing in between can only widen
+    // the allowance, never fail a consistent index.
+    let pending_chunks = storage
+        .count_embedding_changes_after(false, chunk_cursor)
+        .unwrap_or(0);
+    let pending_reflections = storage
+        .count_embedding_changes_after(true, reflection_cursor)
+        .unwrap_or(0);
 
-    if chunks_match && reflections_match {
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let counts =
+        format!("DB={db_chunks}c/{db_reflections}r, HNSW={idx_chunks}c/{idx_reflections}r");
+
+    if db_chunks == idx_chunks && db_reflections == idx_reflections {
+        EvalResult::pass("Index Consistency", "data", ms, counts)
+    } else if index_gap_in_flight(db_chunks, idx_chunks, pending_chunks)
+        && index_gap_in_flight(db_reflections, idx_reflections, pending_reflections)
+    {
         EvalResult::pass(
             "Index Consistency",
             "data",
             ms,
-            format!("DB={db_chunks}c/{db_reflections}r, HNSW={idx_chunks}c/{idx_reflections}r"),
+            format!(
+                "{counts}; gap covered by {pending_chunks}c/{pending_reflections}r changes written after the index was loaded (in flight)"
+            ),
         )
     } else {
         EvalResult::fail(
@@ -571,7 +595,7 @@ async fn test_search_index_consistency(
             "data",
             ms,
             format!(
-                "MISMATCH: DB={db_chunks}c/{db_reflections}r, HNSW={idx_chunks}c/{idx_reflections}r"
+                "MISMATCH: {counts}; only {pending_chunks}c/{pending_reflections}r changes in flight"
             ),
         )
     }
@@ -875,6 +899,39 @@ async fn test_search_latency_p95(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn index_lag_from_changes_after_the_cursor_passes_and_drift_fails() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        storage
+            .with_connection(|conn| {
+                conn.execute("INSERT INTO chunks(id,conversation_id,project_name,timestamp,content,message_count) VALUES('c','conv','project','2026-10-22','content',1)", [])?;
+                conn.execute("INSERT INTO chunk_embeddings(chunk_id,embedding) VALUES('c',?1)", [vec![0u8; 1536]])?;
+                Ok(())
+            })
+            .unwrap();
+        let search = Arc::new(RwLock::new(SearchEngine::new(EmbeddingEngine::dimension())));
+
+        // The index predates the row: one change after its cursor covers the gap.
+        let lag = test_search_index_consistency(&storage, &search).await;
+        assert!(lag.passed, "{}", lag.detail);
+        assert!(lag.detail.contains("in flight"), "{}", lag.detail);
+
+        // The index claims to have applied that change yet lacks the row: drift.
+        let seq = storage.latest_embedding_change_seq().unwrap();
+        search.write().await.set_change_cursor(seq);
+        let drift = test_search_index_consistency(&storage, &search).await;
+        assert!(!drift.passed, "{}", drift.detail);
+        assert!(drift.detail.starts_with("MISMATCH"), "{}", drift.detail);
+    }
+
+    #[test]
+    fn index_gap_is_in_flight_only_within_the_pending_changes() {
+        assert!(index_gap_in_flight(10, 10, 0));
+        assert!(index_gap_in_flight(12, 10, 2));
+        assert!(index_gap_in_flight(10, 12, 2));
+        assert!(!index_gap_in_flight(13, 10, 2));
+    }
 
     #[tokio::test]
     async fn full_eval_has_twenty_four_named_results() {

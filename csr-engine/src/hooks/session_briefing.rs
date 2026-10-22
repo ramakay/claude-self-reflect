@@ -52,7 +52,7 @@ const BRIEFING_INSTRUCTION: &str = concat!(
     "episodes for THIS project, newest first, as JSON. Each has fields: request, ",
     "investigated, completed, next_steps, outcome, error_signatures, tools_used, ",
     "files_modified, todos, approved_plan, prev_episode_id, anchors.\n\n",
-    "Write a concise briefing (under 150 words). Start with '## Session Intelligence (CSR v9.2)'.\n",
+    "Write a concise briefing (under 150 words). Start with '## Session Intelligence'.\n",
     "Reference specific file names, error messages, and outcomes. Look for:\n",
     "- Recent work and outcomes\n",
     "- Patterns (repeated errors, same files across sessions)\n",

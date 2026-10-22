@@ -95,6 +95,17 @@ pub(crate) fn latest_seq(conn: &Connection) -> Result<i64> {
     )?)
 }
 
+/// Changes of one side (`reflection` picks the table) newer than `after`:
+/// rows a reader whose index cursor sits at `after` has not applied yet.
+pub(crate) fn count_after(conn: &Connection, reflection: bool, after: i64) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM embedding_changes WHERE kind=?1 AND seq>?2",
+        rusqlite::params![i64::from(reflection), after],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
