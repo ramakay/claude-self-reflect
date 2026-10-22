@@ -98,6 +98,8 @@ pub struct RecapFeeds {
 /// claim the user was shown something they were not.
 pub const DREAM_CLAUSE_PREFIX: &str = "Dreamt: ";
 pub const CORRECTION_CLAUSE_PREFIX: &str = "Corrected: ";
+/// The clause naming the session's literal last typed message.
+pub const THEN_CLAUSE_PREFIX: &str = "Then: ";
 
 /// Compose an evidence-backed recap without reading external state.
 pub fn compose_recap(
@@ -112,6 +114,27 @@ pub fn compose_recap_with_deliveries(
     ep: &crate::hooks::stop::Episode,
     feeds: &RecapFeeds,
     age: &str,
+) -> Option<ComposedRecap> {
+    let base = compose_recap_inner(ep, feeds, age, None)?;
+    // The `Then:` clause is a pure addition: it is kept only when every other
+    // line of the recap comes out exactly as it would without it.
+    if let Some(then) = then_clause(ep) {
+        if let Some(with) = compose_recap_inner(ep, feeds, age, Some(&then)) {
+            if with.text.split('\n').skip(1).eq(base.text.split('\n').skip(1))
+                && with.corrections == base.corrections
+            {
+                return Some(with);
+            }
+        }
+    }
+    Some(base)
+}
+
+fn compose_recap_inner(
+    ep: &crate::hooks::stop::Episode,
+    feeds: &RecapFeeds,
+    age: &str,
+    then: Option<&str>,
 ) -> Option<ComposedRecap> {
     const MAX_CHARS: usize = 700;
 
@@ -141,6 +164,9 @@ pub fn compose_recap_with_deliveries(
         (None, Some(completed)) => format!("recap [{age}]: {}", terminate_clause(completed)),
         (None, None) => unreachable!("empty episodes abstain above"),
     };
+    if let Some(then) = then {
+        recap.push_str(&format!(" {THEN_CLAUSE_PREFIX}{}", terminate_clause(then)));
+    }
     // Machine-owned sentinel, accounted for INSIDE the MAX_CHARS budget below
     // (not appended after trimming) — every downstream clause-drop decision
     // already sees its true cost via `recap.chars().count()`.
@@ -481,6 +507,9 @@ pub(crate) fn compose_clear_handoff(ep: &crate::hooks::stop::Episode, age: &str)
             }
         });
     let mut out = format!("recap [cleared, {age}]: {}", terminate_clause(&intent));
+    if let Some(then) = then_clause(ep) {
+        out.push_str(&format!(" {THEN_CLAUSE_PREFIX}{}", terminate_clause(&then)));
+    }
     if let Some(open) = open {
         out.push_str(&format!(" Still open: {}", terminate_clause(&open)));
     }
@@ -489,6 +518,128 @@ pub(crate) fn compose_clear_handoff(ep: &crate::hooks::stop::Episode, age: &str)
         ep.session_id
     ));
     Some(out)
+}
+
+/// The literal last typed message, as a `Then:` clause: whole leading
+/// sentences, only when it reads as an ask and says something the displayed
+/// intent does not. `None` means the recap names no later ask. It never looks
+/// at an older message: with no evidence of which one the session was on, the
+/// recap stays as it was.
+pub(crate) fn then_clause(ep: &crate::hooks::stop::Episode) -> Option<String> {
+    use crate::extraction::provenance::extractable;
+    let intent = recap_intent(ep)?;
+    let ask = ep
+        .latest_ask
+        .as_deref()
+        .and_then(extractable)
+        .and_then(|text| clean_intent(&text))?;
+    if crate::import::contamination::has_csr_text(&ask) || !is_request(&ask) {
+        return None;
+    }
+    let ask_key = word_key(&ask);
+    let covered = |other: &str| {
+        let other = word_key(other);
+        !other.is_empty() && (other.contains(&ask_key) || ask_key.contains(&other))
+    };
+    let anchor = ep.anchor_request.as_deref().unwrap_or("");
+    (!ask_key.is_empty() && !covered(&intent) && !covered(anchor)).then_some(ask)
+}
+
+/// Lowercase alphanumeric words joined by single spaces, for comparing two
+/// texts regardless of case, punctuation and spacing.
+fn word_key(text: &str) -> String {
+    text.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Words that open a question.
+const QUESTION_OPENERS: &[&str] = &[
+    "what", "why", "how", "where", "when", "who", "which", "is", "are", "was", "were", "does",
+    "do", "did", "can", "could", "should", "would", "will", "have", "has", "shall",
+];
+
+/// Verbs that open an instruction. Words that are just as often a noun
+/// ("work", "test", "plan") are left out on purpose.
+const COMMAND_OPENERS: &[&str] = &[
+    "fix", "add", "make", "build", "run", "show", "tell", "explain", "review", "update", "remove",
+    "delete", "create", "write", "implement", "verify", "find", "search", "try", "continue",
+    "proceed", "commit", "push", "merge", "install", "open", "read", "compare", "summarize",
+    "save", "rename", "enable", "disable", "investigate", "debug", "deploy", "ship", "revert",
+    "rebase", "refactor", "send", "share", "ask", "check", "pull", "restart", "retry", "rerun",
+    "see", "look", "list", "give", "get", "let", "set", "change", "move", "use", "stop", "start",
+    "kill", "clean", "double-check", "look",
+];
+
+/// Words a command may be followed by: a determiner, pronoun, particle or
+/// wh-word. A noun phrase that happens to start with a command word ("Update
+/// available for the CLI", "Build passes now") has something else here.
+const COMMAND_FOLLOWERS: &[&str] = &[
+    "the", "a", "an", "this", "that", "these", "those", "it", "them", "me", "us", "my", "our",
+    "your", "its", "all", "every", "each", "any", "some", "up", "out", "on", "in", "into", "over",
+    "off", "back", "down", "for", "with", "from", "at", "to", "if", "whether", "what", "how",
+    "why", "where", "when", "which", "who", "both", "only", "everything", "anything", "again",
+];
+
+/// Leading words that carry no ask of their own: "ok so now fix the build".
+const REQUEST_FILLERS: &[&str] = &[
+    "ok", "okay", "so", "now", "then", "also", "and", "please", "pls", "hey", "well", "next",
+    "first", "finally", "actually", "alright", "yes", "yeah",
+];
+
+/// True when `text` is clearly an ask. It fails closed: a miss costs a clause
+/// that was not shown, a false hit names a remark as the session's next step.
+///
+/// Three shapes count, each read from the opening words after any filler:
+/// a question whose FIRST sentence ends in `?` and opens with a question word;
+/// `can/could/would/will you|we ...` and `I want|need you to ...`; and an
+/// instruction that opens with a command verb followed by a determiner,
+/// pronoun or particle (or a path). A question word buried inside a statement
+/// ("I already know how many workers finished") never counts, and neither
+/// does a noun phrase that opens with a command word.
+pub(crate) fn is_request(text: &str) -> bool {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '/' && c != '`')
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let start = words
+        .iter()
+        .position(|word| !REQUEST_FILLERS.contains(&word.as_str()))
+        .unwrap_or(words.len());
+    let words = &words[start..];
+    let Some(opener) = words.first().map(String::as_str) else {
+        return false;
+    };
+    let second = words.get(1).map(String::as_str).unwrap_or("");
+
+    // A question: the first sentence ends with '?'.
+    let first_sentence_is_question = text
+        .split_once('?')
+        .is_some_and(|(before, _)| !before.contains(['.', '!']));
+    if first_sentence_is_question && words.len() >= 3 && QUESTION_OPENERS.contains(&opener) {
+        return true;
+    }
+    if words.len() >= 4
+        && ((matches!(opener, "can" | "could" | "would" | "will") && matches!(second, "you" | "we"))
+            || (matches!(opener, "i" | "we")
+                && matches!(second, "want" | "need")
+                && words.get(2).map(String::as_str) == Some("you")
+                && words.get(3).map(String::as_str) == Some("to")))
+    {
+        return true;
+    }
+    if (opener == "let's" || opener == "lets") && words.len() >= 3 {
+        return true;
+    }
+    COMMAND_OPENERS.contains(&opener)
+        && words.len() >= 2
+        && (COMMAND_FOLLOWERS.contains(&second) || second.starts_with(['/', '`']))
 }
 
 /// The completed clause: the receipts `displayed_receipts` picks, never
@@ -890,6 +1041,131 @@ mod tests {
         assert!(crate::extraction::provenance::is_csr_emission(&handoff));
         let no_sentinel = handoff.replace(RECAP_SENTINEL, "");
         assert!(crate::extraction::provenance::is_csr_emission(&no_sentinel));
+    }
+
+    #[test]
+    fn is_request_accepts_clear_asks_and_fails_closed_on_everything_else() {
+        for ask in [
+            "Why did the second worker finish so early?",
+            "ok so what should happen with the scratch files?",
+            "Can you check the usage numbers",
+            "could we ship the build tonight",
+            "Change the subagent setting please",
+            "see if anything happened since the last push",
+            "Share the final build with me on mobile",
+            "Tell me which crate pulls in the old parser",
+            "Please fix the build before the release",
+            "I want you to rewrite the intro section",
+            "let's drop the second experiment",
+            "Check /tmp/csr-out for the new log",
+        ] {
+            assert!(is_request(ask), "should be an ask: {ask}");
+        }
+        for remark in [
+            // A question word inside a statement.
+            "I already know how many workers finished today",
+            "I already know how many workers finished today?",
+            "That is why the build was slow.",
+            // A command word opening a noun phrase.
+            "Work on the pane is finally finished",
+            "Build is green again.",
+            "Update available for the CLI",
+            "Push failed with a lock error",
+            "Test results look fine to me",
+            // Reactions and acknowledgements.
+            "wow that worker kill took forever",
+            "ok go",
+            "keeping them open for now",
+            "Thanks, that works.",
+            // A question word that opens, but no question.
+            "How the build got slow is a long story.",
+            "Why did it fail. I already know the reason.",
+            "",
+        ] {
+            assert!(!is_request(remark), "should not be an ask: {remark}");
+        }
+    }
+
+    #[test]
+    fn then_clause_is_a_pure_addition_before_the_sentinel() {
+        let mut ep = episode();
+        let feeds = full_feeds();
+        let old = compose_recap(&ep, &feeds, "3m ago").expect("recap");
+        assert!(!old.contains("Then:"));
+        ep.latest_ask = Some("Why did the second worker finish so early?".into());
+        let new = compose_recap(&ep, &feeds, "3m ago").expect("recap");
+        let at = old.find(&format!(" {RECAP_SENTINEL}")).expect("sentinel");
+        let expected = format!(
+            "{} Then: Why did the second worker finish so early?{}",
+            &old[..at],
+            &old[at..]
+        );
+        assert_eq!(new, expected);
+        assert!(crate::extraction::provenance::is_csr_emission(&new));
+        let no_sentinel = new.replace(RECAP_SENTINEL, "");
+        assert!(crate::extraction::provenance::is_csr_emission(&no_sentinel));
+    }
+
+    #[test]
+    fn then_clause_is_dropped_when_it_would_displace_any_other_line() {
+        let mut ep = episode();
+        ep.anchor_request = Some("r".repeat(INTENT_MAX_CHARS));
+        let feeds = full_feeds();
+        let old = compose_recap(&ep, &feeds, "3m ago").expect("recap");
+        ep.latest_ask = Some("Why did the second worker finish so early, given that the queue was idle all morning and nothing else was running?".into());
+        let new = compose_recap(&ep, &feeds, "3m ago").expect("recap");
+        // Either the recap is unchanged, or it is the old one plus the clause.
+        if new != old {
+            assert!(new.contains(" Then: "), "{new}");
+            assert_eq!(
+                new.split('\n').skip(1).collect::<Vec<_>>(),
+                old.split('\n').skip(1).collect::<Vec<_>>()
+            );
+        }
+        assert!(new.chars().count() <= 700 + 160, "{new}");
+    }
+
+    #[test]
+    fn then_clause_needs_a_distinct_ask_and_never_walks_back() {
+        let feeds = full_feeds();
+        let mut ep = episode();
+        // The same words as the anchor, or part of it: nothing new to say.
+        for same in [
+            "Fix the recap composer",
+            "fix the recap composer?",
+            "Fix the recap composer please",
+        ] {
+            ep.latest_ask = Some(same.into());
+            let out = compose_recap(&ep, &feeds, "3m ago").expect("recap");
+            assert!(!out.contains("Then:"), "{same}: {out}");
+        }
+        // An acknowledgement, a remark and no ask at all: the recap is unchanged.
+        let old = compose_recap(&episode(), &feeds, "3m ago").expect("recap");
+        for quiet in [Some("ok go"), Some("Work on the pane is finally finished"), None] {
+            ep.latest_ask = quiet.map(str::to_string);
+            assert_eq!(compose_recap(&ep, &feeds, "3m ago").as_deref(), Some(old.as_str()));
+        }
+        // CSR's own text pasted back is not an ask.
+        ep.latest_ask = Some(format!("Why did this repeat? {RECAP_SENTINEL}"));
+        let out = compose_recap(&ep, &feeds, "3m ago").expect("recap");
+        assert!(!out.contains("Then:"), "{out}");
+    }
+
+    #[test]
+    fn the_clear_handoff_names_the_last_ask_between_intent_and_still_open() {
+        let mut ep = episode();
+        ep.latest_ask = Some("Why did the second worker finish so early?".into());
+        let handoff = compose_clear_handoff(&ep, "3m ago").expect("handoff");
+        assert_eq!(
+            handoff.lines().next(),
+            Some("recap [cleared, 3m ago]: Fix the recap composer. Then: Why did the second worker finish so early? Still open: wire session start.")
+        );
+        assert!(crate::extraction::provenance::is_csr_emission(&handoff));
+        ep.latest_ask = Some("ok go".into());
+        assert_eq!(
+            compose_clear_handoff(&ep, "3m ago"),
+            compose_clear_handoff(&episode(), "3m ago")
+        );
     }
 
     #[test]
