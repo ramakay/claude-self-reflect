@@ -51,6 +51,15 @@ static FILLER: LazyLock<Regex> = LazyLock::new(|| {
     .expect("filler regex")
 });
 
+/// The outcome words a session story appends to its request. They report that
+/// a session ended, not what it found.
+static STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(?:completed successfully|partially completed|completed|failed|abandoned|interrupted|in progress|resolved errors during session)\.?$",
+    )
+    .expect("status regex")
+});
+
 /// Openers of a question written without its question mark.
 static QUESTION_OPENER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -69,9 +78,13 @@ pub fn is_question_echo(content: &str) -> bool {
     let sentences = sentences(&body);
     let mut questions = 0;
     for (at, sentence) in sentences.iter().enumerate() {
-        if sentence.ends_with('?') || (at == 0 && is_unpunctuated_question(sentence)) {
+        if sentence.trim_end_matches('.').ends_with('?')
+            || (at == 0 && is_unpunctuated_question(sentence))
+        {
             questions += 1;
-        } else if !(FILLER.is_match(sentence) && sentence.chars().count() <= MAX_FILLER_CHARS) {
+        } else if !(STATUS.is_match(sentence)
+            || (FILLER.is_match(sentence) && sentence.chars().count() <= MAX_FILLER_CHARS))
+        {
             return false;
         }
     }
@@ -88,8 +101,10 @@ fn is_unpunctuated_question(sentence: &str) -> bool {
         && !sentence.contains(':')
 }
 
-/// `content` without its row prefixes, `## User Request` header, signature
-/// (and whatever follows it) and rendered tool markers.
+/// `content` without its row prefixes, `## User Request` header, the slots a
+/// derivation fills with open issues (`## Active Issues`, `Unresolved:`), the
+/// signature (and whatever follows it) and rendered tool markers. A session
+/// episode, stored as a JSON object, is reduced to the text of its slots.
 fn strip_scaffolding(content: &str) -> String {
     let mut text = content.trim_start();
     while let Some(rest) = ROW_PREFIXES
@@ -98,12 +113,53 @@ fn strip_scaffolding(content: &str) -> String {
     {
         text = rest.trim_start();
     }
+    if let Some(episode) = episode_text(text) {
+        return TOOL_MARKER.replace_all(&episode, " ").into_owned();
+    }
     let text = text.strip_prefix("## User Request").unwrap_or(text);
-    let text = match text.find("Signature:") {
-        Some(at) => text[..at].trim_end().trim_end_matches('-'),
-        None => text,
-    };
+    let mut end = text.len();
+    for marker in ["Signature:", "## Active Issues", "Unresolved:"] {
+        if let Some(at) = text.find(marker) {
+            end = end.min(at);
+        }
+    }
+    let text = text[..end].trim_end().trim_end_matches('-');
     TOOL_MARKER.replace_all(text, " ").into_owned()
+}
+
+/// The request, findings and open items of a session episode row
+/// (`{"schema":"v2","request":...,"completed":...}`), one per line, or `None`
+/// when `text` is not an episode.
+fn episode_text(text: &str) -> Option<String> {
+    if !text.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let object = value.as_object()?;
+    object.get("schema")?;
+    let mut out = String::new();
+    for slot in [
+        "request",
+        "investigated",
+        "completed",
+        "next_steps",
+        "blockers",
+    ] {
+        match object.get(slot) {
+            Some(serde_json::Value::String(line)) => {
+                out.push_str(line);
+                out.push('\n');
+            }
+            Some(serde_json::Value::Array(lines)) => {
+                for line in lines.iter().filter_map(serde_json::Value::as_str) {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// The sentences of `body`: split at line breaks and at a `.`, `?` or `!`
@@ -210,6 +266,45 @@ mod tests {
         assert!(!is_question_echo(
             "why we chose one binary was the install burden."
         ));
+    }
+
+    #[test]
+    fn a_story_with_only_an_outcome_and_open_issues_is_an_echo() {
+        assert!(is_question_echo(&format!(
+            "[story] {Q}. Completed successfully. Unresolved: \"b75ad51a\\nfix(mcp): keep library stdout off the JSON-RPC channel (#"
+        )));
+        assert!(is_question_echo(&format!(
+            "[story] {Q}. Partially completed. Resolved errors during session. Unresolved: --- {SIG}"
+        )));
+    }
+
+    #[test]
+    fn an_extraction_whose_active_issues_are_noise_is_an_echo() {
+        assert!(is_question_echo(&format!(
+            "[reflection] ## User Request\n{Q}\n\n## Active Issues\n\"b75ad51a\\nfix(mcp): keep stdout off the channel (#\n\n---\n{SIG}"
+        )));
+    }
+
+    #[test]
+    fn a_story_that_reports_a_finding_is_not_an_echo() {
+        assert!(!is_question_echo(&format!(
+            "[story] {Q}. Completed successfully. The team chose one binary because Docker was too painful to install."
+        )));
+    }
+
+    #[test]
+    fn an_episode_that_only_restates_the_request_is_an_echo() {
+        let episode = |completed: &str| {
+            format!(
+                "[episode] {{\"schema\":\"v2\",\"session_id\":\"s\",\"request\":\"{Q}\",\"investigated\":[],\"completed\":\"{completed}\",\"next_steps\":null,\"blockers\":null,\"outcome\":\"partial\"}}"
+            )
+        };
+        assert!(is_question_echo(&episode(
+            "Checking past sessions for the actual reasoning."
+        )));
+        assert!(!is_question_echo(&episode(
+            "Installing it was too painful, and the scale never needed a database server."
+        )));
     }
 
     #[test]
