@@ -2839,44 +2839,43 @@ fn recent_sessions(
                      LIMIT 1)
                 ) as enrichment";
 
-    let sql = if project.filter(|p| *p != "all").is_some() {
-        format!(
-            "SELECT c.conversation_id, c.project_name,
-                MAX(c.timestamp) as last_active,
-                SUM(c.message_count) as total_messages,
-                COUNT(*) as chunk_count,
-                (SELECT c2.summary FROM chunks c2
-                 WHERE c2.conversation_id = c.conversation_id
-                 ORDER BY c2.rowid ASC LIMIT 1) as summary,
-                {enrichment_subquery}
-         FROM chunks c
-         WHERE c.project_name = ?1 {headless_clause}
-         GROUP BY c.conversation_id
-         ORDER BY MAX(c.timestamp) DESC LIMIT ?2"
-        )
+    // Only the newest `limit` conversations are aggregated. Grouping every chunk
+    // of the project to pick them read ~100k rows scattered across a multi-GB
+    // file: seconds on a cold page cache, on every Stop and SessionStart.
+    let project = project.filter(|p| *p != "all");
+    let newest = newest_conversations(conn, limit, project, headless_clause)?;
+    if newest.is_empty() {
+        return Ok(Vec::new());
+    }
+    let newest = serde_json::to_string(&newest).unwrap_or_else(|_| "[]".into());
+
+    // `+` keeps the planner on the conversation index rather than the project one.
+    let scope = if project.is_some() {
+        "AND +c.project_name = ?3"
     } else {
-        format!(
-            "SELECT c.conversation_id, c.project_name,
-                MAX(c.timestamp) as last_active,
-                SUM(c.message_count) as total_messages,
-                COUNT(*) as chunk_count,
-                (SELECT c2.summary FROM chunks c2
-                 WHERE c2.conversation_id = c.conversation_id
-                 ORDER BY c2.rowid ASC LIMIT 1) as summary,
-                {enrichment_subquery}
-         FROM chunks c
-         WHERE 1 = 1 {headless_clause}
-         GROUP BY c.conversation_id
-         ORDER BY MAX(c.timestamp) DESC LIMIT ?1"
-        )
+        ""
     };
+    let sql = format!(
+        "SELECT c.conversation_id, c.project_name,
+            MAX(c.timestamp) as last_active,
+            SUM(c.message_count) as total_messages,
+            COUNT(*) as chunk_count,
+            (SELECT c2.summary FROM chunks c2
+             WHERE c2.conversation_id = c.conversation_id
+             ORDER BY c2.rowid ASC LIMIT 1) as summary,
+            {enrichment_subquery}
+     FROM chunks c
+     WHERE c.conversation_id IN (SELECT value FROM json_each(?1)) {scope}
+     GROUP BY c.conversation_id
+     ORDER BY MAX(c.timestamp) DESC LIMIT ?2"
+    );
 
     let mut stmt = conn.prepare(&sql)?;
 
-    let rows = if let Some(p) = project.filter(|p| *p != "all") {
-        stmt.query_map(params![p, limit as i64], row_to_session)?
+    let rows = if let Some(p) = project {
+        stmt.query_map(params![newest, limit as i64, p], row_to_session)?
     } else {
-        stmt.query_map(params![limit as i64], row_to_session)?
+        stmt.query_map(params![newest, limit as i64], row_to_session)?
     };
 
     let mut results = Vec::new();
@@ -2884,6 +2883,39 @@ fn recent_sessions(
         results.push(row?);
     }
     Ok(results)
+}
+
+/// The ids of the `limit` conversations with the newest chunks, newest first.
+/// Walks `idx_chunks_project_timestamp` (or `idx_chunks_timestamp`) from the
+/// top and stops at the `limit`-th distinct conversation, so the cost follows
+/// how many chunks the newest sessions have, not how many the project has.
+fn newest_conversations(
+    conn: &Connection,
+    limit: usize,
+    project: Option<&str>,
+    headless_clause: &str,
+) -> Result<Vec<String>> {
+    let scope = if project.is_some() {
+        "c.project_name = ?1"
+    } else {
+        "?1 IS NULL"
+    };
+    let sql = format!(
+        "SELECT c.conversation_id FROM chunks c
+         WHERE {scope} {headless_clause}
+         ORDER BY c.timestamp DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![project])?;
+    let mut ids: Vec<String> = Vec::new();
+    while ids.len() < limit {
+        let Some(row) = rows.next()? else { break };
+        let id: String = row.get(0)?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
 }
 
 /// Helper: map a row to SessionInfo.
@@ -5562,6 +5594,102 @@ mod tests {
          GROUP BY c.conversation_id
          ORDER BY MAX(c.timestamp) DESC
          LIMIT ?2";
+
+    /// The grouped scan over every chunk of the project that picked the newest
+    /// sessions before `newest_conversations`; the oracle for it.
+    fn recent_sessions_oracle(
+        conn: &Connection,
+        limit: usize,
+        project: Option<&str>,
+        exclude_headless: bool,
+    ) -> Vec<(String, String, i64, i64, Option<String>)> {
+        let headless = if exclude_headless {
+            "AND c.conversation_id NOT IN (SELECT conversation_id FROM conversation_entrypoint \
+             WHERE entrypoint LIKE 'sdk-%')"
+        } else {
+            ""
+        };
+        let scope = if project.is_some() {
+            "c.project_name = ?1"
+        } else {
+            "?1 IS NULL"
+        };
+        let sql = format!(
+            "SELECT c.conversation_id, MAX(c.timestamp), SUM(c.message_count), COUNT(*),
+                (SELECT c2.summary FROM chunks c2 WHERE c2.conversation_id = c.conversation_id
+                 ORDER BY c2.rowid ASC LIMIT 1)
+             FROM chunks c WHERE {scope} {headless}
+             GROUP BY c.conversation_id ORDER BY MAX(c.timestamp) DESC LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map(params![project, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn recent_sessions_match_the_whole_project_scan_they_replace() {
+        let conn = mem();
+        // Seven conversations over two projects, interleaved in time, two chunks
+        // each at distinct timestamps (no ties to order arbitrarily); one
+        // headless; one conversation with chunks in both projects.
+        for conv in 0..7 {
+            for n in 0..2 {
+                let mut chunk = test_chunk(&format!("r{conv}-{n}"), "content");
+                chunk.conversation_id = format!("conv-{conv}");
+                chunk.project_name = if conv % 3 == 0 { "proj-b" } else { "proj-a" }.into();
+                chunk.summary = Some(format!("summary {conv}-{n}"));
+                chunk.message_count = 1 + n;
+                let day = 1 + (conv * 5 + n * 11) % 27;
+                chunk.timestamp = format!("2026-08-{day:02}T00:00:00Z");
+                insert_chunk(&conn, &chunk, &[0.1; 4]).unwrap();
+            }
+        }
+        let mut straddler = test_chunk("r-straddle", "content");
+        straddler.conversation_id = "conv-1".into();
+        straddler.project_name = "proj-b".into();
+        straddler.timestamp = "2026-08-30T00:00:00Z".into();
+        insert_chunk(&conn, &straddler, &[0.1; 4]).unwrap();
+        conn.execute(
+            "INSERT INTO conversation_entrypoint (conversation_id, entrypoint)
+             VALUES ('conv-2', 'sdk-cli')",
+            [],
+        )
+        .unwrap();
+
+        for project in [Some("proj-a"), Some("proj-b"), Some("absent"), None] {
+            for exclude_headless in [false, true] {
+                for limit in [1, 2, 3, 10] {
+                    let got: Vec<_> = recent_sessions(&conn, limit, project, exclude_headless)
+                        .unwrap()
+                        .into_iter()
+                        .map(|s| {
+                            (
+                                s.conversation_id,
+                                s.timestamp,
+                                s.total_messages as i64,
+                                s.chunk_count as i64,
+                                s.summary,
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        got,
+                        recent_sessions_oracle(&conn, limit, project, exclude_headless),
+                        "project {project:?} headless-excluded {exclude_headless} limit {limit}"
+                    );
+                }
+            }
+        }
+        // The headless run is skipped only when asked.
+        let all = recent_sessions(&conn, 10, Some("proj-a"), false).unwrap();
+        assert!(all.iter().any(|s| s.conversation_id == "conv-2"));
+        let interactive = recent_sessions(&conn, 10, Some("proj-a"), true).unwrap();
+        assert!(interactive.iter().all(|s| s.conversation_id != "conv-2"));
+    }
 
     #[test]
     fn unenriched_conversations_match_the_grouped_join_they_replace() {
