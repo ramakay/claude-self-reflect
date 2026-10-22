@@ -74,6 +74,8 @@ pub(crate) struct Budget {
     dir_reads: usize,
     git_calls: usize,
     deadline: Instant,
+    /// A listing or `git` call was refused: what was being judged is unknown.
+    starved: bool,
 }
 
 impl Budget {
@@ -84,6 +86,7 @@ impl Budget {
             dir_reads: 64,
             git_calls: 3,
             deadline: Instant::now() + limit.min(PROMPT_CHECK_TIMEOUT),
+            starved: false,
         }
     }
 
@@ -93,6 +96,7 @@ impl Budget {
 
     fn take_dir_read(&mut self) -> bool {
         if self.dir_reads == 0 || self.expired() {
+            self.starved = true;
             return false;
         }
         self.dir_reads -= 1;
@@ -101,6 +105,7 @@ impl Budget {
 
     fn take_git_call(&mut self) -> bool {
         if self.git_calls == 0 || self.expired() {
+            self.starved = true;
             return false;
         }
         self.git_calls -= 1;
@@ -234,7 +239,7 @@ pub(crate) fn check_conversations(
     for folder in folders {
         // Once the budget is gone nothing further can pass: stop, do not decode.
         // The folders not reached are neither in nor out of the repository.
-        if budget.expired() || budget.git_calls == 0 {
+        if budget.expired() || budget.starved || budget.git_calls == 0 {
             break;
         }
         let deadline = budget.deadline;
@@ -252,8 +257,8 @@ pub(crate) fn check_conversations(
         .is_some();
         if passed {
             in_repo.insert(folder);
-        } else if !budget.expired() {
-            // A "no" the clock did not cut short is a verdict.
+        } else if !budget.expired() && !budget.starved {
+            // A "no" no budget limit cut short is a verdict.
             failed.insert(folder);
         }
     }
@@ -399,6 +404,7 @@ mod tests {
             dir_reads: 64,
             git_calls: 3,
             deadline: Instant::now() + Duration::from_secs(30),
+            starved: false,
         }
     }
 
@@ -733,9 +739,8 @@ mod tests {
             )
         };
         let spent = run(Budget {
-            dir_reads: 64,
-            git_calls: 3,
             deadline: Instant::now(),
+            ..roomy()
         });
         assert!(spent.widened.is_empty());
         let mut unchecked: Vec<_> = spent.unchecked.iter().cloned().collect();
@@ -745,6 +750,39 @@ mod tests {
         let full = run(roomy());
         assert_eq!(full.widened.keys().collect::<Vec<_>>(), ["inside"]);
         assert!(full.unchecked.is_empty(), "{:?}", full.unchecked);
+    }
+
+    #[test]
+    fn running_out_of_listings_leaves_a_conversation_unchecked() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        mkdirs(
+            &root,
+            &["Users/u/projects/repo/.git", "Users/u/projects/repo/sub"],
+        );
+        let map: HashMap<String, Vec<String>> = [(
+            "inside".to_string(),
+            vec!["/cc/projects/-Users-u-projects-repo-sub/s.jsonl".to_string()],
+        )]
+        .into();
+        // Time to spare, but too few listings to decode the folder.
+        let starved = check_conversations(
+            &map,
+            &[PathBuf::from("/cc/projects")],
+            &root.join("Users/u/projects/repo"),
+            &root,
+            &nearest_git_dir,
+            Budget {
+                dir_reads: 1,
+                ..roomy()
+            },
+        );
+        assert!(starved.widened.is_empty());
+        assert_eq!(
+            starved.unchecked.iter().collect::<Vec<_>>(),
+            ["inside"],
+            "a folder the listings ran out on is not a verdict"
+        );
     }
 
     #[test]
