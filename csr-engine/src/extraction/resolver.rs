@@ -1645,6 +1645,133 @@ fn internal_module_tier(p: &Pending, project_roots: &[PathBuf]) -> Option<(Strin
     ))
 }
 
+/// A write the resolve pass decided on while planning (see [`plan_resolve`]):
+/// the edge it is for, the state the pass read for that edge, and the change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedWrite {
+    src_id: String,
+    dst_id: String,
+    kind: String,
+    /// The `callee_kind`, `evidence` and `boundary` the pass read: a tier
+    /// verdict is a function of them, so [`apply_planned`] writes only to a row
+    /// that still holds them.
+    callee_kind: String,
+    evidence: String,
+    boundary: String,
+    change: Change,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Change {
+    Bind { new_dst: String, evidence: String },
+    Classify { boundary: String, evidence: String },
+    Clear,
+}
+
+impl PlannedWrite {
+    fn of(p: &Pending, change: Change) -> Self {
+        Self {
+            src_id: p.src_id.clone(),
+            dst_id: p.dst_id.clone(),
+            kind: p.kind.clone(),
+            callee_kind: p.callee_kind.clone(),
+            evidence: p.evidence.clone(),
+            boundary: p.boundary.clone(),
+            change,
+        }
+    }
+}
+
+thread_local! {
+    /// Where `bind`/`classify_edge`/`clear_edge` put their writes while a plan
+    /// is being made on this thread; `None` (the default) writes through.
+    static PLAN: std::cell::RefCell<Option<Vec<PlannedWrite>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether this thread is making a plan, so a write is queued, not executed.
+fn planning() -> bool {
+    PLAN.with(|plan| plan.borrow().is_some())
+}
+
+fn plan_push(write: PlannedWrite) {
+    PLAN.with(|plan| {
+        if let Some(writes) = plan.borrow_mut().as_mut() {
+            writes.push(write);
+        }
+    });
+}
+
+/// `resolve_edges` that writes nothing: it reads the graph (hold a read
+/// transaction around the call for one consistent snapshot) and returns the
+/// writes it would have made, in order, with the stats it would have returned.
+/// The per-edge tiers read the maps they loaded at the start, never the rows
+/// they write, so replaying the list with [`apply_planned`] gives what
+/// `resolve_edges` gives. Planning is what lets the project-wide pass run
+/// without the database write lock: only the replay needs it.
+pub fn plan_resolve(
+    conn: &Connection,
+    project: &str,
+    file_exists: &dyn Fn(&str) -> bool,
+) -> Result<(ResolveStats, Vec<PlannedWrite>)> {
+    // Restores the previous (normally absent) plan even if the pass panics.
+    struct Restore(Option<Vec<PlannedWrite>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PLAN.with(|plan| *plan.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(PLAN.with(|plan| plan.borrow_mut().replace(Vec::new())));
+    let stats = resolve_edges(conn, project, file_exists)?;
+    let writes = PLAN
+        .with(|plan| plan.borrow_mut().take())
+        .unwrap_or_default();
+    Ok((stats, writes))
+}
+
+/// Replay a [`plan_resolve`] list, in order, inside the caller's transaction.
+/// Returns how many writes found their edge changed since the plan was made
+/// (re-extracted, or classified by another writer) and left it alone; the
+/// caller must not call the project settled while that is above zero.
+pub fn apply_planned(conn: &Connection, writes: &[PlannedWrite]) -> Result<usize> {
+    const WHERE: &str = "WHERE src_id = ? AND dst_id = ? AND kind = ? AND resolved = 0
+         AND callee_kind = ? AND evidence = ? AND boundary = ?";
+    let mut bind = conn.prepare(&format!(
+        "UPDATE OR REPLACE code_edges SET dst_id = ?, resolved = 1, boundary = '', evidence = ?
+         {WHERE}"
+    ))?;
+    let mut classify = conn.prepare(&format!(
+        "UPDATE code_edges SET boundary = ?, evidence = ? {WHERE}"
+    ))?;
+    let mut clear = conn.prepare(&format!(
+        "UPDATE code_edges SET boundary = '', evidence = '' {WHERE}"
+    ))?;
+    let mut skipped = 0usize;
+    for w in writes {
+        let key = (
+            &w.src_id,
+            &w.dst_id,
+            &w.kind,
+            &w.callee_kind,
+            &w.evidence,
+            &w.boundary,
+        );
+        let changed = match &w.change {
+            Change::Bind { new_dst, evidence } => bind.execute(params![
+                new_dst, evidence, key.0, key.1, key.2, key.3, key.4, key.5
+            ])?,
+            Change::Classify { boundary, evidence } => classify.execute(params![
+                boundary, evidence, key.0, key.1, key.2, key.3, key.4, key.5
+            ])?,
+            Change::Clear => clear.execute(params![key.0, key.1, key.2, key.3, key.4, key.5])?,
+        };
+        if changed == 0 {
+            skipped += 1;
+        }
+    }
+    Ok(skipped)
+}
+
 /// Bind tier: repoint (or, for repo_scan evidence, leave in place) `dst_id`
 /// and flip `resolved`. `UPDATE OR REPLACE` tolerates the PK collision when
 /// two different placeholder names resolve onto the same real target id.
@@ -1652,6 +1779,14 @@ fn internal_module_tier(p: &Pending, project_roots: &[PathBuf]) -> Option<(Strin
 /// even if a prior pass had classified this exact placeholder before a later
 /// def appeared for it.
 fn bind(conn: &Connection, p: &Pending, new_dst: &str, evidence: &str) -> Result<()> {
+    if planning() {
+        let change = Change::Bind {
+            new_dst: new_dst.to_string(),
+            evidence: evidence.to_string(),
+        };
+        plan_push(PlannedWrite::of(p, change));
+        return Ok(());
+    }
     conn.execute(
         "UPDATE OR REPLACE code_edges SET dst_id = ?1, resolved = 1, boundary = '', evidence = ?2
          WHERE src_id = ?3 AND dst_id = ?4 AND kind = ?5",
@@ -1662,6 +1797,14 @@ fn bind(conn: &Connection, p: &Pending, new_dst: &str, evidence: &str) -> Result
 
 /// Classify tier: leave `resolved = 0`, attach `boundary` + `evidence`.
 fn classify_edge(conn: &Connection, p: &Pending, boundary: &str, evidence: &str) -> Result<()> {
+    if planning() {
+        let change = Change::Classify {
+            boundary: boundary.to_string(),
+            evidence: evidence.to_string(),
+        };
+        plan_push(PlannedWrite::of(p, change));
+        return Ok(());
+    }
     conn.execute(
         "UPDATE code_edges SET boundary = ?1, evidence = ?2
          WHERE src_id = ?3 AND dst_id = ?4 AND kind = ?5",
@@ -1675,6 +1818,10 @@ fn classify_edge(conn: &Connection, p: &Pending, boundary: &str, evidence: &str)
 /// if an earlier pass (with less graph data) had classified this exact
 /// placeholder differently.
 fn clear_edge(conn: &Connection, p: &Pending) -> Result<()> {
+    if planning() {
+        plan_push(PlannedWrite::of(p, Change::Clear));
+        return Ok(());
+    }
     conn.execute(
         "UPDATE code_edges SET boundary = '', evidence = ''
          WHERE src_id = ?1 AND dst_id = ?2 AND kind = ?3",
@@ -4318,5 +4465,156 @@ mod tests {
             )
             .unwrap();
         assert_eq!(boundary, "local");
+    }
+
+    /// A graph that exercises every kind of verdict: same-file and unique-def
+    /// binds, a co-edit-broken ambiguity, an unbreakable one, an unexplained
+    /// name, and an edge whose source file is gone.
+    fn mixed_graph(conn: &Connection) {
+        for (id, file, name) in [
+            ("foo", "a.rs", "foo"),
+            ("bar", "a.rs", "bar"),
+            ("baz", "b.rs", "baz"),
+            ("dup_x", "x.rs", "dup"),
+            ("dup_y", "y.rs", "dup"),
+            ("twin_x", "x.rs", "twin"),
+            ("twin_y", "y.rs", "twin"),
+            ("caller", "z.rs", "caller"),
+            ("ghost", "gone.rs", "ghost"),
+        ] {
+            upsert_node(conn, &def(id, file, name)).unwrap();
+        }
+        codegraph::replace_file_edges(
+            conn,
+            "proj",
+            "a.rs",
+            &[
+                call_edge("foo", "bar", "a.rs"),
+                call_edge("foo", "baz", "a.rs"),
+            ],
+        )
+        .unwrap();
+        codegraph::replace_file_edges(
+            conn,
+            "proj",
+            "z.rs",
+            &[
+                call_edge("caller", "dup", "z.rs"),
+                call_edge("caller", "twin", "z.rs"),
+                call_edge("caller", "mystery", "z.rs"),
+            ],
+        )
+        .unwrap();
+        codegraph::replace_file_edges(
+            conn,
+            "proj",
+            "gone.rs",
+            &[call_edge("ghost", "mystery", "gone.rs")],
+        )
+        .unwrap();
+        // z.rs and x.rs were edited together twice; y.rs never.
+        for session in ["s1", "s2"] {
+            insert_evolution(conn, session, "z.rs");
+            insert_evolution(conn, session, "x.rs");
+        }
+    }
+
+    fn edge_dump(conn: &Connection) -> Vec<(String, String, String, i64, String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT src_id, dst_id, kind, resolved, boundary, evidence FROM code_edges
+                 ORDER BY src_id, dst_id, kind",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn a_planned_resolve_replayed_equals_the_direct_resolve() {
+        let direct = mem();
+        let planned = mem();
+        mixed_graph(&direct);
+        mixed_graph(&planned);
+        let exists = |f: &str| f != "gone.rs";
+
+        let want = resolve_edges(&direct, "proj", &exists).unwrap();
+        let before = edge_dump(&planned);
+        let (got, writes) = plan_resolve(&planned, "proj", &exists).unwrap();
+        assert_eq!(edge_dump(&planned), before, "planning writes nothing");
+        assert!(!writes.is_empty());
+        assert_eq!(apply_planned(&planned, &writes).unwrap(), 0);
+
+        assert_eq!(edge_dump(&planned), edge_dump(&direct));
+        assert_eq!(got.resolved, want.resolved);
+        assert_eq!(got.stale, want.stale);
+        assert_eq!(got.ambiguous_remaining, want.ambiguous_remaining);
+        // The fixture reaches the verdicts the test is about.
+        let dump = edge_dump(&direct);
+        let find = |src: &str, dst: &str| {
+            dump.iter()
+                .find(|e| e.0 == src && e.1.ends_with(dst))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(find("foo", "bar").3, 1);
+        assert_eq!(find("foo", "baz").3, 1);
+        assert_eq!(find("caller", "dup_x").3, 1, "co-edit breaks the tie");
+        assert_eq!(find("caller", "twin_x").3, 1, "co-edit breaks the tie");
+        assert_eq!(find("ghost", "name:mystery").5, "file_missing");
+    }
+
+    #[test]
+    fn the_plan_ends_with_the_pass_and_a_later_resolve_writes_through() {
+        let conn = mem();
+        mixed_graph(&conn);
+        let exists = |f: &str| f != "gone.rs";
+        // A pass that dies while planning leaves no plan behind on its thread.
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = plan_resolve(&conn, "proj", &|_: &str| panic!("killed mid-plan"));
+        }));
+        assert!(died.is_err());
+        assert!(!planning());
+        assert!(edge_dump(&conn).iter().all(|e| e.3 == 0), "nothing written");
+
+        resolve_edges(&conn, "proj", &exists).unwrap();
+        assert!(edge_dump(&conn).iter().any(|e| e.3 == 1), "writes through");
+    }
+
+    #[test]
+    fn a_write_planned_for_an_edge_that_has_since_changed_is_left_alone() {
+        let conn = mem();
+        mixed_graph(&conn);
+        let (_, writes) = plan_resolve(&conn, "proj", &|_: &str| true).unwrap();
+        // An edit re-extracts a.rs between the plan and the replay: foo -> bar
+        // is a fresh placeholder with different evidence.
+        conn.execute(
+            "UPDATE code_edges SET evidence = 'via:other' WHERE src_id = 'foo' AND dst_id = 'name:bar'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(apply_planned(&conn, &writes).unwrap(), 1);
+        let dump = edge_dump(&conn);
+        let foo_bar = dump
+            .iter()
+            .find(|e| e.0 == "foo" && e.1 == "name:bar")
+            .unwrap();
+        assert_eq!((foo_bar.3, foo_bar.5.as_str()), (0, "via:other"));
+        assert!(
+            dump.iter()
+                .any(|e| e.0 == "foo" && e.1 == "baz" && e.3 == 1),
+            "the other edges were applied"
+        );
     }
 }
