@@ -1786,30 +1786,24 @@ mod tests {
         assert_eq!(t.features("csr"), ["pane_cmd"]);
         assert_eq!(t.features("tool")[0], "touch");
     }
-    /// A pane that took the relay's invitation: a child that would die of an uncaught SIGUSR1 and a
-    /// fresh pid file that says it catches them.
-    fn waking_pane(keep: &std::path::Path, sid: &str) -> std::process::Child {
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+    /// A pane listening at the pipe the relay writes to.
+    fn listening_pane(keep: &std::path::Path, sid: &str) -> wake::Listener {
         std::fs::create_dir_all(keep.join("panes")).unwrap();
-        std::fs::write(
-            keep.join("panes").join(format!("{sid}.json")),
-            json!({ "pid": child.id(), "wake": 1 }).to_string(),
-        )
-        .unwrap();
-        child
+        wake::Listener::open(keep, sid).unwrap()
     }
 
-    async fn ended(child: &mut std::process::Child) -> bool {
-        for _ in 0..1000 {
-            if child.try_wait().unwrap().is_some() {
-                return true;
+    /// The wakes that arrive within a second, polled as the pane's loop polls.
+    async fn woken(pane: &mut wake::Listener) -> (bool, bool) {
+        let mut got = (false, false);
+        for _ in 0..500 {
+            let (now, soon) = pane.take();
+            got = (got.0 | now, got.1 | soon);
+            if got != (false, false) {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        false
+        got
     }
 
     #[tokio::test]
@@ -1837,32 +1831,29 @@ mod tests {
         let rig = rig(t);
         let keep = rig._dir.path().join("keep");
         rig.app.wake_panes_in(keep.clone());
-        let mut child = waking_pane(&keep, "s");
+        let mut pane = listening_pane(&keep, "s");
         // Before a tool runs there is nothing new to show.
         post(&rig.app, "/event", ev("s", "tool", json!({}))).await;
         settle().await;
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "woken before the tool ran"
-        );
+        assert_eq!(pane.take(), (false, false), "woken before the tool ran");
         // Another session's hook does not reach this pane.
         post(&rig.app, "/event", ev("other", "stop", json!({}))).await;
         settle().await;
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "woken by another session"
-        );
+        assert_eq!(pane.take(), (false, false), "woken by another session");
         post(&rig.app, "/event", ev("s", "stop", json!({}))).await;
-        assert!(ended(&mut child).await, "Stop wakes the pane");
+        assert_eq!(woken(&mut pane).await, (true, false), "Stop wakes the pane");
         assert!(
             ran.load(Ordering::SeqCst),
             "the wake came after the handler ran"
         );
-        // After a tool: the burst signal, SIGUSR2.
-        let mut child = waking_pane(&keep, "s");
+        // After a tool: the burst wake.
         let after = json!({ "sid": "s", "cwd": "/repo", "k": "tool", "id": "", "result": {} });
         post(&rig.app, "/after", after).await;
-        assert!(ended(&mut child).await, "a finished tool wakes the pane");
+        assert_eq!(
+            woken(&mut pane).await,
+            (false, true),
+            "a finished tool wakes the pane, soon"
+        );
     }
 
     #[tokio::test]
@@ -1870,13 +1861,11 @@ mod tests {
         let mut t = Table::new();
         t.on("stop", "test", handler(|_, _| async { Ok(Reply::none()) }));
         let rig = rig(t);
-        let mut child = waking_pane(&rig._dir.path().join("keep"), "s");
+        let mut pane = listening_pane(&rig._dir.path().join("keep"), "s");
         post(&rig.app, "/event", ev("s", "stop", json!({}))).await;
         settle().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(child.try_wait().unwrap().is_none());
-        let _ = child.kill();
-        let _ = child.wait();
+        assert_eq!(pane.take(), (false, false));
     }
     /// The wake only fires where a handler is dispatched, so every hook that wakes a pane must have
     /// an entry of the shape `classify` expects in the table the relay really runs.

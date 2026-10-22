@@ -1,23 +1,26 @@
 //! Waking a pane: the relay tells a pane its session did something, the pane draws.
 //!
 //! The relay (`companion serve`) sees every hook of its Claude Code session. On the ones that
-//! change what a pane shows it sends a signal to the pane's pid, which `watch` keeps in
-//! `<keep>/panes/<sid>.json`:
+//! change what a pane shows it writes one byte to a named pipe the pane keeps at
+//! `<keep>/panes/<sid>.wake`:
 //!
-//! - `SIGUSR1`, at once: a turn ended, a prompt was sent, a compaction began.
-//! - `SIGUSR2`, soon: a tool finished, a measurement came. These arrive in bursts, so the pane
+//! - `N`, at once: a turn ended, a prompt was sent, a compaction began.
+//! - `S`, soon: a tool finished, a measurement came. These arrive in bursts, so the pane
 //!   waits 300 ms for the burst to gather.
 //!
-//! Signals only lower the latency of a redraw. The pane's own checks (`gate.rs`) are correct
-//! without them, for the sessions whose relay cannot reach them.
+//! A byte only lowers the latency of a redraw. The pane's own checks (`gate.rs`) are correct
+//! without it, for the sessions whose relay cannot reach them.
 //!
-//! A signal that nothing catches ends the process, so the relay signals only a pane that wrote
-//! `"wake": 1` into its pid file after it installed its handlers, and only while that file is
-//! being kept fresh by the pane's heartbeat.
-use super::paths::{read_json, valid_id};
+//! No process id is trusted. The relay opens the pipe without blocking: with no pane reading it
+//! (one that ended, or crashed and left the file) the open fails and nothing is sent, and a
+//! process that took the dead pane's pid is never addressed at all.
+use super::paths::valid_id;
 use std::{
-    path::Path,
-    time::{Duration, Instant, SystemTime},
+    fs,
+    io::{Read, Write},
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 /// What a hook means for a pane.
@@ -29,10 +32,10 @@ pub enum Kind {
     Burst,
 }
 impl Kind {
-    pub fn signal(self) -> libc::c_int {
+    fn byte(self) -> u8 {
         match self {
-            Kind::Now => libc::SIGUSR1,
-            Kind::Burst => libc::SIGUSR2,
+            Kind::Now => b'N',
+            Kind::Burst => b'S',
         }
     }
 }
@@ -52,30 +55,83 @@ pub fn classify(path: &str, key: &str) -> Option<Kind> {
     }
 }
 
-/// A pid file older than this is not being kept by a living pane (its heartbeat is every 5 s).
-const FRESH: Duration = Duration::from_secs(20);
+/// Where the pane of `sid` listens.
+pub fn pipe_path(keep: &Path, sid: &str) -> Option<PathBuf> {
+    valid_id(sid).then(|| keep.join("panes").join(format!("{sid}.wake")))
+}
 
-/// Signal the pane of `sid`, if there is one that can take it. True when a signal was sent.
+/// Tell the pane of `sid`, if one is listening. True when the byte was written; a pane that is
+/// not there, or not reading, or not keeping up, is no error.
 pub fn notify(keep: &Path, sid: &str, kind: Kind) -> bool {
-    if !valid_id(sid) {
+    let Some(path) = pipe_path(keep, sid) else {
         return false;
-    }
-    let file = keep.join("panes").join(format!("{sid}.json"));
-    let fresh = std::fs::metadata(&file)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_some_and(|age| age <= FRESH);
-    if !fresh {
+    };
+    let Ok(mut pipe) = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(&path)
+    else {
         return false;
+    };
+    // Whatever sits at the path, a pipe of ours is the only thing a byte goes to.
+    let ours = pipe
+        .metadata()
+        .is_ok_and(|m| m.file_type().is_fifo() && m.uid() == unsafe { libc::geteuid() });
+    ours && pipe.write_all(&[kind.byte()]).is_ok()
+}
+
+/// The pane's end of the pipe. Dropping it removes the pipe, if it is still this one.
+pub struct Listener {
+    path: PathBuf,
+    pipe: fs::File,
+    id: (u64, u64),
+}
+impl Listener {
+    /// Make the pipe for `sid` and open it for reading, replacing whatever a pane that ended
+    /// badly left there. None for an id that cannot be a file name, or when the system says no.
+    pub fn open(keep: &Path, sid: &str) -> Option<Self> {
+        let path = pipe_path(keep, sid)?;
+        let _ = fs::remove_file(&path);
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+            return None;
+        }
+        // O_CLOEXEC is Rust's default: a reload by `exec` closes it and the next process makes
+        // its own.
+        let pipe = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .ok()?;
+        let info = pipe.metadata().ok()?;
+        Some(Self {
+            path,
+            id: (info.dev(), info.ino()),
+            pipe,
+        })
     }
-    let pane = read_json(&file);
-    let pid = pane["pid"]
-        .as_i64()
-        .filter(|p| (2..=i64::from(i32::MAX)).contains(p));
-    match pid {
-        Some(pid) if pane["wake"] == 1 => unsafe { libc::kill(pid as i32, kind.signal()) == 0 },
-        _ => false,
+    /// The wakes that came since the last call: (at once, soon).
+    pub fn take(&mut self) -> (bool, bool) {
+        let (mut now, mut soon) = (false, false);
+        let mut buffer = [0u8; 256];
+        while let Ok(n @ 1..) = self.pipe.read(&mut buffer) {
+            for byte in &buffer[..n] {
+                match byte {
+                    b'N' => now = true,
+                    b'S' => soon = true,
+                    _ => (),
+                }
+            }
+        }
+        (now, soon)
+    }
+}
+impl Drop for Listener {
+    fn drop(&mut self) {
+        // A newer pane of the same session has put its own pipe here: leave that one.
+        if fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -127,7 +183,6 @@ impl Debounce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     #[test]
     fn the_hooks_that_change_a_pane_are_told_apart_by_how_soon() {
@@ -150,24 +205,108 @@ mod tests {
     }
 
     #[test]
-    fn fifty_signals_in_a_second_draw_at_most_twice() {
+    fn fifty_wakes_through_the_pipe_in_a_second_draw_at_most_twice() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("panes")).unwrap();
+        let mut pipe = Listener::open(d.path(), "s").unwrap();
         let t0 = Instant::now();
         let mut wake = Debounce::default();
         let mut draws = 0;
+        let mut sent = 0;
         for tick in 0..=1200 {
             let at = t0 + Duration::from_millis(tick);
             if tick < 1000 && tick % 20 == 0 {
+                assert!(notify(d.path(), "s", Kind::Now), "wake {sent} is written");
+                sent += 1;
+            }
+            // What the watch loop does each pass: the pipe's bytes into the debounce.
+            let (now, soon) = pipe.take();
+            if now {
                 wake.signal(at, Kind::Now);
+            }
+            if soon {
+                wake.signal(at, Kind::Burst);
             }
             if wake.ready(at) {
                 wake.drew(at);
                 draws += 1;
             }
         }
+        assert_eq!(sent, 50);
         assert_eq!(
             draws, 2,
             "the first at once, the rest together a second later"
         );
+    }
+
+    #[test]
+    fn a_wake_reaches_the_pane_that_listens_and_says_which_kind() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("panes")).unwrap();
+        let mut pipe = Listener::open(d.path(), "s").unwrap();
+        assert_eq!(pipe.take(), (false, false));
+        assert!(notify(d.path(), "s", Kind::Now));
+        assert_eq!(pipe.take(), (true, false));
+        assert!(notify(d.path(), "s", Kind::Burst));
+        assert_eq!(pipe.take(), (false, true));
+        assert!(notify(d.path(), "s", Kind::Burst));
+        assert!(notify(d.path(), "s", Kind::Now));
+        assert_eq!(pipe.take(), (true, true));
+        assert!(!notify(d.path(), "other", Kind::Now), "another session");
+        assert!(!notify(d.path(), "../escape", Kind::Now));
+    }
+
+    #[test]
+    fn nobody_listening_is_a_silent_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("panes")).unwrap();
+        assert!(!notify(d.path(), "s", Kind::Now), "no pipe");
+        // A pane that crashed leaves its pipe behind with nobody to read it.
+        drop(Listener::open(d.path(), "s").unwrap());
+        let left = pipe_path(d.path(), "s").unwrap();
+        assert!(!left.exists(), "a pane that ends takes its pipe with it");
+        let name = std::ffi::CString::new(left.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(!notify(d.path(), "s", Kind::Now), "left behind, unread");
+        // Nothing but a pipe is written to.
+        fs::remove_file(&left).unwrap();
+        fs::write(&left, "keep me").unwrap();
+        assert!(!notify(d.path(), "s", Kind::Now));
+        assert_eq!(fs::read_to_string(&left).unwrap(), "keep me");
+        fs::remove_file(&left).unwrap();
+        std::os::unix::fs::symlink(d.path().join("elsewhere"), &left).unwrap();
+        assert!(!notify(d.path(), "s", Kind::Now));
+        assert!(!d.path().join("elsewhere").exists());
+    }
+
+    #[test]
+    fn a_pane_that_does_not_read_never_holds_the_relay() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("panes")).unwrap();
+        let _pipe = Listener::open(d.path(), "s").unwrap();
+        let began = Instant::now();
+        let written = (0..70_000)
+            .filter(|_| notify(d.path(), "s", Kind::Burst))
+            .count();
+        assert!(
+            written > 0 && written < 70_000,
+            "the pipe filled: {written}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "and nothing blocked"
+        );
+    }
+
+    #[test]
+    fn a_newer_pane_of_the_session_keeps_its_pipe_when_the_older_one_ends() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("panes")).unwrap();
+        let older = Listener::open(d.path(), "s").unwrap();
+        let mut newer = Listener::open(d.path(), "s").unwrap();
+        drop(older);
+        assert!(notify(d.path(), "s", Kind::Now));
+        assert_eq!(newer.take(), (true, false));
     }
 
     #[test]
@@ -197,50 +336,5 @@ mod tests {
         assert!(!wake.ready(ms(999)));
         assert_eq!(wake.next(), Some(ms(1000)));
         assert!(wake.ready(ms(1000)));
-    }
-
-    fn pane_file(keep: &Path, sid: &str, pid: u32, wake: bool) {
-        std::fs::create_dir_all(keep.join("panes")).unwrap();
-        let body = if wake {
-            format!("{{\"pid\":{pid},\"wake\":1}}")
-        } else {
-            format!("{{\"pid\":{pid}}}")
-        };
-        std::fs::write(keep.join("panes").join(format!("{sid}.json")), body).unwrap();
-    }
-
-    #[test]
-    fn only_a_fresh_pane_that_said_it_takes_signals_is_signalled() {
-        let d = tempfile::tempdir().unwrap();
-        // A child that catches nothing would die of SIGUSR1: it must not be sent one unless
-        // it asked. `sleep` is that child.
-        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-        let pid = child.id();
-        pane_file(d.path(), "old-pane", pid, false);
-        assert!(!notify(d.path(), "old-pane", Kind::Now), "no wake field");
-        assert!(child.try_wait().unwrap().is_none(), "the pane is alive");
-        assert!(!notify(d.path(), "missing", Kind::Now));
-        assert!(!notify(d.path(), "../escape", Kind::Now));
-        pane_file(d.path(), "stale", pid, true);
-        let file = d.path().join("panes/stale.json");
-        let old = SystemTime::now() - Duration::from_secs(60);
-        std::fs::File::options()
-            .write(true)
-            .open(&file)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
-        assert!(
-            !notify(d.path(), "stale", Kind::Now),
-            "its heartbeat stopped"
-        );
-        assert!(child.try_wait().unwrap().is_none());
-        // Pid 1 and nonsense are never signalled.
-        pane_file(d.path(), "init", 1, true);
-        assert!(!notify(d.path(), "init", Kind::Now));
-        pane_file(d.path(), "live", pid, true);
-        assert!(notify(d.path(), "live", Kind::Now));
-        let status = child.wait().unwrap();
-        assert!(!status.success(), "sleep takes the signal as its end");
     }
 }

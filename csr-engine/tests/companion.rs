@@ -320,9 +320,11 @@ fn terminal_session(reload: bool) {
     } else {
         std::path::Path::new(env!("CARGO_BIN_EXE_csr-engine"))
     };
+    let frame_log = paths.home.join("frames.log");
     let child = Command::new(executable)
         .env("HOME", &paths.home)
         .env("TERM_PROGRAM", "kitty")
+        .env("CSR_PANE_FRAME_LOG", &frame_log)
         .env_remove("CSR_COMPANION_PIXELS")
         .args([
             "companion",
@@ -358,11 +360,57 @@ fn terminal_session(reload: bool) {
     }
     assert!(pid.exists(), "watch created its pid file");
     std::thread::sleep(Duration::from_millis(100));
-    // The pid file invites the relay's wakes, and a pane that says so takes them all: a burst
-    // of both kinds neither ends it nor leaves it unable to answer SIGTERM later.
     let kept: serde_json::Value = serde_json::from_slice(&fs::read(&pid).unwrap()).unwrap();
     assert_eq!(kept["pid"], child_guard.0.id());
-    assert_eq!(kept["wake"], 1);
+    // The pane listens at a pipe of its own; the relay trusts no pid.
+    let wakes = paths.keep.join("panes/sess-now.wake");
+    assert!(
+        wakes.exists(),
+        "the pane keeps a pipe for the relay's wakes"
+    );
+    // Let the first frames land and the pane go quiet; away from a minute edge, whose clock
+    // labels would redraw it for their own reasons.
+    let seconds = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            % 60
+    };
+    let drain = |master: &mut fs::File, output: &mut Vec<u8>, span: Duration| {
+        let until = Instant::now() + span;
+        while Instant::now() < until {
+            let _ = master.read_to_end(output);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    // Quiet: the pane has drawn and written all of it, and a second and a half passed with
+    // nothing more.
+    let quiet = |master: &mut fs::File, output: &mut Vec<u8>| {
+        let mut changed = Instant::now();
+        let mut length = 0;
+        let began = Instant::now();
+        while changed.elapsed() < Duration::from_millis(1500) {
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "the pane never went quiet"
+            );
+            drain(master, output, Duration::from_millis(50));
+            if output.len() != length {
+                length = output.len();
+                changed = Instant::now();
+            }
+        }
+    };
+    quiet(&mut master, &mut output);
+    while seconds() >= 52 {
+        drain(&mut master, &mut output, Duration::from_millis(500));
+    }
+    let frames = |log: &std::path::Path| fs::read_to_string(log).map_or(0, |t| t.lines().count());
+    let settled = frames(&frame_log);
+    assert!(settled >= 1, "the pane drew its first frame");
+    // Fifty wakes of each kind in half a second, written to the live pane: they draw it once at
+    // the leading edge and once more for the rest, a second later; never fifty times.
     for _ in 0..50 {
         assert!(csr_engine::companion::wake::notify(
             &paths.keep,
@@ -374,8 +422,15 @@ fn terminal_session(reload: bool) {
             "sess-now",
             csr_engine::companion::wake::Kind::Burst
         ));
+        drain(&mut master, &mut output, Duration::from_millis(10));
     }
-    std::thread::sleep(Duration::from_millis(400));
+    quiet(&mut master, &mut output);
+    let drawn = frames(&frame_log) - settled;
+    assert!(
+        (1..=2).contains(&drawn),
+        "100 wakes drew {drawn} frames, want 1 or 2 (settled at {settled}, log {:?})",
+        fs::read_to_string(&frame_log)
+    );
     assert!(
         child_guard.0.try_wait().unwrap().is_none(),
         "a burst of wakes must not end the pane"
