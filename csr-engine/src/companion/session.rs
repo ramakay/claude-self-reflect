@@ -123,6 +123,7 @@ impl Session {
                 "tools": {},
                 "files": {},
                 "edited": [],
+                "edit_at": {},
                 "shell": {},
                 "last": {},
                 "talk": [],
@@ -297,7 +298,12 @@ impl Session {
                     let count = self.data["files"][path.as_ref()].as_u64().unwrap_or(0) + 1;
                     self.data["files"][path.as_ref()] = json!(count);
                     self.data["last"][path.as_ref()] = json!(t);
-                    if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+                    let edits = matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit");
+                    if edits {
+                        // `last` also moves on reads. Only an edit dates a timeline row.
+                        self.data["edit_at"][path.as_ref()] = json!(t);
+                    }
+                    if edits
                         && !self.data["edited"]
                             .as_array()
                             .unwrap()

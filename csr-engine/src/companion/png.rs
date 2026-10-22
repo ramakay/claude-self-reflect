@@ -95,6 +95,15 @@ fn instrument_png(
         pane.theme = theme;
         pane.pixels = true;
         pane.enable_cards();
+        // CSR_PANE_KEYS="t" or "1,2": keys pressed before the frame, so a drill-down or a popup
+        // can be rendered from the real data.
+        for key in std::env::var("CSR_PANE_KEYS")
+            .unwrap_or_default()
+            .split([',', ' '])
+            .filter(|key| !key.is_empty())
+        {
+            pane.key(key);
+        }
         let lines = pane.frame(cols, rows, now);
         let image = compose(&lines, &pane.placed, cols, rows, cell, theme)?;
         image.save(dir.join(format!("instrument-{name}.png")))?;

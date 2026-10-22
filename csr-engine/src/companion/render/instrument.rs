@@ -48,7 +48,11 @@ pub enum RiverKind {
 }
 #[derive(Clone, Debug)]
 pub struct RiverRow {
+    /// Where the row sorts. For an undated row this is a stand-in and is never shown.
     pub at: f64,
+    /// When the row happened, if the data says. `None` draws no time label: a row never shows a
+    /// time borrowed from somewhere else.
+    pub when: Option<f64>,
     pub kind: RiverKind,
     /// The glyph the plain-text pane leads the row with. The picture draws the kind's icon instead.
     pub lead: &'static str,
@@ -63,14 +67,82 @@ impl RiverRow {
             self.line.clone()
         }
     }
+    /// The row's time label against `now`, or empty when the row has no time of its own.
+    pub fn time_label(&self, now: f64) -> String {
+        self.when.map(|at| time_label(at, now)).unwrap_or_default()
+    }
+    /// The row's past-tense mood word, from a fixed table.
+    pub fn mood(&self) -> &'static str {
+        mood(self.kind, self.lead)
+    }
 }
 fn river_row(at: f64, kind: RiverKind, lead: &'static str, line: String) -> RiverRow {
     RiverRow {
         at,
+        when: (at > 0.).then_some(at),
         kind,
         lead,
         line,
     }
+}
+/// The one word a timeline row says before its line. Fixed table, no model.
+pub fn mood(kind: RiverKind, lead: &str) -> &'static str {
+    match (kind, lead) {
+        (RiverKind::Write | RiverKind::Commit, "! ") => "worried",
+        (RiverKind::Prompt, _) => "asked",
+        (RiverKind::Dream, _) => "wondered",
+        (RiverKind::Compact, _) => "made room",
+        (RiverKind::Write, _) => "tinkered",
+        (RiverKind::Commit, _) => "landed",
+        (RiverKind::Agent, "✓ ") => "heard back",
+        (RiverKind::Agent, _) => "delegated",
+        (RiverKind::Other, _) => "",
+    }
+}
+/// A timeline row's time against `now`, in `tz`: "just now" under a minute, "N min ago" under an
+/// hour, "HH:MM" on the same local day, else "Mon D HH:MM".
+pub fn time_label_in<Tz: chrono::TimeZone>(at: f64, now: f64, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let ago = now - at;
+    if ago < 60. {
+        return "just now".into();
+    }
+    if ago < 3600. {
+        return format!("{} min ago", (ago / 60.).floor() as i64);
+    }
+    let Some(then) = tz.timestamp_opt(at.floor() as i64, 0).single() else {
+        return String::new();
+    };
+    let today = tz.timestamp_opt(now.floor() as i64, 0).single();
+    if today.is_some_and(|t| t.date_naive() == then.date_naive()) {
+        then.format("%H:%M").to_string()
+    } else {
+        then.format("%b %-d %H:%M").to_string()
+    }
+}
+pub fn time_label(at: f64, now: f64) -> String {
+    time_label_in(at, now, &chrono::Local)
+}
+/// The latest edit of the one file in this session that `scope` names. `s["edit_at"]` maps each
+/// edited path to its last edit time; a scope matches a path equal to it or ending in `/scope`.
+/// Two files answering to one scope is ambiguous, so it dates nothing.
+fn edit_time(scope: &str, s: &Value) -> Option<f64> {
+    let files = s["edit_at"].as_object()?;
+    let scope = scope.trim_start_matches("./");
+    if scope.is_empty() {
+        return None;
+    }
+    let suffix = format!("/{scope}");
+    let mut hits = files
+        .iter()
+        .filter(|(path, _)| path.as_str() == scope || path.ends_with(&suffix));
+    let (_, at) = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    at.as_f64().filter(|at| *at > 0.)
 }
 /// What a shift row is and when it happened. A shift that names a commit (`oid:` receipt) is a
 /// commit row, dated by that commit among the session's commit shifts (`at` is the commit time;
@@ -133,6 +205,19 @@ pub struct Open {
     pub threads: bool,
     pub dreams: bool,
 }
+/// The threads timeline's heading and its subtitle.
+const MONOLOGUE: &str = "Monologue";
+const MONOLOGUE_SUB: &str = "the session thinking out loud";
+/// Room the Monologue heading and subtitle take above the first row, in layout points.
+const MONOLOGUE_H: f32 = 42.;
+/// A timeline row's band height and the distance from one band to the next.
+const ROW_BAND: f32 = 29.;
+const ROW_PITCH: f32 = 33.;
+const ROW_GAP: f32 = ROW_PITCH - ROW_BAND;
+/// How strongly a row's kind colour tints its band over the card.
+const BAND_ALPHA: f32 = 0.10;
+/// Shear of the fake italic the mood word is drawn in.
+const ITALIC_SLANT: f32 = 0.2;
 /// How many confused-Claude or should-be items a card keeps.
 const OBSERVATION_CAP: usize = 5;
 /// Every look of this session that carries `key`, newest first, one item per `line`. A later look
@@ -262,8 +347,15 @@ impl Composition {
             .collect::<Vec<_>>();
         let commits = array(&data["shifts"]);
         for shift in &shifts {
-            let (kind, at) = shift_when(shift, commits);
-            river.push(river_row(
+            let (kind, commit_at) = shift_when(shift, commits);
+            // An unlanded edit is dated by its file's last edit in this session. The map's own
+            // time stands in for sorting only: it belongs to the whole map, not to this row.
+            let at = commit_at.or_else(|| {
+                (kind == RiverKind::Write)
+                    .then(|| edit_time(string(&shift["scope"]), s))
+                    .flatten()
+            });
+            let mut row = river_row(
                 at.unwrap_or_else(|| num(&data["story_map"]["at"])),
                 kind,
                 match mark(shift) {
@@ -273,7 +365,11 @@ impl Composition {
                     _ => "~ ",
                 },
                 format!("{} · {}", string(&shift["scope"]), string(&shift["now"])),
-            ));
+            );
+            if at.is_none() {
+                row.when = None;
+            }
+            river.push(row);
         }
         for agent in &projection.agents {
             if let Some(start) = agent.started {
@@ -460,6 +556,18 @@ fn sells() -> [&'static str; 3] {
         "CSR keeps the threads you dropped.",
     ]
 }
+/// The colour a timeline kind wears: its icon, its band and its left rule.
+fn river_color(kind: RiverKind, t: &Tokens) -> Rgba {
+    match kind {
+        RiverKind::Write => t.sky,
+        RiverKind::Compact => t.amber,
+        RiverKind::Dream => t.dream,
+        RiverKind::Agent => t.asked,
+        RiverKind::Commit => t.mint,
+        RiverKind::Prompt => t.csr_share,
+        RiverKind::Other => t.faint,
+    }
+}
 /// One timeline icon centred on (`cx`, `cy`). Lucide has no quote glyph in the bundled subset, so
 /// the prompt mark is drawn; every other kind is a bundled Lucide glyph.
 fn river_icon(canvas: &mut Canvas, f: &Fonts, kind: RiverKind, cx: f32, cy: f32, t: &Tokens) {
@@ -478,25 +586,26 @@ fn river_icon(canvas: &mut Canvas, f: &Fonts, kind: RiverKind, cx: f32, cy: f32,
             A::L,
         );
     };
+    let col = river_color(kind, t);
     match kind {
-        RiverKind::Write => glyph(canvas, Icon::FilePen, t.sky),
-        RiverKind::Compact => glyph(canvas, Icon::Recycle, t.amber),
-        RiverKind::Dream => glyph(canvas, Icon::MoonStar, t.dream),
-        RiverKind::Agent => glyph(canvas, Icon::Bot, t.asked),
-        RiverKind::Commit => glyph(canvas, Icon::GitCommit, t.mint),
+        RiverKind::Write => glyph(canvas, Icon::FilePen, col),
+        RiverKind::Compact => glyph(canvas, Icon::Recycle, col),
+        RiverKind::Dream => glyph(canvas, Icon::MoonStar, col),
+        RiverKind::Agent => glyph(canvas, Icon::Bot, col),
+        RiverKind::Commit => glyph(canvas, Icon::GitCommit, col),
         RiverKind::Prompt => {
             for dx in [-3.2, 2.6] {
                 let (x, y) = (cx + dx, cy - 1.8);
-                canvas.circle(x, y, 2.1, t.ink);
+                canvas.circle(x, y, 2.1, col);
                 let mut tail = tiny_skia::PathBuilder::new();
                 tail.move_to(x + 1.6, y + 0.4);
                 tail.quad_to(x + 1.4, y + 3.2, x - 1.8, y + 5.2);
                 if let Some(tail) = tail.finish() {
-                    canvas.stroke(&tail, 1.5, t.ink, true);
+                    canvas.stroke(&tail, 1.5, col, true);
                 }
             }
         }
-        RiverKind::Other => canvas.circle(cx, cy, 2.5, t.faint),
+        RiverKind::Other => canvas.circle(cx, cy, 2.5, col),
     }
 }
 fn mark(v: &Value) -> &str {
@@ -861,11 +970,16 @@ pub fn rows_with_figure(
         details_start = out.len();
     }
     if open.threads {
+        out.extend(wrap(&format!("{MONOLOGUE} · {MONOLOGUE_SUB}")));
+        details_start = out.len();
         for row in &c.river {
+            let when = row.time_label(c.now);
             out.extend(wrap(&format!(
-                "{} · {}{}",
-                masthead::span((c.now - row.at).max(0.)),
+                "{}{}{}{} · {}",
+                when,
+                if when.is_empty() { "" } else { " · " },
                 row.lead,
+                row.mood(),
                 row.line
             )));
         }
@@ -1933,7 +2047,8 @@ pub fn draw(
     let requested_extra_h = if open.changes {
         c.shifts.len() as f32 * 58.
     } else if open.threads {
-        (c.river.len().min(8) as f32 * 33.).max(60.)
+        // A heading, then up to eight bands with a gap between each.
+        P * 2. + MONOLOGUE_H + (c.river.len().min(8) as f32 * ROW_PITCH - ROW_GAP).max(40.)
     } else if open.dreams {
         c.dream.queue.len().min(4) as f32 * 38.
     } else {
@@ -2362,46 +2477,75 @@ pub fn draw(
                 b += 17.;
             }
         } else if open.threads {
-            let spine_h = (extra_h - P * 2.).max(0.);
-            let spine_x = IX + 55.;
+            let title_st = serif(20., t.bold);
+            let head = y + P + f.cap(title_st);
+            canvas.text(f, MONOLOGUE, IX, head, title_st, t.ink, A::L);
+            single(
+                &mut canvas,
+                f,
+                MONOLOGUE_SUB,
+                IX,
+                head + 16.,
+                IW,
+                theme::CAPTION_SIZE,
+                t.quiet,
+                t,
+            );
+            let top = y + P + MONOLOGUE_H;
+            let spine_h = (extra_h - P * 2. - MONOLOGUE_H).max(0.);
+            let spine_x = IX + 72.;
             let rows: Vec<_> = c
                 .river
                 .iter()
                 .skip(open.scroll)
-                .take((spine_h / 33.) as usize)
+                .take(((spine_h + ROW_GAP) / ROW_PITCH) as usize)
                 .collect();
+            // The first baseline sits half a band plus a cap-height below the first band's top.
+            let b = top + ROW_BAND / 2. + 4.;
             // The spine runs between the icons, never through them, and ends at the last one.
-            let mut from = y + P;
-            for i in 0..rows.len() {
-                let mid = b + i as f32 * 33. - 4.;
+            let mut from = b - 4. + 9.;
+            for i in 1..rows.len() {
+                let mid = b + i as f32 * ROW_PITCH - 4.;
                 canvas.vhair(spine_x, from, (mid - 9. - from).max(0.), t.band);
                 from = mid + 9.;
             }
+            let mut b = b;
             for row in rows {
-                river_icon(&mut canvas, f, row.kind, spine_x, b - 4., t);
-                single(
-                    &mut canvas,
-                    f,
-                    &masthead::span((c.now - row.at).max(0.)),
-                    IX,
-                    b,
-                    48.,
-                    9.5,
-                    t.quiet,
-                    t,
+                let kind_col = river_color(row.kind, t);
+                let band_y = b - 4. - ROW_BAND / 2.;
+                canvas.rrect(
+                    IX - 8.,
+                    band_y,
+                    IW + 16.,
+                    ROW_BAND,
+                    5.,
+                    al(kind_col, BAND_ALPHA),
                 );
+                canvas.rect(IX - 8., band_y + 3., 1., ROW_BAND - 6., kind_col);
+                river_icon(&mut canvas, f, row.kind, spine_x, b - 4., t);
+                let when = row.time_label(c.now);
+                if !when.is_empty() {
+                    single(&mut canvas, f, &when, IX, b, 62., 9.5, t.quiet, t);
+                }
+                let mut x = IX + 88.;
+                let mood = row.mood();
+                if !mood.is_empty() {
+                    let st = sans(10., t.regular);
+                    let w = canvas.text_slanted(f, mood, x, b, st, t.quiet, A::L, ITALIC_SLANT);
+                    x += w + 6.;
+                }
                 single(
                     &mut canvas,
                     f,
                     &row.picture_text(),
-                    IX + 70.,
+                    x,
                     b,
-                    IW - 70.,
+                    IX + IW - x,
                     11.5,
                     t.ink,
                     t,
                 );
-                b += 33.;
+                b += ROW_PITCH;
             }
         } else {
             for d in c.dream.queue.iter().take(4) {
@@ -3673,6 +3817,153 @@ mod tests {
                 save(&name, &pm);
             }
         }
+    }
+
+    fn at_local(h: u32, m: u32, day: u32) -> f64 {
+        use chrono::TimeZone;
+        chrono::FixedOffset::east_opt(2 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 10, day, h, m, 0)
+            .unwrap()
+            .timestamp() as f64
+    }
+
+    #[test]
+    fn time_labels_follow_the_local_day() {
+        let tz = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        let now = at_local(15, 0, 21);
+        let label = |at: f64| time_label_in(at, now, &tz);
+        assert_eq!(label(now), "just now");
+        assert_eq!(label(now - 59.), "just now");
+        assert_eq!(label(now + 30.), "just now");
+        assert_eq!(label(now - 60.), "1 min ago");
+        assert_eq!(label(now - 59. * 60.), "59 min ago");
+        assert_eq!(label(now - 3599.), "59 min ago");
+        // An hour or more, still today: the clock time in the local zone.
+        assert_eq!(label(now - 3600.), "14:00");
+        assert_eq!(label(at_local(0, 5, 21)), "00:05");
+        // Yesterday and older carry the date.
+        assert_eq!(label(at_local(23, 30, 20)), "Oct 20 23:30");
+        assert_eq!(label(at_local(9, 7, 3)), "Oct 3 09:07");
+        // Crossing midnight: 1.5 hours ago is still yesterday.
+        let early = at_local(0, 30, 21);
+        assert_eq!(
+            time_label_in(at_local(23, 0, 20), early, &tz),
+            "Oct 20 23:00"
+        );
+        // The same instant reads differently in another zone's day.
+        let utc = chrono::Utc;
+        assert_eq!(time_label_in(at_local(1, 0, 21), now, &utc), "Oct 20 23:00");
+    }
+
+    #[test]
+    fn every_row_kind_has_its_mood_word() {
+        let word = |kind, lead| mood(kind, lead);
+        assert_eq!(word(RiverKind::Prompt, "↳ "), "asked");
+        assert_eq!(word(RiverKind::Dream, "☾ "), "wondered");
+        assert_eq!(word(RiverKind::Compact, "♻ "), "made room");
+        assert_eq!(word(RiverKind::Write, "~ "), "tinkered");
+        assert_eq!(word(RiverKind::Commit, "~ "), "landed");
+        assert_eq!(word(RiverKind::Agent, "○ "), "delegated");
+        assert_eq!(word(RiverKind::Agent, "✓ "), "heard back");
+        assert_eq!(word(RiverKind::Write, "! "), "worried");
+        assert_eq!(word(RiverKind::Commit, "! "), "worried");
+        assert_eq!(word(RiverKind::Other, ""), "");
+    }
+
+    fn write_row(data: &Value, s: &Value, now: f64) -> RiverRow {
+        let c = Composition::build(data, s, now);
+        c.river
+            .into_iter()
+            .find(|r| r.kind == RiverKind::Write)
+            .expect("an unlanded edit row")
+    }
+
+    #[test]
+    fn a_write_row_is_dated_by_its_files_last_edit_never_the_maps_time() {
+        let now = 1_800_000_000.;
+        let (data, mut s) = timeline_data();
+        // No per-file edit times: no label, but the row keeps its sort position at the map's time.
+        let row = write_row(&data, &s, now);
+        assert_eq!(row.when, None);
+        assert_eq!(row.at, now - 6200.);
+        assert_eq!(row.time_label(now), "");
+        // The file was last edited 20 minutes ago.
+        s["edit_at"] = json!({"/repo/csr-engine/src/summarizer.rs": now - 1200.});
+        let row = write_row(&data, &s, now);
+        assert_eq!(row.when, Some(now - 1200.));
+        assert_eq!(row.at, now - 1200.);
+        assert_eq!(row.time_label(now), "20 min ago");
+        // A read-only touch in `last` dates nothing.
+        s["edit_at"] = json!({});
+        s["last"] = json!({"/repo/csr-engine/src/summarizer.rs": now - 60.});
+        assert_eq!(write_row(&data, &s, now).when, None);
+        // A different file with a similar name does not match.
+        s["edit_at"] = json!({"/repo/csr-engine/src/not_summarizer.rs": now - 60.});
+        assert_eq!(write_row(&data, &s, now).when, None);
+        // Two files answering to one scope are ambiguous: borrow neither.
+        s["edit_at"] = json!({"/a/summarizer.rs": now - 60., "/b/summarizer.rs": now - 90.});
+        assert_eq!(write_row(&data, &s, now).when, None);
+    }
+
+    #[test]
+    fn rows_without_a_time_of_their_own_show_none() {
+        let now = 1_800_000_000.;
+        let (data, s) = timeline_data();
+        let c = Composition::build(&data, &s, now);
+        // "Dated by neither" names a commit the session never saw: sorted by the map, not labelled.
+        let unmatched = c
+            .river
+            .iter()
+            .find(|r| r.line.starts_with("summarizer.rs · Dated by neither"))
+            .expect("row");
+        assert_eq!(unmatched.kind, RiverKind::Commit);
+        assert_eq!(unmatched.when, None);
+        // Every other row carries its own time.
+        assert!(c
+            .river
+            .iter()
+            .filter(|r| r.when.is_none())
+            .all(|r| r.line.contains("Dated by neither") || r.kind == RiverKind::Write));
+    }
+
+    #[test]
+    fn the_text_pane_reads_monologue_verb_and_time() {
+        let now = 1_800_000_000.;
+        let (data, mut s) = timeline_data();
+        s["edit_at"] = json!({"/r/summarizer.rs": now - 1200.});
+        let c = Composition::build(&data, &s, now);
+        let open = Open {
+            threads: true,
+            ..Open::default()
+        };
+        let text = text_rows(&c, 110, 60, open);
+        let head = text
+            .iter()
+            .position(|l| l == "Monologue · the session thinking out loud")
+            .unwrap_or_else(|| panic!("{text:#?}"));
+        assert!(text[head + 1].contains("wondered"), "{text:#?}");
+        let all = text.join("\n");
+        assert!(
+            all.contains("☾ wondered · What if recall started from the file?"),
+            "{all}"
+        );
+        assert!(all.contains("10 min ago · ☾"), "{all}");
+        assert!(all.contains("♻ made room · Compacted"), "{all}");
+        assert!(all.contains("↳ asked · Decide the release name"), "{all}");
+        assert!(
+            all.contains("20 min ago · ~ tinkered · summarizer.rs"),
+            "{all}"
+        );
+        assert!(!all.contains("h0"), "no durations: {all}");
+        // The undated unlanded row has no time prefix at all.
+        let (data, s) = timeline_data();
+        let c = Composition::build(&data, &s, now);
+        let all = text_rows(&c, 110, 60, open).join("\n");
+        assert!(
+            all.contains("\n~ tinkered · summarizer.rs · Unlanded edit"),
+            "{all}"
+        );
     }
 
     fn fresh_with_history(prior: usize) -> Composition {

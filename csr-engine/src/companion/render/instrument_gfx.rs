@@ -1046,6 +1046,22 @@ impl Canvas {
         col: Rgba,
         anchor: A,
     ) -> f32 {
+        self.text_slanted(f, s, x, base, st, col, anchor, 0.)
+    }
+
+    /// `text`, sheared to the right by `slant` (0.2 is about 11 degrees). The bundled faces have no
+    /// italic, so this is the only italic the pane has.
+    pub fn text_slanted(
+        &mut self,
+        f: &Fonts,
+        s: &str,
+        x: f32,
+        base: f32,
+        st: St,
+        col: Rgba,
+        anchor: A,
+        slant: f32,
+    ) -> f32 {
         let (glyphs, adv) = f.place(s, st, 1.);
         let adv_pt = if s.is_empty() { 0. } else { adv / S - st.track };
         if self.dry {
@@ -1069,7 +1085,8 @@ impl Canvas {
                 let b = o.px_bounds();
                 let (bx, byy) = (b.min.x.floor() as i32, b.min.y.floor() as i32);
                 o.draw(|gx, gy, cov| {
-                    let (px, py) = (bx + gx as i32, byy + gy as i32);
+                    let py = byy + gy as i32;
+                    let px = bx + gx as i32 + ((by - py as f32) * slant).round() as i32;
                     if px < 0 || py < 0 || px >= w || py >= h {
                         return;
                     }
