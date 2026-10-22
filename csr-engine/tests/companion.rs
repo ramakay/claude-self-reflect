@@ -2300,6 +2300,108 @@ fn png_screen_respects_requested_cell_dimensions() {
     }
 }
 
+/// A fake herdr for the pane's event thread: it acknowledges the subscription and keeps it open,
+/// and answers a snapshot with `snapshot`. Returns the socket and a way to push event lines.
+#[cfg(unix)]
+fn fake_herdr(socket: &std::path::Path, snapshot: &'static str) -> std::sync::mpsc::Sender<String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    let listener = UnixListener::bind(socket).unwrap();
+    let (push, pushed) = std::sync::mpsc::channel::<String>();
+    let pushed = std::sync::Arc::new(std::sync::Mutex::new(pushed));
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let pushed = pushed.clone();
+            std::thread::spawn(move || {
+                let mut request = String::new();
+                BufReader::new(conn.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                let mut conn = conn;
+                if request["method"] == "events.subscribe" {
+                    let _ = writeln!(
+                        conn,
+                        r#"{{"id":"csr","result":{{"type":"subscription_started"}}}}"#
+                    );
+                    while let Ok(line) = pushed.lock().unwrap().recv() {
+                        if writeln!(conn, "{line}").is_err() {
+                            break;
+                        }
+                    }
+                } else {
+                    let _ = writeln!(conn, r#"{{"id":"s","result":{{"snapshot":{snapshot}}}}}"#);
+                }
+            });
+        }
+    });
+    push
+}
+
+/// herdr's default focus is one tab, but every attached client has a place of its own, and herdr
+/// does not say where. A pane whose tab is not the default focus may be in front of someone: a
+/// wake from the relay draws it at once, as it does with no herdr at all.
+#[cfg(unix)]
+#[test]
+fn a_pane_outside_herdrs_default_focus_still_draws_when_woken() {
+    use std::time::{Duration, Instant};
+    let (_home, paths) = home();
+    let socket = paths.home.join("herdr.sock");
+    let _push = fake_herdr(
+        &socket,
+        r#"{"focused_tab_id":"w1:t1","panes":[{"pane_id":"w1:p2","tab_id":"w1:t1"},{"pane_id":"w1:p3","tab_id":"w1:t2"}]}"#,
+    );
+    let frame_log = paths.home.join("frames.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        .env("HOME", &paths.home)
+        .env("TERM_PROGRAM", "kitty")
+        .env("CSR_PANE_FRAME_LOG", &frame_log)
+        .env("CSR_PANE_HERDR_EVENTS", "1")
+        .env("HERDR_SOCKET_PATH", &socket)
+        .env("HERDR_PANE_ID", "w1:p3")
+        .args([
+            "companion",
+            "pane",
+            "--repo",
+            env!("CARGO_MANIFEST_DIR"),
+            "--watch",
+            "--sid",
+            "sess-now",
+            "--agent",
+            "w1:p2",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let frames = || fs::read_to_string(&frame_log).map_or(0, |t| t.lines().count());
+    let wakes = paths.keep.join("panes/sess-now.wake");
+    let start = Instant::now();
+    while (frames() == 0 || !wakes.exists()) && start.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(frames() >= 1, "the first frame");
+    // Let the first frames and the snapshot settle, and the debounce's spacing pass.
+    std::thread::sleep(Duration::from_millis(2500));
+    let before = frames();
+    assert!(csr_engine::companion::wake::notify(
+        &paths.keep,
+        "sess-now",
+        csr_engine::companion::wake::Kind::Now
+    ));
+    let start = Instant::now();
+    while frames() == before && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        frames() > before,
+        "a woken pane in a tab that is not herdr's default focus drew nothing"
+    );
+}
+
 /// herdr's events, opt-in: with a fake herdr on a socket, the watching pane subscribes, and when
 /// herdr says the agent pane closed the pane ends by itself, cleanly, and removes its pid file.
 #[cfg(unix)]
@@ -2354,7 +2456,7 @@ fn the_pane_ends_when_herdr_says_the_agent_pane_closed() {
                 // A snapshot that has this pane's tab on screen.
                 let _ = writeln!(
                     conn,
-                    r#"{{"id":"s","result":{{"snapshot":{{"focused_tab_id":"w1:t1","panes":[{{"pane_id":"w1:p3","tab_id":"w1:t1"}}]}}}}}}"#
+                    r#"{{"id":"s","result":{{"snapshot":{{"focused_tab_id":"w1:t1","panes":[{{"pane_id":"w1:p2","tab_id":"w1:t1"}},{{"pane_id":"w1:p3","tab_id":"w1:t1"}}]}}}}}}"#
                 );
             }
         }

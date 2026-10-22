@@ -1,6 +1,6 @@
 use super::{
     cli::PaneArgs,
-    herdr_events::{self, Watcher as HerdrEvents},
+    herdr_events::Watcher as HerdrEvents,
     pane::Pane,
     paths::{self, Paths},
     private,
@@ -528,14 +528,10 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                 break;
             }
             // The relay says the session did something: draw when the debounce lets it.
-            let (mut now_wake, mut soon_wake) = wake_pipe
+            let (now_wake, mut soon_wake) = wake_pipe
                 .as_mut()
                 .map_or((false, false), wake::Listener::take);
-            if let Some((visible, status)) = events.as_ref().map(HerdrEvents::take_wakes) {
-                now_wake |= visible;
-                soon_wake |= status;
-            }
-            let hidden = events.as_ref().is_some_and(HerdrEvents::hidden);
+            soon_wake |= events.as_ref().is_some_and(HerdrEvents::take_status);
             if now_wake || soon_wake {
                 let at = Instant::now();
                 if now_wake {
@@ -550,11 +546,9 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
             pressed |= pane.map_wait(now).1;
             // A compaction ended: draw it now.
             pressed |= pane.compaction_gone();
-            if herdr_events::may_draw(hidden, last.elapsed())
-                && ((boundary.failures > 0 && (boundary.ready(now) || pressed))
-                    || (boundary.failures == 0
-                        && (pressed
-                            || (last.elapsed() >= Duration::from_secs(1) && pane.due(now)))))
+            if (boundary.failures > 0 && (boundary.ready(now) || pressed))
+                || (boundary.failures == 0
+                    && (pressed || (last.elapsed() >= Duration::from_secs(1) && pane.due(now))))
             {
                 let (cols, rows) = terminal::size().unwrap_or((60, 30));
                 if let Some(log) = &frame_log {
