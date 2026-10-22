@@ -438,6 +438,10 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     // The live HNSW index must drop the old ids too (Codex HIGH): deleting only
     // the SQLite rows left old vectors matching, and a reused deterministic id
     // was skipped as a duplicate on re-insert, pinning stale content forever.
+    // Read before the wipe and the commits (see `SearchEngine::defers_to_sync`):
+    // a failed read after the wipe would leave the plan deleted while its
+    // checkpoint already matches, so nothing would import it again.
+    let fence = storage.change_fence()?;
     let old_ids = storage.get_chunk_ids_for_conversation(&conv_id)?;
     storage.delete_chunks_for_conversation(&conv_id)?;
     if !old_ids.is_empty() {
@@ -477,8 +481,6 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     // storage call (see `Engine::import_file_with_attribution`).
     let mut stored_now: Vec<(String, Vec<f32>)> = Vec::with_capacity(new_chunks.len());
     let mut failure = None;
-    // Read before the commits (see `SearchEngine::defers_to_sync`).
-    let fence = storage.change_fence()?;
     for (chunk, embedding) in new_chunks.iter().zip(embeddings.iter()) {
         let stored = (|| -> Result<()> {
             storage.insert_chunk_with_source(chunk, embedding, "plan")?;
@@ -893,6 +895,32 @@ mod tests {
         let imported = import_plan(&engine, &plan).unwrap();
         assert!(imported > 0);
         assert_eq!(engine.search().blocking_read().chunk_count(), imported);
+    }
+
+    #[test]
+    fn a_failed_fence_read_leaves_the_imported_plan_in_place() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone());
+        let mut plan = PlanDoc {
+            slug: "fence-plan-wipe".into(),
+            path: PathBuf::from("/dev/null"),
+            mtime: "2026-07-20T12:00:00Z".into(),
+            content: distinctive_body("wipeone"),
+        };
+        assert!(import_plan(&engine, &plan).unwrap() > 0);
+        let conv_id = format!("plan:{}", plan.slug);
+        let before = storage.get_chunk_ids_for_conversation(&conv_id).unwrap();
+        assert!(!before.is_empty());
+
+        plan.mtime = "2026-07-21T12:00:00Z".into();
+        plan.content = distinctive_body("wipetwo");
+        let _fail = crate::storage::lock_probe::fail_fence_reads();
+        assert!(import_plan(&engine, &plan).is_err());
+        assert_eq!(
+            storage.get_chunk_ids_for_conversation(&conv_id).unwrap(),
+            before,
+            "a failed fence read wiped the plan before it could replace it"
+        );
     }
 
     #[test]
