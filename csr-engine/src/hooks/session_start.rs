@@ -1295,6 +1295,12 @@ fn overlay_compact_snapshot(
         current.completions = snapshot.completions;
         current.completions_untied = snapshot.completions_untied;
         current.anchor_receipts = snapshot.anchor_receipts;
+    } else if let Some(anchor) = current.compact_anchor.as_mut() {
+        // The anchor's receipts are indices into the snapshot's completions,
+        // which were not taken: over this episode's list they would pick
+        // receipts made for another ask. Receipts and indices move together,
+        // or the anchor shows none.
+        anchor.receipts = Some(Vec::new());
     }
     current.recap_evidence_version = Some(super::stop::RECAP_EVIDENCE_VERSION);
     Some(current)
@@ -3711,6 +3717,55 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
                 Some("Now wire the staging endpoint.")
             );
         }
+    }
+
+    /// A snapshot taken against a later ask carries receipt indices into its own
+    /// completions. Over an episode of the earlier ask they would pick that
+    /// ask's receipts and show them beside the new one.
+    #[test]
+    fn a_newer_snapshot_with_another_anchor_does_not_pick_the_old_asks_receipts() {
+        let mut ep = stored_episode(Some(EARLIER), None);
+        ep.recap_evidence_version = Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION);
+        ep.anchor_receipts = Some(vec![0]);
+        let mut snapshot = snapshot_at(Some(LATER), Some("Something else entirely."), None);
+        snapshot.anchor = Some(crate::hooks::stop::CompactAnchor {
+            request: "Now wire the staging endpoint.".into(),
+            completions_untied: false,
+            receipts: Some(vec![0]),
+        });
+        let overlaid = overlay_compact_snapshot(&ep, snapshot).expect("ahead");
+        let shown = recap_episode(&overlaid, Some("compact"), Some(ep.session_id.as_str()));
+        let feeds = crate::hooks::recap::RecapFeeds {
+            settled: vec![],
+            still_open: vec![],
+            retired_while_away: vec![],
+            corrections: vec![],
+            open_proposals: 0,
+            top_dream: None,
+        };
+        let text = crate::hooks::recap::compose_recap(&shown, &feeds, "1h ago")
+            .expect("the anchor still composes");
+        assert!(text.contains("Now wire the staging endpoint"), "{text}");
+        assert!(!text.contains("1111111"), "{text}");
+        assert!(!text.contains("2222222"), "{text}");
+        // The same anchor moves its receipts together with the snapshot's.
+        let mut same = snapshot_at(
+            Some(LATER),
+            Some("Fix the auth middleware regression."),
+            None,
+        );
+        same.anchor = Some(crate::hooks::stop::CompactAnchor {
+            request: "Now wire the staging endpoint.".into(),
+            completions_untied: false,
+            receipts: Some(vec![0]),
+        });
+        let overlaid = overlay_compact_snapshot(&ep, same).expect("ahead");
+        let shown = recap_episode(&overlaid, Some("compact"), Some(ep.session_id.as_str()));
+        let text = crate::hooks::recap::compose_recap(&shown, &feeds, "1h ago").expect("composes");
+        assert!(
+            text.contains("2222222") && !text.contains("1111111"),
+            "{text}"
+        );
     }
 
     /// An ask saved with task A must not be shown after the compact anchor for
