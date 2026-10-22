@@ -3087,6 +3087,7 @@ mod tests {
                 late_errors: false,
                 closing_success: false,
                 latest_ask: None,
+                watermark: None,
                 anchors: vec![],
             };
             storage
@@ -3823,6 +3824,7 @@ mod tests {
             late_errors: false,
             closing_success: false,
             latest_ask: None,
+            watermark: None,
             anchors: vec![crate::extraction::anchors::FunctionAnchor {
                 file: "src/radio/RadioSheet.swift".into(),
                 node_kind: "file".into(),

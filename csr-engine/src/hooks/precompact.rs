@@ -36,10 +36,11 @@ pub(crate) struct CompactSnapshot {
     /// this field existed reads as no ask.
     #[serde(default)]
     pub latest_ask: Option<String>,
-    /// When the snapshot was taken (RFC 3339). The overlay applies only to a
-    /// stored episode that is not newer; a snapshot without it is ignored.
+    /// The transcript position this snapshot read (`Episode::watermark`),
+    /// recorded the same way the Stop episode records its own. The overlay
+    /// applies only when it is clearly ahead of the stored episode's.
     #[serde(default)]
-    pub taken_at: Option<String>,
+    pub watermark: Option<String>,
     pub completions: Vec<super::stop::CompletionReceipt>,
     pub completions_untied: bool,
 }
@@ -94,7 +95,7 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
                 anchor_request: episode.anchor_request,
                 anchor: episode.compact_anchor,
                 latest_ask: episode.latest_ask,
-                taken_at: Some(chrono::Utc::now().to_rfc3339()),
+                watermark: episode.watermark,
                 completions: episode.completions,
                 completions_untied: episode.completions_untied,
             };
@@ -144,9 +145,11 @@ mod tests {
             temp.path().to_path_buf(),
         );
         let path = temp.path().join("r8-compact.jsonl");
-        let first = serde_json::json!({"type":"user","message":{"content":FIRST}}).to_string();
-        let done = serde_json::json!({"type":"assistant","message":{"content":"Done.","stop_reason":"end_turn"}}).to_string();
+        // Row times are what orders the Stop episode against the snapshot.
+        let first = serde_json::json!({"type":"user","timestamp":"2026-10-21T10:00:00Z","message":{"content":FIRST}}).to_string();
+        let done = serde_json::json!({"type":"assistant","timestamp":"2026-10-21T10:01:00Z","message":{"content":"Done.","stop_reason":"end_turn"}}).to_string();
         let ep = crate::hooks::stop::extract_episode(&[&first, &done], "r8-compact", "fixture");
+        assert!(ep.watermark.is_some());
         storage
             .insert_reflection(
                 "r8-episode",
@@ -164,7 +167,7 @@ mod tests {
         writeln!(
             file,
             "{}",
-            serde_json::json!({"type":"user","message":{"content":LATEST}})
+            serde_json::json!({"type":"user","timestamp":"2026-10-21T10:30:00Z","message":{"content":LATEST}})
         )
         .unwrap();
         drop(file);

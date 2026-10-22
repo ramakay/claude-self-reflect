@@ -141,6 +141,12 @@ pub struct Episode {
     /// ask, and says nothing when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_ask: Option<String>,
+    /// The time of the last user, assistant or system row this reader saw
+    /// (RFC 3339): where in the transcript the episode stands. The Stop reader
+    /// and the PreCompact reader record it the same way, so two readings of
+    /// one session can be ordered by it, which their wall clocks cannot do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<String>,
 }
 
 /// A compact intent and whether the displayed receipts belong to that task.
@@ -868,6 +874,7 @@ where
     // First and last row times, for the session's real duration.
     let mut first_row_at: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut last_row_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut watermark: Option<chrono::DateTime<chrono::Utc>> = None;
     // An error-pattern match in a tool result since the latest task began.
     let mut late_errors = false;
     // The assistant's latest main-session text since the latest task began.
@@ -895,6 +902,9 @@ where
         {
             first_row_at = Some(first_row_at.map_or(at, |first| first.min(at)));
             last_row_at = Some(last_row_at.map_or(at, |last| last.max(at)));
+            if matches!(msg_type, "user" | "human" | "assistant" | "system") {
+                watermark = Some(watermark.map_or(at, |last| last.max(at)));
+            }
         }
         // A legacy in-file subagent row. It still counts toward tools/files,
         // but never toward the recap's task, turn or completion state.
@@ -1281,6 +1291,7 @@ where
         late_errors,
         closing_success,
         latest_ask,
+        watermark: watermark.map(|at| at.to_rfc3339()),
     }
 }
 
@@ -2866,7 +2877,10 @@ mod tests {
         use crate::hooks::recap::is_request;
         let closing = |remark: &str| {
             extract(&[
-                dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+                dur_typed(
+                    "Fix the login validation before the release",
+                    "2026-10-21T10:00:00Z",
+                ),
                 dur_timed(
                     serde_json::json!({"type": "assistant", "message": {
                         "content": [{"type": "text", "text": "Fixed. All tests pass."}],
@@ -2878,7 +2892,10 @@ mod tests {
             ])
         };
         // Remarks: the request check says no, so the success stands.
-        for remark in ["Thanks for fixing the build", "Great work helping us fix the build"] {
+        for remark in [
+            "Thanks for fixing the build",
+            "Great work helping us fix the build",
+        ] {
             assert!(!is_request(remark), "{remark}");
             let ep = closing(remark);
             assert!(ep.closing_success, "{remark}");
@@ -3097,6 +3114,7 @@ mod tests {
             late_errors: false,
             closing_success: false,
             latest_ask: None,
+            watermark: None,
         };
 
         let json = serde_json::to_string(&ep).unwrap();
@@ -3157,6 +3175,7 @@ mod tests {
             late_errors: false,
             closing_success: false,
             latest_ask: None,
+            watermark: None,
         };
 
         let tags = episode_tags(&ep);

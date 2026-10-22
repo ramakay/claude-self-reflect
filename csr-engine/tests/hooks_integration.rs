@@ -1971,6 +1971,7 @@ fn test_explore_prompt_never_fails() {
         late_errors: false,
         closing_success: false,
         latest_ask: None,
+        watermark: None,
         anchors: vec![],
     };
 
@@ -2510,6 +2511,7 @@ fn test_episode_struct_serialization() {
         late_errors: false,
         closing_success: false,
         latest_ask: None,
+        watermark: None,
         anchors: vec![],
     };
 

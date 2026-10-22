@@ -1040,6 +1040,7 @@ mod tests {
             late_errors: false,
             closing_success: false,
             latest_ask: None,
+            watermark: None,
             anchors: vec![],
         };
         let feeds = RecapFeeds {
