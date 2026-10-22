@@ -60,6 +60,12 @@ static STATUS: LazyLock<Regex> = LazyLock::new(|| {
     .expect("status regex")
 });
 
+/// A line that is only file paths, optionally led by a line count: what a
+/// `Read` or `ls` left behind. It names what was looked at, not what was found.
+static PATH_ONLY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:\d+\s+)?/\S+(?:\s+(?:\d+\s+)?/\S+)*$").expect("path-only regex")
+});
+
 /// Openers of a question written without its question mark.
 static QUESTION_OPENER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -83,6 +89,7 @@ pub fn is_question_echo(content: &str) -> bool {
         {
             questions += 1;
         } else if !(STATUS.is_match(sentence)
+            || PATH_ONLY.is_match(sentence)
             || (FILLER.is_match(sentence) && sentence.chars().count() <= MAX_FILLER_CHARS))
         {
             return false;
@@ -127,7 +134,8 @@ fn strip_scaffolding(content: &str) -> String {
     TOOL_MARKER.replace_all(text, " ").into_owned()
 }
 
-/// The request, findings and open items of a session episode row
+/// The request, findings and open items of a session episode row (its
+/// `investigated` slot lists files looked at, never a finding, so it is left out)
 /// (`{"schema":"v2","request":...,"completed":...}`), one per line, or `None`
 /// when `text` is not an episode.
 fn episode_text(text: &str) -> Option<String> {
@@ -304,6 +312,23 @@ mod tests {
         )));
         assert!(!is_question_echo(&episode(
             "Installing it was too painful, and the scale never needed a database server."
+        )));
+    }
+
+    #[test]
+    fn an_episode_that_only_lists_files_it_read_is_an_echo() {
+        assert!(is_question_echo(&format!(
+            "{{\"schema\":\"v2\",\"request\":\"{Q}\",\"investigated\":[\"/a/b/mod.rs\"],\"completed\":\"Checking the commit.\"}}"
+        )));
+    }
+
+    #[test]
+    fn a_question_followed_by_filler_and_bare_paths_is_an_echo() {
+        assert!(is_question_echo(&format!(
+            "{Q}\n\nChecking past sessions.\n\n/Users/x/.plans/02-results.md\n\n113 /Users/x/.plans/02-results.md"
+        )));
+        assert!(!is_question_echo(&format!(
+            "{Q}\n\nChecking past sessions.\n\nSee /Users/x/.plans/02-results.md for the reasons."
         )));
     }
 
