@@ -1253,6 +1253,9 @@ where
     // changes it only once a matching tool_result succeeds; sidechain rows
     // never touch it.
     let mut tasks = TaskState::default();
+    // The task segment each task or todo was first seen under. A task belongs
+    // to the ask it was created for, even when a later ask marks it finished.
+    let mut task_births: HashMap<String, Option<usize>> = HashMap::new();
     // Recap evidence: the latest typed task, and what was provably completed
     // after it (reset whenever a newer task is asked).
     let mut segments: Vec<TaskSegment> = Vec::new();
@@ -1489,10 +1492,16 @@ where
                                             // No id, so no result can ever answer
                                             // it (synthetic or legacy rows): apply.
                                             None => {
+                                                let current = segments.len().checked_sub(1);
+                                                note_births(&op, &mut task_births, current);
                                                 for (claim, receipt) in tasks.apply(op, None) {
+                                                    let origin = task_births
+                                                        .get(&claim)
+                                                        .copied()
+                                                        .unwrap_or(current);
                                                     push_completion(
                                                         &mut completions,
-                                                        segments.len().checked_sub(1),
+                                                        origin,
                                                         &claim,
                                                         &receipt,
                                                     );
@@ -1651,13 +1660,12 @@ where
                         let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str());
                         if let Some(op) = tool_use_id.and_then(|id| tasks.pending.remove(id)) {
                             if !failed {
+                                let current = segments.len().checked_sub(1);
+                                note_births(&op, &mut task_births, current);
                                 for (claim, receipt) in tasks.apply(op, Some(&block_text)) {
-                                    push_completion(
-                                        &mut completions,
-                                        segments.len().checked_sub(1),
-                                        &claim,
-                                        &receipt,
-                                    );
+                                    let origin =
+                                        task_births.get(&claim).copied().unwrap_or(current);
+                                    push_completion(&mut completions, origin, &claim, &receipt);
                                 }
                             }
                         } else if tool_use_id.is_none() && !failed {
@@ -1783,6 +1791,21 @@ where
         closing_success,
         latest_ask,
         watermark: watermark.map(|at| at.to_rfc3339()),
+    }
+}
+
+/// Remember the segment a task or todo first appeared under.
+fn note_births(op: &TaskOp, births: &mut HashMap<String, Option<usize>>, segment: Option<usize>) {
+    match op {
+        TaskOp::Create(subject) => {
+            births.entry(subject.clone()).or_insert(segment);
+        }
+        TaskOp::Write(items) => {
+            for item in items {
+                births.entry(item.content.clone()).or_insert(segment);
+            }
+        }
+        TaskOp::Update { .. } => {}
     }
 }
 
@@ -5123,6 +5146,45 @@ mod tests {
             crate::hooks::recap::displayed_receipts(&ep.completions).len(),
             1
         );
+    }
+
+    #[test]
+    fn a_task_created_under_an_earlier_ask_is_not_the_later_asks_result() {
+        let task = |name: &str, id: &str, input: serde_json::Value, result: &str| {
+            vec![
+                assistant_named_tool(name, id, input),
+                tool_result_bound(id, result),
+            ]
+        };
+        let mut rows = vec![typed_line(
+            "plan the daemon rewrite for the stale lock",
+            "typed",
+        )];
+        rows.extend(task(
+            "TaskCreate",
+            "t1",
+            serde_json::json!({"subject": "Review the lock fix", "description": "d"}),
+            "Task #1 created successfully: Review the lock fix",
+        ));
+        rows.push(assistant_stop_line("Planned.", "end_turn"));
+        rows.push(typed_line(
+            "now run the full release checks and report",
+            "typed",
+        ));
+        rows.extend(task(
+            "TaskUpdate",
+            "t2",
+            serde_json::json!({"taskId": "1", "status": "completed"}),
+            "Updated task #1 status",
+        ));
+        rows.push(assistant_stop_line("Done.", "end_turn"));
+        let ep = extract(&rows);
+        assert_eq!(
+            ep.completions,
+            vec![receipt("Review the lock fix", "task #1 completed")]
+        );
+        // The task was created for the first ask, not the one that closed it.
+        assert_eq!(ep.anchor_receipts, Some(vec![0]));
     }
 
     #[test]
