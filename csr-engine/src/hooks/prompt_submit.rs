@@ -1658,11 +1658,23 @@ async fn hybrid_chunk_candidates(
     (fused, keyword_only)
 }
 
+/// Most the candidate list may grow, as a multiple of the requested `limit`,
+/// when the content gates keep emptying it.
+const REPLENISH_CAP_FACTOR: usize = 4;
+
 /// [`search_chunks_with_vec`] with the repository test supplied, so unit tests
 /// decide which conversations widen without a filesystem or `git`. `same_repo`
-/// is called at most once, and only when some candidate's label differs from
-/// `project` and has a recorded transcript path. A prompt whose candidates all
-/// match by label costs nothing; any other costs one batched query first.
+/// is called at most once per pass, and only when some candidate's label
+/// differs from `project` and has a recorded transcript path. A prompt whose
+/// candidates all match by label costs nothing; any other costs one batched
+/// query first.
+///
+/// The content gates (CSR text, age, tool-output dump) run after retrieval, so
+/// a run of top-ranked candidates they reject would leave the slots empty while
+/// eligible ones sit just below the cut. When a gate rejected something and
+/// fewer than `limit` chunks survived, the retrieval is repeated with twice the
+/// limit, up to [`REPLENISH_CAP_FACTOR`] times `limit` or until the index has
+/// no more candidates above the floor. A prompt no gate touched searches once.
 #[allow(clippy::too_many_arguments)]
 async fn search_chunks_with_vec_core(
     engine: &Engine,
@@ -1673,8 +1685,45 @@ async fn search_chunks_with_vec_core(
     min_score: f32,
     project: &str,
     current_session: Option<&str>,
-    same_repo: impl FnOnce(HashMap<String, Vec<String>>) -> super::scope_folder::RepoConversations,
+    mut same_repo: impl FnMut(HashMap<String, Vec<String>>) -> super::scope_folder::RepoConversations,
 ) -> Vec<RawResult> {
+    let cap = limit.saturating_mul(REPLENISH_CAP_FACTOR);
+    let mut fetch = limit;
+    loop {
+        let (raw_results, candidates, gated) = chunk_candidates_pass(
+            engine,
+            query,
+            mode,
+            query_vec,
+            fetch,
+            min_score,
+            project,
+            current_session,
+            &mut same_repo,
+        )
+        .await;
+        if gated == 0 || raw_results.len() >= limit || candidates < fetch || fetch >= cap {
+            return raw_results;
+        }
+        fetch = fetch.saturating_mul(2).min(cap);
+    }
+}
+
+/// One retrieval and filtering pass at `limit` candidates. Returns the chunks
+/// that survive, how many candidates retrieval produced, and how many the
+/// content gates rejected.
+#[allow(clippy::too_many_arguments)]
+async fn chunk_candidates_pass(
+    engine: &Engine,
+    query: &str,
+    mode: crate::search::hybrid::SearchMode,
+    query_vec: &[f32],
+    limit: usize,
+    min_score: f32,
+    project: &str,
+    current_session: Option<&str>,
+    same_repo: &mut impl FnMut(HashMap<String, Vec<String>>) -> super::scope_folder::RepoConversations,
+) -> (Vec<RawResult>, usize, usize) {
     let storage = engine.storage();
 
     let now = chrono::Utc::now();
@@ -1684,6 +1733,7 @@ async fn search_chunks_with_vec_core(
     .await;
     let mut raw_results = Vec::new();
     let mut kept_keyword_only: Vec<usize> = Vec::new();
+    let mut gated = 0usize;
 
     // Batch the row fetch. `get_chunks_by_ids` already takes a slice, but was
     // being called once per hit via `from_ref`, making this N+1 over the HNSW
@@ -1774,6 +1824,7 @@ async fn search_chunks_with_vec_core(
                 // read the whole chunk, before the preview is cut. Selection
                 // only; the stored chunk is untouched.
                 if csr_text.contains_key(&chunk.id) {
+                    gated += 1;
                     continue;
                 }
 
@@ -1784,6 +1835,7 @@ async fn search_chunks_with_vec_core(
                     .copied()
                     .unwrap_or((crate::provenance::TrustTier::Unknown, None));
                 if is_tool_dump(tool_result_share, &chunk.content) {
+                    gated += 1;
                     continue;
                 }
 
@@ -1793,7 +1845,8 @@ async fn search_chunks_with_vec_core(
                     let age_days = (now - ts).num_days();
                     // Reject future-dated chunks (clock skew) and stale chunks
                     if !(0..=MAX_CHUNK_AGE_DAYS).contains(&age_days) {
-                            continue;
+                        gated += 1;
+                        continue;
                     }
                 }
 
@@ -1832,7 +1885,7 @@ async fn search_chunks_with_vec_core(
         });
     }
 
-    raw_results
+    (raw_results, results.len(), gated)
 }
 
 /// Search reflections using a pre-computed embedding vector (P-1 optimization).
@@ -2823,6 +2876,79 @@ mod tests {
         ] {
             assert!(!is_tool_dump(Some(1.0), kept), "{kept}");
         }
+    }
+
+    /// The first fifteen candidates are all dumps: the report ranked below
+    /// them, still over the floor, is what the prompt gets.
+    #[tokio::test]
+    async fn a_run_of_top_ranked_dumps_does_not_empty_the_slots() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(64);
+        let mut rows: Vec<(String, String, Option<f64>, [f32; 2])> = (0..15)
+            .map(|i| {
+                (
+                    format!("dump-{i:02}"),
+                    format!("{i}: let value_{i} = table[{i}];"),
+                    Some(1.0),
+                    [1.0, 0.0],
+                )
+            })
+            .collect();
+        rows.push((
+            "report".into(),
+            "Cleanup is done. The simulator folder dropped from 284 GB to 67 GB.".into(),
+            Some(0.0),
+            [0.8, 0.6],
+        ));
+        for (seq, (id, content, share, vec)) in rows.iter().enumerate() {
+            let chunk = crate::import::ConversationChunk {
+                id: id.clone(),
+                conversation_id: format!("conv-{id}"),
+                project_name: "project".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: content.clone(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, vec).unwrap();
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "UPDATE chunks SET min_trust=1, tool_result_share=?2 WHERE id=?1",
+                        rusqlite::params![id, share],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            search.insert_chunk(id.clone(), vec.to_vec());
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        let results = search_chunks_with_vec_core(
+            &engine,
+            "",
+            crate::search::hybrid::SearchMode::Vector,
+            &[1.0, 0.0],
+            15,
+            0.55,
+            "project",
+            None,
+            |_| HashMap::new(),
+        )
+        .await;
+        let ids: Vec<_> = results
+            .iter()
+            .filter_map(|r| r.memory_id.as_deref())
+            .collect();
+        assert_eq!(ids, ["report"]);
     }
 
     /// Four external-floor chunks match the query equally. The one that only
