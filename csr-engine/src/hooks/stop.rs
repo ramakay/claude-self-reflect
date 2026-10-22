@@ -136,8 +136,9 @@ pub struct Episode {
     /// only this. `false` for episodes written before this existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub late_errors: bool,
-    /// Whether the latest task's LAST significant call failed: the session
-    /// ended on a failure rather than recovering from one.
+    /// Whether the latest task ended on a failure rather than recovering from
+    /// one: its last significant call failed, or a test, build or lint it ran
+    /// failed and no run of the same command passed after.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub final_failed: bool,
     /// Whether the latest task committed, merged a PR or installed something
@@ -293,15 +294,95 @@ static ONELINE_COMMIT_RE: LazyLock<Regex> =
 static MERGED_PR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^MERGED[ \t]+(?:\S+Z[ \t]+)?([0-9a-f]{7,40})\b").unwrap());
 
+/// The pieces of a command joined only by `&&`, so that each runs only if the
+/// one before it succeeded. A `|` stays inside its piece (`quiet_commit_is_proven`
+/// refuses one on the commit itself). `None` for any other operator: `;`, a
+/// newline, `||`, a lone `&`, a subshell or command substitution.
+fn and_chain(command: &str) -> Option<Vec<String>> {
+    let mut pieces = vec![String::new()];
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        let piece = pieces.last_mut()?;
+        match quote {
+            Some(q) => {
+                piece.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    piece.push(c);
+                }
+                '&' if chars.peek() == Some(&'&') => {
+                    chars.next();
+                    pieces.push(String::new());
+                }
+                // `2>&1`: the `&` belongs to a redirection.
+                '&' if piece.ends_with('>') => piece.push(c),
+                ';' | '&' | '\n' | '(' | ')' | '`' => return None,
+                '|' if chars.peek() == Some(&'|') => return None,
+                '$' if chars.peek() == Some(&'(') => return None,
+                _ => piece.push(c),
+            },
+        }
+    }
+    quote.is_none().then_some(pieces)
+}
+
+/// Whether a quiet commit's `git log` line is proof of a new HEAD: the
+/// command is a chain of `&&` where a committing git command comes before a
+/// `git log` or `git show`, so the log runs only because the commit
+/// succeeded. A commit joined to its log by `;`, a newline or `||` runs the
+/// log whether the commit worked or not and shows an older HEAD when it did
+/// not; that proves nothing.
+fn quiet_commit_is_proven(command: &str) -> bool {
+    let Some(pieces) = and_chain(command) else {
+        return false;
+    };
+    let git_subcommand = |piece: &str| -> Option<String> {
+        let words = shell_simple_commands(piece).into_iter().next()?;
+        let mut rest = words
+            .iter()
+            .skip_while(|w| w.contains('=') && !w.starts_with('-'));
+        let program = rest.next()?;
+        if program != "git" && !program.ends_with("/git") {
+            return None;
+        }
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
+                    rest.next();
+                }
+                w if w.starts_with('-') => {}
+                w => return Some(w.to_string()),
+            }
+        }
+        None
+    };
+    let Some(commit) = pieces
+        .iter()
+        .position(|piece| is_git_committing_command(piece) && !piece.contains('|'))
+    else {
+        return false;
+    };
+    pieces[commit + 1..]
+        .iter()
+        .any(|piece| matches!(git_subcommand(piece).as_deref(), Some("log" | "show")))
+}
+
 /// The commits one successful committing Bash call made, as `(sha, subject)`.
 ///
 /// The `[<branch> <sha>] <subject>` line git prints is proof by itself. A quiet
 /// commit (`git commit -q`, the usual form here) prints no such line; its call
 /// then ends with `git log --oneline -1` or similar, which prints
-/// `<sha> <subject>`. That line counts only when its subject appears in the
-/// command, so a commit that failed behind a `;` (the log then shows an older
-/// HEAD) and a `git log -5` listing give no receipt. A message the shell
-/// quoted differently from how git prints it simply gives none.
+/// `<sha> <subject>`. That line counts only when the command proves the log ran
+/// because the commit succeeded (`quiet_commit_is_proven`) and the first
+/// line it printed is HEAD with a subject the command names; a listing of
+/// older commits gives no receipt. A message the shell quoted differently from
+/// how git prints it simply gives none.
 fn commits_made(command: &str, output: &str) -> Vec<(String, String)> {
     let printed: Vec<(String, String)> = GIT_COMMIT_LINE_RE
         .captures_iter(output)
@@ -310,11 +391,14 @@ fn commits_made(command: &str, output: &str) -> Vec<(String, String)> {
     if !printed.is_empty() {
         return printed;
     }
+    if !quiet_commit_is_proven(command) {
+        return Vec::new();
+    }
     ONELINE_COMMIT_RE
-        .captures_iter(output)
+        .captures(output)
         .filter(|c| command.contains(&c[2]))
-        .map(|c| (c[1].to_string(), c[2].to_string()))
-        .collect()
+        .map(|c| vec![(c[1].to_string(), c[2].to_string())])
+        .unwrap_or_default()
 }
 
 /// The PR number of the one `gh pr merge <N>` a Bash command runs, or `None`
@@ -593,6 +677,127 @@ fn command_installs(program: &str, args: &[String]) -> bool {
     operands.iter().take(3).any(|a| *a == "install")
 }
 
+/// Prefix of a failure key that belongs to a verification command.
+const VERIFY_KEY_PREFIX: &str = "verify:";
+
+/// Whether a command verifies the work: a test run, a build, a type check, a
+/// lint. Its failure is the work failing, and only a run of the same command
+/// passing resolves it.
+fn is_verification(program: &str, args: &[String]) -> bool {
+    let operands: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-') && !a.starts_with('+'))
+        .collect();
+    let first = operands.first().copied();
+    match program {
+        "cargo" => matches!(
+            first,
+            Some("test" | "nextest" | "build" | "check" | "clippy" | "bench")
+        ),
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            let target = if first == Some("run") {
+                operands.get(1).copied()
+            } else {
+                first
+            };
+            target.is_some_and(|t| {
+                ["test", "build", "lint", "typecheck", "check", "tsc"]
+                    .iter()
+                    .any(|v| t == *v || t.starts_with(&format!("{v}:")))
+            })
+        }
+        "go" => matches!(first, Some("test" | "build" | "vet")),
+        "swift" => matches!(first, Some("test" | "build")),
+        "python" | "python3" => args.windows(2).any(|w| {
+            w[0] == "-m" && matches!(w[1].as_str(), "pytest" | "mypy" | "unittest" | "ruff")
+        }),
+        "make" | "gmake" | "ninja" | "xcodebuild" | "gradle" | "gradlew" | "mvn" | "tsc"
+        | "pytest" | "py.test" | "jest" | "vitest" | "mypy" | "ruff" | "eslint" | "tox" | "nox"
+        | "rspec" | "ctest" | "bazel" => true,
+        _ => false,
+    }
+}
+
+/// Flags that change how a verification command prints or runs, not what it
+/// checks. `true`: the flag takes the next word as its value.
+fn verification_noise_flag(word: &str) -> Option<bool> {
+    match word {
+        "--release" | "-r" | "-q" | "--quiet" | "-v" | "-vv" | "--verbose" | "--locked"
+        | "--offline" | "--frozen" | "--nocapture" | "--no-fail-fast" | "--show-output" => {
+            Some(false)
+        }
+        "--color" | "-j" | "--jobs" | "--message-format" => Some(true),
+        w if w.starts_with("--color=")
+            || w.starts_with("--jobs=")
+            || w.starts_with("--message-format=") =>
+        {
+            Some(false)
+        }
+        w if w.len() > 2 && w.starts_with("-j") && w[2..].chars().all(|c| c.is_ascii_digit()) => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// The directory a Bash call runs in: the last `cd` in the command (relative
+/// to the call's own directory), else the call's directory.
+fn command_directory(command: &str, cwd: Option<&str>) -> String {
+    let target = shell_simple_commands(command)
+        .into_iter()
+        .filter(|words| words.first().map(String::as_str) == Some("cd"))
+        .filter_map(|words| words.get(1).cloned())
+        .next_back();
+    match (target, cwd) {
+        (Some(dir), _) if dir.starts_with('/') => dir,
+        (Some(dir), Some(base)) => format!("{}/{}", base.trim_end_matches('/'), dir),
+        (Some(dir), None) => dir,
+        (None, Some(base)) => base.to_string(),
+        (None, None) => String::new(),
+    }
+    .trim_end_matches('/')
+    .to_string()
+}
+
+/// The failure key of a verification command: what it checks (program, every
+/// argument that selects a target or a filter) and where it runs. A run of
+/// `cargo test --test healthy` does not resolve a failed `cargo test --test
+/// broken`, and neither does the same command in another directory.
+fn verification_key(command: &str, program: &str, args: &[String], cwd: Option<&str>) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut words = args.iter().map(String::as_str);
+    while let Some(word) = words.next() {
+        // Redirections (`2>&1`, `> log`) are not arguments.
+        if !word.is_empty()
+            && word
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .starts_with('>')
+        {
+            if word
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .trim_start_matches('>')
+                .is_empty()
+            {
+                words.next();
+            }
+            continue;
+        }
+        match verification_noise_flag(word) {
+            Some(true) => {
+                words.next();
+            }
+            Some(false) => {}
+            None => kept.push(word),
+        }
+    }
+    format!(
+        "{VERIFY_KEY_PREFIX}{program} {} @{}",
+        kept.join(" "),
+        command_directory(command, cwd)
+    )
+}
+
 /// What a main-thread tool call's result will mean (see [`CallSignature`]).
 ///
 /// An edit is filed under its file, so a later successful edit or write of the
@@ -600,7 +805,7 @@ fn command_installs(program: &str, args: &[String]) -> bool {
 /// significant command in its chain (`cd x && cargo test | tail` is
 /// `cargo test`); a chain of probes and plumbing has none. Every other tool
 /// (reads, searches, fetches, CSR's own) is a probe.
-fn call_signature(name: &str, input: &serde_json::Value) -> CallSignature {
+fn call_signature(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> CallSignature {
     match name {
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => CallSignature {
             failure_key: input
@@ -631,6 +836,9 @@ fn call_signature(name: &str, input: &serde_json::Value) -> CallSignature {
                 .rev()
                 .find(|(program, _)| !PROBE_PROGRAMS.contains(&program.as_str()))
                 .map(|(program, args)| {
+                    if is_verification(program, args) {
+                        return verification_key(command, program, args, cwd);
+                    }
                     let operation = SUBCOMMAND_PROGRAMS
                         .contains(&program.as_str())
                         .then(|| args.iter().find(|a| !a.starts_with('-')))
@@ -748,6 +956,10 @@ impl TaskOp {
 #[derive(Default)]
 struct TaskState {
     todos: Vec<TodoItem>,
+    /// The task segment each entry of `todos` was created under, by position.
+    /// Identity, not subject: two TaskCreate tasks both named "Run tests"
+    /// belong to the asks they were created for.
+    origins: Vec<Option<usize>>,
     /// Numeric task id -> index into `todos`. Ids come only from tool_result
     /// text ("Task #N created successfully"), never from ordinal position.
     task_id_map: HashMap<String, usize>,
@@ -759,25 +971,36 @@ struct TaskState {
 }
 
 impl TaskState {
-    /// Apply a successful change. `result` is the tool_result text when there
-    /// was one. Returns the completions it evidences, as (claim, receipt).
-    fn apply(&mut self, op: TaskOp, result: Option<&str>) -> Vec<(String, String)> {
+    /// Apply a successful change made under task segment `segment`. `result`
+    /// is the tool_result text when there was one. Returns the completions it
+    /// evidences, as (claim, receipt, the segment the task was created under).
+    fn apply(
+        &mut self,
+        op: TaskOp,
+        result: Option<&str>,
+        segment: Option<usize>,
+    ) -> Vec<(String, String, Option<usize>)> {
         match op {
             TaskOp::Write(items) => {
                 // Full-list rewrite: replaces TaskCreate-derived state and
-                // invalidates id bindings (indices no longer apply).
+                // invalidates id bindings (indices no longer apply). A todo has
+                // no id, so an item of the same words in two lists cannot be
+                // told from a new one: a completion belongs to the segment it
+                // was written under, never to an earlier ask.
                 let previous = std::mem::replace(&mut self.todos, items);
+                self.origins = vec![segment; self.todos.len()];
                 self.task_id_map.clear();
                 self.unbound_creates.clear();
                 self.todos
                     .iter()
-                    .filter(|t| {
+                    .zip(&self.origins)
+                    .filter(|(t, _)| {
                         t.status == "completed"
                             && !previous
                                 .iter()
                                 .any(|p| p.content == t.content && p.status == "completed")
                     })
-                    .map(|t| (t.content.clone(), "todo completed".to_string()))
+                    .map(|(t, origin)| (t.content.clone(), "todo completed".to_string(), *origin))
                     .collect()
             }
             TaskOp::Create(subject) => {
@@ -790,6 +1013,7 @@ impl TaskState {
                     content: subject,
                     status: "pending".to_string(),
                 });
+                self.origins.push(segment);
                 match result.and_then(|text| TASK_CREATED_RE.captures(text)) {
                     Some(caps) => {
                         self.task_id_map.insert(caps[1].to_string(), index);
@@ -805,16 +1029,20 @@ impl TaskState {
                 subject,
             } => {
                 let mut done = Vec::new();
-                let Some(item) = self
-                    .task_id_map
-                    .get(&task_id)
-                    .and_then(|&index| self.todos.get_mut(index))
-                else {
+                let Some(index) = self.task_id_map.get(&task_id).copied() else {
+                    return done;
+                };
+                let origin = self.origins.get(index).copied().unwrap_or(segment);
+                let Some(item) = self.todos.get_mut(index) else {
                     return done;
                 };
                 if let Some(status) = status {
                     if status == "completed" && item.status != "completed" {
-                        done.push((item.content.clone(), format!("task #{task_id} completed")));
+                        done.push((
+                            item.content.clone(),
+                            format!("task #{task_id} completed"),
+                            origin,
+                        ));
                     }
                     item.status = status;
                 }
@@ -1253,9 +1481,6 @@ where
     // changes it only once a matching tool_result succeeds; sidechain rows
     // never touch it.
     let mut tasks = TaskState::default();
-    // The task segment each task or todo was first seen under. A task belongs
-    // to the ask it was created for, even when a later ask marks it finished.
-    let mut task_births: HashMap<String, Option<usize>> = HashMap::new();
     // Recap evidence: the latest typed task, and what was provably completed
     // after it (reset whenever a newer task is asked).
     let mut segments: Vec<TaskSegment> = Vec::new();
@@ -1460,7 +1685,14 @@ where
                                     block.get("id").and_then(|v| v.as_str()),
                                     block.get("input"),
                                 ) {
-                                    calls.insert(id.to_string(), call_signature(name, input));
+                                    calls.insert(
+                                        id.to_string(),
+                                        call_signature(
+                                            name,
+                                            input,
+                                            val.get("cwd").and_then(|v| v.as_str()),
+                                        ),
+                                    );
                                 }
                                 tools_used.insert(name.to_string());
                                 if let (false, Some(task)) = (sidechain, segments.last_mut()) {
@@ -1493,12 +1725,9 @@ where
                                             // it (synthetic or legacy rows): apply.
                                             None => {
                                                 let current = segments.len().checked_sub(1);
-                                                note_births(&op, &mut task_births, current);
-                                                for (claim, receipt) in tasks.apply(op, None) {
-                                                    let origin = task_births
-                                                        .get(&claim)
-                                                        .copied()
-                                                        .unwrap_or(current);
+                                                for (claim, receipt, origin) in
+                                                    tasks.apply(op, None, current)
+                                                {
                                                     push_completion(
                                                         &mut completions,
                                                         origin,
@@ -1661,10 +1890,9 @@ where
                         if let Some(op) = tool_use_id.and_then(|id| tasks.pending.remove(id)) {
                             if !failed {
                                 let current = segments.len().checked_sub(1);
-                                note_births(&op, &mut task_births, current);
-                                for (claim, receipt) in tasks.apply(op, Some(&block_text)) {
-                                    let origin =
-                                        task_births.get(&claim).copied().unwrap_or(current);
+                                for (claim, receipt, origin) in
+                                    tasks.apply(op, Some(&block_text), current)
+                                {
                                     push_completion(&mut completions, origin, &claim, &receipt);
                                 }
                             }
@@ -1727,6 +1955,12 @@ where
     // Determine outcome (task-aware: incomplete todos cap success at partial)
     let closing_success = crate::extraction::has_success_signal(&closing_text);
     let late_errors = !open_failures.is_empty();
+    // A test, build or lint that failed and was never run again to pass still
+    // fails the work, whatever unrelated call came after it.
+    let final_failed = final_failed
+        || open_failures
+            .iter()
+            .any(|key| key.starts_with(VERIFY_KEY_PREFIX));
     let closing_ended = clean_end && !request_pending && !turn_in_flight;
     let outcome = compute_outcome(
         message_count,
@@ -1791,21 +2025,6 @@ where
         closing_success,
         latest_ask,
         watermark: watermark.map(|at| at.to_rfc3339()),
-    }
-}
-
-/// Remember the segment a task or todo first appeared under.
-fn note_births(op: &TaskOp, births: &mut HashMap<String, Option<usize>>, segment: Option<usize>) {
-    match op {
-        TaskOp::Create(subject) => {
-            births.entry(subject.clone()).or_insert(segment);
-        }
-        TaskOp::Write(items) => {
-            for item in items {
-                births.entry(item.content.clone()).or_insert(segment);
-            }
-        }
-        TaskOp::Update { .. } => {}
     }
 }
 
@@ -4964,13 +5183,11 @@ mod tests {
             bash_receipts(command, "1a2b3c4 fix(recap): subject", false),
             vec![receipt("fix(recap): subject", "1a2b3c4")]
         );
-        // A heredoc message carries the subject on its first line.
+        // A heredoc commit followed by a separate line proves nothing: the
+        // log runs whether or not the commit did.
         let heredoc =
             "git commit -q -F - <<'EOF'\nfix(recap): subject\n\nbody\nEOF\ngit log --oneline -1";
-        assert_eq!(
-            bash_receipts(heredoc, "1a2b3c4 fix(recap): subject", false),
-            vec![receipt("fix(recap): subject", "1a2b3c4")]
-        );
+        assert!(bash_receipts(heredoc, "1a2b3c4 fix(recap): subject", false).is_empty());
         // Hook chatter before the line changes nothing.
         assert_eq!(
             bash_receipts(
@@ -5002,6 +5219,33 @@ mod tests {
         assert!(bash_receipts(command, "aaa1111 feat: new thing", true).is_empty());
         // A log line without a committing command in the call is history.
         assert!(bash_receipts("git log --oneline -1", "aaa1111 feat: new thing", false).is_empty());
+    }
+
+    #[test]
+    fn a_quiet_commit_that_failed_is_no_receipt_when_an_older_head_has_the_same_subject() {
+        // Nothing was staged, so the commit failed; the log that follows shows
+        // the older HEAD, whose subject is the same. Only a log that runs
+        // because the commit succeeded (`&&`) is proof of a new HEAD.
+        for command in [
+            "git commit -q -m 'fix: x'; git log --oneline -1",
+            "git commit -q -m 'fix: x'\ngit log --oneline -1",
+            "git commit -q -m 'fix: x' || true; git log --oneline -1",
+            "git log --oneline -1 && git commit -q -m 'fix: x'",
+            "git commit -q -m 'fix: x' | cat && git log --oneline -1",
+        ] {
+            assert!(
+                bash_receipts(command, "9d8c7b6 fix: x", false).is_empty(),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            bash_receipts(
+                "git commit -q -m 'fix: x' && git log --oneline -1 | cat",
+                "9d8c7b6 fix: x",
+                false
+            ),
+            vec![receipt("fix: x", "9d8c7b6")]
+        );
     }
 
     #[test]
@@ -5188,6 +5432,82 @@ mod tests {
     }
 
     #[test]
+    fn two_tasks_with_one_subject_each_belong_to_their_own_ask() {
+        let create = |id: &str, n: u32| {
+            vec![
+                assistant_named_tool(
+                    "TaskCreate",
+                    id,
+                    serde_json::json!({"subject": "Run tests", "description": "d"}),
+                ),
+                tool_result_bound(id, &format!("Task #{n} created successfully: Run tests")),
+            ]
+        };
+        let complete = |id: &str, n: u32| {
+            vec![
+                assistant_named_tool(
+                    "TaskUpdate",
+                    id,
+                    serde_json::json!({"taskId": n.to_string(), "status": "completed"}),
+                ),
+                tool_result_bound(id, "Updated task"),
+            ]
+        };
+        let mut rows = vec![typed_line(
+            "plan the daemon rewrite for the stale lock",
+            "typed",
+        )];
+        rows.extend(create("a1", 1));
+        rows.push(assistant_stop_line("Planned.", "end_turn"));
+        rows.push(typed_line(
+            "now run the full release checks and report",
+            "typed",
+        ));
+        rows.extend(create("b1", 2));
+        rows.extend(complete("b2", 2));
+        rows.push(assistant_stop_line("Done.", "end_turn"));
+        let ep = extract(&rows);
+        assert_eq!(
+            ep.completions,
+            vec![receipt("Run tests", "task #2 completed")]
+        );
+        // Task 2 was created and finished under the second ask; the first
+        // ask's recap must not claim it.
+        assert_eq!(ep.anchor_receipts, Some(vec![]));
+        assert_eq!(
+            ep.compact_anchor.as_ref().and_then(|a| a.receipts.clone()),
+            Some(vec![0])
+        );
+        // The same holds for a rewritten todo list.
+        let write = |id: &str, status: &str| {
+            vec![
+                assistant_named_tool(
+                    "TodoWrite",
+                    id,
+                    serde_json::json!({"todos": [{"content": "Run tests", "status": status}]}),
+                ),
+                tool_result_bound(id, "ok"),
+            ]
+        };
+        let mut rows = vec![typed_line(
+            "plan the daemon rewrite for the stale lock",
+            "typed",
+        )];
+        rows.extend(write("w1", "pending"));
+        rows.push(assistant_stop_line("Planned.", "end_turn"));
+        rows.push(typed_line(
+            "now run the full release checks and report",
+            "typed",
+        ));
+        rows.extend(write("w2", "pending"));
+        rows.extend(write("w3", "completed"));
+        rows.push(assistant_stop_line("Done.", "end_turn"));
+        let ep = extract(&rows);
+        assert_eq!(ep.completions, vec![receipt("Run tests", "todo completed")]);
+        assert_eq!(ep.anchor_receipts, Some(vec![]));
+    }
+
+    #[test]
     fn a_session_with_no_receipt_composes_no_completed_clause() {
         // A question answered from reads: nothing was committed, edited or
         // finished, so the recap says what was asked and nothing more.
@@ -5227,7 +5547,7 @@ mod tests {
                 ),
                 bash_step(
                     "b",
-                    "cargo test --lib hooks::stop",
+                    "cd csr-engine && cargo test --lib",
                     "test result: ok",
                     false,
                 ),
@@ -5252,9 +5572,10 @@ mod tests {
             ],
             "Built.",
         );
-        // A failure the session moved past is recorded, not held against the end.
-        assert!(ep.late_errors && !ep.final_failed);
-        assert_eq!(ep.outcome, "success");
+        // A failed test run is not cleared by a build that passed: the tests
+        // still fail.
+        assert!(ep.late_errors && ep.final_failed);
+        assert_eq!(ep.outcome, "failed");
     }
 
     #[test]
@@ -5304,6 +5625,97 @@ mod tests {
     }
 
     #[test]
+    fn an_unresolved_test_failure_survives_a_later_unrelated_success() {
+        let commit = || bash_step("c", "git commit -q -m wip", "[main 1a2b3c4] wip", false);
+        let red = |id: &str, command: &str| bash_step(id, command, "Exit code 101", true);
+        let green = |id: &str, command: &str| bash_step(id, command, "ok", false);
+        // Commit WIP, fail the tests, format successfully, stop.
+        let ep = closing_run(
+            vec![commit(), red("t", "cargo test"), green("f", "cargo fmt")],
+            "Committed; the tests still fail.",
+        );
+        assert!(ep.final_failed && ep.closing_receipt);
+        assert_eq!(ep.outcome, "partial");
+        // Without a commit the same ending is a failure.
+        let ep = closing_run(
+            vec![red("t", "cargo test"), green("f", "cargo fmt")],
+            "The tests still fail.",
+        );
+        assert_eq!(ep.outcome, "failed");
+        // The same tests run again and passing resolve it.
+        let ep = closing_run(
+            vec![
+                commit(),
+                red("t", "cargo test"),
+                green("f", "cargo fmt"),
+                green("g", "cargo test"),
+            ],
+            "Fixed and green.",
+        );
+        assert!(!ep.final_failed);
+        assert_eq!(ep.outcome, "success");
+        // A failed build or lint stays open the same way.
+        for command in [
+            "cargo clippy -- -D warnings",
+            "cargo build --release",
+            "npm test",
+        ] {
+            let ep = closing_run(
+                vec![commit(), red("t", command), green("f", "cargo fmt")],
+                "Done.",
+            );
+            assert_eq!(ep.outcome, "partial", "{command}");
+        }
+    }
+
+    #[test]
+    fn a_test_pass_clears_only_the_failure_of_the_same_target_and_directory() {
+        let commit = || bash_step("c", "git commit -q -m wip", "[main 1a2b3c4] wip", false);
+        let red = |id: &str, command: &str| bash_step(id, command, "Exit code 101", true);
+        let green = |id: &str, command: &str| bash_step(id, command, "ok", false);
+        // A different test target is a different test.
+        let ep = closing_run(
+            vec![
+                commit(),
+                red("a", "cargo test --test broken"),
+                green("b", "cargo test --test healthy"),
+            ],
+            "Done.",
+        );
+        assert!(ep.final_failed);
+        assert_eq!(ep.outcome, "partial");
+        // So is a different filter, or the same command in another directory.
+        for (failing, passing) in [
+            ("cargo test parser", "cargo test lexer"),
+            ("cd /repo/a && cargo test", "cd /repo/b && cargo test"),
+            ("cargo test -p engine", "cargo test -p companion"),
+        ] {
+            let ep = closing_run(
+                vec![commit(), red("a", failing), green("b", passing)],
+                "Done.",
+            );
+            assert_eq!(ep.outcome, "partial", "{failing} then {passing}");
+        }
+        // The same target run again and passing clears it, whatever the noise
+        // flags, redirections and pipes around it.
+        for (failing, passing) in [
+            ("cargo test --test broken", "cargo test --test broken"),
+            (
+                "cargo test --release --test broken 2>&1 | tail -5",
+                "cargo test --test broken -q > /tmp/out.log",
+            ),
+            ("cd /repo/a && cargo test", "cd /repo/a && cargo test"),
+        ] {
+            let ep = closing_run(
+                vec![commit(), red("a", failing), green("b", passing)],
+                "Fixed.",
+            );
+            assert!(!ep.final_failed, "{failing} then {passing}");
+            assert_eq!(ep.outcome, "success", "{failing} then {passing}");
+        }
+    }
+
+    #[test]
     fn a_commit_a_merge_or_an_install_lifts_a_failed_ending_to_partial() {
         let failing = || bash_step("a", "cargo test --lib", "Exit code 101", true);
         let ep = closing_run(vec![failing()], "Red.");
@@ -5316,8 +5728,8 @@ mod tests {
             ],
             "Committed the work in progress.",
         );
-        assert!(ep.closing_receipt && !ep.final_failed);
-        assert_eq!(ep.outcome, "success");
+        assert!(ep.closing_receipt && ep.final_failed);
+        assert_eq!(ep.outcome, "partial");
         // Or installed the build, and the failure it ended on is a later install.
         let ep = closing_run(
             vec![
@@ -5385,15 +5797,15 @@ mod tests {
     #[test]
     fn call_signatures_name_the_command_that_matters() {
         let key = |command: &str| {
-            call_signature("Bash", &serde_json::json!({"command": command})).failure_key
+            call_signature("Bash", &serde_json::json!({"command": command}), None).failure_key
         };
         assert_eq!(
             key("cd csr-engine && cargo test --lib 2>&1 | tail -5").as_deref(),
-            Some("cargo test")
+            Some("verify:cargo test --lib @csr-engine")
         );
         assert_eq!(
             key("export A=1; time cargo build --release").as_deref(),
-            Some("cargo build")
+            Some("verify:cargo build @")
         );
         assert_eq!(key("git push origin main").as_deref(), Some("git push"));
         assert_eq!(
@@ -5405,7 +5817,7 @@ mod tests {
         assert_eq!(key("git log --oneline -1 && git status"), None);
         assert_eq!(key("cd /tmp && ls"), None);
         let installs = |command: &str| {
-            call_signature("Bash", &serde_json::json!({"command": command})).installs
+            call_signature("Bash", &serde_json::json!({"command": command}), None).installs
         };
         for yes in [
             "./install-on-phone.sh",
@@ -5427,7 +5839,7 @@ mod tests {
             assert!(!installs(no), "{no}");
         }
         assert_eq!(
-            call_signature("Read", &serde_json::json!({"file_path": "/r/a.rs"})).failure_key,
+            call_signature("Read", &serde_json::json!({"file_path": "/r/a.rs"}), None).failure_key,
             None
         );
     }
