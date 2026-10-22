@@ -1083,9 +1083,11 @@ async fn store_story(
 
     // The new story replaces the old: one story per session, the latest
     if let Some(prior) = prior {
-        let mut idx = engine.search().write().await;
         for old in &prior.ids {
             let _ = engine.storage().delete_reflection(old);
+        }
+        let mut idx = engine.search().write().await;
+        for old in &prior.ids {
             idx.remove_reflection(old);
         }
     }
