@@ -714,50 +714,6 @@ fn whole_paragraphs(text: &str, max: usize) -> Option<String> {
     (!head.is_empty()).then(|| head.to_string())
 }
 
-/// Opening words of a thank-you or praise.
-const PRAISE_OPENERS: &[&str] = &[
-    "thanks",
-    "thank",
-    "thx",
-    "ty",
-    "great",
-    "nice",
-    "perfect",
-    "awesome",
-    "cool",
-    "good",
-    "excellent",
-    "amazing",
-    "wow",
-    "lgtm",
-    "love",
-    "appreciate",
-    "brilliant",
-    "wonderful",
-    "sweet",
-    "beautiful",
-    "fantastic",
-    "super",
-    "well",
-];
-
-/// A typed message that only reacts to the work ("Thanks for fixing the
-/// build"): it opens with praise and nothing after the praise word asks,
-/// instructs or questions. Anything that does ("Great now fix the tests",
-/// "Thanks! Can you also bump the version?") is a new task.
-fn is_closing_remark(prose: &str) -> bool {
-    let words: Vec<&str> = prose.split_whitespace().collect();
-    let Some(first) = words.first().map(|word| {
-        word.trim_matches(|c: char| !c.is_alphanumeric())
-            .to_lowercase()
-    }) else {
-        return false;
-    };
-    PRAISE_OPENERS.contains(&first.as_str())
-        && !prose.contains('?')
-        && !(1..words.len()).any(|at| crate::hooks::recap::is_request(&words[at..].join(" ")))
-}
-
 /// Longest stored `latest_ask`, in bytes. The recap renders at most
 /// `INTENT_MAX_CHARS` of it, so the cut never reaches a rendered sentence.
 const LATEST_ASK_MAX_BYTES: usize = 400;
@@ -1019,10 +975,13 @@ where
                             }
                         }
                         _ => {
-                            // A closing remark ("thanks for fixing the build")
-                            // is not a new task: it neither undoes the success
-                            // said before it nor forgives a failure.
-                            if !is_closing_remark(&prose) {
+                            // Only a message the recap's own request check reads
+                            // as an ask starts the outcome over. Anything else
+                            // ("thanks for fixing the build") neither undoes
+                            // the success said before it nor forgives a
+                            // failure; a task it misses inherits the last
+                            // one's state, the cost of one fail-closed rule.
+                            if crate::hooks::recap::is_request(&prose) {
                                 late_errors = false;
                                 closing_text.clear();
                             }
@@ -2903,13 +2862,11 @@ mod tests {
     }
 
     #[test]
-    fn a_closing_remark_does_not_reset_the_outcome_but_a_new_task_does() {
+    fn only_a_message_the_request_check_accepts_resets_the_outcome() {
+        use crate::hooks::recap::is_request;
         let closing = |remark: &str| {
             extract(&[
-                dur_typed(
-                    "Fix the login validation before the release",
-                    "2026-10-21T10:00:00Z",
-                ),
+                dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
                 dur_timed(
                     serde_json::json!({"type": "assistant", "message": {
                         "content": [{"type": "text", "text": "Fixed. All tests pass."}],
@@ -2920,19 +2877,21 @@ mod tests {
                 dur_typed(remark, "2026-10-21T10:10:00Z"),
             ])
         };
-        let ep = closing("Thanks for fixing the build");
-        assert!(ep.closing_success);
-        assert_eq!(ep.outcome, "success");
-        // A new task, even one that opens with praise, starts over.
-        for task in [
-            "Great. Now update the changelog for that fix",
-            "Great now fix the tests",
-            "Great\nNow fix the tests",
-            "Thanks! Can you also bump the version?",
-        ] {
-            let ep = closing(task);
-            assert!(!ep.closing_success, "{task}");
+        // Remarks: the request check says no, so the success stands.
+        for remark in ["Thanks for fixing the build", "Great work helping us fix the build"] {
+            assert!(!is_request(remark), "{remark}");
+            let ep = closing(remark);
+            assert!(ep.closing_success, "{remark}");
+            assert_eq!(ep.outcome, "success", "{remark}");
         }
+        // An ask the check accepts starts over.
+        let ask = "Can you bump the version?";
+        assert!(is_request(ask));
+        assert!(!closing(ask).closing_success);
+        // "Great now fix the tests": whatever the check says decides it, with
+        // no second rule to override it.
+        let mixed = "Great now fix the tests";
+        assert_eq!(!is_request(mixed), closing(mixed).closing_success);
         // A remark after a failure does not forgive it.
         let ep = extract(&[
             dur_typed("Run the release script and report", "2026-10-21T10:00:00Z"),
