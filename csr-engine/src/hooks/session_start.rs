@@ -1189,12 +1189,7 @@ pub(crate) fn format_session_start_tier0_for_session(
                     serde_json::from_str::<super::precompact::CompactSnapshot>(&json).ok()
                 })
             {
-                let mut current = ep.clone();
-                current.compact_anchor = snapshot.anchor;
-                current.completions = snapshot.completions;
-                current.completions_untied = snapshot.completions_untied;
-                current.recap_evidence_version = Some(super::stop::RECAP_EVIDENCE_VERSION);
-                refreshed = Some(current);
+                refreshed = Some(overlay_compact_snapshot(ep, snapshot));
             }
         }
         let recap_ep = recap_episode(refreshed.as_ref().unwrap_or(ep), source, target_session_id);
@@ -1227,6 +1222,22 @@ pub(crate) fn format_session_start_tier0_for_session(
         .episode_floor_for_session(&ep.session_id)
         .unwrap_or(crate::provenance::TrustTier::Unknown);
     format_tier0_block_with_recap(ep, anchor_verdicts, age, recap.as_deref(), trust)
+}
+
+/// The stored episode with the PreCompact snapshot laid over it. The compact
+/// anchor stands alone (its request and its own untied flag). The receipts and
+/// their `completions_untied` flag are relative to an anchor, so they replace
+/// the stored ones only when the snapshot was taken against the same anchor;
+/// otherwise they would sit under a task they were not made for.
+fn overlay_compact_snapshot(ep: &Episode, snapshot: super::precompact::CompactSnapshot) -> Episode {
+    let mut current = ep.clone();
+    current.compact_anchor = snapshot.anchor;
+    if snapshot.anchor_request.is_some() && snapshot.anchor_request == ep.anchor_request {
+        current.completions = snapshot.completions;
+        current.completions_untied = snapshot.completions_untied;
+    }
+    current.recap_evidence_version = Some(super::stop::RECAP_EVIDENCE_VERSION);
+    current
 }
 
 /// Only the recap changes after compaction; fragment fallback and the episode
@@ -3521,6 +3532,47 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
             taken.anchor_request.as_deref(),
             Some("Now wire the staging endpoint.")
         );
+    }
+
+    /// The snapshot's receipts belong to the anchor it was taken against. Laid
+    /// over an episode with a different anchor they would sit under a task they
+    /// were not made for.
+    #[test]
+    fn a_compact_snapshot_replaces_receipts_only_for_the_same_anchor() {
+        use crate::hooks::stop::{CompactAnchor, CompletionReceipt};
+        let mut ep = minimal_episode("Fix the auth middleware regression", "Fixed it", None);
+        ep.anchor_request = Some("Fix the auth middleware regression.".into());
+        ep.completions = vec![CompletionReceipt {
+            claim: "stored".into(),
+            receipt: "1111111".into(),
+        }];
+        let snapshot = |anchor_request: Option<&str>| super::super::precompact::CompactSnapshot {
+            anchor_request: anchor_request.map(str::to_string),
+            anchor: Some(CompactAnchor {
+                request: "Now wire the staging endpoint.".into(),
+                completions_untied: true,
+            }),
+            completions: vec![CompletionReceipt {
+                claim: "fresh".into(),
+                receipt: "2222222".into(),
+            }],
+            completions_untied: true,
+        };
+        // Same anchor: the fresher receipts are used.
+        let same = overlay_compact_snapshot(&ep, snapshot(Some("Fix the auth middleware regression.")));
+        assert_eq!(same.completions[0].receipt, "2222222");
+        assert!(same.completions_untied);
+        // A different anchor, or a snapshot that predates the field: the stored
+        // receipts stay, the compact anchor still arrives.
+        for other in [Some("Something else entirely."), None] {
+            let kept = overlay_compact_snapshot(&ep, snapshot(other));
+            assert_eq!(kept.completions[0].receipt, "1111111", "{other:?}");
+            assert!(!kept.completions_untied, "{other:?}");
+            assert_eq!(
+                kept.compact_anchor.as_ref().map(|a| a.request.as_str()),
+                Some("Now wire the staging endpoint.")
+            );
+        }
     }
 
     /// Only text that can render decides: a completed todo never renders, so

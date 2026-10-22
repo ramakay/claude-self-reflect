@@ -24,6 +24,11 @@ use crate::engine::Engine;
 /// source of the first-task anchor for startup, resume and other sessions.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct CompactSnapshot {
+    /// The anchor the snapshot's `completions` and `completions_untied` are
+    /// relative to (the episode's `anchor_request` at PreCompact). A snapshot
+    /// written before this field existed carries `None` and never matches.
+    #[serde(default)]
+    pub anchor_request: Option<String>,
     pub anchor: Option<super::stop::CompactAnchor>,
     pub completions: Vec<super::stop::CompletionReceipt>,
     pub completions_untied: bool,
@@ -76,6 +81,7 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
             let episode =
                 super::stop::extract_episode_from_messages(&sanitized, &rows, session_id, "");
             let snapshot = CompactSnapshot {
+                anchor_request: episode.anchor_request,
                 anchor: episode.compact_anchor,
                 completions: episode.completions,
                 completions_untied: episode.completions_untied,
