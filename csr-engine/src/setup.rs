@@ -2322,8 +2322,12 @@ fn daemon_step(
 /// [`daemon_step`] against the real machine, returning the text to print.
 fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
     let home = dirs::home_dir().unwrap_or_default();
-    let exe = std::env::current_exe().unwrap_or_default();
-    let engine = exe.canonicalize().unwrap_or(exe);
+    let engine = stable_engine_path(
+        std::env::args_os().next().as_deref(),
+        &std::env::current_dir().unwrap_or_default(),
+        std::env::var_os("PATH").as_deref(),
+        &std::env::current_exe().unwrap_or_default(),
+    );
     let spec = DaemonAgentSpec {
         engine: engine.clone(),
         home: home.clone(),
@@ -2357,6 +2361,39 @@ fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
         });
     }
     text
+}
+
+/// The path to store for this binary. Not the canonical one: a symlink such as
+/// `~/.local/bin/csr-engine` that an upgrade repoints keeps working, while the
+/// versioned file it pointed at may be deleted. The name setup was invoked by
+/// (found on PATH, or given as a path) is used when it is the very file that is
+/// running; a shim that only leads somewhere else (an npm bin entry) is not.
+fn stable_engine_path(
+    argv0: Option<&std::ffi::OsStr>,
+    cwd: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+    current_exe: &Path,
+) -> std::path::PathBuf {
+    let same_file = |candidate: &Path| match (candidate.canonicalize(), current_exe.canonicalize())
+    {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    let candidate = argv0.and_then(|name| {
+        let name = Path::new(name);
+        if name.components().count() > 1 {
+            Some(std::path::absolute(cwd.join(name)).unwrap_or_else(|_| cwd.join(name)))
+        } else {
+            let path_var = path_var?;
+            std::env::split_paths(path_var)
+                .map(|dir| dir.join(name))
+                .find(|p| p.is_file())
+        }
+    });
+    match candidate {
+        Some(path) if same_file(&path) => path,
+        _ => current_exe.to_path_buf(),
+    }
 }
 
 fn absolute(path: &Path) -> std::path::PathBuf {
@@ -4319,5 +4356,52 @@ esac
             "the file must keep describing the job that is loaded"
         );
         assert!(!fake.calls.iter().any(|c| c.starts_with("bootstrap")));
+    }
+
+    #[test]
+    fn the_stored_binary_path_is_the_stable_name_not_the_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let versioned = dir.path().join("versions/1/csr-engine");
+        std::fs::create_dir_all(versioned.parent().unwrap()).unwrap();
+        std::fs::write(&versioned, "#!/bin/sh\n").unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(&versioned, bin.join("csr-engine")).unwrap();
+        let running = versioned.canonicalize().unwrap();
+        let cwd = dir.path();
+
+        // invoked by name from PATH
+        let by_name = stable_engine_path(
+            Some("csr-engine".as_ref()),
+            cwd,
+            Some(bin.as_os_str()),
+            &running,
+        );
+        assert_eq!(by_name, bin.join("csr-engine"));
+        // invoked by an absolute path
+        let by_path = stable_engine_path(
+            Some(bin.join("csr-engine").as_os_str()),
+            cwd,
+            None,
+            &running,
+        );
+        assert_eq!(by_path, bin.join("csr-engine"));
+        // invoked by a relative path
+        let relative = stable_engine_path(Some("bin/csr-engine".as_ref()), cwd, None, &running);
+        assert_eq!(relative, bin.join("csr-engine"));
+
+        // A different file on PATH (a shim) is not this binary: the running one wins.
+        let shim_dir = dir.path().join("shim");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::write(shim_dir.join("csr-engine"), "#!/usr/bin/env node\n").unwrap();
+        let shim = stable_engine_path(
+            Some("csr-engine".as_ref()),
+            cwd,
+            Some(shim_dir.as_os_str()),
+            &running,
+        );
+        assert_eq!(shim, running);
+        // nothing to go on
+        assert_eq!(stable_engine_path(None, cwd, None, &running), running);
     }
 }
