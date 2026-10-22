@@ -2370,8 +2370,124 @@ pub fn run(conn: &Connection) -> Result<()> {
     // created here with the rest, so they add no migration of their own.
     conn.execute_batch(CREATE_CODEMAP)?;
 
+    create_graph_gen_triggers(conn)?;
+
     finish_chunks_fts_compaction(conn)?;
 
+    Ok(())
+}
+
+/// Project that a table's gen bump is for, in the trigger SQL below.
+const GEN_BUMP_PROJECT: &str = "INSERT INTO code_graph_project_gen (project, gen) VALUES ({p}, 1)
+     ON CONFLICT(project) DO UPDATE SET gen = gen + 1;";
+
+/// Every project at once: the `'*'` row is added to each project's own counter
+/// by `codegraph::project_gen`.
+const GEN_BUMP_ALL: &str = "INSERT INTO code_graph_project_gen (project, gen) VALUES ('*', 1)
+     ON CONFLICT(project) DO UPDATE SET gen = gen + 1;";
+
+/// `code_graph_project_gen` triggers. The drain plans a project's resolve
+/// without the write lock and applies it only if the project's counter has not
+/// moved, so the counter has to move for EVERY write to a table the resolve
+/// reads, from whatever code path writes it (hook, drain, backfill, co-edit
+/// replay, repo scan, a migration, an operator's SQL). A helper that bumps after
+/// its statement leaves a window between the two and is skipped by any writer
+/// that does not call it; a trigger bumps inside the statement's own
+/// transaction and cannot be bypassed.
+///
+/// `code_edges` rows carry no project, so it comes from the source node; when
+/// that node is gone the bump goes to every project. `code_evolution` is read by
+/// the co-edit tier without a project filter (a row labelled for another
+/// project, or for none, can change the winner), so it always bumps every
+/// project. The resolver's own edge updates fire the edge trigger too: the plan
+/// they belong to has been applied, and the rank plan reads its counter after
+/// the apply commits.
+///
+/// `IF NOT EXISTS` makes this a no-op on an up-to-date database, which takes no
+/// write lock.
+fn create_graph_gen_triggers(conn: &Connection) -> Result<()> {
+    let mut sql = String::new();
+    let mut trigger = |name: &str, event: &str, table: &str, body: String| {
+        sql.push_str(&format!(
+            "CREATE TRIGGER IF NOT EXISTS {name} AFTER {event} ON {table} BEGIN {body} END;\n"
+        ));
+    };
+    // Tables that carry their own project column.
+    for (table, col) in [
+        ("code_nodes", "project"),
+        ("repo_defs", "project"),
+        ("local_bindings", "project"),
+        ("edge_scope_chains", "project"),
+    ] {
+        trigger(
+            &format!("{table}_gen_ai"),
+            "INSERT",
+            table,
+            GEN_BUMP_PROJECT.replace("{p}", &format!("NEW.{col}")),
+        );
+        trigger(
+            &format!("{table}_gen_au"),
+            "UPDATE",
+            table,
+            format!(
+                "{} {}",
+                GEN_BUMP_PROJECT.replace("{p}", &format!("OLD.{col}")),
+                GEN_BUMP_PROJECT.replace("{p}", &format!("NEW.{col}")),
+            ),
+        );
+        trigger(
+            &format!("{table}_gen_ad"),
+            "DELETE",
+            table,
+            GEN_BUMP_PROJECT.replace("{p}", &format!("OLD.{col}")),
+        );
+    }
+    // Edges: the source node's project, else everyone.
+    let edge_bump = |row: &str| {
+        format!(
+            "INSERT INTO code_graph_project_gen (project, gen)
+               SELECT n.project, 1 FROM code_nodes n WHERE n.id = {row}.src_id
+               ON CONFLICT(project) DO UPDATE SET gen = gen + 1;
+             {}",
+            // No source node: bump all. The WHEN-less form keeps the trigger
+            // one statement list; the extra bump when the node exists is the
+            // cost of one row.
+            GEN_BUMP_ALL.replace(
+                "VALUES ('*', 1)",
+                &format!(
+                    "SELECT '*', 1 WHERE NOT EXISTS (SELECT 1 FROM code_nodes n WHERE n.id = {row}.src_id)"
+                )
+            )
+        )
+    };
+    trigger(
+        "code_edges_gen_ai",
+        "INSERT",
+        "code_edges",
+        edge_bump("NEW"),
+    );
+    trigger(
+        "code_edges_gen_au",
+        "UPDATE",
+        "code_edges",
+        edge_bump("NEW"),
+    );
+    trigger(
+        "code_edges_gen_ad",
+        "DELETE",
+        "code_edges",
+        edge_bump("OLD"),
+    );
+    // Co-edit evidence: every project.
+    for (suffix, event) in [("ai", "INSERT"), ("au", "UPDATE"), ("ad", "DELETE")] {
+        trigger(
+            &format!("code_evolution_gen_{suffix}"),
+            event,
+            "code_evolution",
+            GEN_BUMP_ALL.to_string(),
+        );
+    }
+    conn.execute_batch(&sql)?;
     Ok(())
 }
 

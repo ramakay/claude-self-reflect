@@ -150,29 +150,14 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
     })
 }
 
-/// Bump the project's resolve-input counter. Every write a project resolve
-/// reads calls this inside the transaction that makes it, so a reader that
-/// saw the counter, read the graph, and finds the counter unchanged under the
-/// write lock knows nothing it read has moved.
-pub fn bump_project_gen(conn: &Connection, project: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO code_graph_project_gen (project, gen) VALUES (?1, 1)
-         ON CONFLICT(project) DO UPDATE SET gen = gen + 1",
-        params![project],
-    )?;
-    Ok(())
-}
-
 /// The project's resolve-input counter (0 before any write).
 pub fn project_gen(conn: &Connection, project: &str) -> Result<i64> {
-    Ok(conn
-        .query_row(
-            "SELECT gen FROM code_graph_project_gen WHERE project = ?1",
-            params![project],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(0))
+    Ok(conn.query_row(
+        "SELECT COALESCE(SUM(gen), 0) FROM code_graph_project_gen
+         WHERE project = ?1 OR project = '*'",
+        params![project],
+        |r| r.get(0),
+    )?)
 }
 
 /// Upsert a node. `first_conv_id` is preserved on an existing row (immutable
@@ -227,7 +212,7 @@ pub fn upsert_node(conn: &Connection, n: &NodeRow) -> Result<()> {
             n.repo_root,
         ],
     )?;
-    bump_project_gen(conn, &n.project)
+    Ok(())
 }
 
 /// Record the exact transcript chunk containing the latest tool edit that
@@ -262,14 +247,11 @@ pub fn set_last_chunk_id(conn: &Connection, node_id: &str, chunk_id: &str) -> Re
 /// longer produce a false positive regardless of ordering.
 pub fn replace_file_edges(
     conn: &Connection,
-    project: &str,
+    _project: &str,
     src_file: &str,
     edges: &[EdgeRow],
 ) -> Result<()> {
-    in_tx(conn, |tx| {
-        replace_file_edges_in(tx, src_file, edges)?;
-        bump_project_gen(tx, project)
-    })
+    in_tx(conn, |tx| replace_file_edges_in(tx, src_file, edges))
 }
 
 /// Run `f` in a transaction of its own, or inside the caller's when `conn`
@@ -339,7 +321,7 @@ pub fn upsert_repo_defs(
                 stmt.execute(params![project, file, name, kind, lang])?;
             }
         }
-        bump_project_gen(tx, project)
+        Ok(())
     })
 }
 
@@ -400,7 +382,6 @@ pub fn retire_missing_nodes(
                 params![id, project, file],
             )?;
         }
-        bump_project_gen(tx, project)?;
         Ok(stale_ids.len())
     })
 }
@@ -467,7 +448,7 @@ pub fn upsert_file_state_pending(
              graph_gen = graph_gen + 1",
         params![project, file, content_hash],
     )?;
-    bump_project_gen(conn, project)
+    Ok(())
 }
 
 /// One file's extraction, to be stored as a unit by [`store_extraction`].
@@ -528,7 +509,7 @@ pub fn queue_extraction(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![project, file, read_path, conv_id, session_id, seq],
         )?;
-        bump_project_gen(tx, project)
+        Ok(())
     })
 }
 
@@ -2299,5 +2280,58 @@ mod tests {
         // Marking clean for re-extraction is a different flag and queues nothing.
         upsert_file_state(&conn, "p", "a.rs", "h3", false).unwrap();
         assert!(pending_resolve_files(&conn).unwrap().is_empty());
+    }
+
+    /// H2: the counter a drain's plan is validated against must move for EVERY
+    /// write to a table the resolve reads, whichever code path makes it. These
+    /// are raw statements on purpose: a writer that goes around the helpers
+    /// (backfill, co-edit replay, repo scan, a migration) is the case that
+    /// must not slip past.
+    #[test]
+    fn every_write_a_resolve_reads_moves_the_project_counter() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::storage::migrations::run(&conn).unwrap();
+        let node = "INSERT INTO code_nodes (id, project, file, kind, name) \
+                    VALUES ('n1', 'p', 'a.rs', 'function', 'f')";
+        let edge = "INSERT INTO code_edges (src_id, dst_id, kind, src_file) \
+                    VALUES ('n1', 'name:g', 'calls', 'a.rs')";
+        let steps: &[(&str, &str)] = &[
+            ("insert node", node),
+            ("update node", "UPDATE code_nodes SET span_end = 9 WHERE id = 'n1'"),
+            ("insert edge", edge),
+            ("update edge evidence", "UPDATE code_edges SET evidence = 'from:x' WHERE src_id = 'n1'"),
+            ("update edge dst", "UPDATE code_edges SET dst_id = 'n2', resolved = 1 WHERE src_id = 'n1'"),
+            ("delete edge", "DELETE FROM code_edges WHERE src_id = 'n1'"),
+            ("insert repo_defs", "INSERT INTO repo_defs (project, file, name, kind) VALUES ('p', 'a.rs', 'f', 'function')"),
+            ("delete repo_defs", "DELETE FROM repo_defs WHERE project = 'p'"),
+            ("insert local_bindings", "INSERT INTO local_bindings (project, file, scope, name) VALUES ('p', 'a.rs', 's', 'x')"),
+            ("insert edge_scope_chains", "INSERT INTO edge_scope_chains (project, file, src_id, dst_id, kind, chain) VALUES ('p', 'a.rs', 'n1', 'name:g', 'calls', 'c')"),
+            ("insert code_evolution", "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES ('e1', 's', 'p', 'a.rs')"),
+            ("code_evolution under another label", "INSERT INTO code_evolution (id, session_id, project_name, file_path) VALUES ('e2', 's', 'q', 'a.rs')"),
+            ("delete node", "DELETE FROM code_nodes WHERE id = 'n1'"),
+        ];
+        for (what, sql) in steps {
+            let before = project_gen(&conn, "p").unwrap();
+            conn.execute(sql, []).unwrap();
+            assert!(
+                project_gen(&conn, "p").unwrap() > before,
+                "{what}: the counter did not move"
+            );
+        }
+        // The co-edit replay's own entry point.
+        let before = project_gen(&conn, "p").unwrap();
+        assert!(crate::storage::queries::insert_code_evolution_backfill(
+            &conn,
+            "bf-1",
+            "s2",
+            "p",
+            "b.rs",
+            "rust",
+            "Edit",
+            "2026-01-01T00:00:00Z",
+            None,
+        )
+        .unwrap());
+        assert!(project_gen(&conn, "p").unwrap() > before, "co-edit replay");
     }
 }
