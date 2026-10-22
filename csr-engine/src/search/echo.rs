@@ -43,12 +43,22 @@ static TOOL_MARKER: LazyLock<Regex> = LazyLock::new(|| {
     .expect("tool marker regex")
 });
 
-/// Assistant narration that announces work without reporting a result.
+/// Assistant narration that announces work without reporting a result: a
+/// closed list of progress phrases, each in full. A sentence that merely opens
+/// with a verb like "Using" or "Running" is a statement and may be the answer.
 static FILLER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)^(?:checking|searching|looking|let me|let\x27s|let us|i\x27ll|i will|i\x27m|i am|one moment|on it|sure|okay|ok|now|first|running|reading|fetching|pulling|querying|consulting|digging|scanning|grepping|opening|trying|asking|calling|using|loading)\b",
+        r"(?i)^(?:(?:checking|searching|looking|digging|scanning|querying|consulting|fetching|pulling|loading|grepping)(?: (?:up|into|at|through|for|in|on|past|prior|previous|earlier|the|our|that|this|it|my|memory|memories|csr|sessions?|conversations?|history|again|now|more|related|relevant|what|how|why|whether|if)\b|\s*(?:\x{2026}|\.\.\.|\.|$))|(?:let me|let\x27s|let us|i\x27ll|i will|i\x27m going to|i am going to) (?:check|look|search|find|see|pull|dig|query|try|run|grep|open|fetch|consult|scan|read)\b|(?:one moment|one sec|on it|sure|okay|ok)\s*(?:\x{2026}|\.\.\.|[.!])?$)",
     )
     .expect("filler regex")
+});
+
+/// Words that turn a progress phrase into a reported result.
+static RESULT_WORDS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:because|since|fixed|resolved|caused|removed|replaced|dropped|chose|decided|due to|turned out|found that|showed|means|so that|instead)\b|:",
+    )
+    .expect("result words regex")
 });
 
 /// The outcome words a session story appends to its request. They report that
@@ -66,10 +76,14 @@ static PATH_ONLY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:\d+\s+)?/\S+(?:\s+(?:\d+\s+)?/\S+)*$").expect("path-only regex")
 });
 
-/// Openers of a question written without its question mark.
+/// Openers of a question written without its question mark: an interrogative
+/// followed by the auxiliary that makes it a question (`what did`, `why was`),
+/// a bare auxiliary (`did we`), or a request to recall. An interrogative
+/// followed by anything else (`what fixed the timeout was ...`) is the subject
+/// of a statement.
 static QUESTION_OPENER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)^(?:why|what|how|when|where|who|whom|whose|which|did|do|does|is|are|was|were|can|could|should|would|will|have|has|had|remind me|tell me|explain|recall|remember)\b",
+        r"(?i)^(?:(?:why|what|how|when|where|who|whom|whose|which)(?: (?:else|exactly|actually))? (?:did|do|does|is|are|was|were|can|could|should|would|will|have|has|had|about)\b|how (?:many|much|long|often|come)\b|(?:did|do|does|is|are|was|were|can|could|should|would|will|have|has|had) (?:we|you|i|they|it|the|this|that|there)\b|(?:remind me|tell me|explain|recall|remember)\b)",
     )
     .expect("question opener regex")
 });
@@ -83,26 +97,46 @@ pub fn is_question_echo(content: &str) -> bool {
     }
     let sentences = sentences(&body);
     let mut questions = 0;
-    for (at, sentence) in sentences.iter().enumerate() {
-        if sentence.trim_end_matches('.').ends_with('?')
-            || (at == 0 && is_unpunctuated_question(sentence))
+    for sentence in &sentences {
+        let text = sentence.text.as_str();
+        if text.trim_end_matches('.').ends_with('?')
+            || (sentence.line_start && is_unpunctuated_question(text))
         {
             questions += 1;
-        } else if !(STATUS.is_match(sentence)
-            || PATH_ONLY.is_match(sentence)
-            || (FILLER.is_match(sentence) && sentence.chars().count() <= MAX_FILLER_CHARS))
-        {
+        } else if !(STATUS.is_match(text) || PATH_ONLY.is_match(text) || is_filler(text)) {
             return false;
         }
     }
     questions > 0
 }
 
+/// Longest a bare interrogative-plus-verb line can be and still be a question.
+const SHORT_WH_WORDS: usize = 6;
+
+static SHORT_WH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:why|what|how|when|where|who|which) \w+").expect("short wh regex")
+});
+
+static COPULA: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(?:is|was|are|were|be|been)\b").expect("copula regex"));
+
+/// A progress announcement short enough to carry no finding.
+fn is_filler(sentence: &str) -> bool {
+    sentence.chars().count() <= MAX_FILLER_CHARS
+        && FILLER.is_match(sentence)
+        && !RESULT_WORDS.is_match(sentence)
+}
+
 /// A question typed without its question mark: it opens with an interrogative
 /// and carries no punctuation that would make it a statement (a closing period,
 /// or a colon introducing the answer, as in a memory titled `why X: because Y`).
 fn is_unpunctuated_question(sentence: &str) -> bool {
-    QUESTION_OPENER.is_match(sentence)
+    // A short interrogative-plus-verb line (`what replaced it`) is a question
+    // unless a copula follows, which makes it the subject of a statement.
+    let short_wh = SHORT_WH.is_match(sentence)
+        && sentence.split_whitespace().count() <= SHORT_WH_WORDS
+        && !COPULA.is_match(sentence);
+    (QUESTION_OPENER.is_match(sentence) || short_wh)
         && sentence.chars().count() <= MAX_FILLER_CHARS * 2
         && !sentence.ends_with(['.', '!', ':', ';'])
         && !sentence.contains(':')
@@ -123,15 +157,34 @@ fn strip_scaffolding(content: &str) -> String {
     if let Some(episode) = episode_text(text) {
         return TOOL_MARKER.replace_all(&episode, " ").into_owned();
     }
-    let text = text.strip_prefix("## User Request").unwrap_or(text);
     let mut end = text.len();
-    for marker in ["Signature:", "## Active Issues", "Unresolved:"] {
+    for marker in ["## Active Issues", "Unresolved:"] {
         if let Some(at) = text.find(marker) {
             end = end.min(at);
         }
     }
-    let text = text[..end].trim_end().trim_end_matches('-');
+    let mut kept = String::new();
+    for line in text[..end].lines() {
+        // The signature is one JSON line; what follows it (`Context:`, the
+        // extraction's error-recovery and fix lines) is content.
+        let line = line.find("Signature:").map_or(line, |at| &line[..at]);
+        if is_scaffold_line(line) {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    let text = kept.trim_end().trim_end_matches('-');
     TOOL_MARKER.replace_all(text, " ").into_owned()
+}
+
+/// A line that only labels the derivation: `Context:`, a rule, or a markdown
+/// heading that is not itself a question.
+fn is_scaffold_line(line: &str) -> bool {
+    let line = line.trim().trim_end_matches('-').trim();
+    line == "Context:"
+        || line.chars().all(|c| matches!(c, '-' | '=' | ' '))
+        || (line.starts_with('#') && !line.contains('?') && line.chars().count() <= 60)
 }
 
 /// The request, findings and open items of a session episode row (its
@@ -170,11 +223,18 @@ fn episode_text(text: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+/// One sentence of a body, and whether it opens a line.
+struct Sentence {
+    text: String,
+    line_start: bool,
+}
+
 /// The sentences of `body`: split at line breaks and at a `.`, `?` or `!`
 /// followed by whitespace, each kept with its terminator.
-fn sentences(body: &str) -> Vec<String> {
+fn sentences(body: &str) -> Vec<Sentence> {
     let mut out = Vec::new();
     for line in body.lines() {
+        let first = out.len();
         let mut current = String::new();
         let mut chars = line.chars().peekable();
         while let Some(c) = chars.next() {
@@ -186,18 +246,24 @@ fn sentences(body: &str) -> Vec<String> {
             }
         }
         push_sentence(&mut out, &mut current);
+        if let Some(opening) = out.get_mut(first) {
+            opening.line_start = true;
+        }
     }
     out
 }
 
-fn push_sentence(out: &mut Vec<String>, current: &mut String) {
-    let sentence = current
+fn push_sentence(out: &mut Vec<Sentence>, current: &mut String) {
+    let text = current
         .trim()
         .trim_matches(|c: char| matches!(c, '"' | '\u{201c}' | '\u{201d}' | '-' | '*'))
         .trim()
         .to_string();
-    if sentence.chars().any(char::is_alphanumeric) {
-        out.push(sentence);
+    if text.chars().any(char::is_alphanumeric) {
+        out.push(Sentence {
+            text,
+            line_start: false,
+        });
     }
     current.clear();
 }
@@ -330,6 +396,55 @@ mod tests {
         assert!(!is_question_echo(&format!(
             "{Q}\n\nChecking past sessions.\n\nSee /Users/x/.plans/02-results.md for the reasons."
         )));
+    }
+
+    #[test]
+    fn a_sentence_that_merely_opens_with_a_progress_verb_is_not_filler() {
+        assert!(!is_question_echo(&format!(
+            "{Q} Using SQLite removed network hops."
+        )));
+        assert!(!is_question_echo(&format!(
+            "{Q}\n\nRunning them against a shared database caused lock contention."
+        )));
+        assert!(!is_question_echo(
+            "Why did we drop Qdrant? Using SQLite removed network hops."
+        ));
+        assert!(!is_question_echo(&format!(
+            "{Q}\n\nSearching the old index was slow because it scanned every row."
+        )));
+    }
+
+    #[test]
+    fn a_declarative_that_opens_with_an_interrogative_is_not_a_question() {
+        assert!(!is_question_echo(
+            "What fixed the timeout was raising the budget to 120s"
+        ));
+        assert!(!is_question_echo(
+            "How the import works is that every file is hashed first"
+        ));
+        assert!(is_question_echo("what did we decide about the hook budget"));
+    }
+
+    #[test]
+    fn an_unpunctuated_question_on_any_line_is_recognised() {
+        assert!(is_question_echo(
+            "## User Request\nwhy did we drop Qdrant\nwhat replaced it"
+        ));
+        assert!(!is_question_echo(
+            "## User Request\nwhy did we drop Qdrant\nwhat fixed it was the embedded index"
+        ));
+    }
+
+    #[test]
+    fn the_fix_after_the_signature_is_content_not_scaffolding() {
+        let row = format!(
+            "[reflection] ## User Request\nwhy did the import time out?\n\n---\n{SIG}\nContext:\n## Error Recovery\n[Msg 5] Error: timeout\n  Fix: Increased timeout to 120s"
+        );
+        assert!(!is_question_echo(&row));
+        let bare = format!(
+            "[reflection] ## User Request\nwhy did the import time out?\n\n---\n{SIG}\nContext:\n## Validation"
+        );
+        assert!(is_question_echo(&bare));
     }
 
     #[test]
