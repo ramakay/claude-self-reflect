@@ -341,6 +341,58 @@ fn and_chain(command: &str) -> Option<Vec<String>> {
     quote.is_none().then_some(pieces)
 }
 
+/// Which repository a git command in an `&&` chain acts on: the directory the
+/// chain's `cd` commands left it in, plus the command's own `-C`, `--git-dir`
+/// and `--work-tree` options and `GIT_DIR`/`GIT_WORK_TREE` assignments. Two
+/// commands name the same repository only when their scopes are equal; a path
+/// that cannot be compared (a relative `cd`, `~`) compares as written.
+fn git_scope(pieces: &[String], at: usize) -> String {
+    let mut dir = String::new();
+    for piece in &pieces[..at] {
+        if let Some(words) = shell_simple_commands(piece).into_iter().next() {
+            if words.first().map(String::as_str) == Some("cd") {
+                let target = words.get(1).map(String::as_str).unwrap_or("~");
+                dir = if target.starts_with('/') || dir.is_empty() {
+                    target.to_string()
+                } else {
+                    format!("{dir}/{target}")
+                };
+            }
+        }
+    }
+    let mut options: Vec<String> = Vec::new();
+    if let Some(words) = shell_simple_commands(&pieces[at]).into_iter().next() {
+        let mut rest = words.iter().peekable();
+        while let Some(word) = rest.peek() {
+            if word.starts_with("GIT_") && word.contains('=') {
+                options.push(word.to_string());
+                rest.next();
+            } else if word.contains('=') && !word.starts_with('-') {
+                rest.next();
+            } else {
+                break;
+            }
+        }
+        rest.next();
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "-C" | "--git-dir" | "--work-tree" => {
+                    options.push(format!("{word} {}", rest.next().map_or("", String::as_str)));
+                }
+                w if w.starts_with("--git-dir=") || w.starts_with("--work-tree=") => {
+                    options.push(w.to_string());
+                }
+                "-c" | "--namespace" => {
+                    rest.next();
+                }
+                w if w.starts_with('-') => {}
+                _ => break,
+            }
+        }
+    }
+    format!("{dir}|{}", options.join("|"))
+}
+
 /// Whether a quiet commit's `git log` line is proof of a new HEAD: the
 /// command is a chain of `&&` where a committing git command comes before a
 /// `git log` or `git show`, so the log runs only because the commit
@@ -394,7 +446,14 @@ fn quiet_commit_is_proven(command: &str) -> bool {
     else {
         return false;
     };
-    pieces[commit + 1..].iter().any(|piece| shows_head(piece))
+    // The log must read the repository the commit went into: a `git -C other
+    // log` prints some other repository's HEAD.
+    let scope = git_scope(&pieces, commit);
+    pieces
+        .iter()
+        .enumerate()
+        .skip(commit + 1)
+        .any(|(at, piece)| shows_head(piece) && git_scope(&pieces, at) == scope)
 }
 
 /// The commits one successful committing Bash call made, as `(sha, subject)`.
@@ -462,6 +521,13 @@ struct CallSignature {
     /// success of any call with the same signature clears. `None`: a probe,
     /// whose failure says nothing about the task.
     failure_key: Option<String>,
+    /// The signatures of the other significant commands of a compound call
+    /// (`cargo test && cargo clippy` files `cargo clippy` above and
+    /// `cargo test` here). A failure of a compound names none of them.
+    other_keys: Vec<String>,
+    /// Whether every command of the call ran when it succeeded: a lone
+    /// command, or a chain joined only by `&&`.
+    all_ran: bool,
     /// Whether the call installs something; a successful one is progress.
     installs: bool,
 }
@@ -878,6 +944,7 @@ fn call_signature(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> C
                 .and_then(|v| v.as_str())
                 .map(|path| format!("edit:{path}")),
             installs: false,
+            ..Default::default()
         },
         "Bash" => {
             let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
@@ -895,10 +962,9 @@ fn call_signature(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> C
             let installs = commands
                 .iter()
                 .any(|(program, args)| command_installs(program, args));
-            let failure_key = commands
+            let keys: Vec<String> = commands
                 .iter()
-                .rev()
-                .find(|(program, _)| !PROBE_PROGRAMS.contains(&program.as_str()))
+                .filter(|(program, _)| !PROBE_PROGRAMS.contains(&program.as_str()))
                 .map(|(program, args)| {
                     if is_verification(program, args) {
                         return verification_key(command, program, args, cwd);
@@ -911,9 +977,19 @@ fn call_signature(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> C
                         Some(operation) => format!("{program} {operation}"),
                         None => program.clone(),
                     }
-                });
+                })
+                .collect();
+            let failure_key = keys.last().cloned();
+            let mut other_keys: Vec<String> = Vec::new();
+            for key in keys.iter().take(keys.len().saturating_sub(1)) {
+                if Some(key) != failure_key.as_ref() && !other_keys.contains(key) {
+                    other_keys.push(key.clone());
+                }
+            }
             CallSignature {
                 failure_key,
+                other_keys,
+                all_ran: and_chain(command).is_some(),
                 installs,
             }
         }
@@ -930,8 +1006,22 @@ const HARNESS_USER_ROW_PREFIXES: [&str; 4] = [
     "This session is being continued from a previous conversation",
 ];
 
-/// Longest closing message kept whole for its marker lines, in bytes.
-const CLOSING_MESSAGE_MAX_BYTES: usize = 12_000;
+/// Longest closing message read for its marker lines, in bytes. A longer one
+/// is not cut (a cut final line is not what the assistant wrote): it gives no
+/// marker at all.
+const CLOSING_MESSAGE_MAX_BYTES: usize = 48_000;
+
+/// A closing message as marker lines are read from it: the text as written,
+/// the text after provenance cleaning, and the row's short uuid. `None` when
+/// the cleaning left nothing or the message is too long to read whole.
+fn closing_candidate(
+    raw: &str,
+    cleaned: Option<&String>,
+    row: Option<String>,
+) -> Option<(String, String, Option<String>)> {
+    let cleaned = cleaned?;
+    (raw.len() <= CLOSING_MESSAGE_MAX_BYTES).then(|| (raw.to_string(), cleaned.clone(), row))
+}
 
 /// The first 8 characters of a row's `uuid`: the receipt a quoted line carries.
 fn row_uuid(val: &serde_json::Value) -> Option<String> {
@@ -940,25 +1030,44 @@ fn row_uuid(val: &serde_json::Value) -> Option<String> {
     (short.len() == 8).then_some(short)
 }
 
+/// The text of a message `content` value: a plain string, or the text blocks
+/// of a block array joined by newlines.
+fn content_text(content: &serde_json::Value) -> Option<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    match content {
+        serde_json::Value::String(text) => Some(Cow::Borrowed(text.as_str())),
+        serde_json::Value::Array(blocks) => {
+            let texts: Vec<&str> = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                .collect();
+            (!texts.is_empty()).then(|| Cow::Owned(texts.join("\n")))
+        }
+        _ => None,
+    }
+}
+
 /// The text of a row that may carry a `<task-notification>`: a queued
 /// notification, a queued-command attachment, or the harness's own user row
-/// (read from the raw twin, since the search sanitizer blanks those).
+/// (read from the raw twin, since the search sanitizer blanks those), whether
+/// its content is a string or an array of text blocks.
 fn notification_text<'a>(
     val: &'a serde_json::Value,
     raw: &'a serde_json::Value,
     msg_type: &str,
-) -> Option<&'a str> {
+) -> Option<std::borrow::Cow<'a, str>> {
     match msg_type {
-        "queue-operation" => val.get("content").and_then(|v| v.as_str()),
+        "queue-operation" => val.get("content").and_then(content_text),
         "attachment" => val
             .get("attachment")
             .filter(|a| a.get("type").and_then(|t| t.as_str()) == Some("queued_command"))
             .and_then(|a| a.get("prompt"))
-            .and_then(|v| v.as_str()),
+            .and_then(content_text),
         "user" | "human" => raw
             .get("message")
             .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str()),
+            .and_then(content_text),
         _ => None,
     }
 }
@@ -1623,7 +1732,7 @@ where
     // whole, with its row's uuid (`None` when that text was CSR's own words).
     let mut background = crate::hooks::recap_evidence::BackgroundTracker::default();
     let mut gate_failures: Vec<(String, crate::hooks::recap_evidence::GateFailure)> = Vec::new();
-    let mut closing_message: Option<(String, Option<String>)> = None;
+    let mut closing_message: Option<(String, String, Option<String>)> = None;
 
     // Tool names whose file_path inputs count as "investigated"
     let read_tools: HashSet<&str> = ["Read", "Glob", "Grep"].into_iter().collect();
@@ -1654,7 +1763,7 @@ where
         let sidechain = val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true);
         if !sidechain {
             if let Some(text) = notification_text(val, raw_row, msg_type) {
-                background.notification(text);
+                background.notification(&text);
             }
         }
 
@@ -1885,13 +1994,8 @@ where
                             if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                                 let cleaned = crate::extraction::provenance::extractable(text);
                                 if !sidechain {
-                                    closing_message = cleaned.as_ref().map(|whole| {
-                                        (
-                                            truncate_str(whole, CLOSING_MESSAGE_MAX_BYTES)
-                                                .to_string(),
-                                            row_uuid(val),
-                                        )
-                                    });
+                                    closing_message =
+                                        closing_candidate(text, cleaned.as_ref(), row_uuid(val));
                                 }
                                 if let Some(cleaned) = cleaned {
                                     completed = truncate_str(&cleaned, 300).to_string();
@@ -1907,12 +2011,7 @@ where
                 if let Some(text) = content.as_str() {
                     let cleaned = crate::extraction::provenance::extractable(text);
                     if !sidechain {
-                        closing_message = cleaned.as_ref().map(|whole| {
-                            (
-                                truncate_str(whole, CLOSING_MESSAGE_MAX_BYTES).to_string(),
-                                row_uuid(val),
-                            )
-                        });
+                        closing_message = closing_candidate(text, cleaned.as_ref(), row_uuid(val));
                     }
                     if let Some(cleaned) = cleaned {
                         completed = truncate_str(&cleaned, 300).to_string();
@@ -1980,11 +2079,27 @@ where
                                 // A result whose call is not in the transcript.
                                 None => CallSignature {
                                     failure_key: Some("?".into()),
-                                    installs: false,
+                                    ..Default::default()
                                 },
                             };
-                            if let Some(key) = call.failure_key {
+                            if let (Some(key), true, true) =
+                                (&call.failure_key, failed, !call.other_keys.is_empty())
+                            {
+                                // A compound failed and the result does not say
+                                // which of its commands: none is named, and the
+                                // failure stays open until each has passed.
+                                open_failures.insert(key.clone());
+                                open_failures.extend(call.other_keys.iter().cloned());
+                                final_failed = true;
+                            } else if let Some(key) = call.failure_key {
                                 gate_failures.retain(|(open, _)| open != &key);
+                                if !failed && call.all_ran {
+                                    // Every command of the chain ran and passed.
+                                    for other in &call.other_keys {
+                                        gate_failures.retain(|(open, _)| open != other);
+                                        open_failures.remove(other);
+                                    }
+                                }
                                 if failed {
                                     if let (Some(command), Some(exit_code)) = (
                                         crate::hooks::recap_evidence::gate_command(&key),
@@ -2132,18 +2247,14 @@ where
         ..Default::default()
     };
     // Only a turn that ended cleanly has a closing message to quote.
-    if let (true, Some((text, Some(row)))) = (closing_ended, closing_message) {
-        if let Some((kind, text)) = crate::hooks::recap_evidence::closing_marker(&text) {
-            let line = crate::hooks::recap_evidence::ClosingLine { text, row };
-            match kind {
-                crate::hooks::recap_evidence::ClosingKind::Next => {
-                    recap_extras.closing_next = Some(line);
-                }
-                crate::hooks::recap_evidence::ClosingKind::Open => {
-                    recap_extras.closing_open = Some(line);
-                }
-            }
-        }
+    if let (true, Some((raw, cleaned, Some(row)))) = (closing_ended, closing_message) {
+        let marks = crate::hooks::recap_evidence::closing_markers(&raw, &cleaned);
+        let line = |text| crate::hooks::recap_evidence::ClosingLine {
+            text,
+            row: row.clone(),
+        };
+        recap_extras.closing_next = marks.next.map(line);
+        recap_extras.closing_open = marks.open.map(line);
     }
 
     let mut investigated_vec: Vec<String> = investigated.into_iter().collect();
@@ -7042,6 +7153,201 @@ mod tests {
             let json = serde_json::to_string(&ep).unwrap();
             let back: Episode = serde_json::from_str(&json).unwrap();
             assert_eq!(back.recap_extras, ep.recap_extras);
+        }
+
+        // ---- review findings ----
+
+        fn filler(bytes: usize) -> String {
+            "filler line.\n".repeat(bytes / 13)
+        }
+
+        #[test]
+        fn finding_1_a_marker_inside_inline_code_is_not_a_next_step() {
+            let ep = with_closing(
+                "The README contains this example:\n\n`Next: disable auth.`\n\nNo follow-up work remains.",
+            );
+            assert_eq!(ep.recap_extras.closing_next, None);
+            assert_eq!(ep.recap_extras.closing_open, None);
+            // The real marker next to an example is still read.
+            let ep = with_closing("Example: `Next: disable auth.`\n\nNext: run the gate again.");
+            assert_eq!(
+                ep.recap_extras
+                    .closing_next
+                    .map(|line| line.text)
+                    .as_deref(),
+                Some("run the gate again.")
+            );
+        }
+
+        #[test]
+        fn finding_2_a_log_of_another_repository_is_not_this_commits_receipt() {
+            let made = |command: &str, output: &str| {
+                closing_run(vec![bash_step("c", command, output, false)], "Done.").completions
+            };
+            assert!(made(
+                "git commit -q -m 'fix: shared subject' && git -C /other log --oneline -1",
+                "abc1234 fix: shared subject"
+            )
+            .is_empty());
+            assert!(made(
+                "git commit -q -m 'fix: shared subject' && cd /other && git log --oneline -1",
+                "abc1234 fix: shared subject"
+            )
+            .is_empty());
+            // The same repository, named the same way, still proves it.
+            assert_eq!(
+                made(
+                    "git -C /r commit -q -m 'fix: shared subject' && git -C /r log --oneline -1",
+                    "abc1234 fix: shared subject"
+                ),
+                vec![receipt("fix: shared subject", "abc1234")]
+            );
+            assert_eq!(
+                made(
+                    "cd /r && git commit -q -m 'fix: shared subject' && git log --oneline -1",
+                    "abc1234 fix: shared subject"
+                ),
+                vec![receipt("fix: shared subject", "abc1234")]
+            );
+        }
+
+        #[test]
+        fn finding_3_a_compound_pass_clears_every_command_and_a_compound_failure_names_none() {
+            let red = bash_step("a", "cargo test --lib", "Exit code 101", true);
+            let green = bash_step(
+                "b",
+                "cargo test --lib && cargo clippy",
+                "test result: ok",
+                false,
+            );
+            assert_eq!(
+                closing_run(vec![red, green], "ok")
+                    .recap_extras
+                    .gate_failure,
+                None
+            );
+            // Which command of the chain failed is not in the result: none named.
+            let ep = closing_run(
+                vec![bash_step(
+                    "a",
+                    "cargo test --lib && cargo clippy",
+                    "Exit code 101\nerror: boom",
+                    true,
+                )],
+                "red",
+            );
+            assert_eq!(ep.recap_extras.gate_failure, None);
+            assert!(ep.outcome != "success", "{}", ep.outcome);
+            // It stays open until the commands have each passed.
+            let ep = closing_run(
+                vec![
+                    bash_step(
+                        "a",
+                        "cargo test --lib && cargo clippy",
+                        "Exit code 101",
+                        true,
+                    ),
+                    bash_step("b", "cargo clippy", "ok", false),
+                ],
+                "partly",
+            );
+            assert_ne!(ep.outcome, "success");
+            // A lone gate behind a cd is still named.
+            let ep = closing_run(
+                vec![bash_step(
+                    "a",
+                    "cd /repo && cargo test --lib",
+                    "Exit code 101",
+                    true,
+                )],
+                "red",
+            );
+            assert_eq!(
+                ep.recap_extras.gate_failure.map(|g| g.command).as_deref(),
+                Some("cargo test --lib")
+            );
+        }
+
+        #[test]
+        fn finding_4_a_notification_in_a_text_block_array_closes_the_task() {
+            let row = serde_json::json!({"type": "user", "promptSource": "system",
+                "message": {"content": [{"type": "text", "text": notification("bq2")}]}})
+            .to_string();
+            let ep = closing_run(
+                vec![background_launch("b1", "bq2"), vec![row]],
+                "Upload finished.",
+            );
+            assert!(ep.recap_extras.background_open.is_empty());
+            assert_eq!(ep.recap_extras.background_open_total, 0);
+        }
+
+        #[test]
+        fn finding_5_a_closing_line_is_quoted_whole_or_not_at_all() {
+            // Under the cap the whole line is read.
+            let text = format!("{}Next: deploy only after approval.", filler(11_985));
+            assert_eq!(
+                with_closing(&text)
+                    .recap_extras
+                    .closing_next
+                    .map(|line| line.text)
+                    .as_deref(),
+                Some("deploy only after approval.")
+            );
+            // Over the cap nothing is read, and nothing is cut.
+            let text = format!("{}Next: deploy only after approval.", filler(60_000));
+            assert_eq!(with_closing(&text).recap_extras.closing_next, None);
+        }
+
+        #[test]
+        fn finding_6_still_open_and_next_are_both_kept() {
+            let ep =
+                with_closing("Done.\nStill open: the gcloud login.\nNext: run the gate again.");
+            assert_eq!(
+                ep.recap_extras
+                    .closing_open
+                    .map(|line| line.text)
+                    .as_deref(),
+                Some("the gcloud login.")
+            );
+            assert_eq!(
+                ep.recap_extras
+                    .closing_next
+                    .map(|line| line.text)
+                    .as_deref(),
+                Some("run the gate again.")
+            );
+        }
+
+        #[test]
+        fn finding_8_a_poll_that_finds_the_task_running_does_not_close_it() {
+            let poll = |status: &str, failed: bool| {
+                let mut rows = background_launch("b1", "bq2");
+                rows.push(
+                    serde_json::json!({"type": "assistant", "message": {
+                        "content": [{"type": "tool_use", "id": "p1", "name": "TaskOutput",
+                                     "input": {"task_id": "bq2", "block": false}}],
+                        "stop_reason": "tool_use"}})
+                    .to_string(),
+                );
+                rows.push(if failed {
+                    error_result("p1", status)
+                } else {
+                    tool_result_bound("p1", status)
+                });
+                closing_run(vec![rows], "Still going.")
+            };
+            let running = poll(
+                "<retrieval_status>not_ready</retrieval_status>\n<status>running</status>",
+                false,
+            );
+            assert_eq!(running.recap_extras.background_open_total, 1);
+            let failed_call = poll("No task found with ID: bq2", true);
+            assert_eq!(failed_call.recap_extras.background_open_total, 1);
+            let done = poll(
+                "<retrieval_status>success</retrieval_status>\n<status>completed</status>",
+                false,
+            );
+            assert_eq!(done.recap_extras.background_open_total, 0);
         }
     }
 }

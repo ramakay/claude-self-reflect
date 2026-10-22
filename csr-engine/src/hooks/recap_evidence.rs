@@ -8,7 +8,7 @@
 //! nothing is invented: each item carries what a reader needs to find it in the
 //! transcript, and a reading that cannot be backed by a receipt is dropped.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -112,15 +112,72 @@ pub(crate) fn gate_command(key: &str) -> Option<String> {
     .then_some(command)
 }
 
+/// Most launches, and most pending closing calls, the tracker holds at once.
+/// A session that starts more background tasks than this without any of them
+/// finishing keeps the newest; the count then covers only those tracked.
+const MAX_TRACKED: usize = 512;
+
+/// What a closing call has to show in its result before it closes a task.
+#[derive(Clone, Copy)]
+enum CloseKind {
+    /// `TaskStop` / `KillShell`: the result says the task was stopped.
+    Stop,
+    /// `TaskOutput` / `BashOutput`: the result reports a final status.
+    Output,
+}
+
+static STOPPED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bsuccessfully\s+(?:stopped|killed)\b|\b(?:stopped|killed)\s+(?:task|shell)\b")
+        .unwrap()
+});
+static FINAL_STATUS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)<status>\s*(?:completed|failed|killed|cancelled|canceled|stopped|exited)\s*</status>",
+    )
+    .unwrap()
+});
+
+impl CloseKind {
+    /// Whether a (non-error) result shows the task ended.
+    fn shows_end(self, result: &str) -> bool {
+        match self {
+            CloseKind::Stop => STOPPED_RE.is_match(result),
+            CloseKind::Output => FINAL_STATUS_RE.is_match(result),
+        }
+    }
+}
+
 /// Tracks background launches and what closes them, over main-session rows.
+/// A task closes on its notification, or when a stop or output call's RESULT
+/// shows it ended; a call that merely names the id, a failed call, and a poll
+/// that finds the task still running close nothing. State is indexed by task
+/// id and bounded by [`MAX_TRACKED`].
 #[derive(Default)]
 pub(crate) struct BackgroundTracker {
-    /// `tool_use` id -> label, for launches whose result has not arrived.
-    launching: HashMap<String, String>,
-    /// Launched tasks in launch order: `(task id, label)`.
-    launched: Vec<(String, String)>,
-    /// Task ids a notification, a stop or an output read closed.
-    closed: HashSet<String>,
+    /// `tool_use` id -> (launch order, label), for launches whose result has
+    /// not arrived.
+    launching: HashMap<String, (u64, String)>,
+    /// Launched tasks nothing has closed: task id -> (launch order, label).
+    open: HashMap<String, (u64, String)>,
+    /// `tool_use` id of a closing call -> what it must show, the open task ids
+    /// it names.
+    pending: HashMap<String, (CloseKind, Vec<String>)>,
+    /// Next launch order.
+    seq: u64,
+}
+
+/// Drops the oldest entry of `map` while it holds more than [`MAX_TRACKED`].
+fn bound<V>(map: &mut HashMap<String, (u64, V)>) {
+    while map.len() > MAX_TRACKED {
+        let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, (order, _))| *order)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        map.remove(&oldest);
+    }
 }
 
 impl BackgroundTracker {
@@ -146,37 +203,49 @@ impl BackgroundTracker {
                     .or_else(|| input.get("command").and_then(|v| v.as_str()))
                     .map(|text| text.lines().next().unwrap_or("").trim().to_string())
                     .unwrap_or_default();
-                self.launching.insert(id.to_string(), label);
+                self.seq += 1;
+                self.launching.insert(id.to_string(), (self.seq, label));
+                bound(&mut self.launching);
             }
             return;
         }
-        // A stop closes a task; a read of its output file or a poll of its id
-        // means the assistant looked at it, so it is not a task nobody saw.
-        let closes = matches!(
-            name,
-            "TaskStop" | "KillShell" | "TaskOutput" | "BashOutput" | "Read" | "Bash"
-        );
-        if !closes || self.launched.is_empty() {
-            return;
-        }
-        let haystack = match name {
-            "Bash" => input
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            _ => input.to_string(),
+        let kind = match name {
+            "TaskStop" | "KillShell" => CloseKind::Stop,
+            "TaskOutput" | "BashOutput" => CloseKind::Output,
+            _ => return,
         };
-        for (task, _) in &self.launched {
-            if !self.closed.contains(task) && haystack.contains(task.as_str()) {
-                self.closed.insert(task.clone());
-            }
+        let (Some(call_id), false) = (id, self.open.is_empty()) else {
+            return;
+        };
+        // The open tasks the call names, by an input field holding exactly the id.
+        let named: Vec<String> = input
+            .as_object()
+            .into_iter()
+            .flat_map(|fields| fields.values())
+            .filter_map(|value| value.as_str())
+            .filter(|value| self.open.contains_key(*value))
+            .map(str::to_string)
+            .collect();
+        if named.is_empty() {
+            return;
         }
+        if self.pending.len() >= MAX_TRACKED {
+            self.pending.clear();
+        }
+        self.pending.insert(call_id.to_string(), (kind, named));
     }
 
     /// A `tool_result` block answering `tool_use_id`.
     pub(crate) fn tool_result(&mut self, tool_use_id: &str, text: &str, is_error: bool) {
-        let Some(label) = self.launching.remove(tool_use_id) else {
+        if let Some((kind, tasks)) = self.pending.remove(tool_use_id) {
+            if !is_error && kind.shows_end(text) {
+                for task in tasks {
+                    self.open.remove(&task);
+                }
+            }
+            return;
+        }
+        let Some((order, label)) = self.launching.remove(tool_use_id) else {
             return;
         };
         if is_error {
@@ -187,7 +256,8 @@ impl BackgroundTracker {
             .or_else(|| AGENT_ID_RE.captures(text))
             .map(|caps| caps[1].to_string());
         if let Some(task) = task {
-            self.launched.push((task, label));
+            self.open.insert(task, (order, label));
+            bound(&mut self.open);
         }
     }
 
@@ -197,22 +267,18 @@ impl BackgroundTracker {
             return;
         }
         for caps in NOTIFICATION_RE.captures_iter(text) {
-            self.closed.insert(caps[1].to_string());
+            self.open.remove(&caps[1]);
         }
     }
 
-    /// `(open tasks newest first, at most MAX_BACKGROUND; total open)`.
+    /// `(open tasks newest first, at most MAX_BACKGROUND; total open tracked)`.
     pub(crate) fn open(&self) -> (Vec<BackgroundTask>, usize) {
-        let open: Vec<&(String, String)> = self
-            .launched
-            .iter()
-            .filter(|(task, _)| !self.closed.contains(task))
-            .collect();
+        let mut open: Vec<(&String, &(u64, String))> = self.open.iter().collect();
+        open.sort_by_key(|(_, (order, _))| std::cmp::Reverse(*order));
         let total = open.len();
         let shown = open
             .into_iter()
-            .rev()
-            .filter_map(|(task, label)| {
+            .filter_map(|(task, (_, label))| {
                 let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
                 let label = if label.chars().count() > BACKGROUND_LABEL_MAX_CHARS {
                     let cut: String = label.chars().take(BACKGROUND_LABEL_MAX_CHARS).collect();
@@ -269,32 +335,73 @@ pub(crate) enum ClosingKind {
     Open,
 }
 
-/// The last marker line of `text` (the assistant's closing message), as the
-/// whole sentence(s) after the marker. A marker counts only at the start of a
-/// line (after a bullet and emphasis), outside code fences, blockquotes and
-/// indented code, and not as an item of a numbered list (where "Next" only
-/// orders the items). `None` when there is no such line or what follows is
-/// empty, a question, "none", or CSR's own text.
-pub(crate) fn closing_marker(text: &str) -> Option<(ClosingKind, String)> {
-    let lines: Vec<&str> = text.lines().collect();
+/// The last "Next" line and the last "Still open" line of a closing message.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClosingMarkers {
+    pub next: Option<String>,
+    pub open: Option<String>,
+}
+
+fn without_backticks(text: &str) -> String {
+    text.chars().filter(|c| *c != '`').collect()
+}
+
+/// Whether a backtick run toggles inline code on this line, carried over from
+/// `in_code` at its start.
+fn inline_code_after(line: &str, mut in_code: bool) -> bool {
+    let mut previous_tick = false;
+    for c in line.chars() {
+        let tick = c == '`';
+        if tick && !previous_tick {
+            in_code = !in_code;
+        }
+        previous_tick = tick;
+    }
+    in_code
+}
+
+/// The last marker line of each kind in `raw` (the assistant's closing
+/// message as written), as the whole sentence(s) after the marker. A marker
+/// counts only at the start of a line (after a bullet and emphasis), outside
+/// inline code, code fences, blockquotes and indented code, and not as an item
+/// of a numbered list (where "Next" only orders the items). The line must also
+/// survive provenance cleaning (`cleaned`), so CSR's own quoted words are never
+/// read as the assistant's. A kind is `None` when it has no such line or what
+/// follows is empty, a question, "none", or CSR's own text.
+pub(crate) fn closing_markers(raw: &str, cleaned: &str) -> ClosingMarkers {
+    let kept: std::collections::HashSet<String> = cleaned
+        .lines()
+        .map(|line| without_backticks(line).trim().to_string())
+        .collect();
+    let lines: Vec<&str> = raw.lines().collect();
     let mut fenced = false;
-    let mut found: Option<(ClosingKind, String)> = None;
-    for (at, raw) in lines.iter().enumerate() {
-        let trimmed = raw.trim_start();
+    let mut in_code = false;
+    let mut found = ClosingMarkers::default();
+    for (at, raw_line) in lines.iter().enumerate() {
+        let trimmed = raw_line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             fenced = !fenced;
+            in_code = false;
             continue;
         }
+        // A line that opens inside an inline code span is code, not a marker.
+        let starts_in_code = in_code;
+        in_code = if trimmed.is_empty() {
+            false
+        } else {
+            inline_code_after(trimmed, in_code)
+        };
         if fenced
+            || starts_in_code
             || trimmed.starts_with('>')
             || trimmed.starts_with('|')
             || trimmed.starts_with('#')
         {
             continue;
         }
-        let indent = raw.len() - trimmed.len();
+        let indent = raw_line.len() - trimmed.len();
         let (body, bulleted, numbered) = strip_list_marker(trimmed);
-        if numbered || ((raw.starts_with('\t') || indent >= 4) && !bulleted) {
+        if numbered || ((raw_line.starts_with('\t') || indent >= 4) && !bulleted) {
             continue;
         }
         let body = body.trim_start_matches(['*', '_']).trim_start();
@@ -302,12 +409,18 @@ pub(crate) fn closing_marker(text: &str) -> Option<(ClosingKind, String)> {
         let Some((kind, content)) = marker_content(body, &lower) else {
             continue;
         };
+        if !kept.contains(without_backticks(trimmed).trim()) {
+            continue;
+        }
         let mut content = content.trim().to_string();
         if content.is_empty() {
             content = following_items(&lines[at + 1..], indent);
         }
         if let Some(sentence) = marker_sentence(&content) {
-            found = Some((kind, sentence));
+            match kind {
+                ClosingKind::Next => found.next = Some(sentence),
+                ClosingKind::Open => found.open = Some(sentence),
+            }
         }
     }
     found
@@ -466,22 +579,124 @@ mod tests {
         assert_eq!(open[0].label, "upload build");
     }
 
+    fn call(tracker: &mut BackgroundTracker, id: &str, name: &str, input: serde_json::Value) {
+        tracker.tool_use(&serde_json::json!({
+            "type": "tool_use", "id": id, "name": name, "input": input
+        }));
+    }
+
     #[test]
-    fn a_stop_or_an_output_read_closes_a_task() {
+    fn a_stop_closes_a_task_only_when_its_result_says_it_stopped() {
         let mut tracker = BackgroundTracker::default();
         launch(&mut tracker, "t1", "render reel", "bq1");
         launch(&mut tracker, "t2", "upload build", "bq2");
-        launch(&mut tracker, "t3", "probe", "bq3");
-        tracker.tool_use(&serde_json::json!({
-            "type": "tool_use", "id": "x", "name": "TaskStop", "input": {"task_id": "bq1"}
-        }));
-        tracker.tool_use(&serde_json::json!({
-            "type": "tool_use", "id": "y", "name": "Bash",
-            "input": {"command": "tail -5 /private/tmp/claude/tasks/bq2.output"}
-        }));
+        call(
+            &mut tracker,
+            "x",
+            "TaskStop",
+            serde_json::json!({"task_id": "bq1"}),
+        );
+        // The call alone closes nothing.
+        assert_eq!(tracker.open().1, 2);
+        tracker.tool_result(
+            "x",
+            r#"{"message":"Successfully stopped task: bq1 (sleep 100)"}"#,
+            false,
+        );
         let (open, total) = tracker.open();
         assert_eq!(total, 1);
-        assert_eq!(open[0].id, "bq3");
+        assert_eq!(open[0].id, "bq2");
+    }
+
+    #[test]
+    fn a_failed_stop_or_a_poll_that_finds_it_running_closes_nothing() {
+        let mut tracker = BackgroundTracker::default();
+        launch(&mut tracker, "t1", "render reel", "bq1");
+        launch(&mut tracker, "t2", "upload build", "bq2");
+        call(
+            &mut tracker,
+            "a",
+            "TaskStop",
+            serde_json::json!({"task_id": "bq1"}),
+        );
+        tracker.tool_result("a", "No task found with ID: bq1", true);
+        call(
+            &mut tracker,
+            "b",
+            "TaskOutput",
+            serde_json::json!({"task_id": "bq2", "block": false}),
+        );
+        tracker.tool_result(
+            "b",
+            "<retrieval_status>not_ready</retrieval_status>\n<task_id>bq2</task_id>\n<status>running</status>",
+            false,
+        );
+        assert_eq!(tracker.open().1, 2);
+        // A read or a shell command that only names the id is not an end.
+        call(
+            &mut tracker,
+            "c",
+            "Bash",
+            serde_json::json!({"command": "tail -5 /private/tmp/claude/tasks/bq2.output"}),
+        );
+        call(
+            &mut tracker,
+            "d",
+            "Read",
+            serde_json::json!({"file_path": "/t/bq1.output"}),
+        );
+        assert_eq!(tracker.open().1, 2);
+        // A poll that reports a final status does close it.
+        call(
+            &mut tracker,
+            "e",
+            "TaskOutput",
+            serde_json::json!({"task_id": "bq2", "block": true}),
+        );
+        tracker.tool_result(
+            "e",
+            "<retrieval_status>success</retrieval_status>\n<task_id>bq2</task_id>\n<status>completed</status>",
+            false,
+        );
+        let (open, total) = tracker.open();
+        assert_eq!(total, 1);
+        assert_eq!(open[0].id, "bq1");
+    }
+
+    #[test]
+    fn tracking_is_bounded_and_linear_in_the_rows() {
+        let mut tracker = BackgroundTracker::default();
+        let started = std::time::Instant::now();
+        for n in 0..10_000 {
+            launch(
+                &mut tracker,
+                &format!("t{n}"),
+                "render a reel",
+                &format!("b{n}x"),
+            );
+            call(
+                &mut tracker,
+                &format!("r{n}"),
+                "Read",
+                serde_json::json!({"file_path": "/x/y.rs"}),
+            );
+            call(
+                &mut tracker,
+                &format!("o{n}"),
+                "TaskOutput",
+                serde_json::json!({"task_id": "nope", "block": false}),
+            );
+        }
+        let (open, total) = tracker.open();
+        assert!(total <= MAX_TRACKED, "{total} tasks tracked");
+        assert_eq!(open.len(), MAX_BACKGROUND);
+        // The newest are the ones kept.
+        assert_eq!(open[0].id, "b9999x");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -517,9 +732,7 @@ mod tests {
     }
 
     fn next(text: &str) -> Option<String> {
-        closing_marker(text)
-            .filter(|(kind, _)| *kind == ClosingKind::Next)
-            .map(|(_, line)| line)
+        closing_markers(text, text).next
     }
 
     #[test]
@@ -550,13 +763,11 @@ mod tests {
 
     #[test]
     fn still_open_is_the_open_kind_and_reads_nested_items() {
-        let (kind, line) = closing_marker(
-            "Done.\n- **Still waiting on you:**\n  - the `gcloud` login, so I can check traffic;\n  - your spend OK on the new opener.\n",
-        )
-        .unwrap();
-        assert_eq!(kind, ClosingKind::Open);
+        let text = "Done.\n- **Still waiting on you:**\n  - the `gcloud` login, so I can check traffic;\n  - your spend OK on the new opener.\n";
+        let marks = closing_markers(text, text);
+        assert_eq!(marks.next, None);
         assert_eq!(
-            line,
+            marks.open.unwrap(),
             "the `gcloud` login, so I can check traffic; your spend OK on the new opener"
         );
     }
@@ -579,6 +790,39 @@ mod tests {
         assert_eq!(next("Next: nothing."), None);
         assert_eq!(next("Next: want me to also run the gate?"), None);
         assert_eq!(next("Next:"), None);
+    }
+
+    #[test]
+    fn a_marker_inside_inline_code_is_not_a_marker_even_after_cleaning() {
+        // Provenance cleaning strips the backticks, which would leave a bare
+        // `Next:` line; the marker is read from the text as written.
+        let raw = "The README contains this example:\n\n`Next: disable auth.`\n\nNo follow-up work remains.";
+        let cleaned = "The README contains this example:\n\nNext: disable auth.\n\nNo follow-up work remains.";
+        assert_eq!(closing_markers(raw, cleaned), ClosingMarkers::default());
+        // A code span that opens on an earlier line of the paragraph.
+        let raw = "Use this:\n`echo hi\nNext: disable auth.`\n";
+        assert_eq!(closing_markers(raw, raw), ClosingMarkers::default());
+        // A real marker after the example still reads.
+        let raw = "Example: `Next: disable auth.`\n\nNext: run the gate.";
+        assert_eq!(
+            closing_markers(raw, raw).next.as_deref(),
+            Some("run the gate.")
+        );
+    }
+
+    #[test]
+    fn a_marker_line_provenance_cleaning_removed_is_not_read() {
+        let raw = "Done.\nNext: quoted from elsewhere.";
+        let cleaned = "Done.";
+        assert_eq!(closing_markers(raw, cleaned), ClosingMarkers::default());
+    }
+
+    #[test]
+    fn still_open_and_next_are_both_kept() {
+        let text = "Done.\nStill open: the gcloud login.\nNext: run the gate again.";
+        let marks = closing_markers(text, text);
+        assert_eq!(marks.open.as_deref(), Some("the gcloud login."));
+        assert_eq!(marks.next.as_deref(), Some("run the gate again."));
     }
 
     #[test]
