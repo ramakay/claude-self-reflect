@@ -923,7 +923,8 @@ where
                 forwarded_note(raw_row).or_else(|| typed_prompt(val))
             {
                 if !sidechain && opening_seen != Some(true) {
-                    latest_ask = (!note).then(|| truncate_str(&prose, LATEST_ASK_MAX_BYTES).to_string());
+                    latest_ask =
+                        (!note).then(|| truncate_str(&prose, LATEST_ASK_MAX_BYTES).to_string());
                 }
                 if opening_seen != Some(true) && (note || is_task_prompt(&prose)) {
                     let sent_at = val
@@ -2620,7 +2621,10 @@ mod tests {
     #[test]
     fn a_success_said_under_an_earlier_task_does_not_close_the_session() {
         let ep = extract(&[
-            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_typed(
+                "Fix the login validation before the release",
+                "2026-10-21T10:00:00Z",
+            ),
             dur_timed(
                 serde_json::json!({"type": "assistant", "message": {
                     "content": [{"type": "text", "text": "Fixed. All tests pass."}],
@@ -2628,16 +2632,25 @@ mod tests {
                 }}),
                 "2026-10-21T10:02:00Z",
             ),
-            dur_typed("Now update the changelog for that fix", "2026-10-21T11:00:00Z"),
+            dur_typed(
+                "Now update the changelog for that fix",
+                "2026-10-21T11:00:00Z",
+            ),
             dur_result("changelog opened", false, "2026-10-21T11:01:00Z"),
         ]);
         assert!(!ep.closing_success, "the latest task has said nothing yet");
         assert_ne!(ep.outcome, "success");
         // The same words said under the closing task do count.
         let ep = extract(&[
-            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_typed(
+                "Fix the login validation before the release",
+                "2026-10-21T10:00:00Z",
+            ),
             dur_done("2026-10-21T10:02:00Z"),
-            dur_typed("Now update the changelog for that fix", "2026-10-21T11:00:00Z"),
+            dur_typed(
+                "Now update the changelog for that fix",
+                "2026-10-21T11:00:00Z",
+            ),
             dur_timed(
                 serde_json::json!({"type": "assistant", "message": {
                     "content": [{"type": "text", "text": "Done. The changelog is updated."}],
@@ -2653,7 +2666,10 @@ mod tests {
     #[test]
     fn the_task_dir_override_keeps_the_closing_tasks_success_not_the_sessions() {
         let mut ep = extract(&[
-            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_typed(
+                "Fix the login validation before the release",
+                "2026-10-21T10:00:00Z",
+            ),
             dur_timed(
                 serde_json::json!({"type": "assistant", "message": {
                     "content": [{"type": "text", "text": "Fixed. All tests pass."}],
@@ -2661,7 +2677,10 @@ mod tests {
                 }}),
                 "2026-10-21T10:02:00Z",
             ),
-            dur_typed("Now update the changelog for that fix", "2026-10-21T11:00:00Z"),
+            dur_typed(
+                "Now update the changelog for that fix",
+                "2026-10-21T11:00:00Z",
+            ),
             dur_result("changelog opened", false, "2026-10-21T11:01:00Z"),
         ]);
         // The session-wide `completed` still holds the early success.
@@ -2682,9 +2701,15 @@ mod tests {
     #[test]
     fn latest_ask_is_the_literal_last_typed_message_and_never_walks_back() {
         let ep = extract(&[
-            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_typed(
+                "Fix the login validation before the release",
+                "2026-10-21T10:00:00Z",
+            ),
             dur_done("2026-10-21T10:02:00Z"),
-            dur_typed("Why did the second worker finish so early", "2026-10-21T10:30:00Z"),
+            dur_typed(
+                "Why did the second worker finish so early",
+                "2026-10-21T10:30:00Z",
+            ),
             dur_done("2026-10-21T10:32:00Z"),
         ]);
         assert_eq!(
@@ -2693,7 +2718,10 @@ mod tests {
         );
         // An acknowledgement is still the last thing typed: no walking back.
         let ep = extract(&[
-            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_typed(
+                "Fix the login validation before the release",
+                "2026-10-21T10:00:00Z",
+            ),
             dur_done("2026-10-21T10:02:00Z"),
             dur_typed("ok go", "2026-10-21T10:30:00Z"),
         ]);
@@ -2703,7 +2731,10 @@ mod tests {
             "isSidechain": true, "message": {"content": "Summarize the diff for the agent"}});
         side["timestamp"] = serde_json::json!("2026-10-21T10:40:00Z");
         let ep = extract(&[
-            dur_typed("Fix the login validation before the release", "2026-10-21T10:00:00Z"),
+            dur_typed(
+                "Fix the login validation before the release",
+                "2026-10-21T10:00:00Z",
+            ),
             dur_done("2026-10-21T10:02:00Z"),
             side.to_string(),
             dur_result("done", false, "2026-10-21T10:41:00Z"),
@@ -2713,7 +2744,9 @@ mod tests {
             Some("Fix the login validation before the release")
         );
         // No typed row at all: nothing.
-        assert!(extract(&[dur_done("2026-10-21T10:02:00Z")]).latest_ask.is_none());
+        assert!(extract(&[dur_done("2026-10-21T10:02:00Z")])
+            .latest_ask
+            .is_none());
     }
 
     #[test]

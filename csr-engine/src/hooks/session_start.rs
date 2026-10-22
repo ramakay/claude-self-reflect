@@ -3559,7 +3559,8 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
             completions_untied: true,
         };
         // Same anchor: the fresher receipts are used.
-        let same = overlay_compact_snapshot(&ep, snapshot(Some("Fix the auth middleware regression.")));
+        let same =
+            overlay_compact_snapshot(&ep, snapshot(Some("Fix the auth middleware regression.")));
         assert_eq!(same.completions[0].receipt, "2222222");
         assert!(same.completions_untied);
         // A different anchor, or a snapshot that predates the field: the stored

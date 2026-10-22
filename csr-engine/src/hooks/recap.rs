@@ -120,7 +120,11 @@ pub fn compose_recap_with_deliveries(
     // line of the recap comes out exactly as it would without it.
     if let Some(then) = then_clause(ep) {
         if let Some(with) = compose_recap_inner(ep, feeds, age, Some(&then)) {
-            if with.text.split('\n').skip(1).eq(base.text.split('\n').skip(1))
+            if with
+                .text
+                .split('\n')
+                .skip(1)
+                .eq(base.text.split('\n').skip(1))
                 && with.corrections == base.corrections
             {
                 return Some(with);
@@ -564,23 +568,124 @@ const QUESTION_OPENERS: &[&str] = &[
 /// Verbs that open an instruction. Words that are just as often a noun
 /// ("work", "test", "plan") are left out on purpose.
 const COMMAND_OPENERS: &[&str] = &[
-    "fix", "add", "make", "build", "run", "show", "tell", "explain", "review", "update", "remove",
-    "delete", "create", "write", "implement", "verify", "find", "search", "try", "continue",
-    "proceed", "commit", "push", "merge", "install", "open", "read", "compare", "summarize",
-    "save", "rename", "enable", "disable", "investigate", "debug", "deploy", "ship", "revert",
-    "rebase", "refactor", "send", "share", "ask", "check", "pull", "restart", "retry", "rerun",
-    "see", "look", "list", "give", "get", "let", "set", "change", "move", "use", "stop", "start",
-    "kill", "clean", "double-check", "look",
+    "fix",
+    "add",
+    "make",
+    "build",
+    "run",
+    "show",
+    "tell",
+    "explain",
+    "review",
+    "update",
+    "remove",
+    "delete",
+    "create",
+    "write",
+    "implement",
+    "verify",
+    "find",
+    "search",
+    "try",
+    "continue",
+    "proceed",
+    "commit",
+    "push",
+    "merge",
+    "install",
+    "open",
+    "read",
+    "compare",
+    "summarize",
+    "save",
+    "rename",
+    "enable",
+    "disable",
+    "investigate",
+    "debug",
+    "deploy",
+    "ship",
+    "revert",
+    "rebase",
+    "refactor",
+    "send",
+    "share",
+    "ask",
+    "check",
+    "pull",
+    "restart",
+    "retry",
+    "rerun",
+    "see",
+    "look",
+    "list",
+    "give",
+    "get",
+    "let",
+    "set",
+    "change",
+    "move",
+    "use",
+    "stop",
+    "start",
+    "kill",
+    "clean",
+    "double-check",
+    "look",
 ];
 
 /// Words a command may be followed by: a determiner, pronoun, particle or
 /// wh-word. A noun phrase that happens to start with a command word ("Update
 /// available for the CLI", "Build passes now") has something else here.
 const COMMAND_FOLLOWERS: &[&str] = &[
-    "the", "a", "an", "this", "that", "these", "those", "it", "them", "me", "us", "my", "our",
-    "your", "its", "all", "every", "each", "any", "some", "up", "out", "on", "in", "into", "over",
-    "off", "back", "down", "for", "with", "from", "at", "to", "if", "whether", "what", "how",
-    "why", "where", "when", "which", "who", "both", "only", "everything", "anything", "again",
+    "the",
+    "a",
+    "an",
+    "this",
+    "that",
+    "these",
+    "those",
+    "it",
+    "them",
+    "me",
+    "us",
+    "my",
+    "our",
+    "your",
+    "its",
+    "all",
+    "every",
+    "each",
+    "any",
+    "some",
+    "up",
+    "out",
+    "on",
+    "in",
+    "into",
+    "over",
+    "off",
+    "back",
+    "down",
+    "for",
+    "with",
+    "from",
+    "at",
+    "to",
+    "if",
+    "whether",
+    "what",
+    "how",
+    "why",
+    "where",
+    "when",
+    "which",
+    "who",
+    "both",
+    "only",
+    "everything",
+    "anything",
+    "again",
 ];
 
 /// Leading words that carry no ask of their own: "ok so now fix the build".
@@ -626,7 +731,8 @@ pub(crate) fn is_request(text: &str) -> bool {
         return true;
     }
     if words.len() >= 4
-        && ((matches!(opener, "can" | "could" | "would" | "will") && matches!(second, "you" | "we"))
+        && ((matches!(opener, "can" | "could" | "would" | "will")
+            && matches!(second, "you" | "we"))
             || (matches!(opener, "i" | "we")
                 && matches!(second, "want" | "need")
                 && words.get(2).map(String::as_str) == Some("you")
@@ -1141,9 +1247,16 @@ mod tests {
         }
         // An acknowledgement, a remark and no ask at all: the recap is unchanged.
         let old = compose_recap(&episode(), &feeds, "3m ago").expect("recap");
-        for quiet in [Some("ok go"), Some("Work on the pane is finally finished"), None] {
+        for quiet in [
+            Some("ok go"),
+            Some("Work on the pane is finally finished"),
+            None,
+        ] {
             ep.latest_ask = quiet.map(str::to_string);
-            assert_eq!(compose_recap(&ep, &feeds, "3m ago").as_deref(), Some(old.as_str()));
+            assert_eq!(
+                compose_recap(&ep, &feeds, "3m ago").as_deref(),
+                Some(old.as_str())
+            );
         }
         // CSR's own text pasted back is not an ask.
         ep.latest_ask = Some(format!("Why did this repeat? {RECAP_SENTINEL}"));
