@@ -9,12 +9,13 @@
 //! format_search_results` and `format_why_labeled`), including a chunk-sized
 //! fragment cut anywhere inside it and the JSON-escaped form a wrapper leaves.
 //!
-//! Two strengths. [`is_csr_emission`] is exact: a complete search-result
-//! envelope, a `csr_why` result in its emitted shape, or a bare call marker.
-//! Import drops only those, so a quoted token or attribute in prose or code is
-//! never data loss. [`is_csr_tool_payload`] adds the density and fragment rules
-//! for search, which only ever re-orders: a chunk cut from the middle of an
-//! emission, or one row of a dump, sinks without being dropped.
+//! Search-side only. Import never calls this module: a tool result is dropped
+//! at import by the tool's name and nothing else, because a grammar match that
+//! is wrong there costs data. Search uses it to re-order, where a wrong verdict
+//! costs a rank. [`is_csr_tool_payload`] sinks a whole emission (a complete
+//! search-result envelope, a `csr_why` result in its emitted shape, a bare call
+//! marker) and text the grammar dominates, such as a chunk cut from the middle
+//! of an emission.
 //!
 //! A token can occur in prose, in source code and in a test that quotes the
 //! format, and a whole tool result (a `Read` of `format/mod.rs`, a diff) must
@@ -113,7 +114,7 @@ const FRAGMENT_SHARE_DENOM: usize = 4;
 /// Whether `text` is, whole, something CSR emitted: a complete search-result
 /// envelope, a `csr_why` result in its emitted shape, or the bare rendering of
 /// a CSR tool call. Nothing short of the whole emission qualifies.
-pub fn is_csr_emission(text: &str) -> bool {
+fn is_csr_emission(text: &str) -> bool {
     if text.len() < 12 {
         return false;
     }

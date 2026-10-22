@@ -12,7 +12,6 @@ pub mod provenance_backfill;
 mod provenance_matcher;
 pub(crate) mod queued_prompts;
 pub mod registry;
-mod script_calls;
 pub mod scrub;
 pub mod watcher;
 
@@ -1698,14 +1697,10 @@ fn sanitize_content(
                 }
             }
             Some("tool_result") => {
-                // Bound to a CSR call we dropped, or CSR's own output by its
-                // grammar: a script that ran the binary, or any tool whose call
-                // carries no CSR name, still hands the corpus CSR's output.
                 let is_csr_result = item
                     .get("tool_use_id")
                     .and_then(|value| value.as_str())
-                    .is_some_and(|id| sanitizer.suppressed_tool_use_ids.contains(id))
-                    || tool_result_is_csr_payload(&item);
+                    .is_some_and(|id| sanitizer.suppressed_tool_use_ids.contains(id));
                 if is_csr_result {
                     sanitizer.stats.csr_tool_blocks_suppressed += 1;
                     continue;
@@ -1967,37 +1962,10 @@ pub(crate) fn drops_as_marker_only(msg: &serde_json::Value, combined_text: &str)
         && is_marker_only_text(combined_text)
 }
 
-/// Whether a `tool_result` block's text is CSR's own search-result or
-/// `csr_why` output (see [`contamination::is_csr_emission`]): only a whole
-/// emission, never a result that merely holds a CSR token. The text is
-/// read whole, whatever shape the content takes (a string, or an array of text
-/// parts), so a payload wrapped in JSON by a script runner is still seen.
-fn tool_result_is_csr_payload(item: &serde_json::Value) -> bool {
-    match item.get("content") {
-        Some(serde_json::Value::String(text)) => contamination::is_csr_emission(text),
-        Some(other) if !other.is_null() => contamination::is_csr_emission(&other.to_string()),
-        _ => false,
-    }
-}
-
-/// Codex code mode runs every tool from one `exec` call whose input is
-/// JavaScript, so a CSR tool is called as `tools.mcp__claude_self_reflect__<tool>(...)`
-/// from inside a call named `exec`. The call and its output go together; the
-/// script's other output is lost with them, which is the price of the one
-/// structural signal there is.
-fn exec_script_calls_csr(item: &serde_json::Value, name: &str) -> bool {
-    name == "exec"
-        && item
-            .get("input")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(script_calls::script_calls_csr_tool)
-}
-
 pub(crate) fn is_csr_tool_use(item: &serde_json::Value, name: &str) -> bool {
     if name.starts_with("csr_")
         || name.starts_with("mcp__claude-self-reflect__")
         || name.starts_with("mcp__claude_self_reflect__")
-        || exec_script_calls_csr(item, name)
     {
         return true;
     }
@@ -3406,29 +3374,34 @@ mod tests {
         assert!(content.contains("KEPT FILE RESULT"));
     }
 
-    /// CSR's output reaches the corpus without a CSR tool name on the call: a
-    /// Bash run of the binary, a script, a paste. The result is dropped by its
-    /// grammar; a result that merely mentions the format is kept.
+    /// Import drops a tool result by the tool's name and nothing else. A result
+    /// that holds a complete search envelope plus the analysis of it is a
+    /// person's or Claude's own text and is imported intact.
     #[test]
-    fn csr_output_in_a_non_csr_tool_result_is_suppressed_by_its_grammar() {
+    fn a_tool_result_holding_an_envelope_and_analysis_is_imported_intact() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("csr-payload.jsonl");
-        let payload = "\u{1f3af} RESULTS: 5 matches (partial relevance, top score: 0.450)\n\u{26a1} PERFORMANCE: 6ms (1 collection searched)\n\n<search>\n  <summary count=\"5\" relevance=\"partial\" top-score=\"0.450\">\n    <preview>PAYLOAD BODY</preview>\n  </summary>\n  <meta>\n    <q>q</q>\n  </meta>\n  <results>\n    <r rank=\"1\">\n      <excerpt><![CDATA[PAYLOAD BODY]]></excerpt>\n    </r>\n  </results>\n</search>\n";
+        let path = dir.path().join("envelope-analysis.jsonl");
+        let envelope = "\u{1f3af} RESULTS: 1 matches (high relevance, top score: 0.900)\n\u{26a1} PERFORMANCE: 6ms (1 collection searched)\n\n<search>\n  <summary count=\"1\" relevance=\"high\" top-score=\"0.900\">\n    <preview>x</preview>\n  </summary>\n  <meta>\n    <q>q</q>\n  </meta>\n  <results>\n    <r rank=\"1\">\n      <excerpt><![CDATA[x]]></excerpt>\n    </r>\n  </results>\n</search>\n";
+        let result =
+            format!("{envelope}Decision: retain SQLite, because it removed the network hops.\n");
+        let bare = "[mcp__claude_self_reflect__csr_why]\nFix: use SQLite.";
+        let why =
+            "WHY: storage\n\nNo evidence chain found.\n\nRoot cause: migration 42 wrote the lock.";
         let lines = [
             serde_json::json!({
-                "type": "assistant",
-                "timestamp": "2026-10-08T12:00:00Z",
+                "type": "assistant", "timestamp": "2026-10-08T12:00:00Z",
                 "message": {"content": [
-                    {"type": "tool_use", "id": "bash-run", "name": "Bash", "input": {"command": "probe.sh"}},
-                    {"type": "tool_use", "id": "bash-grep", "name": "Bash", "input": {"command": "grep RESULTS src/format/mod.rs"}}
+                    {"type": "tool_use", "id": "a", "name": "Bash", "input": {"command": "probe.sh"}},
+                    {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "echo"}},
+                    {"type": "tool_use", "id": "c", "name": "Bash", "input": {"command": "why.sh"}}
                 ]}
             }),
             serde_json::json!({
-                "type": "user",
-                "timestamp": "2026-10-08T12:00:01Z",
+                "type": "user", "timestamp": "2026-10-08T12:00:01Z",
                 "message": {"content": [
-                    {"type": "tool_result", "tool_use_id": "bash-run", "content": payload},
-                    {"type": "tool_result", "tool_use_id": "bash-grep", "content": "src/format/mod.rs:413: the line that prints RESULTS: {} matches"}
+                    {"type": "tool_result", "tool_use_id": "a", "content": result},
+                    {"type": "tool_result", "tool_use_id": "b", "content": bare},
+                    {"type": "tool_result", "tool_use_id": "c", "content": why}
                 ]}
             }),
         ];
@@ -3442,18 +3415,16 @@ mod tests {
         )
         .unwrap();
         let parsed = parse_jsonl_file_with_stats(&path, "test").unwrap();
-        assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 1);
+        assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 0);
         let content = parsed
             .chunks
             .into_iter()
             .map(|chunk| chunk.content)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!content.contains("PAYLOAD BODY"), "{content}");
-        assert!(
-            content.contains("the line that prints RESULTS"),
-            "{content}"
-        );
+        assert!(content.contains("Decision: retain SQLite"), "{content}");
+        assert!(content.contains("Fix: use SQLite."), "{content}");
+        assert!(content.contains("Root cause: migration 42"), "{content}");
     }
 
     /// A pane-capture dump is search-side only: it sinks in ranking but import
@@ -3535,40 +3506,15 @@ mod tests {
                 .join("\n"),
         )
         .unwrap();
-        for (_, text) in &sources {
-            assert!(!contamination::is_csr_emission(text));
-        }
         let parsed = parse_jsonl_file_with_stats(&path, "test").unwrap();
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 0);
-    }
-
-    #[test]
-    fn a_codex_exec_script_that_calls_a_csr_tool_is_a_csr_tool_use() {
-        let script = |source: &str| serde_json::json!({"type": "tool_use", "id": "x", "name": "exec", "input": source});
-        for source in [
-            "text(await tools.mcp__claude_self_reflect__csr_reflect_on_past({query:\"q\",limit:3}));",
-            "const r = await tools.mcp__claude-self-reflect__csr_why({query:\"q\"});",
-            "await tools[\"mcp__claude_self_reflect__csr_why\"]({query:\"q\"})",
-        ] {
-            let item = script(source);
-            assert!(is_csr_tool_use(&item, "exec"), "{source}");
-        }
-        let other = script("text(await tools.exec_command({cmd:\"git status\"}));");
-        assert!(!is_csr_tool_use(&other, "exec"));
-        // Quoting the namespace is not calling it.
-        for source in [
-            "text(await tools.exec_command({cmd:\"rg 'tools.mcp__claude_self_reflect__' src\"}));",
-            "text(await tools.exec_command({cmd:\"rg tools.mcp__claude_self_reflect__csr_why src\"}));",
-            "// await tools.mcp__claude_self_reflect__csr_why({query:\"q\"})\ntext(await tools.exec_command({cmd:\"ls\"}));",
-            "const note = \"tools.mcp__claude_self_reflect__csr_why(\";",
-            "text(await tools.exec_command({cmd: \"rg -F 'await tools.mcp__claude_self_reflect__csr_why(' csr-engine/src\"}))",
-        ] {
-            let item = script(source);
-            assert!(!is_csr_tool_use(&item, "exec"), "{source}");
-        }
-        let bash = serde_json::json!({"type": "tool_use", "name": "Bash",
-            "input": "tools.mcp__claude_self_reflect__csr_why"});
-        assert!(!is_csr_tool_use(&bash, "Bash"));
+        let content = parsed
+            .chunks
+            .into_iter()
+            .map(|chunk| chunk.content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(content.contains("The parser fails on"), "{content}");
     }
 
     #[test]
