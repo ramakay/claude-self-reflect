@@ -1975,6 +1975,13 @@ fn loaded_job_matches(wanted: &AgentFacts, loaded: &LoadedJob) -> bool {
             .env
             .iter()
             .all(|(key, value)| loaded.env.get(key) == Some(value))
+        // A key the loaded job still has but the file no longer does is a
+        // difference too: only launchd's own keys and PATH may be extra.
+        && loaded.env.keys().all(|key| {
+            key == "PATH"
+                || LAUNCHD_INJECTED_ENV.contains(&key.as_str())
+                || wanted.env.contains_key(key)
+        })
 }
 
 /// A launchd agent file that runs `csr-engine daemon`.
@@ -4398,6 +4405,35 @@ esac
 </dict></plist>
 ";
         assert_eq!(run(bare), bare.replace("/old/place/csr-engine", engine));
+    }
+
+    #[test]
+    fn a_key_deleted_from_a_matching_file_reloads_the_job_that_still_has_it() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1")]);
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let before = std::fs::read_to_string(spec.plist_path()).unwrap();
+        // The file is edited to a valid generated plist without the switch;
+        // the job loaded earlier still has it.
+        let edited = before.replace(
+            "    <key>CSR_NO_DREAMING</key>\n    <string>1</string>\n",
+            "",
+        );
+        assert_ne!(edited, before);
+        std::fs::write(spec.plist_path(), &edited).unwrap();
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_of(&before, 77);
+
+        spec.env = Default::default();
+        install(&spec, &mut fake);
+        assert_eq!(std::fs::read_to_string(spec.plist_path()).unwrap(), edited);
+        assert!(
+            fake.calls.iter().any(|c| c.starts_with("bootout")),
+            "the loaded job kept the deleted switch: {:?}",
+            fake.calls
+        );
+        assert!(fake.calls.iter().any(|c| c.starts_with("bootstrap")));
     }
 
     #[test]
