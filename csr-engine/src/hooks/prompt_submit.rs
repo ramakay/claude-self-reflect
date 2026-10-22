@@ -2505,7 +2505,7 @@ fn statement_label() -> &'static regex::Regex {
     static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     PATTERN.get_or_init(|| {
         regex::Regex::new(
-            r"(?im)(?:^|[.!?][ \t]+)[ \t>*#|-]*(decisions?|decided|verdict|root cause|receipts?)\**[ \t]*:\**[ \t]*([^\n]*)",
+            r"(?im)(?:^|[.!?][ \t]+)[ \t>*#|+-]*(?:\d{1,3}[.)][ \t]+[ \t>*#|-]*)?(decisions?|decided|fixed|verdict|root cause|receipts?)\**[ \t]*:\**[ \t]*([^\n]*)",
         )
         .expect("statement label compiles")
     })
@@ -2520,17 +2520,40 @@ fn change_reference() -> &'static regex::Regex {
 }
 
 /// The line is a declaration or a statement of source, not a sentence: it ends
-/// the way source lines end (`{`, `;`, `,`), or what follows its label is one
-/// typed token (`Vec<Receipt>`, `Verdict::Ok`). Prose that quotes a call or a
-/// path inside a sentence is not source.
+/// in `{` or `;`, it is a field (`name: Type,` or `name = value,`), or what
+/// follows its label is one typed token (`Vec<Receipt>`, `Verdict::Ok`). Prose
+/// that quotes a call or a path inside a sentence is not source, and neither is
+/// a clause that ends in a comma because the sentence goes on.
 fn source_shaped(line: &str, tail: &str) -> bool {
-    if line.trim_end().ends_with(['{', ';', ',']) {
+    let line = line.trim_end();
+    if line.ends_with(['{', ';']) || (line.ends_with(',') && is_field(line)) {
         return true;
     }
     let token = tail.trim();
     !token.is_empty()
         && !token.contains(char::is_whitespace)
         && token.contains(['<', '>', '[', ']', '&', '*'])
+}
+
+/// `name: Type,` or `name = value,` (after any bullet, `pub` or label
+/// markup): a bare identifier, then a value that is one token or opens with a
+/// bracket, a reference or a generic. Words after the colon make it a clause.
+fn is_field(line: &str) -> bool {
+    let body = line
+        .trim_end_matches(',')
+        .trim_start_matches(|c: char| c.is_whitespace() || ">*#|+-".contains(c));
+    let body = body.strip_prefix("pub ").unwrap_or(body);
+    let Some(at) = body.find([':', '=']) else {
+        return false;
+    };
+    let (name, value) = (body[..at].trim().trim_matches('*'), body[at + 1..].trim());
+    let value = value.trim_start_matches(['=', ':', '*', ' ']);
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        && !value.is_empty()
+        && (!value.contains(char::is_whitespace) || value.starts_with(['[', '(', '&', '<']))
 }
 
 /// Words made of letters only (an apostrophe or hyphen inside is fine).
@@ -2985,6 +3008,50 @@ mod tests {
             "commit 3f9a2c1d4e5f60718293a4b5c6d7e8f901234567"
         ));
         assert!(is_tool_dump(Some(1.0), "    Merge PR #62"));
+    }
+
+    /// A prose line may end in a comma; only a field (`name: Type,` or
+    /// `name = value,`) is source.
+    #[test]
+    fn prose_ending_in_a_comma_is_still_a_statement() {
+        for kept in [
+            "Decision: keep the watcher running,\nthen seal the final chunk.",
+            "Decision: keep the watcher running,",
+            "- Root cause: the scorer returned early,\nso the match never ran.",
+        ] {
+            assert!(!is_tool_dump(Some(1.0), kept), "{kept}");
+        }
+        for dump in [
+            "decision: Option<Decision>,",
+            "    decision: bool,\n    retries: usize,",
+            "pub struct Log {\n    receipts: [u8; 32],\n}",
+            "Decision = Verdict::Ok,",
+            "verdict: &'static str,",
+        ] {
+            assert!(is_tool_dump(Some(1.0), dump), "{dump}");
+        }
+    }
+
+    /// A statement label may follow a markdown bullet or a list number.
+    #[test]
+    fn a_bulleted_or_numbered_label_is_a_statement() {
+        for kept in [
+            "- Fixed: the watcher now seals trailing chunks",
+            "* Decision: keep the 800ms budget because p95 never crossed it.",
+            "1. Verdict: the second option is faster and no less safe.",
+            "2) Root cause: the scorer returned a hardcoded timing value.",
+            "  - **Decision:** keep the label on the floor and filter on the share.",
+            "+ Receipts: 1440x2560, 60 fps, 5400 frames.",
+        ] {
+            assert!(!is_tool_dump(Some(1.0), kept), "{kept}");
+        }
+        for dump in [
+            "- decision: bool,",
+            "1. verdict: Verdict::Ok;",
+            "* fixed: Option<Fixed>,",
+        ] {
+            assert!(is_tool_dump(Some(1.0), dump), "{dump}");
+        }
     }
 
     /// The first fifteen candidates are all dumps: the report ranked below
