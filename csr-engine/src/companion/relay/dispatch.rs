@@ -20,7 +20,7 @@ use super::{
     session::{Ext, SessionRef, Sessions},
     timers::{HubTimers, TimerWork, Timers},
 };
-use crate::companion::store::Store;
+use crate::companion::{store::Store, wake};
 use anyhow::Result;
 use serde_json::{json, Map, Value};
 use std::{
@@ -28,9 +28,10 @@ use std::{
     fs::File,
     future::Future,
     io::Write,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
 };
 
@@ -427,6 +428,20 @@ pub struct App {
     warned: AtomicBool,
     timers: Arc<dyn Timers>,
     module: Arc<Mutex<Ext>>,
+    /// Where the panes of this relay's sessions keep their pid files. Unset: no pane is woken.
+    keep: OnceLock<PathBuf>,
+}
+
+/// A pane to wake once the hook that calls for it has been handled.
+struct Wake {
+    keep: PathBuf,
+    sid: String,
+    kind: wake::Kind,
+}
+impl Wake {
+    fn send(self) {
+        wake::notify(&self.keep, &self.sid, self.kind);
+    }
 }
 
 impl App {
@@ -449,6 +464,22 @@ impl App {
             table,
             events: AtomicU64::new(0),
             warned: AtomicBool::new(false),
+            keep: OnceLock::new(),
+        })
+    }
+
+    /// Wake the panes whose pid files are under `keep` when a hook changes what they show.
+    pub fn wake_panes_in(&self, keep: PathBuf) {
+        let _ = self.keep.set(keep);
+    }
+
+    fn wake_for(&self, path: &str, key: &str, sid: &str) -> Option<Wake> {
+        let keep = self.keep.get()?.clone();
+        let kind = wake::classify(path, key)?;
+        Some(Wake {
+            keep,
+            sid: sid.to_string(),
+            kind,
         })
     }
 
@@ -562,6 +593,7 @@ impl App {
         let Some(hook) = manifest::find(key) else {
             return json!({});
         };
+        let wake = self.wake_for("/event", key, &at.sid);
         if hook.shape == Shape::Start {
             if let Ok(mut session) = at.session.lock() {
                 session.interactive = e.get("isInteractive").and_then(Value::as_bool);
@@ -580,12 +612,20 @@ impl App {
                 Box::pin(async move {
                     // One host for the whole chain: its calls go out in the order the entries ran.
                     chain_event(hook.key, hook.shape, &entries, cx_of(host, ""), e).await;
+                    if let Some(wake) = wake {
+                        wake.send();
+                    }
                 })
             });
             return json!({});
         }
-        self.converse(hook.key, hook.shape, false, entries, e, None, at)
-            .await
+        let reply = self
+            .converse(hook.key, hook.shape, false, entries, e, None, at)
+            .await;
+        if let Some(wake) = wake {
+            wake.send();
+        }
+        reply
     }
 
     async fn after(&self, key: &str, result: Value, left: Option<Value>, at: Request) -> Value {
@@ -596,8 +636,14 @@ impl App {
         if entries.iter().all(|entry| entry.after.is_none()) {
             return json!({});
         }
-        self.converse(hook.key, hook.shape, true, entries, result, left, at)
-            .await
+        let wake = self.wake_for("/after", key, &at.sid);
+        let reply = self
+            .converse(hook.key, hook.shape, true, entries, result, left, at)
+            .await;
+        if let Some(wake) = wake {
+            wake.send();
+        }
+        reply
     }
 
     async fn press(&self, e: Value, at: Request) -> Value {
@@ -1739,5 +1785,97 @@ mod tests {
         assert_eq!(t.features("start")[0], "pane_cmd");
         assert_eq!(t.features("csr"), ["pane_cmd"]);
         assert_eq!(t.features("tool")[0], "touch");
+    }
+    /// A pane that took the relay's invitation: a child that would die of an uncaught SIGUSR1 and a
+    /// fresh pid file that says it catches them.
+    fn waking_pane(keep: &std::path::Path, sid: &str) -> std::process::Child {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::create_dir_all(keep.join("panes")).unwrap();
+        std::fs::write(
+            keep.join("panes").join(format!("{sid}.json")),
+            json!({ "pid": child.id(), "wake": 1 }).to_string(),
+        )
+        .unwrap();
+        child
+    }
+
+    async fn ended(child: &mut std::process::Child) -> bool {
+        for _ in 0..1000 {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_changes_the_pane_wakes_it_once_the_handler_has_run_and_the_rest_do_not() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let mark = ran.clone();
+        let mut t = Table::new();
+        t.on(
+            "stop",
+            "test",
+            handler(move |_, _| {
+                let mark = mark.clone();
+                async move {
+                    mark.store(true, Ordering::SeqCst);
+                    Ok(Reply::none())
+                }
+            }),
+        );
+        t.gate(
+            "tool",
+            "test",
+            handler(|_, _| async { Ok(Reply::none()) }),
+            handler(|_, _| async { Ok(Reply::none()) }),
+        );
+        let rig = rig(t);
+        let keep = rig._dir.path().join("keep");
+        rig.app.wake_panes_in(keep.clone());
+        let mut child = waking_pane(&keep, "s");
+        // Before a tool runs there is nothing new to show.
+        post(&rig.app, "/event", ev("s", "tool", json!({}))).await;
+        settle().await;
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "woken before the tool ran"
+        );
+        // Another session's hook does not reach this pane.
+        post(&rig.app, "/event", ev("other", "stop", json!({}))).await;
+        settle().await;
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "woken by another session"
+        );
+        post(&rig.app, "/event", ev("s", "stop", json!({}))).await;
+        assert!(ended(&mut child).await, "Stop wakes the pane");
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "the wake came after the handler ran"
+        );
+        // After a tool: the burst signal, SIGUSR2.
+        let mut child = waking_pane(&keep, "s");
+        let after = json!({ "sid": "s", "cwd": "/repo", "k": "tool", "id": "", "result": {} });
+        post(&rig.app, "/after", after).await;
+        assert!(ended(&mut child).await, "a finished tool wakes the pane");
+    }
+
+    #[tokio::test]
+    async fn a_relay_without_a_keep_directory_wakes_nobody() {
+        let mut t = Table::new();
+        t.on("stop", "test", handler(|_, _| async { Ok(Reply::none()) }));
+        let rig = rig(t);
+        let mut child = waking_pane(&rig._dir.path().join("keep"), "s");
+        post(&rig.app, "/event", ev("s", "stop", json!({}))).await;
+        settle().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(child.try_wait().unwrap().is_none());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

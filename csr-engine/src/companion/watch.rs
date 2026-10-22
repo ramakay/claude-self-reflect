@@ -7,6 +7,7 @@ use super::{
         kitty::{self, Drawn},
         text::{self, wrap},
     },
+    wake::{Debounce, Kind as WakeKind},
 };
 use crate::process::CommandDeadline;
 use crossterm::{
@@ -41,6 +42,15 @@ thread_local! {
 static ENDING: AtomicBool = AtomicBool::new(false);
 extern "C" fn ending(_: libc::c_int) {
     ENDING.store(true, Ordering::Relaxed);
+}
+/// The relay's wakes (`wake.rs`): `SIGUSR1` draws at once, `SIGUSR2` once a burst has gathered.
+static WAKE_NOW: AtomicBool = AtomicBool::new(false);
+static WAKE_SOON: AtomicBool = AtomicBool::new(false);
+extern "C" fn wake_now(_: libc::c_int) {
+    WAKE_NOW.store(true, Ordering::Relaxed);
+}
+extern "C" fn wake_soon(_: libc::c_int) {
+    WAKE_SOON.store(true, Ordering::Relaxed);
 }
 
 pub struct TerminalGuard {
@@ -85,8 +95,16 @@ struct Signals {
     old: [libc::sighandler_t; 2],
 }
 impl Signals {
+    /// Install the handlers. The wake signals kill a process that does not catch them, so these
+    /// go in before the pid file that invites them is written.
     fn install() -> Self {
         ENDING.store(false, Ordering::Relaxed);
+        WAKE_NOW.store(false, Ordering::Relaxed);
+        WAKE_SOON.store(false, Ordering::Relaxed);
+        unsafe {
+            libc::signal(libc::SIGUSR1, wake_now as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGUSR2, wake_soon as *const () as libc::sighandler_t);
+        }
         Self {
             old: unsafe {
                 [
@@ -96,6 +114,27 @@ impl Signals {
             },
         }
     }
+    /// Take the wakes that came since the last call.
+    fn woken() -> (bool, bool) {
+        (
+            WAKE_NOW.swap(false, Ordering::Relaxed),
+            WAKE_SOON.swap(false, Ordering::Relaxed),
+        )
+    }
+    /// Ignore the wakes: across an `exec` an ignored signal stays ignored, a caught one does not,
+    /// and the engine that takes over may be one that never heard of them.
+    fn ignore_wakes() {
+        unsafe {
+            libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+            libc::signal(libc::SIGUSR2, libc::SIG_IGN);
+        }
+    }
+    fn catch_wakes() {
+        unsafe {
+            libc::signal(libc::SIGUSR1, wake_now as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGUSR2, wake_soon as *const () as libc::sighandler_t);
+        }
+    }
 }
 impl Drop for Signals {
     fn drop(&mut self) {
@@ -103,6 +142,8 @@ impl Drop for Signals {
             libc::signal(libc::SIGTERM, self.old[0]);
             libc::signal(libc::SIGHUP, self.old[1]);
         }
+        // The pid file outlives these handlers by a moment: a late wake must not end the process.
+        Self::ignore_wakes();
     }
 }
 
@@ -179,13 +220,17 @@ struct PidFile {
     path: Option<PathBuf>,
 }
 impl PidFile {
-    fn new(paths: &Paths, sid: &str) -> io::Result<Self> {
+    /// `wake`: the handlers for the relay's wakes are in; the file says so, and only then does the
+    /// relay signal this pid.
+    fn new(paths: &Paths, sid: &str, wake: &Signals) -> io::Result<Self> {
+        let _ = wake;
         let path = paths.kept_file("panes", sid);
         if let Some(p) = &path {
             private::write_atomic(
                 p,
                 &json!({
                     "pid": std::process::id(),
+                    "wake": 1,
                 })
                 .to_string(),
                 &paths.keep,
@@ -437,13 +482,13 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let mut pane = Pane::new(paths.clone(), args);
     pane.enable_cards();
     pane.herdr = super::phone::Herdr::from_env(&paths.home);
-    let mine = PidFile::new(&paths, args.sid.as_deref().unwrap_or(""))?;
+    let signals = Signals::install();
+    let mine = PidFile::new(&paths, args.sid.as_deref().unwrap_or(""), &signals)?;
     let mut beat = Heartbeat::start(
         mine.path.clone(),
         Duration::from_secs(5),
         Duration::from_secs(120),
     );
-    let signals = Signals::install();
     let terminal = TerminalGuard::enter()?;
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -470,6 +515,7 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let mut last = Instant::now();
     let mut last_key = None;
     let mut restart_due = None;
+    let mut wake = Debounce::default();
     let result = (|| -> anyhow::Result<()> {
         while !ENDING.load(Ordering::Relaxed) {
             beat.alive();
@@ -502,10 +548,13 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                     TerminalGuard::restore();
                     reload_error = Some(failed_exec(
                         || {
-                            std::process::Command::new(&exe)
+                            Signals::ignore_wakes();
+                            let error = std::process::Command::new(&exe)
                                 .args(std::env::args_os().skip(1))
                                 .env(HOME_ENGINE, &home)
-                                .exec()
+                                .exec();
+                            Signals::catch_wakes();
+                            error
                         },
                         || terminal.resume(),
                     ));
@@ -517,6 +566,18 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
             }
             // The error card comes and goes with the reload's error: draw when it does.
             pressed |= reload_error != reloading;
+            // The relay says the session did something: draw when the debounce lets it.
+            let (now_wake, soon_wake) = Signals::woken();
+            if now_wake || soon_wake {
+                let at = Instant::now();
+                if now_wake {
+                    wake.signal(at, WakeKind::Now);
+                }
+                if soon_wake {
+                    wake.signal(at, WakeKind::Burst);
+                }
+            }
+            pressed |= wake.ready(Instant::now());
             // The Shift Map's hold is up and it folds: draw it now.
             pressed |= pane.map_wait(now).1;
             // A compaction ended: draw it now.
@@ -574,9 +635,15 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                 io::stdout().flush()?;
                 pressed = false;
                 last = Instant::now();
+                wake.drew(last);
             }
             recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
-            if terminal.raw && event::poll(Duration::from_millis(200))? {
+            // A wake that is waiting for its gathering or its spacing shortens the poll.
+            let wait = wake.next().map_or(Duration::from_millis(200), |at| {
+                at.saturating_duration_since(Instant::now())
+                    .clamp(Duration::from_millis(5), Duration::from_millis(200))
+            });
+            if terminal.raw && event::poll(wait)? {
                 recover_terminal(&epoch, &mut restored, &mut drawn, || terminal.resume())?;
                 match event::read()? {
                     Event::Resize(_, _) => {
@@ -635,7 +702,7 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                     _ => (),
                 }
             } else if !terminal.raw {
-                thread::sleep(Duration::from_millis(200));
+                thread::sleep(wait);
             }
         }
         Ok(())
@@ -903,7 +970,7 @@ mod failed_exec_tests {
     fn failed_exec_resumes_the_terminal_and_keeps_heartbeat_and_pid_ownership() {
         let d = tempfile::tempdir().unwrap();
         let paths = Paths::new(d.path().into());
-        let mine = PidFile::new(&paths, "s").unwrap();
+        let mine = PidFile::new(&paths, "s", &Signals::install()).unwrap();
         let path = mine.path.as_ref().unwrap().clone();
         let before = mtime(&path);
         let mut beat = Heartbeat::start(

@@ -358,6 +358,28 @@ fn terminal_session(reload: bool) {
     }
     assert!(pid.exists(), "watch created its pid file");
     std::thread::sleep(Duration::from_millis(100));
+    // The pid file invites the relay's wakes, and a pane that says so takes them all: a burst
+    // of both kinds neither ends it nor leaves it unable to answer SIGTERM later.
+    let kept: serde_json::Value = serde_json::from_slice(&fs::read(&pid).unwrap()).unwrap();
+    assert_eq!(kept["pid"], child_guard.0.id());
+    assert_eq!(kept["wake"], 1);
+    for _ in 0..50 {
+        assert!(csr_engine::companion::wake::notify(
+            &paths.keep,
+            "sess-now",
+            csr_engine::companion::wake::Kind::Now
+        ));
+        assert!(csr_engine::companion::wake::notify(
+            &paths.keep,
+            "sess-now",
+            csr_engine::companion::wake::Kind::Burst
+        ));
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        child_guard.0.try_wait().unwrap().is_none(),
+        "a burst of wakes must not end the pane"
+    );
     if reload {
         let old = fs::metadata(&pid).unwrap().modified().unwrap();
         let bad = paths.home.join("bad-engine");

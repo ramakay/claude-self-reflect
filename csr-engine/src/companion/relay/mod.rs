@@ -272,6 +272,7 @@ async fn run(args: &ServeArgs) -> Result<()> {
         Arc::new(log),
         default_table(),
     );
+    app.wake_panes_in(crate::companion::private::default_root());
 
     let stopped = stop_signals()?;
     {
