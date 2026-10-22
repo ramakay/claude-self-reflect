@@ -2305,6 +2305,12 @@ impl Storage {
         codegraph::upsert_file_state_pending(&conn, project, file, content_hash)
     }
 
+    /// Store one file's extraction atomically. See `codegraph::store_extraction`.
+    pub fn store_code_extraction(&self, x: &codegraph::Extraction<'_>) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        codegraph::store_extraction(&conn, x)
+    }
+
     /// Files an extraction changed that no resolve has covered yet.
     pub fn pending_resolve_files(&self) -> Result<Vec<(String, String, i64)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;

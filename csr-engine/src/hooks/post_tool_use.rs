@@ -305,38 +305,37 @@ fn update_code_graph_for(
 
     let storage = engine.storage();
     let source_chunk_id = storage.latest_chunk_id_for_conversation(&conv_id)?;
-    for node in &fragment.nodes {
-        let mut node = node.clone();
-        node.repo_root = repo_root.clone();
-        let changed = storage
-            .get_code_node(&node.id)?
-            .is_none_or(|stored| stored.body_hash != node.body_hash);
-        storage.upsert_code_node(&node)?;
-        if changed {
-            if let Some(chunk_id) = source_chunk_id.as_deref() {
-                storage.set_code_node_last_chunk(&node.id, chunk_id)?;
-            }
-        }
-    }
-    let seen_node_ids: Vec<String> = fragment.nodes.iter().map(|n| n.id.clone()).collect();
+    let nodes: Vec<crate::storage::codegraph::NodeRow> = fragment
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut n = n.clone();
+            n.repo_root = repo_root.clone();
+            n
+        })
+        .collect();
     // Only a CLEAN parse may drive the destructive half. A partial parse still
     // returns some valid definitions — `extract_graph_fragment` sets
     // `parse_clean = false` while `nodes` stays non-empty — and treating that
     // truncated view as authoritative would retire every symbol it failed to
     // see, taking each one's `code_node_attribution` provenance with it. Files
     // are routinely observed mid-edit, so this is a common path, not a corner
-    // case. Upserts above are additive and safe unconditionally; only
-    // retirement and edge replacement are gated. This is the same signal
-    // `eval::codegraph` and `import::backfill` already gate on.
-    if fragment.parse_clean {
-        storage.retire_missing_code_nodes(&project, &stored_path_str, &seen_node_ids)?;
-        storage.replace_code_file_edges(&project, &stored_path_str, &fragment.edges)?;
-    }
-
+    // case. Upserts are additive and safe unconditionally; only retirement and
+    // edge replacement are gated. This is the same signal `eval::codegraph` and
+    // `import::backfill` already gate on.
     let content_hash = crate::extraction::anchors::hash_normalized(&source);
-    // The last write of the extraction, and it queues the file for the daemon's
-    // project-wide resolve (bumps `graph_gen`) in the same statement.
-    storage.upsert_code_file_state_pending(&project, &stored_path_str, &content_hash)?;
+    // One transaction: the nodes, the retirement, the edge replacement and the
+    // `graph_gen` bump that queues the project-wide resolve for the drain
+    // (`extraction::graph_drain`). A kill between them can never leave new
+    // edges under a generation the drain already settled.
+    storage.store_code_extraction(&crate::storage::codegraph::Extraction {
+        project: &project,
+        file: &stored_path_str,
+        content_hash: &content_hash,
+        nodes: &nodes,
+        source_chunk_id: source_chunk_id.as_deref(),
+        edges: fragment.parse_clean.then_some(fragment.edges.as_slice()),
+    })?;
 
     eprintln!(
         "CSR: code graph updated for {} ({} nodes, {} edges)",
@@ -904,6 +903,60 @@ mod tests {
             .unwrap();
         assert_eq!(edges(&storage), (1, 1));
         assert!(storage.pending_resolve_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_extraction_that_dies_before_the_generation_bump_leaves_the_old_graph() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().canonicalize().unwrap().join("kill.rs");
+        std::fs::write(&file, "fn caller() { callee(); }\nfn callee() {}\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        let input = write_input(&file, Some("/Users/x/projects/my-repo"));
+        let calls = |storage: &crate::storage::Storage| -> Vec<String> {
+            storage
+                .with_connection(|c| {
+                    let mut stmt = c.prepare(
+                        "SELECT dst_id FROM code_edges WHERE kind = 'calls' ORDER BY dst_id",
+                    )?;
+                    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+                })
+                .unwrap()
+        };
+
+        // A settled file: extracted, drained, nothing pending.
+        update_code_graph_for(&input, &engine, &path, resolve_without_env).unwrap();
+        storage
+            .with_connection(|c| crate::extraction::graph_drain::drain(c, &|_: &str| true))
+            .unwrap();
+        assert!(storage.pending_resolve_files().unwrap().is_empty());
+        let settled = calls(&storage);
+        assert_eq!(settled.len(), 1);
+        assert!(!settled[0].starts_with("name:"), "bound by the drain");
+
+        // The process dies when it comes to the generation bump: an abort on
+        // that very write stands in for the kill.
+        storage
+            .with_connection(|c| {
+                c.execute_batch(
+                    "CREATE TRIGGER die_before_bump BEFORE UPDATE ON code_graph_file_state
+                     BEGIN SELECT RAISE(ABORT, 'killed'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        std::fs::write(&file, "fn caller() { other(); }\nfn other() {}\n").unwrap();
+        assert!(update_code_graph_for(&input, &engine, &path, resolve_without_env).is_err());
+
+        // Either the whole extraction landed and is queued, or none of it did.
+        // The old edges with nothing pending is the consistent "none of it".
+        let queued = !storage.pending_resolve_files().unwrap().is_empty();
+        let edges = calls(&storage);
+        assert!(
+            (queued && edges == ["name:other"]) || (!queued && edges == settled),
+            "new edges without a queued resolve: queued={queued} edges={edges:?}"
+        );
     }
 
     #[test]

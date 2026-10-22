@@ -241,7 +241,22 @@ pub fn replace_file_edges(
     src_file: &str,
     edges: &[EdgeRow],
 ) -> Result<()> {
+    in_tx(conn, |tx| replace_file_edges_in(tx, src_file, edges))
+}
+
+/// Run `f` in a transaction of its own, or inside the caller's when `conn`
+/// already has one open (so a caller can make several of these writes atomic).
+fn in_tx<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    if !conn.is_autocommit() {
+        return f(conn);
+    }
     let tx = conn.unchecked_transaction()?;
+    let out = f(&tx)?;
+    tx.commit()?;
+    Ok(out)
+}
+
+fn replace_file_edges_in(tx: &Connection, src_file: &str, edges: &[EdgeRow]) -> Result<()> {
     tx.execute(
         "DELETE FROM code_edges WHERE src_file = ?1",
         params![src_file],
@@ -270,7 +285,6 @@ pub fn replace_file_edges(
             ])?;
         }
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -346,20 +360,20 @@ pub fn retire_missing_nodes(
         return Ok(0);
     }
 
-    let tx = conn.unchecked_transaction()?;
-    for id in &stale_ids {
-        tx.execute("DELETE FROM code_node_rank WHERE node_id = ?1", params![id])?;
-        tx.execute(
-            "DELETE FROM code_node_attribution WHERE node_id = ?1",
-            params![id],
-        )?;
-        tx.execute(
-            "DELETE FROM code_nodes WHERE id = ?1 AND project = ?2 AND file = ?3",
-            params![id, project, file],
-        )?;
-    }
-    tx.commit()?;
-    Ok(stale_ids.len())
+    in_tx(conn, |tx| {
+        for id in &stale_ids {
+            tx.execute("DELETE FROM code_node_rank WHERE node_id = ?1", params![id])?;
+            tx.execute(
+                "DELETE FROM code_node_attribution WHERE node_id = ?1",
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM code_nodes WHERE id = ?1 AND project = ?2 AND file = ?3",
+                params![id, project, file],
+            )?;
+        }
+        Ok(stale_ids.len())
+    })
 }
 
 /// Definition sites for `name` within `project`: `(file, kind)`, deterministic order.
@@ -425,6 +439,46 @@ pub fn upsert_file_state_pending(
         params![project, file, content_hash],
     )?;
     Ok(())
+}
+
+/// One file's extraction, to be stored as a unit by [`store_extraction`].
+pub struct Extraction<'a> {
+    pub project: &'a str,
+    pub file: &'a str,
+    pub content_hash: &'a str,
+    /// Nodes the file defines now, already stamped with their repo root.
+    pub nodes: &'a [NodeRow],
+    /// The transcript chunk of the edit, to attribute changed nodes to.
+    pub source_chunk_id: Option<&'a str>,
+    /// Only a clean parse may retire nodes and replace edges; `None` for a
+    /// partial parse, which must leave both alone.
+    pub edges: Option<&'a [EdgeRow]>,
+}
+
+/// Store an extraction in ONE transaction: node upserts, retirement of the
+/// symbols the file lost, the file's edge replacement, and the `graph_gen`
+/// bump that queues the project-wide resolve. A process killed anywhere in it
+/// leaves the graph as it was before; there is no state with new edges and an
+/// unchanged generation.
+pub fn store_extraction(conn: &Connection, x: &Extraction<'_>) -> Result<()> {
+    in_tx(conn, |tx| {
+        for node in x.nodes {
+            let changed =
+                get_node(tx, &node.id)?.is_none_or(|stored| stored.body_hash != node.body_hash);
+            upsert_node(tx, node)?;
+            if changed {
+                if let Some(chunk_id) = x.source_chunk_id {
+                    set_last_chunk_id(tx, &node.id, chunk_id)?;
+                }
+            }
+        }
+        if let Some(edges) = x.edges {
+            let seen: Vec<String> = x.nodes.iter().map(|n| n.id.clone()).collect();
+            retire_missing_nodes(tx, x.project, x.file, &seen)?;
+            replace_file_edges(tx, x.project, x.file, edges)?;
+        }
+        upsert_file_state_pending(tx, x.project, x.file, x.content_hash)
+    })
 }
 
 /// Files whose edges changed since the last resolve that covered them:
