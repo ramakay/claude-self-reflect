@@ -139,14 +139,13 @@ pub fn compose_recap_with_deliveries(
     Some(base)
 }
 
-/// The episode as seen from the ask that drove the most work. The stored
-/// anchor is the first task of the session, which a long session has long
-/// left, and the latest typed ask is often a short remark. The head quotes the
-/// substantive ask whose turns held the most tool calls, edits and commits
-/// (`work_segment`), with the receipts made under it. The intent, the receipts
-/// tied to it and the untied flag move together. When no ask drove any work,
-/// and on an episode stored before the choice was recorded, the episode is
-/// returned as it was.
+/// The episode as seen from the session's latest substantive ask. The stored
+/// anchor is the first task of the session; the compact anchor is the latest
+/// typed ask with enough words to be a task, with its own receipts. Naming the
+/// first task of a long session as its intent misleads, so when the latest
+/// ask is usable the intent, the receipts tied to it and the untied flag all
+/// move to it together. Without a usable latest ask, or on a legacy episode
+/// that never recorded the tie, the episode is returned as it was.
 pub(crate) fn current_task_view(
     ep: &crate::hooks::stop::Episode,
 ) -> std::borrow::Cow<'_, crate::hooks::stop::Episode> {
@@ -154,7 +153,7 @@ pub(crate) fn current_task_view(
     if ep.recap_evidence_version.is_none() {
         return Cow::Borrowed(ep);
     }
-    let Some(anchor) = &ep.recap_extras.work_anchor else {
+    let Some(anchor) = &ep.compact_anchor else {
         return Cow::Borrowed(ep);
     };
     let Some(intent) = Some(&anchor.request)
@@ -540,8 +539,6 @@ pub(crate) fn compose_clear_handoff(ep: &crate::hooks::stop::Episode, age: &str)
     use crate::import::contamination::has_csr_text;
 
     const OPEN_MAX_CHARS: usize = 120;
-    let view = current_task_view(ep);
-    let ep = &*view;
     let intent = recap_intent(ep)?;
     let open = ep
         .todos
@@ -813,23 +810,13 @@ fn session_settled(ep: &crate::hooks::stop::Episode) -> Vec<String> {
             .filter_map(|(index, _)| own.get(index).map(|done| done.receipt.clone()))
             .collect()
     };
-    // The cap on what is displayed applies to what the head leaves out, so a
-    // head that carries the latest receipts does not hide the earlier ones.
-    // Only the strongest kind the session has: a task or todo never stands
-    // beside a commit.
-    let strongest = displayed_receipts(&ep.completions)
-        .first()
-        .and_then(|(index, _)| ep.completions.get(*index))
-        .map(|done| receipt_kind(&done.receipt));
-    let rest: Vec<crate::hooks::stop::CompletionReceipt> = ep
-        .completions
-        .iter()
-        .filter(|done| Some(receipt_kind(&done.receipt)) == strongest)
-        .filter(|done| !shown.contains(&done.receipt))
-        .cloned()
-        .collect();
-    displayed_receipts(&rest)
+    displayed_receipts(&ep.completions)
         .into_iter()
+        .filter(|(index, _)| {
+            ep.completions
+                .get(*index)
+                .is_some_and(|done| !shown.contains(&done.receipt))
+        })
         .map(|(_, entry)| entry)
         .collect()
 }
@@ -2938,9 +2925,7 @@ mod tests {
         );
         assert_eq!(
             got.lines().nth(1),
-            Some(
-                "Settled: fix(a): under an earlier ask (aaaaaaa); fix(c): under a later ask (ccccccc)."
-            )
+            Some("Settled: fix(c): under a later ask (ccccccc).")
         );
         // The anchor made none: the head says what was asked and nothing more.
         ep.anchor_receipts = Some(vec![]);
@@ -2967,11 +2952,7 @@ mod tests {
         ep.completions_untied = false;
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
         assert!(got.contains("(bbbbbbb); fix(c): under a later ask (ccccccc)"));
-        // The head carries the latest two; the third is a session fact.
-        assert_eq!(
-            got.lines().nth(1),
-            Some("Settled: fix(a): under an earlier ask (aaaaaaa).")
-        );
+        assert!(!got.contains("Settled:"), "{got}");
         // A task the session marked completed reads as the anchor's result.
         ep.completions = vec![done("Write regression tests", "task #3 completed")];
         ep.anchor_receipts = Some(vec![0]);
