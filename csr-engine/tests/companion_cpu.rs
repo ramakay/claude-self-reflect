@@ -467,3 +467,27 @@ fn a_story_lookup_is_remembered_until_the_database_moves() {
     db.remembered_query(sql, &params);
     assert_eq!(db.queries(), after_first + 2, "and not again");
 }
+
+/// The account's plan figures go away (an API key replaces the subscription): the transcripts'
+/// listing, which only a plan's week keeps, must not stay due in the past.
+#[test]
+fn a_pane_that_goes_from_plan_to_api_mode_is_quiet_again() {
+    let (_home, paths) = rich_home();
+    let mut pane = pane_in(&paths);
+    pane.frame(76, 67, NOW);
+    assert!(
+        pane.due(NOW + 60.1),
+        "in plan mode the listing is read again a minute on"
+    );
+    // The switch: no usage file carries a plan window any longer.
+    fs::remove_dir_all(paths.keep.join("usage")).unwrap();
+    pane.frame(76, 67, NOW + 70.);
+    // Far from the next minute edge (+120) and from the floor, nothing is due; before the fix the
+    // listing's old deadline (+60) stayed in the past and every check asked for a frame.
+    for at in [71., 75., 80., 90.] {
+        assert!(
+            !pane.due(NOW + at),
+            "API mode drew at +{at}: a stale deadline"
+        );
+    }
+}

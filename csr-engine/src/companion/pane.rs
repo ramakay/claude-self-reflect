@@ -1336,6 +1336,11 @@ impl Pane {
             if spend.ready && spend.start() == Some(start) {
                 spent = spend.total();
             }
+        } else {
+            // Only a plan's week is added up, and only a frame in plan mode steps the spend: left
+            // in place, its listing deadline would stay in the past and its unfinished work
+            // would keep the pane busy for good.
+            *spend_kept = None;
         }
         data["value"] = value::week_value(paths, &plan, &narrative, &spent);
         data["plan"] = plan;
