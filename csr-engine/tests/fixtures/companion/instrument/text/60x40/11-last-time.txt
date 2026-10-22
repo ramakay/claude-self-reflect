@@ -2,7 +2,7 @@
 dreamer 0 of 40k
 It asks a what-if from your past sessions.
 Last time here · 1h ago
-Make the companion readable: Restore footer labels
+Make the companion readable. Latest: Restore footer labels
 (abcdef1).
 Settled: Keep one layout owner (fedcba9).
 Now: Check device readability (commit acdc123).
