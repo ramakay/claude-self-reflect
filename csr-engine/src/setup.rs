@@ -1934,36 +1934,93 @@ fn agent_facts(plist: &PlistValue) -> AgentFacts {
     }
 }
 
-/// The two strings launchd reads to find the executable, with where each sits
-/// in the raw text so a repair can replace just those bytes.
+/// One of the strings launchd reads to find the executable.
+#[derive(Clone)]
+enum ProgramString {
+    /// Plain text in one run: decoded value and the byte range to splice.
+    Plain(String, std::ops::Range<usize>),
+    /// Empty, self-closing, or holding a comment, CDATA or other markup. It
+    /// cannot be spliced without parsing XML in full, so it is never edited.
+    /// The value is what it reads as, when that can be told.
+    Opaque(Option<String>),
+}
+
+impl ProgramString {
+    fn value(&self) -> Option<&str> {
+        match self {
+            ProgramString::Plain(value, _) => Some(value),
+            ProgramString::Opaque(value) => value.as_deref(),
+        }
+    }
+
+    /// Setup cannot tell what it names, or it names nothing that exists.
+    fn is_dead(&self) -> bool {
+        self.value().is_none_or(|v| !Path::new(v).exists())
+    }
+}
+
+/// What a string with markup in it reads as: comments dropped, CDATA taken
+/// literally, entities decoded. `None` for any other markup.
+fn read_marked_up(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(at) = rest.find('<') {
+        out.push_str(&xml_unescape(&rest[..at]));
+        rest = &rest[at..];
+        if let Some(body) = rest.strip_prefix("<!--") {
+            rest = &body[body.find("-->")? + 3..];
+        } else {
+            let body = rest.strip_prefix("<![CDATA[")?;
+            let end = body.find("]]>")?;
+            out.push_str(&body[..end]);
+            rest = &body[end + 3..];
+        }
+    }
+    out.push_str(&xml_unescape(rest));
+    Some(out)
+}
+
+/// The two strings launchd reads to find the executable.
 #[derive(Default)]
 struct ProgramSpans {
     /// The top-level `Program` string: the file launchd executes when present.
-    program: Option<(String, std::ops::Range<usize>)>,
+    program: Option<ProgramString>,
     /// The first string of the top-level `ProgramArguments` array.
-    first_arg: Option<(String, std::ops::Range<usize>)>,
+    first_arg: Option<ProgramString>,
 }
 
 /// Find `Program` and `ProgramArguments[0]` structurally: only keys that are
 /// direct children of the plist's top-level dict count, so a same-named key or
 /// an equal string inside EnvironmentVariables or any nested dict is never
-/// mistaken for them.
+/// mistaken for them. A string that is not plain text in one run is reported as
+/// opaque rather than parsed.
 fn plist_program_spans(text: &str) -> ProgramSpans {
     let tokens = plist_tokens(text);
     let offset = |s: &str| s.as_ptr() as usize - text.as_ptr() as usize;
-    // a `<string>` element at `at` (after whitespace): its text and byte range
-    let string_at = |mut at: usize| -> Option<(String, std::ops::Range<usize>)> {
+    // a `<string>` element at `at` (after whitespace)
+    let string_at = |mut at: usize| -> Option<ProgramString> {
         while tokens.get(at).is_some_and(|t| !t.0) {
             at += 1;
         }
-        let (true, "string") = *tokens.get(at)? else {
+        let &(true, tag) = tokens.get(at)? else {
             return None;
         };
-        let (false, content) = *tokens.get(at + 1)? else {
-            return None;
-        };
-        let start = offset(content);
-        Some((xml_unescape(content), start..start + content.len()))
+        match tag {
+            "string/" => Some(ProgramString::Opaque(Some(String::new()))),
+            "string" => {
+                let start = offset(tag) + tag.len() + 1; // past the '>'
+                let len = text[start..].find("</string>")?;
+                let raw = &text[start..start + len];
+                Some(if raw.is_empty() {
+                    ProgramString::Opaque(Some(String::new()))
+                } else if raw.contains('<') {
+                    ProgramString::Opaque(read_marked_up(raw))
+                } else {
+                    ProgramString::Plain(xml_unescape(raw), start..start + len)
+                })
+            }
+            _ => None,
+        }
     };
     let mut found = ProgramSpans::default();
     let mut at = 0;
@@ -2433,38 +2490,43 @@ fn apply_daemon_agent(
             // nothing was merged into a file we do not write
             notes.retain(|n| n.starts_with("Another agent"));
             let found = plist_program_spans(text);
-            let program_key = found.program.as_ref().map(|(value, _)| value.clone());
-            let first_arg = found.first_arg.as_ref().map(|(value, _)| value.clone());
             // launchd executes Program when there is one; otherwise argv[0].
             // Whatever it would run, if gone, is repaired in place, and a dead
             // argv[0] next to it is repaired with it. A live Program leaves a
             // stale argv[0] label alone: it does not stop the daemon starting.
-            let dead = |path: &Option<String>| {
-                path.as_deref().filter(|p| !Path::new(p).exists()).is_some()
-            };
-            let runs_dead = match &program_key {
-                Some(_) => dead(&program_key),
-                None => dead(&first_arg),
-            };
+            let runs_dead = found
+                .program
+                .as_ref()
+                .or(found.first_arg.as_ref())
+                .is_some_and(ProgramString::is_dead);
             if !runs_dead {
                 (true, text.to_owned())
             } else {
                 let engine = xml_escape(&spec.engine.to_string_lossy());
+                let mut targets: Vec<&ProgramString> = Vec::new();
+                targets.extend(found.program.as_ref());
+                targets.extend(found.first_arg.as_ref().filter(|a| a.is_dead()));
                 let mut spans = Vec::new();
-                let mut gone = Vec::new();
-                if let Some((value, span)) = found.program.clone() {
-                    spans.push(span);
-                    gone.push(value);
-                }
-                if dead(&first_arg) {
-                    if let Some((value, span)) = found.first_arg.clone() {
-                        spans.push(span);
-                        if !gone.contains(&value) {
-                            gone.push(value);
+                let mut gone: Vec<String> = Vec::new();
+                let mut opaque = false;
+                for target in targets {
+                    match target {
+                        ProgramString::Plain(value, span) => {
+                            spans.push(span.clone());
+                            if !gone.contains(value) {
+                                gone.push(value.clone());
+                            }
                         }
+                        ProgramString::Opaque(_) => opaque = true,
                     }
                 }
-                if spans.is_empty() {
+                if opaque {
+                    notes.push(format!(
+                        "Your agent {} ({}) points at a program that is gone, in a string setup will not edit in place (empty, a comment or CDATA). It is left untouched. Fix it by hand: set Program or the first ProgramArguments string to {}.",
+                        agent.label,
+                        plist.display(),
+                        spec.engine.display()
+                    ));
                     (true, text.to_owned())
                 } else {
                     notes.push(format!(
@@ -4500,6 +4562,104 @@ esac
                 "decoy:\n{decoy}"
             );
         }
+    }
+
+    #[test]
+    fn markup_inside_the_program_string_is_never_spliced() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let body = |program: &str, args0: &str| {
+            format!(
+                "<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+{program}
+  <key>ProgramArguments</key><array>
+    {args0}
+    <string>daemon</string>
+  </array>
+</dict></plist>
+"
+            )
+        };
+        let program = |inner: &str| format!("  <key>Program</key>{inner}");
+        let cases = [
+            body(
+                &program("<string>/missing/<!--c-->csr-engine</string>"),
+                "<string>/x</string>",
+            ),
+            body(
+                &program("<string><![CDATA[/old/place/csr-engine]]></string>"),
+                "<string>/x</string>",
+            ),
+            body(&program("<string></string>"), "<string>/x</string>"),
+            body(&program("<string/>"), "<string>/x</string>"),
+            // no Program: argv[0] is what launchd runs
+            body("", "<string>/missing/<!--c-->csr-engine</string>"),
+            body("", "<string><![CDATA[/old/place/csr-engine]]></string>"),
+            body("", "<string></string>"),
+            body("", "<string/>"),
+        ];
+        for theirs in cases {
+            std::fs::create_dir_all(spec.plist_path().parent().unwrap()).unwrap();
+            std::fs::write(spec.plist_path(), &theirs).unwrap();
+            let run = install_run(&spec, &mut FakeLaunchctl::new(false));
+            assert_eq!(run.outcome, DaemonOutcome::KeptExisting, "{theirs}");
+            assert_eq!(
+                std::fs::read_to_string(spec.plist_path()).unwrap(),
+                theirs,
+                "the file must be left untouched"
+            );
+            let said = run.notes.join("\n");
+            assert!(said.contains(DAEMON_LABEL), "{said}");
+            assert!(
+                said.contains(&spec.plist_path().display().to_string()),
+                "{said}"
+            );
+            assert!(said.contains("/opt/csr/bin/csr-engine"), "{said}");
+            assert!(said.contains("by hand"), "{said}");
+        }
+    }
+
+    #[test]
+    fn an_escaped_program_path_is_decoded_to_compare_and_encoded_on_write() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        let file = spec.plist_path();
+        let write = |text: &str| {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, text).unwrap();
+        };
+        let plist = |path: &str| {
+            format!(
+                "<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+  <key>Program</key><string>{path}</string>
+  <key>ProgramArguments</key><array><string>{path}</string><string>daemon</string></array>
+</dict></plist>
+"
+            )
+        };
+        // A live binary whose directory has an ampersand: decoded, it exists,
+        // so nothing is repaired.
+        let live = home.path().join("a&b");
+        std::fs::create_dir_all(&live).unwrap();
+        let exe = live.join("csr-engine");
+        std::fs::write(&exe, "x").unwrap();
+        let escaped = exe.to_string_lossy().replace('&', "&amp;");
+        let fine = plist(&escaped);
+        write(&fine);
+        install(&spec, &mut FakeLaunchctl::new(false));
+        assert_eq!(std::fs::read_to_string(spec.plist_path()).unwrap(), fine);
+
+        // A dead escaped path is repaired, and the new path is written encoded.
+        spec.engine = std::path::PathBuf::from("/opt/c&c/csr-engine");
+        write(&plist("/old/a&amp;b/csr-engine"));
+        let run = install_run(&spec, &mut FakeLaunchctl::new(false));
+        assert_eq!(
+            std::fs::read_to_string(spec.plist_path()).unwrap(),
+            plist("/opt/c&amp;c/csr-engine")
+        );
+        assert!(run.notes.join("\n").contains("/old/a&b/csr-engine"));
     }
 
     #[test]
