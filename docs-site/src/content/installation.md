@@ -27,6 +27,8 @@ Non-interactive installs (CI, scripts) never activate automatically. Control the
 | `CSR_SKIP_SETUP=1` | Download only, never run setup |
 | `CSR_NO_DAEMON=1` | Setup does not install or start the daemon (dreams and background enrichment then need `csr-engine daemon` run by hand) |
 
+launchd does not read your shell, so setup writes the daemon's settings into its agent file. Any other `CSR_*` variable you run setup with (for example `CSR_NO_DREAMING=1` or `CSR_NARRATIVE_MODEL`) is written into the agent, and anything an existing agent already had is kept; setup prints what it carried. A daemon agent you installed by hand under another label is adopted, not duplicated.
+
 ### npm
 
 ```bash
