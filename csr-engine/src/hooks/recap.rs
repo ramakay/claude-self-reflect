@@ -117,8 +117,6 @@ pub fn compose_recap_with_deliveries(
     feeds: &RecapFeeds,
     age: &str,
 ) -> Option<ComposedRecap> {
-    let view = current_task_view(ep);
-    let ep = &*view;
     let base = compose_recap_inner(ep, feeds, age, None)?;
     // The `Then:` clause is a pure addition: it is kept only when every other
     // line of the recap comes out exactly as it would without it.
@@ -137,37 +135,6 @@ pub fn compose_recap_with_deliveries(
         }
     }
     Some(base)
-}
-
-/// The episode as seen from the session's latest substantive ask. The stored
-/// anchor is the first task of the session; the compact anchor is the latest
-/// typed ask with enough words to be a task, with its own receipts. Naming the
-/// first task of a long session as its intent misleads, so when the latest
-/// ask is usable the intent, the receipts tied to it and the untied flag all
-/// move to it together. Without a usable latest ask, or on a legacy episode
-/// that never recorded the tie, the episode is returned as it was.
-pub(crate) fn current_task_view(
-    ep: &crate::hooks::stop::Episode,
-) -> std::borrow::Cow<'_, crate::hooks::stop::Episode> {
-    use std::borrow::Cow;
-    if ep.recap_evidence_version.is_none() {
-        return Cow::Borrowed(ep);
-    }
-    let Some(anchor) = &ep.compact_anchor else {
-        return Cow::Borrowed(ep);
-    };
-    let Some(intent) = Some(&anchor.request)
-        .filter(|request| !crate::import::contamination::has_csr_text(request))
-        .and_then(|request| anchor_intent(request))
-        .filter(|intent| !crate::import::contamination::has_csr_text(intent))
-    else {
-        return Cow::Borrowed(ep);
-    };
-    let mut current = ep.clone();
-    current.anchor_request = Some(intent);
-    current.completions_untied = anchor.completions_untied;
-    current.anchor_receipts = anchor.receipts.clone();
-    Cow::Owned(current)
 }
 
 fn compose_recap_inner(

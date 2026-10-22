@@ -3031,28 +3031,28 @@ mod tests {
     }
 
     #[test]
-    fn startup_resume_clear_name_the_latest_task_after_compact_capture() {
+    fn startup_resume_clear_keep_first_task_after_compact_capture() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
         std::env::remove_var("CSR_NO_RECAP");
         let ep = compact_episode(&[]);
         for source in ["startup", "resume", "clear"] {
             let block = compact_block(&ep, source, Some("s"));
             assert!(
-                block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[2])),
+                block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[0])),
                 "{source}: {block}"
             );
         }
     }
 
     #[test]
-    fn compact_different_or_missing_session_names_the_latest_task() {
+    fn compact_different_or_missing_session_keeps_first_task() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
         std::env::remove_var("CSR_NO_RECAP");
         let ep = compact_episode(&[]);
         for session in [Some("different"), None] {
             let block = compact_block(&ep, "compact", session);
             assert!(
-                block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[2])),
+                block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[0])),
                 "{block}"
             );
         }

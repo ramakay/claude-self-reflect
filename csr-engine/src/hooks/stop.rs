@@ -5090,7 +5090,7 @@ mod tests {
     }
 
     #[test]
-    fn recap_for_the_live_garble_shape_names_the_latest_task_and_no_prose() {
+    fn recap_for_the_live_garble_shape_names_the_whole_first_task_and_no_prose() {
         let ep = extract(&multi_topic_session());
         let got = crate::hooks::recap::compose_recap(
             &ep,
@@ -5105,17 +5105,11 @@ mod tests {
             "3h ago",
         )
         .unwrap();
-        // The latest substantive ask is the intent; the first topic's commit is
-        // a session fact on its own line, never this ask's result.
-        let head = got.lines().next().unwrap_or_default();
-        assert!(
-            head.starts_with("recap [3h ago]: How do we show cost as % of max plan"),
-            "{got}"
-        );
-        assert!(!head.contains("0aa11bb"), "{got}");
-        assert!(
-            got.contains("Settled: feat(pane): first topic commit (0aa11bb)"),
-            "{got}"
+        assert_eq!(
+            got,
+            "recap [3h ago]: anthropics codemod, when github links are bought up or disccussed, \
+             can present a side pane (enhanced for herdr users) - thoughts? \
+             Latest: feat(pane): first topic commit (0aa11bb). [[CSR:RECAP]]"
         );
         assert!(!got.contains("How the share works"));
     }
@@ -5569,7 +5563,7 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_is_shown_beside_the_ask_it_was_made_under_and_not_the_other() {
+    fn a_commit_made_under_a_later_ask_is_not_shown_beside_the_earlier_one() {
         let ep = extract(&[
             typed_line("run the release checks and report", "typed"),
             assistant_stop_line("The checks pass.", "end_turn"),
@@ -5586,48 +5580,20 @@ mod tests {
             ep.completions,
             vec![receipt("fix(daemon): stale lock", "1a2b3c4")]
         );
-        // The first ask owns no receipt; the latest ask owns the commit.
         assert_eq!(ep.anchor_receipts, Some(vec![]));
-        assert_eq!(
-            ep.compact_anchor.as_ref().and_then(|a| a.receipts.clone()),
-            Some(vec![0])
-        );
         let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
         let head = got.lines().next().unwrap_or_default();
+        assert!(head.starts_with("recap [now]: run the release checks and report."));
+        assert!(!head.contains("1a2b3c4"), "{got}");
+        // The commit is session evidence and is shown on its own Settled line.
         assert!(
-            head.starts_with("recap [now]: now land the fix for the stale lock in the daemon"),
+            got.contains("Settled: fix(daemon): stale lock (1a2b3c4)"),
             "{got}"
         );
-        assert!(head.contains("fix(daemon): stale lock (1a2b3c4)"), "{got}");
-        assert!(!got.contains("release checks"), "{got}");
         // The commit stays on the episode for the companion's own reading.
         assert_eq!(
             crate::hooks::recap::displayed_receipts(&ep.completions).len(),
             1
-        );
-    }
-
-    #[test]
-    fn a_commit_made_under_the_earlier_ask_is_settled_not_the_latest_asks_result() {
-        let ep = extract(&[
-            typed_line("land the fix for the stale lock in the daemon", "typed"),
-            assistant_named_tool(
-                "Bash",
-                "c",
-                serde_json::json!({"command": "git commit -m 'fix(daemon): stale lock'"}),
-            ),
-            tool_result_bound("c", "[main 1a2b3c4] fix(daemon): stale lock"),
-            assistant_stop_line("Committed.", "end_turn"),
-            typed_line("now explain how the watcher seals a conversation", "typed"),
-            assistant_stop_line("It seals on the next idle tick.", "end_turn"),
-        ]);
-        let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
-        let head = got.lines().next().unwrap_or_default();
-        assert!(head.contains("explain how the watcher seals"), "{got}");
-        assert!(!head.contains("1a2b3c4"), "{got}");
-        assert!(
-            got.contains("Settled: fix(daemon): stale lock (1a2b3c4)"),
-            "{got}"
         );
     }
 
