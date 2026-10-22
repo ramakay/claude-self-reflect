@@ -907,7 +907,7 @@ impl<'a> Pump<'a> {
         // own tick.
         match self
             .storage
-            .with_connection(crate::extraction::graph_catchup::run)
+            .with_connection(|conn| crate::extraction::graph_catchup::run(conn))
         {
             Ok(0) => {}
             Ok(n) => ctx.log(&format!("graph catch-up files={n}")),
