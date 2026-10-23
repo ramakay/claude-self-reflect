@@ -95,14 +95,32 @@ fn instrument_png(
         pane.theme = theme;
         pane.pixels = true;
         pane.enable_cards();
+        // The first frame gives the keys what they act on, as a running pane has.
+        pane.frame(cols, rows, now);
         // CSR_PANE_KEYS="t" or "1,2": keys pressed before the frame, so a drill-down or a popup
-        // can be rendered from the real data.
+        // can be rendered from the real data. "@observe:2:0" clicks the row of that act, found on
+        // the frame the pane drew, as a mouse click would.
         for key in std::env::var("CSR_PANE_KEYS")
             .unwrap_or_default()
             .split([',', ' '])
             .filter(|key| !key.is_empty())
         {
-            pane.key(key);
+            if let Some(act) = key.strip_prefix('@') {
+                pane.frame(cols, rows, now);
+                let row = pane
+                    .acts
+                    .iter()
+                    .find(|(_, a)| a["key"] == act)
+                    .map(|(row, _)| *row);
+                match row {
+                    Some(row) => {
+                        pane.click(row, 2, now);
+                    }
+                    None => eprintln!("no row answers {act}"),
+                }
+            } else {
+                pane.key(key);
+            }
         }
         let lines = pane.frame(cols, rows, now);
         let image = compose(&lines, &pane.placed, cols, rows, cell, theme)?;

@@ -599,6 +599,20 @@ pub struct Canvas {
     pub output_scale: f32,
     pub quota_gauges: Vec<QuotaGauge>,
     pub fresh_plots: Vec<FreshPlot>,
+    /// Every row drawn with a trailing "…": where it sits and its words in full.
+    pub cuts: Vec<Cut>,
+    /// What the next cut rows are called in their popup. Empty: do not record them.
+    pub cut_title: &'static str,
+}
+
+/// One row the picture drew shortened, so a click on it can show the whole text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cut {
+    /// Baseline and size of the row, in layout points.
+    pub y: f32,
+    pub size: f32,
+    pub title: &'static str,
+    pub full: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -858,6 +872,8 @@ impl Canvas {
             output_scale: S,
             quota_gauges: Vec::new(),
             fresh_plots: Vec::new(),
+            cuts: Vec::new(),
+            cut_title: "In full",
         }
     }
     pub fn dry() -> Canvas {
@@ -867,6 +883,8 @@ impl Canvas {
             output_scale: S,
             quota_gauges: Vec::new(),
             fresh_plots: Vec::new(),
+            cuts: Vec::new(),
+            cut_title: "In full",
         }
     }
     pub fn fill(&mut self, p: &Path, col: Rgba) {
@@ -1261,6 +1279,8 @@ pub fn contact(f: &Fonts, tiles: &[(String, Pixmap, String)], path: &str, bg: Rg
         output_scale: S,
         quota_gauges: Vec::new(),
         fresh_plots: Vec::new(),
+        cuts: Vec::new(),
+        cut_title: "",
     };
     c.pm.fill(color(bg));
     let mut y = gap;

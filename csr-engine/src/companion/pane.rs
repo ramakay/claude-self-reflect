@@ -190,6 +190,7 @@ struct Instrument {
     placed: Vec<super::render::kitty::Placement>,
     acts: BTreeMap<usize, Value>,
     metrics: Option<super::render::instrument::Metrics>,
+    more: Vec<Value>,
 }
 /// Account reads borrowed while the session is also borrowed.
 struct Wide<'a> {
@@ -262,7 +263,10 @@ pub struct Pane {
     /// places) and whether its text was just copied.
     popup: Option<(ObsCard, String, bool)>,
     /// The lines of each observation card at the last frame, `[confusing, should_be]`.
-    obs_lines: [Vec<String>; 2],
+    obs_lines: [Vec<String>; 3],
+    /// The rows the last frame drew with a trailing "…", each `{title, line}` in full: what a click
+    /// on such a row opens.
+    more: Vec<Value>,
     /// What `c` copies for the popup at the last frame.
     popup_copy: Option<String>,
     /// Text for the watch loop to put on the clipboard.
@@ -351,6 +355,7 @@ impl Pane {
             offer_notice: None,
             popup: None,
             obs_lines: Default::default(),
+            more: vec![],
             popup_copy: None,
             copy_out: None,
             instrument_kept: None,
@@ -933,13 +938,32 @@ impl Pane {
     ) -> Vec<String> {
         use super::render::{instrument, raster, text};
         self.instrument_metrics = None;
-        self.obs_lines = [ObsCard::Confusing, ObsCard::ShouldBe].map(|card| {
+        self.obs_lines = [ObsCard::Confusing, ObsCard::ShouldBe, ObsCard::More].map(|card| {
+            if card == ObsCard::More {
+                return self
+                    .more
+                    .iter()
+                    .map(|i| string(&i["line"]).to_owned())
+                    .collect();
+            }
             composition
                 .items(card)
                 .iter()
                 .map(|i| string(&i["line"]).to_owned())
                 .collect()
         });
+        // A popup on a shortened row reads the rows the frame under it drew.
+        let with_more;
+        let composition = if self.popup.as_ref().is_some_and(|p| p.0 == ObsCard::More) {
+            with_more = {
+                let mut c = composition.clone();
+                c.more = self.more.clone();
+                c
+            };
+            &with_more
+        } else {
+            composition
+        };
         let mut open = self.instrument_open;
         open.popup = None;
         self.popup_copy = None;
@@ -976,6 +1000,9 @@ impl Pane {
             self.acts = kept.acts.clone();
             self.placed = kept.placed.clone();
             self.instrument_metrics = kept.metrics.clone();
+            if open.popup.is_none() {
+                self.more = kept.more.clone();
+            }
             self.pill = None;
             self.reused += 1;
             return kept.rows.clone();
@@ -1007,16 +1034,33 @@ impl Pane {
             }
         }
         self.pill = None;
+        // Every wrapped row of an observation opens it, not only its first.
+        let mut more: Vec<Value> = vec![];
         for (card, should) in [(ObsCard::Confusing, false), (ObsCard::ShouldBe, true)] {
-            for (index, item) in composition.items(card).iter().enumerate() {
+            let items = composition.items(card);
+            let fold = instrument::fold_row(card.title(), items.len());
+            if let Some(row) = semantic.iter().position(|l| *l == fold) {
+                for r in row..row + text::wrap(&fold, cols.max(1), 1000).len() {
+                    self.acts
+                        .insert(r, json!({"key": format!("observe:{}:0", card as usize)}));
+                }
+                continue;
+            }
+            for (index, item) in items.iter().enumerate() {
                 let text = instrument::observation_text(item, should);
-                let first = text::wrap(&text, cols.max(1), 1000).into_iter().next();
-                if let Some(row) = first.and_then(|first| semantic.iter().position(|l| *l == first))
+                let wrapped = text::wrap(&text, cols.max(1), 1000);
+                if let Some(row) = wrapped
+                    .first()
+                    .and_then(|first| semantic.iter().position(|l| l == first))
                 {
-                    self.acts.insert(
-                        row,
-                        json!({"key": format!("observe:{}:{index}", card as usize)}),
-                    );
+                    for (offset, line) in wrapped.iter().enumerate() {
+                        if semantic.get(row + offset) == Some(line) {
+                            self.acts.insert(
+                                row + offset,
+                                json!({"key": format!("observe:{}:{index}", card as usize)}),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1029,6 +1073,37 @@ impl Pane {
                 self.acts.insert(row, json!({"key":"instrument:agents"}));
             } else if line.contains("CTX ") {
                 self.acts.insert(row, json!({"key":"instrument:figure"}));
+            }
+        }
+        // An open figure lists its facts a row each; every row of the list is the figure's.
+        if open.figure {
+            let rows_of = instrument::figure_text_rows(composition, cols, true);
+            if let Some(row) = rows_of
+                .first()
+                .and_then(|first| semantic.iter().position(|l| l == first))
+            {
+                for (offset, line) in rows_of.iter().enumerate() {
+                    if semantic.get(row + offset) == Some(line) {
+                        self.acts
+                            .insert(row + offset, json!({"key":"instrument:figure"}));
+                    }
+                }
+            }
+        }
+        // A story cut at a clause shows its "…": every row of it opens the whole story.
+        if let Some((lines, full)) = instrument::text_story_cut(composition, cols) {
+            let item = json!({"title": "Where the work stands", "line": full});
+            if let Some(row) = lines
+                .first()
+                .and_then(|first| semantic.iter().position(|l| l == first))
+            {
+                more.push(item);
+                for (offset, line) in lines.iter().enumerate() {
+                    if semantic.get(row + offset) == Some(line) {
+                        self.acts
+                            .insert(row + offset, json!({"key": "observe:2:0"}));
+                    }
+                }
             }
         }
         let mut out = semantic;
@@ -1103,11 +1178,29 @@ impl Pane {
                     {
                         self.acts.insert(row, json!({"key":"instrument:figure"}));
                     }
+                    // Every row drawn with a trailing "…" opens its words in full.
+                    more.clear();
+                    for cut in &metrics.cuts {
+                        let item = json!({"title": cut.title, "line": cut.full});
+                        let index = more.iter().position(|m| *m == item).unwrap_or_else(|| {
+                            more.push(item);
+                            more.len() - 1
+                        });
+                        for row in to_row(cut.y - cut.size)..=to_row(cut.y + cut.size * 0.3) {
+                            self.acts
+                                .insert(row, json!({"key": format!("observe:2:{index}")}));
+                        }
+                    }
+                    // A row of text spans more than one terminal row on small cells: the whole
+                    // line is the target.
+                    let half = super::render::theme::BODY_LINE / 2. - 0.5;
                     for (card, index, y) in &metrics.observation_rows {
-                        self.acts.insert(
-                            to_row(*y),
-                            json!({"key": format!("observe:{}:{index}", *card as usize)}),
-                        );
+                        for row in to_row(*y - half)..=to_row(*y + half) {
+                            self.acts.insert(
+                                row,
+                                json!({"key": format!("observe:{}:{index}", *card as usize)}),
+                            );
+                        }
                     }
                     if let (Some(mut answer), Some(y)) = (answer, metrics.answer_y) {
                         answer["spans"] = json!(metrics
@@ -1142,6 +1235,9 @@ impl Pane {
                     }
                 }
             }
+        }
+        if open.popup.is_none() {
+            self.more = more;
         }
         if open.popup.is_some() {
             // Only the popup's own footer answers while it is up.
@@ -1302,6 +1398,7 @@ impl Pane {
             placed: self.placed.clone(),
             acts: self.acts.clone(),
             metrics: self.instrument_metrics.clone(),
+            more: self.more.clone(),
         });
         out
     }
@@ -1593,7 +1690,7 @@ impl Pane {
                 self.open_observation(card, to);
             }
             "tab" => {
-                if !self.obs_lines[card.other() as usize].is_empty() {
+                if card != ObsCard::More && !self.obs_lines[card.other() as usize].is_empty() {
                     self.open_observation(card.other(), 0);
                 }
             }
@@ -1874,10 +1971,10 @@ impl Pane {
                 Some((card.parse::<usize>().ok()?, index.parse::<usize>().ok()?))
             })
         {
-            let card = if card == 0 {
-                ObsCard::Confusing
-            } else {
-                ObsCard::ShouldBe
+            let card = match card {
+                0 => ObsCard::Confusing,
+                1 => ObsCard::ShouldBe,
+                _ => ObsCard::More,
             };
             self.open_observation(card, index);
             return true;

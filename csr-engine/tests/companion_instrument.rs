@@ -2208,12 +2208,18 @@ fn the_popup_repaints_once_on_open_and_once_on_close() {
         .observation_rows
         .len();
     assert_eq!(places, 5);
-    let first = pane
+    // Five items, seven rows: every drawn row of an item answers a click.
+    let keys: Vec<&str> = pane
         .acts
         .values()
-        .filter(|a| string(&a["key"]).starts_with("observe:"))
-        .count();
-    assert_eq!(first, 5, "{:?}", pane.acts);
+        .map(|a| string(&a["key"]))
+        .filter(|k| k.starts_with("observe:"))
+        .collect();
+    assert_eq!(keys.len(), 7, "{:?}", pane.acts);
+    let mut distinct = keys.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 5, "{:?}", pane.acts);
     // Opening changes the picture once; the same popup frame again changes nothing.
     pane.key("o");
     let (written, open) = shot(&mut pane);
@@ -2250,6 +2256,120 @@ fn the_popup_repaints_once_on_open_and_once_on_close() {
     assert_ne!(popup, closed);
     let metrics = pane.instrument_metrics.as_ref().unwrap();
     assert!(metrics.observation_rows.iter().any(|r| r.1 == 1));
+}
+
+#[test]
+fn every_wrapped_row_of_an_observation_opens_it_in_the_text_pane() {
+    let (_home, paths) = observed_home();
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 30, 60));
+    let rows = plain_rows(&mut pane, 30, 60);
+    let first = row_of(&rows, "Repeated the rejected");
+    // The item wraps onto a second row at 30 columns; that row answers too.
+    assert!(!rows[first + 1].is_empty(), "{rows:#?}");
+    assert_eq!(pane.acts[&first]["key"], pane.acts[&(first + 1)]["key"]);
+    assert!(pane.click(first + 1, 3, NOW));
+    let shown = plain_rows(&mut pane, 30, 60);
+    assert!(
+        first_row(&shown).starts_with("Confused Claude"),
+        "{shown:#?}"
+    );
+}
+
+#[test]
+fn l_t_and_i_each_change_the_picture_through_the_keys_the_footer_names() {
+    use csr_engine::companion::render::kitty;
+    for (cols, rows) in [(40, 50), (76, 67)] {
+        let (_home, paths) = observed_home();
+        let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+        pane.pixels = true;
+        pane.enable_cards();
+        let shot = |pane: &mut Pane| {
+            pane.frame(cols, rows, NOW);
+            kitty::bands(&pane.placed)
+        };
+        let closed = shot(&mut pane);
+        assert!(!closed.is_empty(), "{cols}x{rows}: a picture");
+        for key in ["l", "t", "i"] {
+            pane.key(key);
+            let open = shot(&mut pane);
+            assert_ne!(open, closed, "{cols}x{rows}: {key} changes the picture");
+            let m = pane.instrument_metrics.as_ref().unwrap();
+            match key {
+                "i" => assert!(m.figure_detail_region.is_some(), "{cols}x{rows}"),
+                _ => assert!(m.drill_region.is_some(), "{cols}x{rows}: {key} got a card"),
+            }
+            pane.key(key);
+            assert_eq!(
+                shot(&mut pane),
+                closed,
+                "{cols}x{rows}: {key} again closes it"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_row_the_picture_cut_opens_its_words_in_full_on_click() {
+    let (_home, paths) = state_home("02-running");
+    // One change whose words are longer than any row of the picture.
+    let con = rusqlite::Connection::open(&paths.db).unwrap();
+    let raw: String = con
+        .query_row(
+            "SELECT value FROM meta WHERE key='story_map:sess-now'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut map: Value = serde_json::from_str(&raw).unwrap();
+    // First, so the story card (which shows three) draws it.
+    map["current"]["entries"].as_array_mut().unwrap().insert(0, json!({
+        "kind":"added","claim":"Long change",
+        "now":"The pane now keeps every changed row whole in its popup, however many words the picture had to leave out of the row itself, so nothing is ever lost to the ellipsis.",
+        "was":"Cut rows ended in an ellipsis and offered nothing to open.",
+        "before":[],"after":[{"scope":"render/layout/a_deeply_nested_directory/instrument_drawing_and_layout_engine.rs","sym":"draw_every_card_in_the_pane_from_the_top","mark":"+"}],"receipts":["oid:7625eed7"]}));
+    con.execute(
+        "UPDATE meta SET value=? WHERE key='story_map:sess-now'",
+        [map.to_string()],
+    )
+    .unwrap();
+    drop(con);
+    let (cols, rows) = (36, 60);
+    let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+    pane.pixels = true;
+    pane.enable_cards();
+    pane.key("l");
+    pane.frame(cols, rows, NOW);
+    let cuts = pane.instrument_metrics.as_ref().unwrap().cuts.clone();
+    assert!(!cuts.is_empty(), "a 36-column pane cuts some row");
+    // Rows with the same words share one popup item, numbered in order of first appearance.
+    let mut seen: Vec<(&str, &str)> = vec![];
+    for cut in &cuts {
+        let at = (cut.title, cut.full.as_str());
+        let index = seen.iter().position(|s| *s == at).unwrap_or_else(|| {
+            seen.push(at);
+            seen.len() - 1
+        });
+        pane.frame(cols, rows, NOW);
+        let key = format!("observe:2:{index}");
+        let (row, _) = pane
+            .acts
+            .iter()
+            .find(|(_, a)| a["key"] == key.as_str())
+            .map(|(r, a)| (*r, a.clone()))
+            .unwrap_or_else(|| panic!("no click target for {cut:?}: {:?}", pane.acts));
+        assert!(pane.click(row, 4, NOW));
+        pane.frame(cols, rows, NOW);
+        // The popup is up: c copies the title and every word of the row.
+        pane.key("c");
+        let copied = pane
+            .take_copy()
+            .unwrap_or_else(|| panic!("no popup for {cut:?}"));
+        assert!(copied.starts_with(cut.title), "{copied}");
+        assert!(copied.contains(&cut.full), "{copied}");
+        assert!(!copied.contains('…'), "{copied}");
+        pane.key("escape");
+        pane.frame(cols, rows, NOW);
+    }
 }
 fn string(v: &Value) -> &str {
     v.as_str().unwrap_or("")

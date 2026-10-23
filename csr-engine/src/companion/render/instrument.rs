@@ -197,6 +197,9 @@ pub struct Composition {
     pub confusing: Vec<Value>,
     /// What should be a skill, memory or tool, across every look of this session.
     pub should_be: Vec<Value>,
+    /// The rows the last frame drew shortened, each `{title, line}` with its words in full. The
+    /// pane fills this from the frame it drew; a popup on one of them reads it.
+    pub more: Vec<Value>,
     pub story: String,
     pub story_age: String,
     pub shifts: Vec<Value>,
@@ -537,6 +540,7 @@ impl Composition {
             },
             confusing: observations(data, &s["id"], "confusing_claude"),
             should_be: observations(data, &s["id"], "should_be"),
+            more: vec![],
             story,
             story_age: age,
             shifts,
@@ -570,6 +574,7 @@ impl Composition {
         match card {
             ObsCard::Confusing => &self.confusing,
             ObsCard::ShouldBe => &self.should_be,
+            ObsCard::More => &self.more,
         }
     }
     /// The popup's content for `at`, or `None` when that item is no longer on its card.
@@ -831,6 +836,14 @@ fn budget(v: &Value) -> Option<String> {
         short(v["cap"].as_f64()?.max(0.))
     ))
 }
+/// A change with everything the pane knows of it: its place, what it is now, what it replaced.
+pub fn shift_full(v: &Value) -> String {
+    let mut line = shift_row(v, true);
+    if !string(&v["was"]).is_empty() {
+        line.push_str(&format!(" · Was: {}", string(&v["was"])));
+    }
+    line
+}
 pub fn shift_row(v: &Value, expanded: bool) -> String {
     let place = format!(
         "{}{}",
@@ -932,6 +945,15 @@ fn meta(c: &Composition) -> String {
 fn observation_card_h(rows: usize) -> f32 {
     P * 2. + theme::TITLE_LINE + S2 + rows as f32 * theme::BODY_LINE
 }
+/// An observation card folded to its title row, while an open section needs the room.
+fn observation_fold_h() -> f32 {
+    P * 2. + theme::TITLE_LINE
+}
+/// Line pitch of an open section's text card.
+const DRILL_LINE: f32 = 17.;
+/// How much taller than the pane the picture may grow, shrinking everything in it, so that an
+/// open section gets its height before any card is folded.
+const DRILL_GROW: f32 = 0.30;
 pub(super) const CONFUSED_TITLE: &str = "Confused Claude";
 pub(super) const SHOULD_BE_TITLE: &str = "Should be a skill / memory / tool";
 /// The short label a should-be item carries on its row.
@@ -1076,6 +1098,61 @@ pub fn rows_with_figure(
     if let Some(detail) = open.popup.and_then(|at| c.detail(at)) {
         return observation::rows(&detail, cols);
     }
+    let (out, short) = assemble(c, cols, rows, open, show_figure, false);
+    if short {
+        // An open section never gets squeezed out: fold the two observation cards to a row each.
+        assemble(c, cols, rows, open, show_figure, true).0
+    } else {
+        out
+    }
+}
+/// The row a folded observation card leaves: its title and how many items it holds.
+pub fn fold_row(title: &str, items: usize) -> String {
+    format!("{title} · {items} · o opens")
+}
+/// The note an open `l` leads with: how many changes there are and how many the story card shows.
+fn changes_note(c: &Composition) -> String {
+    match c.shifts.len() {
+        0 => "No changes yet in this session.".into(),
+        n @ 1..=3 => format!(
+            "{n} change{}, all shown above; each with what it replaced.",
+            if n == 1 { "" } else { "s" }
+        ),
+        n => format!("{n} changes, the first 3 shown above; each with what it replaced."),
+    }
+}
+const NO_THREADS: &str = "No threads yet: the session has said nothing out loud.";
+/// The figure's text rows: the closed pane's facts, or with `i` open one fact to a row.
+pub fn figure_text_rows(c: &Composition, cols: usize, open_figure: bool) -> Vec<String> {
+    if open_figure {
+        figure_detail_lines(c)
+            .iter()
+            .flat_map(|line| {
+                // A fact whose pieces do not fit a row wraps; fact_rows would drop them.
+                if line.split(" · ").any(|piece| text::len(piece) > cols) {
+                    text::wrap(line.trim(), cols.max(1), 1000)
+                } else {
+                    fact_rows(line, cols)
+                }
+            })
+            .collect()
+    } else {
+        figure_lines(c)
+            .iter()
+            .flat_map(|line| fact_rows(line, cols))
+            .collect()
+    }
+}
+/// The text rows, and whether an open section was cut for want of room.
+fn assemble(
+    c: &Composition,
+    cols: usize,
+    rows: usize,
+    open: Open,
+    show_figure: bool,
+    fold: bool,
+) -> (Vec<String>, bool) {
+    let mut short = false;
     let mut out = vec![];
     let mut history_insert = None;
     let mut pitch_insert = None;
@@ -1113,11 +1190,16 @@ pub fn rows_with_figure(
         if items.is_empty() {
             continue;
         }
+        if fold {
+            out.extend(wrap(&fold_row(title, items.len())));
+            continue;
+        }
         out.extend(wrap(title));
         for item in items {
             out.extend(wrap(&observation_text(item, should)));
         }
     }
+    let obs_end = out.len();
     if c.offer {
         out.extend(wrap("Press 1 to turn dreams on in all your sessions."));
     }
@@ -1154,7 +1236,11 @@ pub fn rows_with_figure(
         out.extend(fact_rows(&format!("Story · {}", c.story_age), cols));
         out.extend(story_text_lines(first_sentence(&c.story), cols, 4));
     }
+    let story_end = out.len();
     let mut details_start = out.len();
+    if open.changes {
+        out.extend(wrap(&changes_note(c)));
+    }
     for v in c
         .shifts
         .iter()
@@ -1171,6 +1257,9 @@ pub fn rows_with_figure(
     if open.threads {
         out.extend(wrap(&format!("{MONOLOGUE} · {MONOLOGUE_SUB}")));
         details_start = out.len();
+        if c.river.is_empty() {
+            out.extend(wrap(NO_THREADS));
+        }
         for row in &c.river {
             let when = row.time_label(c.now);
             out.extend(wrap(&format!(
@@ -1197,27 +1286,24 @@ pub fn rows_with_figure(
             out.extend(wrap(&line));
         }
     }
+    // `i` opens the figure: one fact to a row, then the history in words.
+    let fig_lines = figure_text_rows(c, cols, open.figure);
     if open.changes || open.threads || open.dreams || open.agents {
         let details = out.drain(details_start..).collect::<Vec<_>>();
-        let figure_rows = if show_figure {
-            figure_lines(c)
-                .iter()
-                .flat_map(|line| fact_rows(line, cols))
-                .count()
-        } else {
-            4
-        };
+        let figure_rows = if show_figure { fig_lines.len() } else { 4 };
         let reserved = figure_rows
             + 1
             + if show_figure { 0 } else { 7 }
             + usize::from(c.agents.agents.iter().any(agents::is_active));
         let room = rows.saturating_sub(out.len() + reserved);
-        out.extend(details.into_iter().skip(open.scroll).take(room));
+        let wanted = details.len().saturating_sub(open.scroll);
+        // The note or heading always shows, whatever else is squeezed.
+        let take = if fold { room.max(wanted.min(3)) } else { room };
+        short = take < wanted.min(8);
+        out.extend(details.into_iter().skip(open.scroll).take(take));
     }
     if show_figure {
-        for line in figure_lines(c) {
-            out.extend(fact_rows(&line, cols));
-        }
+        out.extend(fig_lines);
     } else {
         let mut extra = vec![];
         if let Some(q) = array(&c.figure["quotas"])
@@ -1256,6 +1342,19 @@ pub fn rows_with_figure(
         .iter()
         .filter(|a| agents::is_active(a))
         .collect();
+    // Past the pane's last row the tail is cut. An open section must not be what goes: fold the
+    // observation cards (a second pass), then give up the rows between them and the open section.
+    let over = (out.len() + usize::from(!active.is_empty())).saturating_sub(rows.saturating_sub(1));
+    if over > 0 && (open.changes || open.threads || open.dreams || open.agents || open.figure) {
+        if fold {
+            let cut = over.min(story_end.saturating_sub(obs_end));
+            out.drain(obs_end..obs_end + cut);
+            history_insert = None;
+            pitch_insert = None;
+        } else {
+            short = true;
+        }
+    }
     if !active.is_empty() {
         out.extend(wrap(&format!(
             "{} in flight · {} stalled",
@@ -1308,7 +1407,7 @@ pub fn rows_with_figure(
             }
         }
     }
-    out
+    (out, short)
 }
 fn starter_questions() -> [(&'static str, &'static str); 8] {
     [
@@ -1431,7 +1530,8 @@ fn agent_lines(c: &Composition) -> Vec<String> {
 fn first_sentence(s: &str) -> &str {
     s.find(". ").map_or(s, |i| &s[..=i])
 }
-fn figure_lines(c: &Composition) -> Vec<String> {
+/// The figure's facts, one per entry: the context row, the quota row and the money line.
+fn figure_facts(c: &Composition) -> (Vec<String>, Vec<String>) {
     let g = &c.figure;
     let mut top = vec![];
     if let Some(n) = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.) {
@@ -1482,18 +1582,54 @@ fn figure_lines(c: &Composition) -> Vec<String> {
     if let Some((line, _)) = csr_status(g) {
         quotas.push(format!("● {line}"));
     }
-    [
-        top.join(" · "),
-        quotas.join(" · "),
-        if has_week(c) && c.csr_cost.usd.is_some() {
-            c.csr_cost.money_line()
-        } else {
-            String::new()
-        },
-    ]
-    .into_iter()
-    .filter(|s| !s.is_empty())
-    .collect()
+    (top, quotas)
+}
+
+fn money_fact(c: &Composition) -> String {
+    if has_week(c) && c.csr_cost.usd.is_some() {
+        c.csr_cost.money_line()
+    } else {
+        String::new()
+    }
+}
+
+fn figure_lines(c: &Composition) -> Vec<String> {
+    let (top, quotas) = figure_facts(c);
+    [top.join(" · "), quotas.join(" · "), money_fact(c)]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// What `i` opens: every fact of the figure on a line of its own, then the per-turn history in
+/// words. Says so when there is nothing to show.
+fn figure_detail_lines(c: &Composition) -> Vec<String> {
+    let (top, quotas) = figure_facts(c);
+    let g = &c.figure;
+    // The cost line alone is not a measurement: with only that, the pane still says nothing was measured.
+    let measured = !top.is_empty()
+        || array(&g["quotas"]).iter().any(|q| q["used"].is_number())
+        || g["cache"]["left"].is_number()
+        || c.requests.iter().any(|(_, fresh)| *fresh > 0.);
+    let mut out: Vec<String> = vec![];
+    if !measured {
+        out.push("No figures yet: nothing has been measured in this session.".into());
+    }
+    out.extend(top.into_iter().chain(quotas));
+    let money = money_fact(c);
+    if !money.is_empty() {
+        out.push(money);
+    }
+    let fresh: Vec<f64> = c.requests.iter().map(|(_, fresh)| *fresh).collect();
+    if let Some(max) = fresh.iter().copied().reduce(f64::max).filter(|m| *m > 0.) {
+        out.push(format!(
+            "Fresh tokens per turn: last {} turns, newest {}, max {}",
+            fresh.len(),
+            short(*fresh.last().unwrap_or(&0.)),
+            short(max)
+        ));
+    }
+    out
 }
 
 fn has_week(data: &Composition) -> bool {
@@ -1933,9 +2069,33 @@ fn single(
     col: Rgba,
     t: &Tokens,
 ) {
+    single_as(c, f, s, s, x, y, width, size, col, t);
+}
+/// `single`, where a click on the row shows `full` when `s` is drawn with a trailing "…".
+fn single_as(
+    c: &mut Canvas,
+    f: &Fonts,
+    s: &str,
+    full: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    size: f32,
+    col: Rgba,
+    t: &Tokens,
+) {
     let st = sans(size, t.regular);
-    let s = f.fit(&icons::line(s), st, width);
-    c.text(f, &s, x, y, st, col, A::L);
+    let line = icons::line(s);
+    let shown = f.fit(&line, st, width);
+    if shown != line && !c.dry && !c.cut_title.is_empty() {
+        c.cuts.push(Cut {
+            y,
+            size,
+            title: c.cut_title,
+            full: full.to_owned(),
+        });
+    }
+    c.text(f, &shown, x, y, st, col, A::L);
 }
 
 /// Match token → kept punctuation (trailing spaces dropped so spaced emdash keeps " —").
@@ -1999,6 +2159,18 @@ fn wrap_clauses(f: &Fonts, s: &str, st: St, maxw: f32, n: usize) -> Vec<String> 
 }
 
 /// Text-fallback story lines with the same clause-boundary rule as the pixel path.
+/// The story's rows in the text pane when they end in "…", with the whole story: what a click on
+/// them opens. `None` when the story is shown whole, or there is none.
+pub fn text_story_cut(c: &Composition, cols: usize) -> Option<(Vec<String>, String)> {
+    if c.story.is_empty() {
+        return None;
+    }
+    let lines = story_text_lines(first_sentence(&c.story), cols, 4);
+    lines
+        .last()
+        .is_some_and(|l| l.ends_with('…'))
+        .then(|| (lines, c.story.clone()))
+}
 pub fn story_text_lines(s: &str, cols: usize, max_lines: usize) -> Vec<String> {
     let cols = cols.max(1);
     fit_story_lines(s, max_lines, &|c| text::wrap(c, cols, 1000), &|l| {
@@ -2074,7 +2246,16 @@ pub struct Metrics {
     pub shift_hits: Vec<f32>,
     /// Each observation row's card, place on it and centre Y in layout pt: the click targets.
     pub observation_rows: Vec<(ObsCard, usize, f32)>,
+    /// The two observation cards were folded to a title row each, for an open section's room.
+    pub observations_folded: bool,
+    /// Every row drawn with a trailing "…", with its words in full: the click targets that open
+    /// the popup.
+    pub cuts: Vec<Cut>,
     pub agents_region: Option<(f32, f32)>,
+    /// Top and height of the card an open `l`, `t`, `d` or `a` draws, in layout pt.
+    pub drill_region: Option<(f32, f32)>,
+    /// Top and height of the facts card an open `i` draws under the figure.
+    pub figure_detail_region: Option<(f32, f32)>,
     pub figure_region: (f32, f32),
     pub help_region: Option<(f32, f32)>,
     pub history_rows: usize,
@@ -2245,19 +2426,10 @@ pub fn draw(
     } else {
         0.
     };
-    let requested_extra_h = if open.changes {
-        c.shifts.len() as f32 * 58.
-    } else if open.threads {
-        // A heading, then up to eight bands with a gap between each.
-        P * 2. + MONOLOGUE_H + (c.river.len().min(8) as f32 * ROW_PITCH - ROW_GAP).max(40.)
-    } else if open.dreams {
-        c.dream.queue.len().min(4) as f32 * 38.
-    } else {
-        0.
-    };
     let empty_help = sell_h;
     let mut drill_lines = vec![];
     if open.changes {
+        drill_lines.extend(f.wrap(&changes_note(c), sans(11.5, t.regular), IW));
         for v in &c.shifts {
             drill_lines.extend(f.wrap(&shift_row(v, true), sans(11.5, t.regular), IW));
             if !string(&v["was"]).is_empty() {
@@ -2278,6 +2450,16 @@ pub fn draw(
             drill_lines.extend(f.wrap(string(&d["line"]), sans(11.5, t.regular), IW));
         }
     }
+    // The height an open section asks for. Threads draw bands, every other section draws lines.
+    let drill_open = open.changes || open.threads || open.dreams || open.agents;
+    let wanted_extra_h = if open.threads {
+        // A heading, then up to eight bands with a gap between each, or the one line saying there are none.
+        P * 2. + MONOLOGUE_H + (c.river.len().min(8) as f32 * ROW_PITCH - ROW_GAP).max(40.)
+    } else if drill_lines.is_empty() {
+        0.
+    } else {
+        drill_lines.len().saturating_sub(open.scroll).max(1) as f32 * DRILL_LINE + P * 2.
+    };
     let notice_h = if c.notice.is_some() {
         P * 2. + theme::BODY_LINE
     } else {
@@ -2285,7 +2467,7 @@ pub fn draw(
     };
     let notice_gap = if c.notice.is_some() { S3 } else { 0. };
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
-    let figure_min = if quotas_only {
+    let figure_min: f32 = if quotas_only {
         154.
     } else if open.figure {
         // Chart (95 + 40), chart labels/payback (72), gauge offset (84).
@@ -2293,43 +2475,113 @@ pub fn draw(
     } else {
         110.
     };
+    // `i` adds a card of the figure's facts, one to a line, under the figure.
+    let fig_detail_lines: Vec<String> = if open.figure {
+        figure_detail_lines(c)
+            .iter()
+            .flat_map(|line| f.wrap(line, sans(11.5, t.regular), IW))
+            .collect()
+    } else {
+        vec![]
+    };
+    let fig_detail_h = if fig_detail_lines.is_empty() {
+        0.
+    } else {
+        fig_detail_lines.len() as f32 * DRILL_LINE + P * 2.
+    };
     let observed = [
         (CONFUSED_TITLE, &c.confusing, false),
         (SHOULD_BE_TITLE, &c.should_be, true),
     ];
-    let observed_h: f32 = observed
+    let observed_full_h: f32 = observed
         .iter()
         .filter(|(_, items, _)| !items.is_empty())
         .map(|(_, items, _)| observation_card_h(items.len()) + S3)
         .sum();
-    let top_core = M
-        + hero_h
-        + S3
-        + observed_h
-        + story_h
-        + if story_h > 0. { S3 } else { 0. }
-        + notice_h
-        + notice_gap;
+    let observed_fold_h: f32 = observed
+        .iter()
+        .filter(|(_, items, _)| !items.is_empty())
+        .map(|_| observation_fold_h() + S3)
+        .sum();
     let tail_core = agents_h
         + if active { S3 } else { 0. }
         + empty_help
-        + if empty_help > 0. { S3 } else { 0. };
-    // Layout points may scale to fit a narrow/wide terminal. Reserve S3 in final pixels.
-    let min_core = top_core + tail_core + figure_min;
-    maxh = maxh.max(min_core / (1. - S3 / available_height as f32));
-    let key_gap = S3 * maxh / available_height as f32;
-    let available_extra = (maxh - min_core - key_gap - S3).max(0.);
+        + if empty_help > 0. { S3 } else { 0. }
+        + if fig_detail_h > 0. {
+            fig_detail_h + S3
+        } else {
+            0.
+        };
+    // The facts card is added to the picture; it never takes the figure's own room. The figure keeps
+    // at least the height the closed pane gave it, and the canvas grows by the card.
+    let figure_min = if fig_detail_h > 0. {
+        let base_tail = tail_core - fig_detail_h - S3;
+        let closed_top = M
+            + hero_h
+            + S3
+            + observed_full_h
+            + story_h
+            + if story_h > 0. { S3 } else { 0. }
+            + notice_h
+            + notice_gap;
+        let closed_min = if quotas_only { 154. } else { 110. };
+        let closed_maxh =
+            maxh.max((closed_top + base_tail + closed_min) / (1. - S3 / available_height as f32));
+        let closed_gap = S3 * closed_maxh / available_height as f32;
+        figure_min.max(closed_maxh - closed_top - base_tail - closed_gap)
+    } else {
+        figure_min
+    };
+    // The layout for one choice of canvas height and observation cards: (height, key gap, room left
+    // for an open section). Layout points may scale to fit a narrow/wide terminal; reserve S3 in
+    // final pixels.
+    let layout_for = |maxh: f32, observed_h: f32| {
+        let top_core = M
+            + hero_h
+            + S3
+            + observed_h
+            + story_h
+            + if story_h > 0. { S3 } else { 0. }
+            + notice_h
+            + notice_gap;
+        let min_core = top_core + tail_core + figure_min;
+        let maxh = maxh.max(min_core / (1. - S3 / available_height as f32));
+        let key_gap = S3 * maxh / available_height as f32;
+        // The slack can be negative: the pane is then exactly as tall as it must be, and an open
+        // section has to grow it by the shortfall and the gap it keeps.
+        (maxh, key_gap, maxh - min_core - key_gap - S3, top_core)
+    };
+    // An open section gets the height it asks for. Shrinking the picture a little comes first,
+    // then folding the two observation cards to a row each; never a section squeezed to nothing.
+    let mut observed_h = observed_full_h;
+    let mut folded = false;
+    let (mut maxh, mut key_gap, mut slack, mut top_core) = layout_for(maxh, observed_h);
+    if drill_open && wanted_extra_h > slack {
+        let grow_cap = maxh * DRILL_GROW;
+        if wanted_extra_h > slack + grow_cap && observed_fold_h < observed_full_h {
+            folded = true;
+            observed_h = observed_fold_h;
+            (maxh, key_gap, slack, top_core) = layout_for(maxh, observed_h);
+        }
+        if wanted_extra_h > slack {
+            // One point over, so float rounding never costs the last line.
+            let grow =
+                ((wanted_extra_h - slack + 1.) / (1. - S3 / available_height as f32)).min(grow_cap);
+            (maxh, key_gap, slack, top_core) = layout_for(maxh + grow, observed_h);
+        }
+    }
+    let available_extra = slack.max(0.);
     let extra_h = if open.threads {
-        requested_extra_h.min(available_extra)
+        wanted_extra_h.min(available_extra)
     } else {
         let lines = drill_lines
             .len()
             .saturating_sub(open.scroll)
-            .min(((available_extra - P * 2.).max(0.) / theme::BODY_LINE) as usize);
+            .min(((available_extra - P * 2.).max(0.) / DRILL_LINE) as usize);
         if lines == 0 {
             0.
         } else {
-            lines as f32 * theme::BODY_LINE + P * 2.
+            lines as f32 * DRILL_LINE + P * 2.
         }
     };
     let top_core = top_core + extra_h + if extra_h > 0. { S3 } else { 0. };
@@ -2527,8 +2779,44 @@ pub fn draw(
     }
     y += hero_h + card_gap;
     let mut observation_rows = vec![];
+    // The observation rows have their own popup: their cut rows are not recorded as shortened rows.
+    let recording = std::mem::take(&mut canvas.cut_title);
     for (title_text, items, should) in observed {
         if items.is_empty() {
+            continue;
+        }
+        if folded {
+            let h = observation_fold_h();
+            panel(&mut canvas, y, h, t);
+            label(
+                &mut canvas,
+                f,
+                title_text,
+                IX,
+                y + P + f.cap(title),
+                theme::TITLE_SIZE,
+                t.ink,
+                t.bold,
+            );
+            canvas.text(
+                f,
+                &format!("{} · o opens", items.len()),
+                IX + IW,
+                y + P + f.cap(caption),
+                caption,
+                t.quiet,
+                A::R,
+            );
+            observation_rows.push((
+                if should {
+                    ObsCard::ShouldBe
+                } else {
+                    ObsCard::Confusing
+                },
+                0,
+                y + h / 2.,
+            ));
+            y += h + card_gap;
             continue;
         }
         let h = observation_card_h(items.len());
@@ -2586,6 +2874,7 @@ pub fn draw(
         }
         y += h + card_gap;
     }
+    canvas.cut_title = recording;
     if let Some(notice) = &c.notice {
         panel(&mut canvas, y, notice_h, t);
         single(
@@ -2636,7 +2925,17 @@ pub fn draw(
             cursor += theme::CAPTION_LINE + S3;
         }
         story_line_count = story_lines_fit.len();
+        // A story cut at a clause is drawn with its "…": every row of it opens the whole story.
+        let story_cut = story_lines_fit.last().is_some_and(|l| l.ends_with('…'));
         for line in &story_lines_fit {
+            if story_cut && !canvas.dry {
+                canvas.cuts.push(Cut {
+                    y: cursor + f.cap(body),
+                    size: theme::BODY_SIZE,
+                    title: "Where the work stands",
+                    full: c.story.clone(),
+                });
+            }
             canvas.text(f, line, IX, cursor + f.cap(body), body, t.ink, A::L);
             cursor += theme::BODY_LINE;
         }
@@ -2660,10 +2959,12 @@ pub fn draw(
         for v in c.shifts.iter().take(3) {
             let b = cursor + f.cap(caption);
             shift_hits.push(b - f.cap(caption) / 2.);
-            single(
+            canvas.cut_title = "A change";
+            single_as(
                 &mut canvas,
                 f,
                 &shift_row(v, false),
+                &shift_full(v),
                 IX,
                 b,
                 IW,
@@ -2671,10 +2972,12 @@ pub fn draw(
                 if mark(v) == "!" { t.risk } else { t.mint },
                 t,
             );
+            canvas.cut_title = recording;
             cursor += theme::CAPTION_LINE;
         }
         y += story_h + card_gap;
     }
+    let drill_region = (extra_h > 0.).then_some((y, extra_h));
     if extra_h > 0. {
         panel(&mut canvas, y, extra_h, t);
         let mut b = y + P;
@@ -2682,10 +2985,11 @@ pub fn draw(
             for line in drill_lines
                 .iter()
                 .skip(open.scroll)
-                .take(((extra_h - P * 2.) / 17.).round() as usize)
+                .take(((extra_h - P * 2.) / DRILL_LINE).round() as usize)
             {
+                b += 12.;
                 label(&mut canvas, f, line, IX, b, 11.5, t.ink, t.regular);
-                b += 17.;
+                b += DRILL_LINE - 12.;
             }
         } else if open.threads {
             let title_st = serif(20., t.bold);
@@ -2703,6 +3007,19 @@ pub fn draw(
                 t,
             );
             let top = y + P + MONOLOGUE_H;
+            if c.river.is_empty() {
+                single(
+                    &mut canvas,
+                    f,
+                    NO_THREADS,
+                    IX,
+                    top + 12.,
+                    IW,
+                    11.5,
+                    t.ink,
+                    t,
+                );
+            }
             let spine_h = (extra_h - P * 2. - MONOLOGUE_H).max(0.);
             let spine_x = IX + 72.;
             let rows: Vec<_> = c
@@ -2745,10 +3062,26 @@ pub fn draw(
                     let w = canvas.text_slanted(f, mood, x, b, st, t.quiet, A::L, ITALIC_SLANT);
                     x += w + 6.;
                 }
-                single(
+                canvas.cut_title = "Monologue";
+                let full = format!(
+                    "{}{}{}",
+                    if when.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{when} · ")
+                    },
+                    if mood.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{mood} · ")
+                    },
+                    row.picture_text()
+                );
+                single_as(
                     &mut canvas,
                     f,
                     &row.picture_text(),
+                    &full,
                     x,
                     b,
                     IX + IW - x,
@@ -2756,6 +3089,7 @@ pub fn draw(
                     t.ink,
                     t,
                 );
+                canvas.cut_title = recording;
                 b += ROW_PITCH;
             }
         } else {
@@ -2792,6 +3126,20 @@ pub fn draw(
         mid_layout = mid;
     }
     y += figure_draw_h;
+    let mut figure_bottom = y;
+    let figure_detail_region = (fig_detail_h > 0.).then_some((y + card_gap, fig_detail_h));
+    if fig_detail_h > 0. {
+        y += card_gap;
+        panel(&mut canvas, y, fig_detail_h, t);
+        let mut b = y + P;
+        for line in &fig_detail_lines {
+            b += 12.;
+            label(&mut canvas, f, line, IX, b, 11.5, t.ink, t.regular);
+            b += DRILL_LINE - 12.;
+        }
+        y += fig_detail_h;
+        figure_bottom = y;
+    }
     let needs_tail = active || help_h > 0.;
     if needs_tail {
         y += card_gap;
@@ -2802,6 +3150,7 @@ pub fn draw(
         panel(&mut canvas, y, agents_draw_h, t);
         let mut x = IX;
         let mut stalled = 0;
+        canvas.cut_title = "Agent in flight";
         for a in c
             .agents
             .agents
@@ -2840,6 +3189,7 @@ pub fn draw(
             t.amber,
             t,
         );
+        canvas.cut_title = recording;
         y += agents_draw_h;
         if help_h > 0. {
             y += card_gap;
@@ -3024,7 +3374,7 @@ pub fn draw(
     } else if active {
         agents_region.map(|(ay, ah)| ay + ah).unwrap_or(y)
     } else {
-        figure_region.0 + figure_region.1
+        figure_bottom
     };
     let last_card_bottom_pad = (height - last_card_bottom).max(0.);
     if let Some(detail) = open.popup.and_then(|at| c.detail(at)) {
@@ -3080,7 +3430,11 @@ pub fn draw(
             story_region,
             shift_hits,
             observation_rows,
+            observations_folded: folded,
+            cuts: canvas.cuts.clone(),
             agents_region,
+            drill_region,
+            figure_detail_region,
             figure_region,
             help_region,
             history_rows,
@@ -4675,5 +5029,292 @@ mod tests {
         assert_eq!(age_span(3.), "<1m");
         assert_eq!(age_span(59.), "<1m");
         assert_eq!(age_span(60.), "1m");
+    }
+
+    // ---- l, t and i each change the pane, and every "…" row opens its words ----
+
+    const LONG_STORY: &str = "The Maestro memory-screen flows pass on the controls code once the Mac's low disk is bypassed with a storage override, and the remaining flaky flow, number eight, still fails about one run in three, which the person has not yet decided to chase, so the release waits on that call, while the feed caption writer keeps its landmark context and the colour mix keeps its per-group controls, neither of which has been verified against a real device yet, and the privacy line and landmark toggle agents have both reported back with their own notes about what they changed, which still need reading before anything is merged. A second sentence follows.";
+
+    /// A session with `shifts` changes (each with a "Was:" line), `dreams` river rows, a long story and
+    /// two observations, plus a figure with data when `figure` is set.
+    fn drill_composition(shifts: usize, dreams: usize, figure: bool) -> Composition {
+        let now = 1_800_000_000.;
+        let entries: Vec<Value> = (0..shifts)
+            .map(|i| {
+                json!({"sig":format!("s{i}"),"kind":"shift",
+                    "claim":format!("Change number {i} says something long enough that the narrow pane has to cut it somewhere before the end"),
+                    "now":format!("Change number {i} says something long enough that the narrow pane has to cut it somewhere before the end"),
+                    "was":format!("The old behaviour number {i}"),
+                    "before":[],"after":[{"scope":format!("file{i}.rs"),"sym":"f","mark":"~"}],
+                    "receipts":["edit:x"],"grounded":false,"moved":true})
+            })
+            .collect();
+        let dream_rows: Vec<Value> = (0..dreams)
+            .map(|i| json!({"session":"dr","at": now - 100. * (i + 1) as f64,
+                "line":format!("What if thread number {i} asked a question long enough to be cut by a narrow pane, as most of them are?")}))
+            .collect();
+        let mut data = json!({
+            "story": {"now": LONG_STORY, "at": now - 3600.},
+            "story_map": {"at": now - 60., "entries": entries},
+            "dreams": dream_rows,
+            "dream_records": [{"kind":"look","session":"dr","at":now - 10.,"outcome":"none",
+                "confusing_claude":[{"line":"Claude told the person the other 15 test flows had already run, then had to take it back, which cost a day.","evidence":"Turn 15"}],
+                "should_be":[{"kind":"skill","line":"Every Codex review repeats the same usage gate, model resolver and worker flags by hand.","evidence":"Turns 2, 3"}]}],
+        });
+        data["limits"] = json!({});
+        let mut c = Composition::build(
+            &data,
+            &json!({"id":"dr","compacts":[],"main":[],"prompts":[]}),
+            now,
+        );
+        if figure {
+            c.figure = json!({"ctx":{"tokens":120_000.,"size":1_000_000.},"trend":1800.,
+                "quotas":[{"code":"5H","used":20.,"pace":0.5},{"code":"7D","used":45.,"pace":0.4}]});
+            c.requests = (0..12)
+                .map(|i| (i as f64, 200. + 150. * ((i * 5) % 7) as f64))
+                .collect();
+        }
+        c
+    }
+    fn drill_keys() -> [(&'static str, Open); 3] {
+        [
+            (
+                "l",
+                Open {
+                    changes: true,
+                    ..Open::default()
+                },
+            ),
+            (
+                "t",
+                Open {
+                    threads: true,
+                    ..Open::default()
+                },
+            ),
+            (
+                "i",
+                Open {
+                    figure: true,
+                    ..Open::default()
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn l_t_and_i_each_open_their_own_card_in_the_picture_whatever_the_data_or_the_size() {
+        // (width px, height px): normal, short, narrow, narrow and short.
+        let sizes = [(1210, 1700), (1210, 700), (704, 520), (560, 420)];
+        let datasets = [
+            ("full", 7, 4, true),
+            ("short", 2, 0, false),
+            ("empty", 0, 0, false),
+        ];
+        for (name, shifts, dreams, figure) in datasets {
+            let c = drill_composition(shifts, dreams, figure);
+            for (w, h) in sizes {
+                let (closed, closed_m) =
+                    draw(&c, w, h, Theme::Dark, Open::default(), false).expect("draws");
+                assert!(closed_m.drill_region.is_none() && closed_m.figure_detail_region.is_none());
+                for (key, open) in drill_keys() {
+                    let at = format!("{name} {w}x{h} key {key}");
+                    let (shown, m) = draw(&c, w, h, Theme::Dark, open, false).expect("draws");
+                    assert_ne!(shown.data(), closed.data(), "{at}: the picture must change");
+                    match key {
+                        "i" => {
+                            let (_, card) = m
+                                .figure_detail_region
+                                .unwrap_or_else(|| panic!("{at}: no figure card"));
+                            assert!(card >= P * 2. + DRILL_LINE, "{at}: {card}");
+                        }
+                        _ => {
+                            let (_, card) = m
+                                .drill_region
+                                .unwrap_or_else(|| panic!("{at}: the section got no room"));
+                            assert!(card >= P * 2. + DRILL_LINE, "{at}: {card}");
+                            assert!(m.figure_detail_region.is_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_section_folds_the_observation_cards_before_it_is_squeezed_out() {
+        let c = drill_composition(7, 4, true);
+        // Room for the closed pane and nothing more.
+        let (_, closed) = draw(&c, 704, 700, Theme::Dark, Open::default(), false).expect("draws");
+        assert!(!closed.observations_folded);
+        let (_, open) = draw(
+            &c,
+            704,
+            700,
+            Theme::Dark,
+            Open {
+                changes: true,
+                ..Open::default()
+            },
+            false,
+        )
+        .expect("draws");
+        let (_, card) = open.drill_region.expect("the changes card");
+        // Every change with its Was line fits, or at least the room it was asked for within the
+        // fold-and-shrink budget; never a stub.
+        assert!(card > 6. * DRILL_LINE, "{card}");
+        assert!(open.observations_folded, "folded");
+        // Folded cards are still click targets: one per card.
+        assert_eq!(open.observation_rows.len(), 2);
+        assert!(open.observation_rows.iter().all(|r| r.1 == 0));
+    }
+
+    #[test]
+    fn the_text_pane_changes_in_the_section_each_key_owns_at_narrow_and_normal_width() {
+        for (cols, rows) in [(30, 32), (42, 40), (100, 60)] {
+            for (name, shifts, dreams, figure) in [
+                ("full", 7, 4, true),
+                ("short", 2, 0, false),
+                ("empty", 0, 0, false),
+            ] {
+                let c = drill_composition(shifts, dreams, figure);
+                let closed = text_rows(&c, cols, rows, Open::default());
+                for (key, open) in drill_keys() {
+                    let at = format!("{name} {cols}x{rows} key {key}");
+                    let shown = text_rows(&c, cols, rows, open);
+                    assert_ne!(shown, closed, "{at}");
+                    let all = shown.join("\n");
+                    let flat = all.split_whitespace().collect::<Vec<_>>().join(" ");
+                    match (key, shifts) {
+                        ("l", 0) => assert!(
+                            flat.contains("No changes yet in this session."),
+                            "{at}\n{all}"
+                        ),
+                        ("l", 1..=3) => assert!(flat.contains("all shown above"), "{at}\n{all}"),
+                        ("l", _) => {
+                            assert!(
+                                flat.contains("7 changes, the first 3 shown above"),
+                                "{at}\n{all}"
+                            )
+                        }
+                        ("t", _) if dreams == 0 && shifts == 0 => {
+                            assert!(flat.contains("No threads yet"), "{at}\n{all}")
+                        }
+                        ("t", _) => assert!(flat.contains("Monologue"), "{at}\n{all}"),
+                        ("i", _) if figure => {
+                            assert!(flat.contains("Fresh tokens per turn"), "{at}\n{all}")
+                        }
+                        ("i", _) => assert!(flat.contains("No figures yet"), "{at}\n{all}"),
+                        _ => unreachable!(),
+                    }
+                    // The pane still ends on the figure facts and keeps the open section on screen.
+                    assert!(shown.len() < rows, "{at}: {} rows\n{all}", shown.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cut_story_and_every_cut_row_carry_their_words_in_full() {
+        let c = drill_composition(7, 4, true);
+        for (w, h) in [(1210, 1700), (704, 900)] {
+            let open = Open {
+                changes: true,
+                ..Open::default()
+            };
+            for open in [
+                Open::default(),
+                open,
+                Open {
+                    threads: true,
+                    ..Open::default()
+                },
+            ] {
+                let (_, m) = draw(&c, w, h, Theme::Dark, open, false).expect("draws");
+                let titles: Vec<_> = m.cuts.iter().map(|c| c.title).collect();
+                assert!(
+                    titles.contains(&"Where the work stands"),
+                    "{w}x{h} {titles:?}"
+                );
+                for cut in &m.cuts {
+                    assert!(!cut.full.ends_with('…'), "{cut:?}");
+                    assert!(!cut.full.is_empty());
+                    if cut.title == "Where the work stands" {
+                        assert_eq!(cut.full, LONG_STORY);
+                    }
+                    if cut.title == "A change" {
+                        assert!(
+                            cut.full.contains("Was: The old behaviour number"),
+                            "{cut:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // The popup on a cut row is the observation popup showing those words, none dropped.
+        let mut c = c;
+        c.more = vec![json!({"title":"Where the work stands","line":LONG_STORY})];
+        let at = PopupAt {
+            card: ObsCard::More,
+            index: 0,
+            copied: false,
+        };
+        let rows = text_rows(
+            &c,
+            40,
+            30,
+            Open {
+                popup: Some(at),
+                ..Open::default()
+            },
+        );
+        assert_eq!(rows[0], "Where the work stands");
+        let flat = rows.join(" ");
+        let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains(LONG_STORY), "{rows:#?}");
+        let (plain, _) = draw(&c, 1210, 1700, Theme::Dark, Open::default(), false).expect("draws");
+        let (popup, _) = draw(
+            &c,
+            1210,
+            1700,
+            Theme::Dark,
+            Open {
+                popup: Some(at),
+                ..Open::default()
+            },
+            false,
+        )
+        .expect("draws");
+        assert_ne!(plain.data(), popup.data());
+    }
+
+    #[test]
+    fn the_text_pane_cuts_only_the_story_and_names_it() {
+        let c = drill_composition(7, 4, true);
+        for cols in [30_usize, 42, 100] {
+            for open in [
+                Open::default(),
+                Open {
+                    changes: true,
+                    ..Open::default()
+                },
+                Open {
+                    threads: true,
+                    ..Open::default()
+                },
+            ] {
+                for line in text_rows(&c, cols, 60, open) {
+                    if line.ends_with('…') {
+                        let (lines, full) =
+                            text_story_cut(&c, cols).expect("a cut story names itself");
+                        assert!(
+                            lines.contains(&line),
+                            "{cols}: only the story is cut, not: {line}"
+                        );
+                        assert_eq!(full, LONG_STORY);
+                    }
+                }
+            }
+        }
     }
 }
