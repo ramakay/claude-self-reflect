@@ -209,6 +209,26 @@ pub fn attached_session_with(
     (sid.starts_with(&job) && sid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
         .then(|| sid.into())
 }
+/// The session the agent pane runs now: an attached job's, else the one herdr reports for the
+/// pane. A `/clear` or a resume gives Claude a new id and herdr follows it; a pane started with
+/// the old one has to move.
+pub fn current_session(paths: &Paths, agent: &str) -> Option<String> {
+    current_session_with(paths, agent, &herdr)
+}
+/// `current_session` through `call`, the function that runs herdr's CLI.
+pub fn current_session_with(
+    paths: &Paths,
+    agent: &str,
+    call: &dyn Fn(&[&str]) -> Option<String>,
+) -> Option<String> {
+    if let Some(job) = attached_session_with(paths, agent, call) {
+        return Some(job);
+    }
+    let v: Value = serde_json::from_str(&call(&["pane", "get", agent])?).ok()?;
+    let shown = &v["result"]["pane"]["agent_session"];
+    let sid = string(&shown["value"]);
+    (shown["kind"] == "id" && super::paths::valid_id(sid)).then(|| sid.to_owned())
+}
 pub fn keep_like(paths: &Paths, act: &Value, liked: bool, now: f64) -> std::io::Result<()> {
     let key = act["like"].as_str().unwrap_or(string(&act["key"]));
     super::private::append(
@@ -300,6 +320,42 @@ mod tests {
     #[test]
     fn test_a_draft_fails_closed_without_the_named_agent() {
         assert!(!send_draft(Some("other"), "one\ntwo", Some("named")));
+    }
+    #[test]
+    fn test_the_current_session_is_the_one_herdr_shows_for_a_plain_claude() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let plain = json!({"result": {"process_info": {
+            "foreground_process_group_id": 7,
+            "foreground_processes": [{"pid": 7, "argv": ["/usr/local/bin/claude"]}],
+        }}})
+        .to_string();
+        let shown = |kind: &str, value: &str| {
+            json!({"result": {"pane": {"agent_session": {"kind": kind, "value": value}}}})
+                .to_string()
+        };
+        for (pane, want) in [
+            (
+                shown("id", "a1325785-854a-45db"),
+                Some("a1325785-854a-45db"),
+            ),
+            (shown("name", "a1325785-854a-45db"), None),
+            (shown("id", "../etc"), None),
+            (shown("id", ""), None),
+            ("not json".into(), None),
+        ] {
+            let call = |args: &[&str]| match args[..2] {
+                ["pane", "process-info"] => Some(plain.clone()),
+                ["pane", "get"] => Some(pane.clone()),
+                _ => None,
+            };
+            assert_eq!(
+                current_session_with(&paths, "w1:p1", &call).as_deref(),
+                want,
+                "{pane}"
+            );
+        }
+        assert_eq!(current_session_with(&paths, "w1:p1", &|_| None), None);
     }
 }
 

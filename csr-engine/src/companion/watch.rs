@@ -8,6 +8,7 @@ use super::{
         kitty::{self, Drawn},
         text::{self, wrap},
     },
+    send,
     wake::{self, Debounce, Kind as WakeKind},
 };
 use crate::process::CommandDeadline;
@@ -563,6 +564,22 @@ impl Reload {
         Ok(true)
     }
 }
+/// How often a pane asks herdr which session its agent pane runs.
+const FOLLOW: Duration = Duration::from_secs(5);
+/// The pane's own arguments with `--sid` set to `sid`: any given one dropped, the new one last.
+fn with_sid(args: &[std::ffi::OsString], sid: &str) -> Vec<std::ffi::OsString> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--sid" {
+            it.next();
+        } else if !arg.to_str().is_some_and(|a| a.starts_with("--sid=")) {
+            out.push(arg.clone());
+        }
+    }
+    out.extend(["--sid".into(), sid.into()]);
+    out
+}
 fn failed_exec(
     exec: impl FnOnce() -> io::Error,
     resume: impl FnOnce() -> io::Result<()>,
@@ -604,6 +621,7 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
         Reload::switch(&exe, Instant::now())
     };
     let mut looked = Instant::now();
+    let mut followed = Instant::now();
     let mut reload_error = None;
     let epoch = Arc::new(AtomicUsize::new(0));
     let panics = epoch.clone();
@@ -725,6 +743,39 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                 Err(error) => reload_error = Some(format!("engine reload: {error}")),
                 Ok(false) if reload.settled() => reload_error = None,
                 Ok(false) => (),
+            }
+            // A `/clear` or a resume gave the agent pane a new session id, and nothing tells
+            // the pane: it draws the old session until it starts again on the new one. herdr
+            // follows the id, so ask it, and exec with the new `--sid` as an engine reload does.
+            if let Some(agent) = args
+                .agent
+                .as_deref()
+                .filter(|_| followed.elapsed() >= FOLLOW)
+            {
+                followed = Instant::now();
+                if let Some(next) = send::current_session(&paths, agent).filter(|s| s != sid) {
+                    if stopping() {
+                        break;
+                    }
+                    watchdog.stop();
+                    TerminalGuard::restore();
+                    let argv: Vec<_> = std::env::args_os().skip(1).collect();
+                    reload_error = Some(failed_exec(
+                        || {
+                            unsafe { libc::alarm(0) };
+                            std::process::Command::new(&running)
+                                .args(with_sid(&argv, &next))
+                                .env(HOME_ENGINE, &home)
+                                .exec()
+                        },
+                        || terminal.resume(),
+                    ));
+                    watchdog = Watchdog::start(
+                        wake_pipe.as_ref().and_then(wake::Listener::cleaner),
+                        mine.path.clone(),
+                    );
+                    drawn = None;
+                }
             }
             // The error card comes and goes with the reload's error: draw when it does.
             pressed |= reload_error != reloading;
@@ -945,6 +996,47 @@ mod tests {
         assert_eq!(b.run(&p, 1001., || 7), Some(7));
         assert_eq!(b.failures, 0);
     }
+    #[test]
+    fn test_a_new_session_replaces_the_sid_and_keeps_every_other_argument() {
+        let args = |list: &[&str]| {
+            list.iter()
+                .map(|a| a.into())
+                .collect::<Vec<std::ffi::OsString>>()
+        };
+        for (given, want) in [
+            (
+                &[
+                    "companion",
+                    "pane",
+                    "--watch",
+                    "--sid",
+                    "old",
+                    "--agent",
+                    "w1:p1",
+                ][..],
+                &[
+                    "companion",
+                    "pane",
+                    "--watch",
+                    "--agent",
+                    "w1:p1",
+                    "--sid",
+                    "new",
+                ][..],
+            ),
+            (
+                &["companion", "pane", "--sid=old", "--watch"][..],
+                &["companion", "pane", "--watch", "--sid", "new"][..],
+            ),
+            (
+                &["companion", "pane", "--watch"][..],
+                &["companion", "pane", "--watch", "--sid", "new"][..],
+            ),
+        ] {
+            assert_eq!(with_sid(&args(given), "new"), args(want), "{given:?}");
+        }
+    }
+
     #[test]
     fn test_retries_wait_out_the_backoff() {
         let d = tempfile::tempdir().unwrap();
