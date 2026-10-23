@@ -98,3 +98,12 @@ harness = false
 [[bench]]
 name = "contamination_bench"
 harness = false
+
+# The pre-commit gate's profile: release speed, with the debug safety nets kept. Debug runs of the
+# pane's picture tests took over 10 minutes (unoptimized tiny-skia); release took 28 s but drops
+# overflow checks and debug_assert!. Shipping builds stay on `release`.
+[profile.gate]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+incremental = true

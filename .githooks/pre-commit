@@ -39,6 +39,11 @@ run() {
   fi
 }
 
+# The integration targets that include a tests/support helper, by #[path] or include!.
+support_targets() {
+  (cd csr-engine && grep -l 'support/' tests/*.rs 2>/dev/null | sed 's|^tests/||; s|\.rs$||')
+}
+
 module_of() {
   m=${1#csr-engine/src/}
   m=${m%%/*}
@@ -74,12 +79,18 @@ for f in $staged; do
         case "$r" in
           src/lib.rs | src/main.rs) full=1 ;;
           src/*) mods="$mods $(module_of "csr-engine/$r")" ;;
+          tests/support/*) targets="$targets $(support_targets)" ;;
           tests/*.rs)
             t=${r#tests/}
             targets="$targets ${t%.rs}"
             ;;
         esac
       done
+      ;;
+    csr-engine/tests/support/*)
+      # A helper module, not a test target: run the targets that pull it in.
+      rust=1
+      targets="$targets $(support_targets)"
       ;;
     csr-engine/tests/*.rs)
       rust=1
@@ -96,7 +107,7 @@ unset IFS
 cd csr-engine
 export CARGO_BUILD_JOBS="$jobs"
 run cargo fmt -- --check
-run cargo clippy --all-targets -- -D warnings
+run cargo clippy --profile gate --all-targets -- -D warnings
 
 # The tests run under a throwaway HOME, so none can read or write the person's real
 # ~/.claude-self-reflect or ~/.claude. Cargo and rustup keep their own homes.
@@ -105,13 +116,13 @@ test_home=$(mktemp -d /private/tmp/precommit-cargo-home.XXXXXX)
 trap 'rm -rf "$test_home"' EXIT
 
 if [ "$full" = 1 ]; then
-  run env HOME="$test_home" cargo test --lib -- --test-threads="$jobs"
+  run env HOME="$test_home" cargo test --profile gate --lib -- --test-threads="$jobs"
 elif [ -n "$mods" ]; then
   filters=$(printf '%s\n' $mods | sort -u | sed 's/$/::/')
   # shellcheck disable=SC2086
-  run env HOME="$test_home" cargo test --lib -- --test-threads="$jobs" $filters
+  run env HOME="$test_home" cargo test --profile gate --lib -- --test-threads="$jobs" $filters
 fi
 
 for t in $(printf '%s\n' $targets | sort -u); do
-  run env HOME="$test_home" cargo test --test "$t" -- --test-threads="$jobs"
+  run env HOME="$test_home" cargo test --profile gate --test "$t" -- --test-threads="$jobs"
 done
