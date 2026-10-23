@@ -876,13 +876,13 @@ fn sink_out_of_family_under_explicit_scope(
 /// asked again whose row also states the answer keeps its rank. Stable: every
 /// class keeps its fused order, so when an echo and an answer come from the
 /// same conversation the answer is what represents that conversation.
-fn sink_non_answers(enriched: &mut [EnrichedResult]) {
+fn sink_non_answers(enriched: &mut [EnrichedResult], query: &str) {
     let classes: HashMap<String, u8> = enriched
         .iter()
         .map(|result| {
             (
                 result.chunk.id.clone(),
-                non_answer_class(&result.chunk.content),
+                non_answer_class(&result.chunk.content, query),
             )
         })
         .collect();
@@ -891,12 +891,12 @@ fn sink_non_answers(enriched: &mut [EnrichedResult]) {
 
 /// 2 for CSR's own payload or a terminal replay, 1 for a question echo, 0 for a
 /// row that can answer.
-fn non_answer_class(content: &str) -> u8 {
+fn non_answer_class(content: &str, query: &str) -> u8 {
     if crate::import::contamination::is_csr_tool_payload(content)
         || crate::import::contamination::is_terminal_replay(content)
     {
         2
-    } else if crate::search::echo::is_question_echo(content) {
+    } else if crate::search::echo::is_question_echo(content, query) {
         1
     } else {
         0
@@ -1347,6 +1347,46 @@ struct SettledPool {
     search_ms: u64,
     /// No lane filled its window, so the pool holds every candidate there is.
     exhausted: bool,
+    /// How many leading rows a caller has been shown. What a page published is
+    /// frozen: a pool rebuilt wider keeps these rows, in this order, and only
+    /// what follows them is new.
+    published: usize,
+}
+
+impl SettledPool {
+    /// This pool widened to a new settle of the same query: the rows already
+    /// published first, as they were shown, then the new pool's rows that are
+    /// not among them. The new pool sinks echoes it can now see over a wider
+    /// window, and re-ordering the published rows to match would repeat some
+    /// and skip others across pages.
+    fn widened_by(self, fresh: SettledPool) -> SettledPool {
+        let frozen = self.published.min(self.enriched.len());
+        let mut enriched: Vec<EnrichedResult> = self.enriched.into_iter().take(frozen).collect();
+        let shown: HashSet<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
+        enriched.extend(
+            fresh
+                .enriched
+                .into_iter()
+                .filter(|e| !shown.contains(&e.chunk.id)),
+        );
+        let mut display_rank_scores = fresh.display_rank_scores;
+        let scored: HashSet<String> = display_rank_scores
+            .iter()
+            .map(|score| score.chunk_id.clone())
+            .collect();
+        display_rank_scores.extend(
+            self.display_rank_scores.into_iter().filter(|score| {
+                !scored.contains(&score.chunk_id) && shown.contains(&score.chunk_id)
+            }),
+        );
+        SettledPool {
+            published: frozen,
+            enriched,
+            display_rank_scores,
+            search_ms: fresh.search_ms,
+            exhausted: fresh.exhausted,
+        }
+    }
 }
 
 /// Everything that makes two recall calls the same query for pagination.
@@ -1360,9 +1400,19 @@ struct PoolKey {
     partition_enabled: bool,
     consumption: ConsumptionMode,
     active_forgetting: bool,
+    /// The project family the ranking boosts and sinks by: `project="all"` with
+    /// a current project is a different ranking from the same `all` without one.
+    family_anchor: Option<String>,
+    current_project: Option<String>,
+    projects_root: Option<PathBuf>,
+    /// The newest verdict rows when the pool was built (see
+    /// [`Storage::verdict_generation`]): a verdict recorded since, by this
+    /// process or another, makes the pool stale.
+    verdict_generation: (i64, i64),
 }
 
 impl PoolKey {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         query: &str,
         scope: &SearchProjectScope,
@@ -1371,6 +1421,7 @@ impl PoolKey {
         partition_enabled: bool,
         consumption: ConsumptionMode,
         active_forgetting: bool,
+        verdict_generation: (i64, i64),
     ) -> Self {
         Self {
             query: query.to_string(),
@@ -1381,6 +1432,10 @@ impl PoolKey {
             partition_enabled,
             consumption,
             active_forgetting,
+            family_anchor: scope.family_anchor.clone(),
+            current_project: scope.current_project_for_all_scope.clone(),
+            projects_root: scope.projects_root_override.clone(),
+            verdict_generation,
         }
     }
 }
@@ -1440,9 +1495,8 @@ fn cache_pool(storage: &Arc<Storage>, key: PoolKey, pool: SettledPool) {
     });
 }
 
-/// The cached pool for `key`, if it covers `need` rows: it holds that many, or
-/// it holds every candidate there is.
-fn cached_pool(storage: &Arc<Storage>, key: &PoolKey, need: usize) -> Option<SettledPool> {
+/// The cached pool for `key` whatever it covers, if it is still fresh.
+fn cached_entry(storage: &Arc<Storage>, key: &PoolKey) -> Option<SettledPool> {
     let cache = POOL_CACHE.lock().ok()?;
     cache
         .iter()
@@ -1453,9 +1507,42 @@ fn cached_pool(storage: &Arc<Storage>, key: &PoolKey, need: usize) -> Option<Set
                     .storage
                     .upgrade()
                     .is_some_and(|held| Arc::ptr_eq(&held, storage))
-                && (entry.pool.exhausted || entry.pool.enriched.len() >= need)
         })
         .map(|entry| entry.pool.clone())
+}
+
+/// The cached pool for `key`, if it covers `need` rows: it holds that many, or
+/// it holds every candidate there is. The first `need` rows count as published
+/// from now on.
+fn cached_pool(storage: &Arc<Storage>, key: &PoolKey, need: usize) -> Option<SettledPool> {
+    let mut cache = POOL_CACHE.lock().ok()?;
+    let entry = cache.iter_mut().find(|entry| {
+        entry.key == *key
+            && entry.at.elapsed() < POOL_TTL
+            && entry
+                .storage
+                .upgrade()
+                .is_some_and(|held| Arc::ptr_eq(&held, storage))
+            && (entry.pool.exhausted || entry.pool.enriched.len() >= need)
+    })?;
+    entry.pool.published = entry
+        .pool
+        .published
+        .max(need.min(entry.pool.enriched.len()));
+    Some(entry.pool.clone())
+}
+
+/// Forget every pool of `storage`: a verdict recorded through this process
+/// must show on the next page, not after the pool expires.
+fn clear_pool_cache(storage: &Arc<Storage>) {
+    if let Ok(mut cache) = POOL_CACHE.lock() {
+        cache.retain(|entry| {
+            entry
+                .storage
+                .upgrade()
+                .is_some_and(|held| !Arc::ptr_eq(&held, storage))
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1475,7 +1562,10 @@ async fn reflect_final_page(
     rerank_mode: RecallRerankMode<'_>,
     record_retrievals: bool,
 ) -> Result<FinalPage> {
-    let pool = settled_pool(
+    // Read before the pool is built: a verdict that lands while it is built
+    // leaves the pool keyed to the older generation, i.e. stale, never fresh.
+    let verdict_generation = storage.verdict_generation();
+    let mut pool = settled_pool(
         storage,
         search,
         query_vec,
@@ -1493,6 +1583,7 @@ async fn reflect_final_page(
     .await?;
     // Only the runtime ranking is paged later; an offline eval run under
     // another reranker must not stand in for it.
+    pool.published = limit.min(pool.enriched.len());
     if matches!(rerank_mode, RecallRerankMode::Runtime) {
         cache_pool(
             storage,
@@ -1504,6 +1595,7 @@ async fn reflect_final_page(
                 partition_enabled,
                 consumption_mode,
                 active_forgetting,
+                verdict_generation,
             ),
             pool.clone(),
         );
@@ -1623,6 +1715,7 @@ async fn settled_pool(
         display_rank_scores: pass.display_rank_scores,
         search_ms,
         exhausted: !pass.window_full,
+        published: 0,
     })
 }
 
@@ -2318,7 +2411,7 @@ async fn reflect_gather_pass(
     // Rows that carry no answer sink below the rows that do. Runs before the
     // out-of-family sink so that sink, which is the stronger statement about
     // where a row belongs, keeps the last word on order.
-    sink_non_answers(&mut enriched);
+    sink_non_answers(&mut enriched, query);
     // Under an explicit project filter, chunk search is already restricted to
     // the project family, but reflections and stories are not: RRF places them
     // by rank, so a cosine-0.12 story from another project could sit above
@@ -2502,6 +2595,7 @@ pub async fn resolve_chunks(
         claim.as_deref(),
         confirmation,
     )?;
+    clear_pool_cache(storage);
 
     Ok(format!(
         "recorded {} verdict(s): {} (source: {})",
@@ -3741,11 +3835,13 @@ async fn get_more_results_in_scope(
         partition_enabled,
         consumption_mode,
         active_forgetting,
+        storage.verdict_generation(),
     );
     let need = offset.saturating_add(limit);
     let pool = match cached_pool(storage, &key, need) {
         Some(pool) => pool,
         None => {
+            let prior = cached_entry(storage, &key);
             let pool = settled_pool(
                 storage,
                 search,
@@ -3762,6 +3858,12 @@ async fn get_more_results_in_scope(
                 RecallRerankMode::Runtime,
             )
             .await?;
+            // What earlier pages showed stays where it was shown.
+            let mut pool = match prior {
+                Some(prior) => prior.widened_by(pool),
+                None => pool,
+            };
+            pool.published = pool.published.max(need.min(pool.enriched.len()));
             cache_pool(storage, key, pool.clone());
             pool
         }
@@ -12329,7 +12431,7 @@ mod echo_recall_tests {
     const QUERY: &str = "why did we drop Docker and Qdrant";
     const SIG: &str = r#"Signature: {"completion_status":"partial","confidence":"MEDIUM","frameworks":["rust"],"pattern_reusability":"medium","error_recovery":false,"total_edits":0,"iteration_count":2,"tools_used":["ToolSearch"],"files_modified":[],"concepts":[]}"#;
     const WHY_ROW: &str = "WHY: why did we drop Qdrant\n\nconv_3ebfc6f9-d73f-49b3-b29b-202ed5f35255:\n  via=reflection score=0.794 [2026-07-15T19:39:01.638330+00:00] conv_3ebfc6f9-d73f-49b3-b29b-202ed5f35255: ## User Request why did we drop Docker and Qdrant";
-    const SEARCH_ROW: &str = "🎯 RESULTS: 5 matches (partial relevance, top score: 0.450)\n⚡ PERFORMANCE: 6ms (1 collection searched)\n\n<search>\n  <summary count=\"5\" relevance=\"partial\" top-score=\"0.450\">\n    <preview>[keyword] why did we drop Docker and Qdrant</preview>\n  </summary>";
+    const SEARCH_ROW: &str = "🎯 RESULTS: 5 matches (partial relevance, top score: 0.450)\n⚡ PERFORMANCE: 6ms (1 collection searched)\n\n<search>\n  <summary count=\"5\" relevance=\"partial\" top-score=\"0.450\">\n    <preview>[keyword] why did we drop Docker and Qdrant</preview>\n  </summary>\n  <meta>\n    <q>why</q>\n  </meta>\n  <results>\n  </results>\n</search>";
 
     fn vec_at(cos: f32) -> Vec<f32> {
         vec![cos, (1.0 - cos * cos).sqrt(), 0.0, 0.0]
@@ -12967,6 +13069,312 @@ mod echo_recall_tests {
             walked.extend(seen);
         }
         assert_eq!(walked, (0..30).collect::<Vec<_>>(), "once each, in order");
+    }
+
+    /// The row markers (`ECHO007`, `ANSWER2`, `ROW5`) of a page, in order. Page
+    /// one and the later pages name rows differently, so tests read the text; the
+    /// summary's preview repeats the first row, so a marker counts once a page.
+    fn marks(out: &str) -> Vec<String> {
+        let mut seen = HashSet::new();
+        out.split_whitespace()
+            .flat_map(|word| word.split(|c: char| !c.is_ascii_alphanumeric()))
+            .filter(|word| {
+                ["ECHO", "ANSWER", "ROW"].iter().any(|tag| {
+                    word.strip_prefix(tag).is_some_and(|rest| {
+                        !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+                    })
+                })
+            })
+            .filter(|word| seen.insert(*word))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Rows the vector window of page one cannot see, an echo-filled first
+    /// 120, then five answers. Rebuilding the pool wider for the offset past
+    /// the cached one sinks the echoes behind the answers; the page must not
+    /// repeat the echoes it showed or skip the answers. What a page published
+    /// stays where it was shown.
+    #[tokio::test]
+    async fn a_page_past_the_cached_pool_repeats_no_row_and_shows_the_answers() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        for n in 0..120 {
+            let (row, vector) = chunk(
+                &format!("echo-{n:03}"),
+                &format!("convecho{n:03}"),
+                0.99 - n as f32 * 0.002,
+                &format!("ECHO{n:03} why did we drop Docker and Qdrant?"),
+            );
+            storage.insert_chunk(&row, &vector).unwrap();
+            engine.insert_chunk(row.id.clone(), vector);
+        }
+        for n in 0..5 {
+            let (row, vector) = chunk(
+                &format!("answer-{n}"),
+                &format!("convanswer{n}"),
+                0.60 - n as f32 * 0.01,
+                &format!(
+                    "ANSWER{n} Qdrant went because installing a server was painful, reason {n}."
+                ),
+            );
+            storage.insert_chunk(&row, &vector).unwrap();
+            engine.insert_chunk(row.id.clone(), vector);
+        }
+        let search = Arc::new(RwLock::new(engine));
+        let scope =
+            SearchProjectScope::resolve_with(&storage, Some("all"), Some("echoproj"), None, None)
+                .unwrap();
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+        let first = reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &q,
+            QUERY,
+            5,
+            0.0,
+            &scope,
+            0,
+            true,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut seen: Vec<String> = marks(&first);
+        assert_eq!(seen.len(), 5, "{first}");
+        for offset in (5..125).step_by(5) {
+            let page = get_more_results_in_scope(
+                &storage,
+                &search,
+                &q,
+                QUERY,
+                offset,
+                5,
+                0.0,
+                &scope,
+                ConsumptionMode::Off,
+                false,
+            )
+            .await
+            .unwrap();
+            let got = marks(&page);
+            assert_eq!(got.len(), 5, "offset {offset}: {page}");
+            if offset == 120 {
+                assert!(
+                    got.iter().all(|id| id.starts_with("ANSWER")),
+                    "the five answers follow the 120 echoes already shown: {got:?}"
+                );
+            }
+            seen.extend(got);
+        }
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            seen.len(),
+            "no row repeats across pages: {seen:?}"
+        );
+        assert_eq!(
+            seen.iter().filter(|id| id.starts_with("ANSWER")).count(),
+            5,
+            "every answer appears once: {seen:?}"
+        );
+    }
+
+    fn six_rows() -> (Arc<Storage>, Arc<RwLock<SearchEngine>>) {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        for n in 0..8 {
+            let (row, vector) = chunk(
+                &format!("row-{n}"),
+                &format!("conv{n}"),
+                0.90 - n as f32 * 0.04,
+                &format!("ROW{n} the install was painful for reason number {n}."),
+            );
+            storage.insert_chunk(&row, &vector).unwrap();
+            engine.insert_chunk(row.id.clone(), vector);
+        }
+        (storage, Arc::new(RwLock::new(engine)))
+    }
+
+    type Rig = (Arc<Storage>, Arc<RwLock<SearchEngine>>, SearchProjectScope);
+
+    const Q4: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+
+    async fn page_one() -> Rig {
+        let (storage, search) = six_rows();
+        let scope =
+            SearchProjectScope::resolve_with(&storage, Some("all"), Some("echoproj"), None, None)
+                .unwrap();
+        let first = reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &Q4,
+            QUERY,
+            5,
+            0.0,
+            &scope,
+            0,
+            true,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(first.contains("ROW0") && !first.contains("ROW5"), "{first}");
+        (storage, search, scope)
+    }
+
+    async fn page_two(rig: &Rig) -> String {
+        let (storage, search, scope) = rig;
+        get_more_results_in_scope(
+            storage,
+            search,
+            &Q4,
+            QUERY,
+            5,
+            3,
+            0.0,
+            scope,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A verdict another process wrote after page one (a direct ledger insert
+    /// here: the in-process cache is not told) still reaches the next page.
+    #[tokio::test]
+    async fn a_verdict_recorded_after_page_one_shows_on_the_next_page() {
+        let rig = page_one().await;
+        let before = rig.0.verdict_generation();
+        rig.0
+            .insert_resolutions(
+                &["row-5".to_string()],
+                "resolved",
+                "fixed in 9.5.8",
+                None,
+                crate::storage::queries::RESOLUTION_SOURCE_USER_CONFIRMED,
+            )
+            .unwrap();
+        assert_ne!(before, rig.0.verdict_generation());
+        let page = page_two(&rig).await;
+        assert!(page.contains("<resolution>"), "{page}");
+        let order = marks(&page);
+        assert_eq!(
+            order.last().map(String::as_str),
+            Some("ROW5"),
+            "a confirmed-resolved row sinks below the unresolved ones: {order:?}"
+        );
+    }
+
+    /// Recording a verdict through `csr_resolve` drops the pools of the store.
+    #[tokio::test]
+    async fn resolving_a_chunk_drops_the_cached_pools() {
+        let rig = page_one().await;
+        let held = |storage: &Arc<Storage>| {
+            POOL_CACHE.lock().unwrap().iter().any(|entry| {
+                entry
+                    .storage
+                    .upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(&held, storage))
+            })
+        };
+        assert!(held(&rig.0), "page one cached its pool");
+        resolve_chunks(
+            &rig.0,
+            vec!["row-6".to_string()],
+            "regressed".to_string(),
+            "broke again".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!held(&rig.0), "the store's pools are gone");
+        let page = page_two(&rig).await;
+        assert_eq!(marks(&page), ["ROW5", "ROW6", "ROW7"], "{page}");
+    }
+
+    /// `project="all"` with a current project boosts that family; the same
+    /// `all` search without one does not (the health probe). Their pools are
+    /// not interchangeable.
+    #[tokio::test]
+    async fn a_pool_built_for_another_current_project_is_not_reused() {
+        let (storage, search) = six_rows();
+        let boosted =
+            SearchProjectScope::resolve_with(&storage, Some("all"), Some("echoproj"), None, None)
+                .unwrap();
+        let unboosted =
+            SearchProjectScope::resolve_with(&storage, Some("all"), None, None, None).unwrap();
+        let other =
+            SearchProjectScope::resolve_with(&storage, Some("all"), Some("elsewhere"), None, None)
+                .unwrap();
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+        reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &q,
+            QUERY,
+            5,
+            0.0,
+            &boosted,
+            0,
+            true,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        let key = |scope: &SearchProjectScope| {
+            PoolKey::new(
+                QUERY,
+                scope,
+                0.0,
+                SearchMode::Hybrid,
+                true,
+                ConsumptionMode::Off,
+                false,
+                storage.verdict_generation(),
+            )
+        };
+        assert!(cached_pool(&storage, &key(&boosted), 5).is_some());
+        assert!(cached_pool(&storage, &key(&unboosted), 5).is_none());
+        assert!(cached_pool(&storage, &key(&other), 5).is_none());
+    }
+
+    /// Codex's inputs, whole: none of these rows is a question echo or a CSR
+    /// payload, so none of them sinks.
+    #[test]
+    fn the_rows_codex_found_sinking_stay_where_their_text_puts_them() {
+        let cases = [
+            (
+                format!("[reflection] ## User Request\nwhy did the import time out?\n\n## Active Issues\nFix: raise the timeout to 120s.\n\n---\n{SIG}"),
+                "why did the import time out",
+            ),
+            (
+                "WHY: storage\n\nNo evidence chain found.\n\nRoot cause: migration 42 wrote the lock.".to_string(),
+                "storage",
+            ),
+            (
+                "[mcp__claude_self_reflect__csr_why]\nFix: use SQLite.".to_string(),
+                "why sqlite",
+            ),
+            (
+                "How long we retain caches is 300 seconds".to_string(),
+                "how long do we retain caches",
+            ),
+            (
+                "Recall uses SQLite and HNSW".to_string(),
+                "what does recall use",
+            ),
+        ];
+        for (row, query) in cases {
+            assert_eq!(non_answer_class(&row, query), 0, "{row}");
+        }
     }
 
     /// A memory whose text opens with the query is promoted ahead of fusion,

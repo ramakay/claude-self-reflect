@@ -927,6 +927,29 @@ impl Storage {
         queries::fts5_search(&conn, query, limit, project)
     }
 
+    /// The newest row ids of the two verdict tables, `(resolution_ledger,
+    /// witness_verdicts)`: both are append-only, so the pair changes when a
+    /// verdict is recorded, by this process or another. Two cheap index reads.
+    /// If they cannot be read the pair is never the same twice, so nothing
+    /// keyed on it is reused.
+    pub fn verdict_generation(&self) -> (i64, i64) {
+        let read = || -> Result<(i64, i64)> {
+            let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            Ok(conn.query_row(
+                "SELECT (SELECT COALESCE(MAX(id), 0) FROM resolution_ledger),
+                        (SELECT COALESCE(MAX(id), 0) FROM witness_verdicts)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        };
+        read().unwrap_or_else(|_| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as i64);
+            (-nanos.max(1), 0)
+        })
+    }
+
     /// [`Self::fts5_search`] for several projects with ONE ranking pass; see
     /// `queries::fts5_search_projects`.
     pub fn fts5_search_projects(
