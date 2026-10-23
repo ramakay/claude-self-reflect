@@ -951,9 +951,17 @@ fn observation_fold_h() -> f32 {
 }
 /// Line pitch of an open section's text card.
 const DRILL_LINE: f32 = 17.;
-/// How much taller than the pane the picture may grow, shrinking everything in it, so that an
-/// open section gets its height before any card is folded.
-const DRILL_GROW: f32 = 0.30;
+/// The figure card's height for the expanded chart (95 + 40), its labels and payback (72) and the
+/// gauge offset (84).
+const FIGURE_EXPANDED_H: f32 = 291.;
+/// Fewest lines a clipped section keeps, its "+N more" line included.
+const DRILL_MIN_LINES: usize = 4;
+/// Most thread bands an open `t` draws at once.
+const THREAD_BANDS: usize = 8;
+/// The line that ends a section clipped to the room it was given.
+fn more_line(hidden: usize) -> String {
+    format!("+{hidden} more")
+}
 pub(super) const CONFUSED_TITLE: &str = "Confused Claude";
 pub(super) const SHOULD_BE_TITLE: &str = "Should be a skill / memory / tool";
 /// The short label a should-be item carries on its row.
@@ -2450,15 +2458,30 @@ pub fn draw(
             drill_lines.extend(f.wrap(string(&d["line"]), sans(11.5, t.regular), IW));
         }
     }
-    // The height an open section asks for. Threads draw bands, every other section draws lines.
-    let drill_open = open.changes || open.threads || open.dreams || open.agents;
-    let wanted_extra_h = if open.threads {
-        // A heading, then up to eight bands with a gap between each, or the one line saying there are none.
-        P * 2. + MONOLOGUE_H + (c.river.len().min(8) as f32 * ROW_PITCH - ROW_GAP).max(40.)
+    // The room an open section asks for, and the least it is given. Threads draw bands, every
+    // other section draws lines.
+    let drill_total = drill_lines.len().saturating_sub(open.scroll);
+    let bands_left = c.river.len().saturating_sub(open.scroll);
+    let thread_card = |bands: usize, more: bool| {
+        // A heading, then the bands with a gap between each, or the one line saying there are none.
+        P * 2.
+            + MONOLOGUE_H
+            + (bands as f32 * ROW_PITCH - ROW_GAP).max(40.)
+            + if more { DRILL_LINE } else { 0. }
+    };
+    let line_card = |lines: usize| lines as f32 * DRILL_LINE + P * 2.;
+    let (drill_want, drill_least) = if open.threads {
+        (
+            thread_card(bands_left.min(THREAD_BANDS), bands_left > THREAD_BANDS),
+            thread_card(bands_left.min(2), bands_left > 2),
+        )
     } else if drill_lines.is_empty() {
-        0.
+        (0., 0.)
     } else {
-        drill_lines.len().saturating_sub(open.scroll).max(1) as f32 * DRILL_LINE + P * 2.
+        (
+            line_card(drill_total.max(1)),
+            line_card(drill_total.clamp(1, DRILL_MIN_LINES)),
+        )
     };
     let notice_h = if c.notice.is_some() {
         P * 2. + theme::BODY_LINE
@@ -2467,16 +2490,10 @@ pub fn draw(
     };
     let notice_gap = if c.notice.is_some() { S3 } else { 0. };
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
-    let figure_min: f32 = if quotas_only {
-        154.
-    } else if open.figure {
-        // Chart (95 + 40), chart labels/payback (72), gauge offset (84).
-        291.
-    } else {
-        110.
-    };
+    // The figure card's smallest height: its one-row gauge strip (or the quotas row).
+    let figure_floor: f32 = if quotas_only { 154. } else { 110. };
     // `i` adds a card of the figure's facts, one to a line, under the figure.
-    let fig_detail_lines: Vec<String> = if open.figure {
+    let fig_detail_all: Vec<String> = if open.figure {
         figure_detail_lines(c)
             .iter()
             .flat_map(|line| f.wrap(line, sans(11.5, t.regular), IW))
@@ -2484,10 +2501,13 @@ pub fn draw(
     } else {
         vec![]
     };
-    let fig_detail_h = if fig_detail_lines.is_empty() {
-        0.
+    let (detail_want, detail_least) = if fig_detail_all.is_empty() {
+        (0., 0.)
     } else {
-        fig_detail_lines.len() as f32 * DRILL_LINE + P * 2.
+        (
+            line_card(fig_detail_all.len()),
+            line_card(fig_detail_all.len().min(DRILL_MIN_LINES)),
+        )
     };
     let observed = [
         (CONFUSED_TITLE, &c.confusing, false),
@@ -2503,92 +2523,147 @@ pub fn draw(
         .filter(|(_, items, _)| !items.is_empty())
         .map(|_| observation_fold_h() + S3)
         .sum();
-    let tail_core = agents_h
+    let story_fold_h = if story_h > 0. {
+        observation_fold_h()
+    } else {
+        0.
+    };
+    let tail_base = agents_h
         + if active { S3 } else { 0. }
         + empty_help
-        + if empty_help > 0. { S3 } else { 0. }
-        + if fig_detail_h > 0. {
-            fig_detail_h + S3
-        } else {
-            0.
-        };
-    // The facts card is added to the picture; it never takes the figure's own room. The figure keeps
-    // at least the height the closed pane gave it, and the canvas grows by the card.
-    let figure_min = if fig_detail_h > 0. {
-        let base_tail = tail_core - fig_detail_h - S3;
-        let closed_top = M
-            + hero_h
-            + S3
-            + observed_full_h
-            + story_h
-            + if story_h > 0. { S3 } else { 0. }
-            + notice_h
-            + notice_gap;
-        let closed_min = if quotas_only { 154. } else { 110. };
-        let closed_maxh =
-            maxh.max((closed_top + base_tail + closed_min) / (1. - S3 / available_height as f32));
-        let closed_gap = S3 * closed_maxh / available_height as f32;
-        figure_min.max(closed_maxh - closed_top - base_tail - closed_gap)
-    } else {
-        figure_min
-    };
-    // The layout for one choice of canvas height and observation cards: (height, key gap, room left
-    // for an open section). Layout points may scale to fit a narrow/wide terminal; reserve S3 in
-    // final pixels.
-    let layout_for = |maxh: f32, observed_h: f32| {
-        let top_core = M
-            + hero_h
+        + if empty_help > 0. { S3 } else { 0. };
+    // Everything above the figure for one choice of observation cards and story card.
+    let top_for = |observed_h: f32, story_h: f32| {
+        M + hero_h
             + S3
             + observed_h
             + story_h
             + if story_h > 0. { S3 } else { 0. }
             + notice_h
-            + notice_gap;
-        let min_core = top_core + tail_core + figure_min;
-        let maxh = maxh.max(min_core / (1. - S3 / available_height as f32));
-        let key_gap = S3 * maxh / available_height as f32;
-        // The slack can be negative: the pane is then exactly as tall as it must be, and an open
-        // section has to grow it by the shortfall and the gap it keeps.
-        (maxh, key_gap, maxh - min_core - key_gap - S3, top_core)
+            + notice_gap
     };
-    // An open section gets the height it asks for. Shrinking the picture a little comes first,
-    // then folding the two observation cards to a row each; never a section squeezed to nothing.
-    let mut observed_h = observed_full_h;
-    let mut folded = false;
-    let (mut maxh, mut key_gap, mut slack, mut top_core) = layout_for(maxh, observed_h);
-    if drill_open && wanted_extra_h > slack {
-        let grow_cap = maxh * DRILL_GROW;
-        if wanted_extra_h > slack + grow_cap && observed_fold_h < observed_full_h {
-            folded = true;
-            observed_h = observed_fold_h;
-            (maxh, key_gap, slack, top_core) = layout_for(maxh, observed_h);
-        }
-        if wanted_extra_h > slack {
-            // One point over, so float rounding never costs the last line.
-            let grow =
-                ((wanted_extra_h - slack + 1.) / (1. - S3 / available_height as f32)).min(grow_cap);
-            (maxh, key_gap, slack, top_core) = layout_for(maxh + grow, observed_h);
-        }
-    }
-    let available_extra = slack.max(0.);
-    let extra_h = if open.threads {
-        wanted_extra_h.min(available_extra)
-    } else {
-        let lines = drill_lines
-            .len()
-            .saturating_sub(open.scroll)
-            .min(((available_extra - P * 2.).max(0.) / DRILL_LINE) as usize);
-        if lines == 0 {
-            0.
+    // The canvas is the closed pane's: an open section never makes it taller. Layout points may
+    // scale to fit a narrow/wide terminal; reserve S3 in final pixels.
+    let maxh = maxh.max(
+        (top_for(observed_full_h, story_h) + tail_base + figure_floor)
+            / (1. - S3 / available_height as f32),
+    );
+    let key_gap = S3 * maxh / available_height as f32;
+    // The height the figure keeps while cards can still fold: the closed pane's, or the least its
+    // layout needs (the expanded chart for `i`, the full ring, the quotas row), whichever is less.
+    let closed_figure_h = {
+        let available = maxh - top_for(observed_full_h, story_h) - tail_base - key_gap;
+        if quotas_only && empty_help > 0. {
+            available.min(empty_quota_height(c)).max(figure_floor)
         } else {
-            lines as f32 * DRILL_LINE + P * 2.
+            available
         }
     };
-    let top_core = top_core + extra_h + if extra_h > 0. { S3 } else { 0. };
+    let figure_target = if quotas_only {
+        empty_quota_height(c)
+    } else if open.figure && fresh_bar_heights(&c.requests).is_some() {
+        FIGURE_EXPANDED_H
+    } else {
+        collapsed_context_layout(&c.figure, 0.).2
+    };
+    let figure_pref = closed_figure_h.min(figure_target).max(figure_floor);
+    // An open section makes its room by folding the two observation cards to a row each, then the
+    // story card, then shrinking the figure to its floor; only then is the section itself clipped.
+    let gaps = if drill_want > 0. { S3 } else { 0. } + if detail_want > 0. { S3 } else { 0. };
+    let want = drill_want + detail_want + gaps;
+    let mut room = maxh - key_gap - top_for(observed_full_h, story_h) - tail_base - figure_pref;
+    let mut observed_h = observed_full_h;
+    let mut story_card_h = story_h;
+    let mut folded = false;
+    let mut story_folded = false;
+    // Float noise in `room` never folds a card for a section that is not open.
+    let needs = |room: f32| want > 0. && want > room;
+    if needs(room) && observed_fold_h < observed_full_h {
+        folded = true;
+        observed_h = observed_fold_h;
+        room += observed_full_h - observed_fold_h;
+    }
+    if needs(room) && story_fold_h < story_h {
+        story_folded = true;
+        story_card_h = story_fold_h;
+        room += story_h - story_fold_h;
+    }
+    if needs(room) {
+        room += figure_pref - figure_floor;
+    }
+    // The drill card is placed first; the facts card takes what it leaves.
+    let space = room - gaps;
+    let drill_given = if drill_want > 0. {
+        drill_want.min(drill_least.max(space - detail_least))
+    } else {
+        0.
+    };
+    let detail_given = if detail_want > 0. {
+        detail_want.min(detail_least.max(space - drill_given))
+    } else {
+        0.
+    };
+    // Lines that fit a given height; one point over, so float rounding never costs the last line.
+    let lines_in = |given: f32| ((given - P * 2.) / DRILL_LINE + 0.001).max(0.) as usize;
+    // The lines a clipped section draws: fewer than all of them end with a "+N more" line.
+    let clip = |all: &[String], skip: usize, given: f32, want: f32| -> Vec<String> {
+        let rest: Vec<String> = all.iter().skip(skip).cloned().collect();
+        if given >= want || rest.len() <= lines_in(given) {
+            return rest;
+        }
+        let shown = lines_in(given).max(DRILL_MIN_LINES.min(rest.len())) - 1;
+        let mut out: Vec<String> = rest.iter().take(shown).cloned().collect();
+        out.push(more_line(rest.len() - shown));
+        out
+    };
+    let drill_rows = if open.threads || drill_lines.is_empty() {
+        vec![]
+    } else {
+        clip(&drill_lines, open.scroll, drill_given, drill_want)
+    };
+    // The bands an open `t` draws, and how many it leaves out.
+    let (thread_bands, thread_hidden) = if open.threads {
+        let spine = drill_given - P * 2. - MONOLOGUE_H;
+        let all = ((spine + ROW_GAP) / ROW_PITCH + 0.001).max(0.) as usize;
+        if bands_left <= THREAD_BANDS && (all >= bands_left || drill_given >= drill_want) {
+            (bands_left, 0)
+        } else {
+            let fit = (((spine - DRILL_LINE + ROW_GAP) / ROW_PITCH + 0.001).max(0.) as usize)
+                .min(THREAD_BANDS)
+                .max(bands_left.min(2));
+            (fit.min(bands_left), bands_left.saturating_sub(fit))
+        }
+    } else {
+        (0, 0)
+    };
+    let extra_h = if open.threads {
+        thread_card(thread_bands, thread_hidden > 0)
+    } else if drill_rows.is_empty() {
+        0.
+    } else {
+        line_card(drill_rows.len())
+    };
+    let fig_detail_lines = if open.figure {
+        clip(&fig_detail_all, 0, detail_given, detail_want)
+    } else {
+        vec![]
+    };
+    let fig_detail_h = if fig_detail_lines.is_empty() {
+        0.
+    } else {
+        line_card(fig_detail_lines.len())
+    };
+    let tail_core = tail_base
+        + if fig_detail_h > 0. {
+            fig_detail_h + S3
+        } else {
+            0.
+        };
+    let top_core = top_for(observed_h, story_card_h) + extra_h + if extra_h > 0. { S3 } else { 0. };
     let card_gap = S3;
     let (figure_h, help_h) = if quotas_only && empty_help > 0. {
         let available = maxh - top_core - tail_core - key_gap;
-        let figure_h = available.min(empty_quota_height(c)).max(figure_min);
+        let figure_h = available.min(empty_quota_height(c)).max(figure_floor);
         // Cards always stack from the top. The final card owns surplus height.
         (figure_h, empty_help + (available - figure_h).max(0.))
     } else {
@@ -2892,17 +2967,50 @@ pub fn draw(
     }
     let mut shift_hits = vec![];
     let mut story_line_count = 0usize;
-    let story_region = (story_h > 0.).then_some((y, story_h));
-    if story_h > 0. {
+    let story_region = (story_h > 0.).then_some((y, story_card_h));
+    let story_title = if c.story.is_empty() && c.shifts.is_empty() {
+        "This session"
+    } else {
+        "Where the work stands"
+    };
+    if story_folded {
+        // Folded to its title row, the card still opens its words in full on a click.
+        panel(&mut canvas, y, story_card_h, t);
+        label(
+            &mut canvas,
+            f,
+            story_title,
+            IX,
+            y + P + f.cap(title),
+            theme::TITLE_SIZE,
+            t.ink,
+            t.bold,
+        );
+        if !canvas.dry {
+            let full = if c.story.is_empty() {
+                c.learnt
+                    .iter()
+                    .cloned()
+                    .chain(c.shifts.iter().map(shift_full))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            } else {
+                c.story.clone()
+            };
+            canvas.cuts.push(Cut {
+                y: y + P + f.cap(title),
+                size: theme::TITLE_SIZE,
+                title: story_title,
+                full,
+            });
+        }
+        y += story_card_h + card_gap;
+    } else if story_h > 0. {
         panel(&mut canvas, y, story_h, t);
         label(
             &mut canvas,
             f,
-            if c.story.is_empty() && c.shifts.is_empty() {
-                "This session"
-            } else {
-                "Where the work stands"
-            },
+            story_title,
             IX,
             y + P + f.cap(title),
             theme::TITLE_SIZE,
@@ -2982,11 +3090,7 @@ pub fn draw(
         panel(&mut canvas, y, extra_h, t);
         let mut b = y + P;
         if open.changes || open.dreams || open.agents {
-            for line in drill_lines
-                .iter()
-                .skip(open.scroll)
-                .take(((extra_h - P * 2.) / DRILL_LINE).round() as usize)
-            {
+            for line in &drill_rows {
                 b += 12.;
                 label(&mut canvas, f, line, IX, b, 11.5, t.ink, t.regular);
                 b += DRILL_LINE - 12.;
@@ -3020,13 +3124,12 @@ pub fn draw(
                     t,
                 );
             }
-            let spine_h = (extra_h - P * 2. - MONOLOGUE_H).max(0.);
             let spine_x = IX + 72.;
             let rows: Vec<_> = c
                 .river
                 .iter()
                 .skip(open.scroll)
-                .take(((spine_h + ROW_GAP) / ROW_PITCH) as usize)
+                .take(thread_bands)
                 .collect();
             // The first baseline sits half a band plus a cap-height below the first band's top.
             let b = top + ROW_BAND / 2. + 4.;
@@ -3092,6 +3195,19 @@ pub fn draw(
                 canvas.cut_title = recording;
                 b += ROW_PITCH;
             }
+            if thread_hidden > 0 {
+                let line_top = y + extra_h - P - DRILL_LINE;
+                label(
+                    &mut canvas,
+                    f,
+                    &more_line(thread_hidden),
+                    IX,
+                    line_top + 12.,
+                    11.5,
+                    t.quiet,
+                    t.regular,
+                );
+            }
         } else {
             for d in c.dream.queue.iter().take(4) {
                 single(&mut canvas, f, string(&d["line"]), IX, b, IW, 12., t.ink, t);
@@ -3115,7 +3231,7 @@ pub fn draw(
         y,
         figure_layout_h,
         t,
-        open.figure,
+        open.figure && figure_h >= FIGURE_EXPANDED_H,
         narrow,
     );
     if let Some((cy, ring, group, avail, mid)) = fig_info {
@@ -5167,6 +5283,114 @@ mod tests {
         // Folded cards are still click targets: one per card.
         assert_eq!(open.observation_rows.len(), 2);
         assert!(open.observation_rows.iter().all(|r| r.1 == 0));
+    }
+
+    #[test]
+    fn an_open_section_never_makes_the_canvas_taller_and_keeps_its_least_content() {
+        // Terminal sizes in cells (columns, rows) at the 16 x 34 px cell.
+        for (cols, rows) in [(46, 30), (46, 60), (40, 50), (80, 40)] {
+            let (w, h) = (cols * 16, (rows - 1) * 34);
+            for (name, shifts, dreams, figure) in [
+                ("rich", 7, 4, true),
+                ("thin", 2, 0, false),
+                ("empty", 0, 0, false),
+            ] {
+                let c = drill_composition(shifts, dreams, figure);
+                let (closed, closed_m) =
+                    draw(&c, w, h, Theme::Dark, Open::default(), false).expect("draws");
+                for (key, open) in drill_keys() {
+                    let at = format!("{name} {cols}x{rows} key {key}");
+                    let (shown, m) = draw(&c, w, h, Theme::Dark, open, false).expect("draws");
+                    assert_eq!(m.height, closed_m.height, "{at}: the canvas grew");
+                    assert_eq!(
+                        (shown.width(), shown.height()),
+                        (closed.width(), closed.height()),
+                        "{at}"
+                    );
+                    match key {
+                        "l" => {
+                            let (_, card) =
+                                m.drill_region.unwrap_or_else(|| panic!("{at}: no card"));
+                            // The note and the first change, or all of them when there are fewer.
+                            let lines = c.shifts.len().min(1) + 1;
+                            assert!(card >= P * 2. + lines as f32 * DRILL_LINE, "{at}: {card}");
+                        }
+                        "t" => {
+                            let (_, card) =
+                                m.drill_region.unwrap_or_else(|| panic!("{at}: no card"));
+                            let bands = c.river.len().min(2);
+                            let least = P * 2.
+                                + MONOLOGUE_H
+                                + (bands as f32 * ROW_PITCH - ROW_GAP).max(40.);
+                            assert!(card >= least, "{at}: {card} < {least}");
+                        }
+                        _ => {
+                            let (_, card) = m
+                                .figure_detail_region
+                                .unwrap_or_else(|| panic!("{at}: no facts card"));
+                            let lines = figure_detail_lines(&c).len().min(3);
+                            assert!(card >= P * 2. + lines as f32 * DRILL_LINE, "{at}: {card}");
+                        }
+                    }
+                    // Whatever the section took came from the cards, not from the canvas.
+                    let (fig_top, fig_h) = m.figure_region;
+                    assert!(fig_h > 0. && fig_top + fig_h <= m.height, "{at}: {fig_h}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_closed_pane_never_folds_a_card_whatever_its_size() {
+        for (name, shifts, dreams, figure) in [
+            ("rich", 7, 4, true),
+            ("thin", 2, 0, false),
+            ("empty", 0, 0, false),
+        ] {
+            let c = drill_composition(shifts, dreams, figure);
+            for w in [560, 736] {
+                for h in (300..2000).step_by(61) {
+                    let (_, m) =
+                        draw(&c, w, h, Theme::Dark, Open::default(), false).expect("draws");
+                    let at = format!("{name} {w}x{h}");
+                    assert!(!m.observations_folded, "{at}");
+                    let (_, story) = m.story_region.expect("a story card");
+                    assert!(story > P * 2. + theme::TITLE_LINE + 1., "{at}: {story}");
+                    assert!(
+                        m.drill_region.is_none() && m.figure_detail_region.is_none(),
+                        "{at}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_folded_story_card_opens_its_words_on_a_click() {
+        let c = drill_composition(7, 4, true);
+        let open = Open {
+            changes: true,
+            ..Open::default()
+        };
+        let mut folded = false;
+        for (cols, rows) in [(46, 30), (40, 50)] {
+            let (_, m) =
+                draw(&c, cols * 16, (rows - 1) * 34, Theme::Dark, open, false).expect("draws");
+            if let Some((top, h)) = m
+                .story_region
+                .filter(|(_, h)| *h < P * 2. + theme::TITLE_LINE + 1.)
+            {
+                folded = true;
+                let cut = m
+                    .cuts
+                    .iter()
+                    .find(|cut| cut.title == "Where the work stands")
+                    .expect("the folded card carries its words");
+                assert_eq!(cut.full, LONG_STORY);
+                assert!(cut.y > top && cut.y < top + h);
+            }
+        }
+        assert!(folded, "no size folded the story card");
     }
 
     #[test]
