@@ -231,9 +231,19 @@ fn on_turn_complete(seams: Seams) -> Handler {
             if !e["agentId"].is_null() || e["reason"] != "answer" {
                 return Ok(Reply::none());
             }
-            if is_person(&cx).await {
-                refresh_story(&cx, &seams).await;
-            }
+            let person = is_person(&cx).await;
+            let refresh = if person {
+                refresh_story(&cx, &seams).await
+            } else {
+                None
+            };
+            // Why the story was or was not told again at this answer: a stale story is read here.
+            let why = refresh.map_or("none".to_string(), |r| format!("{r:?}"));
+            let _ = cx.store.set(
+                &cx.sid,
+                "storyWhy",
+                &json!({ "why": why, "person": person, "at": cx.clock.now() }),
+            );
             Ok(Reply::none())
         }
     })
@@ -678,11 +688,16 @@ mod tests {
         fx.cx.session.lock().unwrap().interactive = Some(false);
         run(&table, "turn_complete", &fx.cx, answer.clone()).await;
         assert_eq!(asked(&engine), 0);
-        // A person's answer asks.
+        let why = |fx: &Fixture| fx.cx.store.get(SID, "storyWhy").unwrap().unwrap();
+        assert_eq!(why(&fx)["why"], "none");
+        assert_eq!(why(&fx)["person"], false);
+        // A person's answer asks, and says what came of it.
         fx.cx.session.lock().unwrap().interactive = Some(true);
         run(&table, "turn_complete", &fx.cx, answer).await;
         assert_eq!(asked(&engine), 1);
         assert!(until(|| !engine.ran.lock().unwrap().is_empty()).await);
+        assert_eq!(why(&fx)["why"], "Why(Go)");
+        assert_eq!(why(&fx)["person"], true);
     }
 
     #[test]
