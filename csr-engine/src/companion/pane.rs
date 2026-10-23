@@ -4,7 +4,7 @@ use super::{
     pages, paths::Paths, render::text::*, send, session::Session, string, threads, value,
 };
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn legend(
     view: &str,
@@ -191,6 +191,18 @@ struct Instrument {
     acts: BTreeMap<usize, Value>,
     metrics: Option<super::render::instrument::Metrics>,
     more: Vec<Value>,
+    hits: BTreeMap<usize, (ObsCard, usize)>,
+    story: Option<usize>,
+}
+/// The observation item the popup shows: its card, the item's line (its identity, since a new look
+/// shifts places), the place it had, whether its text was just copied, and what the last `s` said.
+#[derive(Clone)]
+struct Popup {
+    card: ObsCard,
+    line: String,
+    index: usize,
+    copied: bool,
+    note: Option<observation::Note>,
 }
 /// Account reads borrowed while the session is also borrowed.
 struct Wide<'a> {
@@ -259,16 +271,27 @@ pub struct Pane {
     compacting: bool,
     /// Visible notice when the dreams-off offer could not write settings.
     offer_notice: Option<String>,
-    /// The observation popup: its card, the item's line (its identity, since a new look shifts
-    /// places) and whether its text was just copied.
-    popup: Option<(ObsCard, String, bool)>,
+    popup: Option<Popup>,
     /// The lines of each observation card at the last frame, `[confusing, should_be]`.
     obs_lines: [Vec<String>; 3],
     /// The rows the last frame drew with a trailing "…", each `{title, line}` in full: what a click
     /// on such a row opens.
     more: Vec<Value>,
+    /// The item each terminal row opens at the last frame: of the picture rows that share a
+    /// terminal row, the one with the most of it. `acts` keeps one act per row and cannot hold
+    /// them all.
+    hits: BTreeMap<usize, (ObsCard, usize)>,
+    /// Where the story is in `more`, when the last frame drew one.
+    story: Option<usize>,
+    /// The observation items dismissed with `x` and not yet read back from the likes log.
+    dismissed: BTreeSet<String>,
     /// What `c` copies for the popup at the last frame.
     popup_copy: Option<String>,
+    /// The popup `popup_copy` and `popup_send` were made for. A key that arrives before the frame
+    /// of a new popup is drawn must not copy or type the one before it.
+    popup_for: Option<(ObsCard, String)>,
+    /// What `s` types into Claude's prompt for it, unsent.
+    popup_send: Option<String>,
     /// Text for the watch loop to put on the clipboard.
     copy_out: Option<String>,
     instrument_kept: Option<Instrument>,
@@ -279,6 +302,16 @@ pub struct Pane {
     pub rasters: usize,
     pub encodes: usize,
     pub reused: usize,
+}
+/// The card and place an `observe:<card>:<index>` act names.
+fn observe_key(key: &str) -> Option<(ObsCard, usize)> {
+    let (card, index) = key.strip_prefix("observe:")?.split_once(':')?;
+    let card = match card.parse::<usize>().ok()? {
+        0 => ObsCard::Confusing,
+        1 => ObsCard::ShouldBe,
+        _ => ObsCard::More,
+    };
+    Some((card, index.parse().ok()?))
 }
 /// How long the narrative's week query is kept.
 const WEEK_EVERY: f64 = 60.;
@@ -356,7 +389,12 @@ impl Pane {
             popup: None,
             obs_lines: Default::default(),
             more: vec![],
+            hits: BTreeMap::new(),
+            story: None,
+            dismissed: BTreeSet::new(),
             popup_copy: None,
+            popup_for: None,
+            popup_send: None,
             copy_out: None,
             instrument_kept: None,
             gate: Default::default(),
@@ -466,7 +504,9 @@ impl Pane {
                 &self.view,
                 self.instrument_open,
                 self.theme,
-                self.popup.as_ref().map(|p| (p.0 as usize, &p.1, p.2)),
+                self.popup
+                    .as_ref()
+                    .map(|p| (p.card as usize, &p.line, p.copied, p.note)),
                 &self.open,
                 &self.sent,
                 &self.answered,
@@ -479,6 +519,7 @@ impl Pane {
     }
     fn build_frame(&mut self, cols: usize, rows: usize, now: f64) -> Vec<String> {
         self.placed.clear();
+        self.hits.clear();
         let cols = cols.max(1);
         let rows = rows.max(1);
         if self.db.is_none() {
@@ -585,6 +626,7 @@ impl Pane {
             session.load(&self.paths, self.db.as_ref());
         }
         let project = self.carry_step();
+        let dismissed = self.dismissed_keys();
         let s = self
             .session
             .as_mut()
@@ -667,6 +709,7 @@ impl Pane {
                 .map(|db| db.learnt_counts(string(&s["project"]), &self.sid, now))
                 .unwrap_or_default());
             let mut data = data;
+            data["dismissed"] = dismissed;
             if let Some(notice) = &self.offer_notice {
                 data["offer_notice"] = json!(notice);
             }
@@ -954,7 +997,7 @@ impl Pane {
         });
         // A popup on a shortened row reads the rows the frame under it drew.
         let with_more;
-        let composition = if self.popup.as_ref().is_some_and(|p| p.0 == ObsCard::More) {
+        let composition = if self.popup.as_ref().is_some_and(|p| p.card == ObsCard::More) {
             with_more = {
                 let mut c = composition.clone();
                 c.more = self.more.clone();
@@ -967,19 +1010,25 @@ impl Pane {
         let mut open = self.instrument_open;
         open.popup = None;
         self.popup_copy = None;
-        if let Some((card, line, copied)) = self.popup.clone() {
-            match self.obs_lines[card as usize]
-                .iter()
-                .position(|l| *l == line)
-            {
+        self.popup_send = None;
+        self.popup_for = None;
+        if let Some(popup) = self.popup.clone() {
+            match self.popup_place(&popup) {
                 Some(index) => {
                     let at = PopupAt {
-                        card,
+                        card: popup.card,
                         index,
-                        copied,
+                        copied: popup.copied,
+                        note: popup.note,
                     };
                     open.popup = Some(at);
-                    self.popup_copy = composition.detail(at).map(|d| d.copy);
+                    let detail = composition.detail(at);
+                    self.popup_copy = detail.as_ref().map(|d| d.copy.clone());
+                    self.popup_send = detail.map(|d| d.send).filter(|s| !s.is_empty());
+                    self.popup_for = Some((popup.card, popup.line.clone()));
+                    if let Some(p) = self.popup.as_mut() {
+                        p.index = index;
+                    }
                 }
                 // The item left its card: there is nothing to show.
                 None => self.popup = None,
@@ -998,10 +1047,17 @@ impl Pane {
         };
         if let Some(kept) = self.instrument_kept.as_ref().filter(|k| k.key == key) {
             self.acts = kept.acts.clone();
+            self.hits = kept.hits.clone();
             self.placed = kept.placed.clone();
             self.instrument_metrics = kept.metrics.clone();
             if open.popup.is_none() {
                 self.more = kept.more.clone();
+                self.story = kept.story;
+                self.obs_lines[ObsCard::More as usize] = self
+                    .more
+                    .iter()
+                    .map(|i| string(&i["line"]).to_owned())
+                    .collect();
             }
             self.pill = None;
             self.reused += 1;
@@ -1036,6 +1092,7 @@ impl Pane {
         self.pill = None;
         // Every wrapped row of an observation opens it, not only its first.
         let mut more: Vec<Value> = vec![];
+        let mut hits: BTreeMap<usize, (ObsCard, usize)> = BTreeMap::new();
         for (card, should) in [(ObsCard::Confusing, false), (ObsCard::ShouldBe, true)] {
             let items = composition.items(card);
             let fold = instrument::fold_row(card.title(), items.len());
@@ -1043,8 +1100,22 @@ impl Pane {
                 for r in row..row + text::wrap(&fold, cols.max(1), 1000).len() {
                     self.acts
                         .insert(r, json!({"key": format!("observe:{}:0", card as usize)}));
+                    hits.insert(r, (card, 0));
                 }
                 continue;
+            }
+            // The card's title opens its first item.
+            let title = text::wrap(card.title(), cols.max(1), 1000);
+            if let Some(row) = title
+                .first()
+                .filter(|_| !items.is_empty())
+                .and_then(|first| semantic.iter().position(|l| l == first))
+            {
+                for (offset, line) in title.iter().enumerate() {
+                    if semantic.get(row + offset) == Some(line) {
+                        hits.insert(row + offset, (card, 0));
+                    }
+                }
             }
             for (index, item) in items.iter().enumerate() {
                 let text = instrument::observation_text(item, should);
@@ -1059,6 +1130,7 @@ impl Pane {
                                 row + offset,
                                 json!({"key": format!("observe:{}:{index}", card as usize)}),
                             );
+                            hits.insert(row + offset, (card, index));
                         }
                     }
                 }
@@ -1106,6 +1178,21 @@ impl Pane {
                 }
             }
         }
+        // The story's rows open it whole, cut or not.
+        let story_rows = instrument::text_story_rows(composition, cols);
+        let mut story = None;
+        if let Some(row) = story_rows
+            .first()
+            .and_then(|first| semantic.iter().position(|l| l == first))
+        {
+            let at = Self::keep_more(&mut more, instrument::story_title(composition), composition);
+            story = Some(at);
+            for (offset, line) in story_rows.iter().enumerate() {
+                if semantic.get(row + offset) == Some(line) {
+                    hits.insert(row + offset, (ObsCard::More, at));
+                }
+            }
+        }
         let mut out = semantic;
         if let Some(strip) = strip {
             self.encodes += 1;
@@ -1120,6 +1207,7 @@ impl Pane {
                     rows: count,
                     png: png.into(),
                 }];
+                hits.retain(|r, _| *r < row);
                 for r in row..row + count {
                     self.acts.insert(r, json!({"key":"instrument:figure"}));
                 }
@@ -1202,6 +1290,48 @@ impl Pane {
                             );
                         }
                     }
+                    // Two picture rows can share a terminal row, and `acts` holds one act per row:
+                    // each terminal row opens the picture row that fills most of it. The title
+                    // opens the card's first item and the story's title and text open the story.
+                    story = metrics.story_open.as_ref().map(|(_, _, title, full)| {
+                        let item = json!({"title": title, "line": full});
+                        more.iter().position(|m| *m == item).unwrap_or_else(|| {
+                            more.push(item);
+                            more.len() - 1
+                        })
+                    });
+                    let px = |y: f32| y / metrics.height * pm.height() as f32;
+                    let mut spans: Vec<(ObsCard, usize, f32, f32)> = metrics
+                        .observation_rows
+                        .iter()
+                        .map(|(card, index, y)| (*card, *index, px(*y - half), px(*y + half)))
+                        .collect();
+                    spans.extend(
+                        metrics
+                            .observation_titles
+                            .iter()
+                            .map(|(card, top, bottom)| (*card, 0, px(*top), px(*bottom))),
+                    );
+                    if let (Some(at), Some((top, bottom, _, _))) = (story, &metrics.story_open) {
+                        spans.push((ObsCard::More, at, px(*top), px(*bottom)));
+                    }
+                    hits.clear();
+                    for row in 0..picture_rows {
+                        let (from, to) = (
+                            (row as u32 * cell.1) as f32,
+                            ((row + 1) as u32 * cell.1) as f32,
+                        );
+                        let mut best: Option<(f32, ObsCard, usize)> = None;
+                        for (card, index, top, bottom) in &spans {
+                            let overlap = bottom.min(to) - top.max(from);
+                            if overlap > 0. && best.is_none_or(|b| overlap > b.0) {
+                                best = Some((overlap, *card, *index));
+                            }
+                        }
+                        if let Some((_, card, index)) = best {
+                            hits.insert(row, (card, index));
+                        }
+                    }
                     if let (Some(mut answer), Some(y)) = (answer, metrics.answer_y) {
                         answer["spans"] = json!(metrics
                             .answer_spans
@@ -1238,10 +1368,14 @@ impl Pane {
         }
         if open.popup.is_none() {
             self.more = more;
+            self.story = story;
+            self.sync_more_lines();
         }
         if open.popup.is_some() {
             // Only the popup's own footer answers while it is up.
             self.acts.clear();
+            hits.clear();
+            self.popup_key_acts();
         }
         out.truncate(rows.saturating_sub(1));
         out = out.into_iter().map(|line| text::safe_line(&line)).collect();
@@ -1252,6 +1386,10 @@ impl Pane {
                 self.acts = std::mem::take(&mut self.acts)
                     .into_iter()
                     .map(|(row, act)| (row + gap, act))
+                    .collect();
+                hits = std::mem::take(&mut hits)
+                    .into_iter()
+                    .map(|(row, hit)| (row + gap, hit))
                     .collect();
                 out.splice(0..0, std::iter::repeat_n(String::new(), gap));
             }
@@ -1308,6 +1446,25 @@ impl Pane {
                 .sum::<usize>()
                 + keys.len().saturating_sub(1) * gap
         };
+        if open.popup.is_some() {
+            // The popup's own keys come first: theme goes, then the labels shorten.
+            if width(&keys, 1) > usable {
+                keys.retain(|(k, _)| *k != "b");
+            }
+            for (full, short) in [
+                ("copy draft", "copy"),
+                ("dismiss", "hide"),
+                ("close", ""),
+                ("next", ""),
+            ] {
+                if width(&keys, 1) <= usable {
+                    break;
+                }
+                if let Some((_, label)) = keys.iter_mut().find(|(_, label)| *label == full) {
+                    *label = short;
+                }
+            }
+        }
         // "o details" is the optional key: it goes before the gap tightens or any label shortens.
         if width(&keys, 2) > usable {
             keys.retain(|(k, _)| *k != "o");
@@ -1399,7 +1556,10 @@ impl Pane {
             acts: self.acts.clone(),
             metrics: self.instrument_metrics.clone(),
             more: self.more.clone(),
+            hits: hits.clone(),
+            story: self.story,
         });
+        self.hits = hits;
         out
     }
     /// Account cost reads: the plan's week, what CSR cost
@@ -1653,51 +1813,200 @@ impl Pane {
         let Some(line) = self.obs_lines[card as usize].get(index) else {
             return false;
         };
-        self.popup = Some((card, line.clone(), false));
+        self.popup = Some(Popup {
+            card,
+            line: line.clone(),
+            index,
+            copied: false,
+            note: None,
+        });
         true
+    }
+    /// Where the popup's item is on its card now: where it was, or where its line moved to.
+    fn popup_place(&self, popup: &Popup) -> Option<usize> {
+        let lines = &self.obs_lines[popup.card as usize];
+        if lines.get(popup.index) == Some(&popup.line) {
+            return Some(popup.index);
+        }
+        lines.iter().position(|l| *l == popup.line)
+    }
+    /// The lines of the shortened rows, as the frame just drawn left them.
+    fn sync_more_lines(&mut self) {
+        self.obs_lines[ObsCard::More as usize] = self
+            .more
+            .iter()
+            .map(|i| string(&i["line"]).to_owned())
+            .collect();
+    }
+    /// The item of `more` that holds `title` and the story's words, added when it is not there.
+    fn keep_more(
+        more: &mut Vec<Value>,
+        title: &str,
+        composition: &super::render::instrument::Composition,
+    ) -> usize {
+        let item =
+            json!({"title": title, "line": super::render::instrument::story_full(composition)});
+        more.iter().position(|m| *m == item).unwrap_or_else(|| {
+            more.push(item);
+            more.len() - 1
+        })
+    }
+    /// The keys of the observation items dismissed in this session: those in the likes log with
+    /// a no, and those dismissed here and perhaps not yet written.
+    fn dismissed_keys(&self) -> Value {
+        let mine = format!("observation:{}:", self.sid);
+        let mut out = json!({});
+        for (key, liked) in send::read_likes(&self.paths)
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            if *liked == json!(false) && key.starts_with(&mine) {
+                out[key] = json!(true);
+            }
+        }
+        for key in &self.dismissed {
+            out[key] = json!(true);
+        }
+        out
+    }
+    /// What each terminal row of the popup's footer answers: the keys the picture drew on it.
+    fn popup_key_acts(&mut self) {
+        let Some(metrics) = self.instrument_metrics.as_ref() else {
+            return;
+        };
+        let Some(picture) = self.placed.first() else {
+            return;
+        };
+        let cell = super::render::kitty::cell_size();
+        let (cols, rows) = (picture.cols, picture.rows as f32 * cell.1 as f32);
+        let at = |y: f32| y / metrics.height * rows;
+        let col = |x: f32| (metrics.content_left + x / 605. * metrics.content_width) * cols as f32;
+        let mut by_row: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
+        for (key, left, right, top, bottom) in &metrics.popup_keys {
+            let first = (at(*top) / cell.1 as f32).floor().max(0.) as usize;
+            let last = (at(*bottom) / cell.1 as f32).floor().max(0.) as usize;
+            for row in first..=last {
+                by_row.entry(row).or_default().push(json!([
+                    col(*left).floor().max(0.) as usize,
+                    col(*right).ceil() as usize,
+                    key
+                ]));
+            }
+        }
+        for (row, keys) in by_row {
+            self.acts
+                .insert(row, json!({"key": "legend", "keys": keys}));
+        }
     }
     /// The text the watch loop should put on the clipboard, once.
     pub fn take_copy(&mut self) -> Option<String> {
         self.copy_out.take()
     }
+    /// The items a step in the popup goes through, in the order the pane draws them: Confused
+    /// Claude's, the should-be's, then the story. A shortened row steps among its own kind.
+    fn walk(&self, at: (ObsCard, usize)) -> Vec<(ObsCard, usize)> {
+        let story = self.story.map(|i| (ObsCard::More, i));
+        if at.0 == ObsCard::More && story != Some(at) {
+            return (0..self.obs_lines[ObsCard::More as usize].len())
+                .map(|i| (ObsCard::More, i))
+                .collect();
+        }
+        [ObsCard::Confusing, ObsCard::ShouldBe]
+            .into_iter()
+            .flat_map(|card| (0..self.obs_lines[card as usize].len()).map(move |i| (card, i)))
+            .chain(story)
+            .collect()
+    }
+    /// Whether the frame last drawn is of the popup that is open now.
+    fn popup_drawn(&self) -> bool {
+        self.popup_for.as_ref().map(|(card, line)| (*card, line))
+            == self.popup.as_ref().map(|p| (p.card, &p.line))
+    }
+    /// `s`: type the popup's message into Claude's prompt, never pressing Enter, and say how it went.
+    fn send_popup(&mut self) {
+        let Some(text) = self.popup_send.clone().filter(|_| self.popup_drawn()) else {
+            return;
+        };
+        let note = match send::agent_pane(self.agent.as_deref()) {
+            None => ("No Claude pane to type into.", false),
+            Some(agent) => {
+                if send::send_draft(Some(&agent), &text, self.agent.as_deref()) {
+                    send::focus_back();
+                    (
+                        "Typed into Claude's prompt. Press Enter there to send.",
+                        true,
+                    )
+                } else {
+                    ("Claude is not at its prompt. Nothing was typed.", false)
+                }
+            }
+        };
+        if let Some(popup) = self.popup.as_mut() {
+            popup.copied = false;
+            popup.note = Some(note);
+        }
+    }
+    /// `x`: hide the popup's item for this session, record it as a no in the likes log, close.
+    fn dismiss_popup(&mut self) {
+        let Some(popup) = self.popup.clone() else {
+            return;
+        };
+        let card = match popup.card {
+            ObsCard::Confusing => "confusing_claude",
+            ObsCard::ShouldBe => "should_be",
+            ObsCard::More => return,
+        };
+        let key = observation::dismiss_key(&self.sid, card, &popup.line);
+        // A PNG export reads the owner's log and never writes to it.
+        if !self.exporting {
+            let act = json!({"key": key, "source": "observation", "title": popup.line});
+            let _ = send::keep_like(&self.paths, &act, false, super::paths::now());
+        }
+        self.dismissed.insert(key);
+        // A key that comes before the next frame must not find it either.
+        self.obs_lines[popup.card as usize].retain(|l| *l != popup.line);
+        self.popup = None;
+    }
     /// Keys while the popup is up. It is modal: nothing else on the pane answers until it closes.
     fn popup_key(&mut self, key: &str) -> bool {
-        let Some((card, line, _)) = self.popup.clone() else {
+        let Some(popup) = self.popup.clone() else {
             return false;
         };
-        let lines = &self.obs_lines[card as usize];
-        let at = lines.iter().position(|l| *l == line).unwrap_or(0);
+        let (card, at) = (popup.card, self.popup_place(&popup).unwrap_or(0));
+        let walk = self.walk((card, at));
         let step = |by: isize| {
-            let len = lines.len().max(1) as isize;
-            (at as isize + by).rem_euclid(len) as usize
+            let here = walk.iter().position(|w| *w == (card, at)).unwrap_or(0);
+            walk.get((here as isize + by).rem_euclid(walk.len().max(1) as isize) as usize)
+                .copied()
         };
         match key {
             "escape" | "esc" | "q" => self.popup = None,
             "c" => {
-                if let Some(text) = self.popup_copy.clone() {
+                if let Some(text) = self.popup_copy.clone().filter(|_| self.popup_drawn()) {
                     self.copy_out = Some(text);
                     if let Some(popup) = self.popup.as_mut() {
-                        popup.2 = true;
+                        popup.copied = true;
+                        popup.note = None;
                     }
                 }
             }
-            "j" | "down" | "n" | "right" => {
-                let to = step(1);
-                self.open_observation(card, to);
+            "s" => self.send_popup(),
+            "x" => self.dismiss_popup(),
+            "j" | "down" | "n" | "right" | "tab" => {
+                if let Some((card, to)) = step(1) {
+                    self.open_observation(card, to);
+                }
             }
-            "k" | "up" | "p" | "left" => {
-                let to = step(-1);
-                self.open_observation(card, to);
-            }
-            "tab" => {
-                if card != ObsCard::More && !self.obs_lines[card.other() as usize].is_empty() {
-                    self.open_observation(card.other(), 0);
+            "k" | "up" | "p" | "left" | "shift+tab" => {
+                if let Some((card, to)) = step(-1) {
+                    self.open_observation(card, to);
                 }
             }
             "b" => self.theme.toggle(),
             digit
                 if digit.len() == 1
-                    && ('1'..='5').contains(&digit.chars().next().unwrap_or(' ')) =>
+                    && ('1'..='9').contains(&digit.chars().next().unwrap_or(' ')) =>
             {
                 let to = digit.parse::<usize>().unwrap_or(1) - 1;
                 self.open_observation(card, to);
@@ -1761,7 +2070,7 @@ impl Pane {
                 self.view = "main".into();
                 return true;
             }
-            "1" | "2" | "3" | "4" | "5" if self.view == "main" => {
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" if self.view == "main" => {
                 let index = key.parse::<usize>().unwrap_or(1) - 1;
                 let answer = self
                     .acts
@@ -1924,6 +2233,26 @@ impl Pane {
             _ => (),
         }
     }
+    /// What a click on each terminal row opens at the last frame, as `observe:<card>:<index>`.
+    pub fn hit_rows(&self) -> BTreeMap<usize, String> {
+        self.hits
+            .iter()
+            .map(|(row, (card, index))| (*row, format!("observe:{}:{index}", *card as usize)))
+            .collect()
+    }
+    /// The row a click on `act` is sent to: for an observation item the row that opens it, from
+    /// the picture row that fills most of it; for any other act the first row that has it.
+    pub fn act_row(&self, act: &str) -> Option<usize> {
+        if let Some(want) = observe_key(act) {
+            if let Some((row, _)) = self.hits.iter().find(|(_, hit)| **hit == want) {
+                return Some(*row);
+            }
+        }
+        self.acts
+            .iter()
+            .find(|(_, a)| a["key"] == act)
+            .map(|(row, _)| *row)
+    }
     pub fn click(&mut self, row: usize, col: usize, now: f64) -> bool {
         let act = self.acts.get(&row).cloned();
         if self.popup.is_some() {
@@ -1935,7 +2264,7 @@ impl Pane {
                     .and_then(|s| s[2].as_str().map(str::to_owned))
             });
             return match pressed.as_deref() {
-                Some("c" | "tab" | "b") => self.key(pressed.as_deref().unwrap_or("")),
+                Some("c" | "s" | "x" | "tab" | "b") => self.key(pressed.as_deref().unwrap_or("")),
                 _ => {
                     self.popup = None;
                     true
@@ -1960,22 +2289,18 @@ impl Pane {
         {
             return true;
         }
+        // The picture row that fills most of this terminal row.
+        if self.view == "main" {
+            if let Some((card, index)) = self.hits.get(&row).copied() {
+                self.open_observation(card, index);
+                return true;
+            }
+        }
         let Some(act) = act else {
             self.open = Value::Null;
             return true;
         };
-        if let Some((card, index)) = string(&act["key"])
-            .strip_prefix("observe:")
-            .and_then(|rest| rest.split_once(':'))
-            .and_then(|(card, index)| {
-                Some((card.parse::<usize>().ok()?, index.parse::<usize>().ok()?))
-            })
-        {
-            let card = match card {
-                0 => ObsCard::Confusing,
-                1 => ObsCard::ShouldBe,
-                _ => ObsCard::More,
-            };
+        if let Some((card, index)) = observe_key(string(&act["key"])) {
             self.open_observation(card, index);
             return true;
         }

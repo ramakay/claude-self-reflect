@@ -238,8 +238,8 @@ const BAND_ALPHA: f32 = 0.10;
 const ITALIC_SLANT: f32 = 0.2;
 /// How many confused-Claude or should-be items a card keeps.
 const OBSERVATION_CAP: usize = 5;
-/// Every look of this session that carries `key`, newest first, one item per `line`. A later look
-/// with an empty list never erases what an earlier one found.
+/// Every look of this session that carries `key`, newest first, one item per `line`, less what was
+/// dismissed. A later look with an empty list never erases what an earlier one found.
 fn observations(data: &Value, session: &Value, key: &str) -> Vec<Value> {
     let mut sources: Vec<&Value> = array(&data["dreams"])
         .iter()
@@ -249,8 +249,11 @@ fn observations(data: &Value, session: &Value, key: &str) -> Vec<Value> {
     sources.sort_by(|a, b| num(&b["at"]).total_cmp(&num(&a["at"])));
     let mut out: Vec<Value> = vec![];
     for item in sources.iter().flat_map(|r| array(&r[key])) {
+        let gone = &data["dismissed"]
+            [observation::dismiss_key(string(session), key, string(&item["line"]))];
         if !string(&item["line"]).is_empty()
             && !string(&item["evidence"]).is_empty()
+            && *gone != true
             && !out.iter().any(|o| o["line"] == item["line"])
         {
             out.push(item.clone());
@@ -1114,6 +1117,27 @@ pub fn rows_with_figure(
         out
     }
 }
+/// The heading of the story card.
+pub fn story_title(c: &Composition) -> &'static str {
+    if c.story.is_empty() && c.shifts.is_empty() {
+        "This session"
+    } else {
+        "Where the work stands"
+    }
+}
+/// Every word the story card holds: the story, or with none, what was learnt and what changed.
+pub fn story_full(c: &Composition) -> String {
+    if c.story.is_empty() {
+        c.learnt
+            .iter()
+            .cloned()
+            .chain(c.shifts.iter().map(shift_full))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    } else {
+        c.story.clone()
+    }
+}
 /// The row a folded observation card leaves: its title and how many items it holds.
 pub fn fold_row(title: &str, items: usize) -> String {
     format!("{title} · {items} · o opens")
@@ -1240,10 +1264,7 @@ fn assemble(
             pitch_insert = Some(out.len());
         }
     }
-    if !c.story.is_empty() {
-        out.extend(fact_rows(&format!("Story · {}", c.story_age), cols));
-        out.extend(story_text_lines(first_sentence(&c.story), cols, 4));
-    }
+    out.extend(text_story_rows(c, cols));
     let story_end = out.len();
     let mut details_start = out.len();
     if open.changes {
@@ -2167,6 +2188,15 @@ fn wrap_clauses(f: &Fonts, s: &str, st: St, maxw: f32, n: usize) -> Vec<String> 
 }
 
 /// Text-fallback story lines with the same clause-boundary rule as the pixel path.
+/// The story's rows in the text pane: its age, then its first sentence. None when there is no story.
+pub fn text_story_rows(c: &Composition, cols: usize) -> Vec<String> {
+    if c.story.is_empty() {
+        return vec![];
+    }
+    let mut out = fact_rows(&format!("Story · {}", c.story_age), cols);
+    out.extend(story_text_lines(first_sentence(&c.story), cols, 4));
+    out
+}
 /// The story's rows in the text pane when they end in "…", with the whole story: what a click on
 /// them opens. `None` when the story is shown whole, or there is none.
 pub fn text_story_cut(c: &Composition, cols: usize) -> Option<(Vec<String>, String)> {
@@ -2254,6 +2284,14 @@ pub struct Metrics {
     pub shift_hits: Vec<f32>,
     /// Each observation row's card, place on it and centre Y in layout pt: the click targets.
     pub observation_rows: Vec<(ObsCard, usize, f32)>,
+    /// Each observation card's title line: its card, top and bottom in layout pt. A click on it
+    /// opens the card's first item.
+    pub observation_titles: Vec<(ObsCard, f32, f32)>,
+    /// The story card's title and text: top and bottom in layout pt, its heading and every word
+    /// of it. A click on those rows opens it in full, folded or not.
+    pub story_open: Option<(f32, f32, String, String)>,
+    /// Where the popup's footer keys sit in layout pt, when a popup is drawn.
+    pub popup_keys: Vec<observation::KeyBox>,
     /// The two observation cards were folded to a title row each, for an open section's room.
     pub observations_folded: bool,
     /// Every row drawn with a trailing "…", with its words in full: the click targets that open
@@ -2854,6 +2892,7 @@ pub fn draw(
     }
     y += hero_h + card_gap;
     let mut observation_rows = vec![];
+    let mut observation_titles = vec![];
     // The observation rows have their own popup: their cut rows are not recorded as shortened rows.
     let recording = std::mem::take(&mut canvas.cut_title);
     for (title_text, items, should) in observed {
@@ -2891,6 +2930,15 @@ pub fn draw(
                 0,
                 y + h / 2.,
             ));
+            observation_titles.push((
+                if should {
+                    ObsCard::ShouldBe
+                } else {
+                    ObsCard::Confusing
+                },
+                y,
+                y + h,
+            ));
             y += h + card_gap;
             continue;
         }
@@ -2906,6 +2954,15 @@ pub fn draw(
             t.ink,
             t.bold,
         );
+        observation_titles.push((
+            if should {
+                ObsCard::ShouldBe
+            } else {
+                ObsCard::Confusing
+            },
+            y + P,
+            y + P + theme::TITLE_LINE,
+        ));
         let mut row_y = y + P + theme::TITLE_LINE + S2;
         for (index, item) in items.iter().enumerate() {
             observation_rows.push((
@@ -2968,11 +3025,8 @@ pub fn draw(
     let mut shift_hits = vec![];
     let mut story_line_count = 0usize;
     let story_region = (story_h > 0.).then_some((y, story_card_h));
-    let story_title = if c.story.is_empty() && c.shifts.is_empty() {
-        "This session"
-    } else {
-        "Where the work stands"
-    };
+    let mut story_open = None;
+    let story_title = story_title(c);
     if story_folded {
         // Folded to its title row, the card still opens its words in full on a click.
         panel(&mut canvas, y, story_card_h, t);
@@ -2986,22 +3040,13 @@ pub fn draw(
             t.ink,
             t.bold,
         );
+        story_open = Some((y, y + story_card_h, story_title.into(), story_full(c)));
         if !canvas.dry {
-            let full = if c.story.is_empty() {
-                c.learnt
-                    .iter()
-                    .cloned()
-                    .chain(c.shifts.iter().map(shift_full))
-                    .collect::<Vec<_>>()
-                    .join(" · ")
-            } else {
-                c.story.clone()
-            };
             canvas.cuts.push(Cut {
                 y: y + P + f.cap(title),
                 size: theme::TITLE_SIZE,
                 title: story_title,
-                full,
+                full: story_full(c),
             });
         }
         y += story_card_h + card_gap;
@@ -3047,6 +3092,7 @@ pub fn draw(
             canvas.text(f, line, IX, cursor + f.cap(body), body, t.ink, A::L);
             cursor += theme::BODY_LINE;
         }
+        story_open = Some((y, cursor, story_title.into(), story_full(c)));
         if !c.learnt.is_empty() {
             single(
                 &mut canvas,
@@ -3493,8 +3539,9 @@ pub fn draw(
         figure_bottom
     };
     let last_card_bottom_pad = (height - last_card_bottom).max(0.);
+    let mut popup_keys = vec![];
     if let Some(detail) = open.popup.and_then(|at| c.detail(at)) {
-        observation::overlay(
+        popup_keys = observation::overlay(
             &mut canvas,
             f,
             &detail,
@@ -3546,6 +3593,9 @@ pub fn draw(
             story_region,
             shift_hits,
             observation_rows,
+            observation_titles,
+            story_open,
+            popup_keys,
             observations_folded: folded,
             cuts: canvas.cuts.clone(),
             agents_region,
@@ -4801,6 +4851,7 @@ mod tests {
             card,
             index,
             copied: false,
+            note: None,
         };
         // Text: the popup's own rows, and the dreamer's explanation when it wrote one.
         let open = Open {
@@ -5348,8 +5399,10 @@ mod tests {
             ("empty", 0, 0, false),
         ] {
             let c = drill_composition(shifts, dreams, figure);
+            // Heights of 9 to 60 rows of 34 px cells, and the edges either side: each draw
+            // rasterizes the whole picture, so a dense sweep costs minutes in a debug build.
             for w in [560, 736] {
-                for h in (300..2000).step_by(61) {
+                for h in [300, 476, 986, 1020, 1666, 2000] {
                     let (_, m) =
                         draw(&c, w, h, Theme::Dark, Open::default(), false).expect("draws");
                     let at = format!("{name} {w}x{h}");
@@ -5482,6 +5535,7 @@ mod tests {
             card: ObsCard::More,
             index: 0,
             copied: false,
+            note: None,
         };
         let rows = text_rows(
             &c,

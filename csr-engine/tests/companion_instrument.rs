@@ -2049,15 +2049,18 @@ fn number_keys_open_an_observation_item_and_the_popup_is_modal() {
     assert!(rows
         .iter()
         .any(|l| l.starts_with("Next step for you: Re-read the quoted evidence")));
-    // j and k step through the card and wrap round.
+    // j and k step through every item of the cards in the order they are drawn.
     pane.key("j");
-    assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 1 of 3"));
+    assert_eq!(
+        first_row(&plain_rows(&mut pane, 100, 60)),
+        "Should be a skill / memory / tool · 1 of 2 · hook"
+    );
     pane.key("k");
     assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 3 of 3"));
     // A number past the card's last item changes nothing.
     pane.key("5");
     assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 3 of 3"));
-    // Tab flips to the other card.
+    // Tab goes to the next item, which here is the first of the other card.
     pane.key("tab");
     let rows = plain_rows(&mut pane, 100, 60);
     assert_eq!(
@@ -2099,7 +2102,9 @@ fn c_copies_the_item_with_its_explanation_or_a_draft_for_a_should_be_item() {
         .iter()
         .any(|l| l == "Copied."));
     // A should-be skill copies a draft, ready to paste, and writes nothing itself.
-    pane.key("tab");
+    for _ in 0..3 {
+        pane.key("tab");
+    }
     pane.key("2");
     plain_rows(&mut pane, 100, 60);
     assert!(plain_rows(&mut pane, 100, 60)
@@ -2370,6 +2375,598 @@ fn a_row_the_picture_cut_opens_its_words_in_full_on_click() {
         pane.key("escape");
         pane.frame(cols, rows, NOW);
     }
+}
+
+/// A herdr that logs every call and answers `process-info` with a foreground process named
+/// `argv0`. HERDR_BIN_PATH is process-wide, so the tests that use it take turns.
+struct FakeHerdr {
+    dir: tempfile::TempDir,
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+impl FakeHerdr {
+    fn new(argv0: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        static TURNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let turn = TURNS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (log, who) = (dir.path().join("log"), dir.path().join("argv0"));
+        fs::write(&who, argv0).unwrap();
+        let script = dir.path().join("herdr");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {log}\ncase \"$2\" in\nprocess-info)\n  who=$(cat {who})\n  printf '{{\"result\":{{\"process_info\":{{\"foreground_process_group_id\":7,\"foreground_processes\":[{{\"pid\":7,\"argv0\":\"%s\",\"argv\":[\"%s\"]}}]}}}}}}' \"$who\" \"$who\"\n  ;;\nesac\n",
+                log = log.display(),
+                who = who.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("HERDR_BIN_PATH", &script);
+        std::env::remove_var("HERDR_PANE_ID");
+        Self { dir, _turn: turn }
+    }
+    /// Every call herdr got, one per line, in order.
+    fn calls(&self) -> Vec<String> {
+        fs::read_to_string(self.dir.path().join("log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+impl Drop for FakeHerdr {
+    fn drop(&mut self) {
+        std::env::remove_var("HERDR_BIN_PATH");
+    }
+}
+fn agent_args(cols: usize, rows: usize) -> PaneArgs {
+    let mut a = args("main", "sess-now", cols, rows);
+    a.agent = Some("fake-agent".into());
+    a
+}
+/// What the popup that is open puts on the clipboard: it names the item.
+fn opened_item(pane: &mut Pane) -> Option<String> {
+    // The popup is drawn before a key reaches it, as the watch loop does after every key.
+    pane.frame(100, 60, NOW);
+    let _ = pane.take_copy();
+    pane.key("c");
+    pane.take_copy()
+}
+/// `opened_item` for a pane of another size.
+fn opened_at(pane: &mut Pane, cols: usize, rows: usize) -> Option<String> {
+    pane.frame(cols, rows, NOW);
+    let _ = pane.take_copy();
+    pane.key("c");
+    pane.take_copy()
+}
+const ITEMS: [&str; 6] = [
+    "Misread which pane should change.",
+    "Repeated the rejected approach.",
+    "Said the test passed without running it.",
+    "Check the card height after each layout edit.",
+    "Bump the version in both files.",
+    "Where the work stands\n",
+];
+fn which_item(copy: &str) -> Option<usize> {
+    ITEMS.iter().position(|item| {
+        if item.ends_with('\n') {
+            copy.starts_with(item)
+        } else {
+            copy.contains(item)
+        }
+    })
+}
+
+#[test]
+fn every_row_of_the_three_cards_opens_its_own_item_by_click_or_by_a_step() {
+    use csr_engine::companion::render::{kitty, theme::BODY_LINE};
+    let mut table = vec![];
+    for (cols, rows) in [(46, 30), (40, 50)] {
+        let (_home, paths) = observed_home();
+        let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+        pane.pixels = true;
+        pane.enable_cards();
+        pane.frame(cols, rows, NOW);
+        let m = pane.instrument_metrics.clone().expect("a picture");
+        let cell = kitty::cell_size();
+        let tall = pane.placed[0].rows as f32 * cell.1 as f32;
+        let at = |y: f32| y / m.height * tall;
+        // The oracle: of the picture rows that touch a terminal row, the one with most of it.
+        let half = BODY_LINE / 2. - 0.5;
+        let mut spans: Vec<(usize, f32, f32)> = vec![];
+        let mut order = vec![];
+        for (card, index, y) in &m.observation_rows {
+            let item = match card {
+                csr_engine::companion::render::observation::ObsCard::Confusing => *index,
+                _ => 3 + *index,
+            };
+            order.push(item);
+            spans.push((item, at(y - half), at(y + half)));
+        }
+        for (card, top, bottom) in &m.observation_titles {
+            let item = match card {
+                csr_engine::companion::render::observation::ObsCard::Confusing => 0,
+                _ => 3,
+            };
+            spans.push((item, at(*top), at(*bottom)));
+        }
+        let (top, bottom, _, _) = m.story_open.clone().expect("a story card");
+        spans.push((5, at(top), at(bottom)));
+        assert_eq!(
+            order,
+            [0, 1, 2, 3, 4],
+            "{cols}x{rows}: the cards, in drawn order"
+        );
+        let mut clicked: Vec<Option<usize>> = vec![];
+        for row in 0..rows - 1 {
+            let mut best: Option<(f32, usize)> = None;
+            for (item, from, to) in &spans {
+                let overlap = to.min(((row + 1) as u32 * cell.1) as f32)
+                    - from.max((row as u32 * cell.1) as f32);
+                if overlap > 0. && best.is_none_or(|b| overlap > b.0) {
+                    best = Some((overlap, *item));
+                }
+            }
+            pane.frame(cols, rows, NOW);
+            pane.click(row, 4, NOW);
+            pane.frame(cols, rows, NOW);
+            let got = opened_at(&mut pane, cols, rows).and_then(|c| which_item(&c));
+            pane.key("escape");
+            pane.frame(cols, rows, NOW);
+            // A row the observation spans do not touch belongs to something else, and opens
+            // none of the three cards' items unless the oracle says so.
+            assert_eq!(got, best.map(|b| b.1), "{cols}x{rows} row {row}");
+            clicked.push(got);
+            if let Some(item) = got {
+                table.push(format!(
+                    "{cols}x{rows} click row {row}: {}",
+                    ITEMS[item].trim()
+                ));
+            }
+        }
+        // Every item is one key away from the ones a click can single out: o opens the first,
+        // and each down steps to the next, round the three cards.
+        pane.key("o");
+        pane.frame(cols, rows, NOW);
+        let mut walked = vec![];
+        for _ in 0..ITEMS.len() {
+            walked.push(opened_at(&mut pane, cols, rows).and_then(|c| which_item(&c)));
+            pane.key("down");
+            pane.frame(cols, rows, NOW);
+        }
+        assert_eq!(
+            walked,
+            (0..ITEMS.len()).map(Some).collect::<Vec<_>>(),
+            "{cols}x{rows}: down visits every item once"
+        );
+        // And back: up from the first goes round to the story, shift+tab likewise.
+        pane.key("escape");
+        pane.key("o");
+        pane.key("up");
+        assert_eq!(
+            opened_at(&mut pane, cols, rows).and_then(|c| which_item(&c)),
+            Some(5)
+        );
+        pane.key("shift+tab");
+        assert_eq!(
+            opened_at(&mut pane, cols, rows).and_then(|c| which_item(&c)),
+            Some(4)
+        );
+        pane.key("tab");
+        assert_eq!(
+            opened_at(&mut pane, cols, rows).and_then(|c| which_item(&c)),
+            Some(5)
+        );
+        pane.key("escape");
+        // Every item is reached by a click or by those steps: none is out of reach.
+        for (item, words) in ITEMS.iter().enumerate() {
+            let direct = clicked.contains(&Some(item));
+            table.push(format!(
+                "{cols}x{rows} {}: {}",
+                words.trim(),
+                if direct { "a click" } else { "keys only" }
+            ));
+        }
+        // The number keys open the first card's items, as before.
+        pane.key("3");
+        assert_eq!(
+            opened_at(&mut pane, cols, rows).and_then(|c| which_item(&c)),
+            Some(2)
+        );
+        pane.key("escape");
+    }
+    println!("{}", table.join("\n"));
+}
+
+/// The real session's shape: five Confused Claude rows and five should-be rows.
+fn five_and_five_home() -> (tempfile::TempDir, Paths) {
+    let (home, paths) = state_home("08b-nothing");
+    let log = paths.keep.join("dreams.jsonl");
+    let mut text = fs::read_to_string(&log).unwrap();
+    let confusing: Vec<Value> = (1..=5)
+        .map(|n| json!({"line": format!("Confused row number {n}."), "evidence": format!("Turn {n}: 'quote {n}'")}))
+        .collect();
+    let should: Vec<Value> = (1..=5)
+        .map(|n| json!({"kind": "skill", "line": format!("Should-be row number {n}."), "evidence": format!("Turns {n} and 9: 'quote'")}))
+        .collect();
+    text.push_str(
+        &json!({"kind":"look","session":"sess-now","at":NOW - 20.,"outcome":"none",
+            "confusing_claude":confusing,"should_be":should})
+        .to_string(),
+    );
+    text.push('\n');
+    fs::write(&log, text).unwrap();
+    (home, paths)
+}
+
+#[test]
+fn a_click_on_row_n_of_five_opens_n_of_five_in_the_text_and_the_picture() {
+    // Text pane: every row answers with its own place.
+    let (_home, paths) = five_and_five_home();
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 100, 60));
+    for n in 1..=5 {
+        let rows = plain_rows(&mut pane, 100, 60);
+        let row = row_of(&rows, &format!("Confused row number {n}."));
+        assert!(pane.click(row, 5, NOW));
+        let shown = plain_rows(&mut pane, 100, 60);
+        assert!(
+            first_row(&shown).starts_with(&format!("Confused Claude · {n} of 5")),
+            "{n}: {shown:#?}"
+        );
+        pane.key("escape");
+        let rows = plain_rows(&mut pane, 100, 60);
+        let row = row_of(&rows, &format!("skill: Should-be row number {n}."));
+        assert!(pane.click(row, 5, NOW));
+        let shown = plain_rows(&mut pane, 100, 60);
+        assert!(
+            first_row(&shown).starts_with(&format!("Should be a skill / memory / tool · {n} of 5")),
+            "{n}: {shown:#?}"
+        );
+        pane.key("escape");
+    }
+    // Picture at 46x30: a click opens the item the oracle names, never its neighbour; the rows
+    // the cell grid cannot single out are a step away, and each step lands on the next number.
+    let (_home, paths) = five_and_five_home();
+    let (cols, rows) = (46, 30);
+    let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+    pane.pixels = true;
+    pane.enable_cards();
+    pane.frame(cols, rows, NOW);
+    let open = pane.hit_rows();
+    let mut seen = vec![];
+    for row in 0..rows - 1 {
+        pane.frame(cols, rows, NOW);
+        pane.click(row, 4, NOW);
+        let copy = opened_at(&mut pane, cols, rows);
+        pane.key("escape");
+        if let Some(copy) = copy {
+            if !copy.contains(" row number ") {
+                assert!(open[&row].starts_with("observe:2"), "row {row}: {copy}");
+                continue;
+            }
+            let word = if copy.starts_with("Confused Claude: ") {
+                "Confused"
+            } else {
+                "Should-be"
+            };
+            let n: usize = copy
+                .split(&format!("{word} row number "))
+                .nth(1)
+                .and_then(|r| r.split('.').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            let want = &open[&row];
+            let card = usize::from(word == "Should-be");
+            assert_eq!(*want, format!("observe:{card}:{}", n - 1), "row {row}");
+            seen.push((word, n));
+        }
+    }
+    // Each card's first row answers: row 1 opens "1 of 5", not "3 of 5".
+    assert!(
+        seen.contains(&("Confused", 1)) && seen.contains(&("Should-be", 1)),
+        "{seen:?}"
+    );
+    pane.key("o");
+    for n in 1..=10 {
+        let copy = opened_at(&mut pane, cols, rows).unwrap();
+        let (word, k) = if n <= 5 {
+            ("Confused", n)
+        } else {
+            ("Should-be", n - 5)
+        };
+        assert!(
+            copy.contains(&format!("{word} row number {k}."))
+                || copy.contains(&format!("{} row number {k}.", word.to_lowercase())),
+            "{n}: {copy}"
+        );
+        pane.key("down");
+    }
+}
+
+#[test]
+fn a_title_and_the_story_open_in_the_text_pane_too() {
+    let (_home, paths) = observed_home();
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 100, 60));
+    let rows = plain_rows(&mut pane, 100, 60);
+    let title = row_of(&rows, "Confused Claude");
+    assert!(pane.click(title, 3, NOW));
+    let shown = plain_rows(&mut pane, 100, 60);
+    assert!(
+        first_row(&shown).starts_with("Confused Claude · 1 of 3"),
+        "{shown:#?}"
+    );
+    pane.key("escape");
+    let rows = plain_rows(&mut pane, 100, 60);
+    let title = row_of(&rows, "Should be a skill / memory / tool");
+    assert!(pane.click(title, 3, NOW));
+    assert!(first_row(&plain_rows(&mut pane, 100, 60))
+        .starts_with("Should be a skill / memory / tool · 1 of 2 · hook"));
+    pane.key("escape");
+    let rows = plain_rows(&mut pane, 100, 60);
+    let story = row_of(&rows, "Story ·");
+    assert!(pane.click(story, 3, NOW));
+    let shown = plain_rows(&mut pane, 100, 60);
+    assert_eq!(first_row(&shown), "Where the work stands", "{shown:#?}");
+    // A story has no send or dismiss: the footer offers copy and close.
+    let footer = shown.last().unwrap();
+    assert!(
+        footer.contains("c copy") && footer.contains("esc close"),
+        "{footer}"
+    );
+    assert!(
+        !footer.contains("s send") && !footer.contains("x "),
+        "{footer}"
+    );
+    // The story is the last step of the cards: tab goes round to the first item.
+    pane.key("tab");
+    assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 1 of 3"));
+}
+
+#[test]
+fn s_types_the_item_into_claude_unsent_and_says_so_when_it_cannot() {
+    let fake = FakeHerdr::new("claude");
+    let (_home, paths) = observed_home();
+    let mut pane = Pane::new(paths, &agent_args(100, 60));
+    plain_rows(&mut pane, 100, 60);
+    // Confused Claude: the line and its evidence, quoted, then the ask.
+    pane.key("o");
+    plain_rows(&mut pane, 100, 60);
+    pane.key("s");
+    let calls = fake.calls();
+    let typed: Vec<&str> = calls
+        .iter()
+        .filter_map(|c| c.strip_prefix("pane send-text fake-agent "))
+        .collect();
+    assert_eq!(
+        typed,
+        [
+            "Here is a note offered by CSR (claude-self-reflect):",
+            "> Confused Claude: Misread which pane should change.",
+            "> Evidence: Turn 4: 'the companion pane'",
+            "You may have gone off course here. Please say what you got wrong and correct course.",
+        ],
+        "{calls:#?}"
+    );
+    // Lines are joined with ctrl+j; nothing ever presses Enter.
+    let keys: Vec<&str> = calls
+        .iter()
+        .filter_map(|c| c.strip_prefix("pane send-keys fake-agent "))
+        .collect();
+    assert!(
+        !keys.is_empty() && keys.iter().all(|k| *k == "ctrl+j"),
+        "{calls:#?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.to_lowercase().contains("enter") || c.contains("return")),
+        "{calls:#?}"
+    );
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(
+        rows.iter()
+            .any(|l| l == "Typed into Claude's prompt. Press Enter there to send."),
+        "{rows:#?}"
+    );
+    // A should-be skill asks Claude to make it, with the draft quoted.
+    for _ in 0..4 {
+        pane.key("tab");
+    }
+    plain_rows(&mut pane, 100, 60);
+    let before = fake.calls().len();
+    pane.key("s");
+    let calls = fake.calls();
+    let typed: Vec<&str> = calls[before..]
+        .iter()
+        .filter_map(|c| c.strip_prefix("pane send-text fake-agent "))
+        .collect();
+    assert!(
+        typed.contains(&"> skill: Bump the version in both files."),
+        "{typed:#?}"
+    );
+    assert!(
+        typed.contains(&"> name: bump-the-version-in-both"),
+        "{typed:#?}"
+    );
+    assert_eq!(
+        typed.last(),
+        Some(&"Please make this skill from the draft above, and show me what you wrote.")
+    );
+    assert!(
+        !calls[before..]
+            .iter()
+            .any(|c| c.to_lowercase().contains("enter")),
+        "{calls:#?}"
+    );
+    // A pane that is not Claude gets nothing, and the popup says so.
+    fs::write(fake.dir.path().join("argv0"), "zsh").unwrap();
+    let before = fake.calls().len();
+    plain_rows(&mut pane, 100, 60);
+    pane.key("s");
+    assert!(fake.calls()[before..]
+        .iter()
+        .all(|c| !c.starts_with("pane send-text")));
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(
+        rows.iter()
+            .any(|l| l == "Claude is not at its prompt. Nothing was typed."),
+        "{rows:#?}"
+    );
+    // The story has nothing to send.
+    pane.key("escape");
+    let rows = plain_rows(&mut pane, 100, 60);
+    let story = row_of(&rows, "Story ·");
+    pane.click(story, 3, NOW);
+    plain_rows(&mut pane, 100, 60);
+    let before = fake.calls().len();
+    pane.key("s");
+    assert_eq!(fake.calls().len(), before);
+}
+
+#[test]
+fn s_with_no_claude_pane_types_nothing_and_says_so_in_one_line() {
+    let fake = FakeHerdr::new("claude");
+    let (_home, paths) = observed_home();
+    // No --agent, and this process is in no herdr pane to find a neighbour from.
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 100, 60));
+    plain_rows(&mut pane, 100, 60);
+    pane.key("o");
+    plain_rows(&mut pane, 100, 60);
+    pane.key("s");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert_eq!(
+        rows.iter()
+            .filter(|l| l.contains("No Claude pane to type into."))
+            .count(),
+        1,
+        "{rows:#?}"
+    );
+}
+
+#[test]
+fn x_hides_the_item_on_the_next_frame_and_after_a_restart_and_records_a_no() {
+    let (_home, paths) = observed_home();
+    let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", 100, 60));
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(rows.iter().any(|l| l.starts_with("Repeated the rejected")));
+    pane.key("2");
+    assert!(opened_item(&mut pane).is_some_and(|c| c.contains("Repeated the rejected")));
+    pane.key("x");
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(
+        !rows.iter().any(|l| l.contains("Repeated the rejected")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|l| l == "Confused Claude"),
+        "the popup closed: {rows:#?}"
+    );
+    assert!(rows.iter().any(|l| l.starts_with("Misread which pane")));
+    assert!(rows.iter().any(|l| l.starts_with("Said the test passed")));
+    // The no is in the likes log, under this session's name.
+    let likes = fs::read_to_string(paths.keep.join("likes.jsonl")).unwrap();
+    let line: Value = serde_json::from_str(likes.lines().last().unwrap()).unwrap();
+    assert!(
+        string(&line["key"]).starts_with("observation:sess-now:confusing_claude:"),
+        "{line}"
+    );
+    assert_eq!(
+        (line["liked"].clone(), string(&line["source"])),
+        (json!(false), "observation")
+    );
+    assert_eq!(string(&line["title"]), "Repeated the rejected approach.");
+    // A pane started afterwards still hides it; another session's pane would not.
+    let mut again = Pane::new(paths.clone(), &args("main", "sess-now", 100, 60));
+    let rows = plain_rows(&mut again, 100, 60);
+    assert!(
+        !rows.iter().any(|l| l.contains("Repeated the rejected")),
+        "{rows:#?}"
+    );
+    // It shows the other items in the same order, numbered again from 1.
+    again.key("o");
+    assert!(first_row(&plain_rows(&mut again, 100, 60)).starts_with("Confused Claude · 1 of 2"));
+    again.key("escape");
+}
+
+#[test]
+fn the_popups_footer_keys_answer_a_click_in_the_text_pane_and_in_the_picture() {
+    let _fake = FakeHerdr::new("claude");
+    let (_home, paths) = observed_home();
+    let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", 100, 60));
+    plain_rows(&mut pane, 100, 60);
+    pane.key("o");
+    let shown = plain_rows(&mut pane, 100, 60);
+    let footer = shown.len() - 1;
+    for key in ["c copy", "s send", "x dismiss", "tab next", "esc close"] {
+        assert!(shown[footer].contains(key), "{key}: {:?}", shown[footer]);
+    }
+    // s send: no agent, so the popup says so, and stays.
+    pane.click(footer, shown[footer].find("s send").unwrap(), NOW);
+    let shown = plain_rows(&mut pane, 100, 60);
+    assert!(
+        shown.iter().any(|l| l == "No Claude pane to type into."),
+        "{shown:#?}"
+    );
+    // tab next opens the next item.
+    pane.click(footer, shown[footer].find("tab next").unwrap(), NOW);
+    let shown = plain_rows(&mut pane, 100, 60);
+    assert!(
+        first_row(&shown).starts_with("Confused Claude · 2 of 3"),
+        "{shown:#?}"
+    );
+    // x dismiss hides it and closes the popup.
+    pane.click(footer, shown[footer].find("x dismiss").unwrap(), NOW);
+    let rows = plain_rows(&mut pane, 100, 60);
+    assert!(
+        !rows.iter().any(|l| l.contains("Repeated the rejected")),
+        "{rows:#?}"
+    );
+    // esc close closes.
+    pane.key("o");
+    let shown = plain_rows(&mut pane, 100, 60);
+    pane.click(footer, shown[footer].find("esc close").unwrap(), NOW);
+    assert!(plain_rows(&mut pane, 100, 60)
+        .iter()
+        .any(|l| l == "Confused Claude"));
+
+    // The footer the picture draws inside the panel answers too, at 46x30 on a 16x34 cell.
+    let (_home, paths) = observed_home();
+    let (cols, rows) = (46, 30);
+    let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+    pane.pixels = true;
+    pane.enable_cards();
+    pane.frame(cols, rows, NOW);
+    pane.key("o");
+    pane.frame(cols, rows, NOW);
+    let hit = |pane: &Pane, key: &str| -> Option<(usize, usize)> {
+        pane.acts
+            .iter()
+            .filter(|(r, _)| **r < rows - 1)
+            .find_map(|(r, a)| {
+                a["keys"]
+                    .as_array()?
+                    .iter()
+                    .find(|s| s[2] == key)
+                    .map(|s| (*r, s[0].as_u64().unwrap() as usize))
+            })
+    };
+    for key in ["c", "s", "x", "tab"] {
+        assert!(hit(&pane, key).is_some(), "{key}: {:?}", pane.acts);
+    }
+    let (row, col) = hit(&pane, "tab").unwrap();
+    pane.click(row, col + 1, NOW);
+    pane.frame(cols, rows, NOW);
+    assert!(opened_at(&mut pane, cols, rows).is_some_and(|c| c.contains("Repeated the rejected")));
+    pane.frame(cols, rows, NOW);
+    let (row, col) = hit(&pane, "x").unwrap();
+    pane.click(row, col + 1, NOW);
+    pane.frame(cols, rows, NOW);
+    assert!(pane.acts.values().all(|a| a["key"] != "observe:0:2"));
+    pane.key("o");
+    pane.key("tab");
+    assert!(opened_at(&mut pane, cols, rows).is_some_and(|c| c.contains("Said the test passed")));
 }
 fn string(v: &Value) -> &str {
     v.as_str().unwrap_or("")

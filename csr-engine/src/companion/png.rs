@@ -107,11 +107,7 @@ fn instrument_png(
         {
             if let Some(act) = key.strip_prefix('@') {
                 pane.frame(cols, rows, now);
-                let row = pane
-                    .acts
-                    .iter()
-                    .find(|(_, a)| a["key"] == act)
-                    .map(|(row, _)| *row);
+                let row = pane.act_row(act);
                 match row {
                     Some(row) => {
                         pane.click(row, 2, now);
@@ -119,6 +115,8 @@ fn instrument_png(
                     None => eprintln!("no row answers {act}"),
                 }
             } else {
+                // A key meets the frame the watch loop drew after the one before it.
+                pane.frame(cols, rows, now);
                 pane.key(key);
             }
         }
@@ -144,6 +142,7 @@ fn instrument_png(
                     "csr_share": theme.tokens().csr_share,
                     "sky": theme.tokens().sky,
                     "cols": cols, "rows": rows,
+                    "rows_open": pane.hit_rows(),
                 }))?,
             )?;
         }

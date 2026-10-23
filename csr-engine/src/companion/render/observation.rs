@@ -35,12 +35,26 @@ impl ObsCard {
     }
 }
 
-/// The item the popup shows: its card and place on it, and whether its text was just copied.
+/// What the last `s` or `x` said: one plain line, and whether it worked.
+pub type Note = (&'static str, bool);
+
+/// The item the popup shows: its card and place on it, whether its text was just copied, and what
+/// the last send said.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PopupAt {
     pub card: ObsCard,
     pub index: usize,
     pub copied: bool,
+    pub note: Option<Note>,
+}
+
+/// The key a dismissed item is kept under in the likes log: the session, the card and the line.
+pub fn dismiss_key(sid: &str, card: &str, line: &str) -> String {
+    // FNV-1a: the line is long and free text, the key must stay short and stable across runs.
+    let hash = line.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("observation:{sid}:{card}:{hash:016x}")
 }
 
 /// One item, in full.
@@ -63,6 +77,9 @@ pub struct Detail {
     /// draft ready to paste.
     pub copy: String,
     pub copied: bool,
+    pub note: Option<Note>,
+    /// What `s` types into Claude's prompt, unsent. Empty when the popup has no such key.
+    pub send: String,
 }
 
 /// The turn numbers an evidence string cites, or `None` when it only quotes.
@@ -157,6 +174,36 @@ fn draft(item: &Value, explain: &str) -> String {
     }
 }
 
+/// What `s` types into Claude's prompt, unsent. It opens with the line CSR's own notes open with, so
+/// the quoted block is CSR's words and what follows is yours; a `More` item has none.
+fn send_text(card: ObsCard, item: &Value, explain: &str) -> String {
+    let (line, evidence) = (string(&item["line"]), string(&item["evidence"]));
+    let quoted = |text: &str| {
+        text.lines()
+            .map(|l| format!("> {l}").trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let opener = "Here is a note offered by CSR (claude-self-reflect):";
+    match card {
+        ObsCard::More => String::new(),
+        ObsCard::Confusing => format!(
+            "{opener}\n\n{}\n\nYou may have gone off course here. Please say what you got wrong and correct course.",
+            quoted(&format!("Confused Claude: {line}\nEvidence: {evidence}"))
+        ),
+        ObsCard::ShouldBe => {
+            let kind = should_be_kind(item);
+            format!(
+                "{opener}\n\n{}\n\nPlease make this {kind} from the draft above, and show me what you wrote.",
+                quoted(&format!(
+                    "{kind}: {line}\nEvidence: {evidence}\nDraft:\n{}",
+                    draft(item, explain).trim_end()
+                ))
+            )
+        }
+    }
+}
+
 /// The popup's content for `items[at.index]` of `at.card`, or `None` when there is no such item.
 pub fn detail(items: &[Value], at: PopupAt) -> Option<Detail> {
     let item = items.get(at.index)?;
@@ -177,6 +224,7 @@ pub fn detail(items: &[Value], at: PopupAt) -> Option<Detail> {
         ObsCard::More => string(&item["title"]).to_owned(),
         card => card.title().to_owned(),
     };
+    let send = send_text(at.card, item, &explain);
     Some(Detail {
         card: at.card,
         heading,
@@ -188,6 +236,8 @@ pub fn detail(items: &[Value], at: PopupAt) -> Option<Detail> {
         next,
         copy,
         copied: at.copied,
+        note: at.note,
+        send,
     })
 }
 
@@ -235,10 +285,14 @@ pub fn rows(d: &Detail, cols: usize) -> Vec<String> {
     if d.copied {
         out.extend(wrap("Copied."));
     }
+    if let Some((note, _)) = d.note {
+        out.extend(wrap(note));
+    }
     out
 }
 
-/// The keys the popup answers to, as the footer lists them.
+/// The keys the popup answers to, as the footer lists them: an observation item can also be sent
+/// to Claude or dismissed, a shortened row in full only copied.
 pub fn footer_keys(d: Option<&Detail>) -> Vec<(&'static str, &'static str)> {
     let copy = match d.map(|d| d.card) {
         Some(ObsCard::ShouldBe) => "copy draft",
@@ -247,7 +301,13 @@ pub fn footer_keys(d: Option<&Detail>) -> Vec<(&'static str, &'static str)> {
     if d.is_some_and(|d| d.card == ObsCard::More) {
         return vec![("c", copy), ("esc", "close")];
     }
-    vec![("c", copy), ("tab", "next"), ("esc", "close")]
+    vec![
+        ("c", copy),
+        ("s", "send"),
+        ("x", "dismiss"),
+        ("tab", "next"),
+        ("esc", "close"),
+    ]
 }
 
 /// Dim the pane and float a panel `h` points tall over the first `shown` points of the picture.
@@ -277,7 +337,20 @@ fn float_panel(canvas: &mut Canvas, h: f32, height: f32, shown: f32, t: &Tokens)
     y
 }
 
-/// The popup's footer keys and the "Copied" mark, drawn at `cursor` under a hairline.
+/// A footer key's hit box in layout points: the key, then left, right, top and bottom.
+pub type KeyBox = (&'static str, f32, f32, f32, f32);
+
+/// Room the one-line note under the footer keys takes, in layout points.
+fn note_h(d: &Detail) -> f32 {
+    if d.note.is_some() {
+        S2 + theme::CAPTION_LINE
+    } else {
+        0.
+    }
+}
+
+/// The popup's footer keys, the "Copied" mark and the last note, drawn at `cursor` under a
+/// hairline. Returns where each key sits, so a click on it can answer as the key.
 fn popup_footer(
     canvas: &mut Canvas,
     f: &Fonts,
@@ -286,11 +359,12 @@ fn popup_footer(
     text_w: f32,
     cursor: f32,
     t: &Tokens,
-) {
+) -> Vec<KeyBox> {
     let caption = sans(theme::CAPTION_SIZE, t.regular);
     canvas.hair(text_x, cursor, text_w, t.hair);
     let cursor = cursor + 1. + S3;
     let mut x = text_x;
+    let mut boxes = vec![];
     for (key, label) in footer_keys(Some(d)) {
         let st = sans(theme::CAPTION_SIZE, t.medium);
         let w = canvas.text(f, key, x, cursor + f.cap(caption), st, t.ink, A::L);
@@ -303,7 +377,25 @@ fn popup_footer(
             t.quiet,
             A::L,
         );
+        boxes.push((
+            key,
+            x - S2,
+            x + w + 4. + w2 + S2,
+            cursor - S2,
+            cursor + theme::CAPTION_LINE + S2,
+        ));
         x += w + 4. + w2 + S3 * 2.;
+    }
+    if let Some((note, ok)) = d.note {
+        canvas.text(
+            f,
+            note,
+            text_x,
+            cursor + theme::CAPTION_LINE + S2 + f.cap(caption),
+            sans(theme::CAPTION_SIZE, t.medium),
+            if ok { t.mint } else { t.warn },
+            A::L,
+        );
     }
     if d.copied {
         canvas.text(
@@ -316,6 +408,7 @@ fn popup_footer(
             A::R,
         );
     }
+    boxes
 }
 
 /// Wrap `s` into at most `n` lines, none of them cut: with `n` big enough the words are whole.
@@ -344,7 +437,14 @@ fn lines_of(f: &Fonts, s: &str, st: St, w: f32, n: usize) -> Vec<String> {
 }
 
 /// A shortened row, in full: its name, then every word of it.
-fn overlay_more(canvas: &mut Canvas, f: &Fonts, d: &Detail, height: f32, shown: f32, t: &Tokens) {
+fn overlay_more(
+    canvas: &mut Canvas,
+    f: &Fonts,
+    d: &Detail,
+    height: f32,
+    shown: f32,
+    t: &Tokens,
+) -> Vec<KeyBox> {
     let panel_x = M + 8.;
     let text_x = panel_x + P;
     let text_w = CW - 16. - 2. * P;
@@ -356,7 +456,16 @@ fn overlay_more(canvas: &mut Canvas, f: &Fonts, d: &Detail, height: f32, shown: 
     if lines.len() > cap {
         lines = lines_of(f, &d.line, body, text_w, cap);
     }
-    let h = P + cap_line + S2 + lines.len() as f32 * body_line + S3 + 1. + S3 + cap_line + P;
+    let h = P
+        + cap_line
+        + S2
+        + lines.len() as f32 * body_line
+        + S3
+        + 1.
+        + S3
+        + cap_line
+        + note_h(d)
+        + P;
     let y = float_panel(canvas, h, height, shown, t);
     let mut cursor = y + P;
     canvas.text(
@@ -374,11 +483,19 @@ fn overlay_more(canvas: &mut Canvas, f: &Fonts, d: &Detail, height: f32, shown: 
         cursor += body_line;
     }
     cursor += S3;
-    popup_footer(canvas, f, d, text_x, text_w, cursor, t);
+    popup_footer(canvas, f, d, text_x, text_w, cursor, t)
 }
 
-/// Dim the pane and float `d` over it, centred on the first `shown` points of the picture.
-pub fn overlay(canvas: &mut Canvas, f: &Fonts, d: &Detail, height: f32, shown: f32, t: &Tokens) {
+/// Dim the pane and float `d` over it, centred on the first `shown` points of the picture. Returns
+/// where the footer keys sit.
+pub fn overlay(
+    canvas: &mut Canvas,
+    f: &Fonts,
+    d: &Detail,
+    height: f32,
+    shown: f32,
+    t: &Tokens,
+) -> Vec<KeyBox> {
     if d.card == ObsCard::More {
         return overlay_more(canvas, f, d, height, shown, t);
     }
@@ -419,6 +536,7 @@ pub fn overlay(canvas: &mut Canvas, f: &Fonts, d: &Detail, height: f32, shown: f
                 + 1.
                 + S3
                 + cap_line
+                + note_h(d)
                 + P
         };
     let mut shaped = build(usize::MAX);
@@ -484,7 +602,7 @@ pub fn overlay(canvas: &mut Canvas, f: &Fonts, d: &Detail, height: f32, shown: f
         }
         cursor += S3;
     }
-    popup_footer(canvas, f, d, text_x, text_w, cursor, t);
+    popup_footer(canvas, f, d, text_x, text_w, cursor, t)
 }
 
 #[cfg(test)]
@@ -497,6 +615,7 @@ mod tests {
             card,
             index,
             copied: false,
+            note: None,
         }
     }
 
@@ -652,6 +771,92 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows.concat().contains(&"partial".repeat(12)), "{rows:?}");
+    }
+
+    #[test]
+    fn a_dismissed_item_is_kept_under_its_session_card_and_line() {
+        let key = dismiss_key("sess-1", "confusing_claude", "Misread the pane.");
+        assert!(
+            key.starts_with("observation:sess-1:confusing_claude:"),
+            "{key}"
+        );
+        assert_eq!(key.len(), "observation:sess-1:confusing_claude:".len() + 16);
+        assert_eq!(
+            key,
+            dismiss_key("sess-1", "confusing_claude", "Misread the pane.")
+        );
+        assert_ne!(
+            key,
+            dismiss_key("sess-2", "confusing_claude", "Misread the pane.")
+        );
+        assert_ne!(key, dismiss_key("sess-1", "should_be", "Misread the pane."));
+        assert_ne!(
+            key,
+            dismiss_key("sess-1", "confusing_claude", "Misread the page.")
+        );
+    }
+
+    #[test]
+    fn what_s_sends_quotes_csrs_words_and_ends_with_yours() {
+        let items = vec![json!({"line":"Said it passed.","evidence":"Turn 3: 'it should pass'"})];
+        let d = detail(&items, at(ObsCard::Confusing, 0)).unwrap();
+        assert_eq!(
+            d.send,
+            "Here is a note offered by CSR (claude-self-reflect):\n\n> Confused Claude: Said it passed.\n> Evidence: Turn 3: 'it should pass'\n\nYou may have gone off course here. Please say what you got wrong and correct course."
+        );
+        let items = vec![json!({"kind":"CLAUDE.md","line":"Run fmt.","evidence":"Turn 4: 'fmt'"})];
+        let d = detail(&items, at(ObsCard::ShouldBe, 0)).unwrap();
+        assert!(d.send.starts_with("Here is a note offered by CSR (claude-self-reflect):\n\n> CLAUDE.md rule: Run fmt.\n"), "{}", d.send);
+        assert!(
+            d.send
+                .contains("\n> Draft:\n> - Run fmt.\n>   <!-- seen: Turn 4: 'fmt' -->\n"),
+            "{}",
+            d.send
+        );
+        assert!(d.send.ends_with("\n\nPlease make this CLAUDE.md rule from the draft above, and show me what you wrote."), "{}", d.send);
+        // The import reads the quote as CSR's and keeps only the ask as the person's words.
+        assert_eq!(
+            crate::extraction::provenance::strip_forwarded_note(&d.send).as_deref(),
+            Some(
+                "Please make this CLAUDE.md rule from the draft above, and show me what you wrote."
+            )
+        );
+        // No quoted line is empty: a blank draft line is a bare `>`, which a quote keeps whole.
+        assert!(d.send.lines().all(|l| l != "> "), "{}", d.send);
+        // A shortened row is only read: nothing to send.
+        let more = vec![json!({"title":"Where the work stands","line":"All of it."})];
+        assert_eq!(detail(&more, at(ObsCard::More, 0)).unwrap().send, "");
+    }
+
+    #[test]
+    fn the_footer_offers_send_and_dismiss_only_where_there_is_something_to_act_on() {
+        let items = vec![json!({"line":"L","evidence":"Turn 1"})];
+        let keys = |card| footer_keys(detail(&items, at(card, 0)).as_ref());
+        assert_eq!(
+            keys(ObsCard::Confusing),
+            [
+                ("c", "copy"),
+                ("s", "send"),
+                ("x", "dismiss"),
+                ("tab", "next"),
+                ("esc", "close")
+            ]
+        );
+        assert_eq!(keys(ObsCard::ShouldBe)[0], ("c", "copy draft"));
+        assert_eq!(keys(ObsCard::ShouldBe)[1], ("s", "send"));
+        assert_eq!(keys(ObsCard::More), [("c", "copy"), ("esc", "close")]);
+    }
+
+    #[test]
+    fn a_note_is_a_row_of_the_text_popup() {
+        let items = vec![json!({"line":"L","evidence":"Turn 1"})];
+        let mut a = at(ObsCard::Confusing, 0);
+        a.note = Some(("No Claude pane to type into.", false));
+        let d = detail(&items, a).unwrap();
+        assert_eq!(
+            rows(&d, 60).last().map(String::as_str),
+            Some("No Claude pane to type into.")
+        );
     }
 
     #[test]

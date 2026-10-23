@@ -863,7 +863,11 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                         let key = match k.code {
                             KeyCode::Char(c) => c.to_lowercase().to_string(),
                             KeyCode::Esc => "escape".into(),
+                            KeyCode::Tab if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                                "shift+tab".into()
+                            }
                             KeyCode::Tab => "tab".into(),
+                            KeyCode::BackTab => "shift+tab".into(),
                             KeyCode::Up => "up".into(),
                             KeyCode::Down => "down".into(),
                             KeyCode::Left => "left".into(),
