@@ -28,6 +28,12 @@ pub const REARM_TOKENS: f64 = 20_000.;
 pub const ATTENDED_MS: f64 = 10. * 60. * 1000.;
 /// A payback longer than this many turns is not worth planning for.
 pub const PAYBACK_UNDER: f64 = 15.;
+/// Claude Code's own auto-compact fires this far under its window: seen at 266k to 271k with
+/// `autoCompactWindow` 300000.
+pub const NATIVE_UNDER: f64 = 33_000.;
+/// CSR acts, seam or not, this far before Claude Code's own auto-compact would: room for one
+/// more turn end, since CSR compacts only at one.
+pub const NATIVE_MARGIN: f64 = 20_000.;
 /// Descriptions and other sections fit around the ids.
 pub const KEEP_MAX: usize = 600;
 /// Whole ids can extend the list this far.
@@ -526,6 +532,31 @@ pub struct Ask<'a> {
     pub seam: &'a Seam,
     /// The context when the owner last cancelled, in this chapter.
     pub cancelled_at: Option<f64>,
+    /// The window Claude Code's own auto-compact works to, when one is set and it is on.
+    pub native_window: Option<f64>,
+}
+
+/// The window Claude Code's own auto-compact works to: `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else
+/// `autoCompactWindow` in settings.json. None when neither is set (it then fires near the
+/// model's own window, far past the band) or when it is off.
+pub fn native_window_of(settings: &Value, env_window: Option<&str>, disabled: bool) -> Option<f64> {
+    if disabled || settings["autoCompactEnabled"] == false {
+        return None;
+    }
+    env_window
+        .and_then(|text| text.trim().parse::<f64>().ok())
+        .or_else(|| settings["autoCompactWindow"].as_f64())
+        .filter(|window| *window > 0.)
+}
+
+/// Where CSR acts at a turn end, seam or not: the band's high edge, or sooner when Claude Code's
+/// own auto-compact would come first. Never under the band.
+pub fn force_at(native_window: Option<f64>) -> f64 {
+    native_window
+        .map_or(BAND_HIGH, |window| {
+            BAND_HIGH.min(window - NATIVE_UNDER - NATIVE_MARGIN)
+        })
+        .max(BAND_LOW)
 }
 
 /// The payback in turns; unmeasured, each request taken as a turn (the cautious reading).
@@ -539,12 +570,13 @@ pub fn payback_turns(payback: &Payback) -> f64 {
 /// What to do at a main-loop turn end.
 ///  - off, below the band, or a compaction that would not pay back within `PAYBACK_UNDER` turns:
 ///    nothing. With no payback at all only the high edge acts.
-///  - in the band: a plan; at a seam, act. At or past the high edge: act, seam or not.
+///  - in the band: a plan; at a seam, act. At or past the high edge, or `NATIVE_MARGIN` before
+///    Claude Code's own auto-compact: act, seam or not.
 ///  - a question waits on the owner: plan only; unattended past the high edge it no longer holds.
 ///  - after a cancel: the next seam and 20k more context.
 ///  - act: suggest offers a press; attended counts down 20 s with a cancel; unattended now.
 pub fn decide(ask: &Ask) -> Verdict {
-    let forced = ask.ctx >= BAND_HIGH;
+    let forced = ask.ctx >= force_at(ask.native_window);
     let said = |act, wait: Option<String>, forced| Verdict { act, wait, forced };
     if ask.setting == Setting::Off || ask.ctx < BAND_LOW {
         return said(Act::None, None, false);
@@ -612,8 +644,10 @@ fn band_edges() -> (String, String) {
 /// calls (~2 prompts) · waiting for a seam`.
 pub fn plan_text(ctx: f64, payback: Option<&Payback>, wait: Option<&str>, forced: bool) -> String {
     let (low, high) = band_edges();
-    let where_ = if forced {
+    let where_ = if forced && ctx >= BAND_HIGH {
         format!("{}, past your {low}–{high} band", k(ctx))
+    } else if forced {
+        format!("{}, close to Claude Code's own auto-compact", k(ctx))
     } else {
         format!("{} of your {low}–{high} band", k(ctx))
     };

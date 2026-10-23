@@ -680,6 +680,7 @@ pub async fn at_turn_end(cx: &Ctx, out: &Out, answer: &str) -> Result<()> {
         return Ok(());
     }
     let stamp = op.stamp;
+    let native_window = out.native_window().await;
     let verdict = decide(&Ask {
         setting,
         mode,
@@ -687,6 +688,7 @@ pub async fn at_turn_end(cx: &Ctx, out: &Out, answer: &str) -> Result<()> {
         payback: pay,
         seam: &seam,
         cancelled_at,
+        native_window,
     });
     let floor = plan.as_ref().and_then(|plan| plan["floor"].as_f64());
     let at = Arc::new(Armed {

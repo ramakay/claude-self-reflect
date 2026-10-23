@@ -10,11 +10,11 @@ mod engine;
 pub(crate) mod kit;
 
 use super::rules::{
-    act_why, decide, ends_on_question, keep_list, last_question, mode_of, notice_line,
-    payback_prompts, payback_text, payback_turns, plan_text, resume_of, rule_in, seam_of, Act, Ask,
-    Human, Keep, Mode, Pay, Payback, Resume, Running, Setting, ShownView, Source, TurnEnd, Verdict,
-    ViewKind, COUNTDOWN_MS, DRIFT, KEEP_HEADER, KEEP_IDS_MAX, KEEP_MAX, NOTICE_HEADER,
-    RESUME_LATE_MS,
+    act_why, decide, ends_on_question, force_at, keep_list, last_question, mode_of,
+    native_window_of, notice_line, payback_prompts, payback_text, payback_turns, plan_text,
+    resume_of, rule_in, seam_of, Act, Ask, Human, Keep, Mode, Pay, Payback, Resume, Running,
+    Setting, ShownView, Source, TurnEnd, Verdict, ViewKind, COUNTDOWN_MS, DRIFT, KEEP_HEADER,
+    KEEP_IDS_MAX, KEEP_MAX, NOTICE_HEADER, RESUME_LATE_MS,
 };
 use crate::companion::{
     app::state::{BAND_HIGH, BAND_LOW},
@@ -152,6 +152,73 @@ fn a_question_is_the_last_character_markdown_and_quotes_aside_its_last_sentence_
 }
 
 #[test]
+fn claude_codes_own_window_comes_from_the_env_then_settings_and_is_none_when_off() {
+    let set = json!({ "autoCompactWindow": 300000 });
+    assert_eq!(native_window_of(&set, None, false), Some(300_000.));
+    assert_eq!(
+        native_window_of(&set, Some("250000"), false),
+        Some(250_000.)
+    );
+    assert_eq!(
+        native_window_of(&Value::Null, Some(" 400000 "), false),
+        Some(400_000.)
+    );
+    assert_eq!(native_window_of(&Value::Null, None, false), None);
+    assert_eq!(native_window_of(&set, None, true), None);
+    let off = json!({ "autoCompactWindow": 300000, "autoCompactEnabled": false });
+    assert_eq!(native_window_of(&off, None, false), None);
+    assert_eq!(
+        native_window_of(&json!({ "autoCompactWindow": 0 }), None, false),
+        None
+    );
+}
+
+#[test]
+fn csr_acts_before_claude_codes_own_auto_compact_and_never_under_the_band() {
+    assert_eq!(force_at(None), BAND_HIGH);
+    // 300k: Claude Code compacts near 267k, so CSR acts from 247k
+    assert_eq!(force_at(Some(300_000.)), 247_000.);
+    assert_eq!(force_at(Some(1_000_000.)), BAND_HIGH);
+    assert_eq!(force_at(Some(200_000.)), BAND_LOW);
+}
+
+#[test]
+fn a_running_agent_holds_a_compaction_only_until_claude_codes_own_would_come_first() {
+    let working = [agent()];
+    let busy = seam_of(&end("ok", Some(&working)));
+    let ask = Ask {
+        setting: Setting::Auto,
+        mode: Mode::Unattended,
+        ctx: 250_000.,
+        payback: Pay::Is(Payback {
+            requests: 16.,
+            per_turn: Some(8.),
+        }),
+        seam: &busy,
+        cancelled_at: None,
+        native_window: None,
+    };
+    // the session that lost to Claude Code at 268k: planned at 250k, waiting on an agent
+    assert_eq!(decide(&ask).act, Act::Plan);
+    let verdict = decide(&Ask {
+        native_window: Some(300_000.),
+        ..ask
+    });
+    assert_eq!((verdict.act, verdict.forced), (Act::Compact, true));
+    assert_eq!(
+        decide(&Ask {
+            ctx: 240_000.,
+            native_window: Some(300_000.),
+            ..ask
+        })
+        .act,
+        Act::Plan
+    );
+    assert!(plan_text(250_000., None, Some("1 agent running"), true)
+        .contains("250k, close to Claude Code's own auto-compact"));
+}
+
+#[test]
 fn decide_nothing_below_the_band_or_when_it_would_not_pay_back_a_plan_until_a_seam() {
     let none: &[Running] = &[];
     let seam = seam_of(&end("ok", Some(none)));
@@ -166,6 +233,7 @@ fn decide_nothing_below_the_band_or_when_it_would_not_pay_back_a_plan_until_a_se
         payback: pay(8., None),
         seam: &seam,
         cancelled_at: None,
+        native_window: None,
     };
     let act = |ask: Ask| decide(&ask).act;
     assert_eq!(

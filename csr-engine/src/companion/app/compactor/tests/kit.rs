@@ -402,6 +402,10 @@ impl Outside for FakeOutside {
         Some(HOME.to_string())
     }
 
+    async fn native_window(&self) -> Option<f64> {
+        None
+    }
+
     async fn write(&self, path: &str, text: &str, _redact: Redact) -> Result<()> {
         locked(&self.writes).push(path.to_string());
         if self

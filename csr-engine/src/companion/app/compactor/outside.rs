@@ -5,7 +5,7 @@
 //! Each call that can wait has its own limit, as the TypeScript's `timeoutMs` had it: a failure or
 //! a timeout reads as no answer.
 
-use super::rules::js_trim_end;
+use super::rules::{js_trim_end, native_window_of};
 use crate::{
     companion::{
         app::carry::{in_process, Threads},
@@ -57,6 +57,8 @@ pub trait Outside: Send + Sync {
     async fn remove(&self, path: &str);
     /// `fs.exists`.
     async fn exists(&self, path: &str) -> bool;
+    /// The window Claude Code's own auto-compact works to, when one is set and it is on.
+    async fn native_window(&self) -> Option<f64>;
 }
 
 /// The engine doing it itself.
@@ -126,6 +128,19 @@ impl Outside for Here {
         let home = std::env::var("HOME").ok()?;
         let home = home.trim_end_matches('/');
         (!home.is_empty()).then(|| home.to_string())
+    }
+
+    async fn native_window(&self) -> Option<f64> {
+        let settings = self.home().await.map_or(Value::Null, |home| {
+            paths::read_json(&Path::new(&home).join(".claude/settings.json"))
+        });
+        native_window_of(
+            &settings,
+            std::env::var("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                .ok()
+                .as_deref(),
+            std::env::var_os("DISABLE_AUTO_COMPACT").is_some(),
+        )
     }
 
     async fn write(&self, path: &str, text: &str, redact: Redact) -> Result<()> {
