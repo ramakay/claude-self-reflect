@@ -107,3 +107,9 @@ inherits = "release"
 debug-assertions = true
 overflow-checks = true
 incremental = true
+
+# The checks stay on csr-engine's own code; third-party crates run as in release (one
+# instrument draw: 71.5 ms with them, 58.4 ms without).
+[profile.gate.package."*"]
+debug-assertions = false
+overflow-checks = false
