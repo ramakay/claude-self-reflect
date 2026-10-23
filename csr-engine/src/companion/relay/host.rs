@@ -217,9 +217,49 @@ impl RelayHost {
     }
 }
 
+/// `env.get` is answered here: the relay has no such call, and this child was started with Claude
+/// Code's own environment.
+fn local(call: &Call) -> Option<Result<Value, String>> {
+    (call.m == "env.get").then(|| {
+        Ok(call
+            .a
+            .first()
+            .and_then(Value::as_str)
+            .and_then(|name| std::env::var(name).ok())
+            .map_or(Value::Null, Value::String))
+    })
+}
+
 #[async_trait]
 impl Host for RelayHost {
     async fn batch(&self, calls: Vec<Call>) -> Result<Vec<Result<Value, String>>> {
+        let mut answers: Vec<Option<Result<Value, String>>> = calls.iter().map(local).collect();
+        let calls: Vec<Call> = calls
+            .into_iter()
+            .zip(&answers)
+            .filter(|(_, answer)| answer.is_none())
+            .map(|(call, _)| call)
+            .collect();
+        let mut remote = self.remote(calls).await?.into_iter();
+        Ok(answers
+            .iter_mut()
+            .map(|answer| {
+                answer
+                    .take()
+                    .or_else(|| remote.next())
+                    .unwrap_or_else(|| Err("no result".to_string()))
+            })
+            .collect())
+    }
+
+    fn detach(&self, work: Detached) {
+        self.hub.detach(work);
+    }
+}
+
+impl RelayHost {
+    /// The calls only the relay can answer, in one round trip.
+    async fn remote(&self, calls: Vec<Call>) -> Result<Vec<Result<Value, String>>> {
         if calls.is_empty() {
             return Ok(Vec::new());
         }
@@ -254,10 +294,6 @@ impl Host for RelayHost {
                 )
             }
         }
-    }
-
-    fn detach(&self, work: Detached) {
-        self.hub.detach(work);
     }
 }
 
@@ -609,6 +645,45 @@ mod tests {
         let late = hub.step(&id, vec![("c1".into(), Ok(json!(1)))]).await;
         assert_eq!(late, json!({}));
         assert_eq!(hub.waiting(), 0);
+    }
+
+    /// The relay has no `env.get`: the engine answers it from its own environment, in place,
+    /// and only the other calls go out.
+    #[tokio::test]
+    async fn env_get_is_answered_here_and_only_the_rest_go_to_the_relay() {
+        let hub = hub_with(Duration::from_secs(5));
+        let only = hub
+            .converse(|host| {
+                Box::pin(async move {
+                    let path = host.call("env.get", vec![json!("PATH")]).await.unwrap();
+                    let none = host
+                        .call("env.get", vec![json!("CSR_TEST_NEVER_SET_9F2")])
+                        .await
+                        .unwrap();
+                    json!({ "path": path.is_string(), "none": none })
+                })
+            })
+            .await;
+        assert_eq!(only, json!({ "path": true, "none": null }));
+        let mixed = hub
+            .converse(|host| {
+                Box::pin(async move {
+                    let got = host
+                        .batch(vec![
+                            Call::new("env.get", vec![json!("PATH")]),
+                            Call::new("session.usage", vec![]),
+                        ])
+                        .await
+                        .unwrap();
+                    json!({ "env": got[0].as_ref().unwrap().is_string(), "usage": got[1] })
+                })
+            })
+            .await;
+        assert_eq!(mixed["calls"].as_array().unwrap().len(), 1);
+        assert_eq!(mixed["calls"][0]["m"], "session.usage");
+        let id = mixed["id"].as_str().unwrap().to_string();
+        let done = hub.step(&id, vec![("c1".into(), Ok(json!(7)))]).await;
+        assert_eq!(done, json!({ "env": true, "usage": { "Ok": 7 } }));
     }
 
     #[tokio::test]
