@@ -29,7 +29,10 @@ use std::{
     io::Write,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -60,11 +63,29 @@ fn now_ms() -> f64 {
         .unwrap_or(0.)
 }
 
+/// Requests the relay posted that are not answered yet.
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts one request in flight while it lives.
+struct InFlight;
+impl InFlight {
+    fn enter() -> Self {
+        IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 async fn endpoint(
     app: Arc<App>,
     path: &'static str,
     body: Bytes,
 ) -> (StatusCode, axum::Json<Value>) {
+    let _in_flight = InFlight::enter();
     let started = Instant::now();
     let Ok(parsed) = serde_json::from_slice::<Value>(&body) else {
         return (
@@ -241,6 +262,28 @@ fn stop_signals() -> Result<impl std::future::Future<Output = ()>> {
     })
 }
 
+/// How often the engine's binary is checked for an install, and how soon a first sighting is
+/// confirmed.
+const EXE_POLL: Duration = Duration::from_secs(10);
+const EXE_CONFIRM: Duration = Duration::from_secs(1);
+
+/// Resolves once an install replaced this engine's binary and no request or conversation is in
+/// flight. The relay respawns a child that ends, so the session moves to the new engine; without
+/// this a session keeps the engine it started with until Claude Code restarts.
+async fn replaced(
+    exe: Option<(PathBuf, crate::binary_identity::FileIdentity)>,
+    app: Arc<App>,
+    (poll, confirm): (Duration, Duration),
+) {
+    let Some((path, start)) = exe else {
+        return std::future::pending().await;
+    };
+    crate::binary_identity::wait_for_binary_replacement(start, path, poll, confirm).await;
+    while IN_FLIGHT.load(Ordering::SeqCst) > 0 || !app.idle() {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Remove the socket file, but only when it is still the one this process bound.
 fn remove_own_socket(sock: &Path, bound: (u64, u64)) {
     if let Ok(meta) = std::fs::symlink_metadata(sock) {
@@ -251,6 +294,7 @@ fn remove_own_socket(sock: &Path, bound: (u64, u64)) {
 }
 
 async fn run(args: &ServeArgs) -> Result<()> {
+    let exe = crate::binary_identity::current_exe_path_and_identity();
     prepare(&args.sock)?;
     let listener = UnixListener::bind(&args.sock)
         .with_context(|| format!("binding {}", args.sock.display()))?;
@@ -288,10 +332,11 @@ async fn run(args: &ServeArgs) -> Result<()> {
         inner: listener,
         uid: unsafe { libc::getuid() },
     };
-    let served = axum::serve(listener, router(app));
+    let served = axum::serve(listener, router(app.clone()));
     let result = tokio::select! {
         served = served => served.map_err(anyhow::Error::from),
         () = stopped => Ok(()),
+        () = replaced(exe, app, (EXE_POLL, EXE_CONFIRM)) => Ok(()),
         () = gone.notified() => Ok(()),
         () = orphaned() => Ok(()),
     };
@@ -374,6 +419,49 @@ mod tests {
         let response = router(app).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(seen.load(Ordering::Relaxed), 3_000_000);
+    }
+
+    /// An install replaces the binary: the child ends once nothing is in flight, and the relay
+    /// starts it again on the new one.
+    #[tokio::test]
+    async fn a_replaced_binary_ends_the_child_once_no_request_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("csr-engine");
+        std::fs::write(&exe, "old").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let start = crate::binary_identity::FileIdentity::capture(&exe).unwrap();
+        let (push, _lines) = mpsc::unbounded_channel();
+        let app = App::new(
+            Hub::new(push),
+            Arc::new(crate::companion::store::Store::at(
+                dir.path().join("companion.db"),
+            )),
+            Arc::new(SystemClock),
+            Arc::new(Log::default()),
+            dispatch::Table::new(),
+        );
+        let fast = (Duration::from_millis(20), Duration::from_millis(20));
+        let mut ends = Box::pin(replaced(Some((exe.clone(), start)), app.clone(), fast));
+        let wait = Duration::from_millis(300);
+        assert!(
+            tokio::time::timeout(wait, &mut ends).await.is_err(),
+            "the same binary keeps the child"
+        );
+        let busy = InFlight::enter();
+        let new = dir.path().join("csr-engine.new");
+        std::fs::write(&new, "new build").unwrap();
+        std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&new, &exe).unwrap();
+        assert!(
+            tokio::time::timeout(wait, &mut ends).await.is_err(),
+            "a request in flight holds the child"
+        );
+        drop(busy);
+        tokio::time::timeout(Duration::from_secs(5), &mut ends)
+            .await
+            .expect("the child ends once the request is answered");
+        let never = replaced(None, app, fast);
+        assert!(tokio::time::timeout(wait, never).await.is_err());
     }
 
     #[test]

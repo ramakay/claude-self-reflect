@@ -2253,6 +2253,19 @@ impl Pane {
             .find(|(_, a)| a["key"] == act)
             .map(|(row, _)| *row)
     }
+    /// What a click at `row`, `col` lands on, for the click log.
+    pub fn click_target(&self, row: usize, col: usize) -> serde_json::Value {
+        json!({
+            "row": row,
+            "col": col,
+            "view": self.view,
+            "popup": self.popup.is_some(),
+            "act": self.acts.get(&row).map(|a| a["key"].clone()),
+            "hit": self.hits.get(&row).map(|(card, index)| format!("{card:?}:{index}")),
+            "foot": self.phone.foot,
+            "edge": self.edge,
+        })
+    }
     pub fn click(&mut self, row: usize, col: usize, now: f64) -> bool {
         let act = self.acts.get(&row).cloned();
         if self.popup.is_some() {

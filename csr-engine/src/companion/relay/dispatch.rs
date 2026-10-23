@@ -483,6 +483,10 @@ impl App {
         })
     }
 
+    /// No conversation with the relay is parked waiting for its next step.
+    pub fn idle(&self) -> bool {
+        self.hub.waiting() == 0
+    }
     pub fn log(&self) -> &Log {
         &self.log
     }

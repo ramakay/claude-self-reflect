@@ -374,6 +374,14 @@ impl Drop for Watchdog {
         self.stop();
     }
 }
+/// One line per left click: where it landed and whether a popup was up after it.
+fn log_click(paths: &Paths, row: &serde_json::Value) {
+    let path = paths.keep.join("pane-clicks.log");
+    if fs::metadata(&path).is_ok_and(|m| m.len() >= 1 << 18) {
+        let _ = fs::rename(&path, paths.keep.join("pane-clicks.log.1"));
+    }
+    let _ = private::append(&path, &format!("{row}\n"), &paths.keep);
+}
 pub fn log_error(paths: &Paths, text: &str) {
     let path = paths.keep.join("pane-errors.log");
     if fs::metadata(&path).is_ok_and(|m| m.len() >= 1 << 20) {
@@ -888,7 +896,14 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                     }
                     Event::Mouse(m) => match m.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
-                            if !pane.click(m.row as usize, m.column as usize, now) {
+                            let mut row = pane.click_target(m.row as usize, m.column as usize);
+                            let kept = pane.click(m.row as usize, m.column as usize, now);
+                            row["at"] = json!(now);
+                            row["after"] = pane.click_target(m.row as usize, m.column as usize)
+                                ["popup"]
+                                .clone();
+                            log_click(&paths, &row);
+                            if !kept {
                                 break;
                             }
                             pressed = true;
