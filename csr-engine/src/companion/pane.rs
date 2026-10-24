@@ -1333,18 +1333,23 @@ impl Pane {
                         }
                     }
                     if let (Some(mut answer), Some(y)) = (answer, metrics.answer_y) {
-                        answer["spans"] = json!(metrics
+                        let cell = |x: f32| {
+                            (metrics.content_left + x / 605. * metrics.content_width) * cols as f32
+                        };
+                        let mut spans = metrics
                             .answer_spans
                             .iter()
-                            .map(|(a, b, word)| json!([
-                                ((metrics.content_left + a / 605. * metrics.content_width)
-                                    * cols as f32)
-                                    .floor() as usize,
-                                ((metrics.content_left + b / 605. * metrics.content_width)
-                                    * cols as f32)
-                                    .ceil() as usize,
-                                word
-                            ]))
+                            .map(|(a, b, word)| {
+                                (cell(*a).floor() as usize, cell(*b).ceil() as usize, word)
+                            })
+                            .collect::<Vec<_>>();
+                        // Rounding out can give two answers the same cell; the later answer keeps it.
+                        for i in 1..spans.len() {
+                            spans[i - 1].1 = spans[i - 1].1.min(spans[i].0);
+                        }
+                        answer["spans"] = json!(spans
+                            .iter()
+                            .map(|(a, b, word)| json!([a, b, word]))
                             .collect::<Vec<_>>());
                         self.acts.insert(to_row(y - 4.), answer);
                     }
@@ -2079,7 +2084,9 @@ impl Pane {
                     .map(|(r, a)| (*r, a.clone()));
                 if let Some((row, act)) = answer {
                     if let Some(span) = array(&act["spans"]).get(index) {
-                        return self.click(row, num(&span[0]) as usize, super::paths::now());
+                        // The middle of the span, so a shared edge cell can't answer for a neighbor.
+                        let col = (num(&span[0]) + num(&span[1])) / 2.;
+                        return self.click(row, col as usize, super::paths::now());
                     }
                 }
                 if key == "1"

@@ -637,6 +637,39 @@ fn live_keys_keep_one_surface_and_switch_theme_without_restart() {
 }
 
 #[test]
+fn pixel_number_keys_answer_their_own_dream_choice() {
+    let sizes = (34..=80).map(|cols| (cols, 30)).chain([(76, 67)]);
+    for ((cols, rows), (key, word)) in sizes.flat_map(|size| {
+        [
+            ("1", "helpful"),
+            ("2", "thought_of_it"),
+            ("3", "not_relevant"),
+            ("4", "ask_claude"),
+        ]
+        .map(|choice| (size, choice))
+    }) {
+        let (_home, paths) = state_home("02-running");
+        let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", cols, rows));
+        pane.pixels = true;
+        pane.enable_cards();
+        pane.frame(cols, rows, NOW);
+        let spans = pane
+            .acts
+            .values()
+            .find(|a| a["dream"].is_string())
+            .map(|a| a["spans"].as_array().unwrap().clone())
+            .unwrap_or_else(|| panic!("{cols}x{rows}: no dream answers"));
+        for pair in spans.windows(2) {
+            assert!(pair[0][1].as_u64() <= pair[1][0].as_u64(), "{spans:?}");
+        }
+        pane.key(key);
+        let text = fs::read_to_string(paths.keep.join("dreams.jsonl")).unwrap();
+        let answer: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(answer["answer"], word, "{cols}x{rows} key {key}: {spans:?}");
+    }
+}
+
+#[test]
 fn real_pixel_answer_promotes_the_next_dream_and_live_theme_repaints() {
     let (_home, paths) = state_home("02-running");
     let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));

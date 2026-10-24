@@ -252,6 +252,8 @@ fn the_hero_opens_its_reasons_without_sending_or_answering() {
     assert!(has(&shown, "Catch a failing frame"));
     assert!(pane.sent.is_null());
     assert_eq!(fs::read(paths.keep.join("dreams.jsonl")).unwrap(), before);
+    // Opening reflows the frame, so the hero is found again before the closing click.
+    let row = row_of(&pane, "instrument:dreams");
     pane.click(row, 0, NOW);
     assert!(!pane.instrument_open.dreams);
 }
