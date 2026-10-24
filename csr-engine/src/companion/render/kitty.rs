@@ -36,7 +36,8 @@ pub fn kitty(png: &[u8], row: usize, col: usize, cols: usize, rows: usize) -> St
     transmit(png, row, col, cols, rows, None)
 }
 /// `kitty` under image id `id`: sent again under the same id, a picture replaces the old one in
-/// place, with no delete first.
+/// place, with no delete first. `z=-1` keeps it under the text: Warp paints a picture at z 0 or
+/// above in a layer of its own, and that layer takes the click, so a tap on a card never arrives.
 fn transmit(
     png: &[u8],
     row: usize,
@@ -53,7 +54,7 @@ fn transmit(
     for (index, chunk) in chunks.enumerate() {
         let more = usize::from(index + 1 < count);
         let ctrl = if index == 0 {
-            format!("a=T,f=100,q=2,C=1,{id}c={cols},r={rows},m={more}")
+            format!("a=T,f=100,q=2,C=1,{id}c={cols},r={rows},z=-1,m={more}")
         } else {
             format!("m={more}")
         };
@@ -266,6 +267,17 @@ mod picture_tests {
         }
     }
     #[test]
+    fn every_picture_sits_under_the_text_so_a_tap_on_it_arrives() {
+        let png = vec![0u8; 5000];
+        let sent = kitty(&png, 2, 1, 4, 3);
+        let first = sent.split("\x1b_G").nth(1).unwrap();
+        assert!(
+            first.starts_with("a=T,") && first.contains(",z=-1,"),
+            "{first:.60}"
+        );
+        assert!(transmit(&png, 0, 0, 1, 1, Some(7)).contains(",i=7,c=1,r=1,z=-1,"));
+    }
+    #[test]
     fn only_the_band_that_changed_is_sent_again_and_nothing_is_deleted_first() {
         let before = bands(&[Placement {
             row: 0,
@@ -302,7 +314,7 @@ mod picture_tests {
     fn kitty_chunks_transmit_png_and_place_without_moving_the_cursor() {
         let png = vec![42; 7000];
         let output = kitty(&png, 2, 3, 40, 5);
-        assert!(output.starts_with("\x1b[3;4H\x1b_Ga=T,f=100,q=2,C=1,c=40,r=5,m=1;"));
+        assert!(output.starts_with("\x1b[3;4H\x1b_Ga=T,f=100,q=2,C=1,c=40,r=5,z=-1,m=1;"));
         let mut encoded = String::new();
         let mut lengths = vec![];
         for packet in output.split("\x1b_G").skip(1) {
