@@ -906,6 +906,10 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                             if !kept {
                                 break;
                             }
+                            // A tap on the popup's "c copy" puts the text out as the key does.
+                            if let Some(text) = pane.take_copy() {
+                                copy_to_clipboard(&text);
+                            }
                             pressed = true;
                         }
                         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
