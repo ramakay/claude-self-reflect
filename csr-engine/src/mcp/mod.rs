@@ -1122,9 +1122,13 @@ impl ServerHandler for CsrServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
-        let client_supports_tasks = context
-            .client_capabilities()
-            .is_some_and(|capabilities| capabilities.supports_tasks());
+        // The task path is opt-in (`CSR_MCP_TASKS=1`): Claude Code 2.1.308+
+        // declares task support but never polls `tasks/get`, which left the
+        // four taskable tools returning empty results. See `tasks::tasks_enabled`.
+        let client_supports_tasks = tasks::tasks_enabled()
+            && context
+                .client_capabilities()
+                .is_some_and(|capabilities| capabilities.supports_tasks());
 
         // gap-G2 spec 2c: check at most once per interval, regardless of
         // how often tools are called; cheap (an atomic read) on every call

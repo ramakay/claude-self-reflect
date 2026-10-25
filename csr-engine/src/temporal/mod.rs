@@ -88,9 +88,18 @@ fn parse_dynamic_expression(
     now: DateTime<Utc>,
     today_start: DateTime<Utc>,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    // "past N days/weeks/months" / "last N days/weeks/months"
+    // "past N hours/days/weeks/months" / "last N hours/days/weeks/months"
     for prefix in &["past ", "last "] {
         if let Some(rest) = expr.strip_prefix(prefix) {
+            if let Some(n_str) = rest
+                .strip_suffix(" hours")
+                .or_else(|| rest.strip_suffix(" hour"))
+            {
+                if let Ok(n) = n_str.trim().parse::<i64>() {
+                    let n = n.clamp(0, 24 * 366 * 100);
+                    return Ok((now - Duration::hours(n), now));
+                }
+            }
             if let Some(n_str) = rest.strip_suffix(" days") {
                 if let Ok(n) = n_str.trim().parse::<i64>() {
                     return Ok((now - Duration::days(n), now));
@@ -118,6 +127,18 @@ fn parse_dynamic_expression(
                     return Ok((start, now));
                 }
             }
+        }
+    }
+
+    // "N hours ago": the hour-wide window ending N hours back.
+    if let Some(rest) = expr
+        .strip_suffix(" hours ago")
+        .or_else(|| expr.strip_suffix(" hour ago"))
+    {
+        if let Ok(n) = rest.trim().parse::<i64>() {
+            let n = n.clamp(0, 24 * 366 * 100);
+            let start = now - Duration::hours(n);
+            return Ok((start, start + Duration::hours(1)));
         }
     }
 
@@ -259,6 +280,22 @@ mod tests {
         let (start, end) = parse_time_expression("past 7 days").unwrap();
         let diff = end - start;
         assert!((diff.num_days() - 7).abs() <= 1);
+    }
+
+    #[test]
+    fn test_parse_last_n_hours() {
+        let (start, end) = parse_time_expression("last 12 hours").unwrap();
+        let diff = end - start;
+        assert!((diff.num_minutes() - 12 * 60).abs() <= 1);
+        let (start, end) = parse_time_expression("past 1 hour").unwrap();
+        assert!(((end - start).num_minutes() - 60).abs() <= 1);
+    }
+
+    #[test]
+    fn test_parse_n_hours_ago() {
+        let (start, end) = parse_time_expression("3 hours ago").unwrap();
+        assert_eq!((end - start).num_minutes(), 60);
+        assert!(((Utc::now() - start).num_minutes() - 180).abs() <= 1);
     }
 
     #[test]
