@@ -362,6 +362,15 @@ fn a_reload_with_an_alarm_armed_leaves_the_new_engine_alive() {
     let mut pane = Pane::start_with(false, &[("CSR_PANE_TEST_ALARM", "1")]);
     let engine = pane.home.path().join("csr-engine-reloaded");
     fs::copy(env!("CARGO_BIN_EXE_csr-engine"), &engine).unwrap();
+    // Run the copy once and wait for it to exit before the pane is pointed at it: macOS scans a new
+    // file the first time it runs (1.5 to 4.9 s on the dev laptop), and the pane gives its version
+    // probe of the copy only 5 s.
+    let warmed = Command::new(&engine)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(warmed.success());
     fs::write(
         pane.home
             .path()
