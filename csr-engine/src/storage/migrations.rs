@@ -391,6 +391,71 @@ fn ensure_witness_verdicts_receipt_committed_at(conn: &Connection) -> Result<()>
 }
 
 /// Run all database migrations.
+/// S6 episode tier: additive tables, never touching `chunks`. `episodes_fts`
+/// is external-content on `episodes` with the `chunks_fts` tokenizer.
+fn migrate_episodes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS episodes (
+            id TEXT NOT NULL UNIQUE,
+            conversation_id TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            first_uuid TEXT NOT NULL,
+            last_uuid TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            text TEXT NOT NULL,
+            token_est INTEGER NOT NULL,
+            echo_class INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'conversation'
+        );
+        CREATE INDEX IF NOT EXISTS idx_episodes_conversation ON episodes(conversation_id, ordinal);
+        CREATE INDEX IF NOT EXISTS idx_episodes_timestamp ON episodes(timestamp);
+        CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
+            text,
+            content='episodes',
+            content_rowid='rowid',
+            tokenize='porter unicode61'
+        );
+        CREATE TRIGGER IF NOT EXISTS episodes_fts_ai AFTER INSERT ON episodes BEGIN
+            INSERT INTO episodes_fts(rowid, text) VALUES (new.rowid, new.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS episodes_fts_ad AFTER DELETE ON episodes BEGIN
+            INSERT INTO episodes_fts(episodes_fts, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+        END;
+        CREATE TABLE IF NOT EXISTS session_cards (
+            conversation_id TEXT PRIMARY KEY,
+            project_name TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            identifiers TEXT NOT NULL DEFAULT '[]',
+            decisions TEXT NOT NULL DEFAULT '[]',
+            task_state TEXT NOT NULL DEFAULT '',
+            receipts TEXT NOT NULL DEFAULT '[]',
+            first_ts TEXT NOT NULL DEFAULT '',
+            last_ts TEXT NOT NULL DEFAULT '',
+            episode_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS episode_watermarks (
+            rel_path TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            source_bytes INTEGER NOT NULL,
+            tail_hash TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            resume_offset INTEGER NOT NULL DEFAULT 0,
+            resume_ordinal INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS episode_compact_records (
+            uuid TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            timestamp TEXT NOT NULL DEFAULT ''
+        );
+        ",
+    )?;
+    Ok(())
+}
+
 pub fn run(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
@@ -1178,6 +1243,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     )?;
     migrate_chunks_fts(conn)?;
     migrate_chunks_fts_au_content_scoped(conn)?;
+    migrate_episodes(conn)?;
 
     // Engine metadata KV — caches expensive computed state (e.g. integrity_check
     // results, which cost ~10s on multi-GB DBs and must not run per status call).

@@ -3,6 +3,7 @@ pub mod cross_encoder;
 pub mod cross_project;
 pub mod decay;
 pub mod echo;
+pub mod episodes;
 pub mod hybrid;
 pub mod identifiers;
 pub mod reinstatement;

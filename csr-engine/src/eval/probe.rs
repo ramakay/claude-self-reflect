@@ -60,6 +60,10 @@ struct ProbeSpec {
     must: Vec<String>,
     #[serde(default)]
     must_not: Vec<String>,
+    /// Sessions (conversation ids) that hold the answer. Optional: a probe
+    /// without it has no session-level column.
+    #[serde(default)]
+    expect_sessions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +76,7 @@ struct CompiledProbe {
     query: String,
     must: Vec<Regex>,
     must_not: Vec<Regex>,
+    expect_sessions: Vec<String>,
 }
 
 fn compile(patterns: &[String]) -> Result<Vec<Regex>> {
@@ -103,6 +108,7 @@ fn load_probes(text: &str) -> Result<(usize, Vec<CompiledProbe>)> {
                 query: p.query,
                 must: compile(&p.must)?,
                 must_not: compile(&p.must_not)?,
+                expect_sessions: p.expect_sessions,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -127,6 +133,63 @@ fn split_blocks(text: &str) -> Vec<(usize, &str)> {
         .map(|(i, (n, start))| {
             let end = found.get(i + 1).map_or(text.len(), |next| next.1);
             (*n, &text[*start..end])
+        })
+        .collect()
+}
+
+/// The session a result block belongs to: its `session` attribute, else its
+/// `<cid>` (the conversation id, which is the session when no episode channel
+/// ran).
+fn block_session(block: &str) -> Option<String> {
+    let head = block.split('>').next().unwrap_or("");
+    if let Some(pos) = head.find("session=\"") {
+        let rest = &head[pos + "session=\"".len()..];
+        return rest.split('"').next().map(str::to_string);
+    }
+    tag_text(block, "cid")
+}
+
+fn tag_text(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let start = block.find(&open)? + open.len();
+    let end = block[start..].find(&format!("</{tag}>"))?;
+    Some(block[start..start + end].to_string())
+}
+
+fn block_eid(block: &str) -> Option<String> {
+    let head = block.split('>').next().unwrap_or("");
+    let pos = head.find("eid=\"")?;
+    head[pos + "eid=\"".len()..]
+        .split('"')
+        .next()
+        .map(str::to_string)
+}
+
+/// Smallest block rank (<= `limit`) whose session is in `expect`; `None` when
+/// `expect` is empty or no block matches.
+pub fn session_hit_rank(text: &str, expect: &[String], limit: usize) -> Option<usize> {
+    if expect.is_empty() {
+        return None;
+    }
+    split_blocks(text)
+        .into_iter()
+        .filter(|(n, _)| *n <= limit)
+        .find(|(_, block)| block_session(block).is_some_and(|s| expect.contains(&s)))
+        .map(|(n, _)| n)
+}
+
+/// Per-block shown identity for the ndjson dump.
+fn dump_blocks(text: &str) -> Vec<Value> {
+    split_blocks(text)
+        .into_iter()
+        .map(|(n, block)| {
+            json!({
+                "rank": n,
+                "cid": tag_text(block, "cid"),
+                "id": tag_text(block, "id"),
+                "eid": block_eid(block),
+                "session": block_session(block),
+            })
         })
         .collect()
 }
@@ -221,6 +284,9 @@ fn rank1_score(text: &str) -> Option<f64> {
 struct ProbeRow {
     id: u32,
     hit_rank: Option<usize>,
+    /// `Some` only for a probe that carries `expect_sessions`.
+    session_scored: bool,
+    session_hit_rank: Option<usize>,
     rank1_score: Option<f64>,
     wall_ms: f64,
 }
@@ -250,6 +316,13 @@ struct CardInputs<'a> {
 fn build_scorecard(i: &CardInputs) -> Value {
     let ranks: Vec<(u32, Option<usize>)> = i.probes.iter().map(|p| (p.id, p.hit_rank)).collect();
     let (rank1, rank1_ids, mrr5) = summarize(&ranks);
+    let session_ranks: Vec<(u32, Option<usize>)> = i
+        .probes
+        .iter()
+        .filter(|p| p.session_scored)
+        .map(|p| (p.id, p.session_hit_rank))
+        .collect();
+    let (session_rank1, session_rank1_ids, session_mrr5) = summarize(&session_ranks);
     let per_probe: Vec<Value> = i
         .probes
         .iter()
@@ -257,6 +330,7 @@ fn build_scorecard(i: &CardInputs) -> Value {
             json!({
                 "id": p.id,
                 "hit_rank": p.hit_rank,
+                "session_hit_rank": p.session_hit_rank,
                 "rank1_score": p.rank1_score,
                 "wall_ms": round3(p.wall_ms),
             })
@@ -299,6 +373,10 @@ fn build_scorecard(i: &CardInputs) -> Value {
             "rank1": rank1,
             "rank1_ids": rank1_ids,
             "mrr5": mrr5,
+            "session_n": session_ranks.len(),
+            "session_rank1": session_rank1,
+            "session_rank1_ids": session_rank1_ids,
+            "session_mrr5": session_mrr5,
             "per_probe": per_probe,
         },
         "audit": audit,
@@ -416,6 +494,7 @@ fn dump_line(
             "kind": kind,
             "wall_ms": round3(wall_ms),
             "response": response,
+            "blocks": dump_blocks(response),
         });
         line[key.0] = json!(key.1);
         if let Some(e) = error {
@@ -507,6 +586,8 @@ pub async fn run_probe(cfg: ProbeConfig) -> Result<Value> {
         probe_rows.push(ProbeRow {
             id: p.id,
             hit_rank: judge(&text, &p.must, &p.must_not, limit),
+            session_scored: !p.expect_sessions.is_empty(),
+            session_hit_rank: session_hit_rank(&text, &p.expect_sessions, limit),
             rank1_score: rank1_score(&text),
             wall_ms: ms,
         });
@@ -652,17 +733,50 @@ mod tests {
     }
 
     #[test]
+    fn probe_session_hit_rank_reads_session_attr() {
+        let xml = r#"<search><r rank="1" session="s-a"><cid>c-a</cid></r><r rank="2" session="s-b" eid="ep:s-b:3"><cid>s-b</cid></r><r rank="3"><cid>s-c</cid></r></search>"#;
+        let want = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(session_hit_rank(xml, &want(&["s-b"]), 5), Some(2));
+        assert_eq!(session_hit_rank(xml, &want(&["s-b"]), 1), None);
+        // The cid stands in for a block with no session attribute.
+        assert_eq!(session_hit_rank(xml, &want(&["s-c"]), 5), Some(3));
+        // The cid of a block that does carry a session attribute does not count.
+        assert_eq!(session_hit_rank(xml, &want(&["c-a"]), 5), None);
+        assert_eq!(session_hit_rank(xml, &[], 5), None);
+        let blocks = dump_blocks(xml);
+        assert_eq!(blocks[1]["eid"], "ep:s-b:3");
+        assert_eq!(blocks[1]["session"], "s-b");
+        assert_eq!(blocks[0]["cid"], "c-a");
+        assert!(blocks[2]["eid"].is_null());
+    }
+
+    #[test]
+    fn probes_without_expect_sessions_still_load() {
+        let (_, probes) = load_probes(DEFAULT_PROBES).unwrap();
+        assert_eq!(probes.len(), 12);
+        assert!(probes.iter().all(|p| p.expect_sessions.is_empty()));
+        let with = r#"{"schema":"PLACEHOLDER","limit":5,"probes":[{"id":1,"query":"q","must":["x"],"expect_sessions":["s1"]}]}"#
+            .replace("PLACEHOLDER", PROBES_SCHEMA);
+        let (_, loaded) = load_probes(&with).unwrap();
+        assert_eq!(loaded[0].expect_sessions, vec!["s1".to_string()]);
+    }
+
+    #[test]
     fn scorecard_has_every_schema_key() {
         let probes = [
             ProbeRow {
                 id: 1,
                 hit_rank: Some(1),
+                session_scored: true,
+                session_hit_rank: Some(2),
                 rank1_score: Some(0.7),
                 wall_ms: 10.0,
             },
             ProbeRow {
                 id: 2,
                 hit_rank: None,
+                session_scored: false,
+                session_hit_rank: None,
                 rank1_score: None,
                 wall_ms: 20.0,
             },
@@ -711,7 +825,16 @@ mod tests {
         for key in ["path", "chunk_count"] {
             assert!(card["db"].get(key).is_some(), "db.{key}");
         }
-        for key in ["n", "rank1", "rank1_ids", "mrr5", "per_probe"] {
+        for key in [
+            "n",
+            "rank1",
+            "rank1_ids",
+            "mrr5",
+            "session_rank1",
+            "session_rank1_ids",
+            "session_mrr5",
+            "per_probe",
+        ] {
             assert!(card["probes"].get(key).is_some(), "probes.{key}");
         }
         for key in ["n", "empty", "p50_ms", "p95_ms", "top1_fp"] {

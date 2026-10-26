@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod dream;
 pub mod embeddings;
 pub mod engine;
+pub mod episodes;
 pub mod eval;
 pub mod extraction;
 pub mod format;

@@ -224,6 +224,11 @@ enum Commands {
         #[command(subcommand)]
         action: EmbedAction,
     },
+    /// S6 episode tier: build from mirrored transcripts, export for embedding, probe session truth.
+    Episodes {
+        #[command(subcommand)]
+        action: EpisodesAction,
+    },
     /// USearch chunk-vector generation tools (S5): export, truth, build, activate,
     /// recall, load-bench, serve-rss. Never touches the serving path.
     Vindex {
@@ -691,6 +696,36 @@ enum SymbolAction {
         /// `--file` still names the path and so the language
         #[arg(long)]
         stdin: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EpisodesAction {
+    /// Parse mirrored transcripts into episodes and session cards (no model).
+    Build {
+        /// Mirror transcripts root (`<rel>.jsonl.zst` or plain `.jsonl`).
+        #[arg(long)]
+        mirror_root: PathBuf,
+        /// Only files and episodes newer than this many days.
+        #[arg(long)]
+        since_days: Option<i64>,
+        /// Also write the stats JSON here.
+        #[arg(long)]
+        stats_out: Option<PathBuf>,
+    },
+    /// Write episodes as `embed sample` rows.
+    Export {
+        #[arg(long)]
+        since_days: Option<i64>,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Add expect_sessions to a probe file from the chunks table.
+    Truth {
+        #[arg(long)]
+        probes: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -1587,6 +1622,28 @@ async fn run(
 
     if let Some(Commands::Vindex { ref action }) = args.command {
         return csr_engine::index_gen::cli::run(&args.db_path, action);
+    }
+
+    if let Some(Commands::Episodes { ref action }) = args.command {
+        use csr_engine::episodes as ep;
+        let line = match action {
+            EpisodesAction::Build {
+                mirror_root,
+                since_days,
+                stats_out,
+            } => ep::cli_build(
+                &args.db_path,
+                mirror_root,
+                *since_days,
+                stats_out.as_deref(),
+            )?,
+            EpisodesAction::Export { since_days, out } => {
+                ep::cli_export(&args.db_path, *since_days, out)?
+            }
+            EpisodesAction::Truth { probes, out } => ep::cli_truth(&args.db_path, probes, out)?,
+        };
+        println!("{line}");
+        return Ok(());
     }
 
     if let Some(Commands::Embed { ref action }) = args.command {

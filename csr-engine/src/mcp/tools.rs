@@ -1346,7 +1346,7 @@ async fn reflect_on_past_with_vec_in_scope_mode(
         record_retrievals,
     )
     .await?;
-    Ok(format::format_search_results_with_ce(
+    let xml = format::format_search_results_with_ce(
         &page.enriched,
         query,
         &scope.scope_label,
@@ -1354,7 +1354,13 @@ async fn reflect_on_past_with_vec_in_scope_mode(
         embed_ms,
         &page.display_rank_scores,
         page.ce.as_ref(),
-    ))
+    );
+    // Session attributes appear only while the episode channel runs; with it
+    // off the page is the chunk-only page, byte for byte.
+    if search_mode == SearchMode::Hybrid && crate::search::episodes::channel_active(storage) {
+        return Ok(annotate_sessions(xml, &page.enriched));
+    }
+    Ok(xml)
 }
 
 /// The final result page of the production recall pipeline, before it is
@@ -2032,6 +2038,113 @@ fn warn_ce_unavailable(reason: &str) {
     }
 }
 
+/// A result row for an episode reached by the episode channel. It stands for
+/// its session only when the session has no chunk of its own in the pool.
+fn episode_row(
+    hit: &crate::search::episodes::EpisodeHit,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> EnrichedResult {
+    EnrichedResult {
+        score: crate::search::hybrid::keyword_only_score(&hit.timestamp, now),
+        chunk: crate::import::ConversationChunk {
+            id: hit.id.clone(),
+            conversation_id: hit.session.clone(),
+            project_name: hit.project.clone(),
+            timestamp: hit.timestamp.clone(),
+            content: format!("[keyword] {}", crate::search::episodes::excerpt(&hit.text)),
+            message_count: 1,
+            summary: Some(format!("{}{}", crate::search::episodes::EID_MARK, hit.id)),
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: hit.session.starts_with("agent-"),
+        },
+        resolution: None,
+        trust: crate::provenance::TrustTier::Unknown,
+        validity_demoted: false,
+    }
+}
+
+/// Settle the sessions whose collapsed representative is an episode. When the
+/// session has a chunk in the pool, that chunk (its best by chunk fusion) keeps
+/// its id and carries the episode as its excerpt; otherwise the episode row
+/// stands alone. Episode rows left without a session are dropped. Returns the
+/// episode id to row id map, which the cross-encoder pool needs to score the
+/// excerpt a session actually shows.
+fn settle_episode_excerpts(
+    enriched: &mut Vec<EnrichedResult>,
+    collapsed: &mut [String],
+    session_keys: &HashMap<String, String>,
+    chunk_fused: &[String],
+    hits: &[crate::search::episodes::EpisodeHit],
+) -> HashMap<String, String> {
+    let by_id: HashMap<&str, &crate::search::episodes::EpisodeHit> =
+        hits.iter().map(|hit| (hit.id.as_str(), hit)).collect();
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for slot in collapsed.iter_mut() {
+        let Some(hit) = by_id.get(slot.as_str()) else {
+            continue;
+        };
+        let session = session_keys.get(slot.as_str());
+        let surrogate = chunk_fused
+            .iter()
+            .find(|id| {
+                !by_id.contains_key(id.as_str())
+                    && session_keys.get(id.as_str()) == session
+                    && enriched.iter().any(|e| e.chunk.id == **id)
+            })
+            .cloned();
+        let Some(surrogate) = surrogate else {
+            continue;
+        };
+        if let Some(row) = enriched.iter_mut().find(|e| e.chunk.id == surrogate) {
+            let keyword = row.chunk.content.starts_with("[keyword] ");
+            row.chunk.content = format!(
+                "{}{}",
+                if keyword { "[keyword] " } else { "" },
+                crate::search::episodes::excerpt(&hit.text)
+            );
+            row.chunk.summary = Some(format!("{}{}", crate::search::episodes::EID_MARK, hit.id));
+        }
+        remap.insert(hit.id.clone(), surrogate.clone());
+        *slot = surrogate;
+    }
+    let kept: HashSet<&str> = collapsed.iter().map(String::as_str).collect();
+    enriched
+        .retain(|e| !by_id.contains_key(e.chunk.id.as_str()) || kept.contains(e.chunk.id.as_str()));
+    remap
+}
+
+fn xml_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Give each `<r rank="N">` block its `session` (the conversation id) and, when
+/// its excerpt is an episode, its `eid`. Rows are in page order.
+fn annotate_sessions(mut xml: String, rows: &[EnrichedResult]) -> String {
+    for (index, row) in rows.iter().enumerate() {
+        let eid = row
+            .chunk
+            .summary
+            .as_deref()
+            .and_then(|summary| summary.strip_prefix(crate::search::episodes::EID_MARK))
+            .map(|id| format!(" eid=\"{}\"", xml_attr(id)))
+            .unwrap_or_default();
+        let from = format!("    <r rank=\"{}\">\n", index + 1);
+        let to = format!(
+            "    <r rank=\"{}\" session=\"{}\"{}>\n",
+            index + 1,
+            xml_attr(&row.chunk.conversation_id),
+            eid
+        );
+        xml = xml.replacen(&from, &to, 1);
+    }
+    xml
+}
+
 /// The cross-encoder stage of hybrid recall: score the pool (first
 /// [`CE_POOL`] fused chunks plus the S1 top sessions' representatives) and
 /// return the new session order with its score summary. Fails open: with no
@@ -2042,7 +2155,7 @@ fn ce_rerank_stage(
     fused: Vec<String>,
     enriched: &[EnrichedResult],
     session_keys: &HashMap<String, String>,
-    answer_class: &HashMap<&str, u8>,
+    answer_class: &HashMap<String, u8>,
 ) -> (Vec<String>, Option<format::CeSummary>) {
     if collapsed.is_empty() {
         return (collapsed, None);
@@ -2093,7 +2206,7 @@ fn ce_rerank_stage(
             (
                 id.clone(),
                 session_keys.get(id).cloned().unwrap_or_else(|| id.clone()),
-                answer_class.get(id.as_str()).copied().unwrap_or(0),
+                answer_class.get(id).copied().unwrap_or(0),
                 score,
             )
         })
@@ -2761,24 +2874,49 @@ async fn reflect_gather_pass(
     let mut ce_summary: Option<format::CeSummary> = None;
     let final_order = match search_mode {
         SearchMode::Hybrid => {
+            // Episode channel: bm25 over `episodes_fts`, one more lexical
+            // list fused at session level with the chunk channels. Off (None)
+            // under CSR_NO_EPISODES=1 or an empty episodes table, where this
+            // arm is the chunk-only path.
+            let episode_hits = {
+                let family: Option<Vec<&str>> = scope
+                    .effective_project
+                    .is_some()
+                    .then(|| scope.family_projects.iter().map(String::as_str).collect());
+                crate::search::episodes::gather(storage, query, family.as_deref())
+            };
+            let mut episode_order: Vec<String> = Vec::new();
+            let mut episode_class: HashMap<String, u8> = HashMap::new();
+            if let Some(hits) = episode_hits.as_ref() {
+                for hit in hits {
+                    episode_order.push(hit.id.clone());
+                    episode_class.insert(hit.id.clone(), hit.echo_class);
+                    enriched.push(episode_row(hit, &now));
+                }
+            }
+            let episode_weight = if episode_hits.is_some() { 1.0 } else { 0.0 };
             let session_keys: HashMap<String, String> = enriched
                 .iter()
                 .map(|e| (e.chunk.id.clone(), session_key_of(storage, &e.chunk)))
                 .collect();
-            let answer_class: HashMap<&str, u8> = enriched
+            let answer_class: HashMap<String, u8> = enriched
                 .iter()
                 .map(|e| {
                     (
-                        e.chunk.id.as_str(),
-                        non_answer_class(&e.chunk.content, query),
+                        e.chunk.id.clone(),
+                        episode_class
+                            .get(&e.chunk.id)
+                            .copied()
+                            .unwrap_or_else(|| non_answer_class(&e.chunk.content, query)),
                     )
                 })
                 .collect();
-            let collapsed = collapse_to_sessions_by(
+            let mut collapsed = collapse_to_sessions_by(
                 &[
                     (&semantic_order, 1.0),
                     (&fts_order, 1.0),
                     (&postings_order, postings_weight),
+                    (&episode_order, episode_weight),
                 ],
                 |id| {
                     session_keys
@@ -2789,11 +2927,11 @@ async fn reflect_gather_pass(
                 |id| answer_class.get(id).copied().unwrap_or(0),
                 RRF_K,
             );
-            // Cross-encoder stage: re-score the top fused units, order the
-            // pooled sessions by their best score. Under the legacy policy
-            // the S1 order stands untouched.
-            let collapsed = if policy == RetrievalPolicy::CrossEncoder {
-                let fused = crate::search::hybrid::fuse_rrf_weighted(
+            // A session whose best unit is an episode shows that episode as
+            // its excerpt, under the session's best chunk when it has one.
+            let mut episode_remap: HashMap<String, String> = HashMap::new();
+            if let Some(hits) = episode_hits.as_ref() {
+                let chunk_fused = crate::search::hybrid::fuse_rrf_weighted(
                     &[
                         (&semantic_order, 1.0),
                         (&fts_order, 1.0),
@@ -2801,6 +2939,30 @@ async fn reflect_gather_pass(
                     ],
                     RRF_K,
                 );
+                episode_remap = settle_episode_excerpts(
+                    &mut enriched,
+                    &mut collapsed,
+                    &session_keys,
+                    &chunk_fused,
+                    hits,
+                );
+            }
+            // Cross-encoder stage: re-score the top fused units, order the
+            // pooled sessions by their best score. Under the legacy policy
+            // the S1 order stands untouched.
+            let collapsed = if policy == RetrievalPolicy::CrossEncoder {
+                let fused: Vec<String> = crate::search::hybrid::fuse_rrf_weighted(
+                    &[
+                        (&semantic_order, 1.0),
+                        (&fts_order, 1.0),
+                        (&postings_order, postings_weight),
+                        (&episode_order, episode_weight),
+                    ],
+                    RRF_K,
+                )
+                .into_iter()
+                .map(|id| episode_remap.get(&id).cloned().unwrap_or(id))
+                .collect();
                 let (reordered, summary) = ce_rerank_stage(
                     query,
                     collapsed,
@@ -8946,6 +9108,139 @@ mod tests {
         assert_eq!(output.matches("<cid>sess-b</cid>").count(), 1, "{output}");
         assert!(output.contains("<id>sess-a-1</id>"), "{output}");
         assert!(!output.contains("<id>sess-a-2</id>"), "{output}");
+    }
+
+    /// Recall over a two-session fixture, with the perf block (wall-clock
+    /// times) removed so two runs compare byte for byte.
+    async fn episode_fixture_page(
+        storage: &Arc<Storage>,
+        search: &Arc<RwLock<SearchEngine>>,
+    ) -> String {
+        let page = reflect_on_past_with_vec_mode(
+            storage,
+            search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "sessionword",
+            10,
+            0.1,
+            Some("all"),
+            0,
+            true,
+            ConsumptionMode::Full,
+            false,
+            "other",
+            SearchMode::Hybrid,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        match (page.find("<perf>"), page.find("</perf>")) {
+            (Some(start), Some(end)) => format!("{}{}", &page[..start], &page[end..]),
+            _ => page,
+        }
+    }
+
+    fn put_episode(storage: &Storage, conversation: &str, ordinal: i64, text: &str) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO episodes (id, conversation_id, project_name, ordinal,
+                         first_uuid, last_uuid, timestamp, text, token_est, echo_class)
+                     VALUES (?1, ?2, 'test', ?3, 'f', 'l', ?4, ?5, 10, 0)",
+                    rusqlite::params![
+                        format!("ep:{conversation}:{ordinal}"),
+                        conversation,
+                        ordinal,
+                        chrono::Utc::now().to_rfc3339(),
+                        text
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn episode_fixture() -> (Arc<Storage>, Arc<RwLock<SearchEngine>>) {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut engine = SearchEngine::new(8);
+        let rows = [
+            (
+                "sess-a-1",
+                "sess-a",
+                "sessionword first note",
+                vec![1.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "sess-b-1",
+                "sess-b",
+                "sessionword third note",
+                vec![0.8, 0.2, 0.0, 0.0],
+            ),
+        ];
+        for (id, conversation, content, vector) in rows {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation.into(),
+                project_name: "test".into(),
+                timestamp: now.clone(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            engine.insert_chunk(chunk.id.clone(), vector);
+        }
+        (storage, Arc::new(RwLock::new(engine)))
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn kill_switch_matches_s5_output() {
+        let _guard = crate::search::episodes::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CSR_NO_EPISODES");
+        let (storage, search) = episode_fixture();
+        // Pre-change path: no episodes at all.
+        let before = episode_fixture_page(&storage, &search).await;
+        assert!(!before.contains("session=\""), "{before}");
+
+        put_episode(&storage, "sess-c", 0, "sessionword episode only detail");
+        put_episode(&storage, "sess-a", 0, "sessionword first note");
+
+        std::env::set_var("CSR_NO_EPISODES", "1");
+        let killed = episode_fixture_page(&storage, &search).await;
+        std::env::remove_var("CSR_NO_EPISODES");
+        assert_eq!(killed, before, "kill switch must equal the S5 path");
+
+        // Channel on: the episode-only session appears with its eid, and a
+        // session with chunks keeps its best chunk id.
+        let on = episode_fixture_page(&storage, &search).await;
+        assert!(
+            on.contains("session=\"sess-c\" eid=\"ep:sess-c:0\""),
+            "{on}"
+        );
+        assert!(on.contains("session=\"sess-a\""), "{on}");
+        assert!(on.contains("<id>sess-a-1</id>"), "{on}");
+        assert_eq!(on.matches("session=\"sess-a\"").count(), 1, "{on}");
+
+        // An empty episodes table is the S5 path as well.
+        storage
+            .with_connection(|conn| {
+                conn.execute("DELETE FROM episodes", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let emptied = episode_fixture_page(&storage, &search).await;
+        assert_eq!(
+            emptied, before,
+            "an empty episodes table must equal the S5 path"
+        );
     }
 
     #[tokio::test]
