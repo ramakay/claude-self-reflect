@@ -1,0 +1,398 @@
+{
+ "schema": "after-s2/1",
+ "laptop": true,
+ "a_side_installed_10_1_0": {
+  "rank1": 6,
+  "rank1_ids": [
+   2,
+   3,
+   5,
+   6,
+   7,
+   10
+  ],
+  "mrr5": 0.620833,
+  "p50_ms": 556.136,
+  "p95_ms": 1790.316,
+  "latency_n": 17,
+  "peak_rss_bytes": 771604480,
+  "cold_start_ms": 1589.283,
+  "hit_ranks": {
+   "1": null,
+   "2": 1,
+   "3": 1,
+   "4": 2,
+   "5": 1,
+   "6": 1,
+   "7": 1,
+   "8": 2,
+   "9": 5,
+   "10": 1,
+   "11": null,
+   "12": 4
+  },
+  "binary_sha256_16": "7b53f200308cd3de",
+  "git_sha": null,
+  "git_dirty": null
+ },
+ "a_side_note": "S3 probe_ab run, latency n=17 (5-query audit set); not latency-comparable to n=322",
+ "after_s1_run1": {
+  "rank1": 7,
+  "rank1_ids": [
+   2,
+   3,
+   4,
+   6,
+   7,
+   8,
+   9
+  ],
+  "mrr5": 0.6875,
+  "p50_ms": 368.137,
+  "p95_ms": 764.125,
+  "latency_n": 322,
+  "peak_rss_bytes": 4100603904,
+  "cold_start_ms": 5051.925,
+  "hit_ranks": {
+   "1": null,
+   "2": 1,
+   "3": 1,
+   "4": 1,
+   "5": 2,
+   "6": 1,
+   "7": 1,
+   "8": 1,
+   "9": 1,
+   "10": 2,
+   "11": null,
+   "12": 4
+  },
+  "binary_sha256_16": "bd559081d92ae954",
+  "git_sha": "9d3e8432e28b7c0ab1e53fa73983c9bbf49f64d5",
+  "git_dirty": "false"
+ },
+ "after_s2_run1": {
+  "rank1": 8,
+  "rank1_ids": [
+   2,
+   3,
+   4,
+   6,
+   7,
+   9,
+   10,
+   12
+  ],
+  "mrr5": 0.736111,
+  "p50_ms": 684.168,
+  "p95_ms": 1068.374,
+  "latency_n": 322,
+  "peak_rss_bytes": 5428494336,
+  "cold_start_ms": 5402.832,
+  "hit_ranks": {
+   "1": null,
+   "2": 1,
+   "3": 1,
+   "4": 1,
+   "5": 3,
+   "6": 1,
+   "7": 1,
+   "8": 2,
+   "9": 1,
+   "10": 1,
+   "11": null,
+   "12": 1
+  },
+  "binary_sha256_16": "e24003009893cc33",
+  "git_sha": "19a96789124a7011a1a86b1ed554755263d95673",
+  "git_dirty": "false",
+  "cross_encoder": {
+   "calls": 304,
+   "loaded": true,
+   "pairs": 7296,
+   "policy": "cross_encoder",
+   "total_ms": 105918
+  },
+  "rank1_raw": 8,
+  "rank1_raw_ids": [
+   2,
+   3,
+   4,
+   6,
+   7,
+   9,
+   10,
+   12
+  ],
+  "rank1_echo_filtered_chunk": 7,
+  "rank1_echo_filtered_chunk_ids": [
+   2,
+   3,
+   4,
+   6,
+   7,
+   10,
+   12
+  ],
+  "echo_unresolved_hit_ids": [
+   9
+  ]
+ },
+ "after_s2_run2": {
+  "rank1": 8,
+  "rank1_ids": [
+   2,
+   3,
+   4,
+   6,
+   7,
+   9,
+   10,
+   12
+  ],
+  "mrr5": 0.736111,
+  "p50_ms": 684.406,
+  "p95_ms": 1067.947,
+  "latency_n": 322,
+  "peak_rss_bytes": 5479235584,
+  "cold_start_ms": 5493.548,
+  "hit_ranks": {
+   "1": null,
+   "2": 1,
+   "3": 1,
+   "4": 1,
+   "5": 3,
+   "6": 1,
+   "7": 1,
+   "8": 2,
+   "9": 1,
+   "10": 1,
+   "11": null,
+   "12": 1
+  },
+  "binary_sha256_16": "e24003009893cc33",
+  "git_sha": "19a96789124a7011a1a86b1ed554755263d95673",
+  "git_dirty": "false",
+  "cross_encoder": {
+   "calls": 304,
+   "loaded": true,
+   "pairs": 7296,
+   "policy": "cross_encoder",
+   "total_ms": 104585
+  },
+  "rank1_raw": 8,
+  "rank1_raw_ids": [
+   2,
+   3,
+   4,
+   6,
+   7,
+   9,
+   10,
+   12
+  ],
+  "rank1_echo_filtered_chunk": 7,
+  "rank1_echo_filtered_chunk_ids": [
+   2,
+   3,
+   4,
+   6,
+   7,
+   10,
+   12
+  ],
+  "echo_unresolved_hit_ids": [
+   9
+  ]
+ },
+ "legacy_control": {
+  "rank1": 7,
+  "rank1_ids": [
+   2,
+   3,
+   4,
+   6,
+   7,
+   8,
+   9
+  ],
+  "mrr5": 0.6875,
+  "p50_ms": 369.149,
+  "p95_ms": 760.672,
+  "latency_n": 322,
+  "peak_rss_bytes": 4108615680,
+  "cold_start_ms": 5098.551,
+  "hit_ranks": {
+   "1": null,
+   "2": 1,
+   "3": 1,
+   "4": 1,
+   "5": 2,
+   "6": 1,
+   "7": 1,
+   "8": 1,
+   "9": 1,
+   "10": 2,
+   "11": null,
+   "12": 4
+  },
+  "binary_sha256_16": "e24003009893cc33",
+  "git_sha": "19a96789124a7011a1a86b1ed554755263d95673",
+  "git_dirty": "false",
+  "cross_encoder": {
+   "calls": 0,
+   "loaded": false,
+   "pairs": 0,
+   "policy": "legacy",
+   "total_ms": 0
+  }
+ },
+ "echo_filter": {
+  "method": "chunk-level, s2/echo_audit_chunk.py, rank-1 chunk located by cid + first 60 chars of preview ([keyword] display prefix stripped); no unique match = unresolved = not passing",
+  "A": {
+   "raw": 6,
+   "filtered": 6,
+   "filtered_ids": [
+    2,
+    3,
+    5,
+    6,
+    7,
+    10
+   ]
+  },
+  "after_s1": {
+   "raw": 7,
+   "filtered": 7,
+   "filtered_ids": [
+    2,
+    3,
+    4,
+    6,
+    7,
+    8,
+    9
+   ]
+  },
+  "after_s2": {
+   "raw": 8,
+   "filtered": 7,
+   "filtered_ids": [
+    2,
+    3,
+    4,
+    6,
+    7,
+    10,
+    12
+   ],
+   "unresolved": {
+    "9": "22 chunks in cid match the 60-char needle (codex 'Script completed' boilerplate); shown <id> c69137a3 is one of them and carries no marker; by shown id filtered would be 8"
+   }
+  }
+ },
+ "named_probes": {
+  "5": {
+   "a": 1,
+   "s1": 2,
+   "s2": 3
+  },
+  "10": {
+   "a": 1,
+   "s1": 2,
+   "s2": 1
+  },
+  "8": {
+   "a": 2,
+   "s1": 1,
+   "s2": 2
+  }
+ },
+ "per_probe_rank1": {
+  "a": {
+   "1": null,
+   "2": 1,
+   "3": 1,
+   "4": 2,
+   "5": 1,
+   "6": 1,
+   "7": 1,
+   "8": 2,
+   "9": 5,
+   "10": 1,
+   "11": null,
+   "12": 4
+  },
+  "s1": {
+   "1": null,
+   "2": 1,
+   "3": 1,
+   "4": 1,
+   "5": 2,
+   "6": 1,
+   "7": 1,
+   "8": 1,
+   "9": 1,
+   "10": 2,
+   "11": null,
+   "12": 4
+  },
+  "s2": {
+   "1": null,
+   "2": 1,
+   "3": 1,
+   "4": 1,
+   "5": 3,
+   "6": 1,
+   "7": 1,
+   "8": 2,
+   "9": 1,
+   "10": 1,
+   "11": null,
+   "12": 1
+  }
+ },
+ "compare": {
+  "s1r1-s2r1": {
+   "rank1_a": 7,
+   "rank1_b": 8,
+   "rank1_delta": 1,
+   "probe_flips": 3,
+   "flipped_ids": [
+    8,
+    10,
+    12
+   ],
+   "audit_top1_agreement": 0.087097
+  },
+  "s2r1-s2r2": {
+   "rank1_a": 8,
+   "rank1_b": 8,
+   "rank1_delta": 0,
+   "probe_flips": 0,
+   "flipped_ids": [],
+   "audit_top1_agreement": 1.0
+  },
+  "a-s2r1": {
+   "rank1_a": 6,
+   "rank1_b": 8,
+   "rank1_delta": 2,
+   "probe_flips": 4,
+   "flipped_ids": [
+    4,
+    5,
+    9,
+    12
+   ],
+   "audit_top1_agreement": 0.0
+  },
+  "s1r1-legacy": {
+   "rank1_a": 7,
+   "rank1_b": 7,
+   "rank1_delta": 0,
+   "probe_flips": 0,
+   "flipped_ids": [],
+   "audit_top1_agreement": 0.958065
+  }
+ }
+}
