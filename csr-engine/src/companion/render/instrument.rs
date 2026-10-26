@@ -8,7 +8,7 @@ use super::{
     theme::{self, Theme, Tokens, ICON_GAP, S1, S2, S3, S4, S5},
 };
 use crate::companion::{
-    agents, array, dreams, masthead, num, pyfmt::short, string, value::InstrumentCost,
+    agents, array, dreams, masthead, num, pyfmt::short, string, truthy, value::InstrumentCost,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -58,6 +58,9 @@ pub struct RiverRow {
     /// The glyph the plain-text pane leads the row with. The picture draws the kind's icon instead.
     pub lead: &'static str,
     pub line: String,
+    /// The mood word. Fixed at build time: a thread's word depends on its state, which the kind
+    /// and lead do not carry.
+    pub mood: &'static str,
 }
 impl RiverRow {
     /// The picture's text: the kind's icon replaces the lead glyph, except a shift at risk.
@@ -74,7 +77,7 @@ impl RiverRow {
     }
     /// The row's past-tense mood word, from a fixed table.
     pub fn mood(&self) -> &'static str {
-        mood(self.kind, self.lead)
+        self.mood
     }
 }
 fn river_row(at: f64, kind: RiverKind, lead: &'static str, line: String) -> RiverRow {
@@ -84,6 +87,18 @@ fn river_row(at: f64, kind: RiverKind, lead: &'static str, line: String) -> Rive
         kind,
         lead,
         line,
+        mood: mood(kind, lead),
+    }
+}
+/// A thread row's mood. "asked" only when the thread waits on the user; open or lost threads are
+/// "left open"; everything else (faded, carried, answered, handed) is "noted".
+pub fn thread_mood(thread: &Value) -> &'static str {
+    if truthy(&thread["waiting"]) {
+        "asked"
+    } else if matches!(string(&thread["state"]), "open" | "lost") {
+        "left open"
+    } else {
+        "noted"
     }
 }
 /// The one word a timeline row says before its line. Fixed table, no model.
@@ -410,18 +425,27 @@ impl Composition {
                 ));
             }
         }
-        river.extend(array(&data["threads"]).iter().map(|thread| {
-            river_row(
-                num(&thread["last_seen"]),
-                RiverKind::Prompt,
-                "↳ ",
-                format!(
-                    "{} · {}",
-                    string(&thread["text"]),
-                    crate::companion::threads::thread_group(thread)
-                ),
-            )
-        }));
+        river.extend(
+            array(&data["threads"])
+                .iter()
+                .filter(|thread| {
+                    !crate::companion::lost::is_summary_footer(string(&thread["text"]))
+                })
+                .map(|thread| {
+                    let mut row = river_row(
+                        num(&thread["last_seen"]),
+                        RiverKind::Prompt,
+                        "↳ ",
+                        format!(
+                            "{} · {}",
+                            string(&thread["text"]),
+                            crate::companion::threads::thread_group(thread)
+                        ),
+                    );
+                    row.mood = thread_mood(thread);
+                    row
+                }),
+        );
         river.sort_by(|a, b| b.at.total_cmp(&a.at));
         let mut stamps: Vec<_> = array(&s["main"])
             .iter()
@@ -4670,6 +4694,49 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_row_says_asked_only_when_it_waits_on_the_user() {
+        let now = 1_800_000_000.;
+        let (mut data, s) = timeline_data();
+        let thread = |text: &str, state: &str, waiting: bool| json!({"text": text, "last_seen": now - 9000., "state": state, "waiting": waiting});
+        let mut footer = thread("Compaction footer", "open", false);
+        footer["text"] = json!(
+            "If you need specific details from before compaction (like exact code \
+             snippets), read the full transcript at: /x/y.jsonl"
+        );
+        data["threads"] = json!([
+            thread("Waits on the user", "lost", true),
+            thread("Open and quiet", "open", false),
+            thread("Lost and quiet", "lost", false),
+            thread("Faded away", "faded", false),
+            thread("Carried over", "carried", false),
+            footer,
+        ]);
+        let c = Composition::build(&data, &s, now);
+        let moods: Vec<_> = c
+            .river
+            .iter()
+            .filter(|r| r.kind == RiverKind::Prompt)
+            .map(|r| {
+                (
+                    r.mood(),
+                    r.line.split(" · ").next().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            moods,
+            vec![
+                ("asked", "Waits on the user".to_owned()),
+                ("left open", "Open and quiet".to_owned()),
+                ("left open", "Lost and quiet".to_owned()),
+                ("noted", "Faded away".to_owned()),
+                ("noted", "Carried over".to_owned()),
+            ],
+            "the compaction footer row is dropped, the rest keep their order"
+        );
+    }
+
+    #[test]
     fn the_text_pane_reads_monologue_verb_and_time() {
         let now = 1_800_000_000.;
         let (data, mut s) = timeline_data();
@@ -4692,7 +4759,10 @@ mod tests {
         );
         assert!(all.contains("10 min ago · ☾"), "{all}");
         assert!(all.contains("♻ made room · Compacted"), "{all}");
-        assert!(all.contains("↳ asked · Decide the release name"), "{all}");
+        assert!(
+            all.contains("↳ left open · Decide the release name"),
+            "{all}"
+        );
         assert!(
             all.contains("20 min ago · ~ tinkered · summarizer.rs"),
             "{all}"
