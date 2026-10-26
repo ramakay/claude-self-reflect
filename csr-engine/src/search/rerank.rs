@@ -242,6 +242,22 @@ pub fn rerank_with(mut cands: Vec<RankCandidate>, policy: RankPolicy) -> Vec<Ran
     cands
 }
 
+/// Re-rank candidates by raw score alone, descending: no `W_USER`,
+/// `W_SUPERSEDES` or `W_PRIMACY` term and no penalty. This is the semantic
+/// order of the cross-encoder retrieval policy, where the cosine (after
+/// validity and project scope) is the only signal the pool is cut by and the
+/// cross-encoder does the judging. Stable: ties keep input order. The
+/// [`rerank`] path and its constants stay in place for
+/// `CSR_RETRIEVAL_LEGACY=1`.
+pub fn rerank_plain(mut cands: Vec<RankCandidate>) -> Vec<RankCandidate> {
+    cands.sort_by(|a, b| {
+        b.cosine
+            .partial_cmp(&a.cosine)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    cands
+}
+
 /// Deterministic recall scores, including the list-level primacy boost, aligned
 /// with the input candidate order. The trained residual adapter uses these as
 /// its immutable baseline.
@@ -767,5 +783,51 @@ mod tests {
             }),
         };
         assert!(adjusted_score(&u) > u.cosine); // boosted, not penalized
+    }
+
+    #[test]
+    fn legacy_rerank_still_applies_the_user_boost() {
+        // The legacy policy keeps W_USER: the user decision at 0.70 beats a
+        // plain assistant chunk at 0.85.
+        let assistant = RankCandidate {
+            timestamp: None,
+            min_trust: TrustTier::Unknown,
+            id: "a".into(),
+            cosine: 0.85,
+            content: "discussion of continuity design tradeoffs".into(),
+            provenance: None,
+        };
+        let ranked = rerank(vec![assistant, user_decision("d", 0.70)]);
+        assert_eq!(ranked[0].id, "d");
+    }
+
+    #[test]
+    fn rerank_plain_orders_by_raw_score_and_does_not_lift_user_authored() {
+        let assistant = RankCandidate {
+            timestamp: None,
+            min_trust: TrustTier::Unknown,
+            id: "a".into(),
+            cosine: 0.85,
+            content: "discussion of continuity design tradeoffs".into(),
+            provenance: None,
+        };
+        let ranked = rerank_plain(vec![
+            user_decision("d", 0.70),
+            assistant,
+            mechanic("m", 0.80),
+        ]);
+        let ids: Vec<&str> = ranked.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a", "m", "d"]);
+    }
+
+    #[test]
+    fn rerank_plain_is_stable_on_ties() {
+        let ranked = rerank_plain(vec![
+            user_decision("first", 0.5),
+            mechanic("second", 0.5),
+            poison("third", 0.5),
+        ]);
+        let ids: Vec<&str> = ranked.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["first", "second", "third"]);
     }
 }

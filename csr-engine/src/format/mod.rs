@@ -72,6 +72,77 @@ pub fn relevance_label(score: f32) -> &'static str {
     }
 }
 
+/// Gap (cross-encoder logits, top minus runner-up) a `high` label needs.
+///
+/// The four `CE_*` bands are S2 first-cut values, not yet calibrated on the
+/// fabricated-probe set. They are in raw cross-encoder logit units and read
+/// margins only, never an absolute score or a cosine.
+pub const CE_GAP_HIGH: f32 = 1.5;
+/// Spread (top minus median of the pooled session scores) a `high` label needs.
+/// S2 first-cut, not yet calibrated on the fabricated-probe set.
+pub const CE_SPREAD_HIGH: f32 = 3.0;
+/// Spread a `good` label needs. S2 first-cut, not yet calibrated on the
+/// fabricated-probe set.
+pub const CE_SPREAD_GOOD: f32 = 2.0;
+/// Spread a `partial` label needs; below it the label is `weak`. S2 first-cut,
+/// not yet calibrated on the fabricated-probe set.
+pub const CE_SPREAD_PARTIAL: f32 = 1.0;
+
+/// Cross-encoder score summary of one recall: the best pooled session score,
+/// the second best (when there is one) and the median, all in raw logits over
+/// the pooled sessions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CeSummary {
+    pub top: f32,
+    pub runner_up: Option<f32>,
+    pub median: f32,
+}
+
+impl CeSummary {
+    /// Summary of pooled session scores, or `None` for an empty set. Scores
+    /// that are not finite are ignored.
+    pub fn from_scores(scores: &[f32]) -> Option<Self> {
+        let mut sorted: Vec<f32> = scores.iter().copied().filter(|s| s.is_finite()).collect();
+        if sorted.is_empty() {
+            return None;
+        }
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let n = sorted.len();
+        let median = if n % 2 == 1 {
+            sorted[n / 2]
+        } else {
+            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+        };
+        Some(Self {
+            top: sorted[0],
+            runner_up: sorted.get(1).copied(),
+            median,
+        })
+    }
+
+    /// The relevance label this summary earns.
+    pub fn label(&self) -> &'static str {
+        ce_relevance_label(self.top, self.runner_up, self.median)
+    }
+}
+
+/// Band a cross-encoder result into the relevance vocabulary from margins
+/// only: `gap` is `top - runner_up` (0 when there is no runner-up) and
+/// `spread` is `top - median`. Absolute scores and cosines never enter.
+pub fn ce_relevance_label(top: f32, runner_up: Option<f32>, median: f32) -> &'static str {
+    let gap = runner_up.map_or(0.0, |second| top - second);
+    let spread = top - median;
+    if gap >= CE_GAP_HIGH && spread >= CE_SPREAD_HIGH {
+        "high"
+    } else if spread >= CE_SPREAD_GOOD {
+        "good"
+    } else if spread >= CE_SPREAD_PARTIAL {
+        "partial"
+    } else {
+        "weak"
+    }
+}
+
 /// Margin (top score minus a *comparable* runner-up score) above which a
 /// weak-band top result is treated as having clearly beaten the rest of the
 /// list, even though its absolute score is still weakly calibrated.
@@ -398,6 +469,30 @@ pub(crate) fn format_search_results_with_rank_scores(
     embed_ms: u64,
     display_rank_scores: &[DisplayRankScore],
 ) -> String {
+    format_search_results_with_ce(
+        results,
+        query,
+        project_scope,
+        search_ms,
+        embed_ms,
+        display_rank_scores,
+        None,
+    )
+}
+
+/// [`format_search_results_with_rank_scores`] plus the cross-encoder summary of
+/// the recall. With `ce` present the summary's `relevance` comes from the CE
+/// margins and gains `ce-top` / `ce-margin`; rows are never dropped by the
+/// label. With `ce` absent the output is the cosine-labelled form, unchanged.
+pub(crate) fn format_search_results_with_ce(
+    results: &[EnrichedResult],
+    query: &str,
+    project_scope: &str,
+    search_ms: u64,
+    embed_ms: u64,
+    display_rank_scores: &[DisplayRankScore],
+    ce: Option<&CeSummary>,
+) -> String {
     let mut out = String::new();
     let keyword_only = !results.is_empty()
         && results
@@ -420,7 +515,7 @@ pub(crate) fn format_search_results_with_rank_scores(
             .iter()
             .map(|result| result.score)
             .fold(f32::NEG_INFINITY, f32::max);
-        let relevance = relevance_label(top_score);
+        let relevance = ce.map_or_else(|| relevance_label(top_score), CeSummary::label);
         out.push_str(&format!(
             "🎯 RESULTS: {} matches ({} relevance, top score: {:.3})\n",
             results.len(),
@@ -452,7 +547,7 @@ pub(crate) fn format_search_results_with_rank_scores(
             .iter()
             .map(|result| result.score)
             .fold(f32::NEG_INFINITY, f32::max);
-        let relevance = relevance_label(top_score);
+        let relevance = ce.map_or_else(|| relevance_label(top_score), CeSummary::label);
 
         let preview = &results[0].chunk.content;
         let preview_short = if preview.chars().count() > 100 {
@@ -523,13 +618,21 @@ pub(crate) fn format_search_results_with_rank_scores(
             None => "n/a".to_string(),
         };
 
+        let ce_attrs = ce.map_or_else(String::new, |summary| {
+            let gap = summary.runner_up.map_or_else(
+                || "n/a".to_string(),
+                |second| format!("{:.2}", summary.top - second),
+            );
+            format!(" ce-top=\"{:.2}\" ce-margin=\"{}\"", summary.top, gap)
+        });
         out.push_str(&format!(
-            "  <summary count=\"{}\" relevance=\"{}\" top-score=\"{:.3}\" rank1-score=\"{:.3}\" margin=\"{}\">\n",
+            "  <summary count=\"{}\" relevance=\"{}\" top-score=\"{:.3}\" rank1-score=\"{:.3}\" margin=\"{}\"{}>\n",
             results.len(),
             relevance,
             top_score,
             rank1_score,
             margin_attr,
+            ce_attrs,
         ));
         out.push_str(&format!(
             "    <preview>{}</preview>\n",
@@ -553,7 +656,10 @@ pub(crate) fn format_search_results_with_rank_scores(
             rank1_synthetic,
             false,
         );
-        if let Some(warning) = &rank1_assessment.warning {
+        // The cosine caveat speaks about cosine bands; under a cross-encoder
+        // label it is only kept when the CE itself reads the match as weak.
+        let caveat_applies = ce.is_none_or(|summary| summary.label() == "weak");
+        if let (true, Some(warning)) = (caveat_applies, &rank1_assessment.warning) {
             out.push_str(&format!("    <caveat>{}</caveat>\n", warning));
         }
         out.push_str("  </summary>\n");
@@ -2636,5 +2742,102 @@ mod tests {
             newest_pos < oldest_pos,
             "caller order must be preserved, got: {xml}"
         );
+    }
+
+    #[test]
+    fn ce_relevance_label_bands() {
+        // high: gap >= 1.5 and spread >= 3.0
+        assert_eq!(ce_relevance_label(6.0, Some(3.0), 1.0), "high");
+        // gap too small for high, spread still clears good
+        assert_eq!(ce_relevance_label(6.0, Some(5.0), 1.0), "good");
+        // spread just under high with a big gap is good
+        assert_eq!(ce_relevance_label(3.9, Some(1.0), 1.0), "good");
+        // good at the spread edge
+        assert_eq!(ce_relevance_label(3.0, Some(2.9), 1.0), "good");
+        // partial between 1.0 and 2.0
+        assert_eq!(ce_relevance_label(2.5, Some(2.4), 1.0), "partial");
+        assert_eq!(ce_relevance_label(2.0, None, 1.0), "partial");
+        // weak below 1.0 spread
+        assert_eq!(ce_relevance_label(1.9, Some(1.8), 1.0), "weak");
+        // no runner-up means gap 0: never high, however large the spread
+        assert_eq!(ce_relevance_label(9.0, None, 0.0), "good");
+        // margins only: shifting every score leaves the label unchanged
+        assert_eq!(ce_relevance_label(-4.0, Some(-7.0), -9.0), "high");
+        assert_eq!(ce_relevance_label(16.0, Some(13.0), 11.0), "high");
+    }
+
+    #[test]
+    fn ce_summary_from_scores_takes_top_runner_up_and_median() {
+        let summary = CeSummary::from_scores(&[1.0, 5.0, 3.0, 2.0]).unwrap();
+        assert_eq!(summary.top, 5.0);
+        assert_eq!(summary.runner_up, Some(3.0));
+        assert_eq!(summary.median, 2.5);
+        let odd = CeSummary::from_scores(&[4.0, 1.0, 2.0]).unwrap();
+        assert_eq!(odd.median, 2.0);
+        let single = CeSummary::from_scores(&[7.0]).unwrap();
+        assert_eq!(single.runner_up, None);
+        assert_eq!(single.median, 7.0);
+        assert!(CeSummary::from_scores(&[]).is_none());
+        assert!(CeSummary::from_scores(&[f32::NAN]).is_none());
+    }
+
+    #[test]
+    fn formatter_without_ce_matches_the_cosine_path_byte_for_byte() {
+        let results = vec![
+            quick_result(0.80, "first row"),
+            quick_result(0.50, "second row"),
+        ];
+        let base = format_search_results_with_rank_scores(&results, "q", "all", 5, 3, &[]);
+        let via_ce = format_search_results_with_ce(&results, "q", "all", 5, 3, &[], None);
+        assert_eq!(base, via_ce);
+        assert_eq!(base, format_search_results(&results, "q", "all", 5, 3));
+        assert!(!base.contains("ce-top"), "got: {base}");
+        assert!(
+            base.contains(
+                "<summary count=\"2\" relevance=\"good\" top-score=\"0.800\" rank1-score=\"0.800\" margin=\"0.300\">"
+            ),
+            "got: {base}"
+        );
+    }
+
+    #[test]
+    fn formatter_with_ce_uses_the_ce_label_and_keeps_every_row() {
+        // Cosine says weak (0.50); the CE margins say high.
+        let results = vec![
+            quick_result(0.50, "first row"),
+            quick_result(0.40, "second row"),
+        ];
+        let ce = CeSummary {
+            top: 6.0,
+            runner_up: Some(3.0),
+            median: 1.0,
+        };
+        let xml = format_search_results_with_ce(&results, "q", "all", 5, 3, &[], Some(&ce));
+        assert!(
+            xml.contains("relevance=\"high\"") && !xml.contains("relevance=\"weak\""),
+            "got: {xml}"
+        );
+        assert!(
+            xml.contains("ce-top=\"6.00\" ce-margin=\"3.00\">"),
+            "got: {xml}"
+        );
+        assert!(
+            xml.contains("(high relevance, top score: 0.500)"),
+            "got: {xml}"
+        );
+        assert!(!xml.contains("<caveat>"), "got: {xml}");
+        assert_eq!(xml.matches("<r rank=").count(), 2, "got: {xml}");
+
+        // A weak CE label with no runner-up reads n/a and keeps the caveat.
+        let weak = CeSummary {
+            top: 0.5,
+            runner_up: None,
+            median: 0.5,
+        };
+        let xml = format_search_results_with_ce(&results, "q", "all", 5, 3, &[], Some(&weak));
+        assert!(xml.contains("relevance=\"weak\""), "got: {xml}");
+        assert!(xml.contains("ce-margin=\"n/a\""), "got: {xml}");
+        assert!(xml.contains("<caveat>"), "got: {xml}");
+        assert_eq!(xml.matches("<r rank=").count(), 2, "got: {xml}");
     }
 }

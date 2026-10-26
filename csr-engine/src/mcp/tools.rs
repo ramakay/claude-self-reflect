@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
 use crate::format::{self, DisplayRankScore, EnrichedResult};
+use crate::search::cross_encoder::{self, RetrievalPolicy, CE_POOL};
 use crate::search::cross_project;
 use crate::search::decay;
 use crate::search::SearchEngine;
@@ -1345,13 +1346,14 @@ async fn reflect_on_past_with_vec_in_scope_mode(
         record_retrievals,
     )
     .await?;
-    Ok(format::format_search_results_with_rank_scores(
+    Ok(format::format_search_results_with_ce(
         &page.enriched,
         query,
         &scope.scope_label,
         page.search_ms,
         embed_ms,
         &page.display_rank_scores,
+        page.ce.as_ref(),
     ))
 }
 
@@ -1361,6 +1363,8 @@ struct FinalPage {
     enriched: Vec<EnrichedResult>,
     display_rank_scores: Vec<DisplayRankScore>,
     search_ms: u64,
+    /// Cross-encoder summary of the recall; `None` off the CE path.
+    ce: Option<format::CeSummary>,
 }
 
 /// Candidates fetched from each keyword lane to fill a page of `n` rows: four
@@ -1397,6 +1401,8 @@ struct SettledPool {
     enriched: Vec<EnrichedResult>,
     display_rank_scores: Vec<DisplayRankScore>,
     search_ms: u64,
+    /// Cross-encoder summary of the recall that built this pool.
+    ce: Option<format::CeSummary>,
     /// No lane filled its window, so the pool holds every candidate there is.
     exhausted: bool,
     /// How many leading rows a caller has been shown. What a page published is
@@ -1436,6 +1442,7 @@ impl SettledPool {
             enriched,
             display_rank_scores,
             search_ms: fresh.search_ms,
+            ce: fresh.ce,
             exhausted: fresh.exhausted,
         }
     }
@@ -1676,6 +1683,7 @@ async fn reflect_final_page(
         enriched,
         display_rank_scores: pool.display_rank_scores,
         search_ms: pool.search_ms,
+        ce: pool.ce,
     })
 }
 
@@ -1766,6 +1774,7 @@ async fn settled_pool(
         enriched,
         display_rank_scores: pass.display_rank_scores,
         search_ms,
+        ce: pass.ce,
         exhausted: !pass.window_full,
         published: 0,
     })
@@ -1786,6 +1795,9 @@ struct GatherPass {
     /// so a refetch could backfill demotion-vacated slots.
     window_full: bool,
     search_ms: u64,
+    /// Cross-encoder summary over the pooled sessions (hybrid, CE policy,
+    /// model available); `None` otherwise.
+    ce: Option<format::CeSummary>,
 }
 
 /// Compute the exact score used by recall reranking, including its conversation
@@ -1842,6 +1854,255 @@ fn recall_display_rank_scores(
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only policy override: parallel tests must not race on the process
+    /// environment, so they set the policy on their own thread instead.
+    static POLICY_OVERRIDE: std::cell::Cell<Option<RetrievalPolicy>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The retrieval policy for one recall call. The single place the MCP recall
+/// path reads `CSR_RETRIEVAL_LEGACY` (through [`RetrievalPolicy::from_env`]).
+///
+/// Under `cfg(test)` the default is [`RetrievalPolicy::Legacy`] unless the
+/// test's own thread opts in with `POLICY_OVERRIDE`: the pipeline tests pin
+/// ordering on synthetic content, and the cross-encoder would otherwise load
+/// whatever model files happen to sit on the machine running them.
+fn current_retrieval_policy() -> RetrievalPolicy {
+    #[cfg(test)]
+    {
+        POLICY_OVERRIDE
+            .with(|cell| cell.get())
+            .unwrap_or(RetrievalPolicy::Legacy)
+    }
+    #[cfg(not(test))]
+    {
+        RetrievalPolicy::from_env()
+    }
+}
+
+/// Sessions whose representative must be in the cross-encoder pool: the S1
+/// collapsed top of the list.
+const CE_PROTECTED_SESSIONS: usize = 5;
+
+/// Longest unit text (characters) handed to the cross-encoder; its tokenizer
+/// truncates to 512 tokens anyway, this only bounds tokenizing a huge chunk.
+const CE_UNIT_MAX_CHARS: usize = 4000;
+
+/// The text the cross-encoder reads for one unit: `[<role>, <YYYY-MM-DD>] `
+/// when the chunk carries a role and a parseable timestamp (either alone when
+/// only one is there), then the chunk content without the keyword-fallback
+/// marker.
+fn ce_pair_text(chunk: &crate::import::ConversationChunk) -> String {
+    let role = chunk.author.as_str();
+    let date = temporal::parse_timestamp(&chunk.timestamp)
+        .map(|timestamp| timestamp.format("%Y-%m-%d").to_string());
+    let header = match (role.is_empty(), date) {
+        (false, Some(date)) => format!("[{role}, {date}] "),
+        (false, None) => format!("[{role}] "),
+        (true, Some(date)) => format!("[{date}] "),
+        (true, None) => String::new(),
+    };
+    let content = chunk
+        .content
+        .strip_prefix("[keyword] ")
+        .unwrap_or(&chunk.content);
+    format!(
+        "{header}{}",
+        format::truncate_chars(content, CE_UNIT_MAX_CHARS)
+    )
+}
+
+/// The chunk ids the cross-encoder scores: the first `limit` distinct ids of
+/// the fused chunk ranking, then every id in `protected` (the S1 top
+/// sessions' representatives) forced in by replacing, from the tail, ids that
+/// are not themselves protected. The pool never exceeds `limit`.
+fn ce_pool_ids(fused: &[String], protected: &[String], limit: usize) -> Vec<String> {
+    let mut pool: Vec<String> = Vec::with_capacity(limit);
+    let mut seen: HashSet<&str> = HashSet::new();
+    for id in fused {
+        if pool.len() >= limit {
+            break;
+        }
+        if seen.insert(id.as_str()) {
+            pool.push(id.clone());
+        }
+    }
+    for id in protected {
+        if pool.contains(id) {
+            continue;
+        }
+        if pool.len() < limit {
+            pool.push(id.clone());
+        } else if let Some(tail) = pool.iter().rposition(|held| !protected.contains(held)) {
+            pool.remove(tail);
+            pool.push(id.clone());
+        }
+    }
+    pool
+}
+
+/// Order produced by [`ce_reorder`].
+#[derive(Debug, PartialEq)]
+struct CeOrdered {
+    /// One chunk id per session: pooled sessions by cross-encoder score, then
+    /// every other session in its S1 place.
+    order: Vec<String>,
+    /// The pooled sessions' scores, best first.
+    session_scores: Vec<f32>,
+}
+
+/// Re-order the S1 collapsed list (one representative chunk id per session)
+/// by cross-encoder score. `scored` holds one row per pool chunk:
+/// `(chunk_id, session_key, answer_class, ce_score)`. A session's score is the
+/// best score among its rows of the lowest answer class present (so an answer
+/// row, class 0, speaks for the session whenever it has one), and the session
+/// is represented by that row. Ties go to the S1 order. A session with no
+/// finite score keeps its S1 place after the pooled ones. Pure: no model.
+fn ce_reorder(
+    collapsed: &[String],
+    session_keys: &HashMap<String, String>,
+    scored: &[(String, String, u8, f32)],
+) -> CeOrdered {
+    let session_of = |id: &str| {
+        session_keys
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.to_string())
+    };
+    let mut s1_place: HashMap<String, usize> = HashMap::new();
+    for (place, id) in collapsed.iter().enumerate() {
+        s1_place.entry(session_of(id)).or_insert(place);
+    }
+
+    let mut sessions: Vec<&str> = Vec::new();
+    let mut best: HashMap<&str, usize> = HashMap::new();
+    for (row, (_, session, class, score)) in scored.iter().enumerate() {
+        if !score.is_finite() {
+            continue;
+        }
+        match best.get(session.as_str()).copied() {
+            None => {
+                sessions.push(session.as_str());
+                best.insert(session.as_str(), row);
+            }
+            Some(held) => {
+                let (_, _, held_class, held_score) = &scored[held];
+                if class < held_class
+                    || (class == held_class && score.total_cmp(held_score).is_gt())
+                {
+                    best.insert(session.as_str(), row);
+                }
+            }
+        }
+    }
+    sessions.sort_by(|left, right| {
+        let (left_score, right_score) = (scored[best[left]].3, scored[best[right]].3);
+        right_score.total_cmp(&left_score).then_with(|| {
+            let place = |session: &str| s1_place.get(session).copied().unwrap_or(usize::MAX);
+            place(left).cmp(&place(right))
+        })
+    });
+
+    let mut order: Vec<String> = sessions
+        .iter()
+        .map(|session| scored[best[session]].0.clone())
+        .collect();
+    let session_scores: Vec<f32> = sessions
+        .iter()
+        .map(|session| scored[best[session]].3)
+        .collect();
+    for id in collapsed {
+        if !best.contains_key(session_of(id).as_str()) {
+            order.push(id.clone());
+        }
+    }
+    CeOrdered {
+        order,
+        session_scores,
+    }
+}
+
+/// Warn about a cross-encoder failure once per process, not once per query.
+fn warn_ce_unavailable(reason: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!("cross-encoder rerank skipped, keeping the S1 order: {reason}");
+    }
+}
+
+/// The cross-encoder stage of hybrid recall: score the pool (first
+/// [`CE_POOL`] fused chunks plus the S1 top sessions' representatives) and
+/// return the new session order with its score summary. Fails open: with no
+/// model or a scoring error the S1 order comes back unchanged, no summary.
+fn ce_rerank_stage(
+    query: &str,
+    collapsed: Vec<String>,
+    fused: Vec<String>,
+    enriched: &[EnrichedResult],
+    session_keys: &HashMap<String, String>,
+    answer_class: &HashMap<&str, u8>,
+) -> (Vec<String>, Option<format::CeSummary>) {
+    if collapsed.is_empty() {
+        return (collapsed, None);
+    }
+    let by_id: HashMap<&str, &EnrichedResult> = enriched
+        .iter()
+        .map(|result| (result.chunk.id.as_str(), result))
+        .collect();
+    let fused: Vec<String> = fused
+        .into_iter()
+        .filter(|id| by_id.contains_key(id.as_str()))
+        .collect();
+    let protected: Vec<String> = collapsed
+        .iter()
+        .take(CE_PROTECTED_SESSIONS)
+        .filter(|id| by_id.contains_key(id.as_str()))
+        .cloned()
+        .collect();
+    let pool = ce_pool_ids(&fused, &protected, CE_POOL);
+    let Some(encoder) = cross_encoder::global() else {
+        warn_ce_unavailable("model files unavailable");
+        return (collapsed, None);
+    };
+    let texts: Vec<String> = pool
+        .iter()
+        .map(|id| ce_pair_text(&by_id[id.as_str()].chunk))
+        .collect();
+    let units: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let scores = match encoder.score(query, &units) {
+        Ok(scores) if scores.len() == pool.len() => scores,
+        Ok(scores) => {
+            warn_ce_unavailable(&format!(
+                "scorer returned {} scores for {} units",
+                scores.len(),
+                pool.len()
+            ));
+            return (collapsed, None);
+        }
+        Err(error) => {
+            warn_ce_unavailable(&format!("{error:#}"));
+            return (collapsed, None);
+        }
+    };
+    let scored: Vec<(String, String, u8, f32)> = pool
+        .iter()
+        .zip(scores)
+        .map(|(id, score)| {
+            (
+                id.clone(),
+                session_keys.get(id).cloned().unwrap_or_else(|| id.clone()),
+                answer_class.get(id.as_str()).copied().unwrap_or(0),
+                score,
+            )
+        })
+        .collect();
+    let ordered = ce_reorder(&collapsed, session_keys, &scored);
+    let summary = format::CeSummary::from_scores(&ordered.session_scores);
+    (ordered.order, summary)
+}
+
 /// One retrieval + enrichment pass for `reflect_on_past_with_vec`: HNSW
 /// search (chunks + reflections) at window size `fetch`, TAD/decay scoring,
 /// FTS5 fallback append (with validity re-resolved for FTS-only
@@ -1863,6 +2124,9 @@ async fn reflect_gather_pass(
     search_mode: SearchMode,
     rerank_mode: RecallRerankMode<'_>,
 ) -> Result<GatherPass> {
+    // The one read of CSR_RETRIEVAL_LEGACY for this call; everything below
+    // takes the policy as a parameter.
+    let policy = current_retrieval_policy();
     let fetch = if search_mode == SearchMode::Fts {
         fetch.min(GET_MORE_WINDOW)
     } else {
@@ -1958,6 +2222,7 @@ async fn reflect_gather_pass(
                     signals.ancestry.get(&c.conversation_id),
                     active_forgetting,
                     scope,
+                    policy,
                 );
                 if ancestry_applied {
                     ancestry_applied_ids.insert(c.id.clone());
@@ -1997,7 +2262,14 @@ async fn reflect_gather_pass(
                     .get(&r.id)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                decay::apply_tad(r.score, &ts, &now, events, &tad_config)
+                match policy {
+                    RetrievalPolicy::Legacy => {
+                        decay::apply_tad(r.score, &ts, &now, events, &tad_config)
+                    }
+                    // No age or retrieval-history multiplier under the
+                    // cross-encoder policy.
+                    RetrievalPolicy::CrossEncoder => r.score,
+                }
             } else {
                 r.score
             };
@@ -2174,6 +2446,7 @@ async fn reflect_gather_pass(
                         None,
                         active_forgetting,
                         scope,
+                        policy,
                     )
                     .0;
                 }
@@ -2187,6 +2460,7 @@ async fn reflect_gather_pass(
                     &signals.validity,
                     signals.ancestry.get(&chunk.conversation_id),
                     active_forgetting,
+                    policy,
                 );
                 if ancestry_applied {
                     ancestry_applied_ids.insert(chunk.id.clone());
@@ -2388,7 +2662,14 @@ async fn reflect_gather_pass(
         }
     };
     let adjusted_scores = trained_order.as_ref().map_or_else(
-        || recall_display_rank_scores(&candidates),
+        || match policy {
+            RetrievalPolicy::Legacy => recall_display_rank_scores(&candidates),
+            // No boost term: the displayed score is the raw score.
+            RetrievalPolicy::CrossEncoder => candidates
+                .iter()
+                .map(|candidate| (candidate.id.clone(), candidate.cosine))
+                .collect(),
+        },
         |rows| {
             rows.iter()
                 .map(|(candidate, score)| (candidate.id.clone(), *score as f32))
@@ -2397,7 +2678,10 @@ async fn reflect_gather_pass(
     );
     let order: Vec<String> = trained_order
         .map(|rows| rows.into_iter().map(|(candidate, _)| candidate).collect())
-        .unwrap_or_else(|| crate::search::rerank::rerank(candidates))
+        .unwrap_or_else(|| match policy {
+            RetrievalPolicy::Legacy => crate::search::rerank::rerank(candidates),
+            RetrievalPolicy::CrossEncoder => crate::search::rerank::rerank_plain(candidates),
+        })
         .into_iter()
         .map(|c| c.id)
         .collect();
@@ -2474,6 +2758,7 @@ async fn reflect_gather_pass(
     // rankings give each session the rank of its best chunk, and the session
     // is represented by that chunk. A channel with weight 0.0 is skipped.
     let mut collapsed_sessions: Option<(HashSet<String>, HashMap<String, String>)> = None;
+    let mut ce_summary: Option<format::CeSummary> = None;
     let final_order = match search_mode {
         SearchMode::Hybrid => {
             let session_keys: HashMap<String, String> = enriched
@@ -2504,6 +2789,44 @@ async fn reflect_gather_pass(
                 |id| answer_class.get(id).copied().unwrap_or(0),
                 RRF_K,
             );
+            // Cross-encoder stage: re-score the top fused units, order the
+            // pooled sessions by their best score. Under the legacy policy
+            // the S1 order stands untouched.
+            let collapsed = if policy == RetrievalPolicy::CrossEncoder {
+                let fused = crate::search::hybrid::fuse_rrf_weighted(
+                    &[
+                        (&semantic_order, 1.0),
+                        (&fts_order, 1.0),
+                        (&postings_order, postings_weight),
+                    ],
+                    RRF_K,
+                );
+                let (reordered, summary) = ce_rerank_stage(
+                    query,
+                    collapsed,
+                    fused,
+                    &enriched,
+                    &session_keys,
+                    &answer_class,
+                );
+                ce_summary = summary;
+                if let Some(enriched_conv) = enriched_conv.as_ref() {
+                    let ranked: Vec<(String, String, f32)> = reordered
+                        .iter()
+                        .map(|id| {
+                            (
+                                id.clone(),
+                                enriched_conv.get(id).cloned().unwrap_or_default(),
+                                adjusted_scores.get(id).copied().unwrap_or(0.0),
+                            )
+                        })
+                        .collect();
+                    crate::mcp::stage_probe::record_stage("ce_rerank", &ranked);
+                }
+                reordered
+            } else {
+                collapsed
+            };
             let represented: HashSet<String> = collapsed
                 .iter()
                 .filter_map(|id| session_keys.get(id).cloned())
@@ -2655,6 +2978,7 @@ async fn reflect_gather_pass(
         validity: signals.validity,
         window_full,
         search_ms,
+        ce: ce_summary,
     })
 }
 
@@ -5052,32 +5376,38 @@ fn score_chunk_candidate(
     ancestry: Option<&crate::storage::ancestry::AncestryLabel>,
     active_forgetting: bool,
     scope: &SearchProjectScope,
+    policy: RetrievalPolicy,
 ) -> (f32, bool) {
     let mut ancestry_applied = false;
     let ancestry = (!crate::search::rerank::is_scaffold_text(&chunk.content))
         .then_some(ancestry)
         .flatten();
-    let decayed_score =
-        if let Ok(timestamp) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
-            ancestry_applied = !is_demote_channel(validity, &chunk.id)
-                && timestamp < *now
-                && ancestry
-                    .and_then(|label| label.releases_behind_for_decay())
-                    .is_some_and(|releases| releases > 0);
-            apply_chunk_decay(
-                score,
-                &timestamp,
-                now,
-                events,
-                config,
-                validity,
-                &chunk.id,
-                ancestry,
-                active_forgetting,
-            )
-        } else {
-            score
-        };
+    // Cross-encoder policy: the decay/TAD multiplier and the release-ancestry
+    // multiplier are both 1.0. A Demote-channel chunk keeps its validity path.
+    let skip_decay =
+        policy == RetrievalPolicy::CrossEncoder && !is_demote_channel(validity, &chunk.id);
+    let decayed_score = if skip_decay {
+        score
+    } else if let Ok(timestamp) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
+        ancestry_applied = !is_demote_channel(validity, &chunk.id)
+            && timestamp < *now
+            && ancestry
+                .and_then(|label| label.releases_behind_for_decay())
+                .is_some_and(|releases| releases > 0);
+        apply_chunk_decay(
+            score,
+            &timestamp,
+            now,
+            events,
+            config,
+            validity,
+            &chunk.id,
+            ancestry,
+            active_forgetting,
+        )
+    } else {
+        score
+    };
     let final_score = decayed_score * project_scope_multiplier(&chunk.project_name, scope);
     (final_score, ancestry_applied)
 }
@@ -5088,6 +5418,7 @@ fn score_fts_candidate(
     validity: &HashMap<String, ConvValidity>,
     ancestry: Option<&crate::storage::ancestry::AncestryLabel>,
     active_forgetting: bool,
+    policy: RetrievalPolicy,
 ) -> (f32, bool) {
     let demoted = is_demote_channel(validity, &chunk.id);
     if demoted && !active_forgetting {
@@ -5115,6 +5446,10 @@ fn score_fts_candidate(
             ),
             false,
         );
+    }
+    if policy == RetrievalPolicy::CrossEncoder {
+        // No age decay, no release ancestry: the flat keyword score stands.
+        return (crate::search::hybrid::FTS_ONLY_BASE_SCORE, false);
     }
     let releases_behind = (!crate::search::rerank::is_scaffold_text(&chunk.content))
         .then(|| ancestry.and_then(|label| label.releases_behind_for_decay()))
@@ -8889,6 +9224,7 @@ mod tests {
             None,
             false,
             &unscoped_search_scope(),
+            RetrievalPolicy::Legacy,
         );
         let current_release = label(0);
         let current = score_chunk_candidate(
@@ -8901,6 +9237,7 @@ mod tests {
             Some(&current_release),
             false,
             &unscoped_search_scope(),
+            RetrievalPolicy::Legacy,
         );
         let shipped_release = label(5);
         let shipped = score_chunk_candidate(
@@ -8913,6 +9250,7 @@ mod tests {
             Some(&shipped_release),
             false,
             &unscoped_search_scope(),
+            RetrievalPolicy::Legacy,
         );
 
         assert_eq!(missing.0.to_bits(), pre_change.to_bits());
@@ -8932,6 +9270,7 @@ mod tests {
             None,
             false,
             &unscoped_search_scope(),
+            RetrievalPolicy::Legacy,
         );
         let organic_current = score_chunk_candidate(
             0.9,
@@ -8943,6 +9282,7 @@ mod tests {
             Some(&current_release),
             false,
             &unscoped_search_scope(),
+            RetrievalPolicy::Legacy,
         );
         assert_eq!(organic_missing.0.to_bits(), organic_pre_change.to_bits());
         assert_eq!(organic_current.0.to_bits(), organic_pre_change.to_bits());
@@ -8967,9 +9307,22 @@ mod tests {
         };
 
         let pre_change = decay::apply_decay(0.45, &timestamp, &now, None, None);
-        let missing = score_fts_candidate(&chunk, &now, &HashMap::new(), None, false);
-        let current =
-            score_fts_candidate(&chunk, &now, &HashMap::new(), Some(&current_release), false);
+        let missing = score_fts_candidate(
+            &chunk,
+            &now,
+            &HashMap::new(),
+            None,
+            false,
+            RetrievalPolicy::Legacy,
+        );
+        let current = score_fts_candidate(
+            &chunk,
+            &now,
+            &HashMap::new(),
+            Some(&current_release),
+            false,
+            RetrievalPolicy::Legacy,
+        );
 
         assert_eq!(missing.0.to_bits(), pre_change.to_bits());
         assert_eq!(current.0.to_bits(), pre_change.to_bits());
@@ -9018,6 +9371,7 @@ mod tests {
             signals.ancestry.get("conv-demoted"),
             false,
             &unscoped_search_scope(),
+            RetrievalPolicy::Legacy,
         );
         assert!(ancestry_applied);
 
@@ -9052,6 +9406,7 @@ mod tests {
             signals.ancestry.get("conv-demoted"),
             false,
             &unscoped_search_scope(),
+            RetrievalPolicy::Legacy,
         );
         let timestamp = chunk
             .timestamp
@@ -9253,6 +9608,7 @@ mod tests {
             Some(&label),
             false,
             &unscoped_search_scope(),
+            RetrievalPolicy::Legacy,
         );
         let (_, live_ancestry_applied) = score_chunk_candidate(
             enriched[1].score,
@@ -9264,6 +9620,7 @@ mod tests {
             Some(&label),
             false,
             &unscoped_search_scope(),
+            RetrievalPolicy::Legacy,
         );
         assert!(!stale_ancestry_applied);
         assert!(live_ancestry_applied);
@@ -12407,6 +12764,257 @@ mod tests {
             page.contains("<results_returned>1</results_returned>"),
             "{page}"
         );
+    }
+
+    // ---- S2: cross-encoder stage, pure pieces -------------------------------
+
+    fn ids(items: &[&str]) -> Vec<String> {
+        items.iter().map(|id| id.to_string()).collect()
+    }
+
+    fn keys(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(id, session)| (id.to_string(), session.to_string()))
+            .collect()
+    }
+
+    fn row(id: &str, session: &str, class: u8, score: f32) -> (String, String, u8, f32) {
+        (id.into(), session.into(), class, score)
+    }
+
+    #[test]
+    fn ce_reorder_orders_pooled_sessions_by_session_max_and_keeps_the_rest() {
+        // S1 order: sA, sB, sC, sD. The pool scored sA once, sB twice (its
+        // second chunk is the better one) and sC once; sD was not pooled.
+        let collapsed = ids(&["a1", "b1", "c1", "d1"]);
+        let session_keys = keys(&[("a1", "sA"), ("b1", "sB"), ("c1", "sC"), ("d1", "sD")]);
+        let scored = vec![
+            row("a1", "sA", 0, 2.0),
+            row("b1", "sB", 0, 1.0),
+            row("b2", "sB", 0, 5.0),
+            row("c1", "sC", 0, 4.0),
+        ];
+        let ordered = ce_reorder(&collapsed, &session_keys, &scored);
+        assert_eq!(ordered.order, ids(&["b2", "c1", "a1", "d1"]));
+        assert_eq!(ordered.session_scores, vec![5.0, 4.0, 2.0]);
+    }
+
+    #[test]
+    fn ce_reorder_ties_keep_the_s1_order_and_answer_rows_speak_for_a_session() {
+        let collapsed = ids(&["a1", "b1", "e1"]);
+        let session_keys = keys(&[("a1", "sA"), ("b1", "sB"), ("e1", "sE")]);
+        let scored = vec![
+            row("b1", "sB", 0, 3.0),
+            row("a1", "sA", 0, 3.0),
+            // sE has an echo that scores high and an answer that scores low:
+            // the answer row represents it.
+            row("e1", "sE", 1, 9.0),
+            row("e2", "sE", 0, 1.0),
+        ];
+        let ordered = ce_reorder(&collapsed, &session_keys, &scored);
+        assert_eq!(ordered.order, ids(&["a1", "b1", "e2"]));
+        assert_eq!(ordered.session_scores, vec![3.0, 3.0, 1.0]);
+    }
+
+    #[test]
+    fn ce_reorder_a_session_with_only_non_answer_rows_is_still_scored() {
+        let collapsed = ids(&["a1", "e1"]);
+        let session_keys = keys(&[("a1", "sA"), ("e1", "sE")]);
+        let scored = vec![row("a1", "sA", 0, 1.0), row("e1", "sE", 2, 6.0)];
+        let ordered = ce_reorder(&collapsed, &session_keys, &scored);
+        assert_eq!(ordered.order, ids(&["e1", "a1"]));
+    }
+
+    #[test]
+    fn ce_reorder_skips_non_finite_scores_and_empty_pools_keep_s1() {
+        let collapsed = ids(&["a1", "b1"]);
+        let session_keys = keys(&[("a1", "sA"), ("b1", "sB")]);
+        let scored = vec![row("a1", "sA", 0, f32::NAN), row("b1", "sB", 0, 0.5)];
+        let ordered = ce_reorder(&collapsed, &session_keys, &scored);
+        assert_eq!(ordered.order, ids(&["b1", "a1"]));
+        assert_eq!(ordered.session_scores, vec![0.5]);
+        let none = ce_reorder(&collapsed, &session_keys, &[]);
+        assert_eq!(none.order, collapsed);
+        assert!(none.session_scores.is_empty());
+    }
+
+    #[test]
+    fn ce_pool_takes_the_first_24_fused_and_always_holds_the_s1_top_five() {
+        let fused: Vec<String> = (0..40).map(|n| format!("f{n}")).collect();
+        // Five protected representatives: two inside the first 24, three out.
+        let protected = ids(&["f2", "f9", "f30", "f35", "zz"]);
+        let pool = ce_pool_ids(&fused, &protected, CE_POOL);
+        assert_eq!(pool.len(), CE_POOL);
+        for id in &protected {
+            assert!(pool.contains(id), "{id} missing from {pool:?}");
+        }
+        // The three forced in displaced the three last unprotected ids.
+        for gone in ["f23", "f22", "f21"] {
+            assert!(!pool.contains(&gone.to_string()), "{gone} kept: {pool:?}");
+        }
+        assert!(pool.contains(&"f20".to_string()));
+        let distinct: HashSet<&String> = pool.iter().collect();
+        assert_eq!(distinct.len(), pool.len());
+    }
+
+    #[test]
+    fn ce_pool_with_a_short_fused_list_appends_the_protected() {
+        let pool = ce_pool_ids(&ids(&["a", "b", "a"]), &ids(&["b", "c"]), CE_POOL);
+        assert_eq!(pool, ids(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn ce_pair_text_carries_role_and_date_and_drops_the_keyword_marker() {
+        let mut chunk = enriched_result_conv("p1", "conv", 0.5, 0).chunk;
+        chunk.author = crate::provenance::Speaker::User;
+        chunk.timestamp = "2026-09-03T08:15:00Z".into();
+        chunk.content = "[keyword] we chose sqlite".into();
+        assert_eq!(ce_pair_text(&chunk), "[user, 2026-09-03] we chose sqlite");
+        chunk.timestamp = "not a time".into();
+        assert_eq!(ce_pair_text(&chunk), "[user] we chose sqlite");
+    }
+
+    #[test]
+    fn cross_encoder_policy_skips_decay_and_legacy_keeps_it() {
+        let now = chrono::Utc::now();
+        let mut chunk = enriched_result_conv("old", "conv-old", 0.9, 0).chunk;
+        chunk.timestamp = (now - chrono::Duration::days(400)).to_rfc3339();
+        let config = decay::DecayConfig::for_search();
+        let score = |policy| {
+            score_chunk_candidate(
+                0.9,
+                &chunk,
+                &now,
+                &[],
+                &config,
+                &HashMap::new(),
+                None,
+                false,
+                &unscoped_search_scope(),
+                policy,
+            )
+            .0
+        };
+        assert_eq!(
+            score(RetrievalPolicy::CrossEncoder).to_bits(),
+            0.9f32.to_bits()
+        );
+        assert!(score(RetrievalPolicy::Legacy) < 0.9);
+
+        let fts =
+            |policy| score_fts_candidate(&chunk, &now, &HashMap::new(), None, false, policy).0;
+        assert_eq!(
+            fts(RetrievalPolicy::CrossEncoder).to_bits(),
+            crate::search::hybrid::FTS_ONLY_BASE_SCORE.to_bits()
+        );
+        assert!(fts(RetrievalPolicy::Legacy) < crate::search::hybrid::FTS_ONLY_BASE_SCORE);
+    }
+
+    /// Opt the current test thread into a retrieval policy; restored on drop.
+    struct PolicyGuard;
+
+    fn force_policy(policy: RetrievalPolicy) -> PolicyGuard {
+        POLICY_OVERRIDE.with(|cell| cell.set(Some(policy)));
+        PolicyGuard
+    }
+
+    impl Drop for PolicyGuard {
+        fn drop(&mut self) {
+            POLICY_OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
+
+    #[test]
+    fn policy_override_is_per_thread_and_tests_default_to_legacy() {
+        // No test sets CSR_RETRIEVAL_LEGACY; the override is the test seam.
+        assert_eq!(current_retrieval_policy(), RetrievalPolicy::Legacy);
+        {
+            let _cross_encoder = force_policy(RetrievalPolicy::CrossEncoder);
+            assert_eq!(current_retrieval_policy(), RetrievalPolicy::CrossEncoder);
+            std::thread::spawn(|| {
+                assert_eq!(current_retrieval_policy(), RetrievalPolicy::Legacy);
+            })
+            .join()
+            .unwrap();
+        }
+        assert_eq!(current_retrieval_policy(), RetrievalPolicy::Legacy);
+    }
+
+    #[tokio::test]
+    async fn hybrid_recall_under_the_cross_encoder_policy_returns_every_session_and_fails_open() {
+        let _policy = force_policy(RetrievalPolicy::CrossEncoder);
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut engine = SearchEngine::new(8);
+        let rows = [
+            (
+                "ce-a",
+                "ce-conv-a",
+                "we dropped Docker for a single binary",
+                [1.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "ce-b",
+                "ce-conv-b",
+                "unrelated note about lunch",
+                [0.8, 0.6, 0.0, 0.0],
+            ),
+            (
+                "ce-c",
+                "ce-conv-c",
+                "Qdrant needed a server we never wanted",
+                [0.9, 0.0, 0.43, 0.0],
+            ),
+        ];
+        for (id, conversation, content, vector) in rows {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation.into(),
+                project_name: "test".into(),
+                timestamp: now.clone(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            engine.insert_chunk(id.to_string(), vector.to_vec());
+        }
+        let search = Arc::new(RwLock::new(engine));
+        let output = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "why did we drop Docker",
+            3,
+            0.0,
+            Some("all"),
+            0,
+            true,
+            ConsumptionMode::Full,
+            false,
+            "other",
+            SearchMode::Hybrid,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        for id in ["ce-a", "ce-b", "ce-c"] {
+            assert!(output.contains(&format!("<id>{id}</id>")), "{output}");
+        }
+        // A scorer on the machine adds the CE attributes; without model files
+        // the S1 order stands and the cosine label path is used.
+        assert_eq!(
+            output.contains("ce-top="),
+            cross_encoder::global().is_some(),
+            "{output}"
+        );
+        // No flat boost on this path: the user-authored rows carry no `adj`.
+        assert!(!output.contains("adj="), "{output}");
     }
 }
 

@@ -307,6 +307,29 @@ fn build_scorecard(i: &CardInputs) -> Value {
             "p50_ms": pct_json(&walls, 50.0),
             "p95_ms": pct_json(&walls, 95.0),
         },
+        "cross_encoder": cross_encoder_json(
+            crate::search::cross_encoder::RetrievalPolicy::from_env(),
+            crate::search::cross_encoder::ce_stats(),
+        ),
+    })
+}
+
+/// The `cross_encoder` block of the run JSON: the retrieval policy in force
+/// and the process-wide cross-encoder counters at the time the card is built.
+fn cross_encoder_json(
+    policy: crate::search::cross_encoder::RetrievalPolicy,
+    stats: crate::search::cross_encoder::CeStats,
+) -> Value {
+    let policy = match policy {
+        crate::search::cross_encoder::RetrievalPolicy::Legacy => "legacy",
+        crate::search::cross_encoder::RetrievalPolicy::CrossEncoder => "cross_encoder",
+    };
+    json!({
+        "policy": policy,
+        "loaded": stats.loaded,
+        "calls": stats.calls,
+        "pairs": stats.pairs,
+        "total_ms": stats.total_ms,
     })
 }
 
@@ -676,6 +699,7 @@ mod tests {
             "probes",
             "audit",
             "latency",
+            "cross_encoder",
         ] {
             assert!(card.get(key).is_some(), "missing {key}");
         }
@@ -696,6 +720,12 @@ mod tests {
         for key in ["n", "p50_ms", "p95_ms"] {
             assert!(card["latency"].get(key).is_some(), "latency.{key}");
         }
+        for key in ["policy", "loaded", "calls", "pairs", "total_ms"] {
+            assert!(
+                card["cross_encoder"].get(key).is_some(),
+                "cross_encoder.{key}"
+            );
+        }
         assert_eq!(card["probes"]["rank1"], 1);
         assert_eq!(card["latency"]["n"], 3);
         let no_audit = build_scorecard(&CardInputs {
@@ -715,5 +745,26 @@ mod tests {
             audit: None,
         });
         assert!(no_audit["audit"].is_null());
+    }
+
+    #[test]
+    fn cross_encoder_block_reports_policy_and_counters() {
+        use crate::search::cross_encoder::{CeStats, RetrievalPolicy};
+        let stats = CeStats {
+            loaded: true,
+            calls: 2,
+            pairs: 48,
+            total_ms: 910,
+        };
+        let on = cross_encoder_json(RetrievalPolicy::CrossEncoder, stats);
+        assert_eq!(on["policy"], "cross_encoder");
+        assert_eq!(on["loaded"], true);
+        assert_eq!(on["calls"], 2);
+        assert_eq!(on["pairs"], 48);
+        assert_eq!(on["total_ms"], 910);
+        let off = cross_encoder_json(RetrievalPolicy::Legacy, CeStats::default());
+        assert_eq!(off["policy"], "legacy");
+        assert_eq!(off["loaded"], false);
+        assert_eq!(off["pairs"], 0);
     }
 }
