@@ -224,6 +224,12 @@ enum Commands {
         #[command(subcommand)]
         action: EmbedAction,
     },
+    /// USearch chunk-vector generation tools (S5): export, truth, build, activate,
+    /// recall, load-bench, serve-rss. Never touches the serving path.
+    Vindex {
+        #[command(subcommand)]
+        action: csr_engine::index_gen::cli::VindexAction,
+    },
     /// Identifier postings: the exact-match index of paths, symbols, flags and SHAs.
     /// Opens the database directly; runs only its own additive migration.
     Identifiers {
@@ -1577,6 +1583,10 @@ async fn run(
             println!();
         }
         return Ok(());
+    }
+
+    if let Some(Commands::Vindex { ref action }) = args.command {
+        return csr_engine::index_gen::cli::run(&args.db_path, action);
     }
 
     if let Some(Commands::Embed { ref action }) = args.command {

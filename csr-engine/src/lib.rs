@@ -13,6 +13,7 @@ pub mod governor;
 pub mod health;
 pub mod hooks;
 pub mod import;
+pub mod index_gen;
 pub mod injection;
 pub mod journal;
 pub mod ledger;

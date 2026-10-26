@@ -72,6 +72,7 @@ axum = { version = "0.8", default-features = false, features = [
 ] }
 libc = "0.2"
 zstd = "0.14.2"
+usearch = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
