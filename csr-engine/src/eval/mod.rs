@@ -13,6 +13,7 @@ pub mod contamination;
 pub mod continuity;
 pub mod health;
 pub mod lessons;
+pub mod probe;
 pub mod provenance;
 pub mod trained_rerank;
 

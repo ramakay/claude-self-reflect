@@ -275,11 +275,11 @@ enum Commands {
     /// Run a reproducible retrieval benchmark in a scratch in-memory store.
     Bench {
         /// Input shape: agentmemory or longmemeval.
-        #[arg(long)]
-        format: String,
+        #[arg(long, required_unless_present = "probe")]
+        format: Option<String>,
         /// agentmemory directory (sessions.json + queries.json) or LongMemEval JSON file.
-        #[arg(long)]
-        data: PathBuf,
+        #[arg(long, required_unless_present = "probe")]
+        data: Option<PathBuf>,
         /// Override the agentmemory queries.json path.
         #[arg(long)]
         queries: Option<PathBuf>,
@@ -301,6 +301,22 @@ enum Commands {
         /// Keep at most N questions of each question type.
         #[arg(long)]
         stratify: Option<usize>,
+        /// Known-answer retrieval scorecard over the live database, read-only
+        /// (no import, no index rebuild or write).
+        #[arg(long)]
+        probe: bool,
+        /// Probe spec JSON (default: the bundled benches/probe/probes.json).
+        #[arg(long, requires = "probe")]
+        probes: Option<PathBuf>,
+        /// Audit queries JSON (csr-audit-queries/1) run after the probes.
+        #[arg(long, requires = "probe")]
+        audit: Option<PathBuf>,
+        /// Write the probe scorecard here instead of printing it.
+        #[arg(long, requires = "probe")]
+        probe_out: Option<PathBuf>,
+        /// Write one ndjson line per probe/audit response here.
+        #[arg(long, requires = "probe")]
+        dump: Option<PathBuf>,
     },
     /// Backfill session stories from V3/heuristic data (zero cost)
     BackfillStories {
@@ -1509,8 +1525,32 @@ async fn run(
         drop_abstention,
         limit,
         stratify,
+        probe,
+        probes,
+        audit,
+        probe_out,
+        dump,
     }) = &args.command
     {
+        if *probe {
+            let card = csr_engine::eval::probe::run_probe(csr_engine::eval::probe::ProbeConfig {
+                db_path: args.db_path.clone(),
+                probes: probes.clone(),
+                audit: audit.clone(),
+                out: probe_out.clone(),
+                dump: dump.clone(),
+            })
+            .await?;
+            if probe_out.is_none() {
+                println!("{}", serde_json::to_string_pretty(&card)?);
+            }
+            return Ok(());
+        }
+        let (Some(format), Some(data)) = (format, data) else {
+            anyhow::bail!(
+                "bench needs --format and --data (or --probe for the known-answer scorecard)"
+            );
+        };
         let format = csr_engine::eval::bench::BenchFormat::parse(format)?;
         if !matches!(mode.as_str(), "hybrid" | "vector" | "fts") {
             anyhow::bail!("unknown --mode {mode:?}; expected hybrid, vector, or fts");
