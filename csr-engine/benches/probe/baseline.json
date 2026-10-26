@@ -1,6 +1,6 @@
 {
  "schema": "csr-probe-baseline/1",
- "created_at": "2026-10-26T04:41:37Z",
+ "created_at": "2026-10-26T05:11:36Z",
  "calibration": {
   "rank1": 5,
   "rank1_ids": [
@@ -146,9 +146,9 @@
  "b_run1": {
   "audit": {
    "empty": 0,
-   "n": 5,
-   "p50_ms": 300.236,
-   "p95_ms": 783.559
+   "n": 310,
+   "p50_ms": 362.059,
+   "p95_ms": 762.564
   },
   "binary": {
    "git_dirty": "false",
@@ -157,20 +157,20 @@
    "sha256": "38c9d9dc93cfb85ce675353338b7b06357b59fd290a137640726b300565a872b",
    "version": "csr-engine 10.1.0"
   },
-  "cold_start_ms": 7039.691,
+  "cold_start_ms": 5168.577,
   "db": {
-   "chunk_count": 859551,
+   "chunk_count": 859915,
    "index_chunk_count": 858417,
    "path": "/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db"
   },
   "errors": 0,
   "latency": {
-   "n": 17,
-   "p50_ms": 414.575,
-   "p95_ms": 1424.619
+   "n": 322,
+   "p50_ms": 365.973,
+   "p95_ms": 762.564
   },
   "limit": 5,
-  "peak_rss_bytes": 4074913792,
+  "peak_rss_bytes": 4101898240,
   "probes": {
    "mrr5": 0.620833,
    "n": 12,
@@ -179,73 +179,73 @@
      "hit_rank": null,
      "id": 1,
      "rank1_score": 0.697,
-     "wall_ms": 543.915
+     "wall_ms": 513.941
     },
     {
      "hit_rank": 1,
      "id": 2,
      "rank1_score": 0.713,
-     "wall_ms": 395.246
+     "wall_ms": 331.273
     },
     {
      "hit_rank": 1,
      "id": 3,
      "rank1_score": 0.504,
-     "wall_ms": 1424.619
+     "wall_ms": 1247.87
     },
     {
      "hit_rank": 2,
      "id": 4,
      "rank1_score": 0.598,
-     "wall_ms": 412.364
+     "wall_ms": 390.092
     },
     {
      "hit_rank": 1,
      "id": 5,
      "rank1_score": 0.578,
-     "wall_ms": 675.304
+     "wall_ms": 655.012
     },
     {
      "hit_rank": 1,
      "id": 6,
      "rank1_score": 0.54,
-     "wall_ms": 316.106
+     "wall_ms": 317.728
     },
     {
      "hit_rank": 1,
      "id": 7,
      "rank1_score": 0.753,
-     "wall_ms": 352.104
+     "wall_ms": 321.042
     },
     {
      "hit_rank": 2,
      "id": 8,
      "rank1_score": 0.64,
-     "wall_ms": 614.801
+     "wall_ms": 618.32
     },
     {
      "hit_rank": 5,
      "id": 9,
      "rank1_score": 0.551,
-     "wall_ms": 479.114
+     "wall_ms": 478.869
     },
     {
      "hit_rank": 1,
      "id": 10,
      "rank1_score": 0.792,
-     "wall_ms": 702.443
+     "wall_ms": 642.163
     },
     {
      "hit_rank": null,
      "id": 11,
      "rank1_score": 0.56,
-     "wall_ms": 414.575
+     "wall_ms": 422.452
     },
     {
      "hit_rank": 4,
      "id": 12,
      "rank1_score": 0.687,
-     "wall_ms": 449.449
+     "wall_ms": 426.622
     }
    ],
    "rank1": 6,
@@ -260,14 +260,14 @@
   },
   "schema": "csr-probe-scorecard/1",
   "side": "B",
-  "started_at": "2026-10-26T04:35:24Z"
+  "started_at": "2026-10-26T04:59:22Z"
  },
  "b_run2": {
   "audit": {
    "empty": 0,
-   "n": 5,
-   "p50_ms": 383.103,
-   "p95_ms": 1028.291
+   "n": 310,
+   "p50_ms": 376.26,
+   "p95_ms": 776.932
   },
   "binary": {
    "git_dirty": "false",
@@ -276,20 +276,20 @@
    "sha256": "38c9d9dc93cfb85ce675353338b7b06357b59fd290a137640726b300565a872b",
    "version": "csr-engine 10.1.0"
   },
-  "cold_start_ms": 7175.607,
+  "cold_start_ms": 5193.043,
   "db": {
-   "chunk_count": 859554,
-   "index_chunk_count": 858417,
+   "chunk_count": 859940,
+   "index_chunk_count": 859916,
    "path": "/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db"
   },
   "errors": 0,
   "latency": {
-   "n": 17,
-   "p50_ms": 533.869,
-   "p95_ms": 1459.143
+   "n": 322,
+   "p50_ms": 377.598,
+   "p95_ms": 776.932
   },
   "limit": 5,
-  "peak_rss_bytes": 4070113280,
+  "peak_rss_bytes": 4107091968,
   "probes": {
    "mrr5": 0.620833,
    "n": 12,
@@ -298,73 +298,73 @@
      "hit_rank": null,
      "id": 1,
      "rank1_score": 0.697,
-     "wall_ms": 533.869
+     "wall_ms": 443.395
     },
     {
      "hit_rank": 1,
      "id": 2,
      "rank1_score": 0.713,
-     "wall_ms": 411.624
+     "wall_ms": 315.777
     },
     {
      "hit_rank": 1,
      "id": 3,
      "rank1_score": 0.504,
-     "wall_ms": 1459.143
+     "wall_ms": 1124.45
     },
     {
      "hit_rank": 2,
      "id": 4,
      "rank1_score": 0.598,
-     "wall_ms": 400.686
+     "wall_ms": 373.483
     },
     {
      "hit_rank": 1,
      "id": 5,
      "rank1_score": 0.578,
-     "wall_ms": 740.036
+     "wall_ms": 613.215
     },
     {
      "hit_rank": 1,
      "id": 6,
      "rank1_score": 0.54,
-     "wall_ms": 333.911
+     "wall_ms": 287.663
     },
     {
      "hit_rank": 1,
      "id": 7,
      "rank1_score": 0.753,
-     "wall_ms": 322.184
+     "wall_ms": 314.763
     },
     {
      "hit_rank": 2,
      "id": 8,
      "rank1_score": 0.64,
-     "wall_ms": 662.316
+     "wall_ms": 588.908
     },
     {
      "hit_rank": 5,
      "id": 9,
      "rank1_score": 0.551,
-     "wall_ms": 491.03
+     "wall_ms": 465.499
     },
     {
      "hit_rank": 1,
      "id": 10,
      "rank1_score": 0.792,
-     "wall_ms": 726.822
+     "wall_ms": 645.545
     },
     {
      "hit_rank": null,
      "id": 11,
      "rank1_score": 0.56,
-     "wall_ms": 776.764
+     "wall_ms": 393.062
     },
     {
      "hit_rank": 4,
      "id": 12,
      "rank1_score": 0.687,
-     "wall_ms": 838.552
+     "wall_ms": 395.671
     }
    ],
    "rank1": 6,
@@ -379,7 +379,7 @@
   },
   "schema": "csr-probe-scorecard/1",
   "side": "B",
-  "started_at": "2026-10-26T04:35:40Z"
+  "started_at": "2026-10-26T05:01:33Z"
  },
  "compare_b1_b2": {
   "rank1_a": 6,
@@ -387,7 +387,7 @@
   "rank1_delta": 0,
   "probe_flips": 0,
   "flipped_ids": [],
-  "audit_top1_agreement": 1.0
+  "audit_top1_agreement": 0.977419
  },
  "compare_a_b1": {
   "rank1_a": 6,
@@ -395,7 +395,7 @@
   "rank1_delta": 0,
   "probe_flips": 0,
   "flipped_ids": [],
-  "audit_top1_agreement": 1.0
+  "audit_top1_agreement": 0.0
  },
  "compare_a_b2": {
   "rank1_a": 6,
@@ -403,6 +403,6 @@
   "rank1_delta": 0,
   "probe_flips": 0,
   "flipped_ids": [],
-  "audit_top1_agreement": 1.0
+  "audit_top1_agreement": 0.0
  }
 }
