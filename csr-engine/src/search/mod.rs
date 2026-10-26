@@ -173,6 +173,196 @@ pub struct SearchEngine {
     /// pass overtook read rows the pass has since rewritten: its publish is
     /// refused ([`CrossedMaintenance`]) instead of restoring them (astra r2 #4).
     rebuilt_at_generation: Option<u64>,
+    /// Set while chunk kNN is served from an activated USearch generation (the
+    /// `vector_generation` watermark): the hnsw_rs chunk graph is then empty
+    /// and unused, and the old `chunks.hnsw.*` files are never opened.
+    chunk_gen: Option<GenServe>,
+}
+
+/// An activated USearch generation plus an exact-scan delta for everything
+/// that changed after the generation's watermark `seq`.
+pub struct GenServe {
+    pub gen: crate::index_gen::Generation,
+    /// Ids of chunks upserted after the watermark; row `i` of `delta_vecs`.
+    pub delta_ids: Vec<String>,
+    /// Row-major `delta_ids.len() * DIMS` floats.
+    pub delta_vecs: Vec<f32>,
+    /// Ids upserted or deleted after the watermark: the generation's copy of
+    /// each is stale and never served.
+    pub shadow: HashSet<String>,
+    delta_pos: HashMap<String, usize>,
+    /// Hashes of the generation's ids: O(1) membership without a second copy
+    /// of every id string.
+    gen_keys: HashSet<u64>,
+    /// How many ids of `shadow` the generation holds.
+    shadowed_in_gen: usize,
+}
+
+const GEN_DIMS: usize = crate::index_gen::DIMS;
+
+/// Cap on one growth step of the generation overfetch.
+const GEN_ESCALATION_FACTOR: usize = 8;
+
+fn gen_key(id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl GenServe {
+    fn new(
+        gen: crate::index_gen::Generation,
+        upserts: Vec<(String, Vec<f32>)>,
+        deleted: HashSet<String>,
+    ) -> Self {
+        let gen_keys: HashSet<u64> = gen.ids().iter().map(|id| gen_key(id)).collect();
+        let mut serve = Self {
+            gen,
+            delta_ids: Vec::new(),
+            delta_vecs: Vec::new(),
+            shadow: HashSet::new(),
+            delta_pos: HashMap::new(),
+            gen_keys,
+            shadowed_in_gen: 0,
+        };
+        for id in &deleted {
+            serve.shadow_id(id);
+        }
+        for (id, vector) in upserts {
+            serve.shadow_id(&id);
+            serve.put(id, &vector);
+        }
+        serve
+    }
+
+    fn in_gen(&self, id: &str) -> bool {
+        self.gen_keys.contains(&gen_key(id))
+    }
+
+    fn shadow_id(&mut self, id: &str) {
+        if self.shadow.insert(id.to_string()) && self.in_gen(id) {
+            self.shadowed_in_gen += 1;
+        }
+    }
+
+    /// Write `vector` as the delta copy of `id` (replacing an earlier one).
+    fn put(&mut self, id: String, vector: &[f32]) {
+        if vector.len() != GEN_DIMS {
+            return;
+        }
+        if let Some(&pos) = self.delta_pos.get(&id) {
+            self.delta_vecs[pos * GEN_DIMS..(pos + 1) * GEN_DIMS].copy_from_slice(vector);
+            return;
+        }
+        self.delta_pos.insert(id.clone(), self.delta_ids.len());
+        self.delta_ids.push(id);
+        self.delta_vecs.extend_from_slice(vector);
+    }
+
+    /// Drop the delta copy of `id`; `true` when there was one.
+    fn take(&mut self, id: &str) -> bool {
+        let Some(pos) = self.delta_pos.remove(id) else {
+            return false;
+        };
+        let last = self.delta_ids.len() - 1;
+        if pos != last {
+            let (head, tail) = self.delta_vecs.split_at_mut(last * GEN_DIMS);
+            head[pos * GEN_DIMS..(pos + 1) * GEN_DIMS].copy_from_slice(&tail[..GEN_DIMS]);
+            self.delta_ids.swap(pos, last);
+            self.delta_pos.insert(self.delta_ids[pos].clone(), pos);
+        }
+        self.delta_ids.pop();
+        self.delta_vecs.truncate(last * GEN_DIMS);
+        true
+    }
+
+    fn has(&self, id: &str) -> bool {
+        self.delta_pos.contains_key(id) || (self.in_gen(id) && !self.shadow.contains(id))
+    }
+
+    fn insert(&mut self, id: String, vector: &[f32]) {
+        if vector.len() != GEN_DIMS || self.has(&id) {
+            return;
+        }
+        self.shadow_id(&id);
+        self.put(id, vector);
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.take(id);
+        if self.in_gen(id) && !self.shadow.contains(id) {
+            self.shadow_id(id);
+        }
+    }
+
+    fn live_count(&self) -> usize {
+        self.gen.len() - self.shadowed_in_gen + self.delta_ids.len()
+    }
+
+    /// Best `limit` live chunks by cosine: the generation (overfetched past
+    /// the shadowed ids) merged with an exact scan of the delta.
+    fn search(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        min_score: f32,
+        allowed: Option<&HashSet<String>>,
+    ) -> Vec<SearchResult> {
+        if limit == 0 || query_vec.len() != GEN_DIMS {
+            return Vec::new();
+        }
+        let permitted = |id: &str| allowed.is_none_or(|ids| ids.contains(id));
+        let total = self.gen.len();
+        let mut results: Vec<SearchResult> = Vec::new();
+        if total > 0 {
+            let base = if allowed.is_some() { limit * 5 } else { limit };
+            let mut fetch = (base + self.shadowed_in_gen).clamp(1, total);
+            loop {
+                let hits = self.gen.search(query_vec, fetch);
+                let returned = hits.len();
+                let tail = hits.last().map(|hit| hit.1);
+                let found: Vec<SearchResult> = hits
+                    .into_iter()
+                    .filter(|(id, score)| {
+                        *score >= min_score && !self.shadow.contains(id) && permitted(id)
+                    })
+                    .map(|(id, score)| SearchResult { id, score })
+                    .collect();
+                // Hits are best first: once the weakest fetched score is below
+                // the threshold, a deeper fetch adds nothing.
+                if found.len() >= limit
+                    || fetch >= total
+                    || returned < fetch
+                    || tail.is_none_or(|score| score < min_score)
+                {
+                    results = found;
+                    break;
+                }
+                fetch = fetch.saturating_mul(GEN_ESCALATION_FACTOR).min(total);
+            }
+        }
+        for (row, id) in self.delta_ids.iter().enumerate() {
+            if !permitted(id) {
+                continue;
+            }
+            let vector = &self.delta_vecs[row * GEN_DIMS..(row + 1) * GEN_DIMS];
+            let score = 1.0 - DistCosine {}.eval(vector, query_vec);
+            if score >= min_score {
+                results.push(SearchResult {
+                    id: id.clone(),
+                    score,
+                });
+            }
+        }
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+        results
+    }
 }
 
 /// Owns an `HnswIo` whose memory map a loaded `Hnsw` borrows. Never touched
@@ -503,6 +693,7 @@ impl SearchEngine {
             chunks_unsynced: false,
             _mapped: Vec::new(),
             rebuilt_at_generation: None,
+            chunk_gen: None,
         }
     }
 
@@ -663,6 +854,12 @@ impl SearchEngine {
         if !self.allow_local_mutations {
             return;
         }
+        if let Some(serve) = self.chunk_gen.as_mut() {
+            // The generation is read-only: the change lives in the delta, which
+            // SQLite recreates at the next load, so it is never "dirty".
+            serve.insert(id, &embedding);
+            return;
+        }
         if self.chunk_positions.contains_key(&id) {
             return; // Already indexed — skip duplicate
         }
@@ -753,6 +950,10 @@ impl SearchEngine {
         if !self.allow_local_mutations {
             return;
         }
+        if let Some(serve) = self.chunk_gen.as_mut() {
+            serve.remove(id);
+            return;
+        }
         if let Some(pos) = self.chunk_positions.remove(id) {
             self.chunk_id_map[pos].clear();
             self.mark_chunk_dirty();
@@ -766,7 +967,20 @@ impl SearchEngine {
 
     /// Check if a chunk ID is already present in the index.
     pub fn has_chunk(&self, id: &str) -> bool {
-        self.chunk_positions.contains_key(id)
+        match &self.chunk_gen {
+            Some(serve) => serve.has(id),
+            None => self.chunk_positions.contains_key(id),
+        }
+    }
+
+    /// Whether chunk kNN is served from a USearch generation.
+    pub fn is_generation_served(&self) -> bool {
+        self.chunk_gen.is_some()
+    }
+
+    /// The generation and delta serving chunks, when there is one.
+    pub fn generation_serve(&self) -> Option<&GenServe> {
+        self.chunk_gen.as_ref()
     }
 
     /// Blank reflection IDs in the map that are not present in the given DB ID set.
@@ -791,6 +1005,20 @@ impl SearchEngine {
     /// vectors whose rows were deleted after the process that dumped this cache
     /// loaded them. Returns the number blanked. Marks the index dirty if any were.
     pub fn blank_orphan_chunks(&mut self, db_ids: &std::collections::HashSet<&str>) -> usize {
+        if let Some(serve) = self.chunk_gen.as_mut() {
+            // The delta was read from SQLite at load, and deletes after it are
+            // shadowed; only a delta row since removed from the DB is an orphan.
+            let orphans: Vec<String> = serve
+                .delta_ids
+                .iter()
+                .filter(|id| !db_ids.contains(id.as_str()))
+                .cloned()
+                .collect();
+            for id in &orphans {
+                serve.remove(id);
+            }
+            return orphans.len();
+        }
         let mut blanked = 0;
         for entry in &mut self.chunk_id_map {
             if !entry.is_empty() && !db_ids.contains(entry.as_str()) {
@@ -807,7 +1035,10 @@ impl SearchEngine {
 
     /// Total chunk id-map slots (live + blanked/tombstoned). O(1).
     pub fn chunk_slot_count(&self) -> usize {
-        self.chunk_id_map.len()
+        match &self.chunk_gen {
+            Some(serve) => serve.gen.len() + serve.delta_ids.len(),
+            None => self.chunk_id_map.len(),
+        }
     }
 
     /// Total reflection id-map slots (live + blanked/tombstoned). O(1).
@@ -823,6 +1054,9 @@ impl SearchEngine {
     /// ids only) are already maintained incrementally by `insert_chunk` /
     /// `remove_chunk` / `blank_orphan_chunks`, so this never rescans the map.
     pub fn chunk_tombstone_count(&self) -> usize {
+        if let Some(serve) = &self.chunk_gen {
+            return serve.shadowed_in_gen;
+        }
         self.chunk_id_map
             .len()
             .saturating_sub(self.chunk_positions.len())
@@ -844,6 +1078,9 @@ impl SearchEngine {
     ) -> Vec<SearchResult> {
         if let Some(proxy) = &self.proxy {
             return proxy.search_chunks(query_vec, limit, min_score);
+        }
+        if let Some(serve) = &self.chunk_gen {
+            return serve.search(query_vec, limit, min_score, None);
         }
         if self.chunk_id_map.is_empty() {
             return Vec::new();
@@ -1030,7 +1267,10 @@ impl SearchEngine {
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.chunk_positions.len()
+        match &self.chunk_gen {
+            Some(serve) => serve.live_count(),
+            None => self.chunk_positions.len(),
+        }
     }
 
     pub fn reflection_count(&self) -> usize {
@@ -1109,6 +1349,12 @@ impl SearchEngine {
                 return Vec::new();
             }
             return proxy.search_chunks_filtered(query_vec, limit, min_score, allowed_ids);
+        }
+        if let Some(serve) = &self.chunk_gen {
+            if allowed_ids.is_empty() {
+                return Vec::new();
+            }
+            return serve.search(query_vec, limit, min_score, Some(allowed_ids));
         }
         if self.chunk_id_map.is_empty() || allowed_ids.is_empty() || limit == 0 {
             return Vec::new();
@@ -1391,8 +1637,10 @@ impl SearchEngine {
         // the generation dump's failure on an empty index, and `chunk_actually_dumped`
         // names the guarded condition once so the manifest logic below can ask "did we
         // really just write this side" without repeating it.
-        let chunk_actually_dumped =
-            !stale_generation && (self.chunk_dirty || force_full) && !self.chunk_id_map.is_empty();
+        let chunk_actually_dumped = !stale_generation
+            && self.chunk_gen.is_none()
+            && (self.chunk_dirty || force_full)
+            && !self.chunk_id_map.is_empty();
         let chunk_basename = if chunk_actually_dumped {
             dump_hnsw_generation(&self.chunk_index, dir, "chunks")
                 .map_err(|e| anyhow::anyhow!("chunk index dump failed: {}", e))?
@@ -1676,6 +1924,157 @@ impl SearchEngine {
         ))
     }
 
+    /// Serve chunk kNN from the activated USearch generation named by the
+    /// `vector_generation` watermark, with everything that changed after the
+    /// watermark `seq` held as an exact-scan delta (see [`GenServe`]).
+    ///
+    /// Loads the reflection hnsw files, the generation and the delta, and
+    /// nothing else: the `chunks-*.hnsw.*` files are never opened, read or
+    /// hashed, and are left exactly as they are. `Ok(None)` without a
+    /// watermark. An `Err` (a generation or reflection file that fails its
+    /// checks) leaves the caller to fall back to [`Self::load_from_disk`].
+    pub fn load_with_generation(
+        index_dir: &Path,
+        storage: &crate::storage::Storage,
+        expected_reflections: usize,
+    ) -> Result<Option<Self>> {
+        Self::load_with_generation_budget(
+            index_dir,
+            storage,
+            expected_reflections,
+            INDEX_LOCK_TIMEOUT,
+        )
+    }
+
+    pub(crate) fn load_with_generation_budget(
+        index_dir: &Path,
+        storage: &crate::storage::Storage,
+        expected_reflections: usize,
+        budget: std::time::Duration,
+    ) -> Result<Option<Self>> {
+        let Some(watermark) = crate::index_gen::read_watermark(storage)? else {
+            return Ok(None);
+        };
+        // Generation files are written once under unique names and never
+        // modified, so opening (and hashing) one needs no index lock.
+        let generation = crate::index_gen::Generation::open(index_dir, &watermark)?;
+        let (upserts, deleted) = crate::index_gen::delta_since(storage, watermark.seq)?;
+        let serve = GenServe::new(generation, upserts, deleted);
+
+        let mut engine = Self::new(16);
+        let lock = match std::fs::File::open(index_dir.join("index.lock")) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(file) = &lock {
+            lock_index(file, false, budget)?;
+        }
+        engine.load_reflection_side(index_dir, expected_reflections, lock.is_some())?;
+        drop(lock);
+        engine.chunk_cursor = watermark.seq;
+        engine.chunk_gen = Some(serve);
+        Ok(Some(engine))
+    }
+
+    /// Load only the reflection side of the manifest in `dir`. A missing or
+    /// unusable manifest leaves the reflection side empty (the caller's
+    /// reconciliation backfills it from SQLite). Damaged reflection files are
+    /// an error.
+    fn load_reflection_side(
+        &mut self,
+        dir: &Path,
+        expected_reflections: usize,
+        lock_held: bool,
+    ) -> Result<()> {
+        let floor = read_maintenance_generation(dir);
+        let manifest = std::fs::read_to_string(dir.join("manifest.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<IndexManifest>(&raw).ok())
+            .filter(|manifest| manifest.version == MANIFEST_VERSION && manifest.epoch >= floor);
+        let Some(manifest) = manifest else {
+            tracing::info!("no usable index manifest: reflections start empty");
+            return Ok(());
+        };
+        let basename = manifest.reflection_basename.as_str();
+        anyhow::ensure!(
+            Path::new(basename).file_name().and_then(|s| s.to_str()) == Some(basename),
+            "invalid index basename"
+        );
+        let points = manifest.reflection_id_map.len();
+        if points > 0 {
+            for extension in ["hnsw.graph", "hnsw.data"] {
+                let name = format!("{basename}.{extension}");
+                let expected = manifest
+                    .files
+                    .get(&name)
+                    .with_context(|| format!("missing integrity metadata for {name}"))?;
+                let path = dir.join(&name);
+                let metadata = std::fs::symlink_metadata(&path)
+                    .with_context(|| format!("checking {}", path.display()))?;
+                anyhow::ensure!(
+                    metadata.is_file() && metadata.len() == expected.bytes,
+                    "index file length or type mismatch: {name}"
+                );
+                anyhow::ensure!(
+                    file_integrity(&path)? == *expected,
+                    "index hash mismatch: {name}"
+                );
+            }
+            check_generation_files(dir, basename, points).map_err(|problem| {
+                anyhow::anyhow!("reflection generation {basename} damaged: {problem}")
+            })?;
+        }
+        if expected_reflections != manifest.reflection_embeddings_expected {
+            tracing::info!(
+                cached_reflections = manifest.reflection_embeddings_expected,
+                db_reflections = expected_reflections,
+                "reflection cache differs from DB — loading + reconciling"
+            );
+        }
+        let use_mmap =
+            should_mmap_generation(dir, basename, &default_reflection_basename(), lock_held);
+        let mut io = (points > 0).then(|| PendingHnswIo::new(dir, basename, use_mmap));
+        let index = if let Some(io) = io.as_mut() {
+            match io.load() {
+                Ok(hnsw) => hnsw,
+                Err(failure) => {
+                    log_hnsw_load_failure("reflection", &failure);
+                    anyhow::bail!("reflection index failed to load");
+                }
+            }
+        } else {
+            Hnsw::new(
+                MAX_NB_CONNECTION,
+                1_000,
+                MAX_LAYER,
+                EF_CONSTRUCTION,
+                DistCosine {},
+            )
+        };
+        self.vectors_mapped = io.is_some() && use_mmap;
+        self._mapped = io
+            .take()
+            .map(PendingHnswIo::into_mapped)
+            .into_iter()
+            .collect();
+        self.reflection_positions = manifest
+            .reflection_id_map
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| !id.is_empty())
+            .map(|(position, id)| (id.clone(), position))
+            .collect();
+        self.active_reflection_count = self.reflection_positions.len();
+        self.reflection_hashes = index_hashes(&index, points);
+        self.reflection_index = index;
+        self.reflection_id_map = manifest.reflection_id_map;
+        self.reflection_cursor = manifest.reflection_change_cursor;
+        self.epoch = manifest.epoch;
+        self.manifest_backed = true;
+        Ok(())
+    }
+
     fn load_from_disk_locked(
         dir: &Path,
         expected_chunks: usize,
@@ -1898,6 +2297,7 @@ impl SearchEngine {
             chunks_unsynced: false,
             _mapped: mapped,
             rebuilt_at_generation: None,
+            chunk_gen: None,
         })
     }
 }
@@ -2348,9 +2748,20 @@ pub fn cleanup_stale_index_files(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut removed = 0usize;
-    for entry in entries.flatten() {
+    let entries: Vec<_> = entries.flatten().collect();
+    // A directory holding a USearch generation (`chunks-g<N>.json`) is served
+    // from it; the old chunk graphs are the `CSR_NO_VECTOR_GEN=1` fallback and
+    // stay exactly as they are, as do the generation's own files.
+    let generation_present = entries.iter().any(|entry| {
         let name = entry.file_name().to_string_lossy().to_string();
+        name.starts_with("chunks-g") && name.ends_with(".json")
+    });
+    let mut removed = 0usize;
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("chunks-g") || (generation_present && name.starts_with("chunks-")) {
+            continue;
+        }
         // Match pattern: chunks-NNN.hnsw.data/graph or reflections-NNN.hnsw.data/graph
         // Keep: chunks.hnsw.data, reflections.hnsw.graph, manifest.json, index.lock
         if (name.starts_with("chunks-") || name.starts_with("reflections-"))
@@ -4318,5 +4729,402 @@ mod tests {
             integrity.blake3
         );
         assert_eq!(integrity.bytes, 1_610_612_736);
+    }
+}
+
+/// Serving chunk kNN from a USearch generation by the `vector_generation`
+/// watermark (S5-FS2).
+#[cfg(test)]
+mod vector_gen_tests {
+    use super::*;
+    use crate::index_gen::{self, DIMS};
+    use crate::storage::Storage;
+
+    const N: usize = 40;
+
+    /// A fixed pseudo-random unit vector per `i` (SplitMix64 noise).
+    fn vector(i: usize) -> Vec<f32> {
+        let mut state = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        let mut v: Vec<f32> = (0..DIMS)
+            .map(|_| {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect();
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= norm);
+        v
+    }
+
+    fn blob(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn put(storage: &Storage, id: &str, v: &[f32]) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO chunks(id,conversation_id,project_name,timestamp,content,message_count) VALUES(?1,'conv','project','2026-09-26','content',1)",
+                    [id],
+                )?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO chunk_embeddings(chunk_id,embedding) VALUES(?1,?2)",
+                    rusqlite::params![id, blob(v)],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn max_seq(storage: &Storage) -> i64 {
+        storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COALESCE(MAX(seq),0) FROM embedding_changes",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        dir: std::path::PathBuf,
+        storage: Storage,
+    }
+
+    /// `N` chunks `c0..` in SQLite, an index-v3 dump of them (plus reflection
+    /// `r0`) and a USearch generation of them; the watermark row only if asked.
+    fn fixture(watermark: bool) -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("index-v3");
+        let storage = Storage::open_memory().unwrap();
+        let mut old = SearchEngine::new(100);
+        let mut ids = Vec::new();
+        let mut flat = Vec::new();
+        for i in 0..N {
+            let id = format!("c{i}");
+            put(&storage, &id, &vector(i));
+            old.insert_chunk(id.clone(), vector(i));
+            flat.extend(vector(i));
+            ids.push(id);
+        }
+        old.insert_reflection("r0".into(), vector(1000));
+        old.dump_to_disk(&dir, N, 1).unwrap();
+        let manifest = index_gen::build(&flat, DIMS, &ids, &dir, 1, max_seq(&storage), 2).unwrap();
+        if watermark {
+            index_gen::write_watermark(&storage, &manifest).unwrap();
+        }
+        Fixture {
+            _tmp: tmp,
+            dir,
+            storage,
+        }
+    }
+
+    fn load(f: &Fixture) -> SearchEngine {
+        SearchEngine::load_with_generation(&f.dir, &f.storage, 1)
+            .unwrap()
+            .expect("watermark present")
+    }
+
+    fn top(engine: &SearchEngine, v: &[f32], k: usize) -> Vec<SearchResult> {
+        engine.search_chunks(v, k, 0.0)
+    }
+
+    fn chunk_files(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().to_string();
+                name.starts_with("chunks")
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn snapshot(files: &[std::path::PathBuf]) -> Vec<(String, String, std::time::SystemTime)> {
+        files
+            .iter()
+            .map(|p| {
+                (
+                    p.file_name().unwrap().to_string_lossy().to_string(),
+                    index_gen::blake3_file(p).unwrap(),
+                    std::fs::metadata(p).unwrap().modified().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vector_gen_serves_from_the_generation_and_leaves_chunk_hnsw_files_alone() {
+        let f = fixture(true);
+        let files = chunk_files(&f.dir);
+        assert!(files
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with(".hnsw.data")));
+        assert!(files
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("g1.usearch")));
+        let before = snapshot(&files);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let engine = load(&f);
+        assert!(engine.is_generation_served());
+        assert_eq!(engine.chunk_count(), N);
+        assert_eq!(engine.chunk_slot_count(), N);
+        let hits = top(&engine, &vector(7), 3);
+        assert_eq!(hits[0].id, "c7");
+        assert!(hits[0].score > 0.99, "{}", hits[0].score);
+        assert!(hits.windows(2).all(|w| w[0].score >= w[1].score));
+        assert_eq!(engine.search_reflections(&vector(1000), 1, 0.0)[0].id, "r0");
+        assert!(engine.has_chunk("c0") && !engine.has_chunk("nope"));
+        drop(engine);
+
+        assert_eq!(
+            snapshot(&chunk_files(&f.dir)),
+            before,
+            "chunk files touched"
+        );
+    }
+
+    #[test]
+    fn vector_gen_never_reads_the_chunk_hnsw_files() {
+        let f = fixture(true);
+        let manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(f.dir.join("manifest.json")).unwrap()).unwrap();
+        // Damage both chunk graph files: opening or hashing either would fail.
+        for ext in ["hnsw.graph", "hnsw.data"] {
+            std::fs::write(
+                f.dir.join(format!("{}.{ext}", manifest.chunk_basename)),
+                b"not a graph",
+            )
+            .unwrap();
+        }
+        let engine = load(&f);
+        assert_eq!(top(&engine, &vector(3), 1)[0].id, "c3");
+        assert!(
+            SearchEngine::load_from_disk(&f.dir, N, 1)
+                .unwrap()
+                .is_none(),
+            "the index-v3 path does see the damage"
+        );
+    }
+
+    #[test]
+    fn vector_gen_without_a_watermark_declines() {
+        let f = fixture(false);
+        assert!(SearchEngine::load_with_generation(&f.dir, &f.storage, 1)
+            .unwrap()
+            .is_none());
+        let old = SearchEngine::load_from_disk(&f.dir, N, 1).unwrap().unwrap();
+        assert!(!old.is_generation_served());
+        assert_eq!(top(&old, &vector(7), 1)[0].id, "c7");
+    }
+
+    #[test]
+    fn vector_gen_a_damaged_generation_is_an_error_not_a_rebuild() {
+        let f = fixture(true);
+        let ids = index_gen::ids_path(&f.dir, "chunks-g1");
+        let mut bytes = std::fs::read(&ids).unwrap();
+        bytes[0] = b'X';
+        std::fs::write(&ids, bytes).unwrap();
+        assert!(SearchEngine::load_with_generation(&f.dir, &f.storage, 1).is_err());
+    }
+
+    #[test]
+    fn vector_gen_delta_upsert_shadows_the_generation_copy() {
+        let f = fixture(true);
+        // Changed in SQLite after the watermark: c3 now holds vector(500),
+        // and a brand-new chunk holds vector(501).
+        put(&f.storage, "c3", &vector(500));
+        put(&f.storage, "fresh", &vector(501));
+        let mut engine = load(&f);
+        assert_eq!(engine.chunk_count(), N + 1);
+        let hits = top(&engine, &vector(500), 2);
+        assert_eq!(hits[0].id, "c3");
+        assert!(hits[0].score > 0.99);
+        assert_eq!(top(&engine, &vector(501), 1)[0].id, "fresh");
+        // The generation's old vector for c3 is no longer served.
+        let old = top(&engine, &vector(3), N + 1);
+        assert!(old.iter().filter(|h| h.id == "c3").all(|h| h.score < 0.99));
+
+        // The same through the index sync: a changed vector replaces the copy.
+        engine.apply_vector("c5".into(), Some(vector(600)), false);
+        assert_eq!(top(&engine, &vector(600), 1)[0].id, "c5");
+        assert!(top(&engine, &vector(5), N + 1)
+            .iter()
+            .filter(|h| h.id == "c5")
+            .all(|h| h.score < 0.99));
+        assert_eq!(engine.chunk_count(), N + 1);
+        assert!(!engine.is_chunk_dirty());
+    }
+
+    #[test]
+    fn vector_gen_delta_delete_removes_the_hit() {
+        let f = fixture(true);
+        f.storage
+            .with_connection(|conn| {
+                conn.execute("DELETE FROM chunk_embeddings WHERE chunk_id='c9'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let mut engine = load(&f);
+        assert_eq!(engine.chunk_count(), N - 1);
+        assert!(!engine.has_chunk("c9"));
+        assert!(top(&engine, &vector(9), N).iter().all(|h| h.id != "c9"));
+
+        engine.remove_chunk("c11");
+        assert!(!engine.has_chunk("c11"));
+        assert_eq!(engine.chunk_count(), N - 2);
+        assert!(top(&engine, &vector(11), N).iter().all(|h| h.id != "c11"));
+        assert_eq!(engine.chunk_tombstone_count(), 2);
+
+        // A delta-only chunk comes and goes; the count follows.
+        engine.insert_chunk("late".into(), vector(700));
+        assert_eq!(engine.chunk_count(), N - 1);
+        assert_eq!(top(&engine, &vector(700), 1)[0].id, "late");
+        engine.remove_chunk("late");
+        assert_eq!(engine.chunk_count(), N - 2);
+        assert!(top(&engine, &vector(700), N).iter().all(|h| h.id != "late"));
+
+        // A deleted id can come back.
+        engine.insert_chunk("c9".into(), vector(9));
+        assert_eq!(top(&engine, &vector(9), 1)[0].id, "c9");
+        assert_eq!(engine.chunk_count(), N - 1);
+        assert!(!engine.is_chunk_dirty());
+    }
+
+    #[test]
+    fn vector_gen_filtered_search_respects_the_allowed_set_and_the_shadow() {
+        let f = fixture(true);
+        put(&f.storage, "c2", &vector(800));
+        let engine = load(&f);
+        let allowed: HashSet<String> = ["c1", "c2", "c4"].map(String::from).into();
+        let hits = engine.search_chunks_filtered(&vector(4), 5, -1.0, &allowed);
+        let ids: HashSet<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, HashSet::from(["c1", "c2", "c4"]));
+        assert_eq!(hits[0].id, "c4");
+        let c2 = hits.iter().find(|h| h.id == "c2").unwrap();
+        assert!(c2.score < 0.99, "c2 is served from its new vector");
+        let high = engine.search_chunks_filtered(&vector(4), 5, 0.99, &allowed);
+        assert_eq!(high.len(), 1);
+        assert!(engine
+            .search_chunks_filtered(&vector(4), 5, 0.0, &HashSet::new())
+            .is_empty());
+    }
+
+    #[test]
+    fn vector_gen_publish_keeps_the_generation_and_the_old_chunk_files() {
+        let f = fixture(true);
+        let files = chunk_files(&f.dir);
+        let before = snapshot(&files);
+        let manifest_before: IndexManifest =
+            serde_json::from_slice(&std::fs::read(f.dir.join("manifest.json")).unwrap()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let mut engine = load(&f);
+        engine.insert_chunk("late".into(), vector(700));
+        engine.remove_chunk("c4");
+        assert!(!engine.is_chunk_dirty() && !engine.is_dirty());
+        assert!(engine.insert_reflection("r1".into(), vector(1001)));
+        assert!(engine.is_reflection_dirty());
+
+        let published = engine.publish_to_disk(&f.dir, N, 2).unwrap();
+        engine.settle_publish(published);
+        engine.insert_reflection("r2".into(), vector(1002));
+        engine.dump_to_disk(&f.dir, N, 3).unwrap();
+        cleanup_stale_index_files(&f.dir);
+        // A stray old-numbered chunk file next to a generation is not removed.
+        std::fs::write(f.dir.join("chunks-1-2.hnsw.data"), b"x").unwrap();
+        cleanup_stale_index_files(&f.dir);
+        assert!(f.dir.join("chunks-1-2.hnsw.data").exists());
+        std::fs::remove_file(f.dir.join("chunks-1-2.hnsw.data")).unwrap();
+
+        assert_eq!(
+            snapshot(&chunk_files(&f.dir)),
+            before,
+            "chunk files changed"
+        );
+        let manifest_after: IndexManifest =
+            serde_json::from_slice(&std::fs::read(f.dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest_after.chunk_basename,
+            manifest_before.chunk_basename
+        );
+        assert_eq!(manifest_after.chunk_id_map, manifest_before.chunk_id_map);
+        assert_eq!(
+            manifest_after.chunk_embeddings_expected,
+            manifest_before.chunk_embeddings_expected
+        );
+        assert_eq!(manifest_after.reflection_embeddings_expected, 3);
+
+        // The next load sees the reflections written, still on the generation.
+        drop(engine);
+        let reloaded = SearchEngine::load_with_generation(&f.dir, &f.storage, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.reflection_count(), 3);
+        assert_eq!(top(&reloaded, &vector(7), 1)[0].id, "c7");
+        // And the index-v3 path still loads its untouched chunk graph.
+        assert!(SearchEngine::load_from_disk(&f.dir, N, 3)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn vector_gen_matches_the_exact_answer_over_a_larger_corpus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open_memory().unwrap();
+        let n = 3000;
+        let mut ids = Vec::new();
+        let mut flat = Vec::new();
+        for i in 0..n {
+            let id = format!("c{i}");
+            put(&storage, &id, &vector(i));
+            flat.extend(vector(i));
+            ids.push(id);
+        }
+        let manifest =
+            index_gen::build(&flat, DIMS, &ids, tmp.path(), 1, max_seq(&storage), 2).unwrap();
+        index_gen::write_watermark(&storage, &manifest).unwrap();
+        // 30 deletes and 30 upserts after the watermark.
+        for i in 0..30 {
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "DELETE FROM chunk_embeddings WHERE chunk_id=?1",
+                        [format!("c{i}")],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            put(&storage, &format!("c{}", 100 + i), &vector(5000 + i));
+        }
+        let engine = SearchEngine::load_with_generation(tmp.path(), &storage, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(engine.chunk_count(), n - 30);
+        // Every query that was a deleted chunk finds a live neighbour, never
+        // the deleted id, and the page is full.
+        for i in 0..30 {
+            let hits = top(&engine, &vector(i), 10);
+            assert_eq!(hits.len(), 10);
+            assert!(hits.iter().all(|h| h.id != format!("c{i}")));
+        }
+        // Upserted chunks answer to their new vectors.
+        for i in 0..30 {
+            assert_eq!(
+                top(&engine, &vector(5000 + i), 1)[0].id,
+                format!("c{}", 100 + i)
+            );
+        }
     }
 }

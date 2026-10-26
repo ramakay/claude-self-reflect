@@ -207,12 +207,23 @@ impl Engine {
         let cached = if persist {
             load_reconciled(&storage, &index_dir, chunk_count, reflection_count, true)?
         } else {
-            SearchEngine::load_from_disk_with_budget(
+            let budget = std::time::Duration::from_millis(100);
+            let served = load_generation_served(
+                !vector_gen_disabled(),
+                &storage,
                 &index_dir,
-                chunk_count,
                 reflection_count,
-                std::time::Duration::from_millis(100),
-            )?
+                budget,
+            );
+            match served {
+                Some(search) => Some(search),
+                None => SearchEngine::load_from_disk_with_budget(
+                    &index_dir,
+                    chunk_count,
+                    reflection_count,
+                    budget,
+                )?,
+            }
             .map(|search| LoadedIndex {
                 search,
                 chunks_added: 0,
@@ -1291,11 +1302,74 @@ fn load_reconciled_expecting(
     persist: bool,
     expected: Option<&(String, String)>,
 ) -> Result<Option<LoadedIndex>> {
+    load_reconciled_gated(
+        !vector_gen_disabled(),
+        storage,
+        index_dir,
+        chunk_count,
+        reflection_count,
+        persist,
+        expected,
+    )
+}
+
+/// `CSR_NO_VECTOR_GEN=1` restores the index-v3 path exactly: the
+/// `vector_generation` watermark is ignored.
+fn vector_gen_disabled() -> bool {
+    std::env::var("CSR_NO_VECTOR_GEN").is_ok_and(|value| value == "1")
+}
+
+/// Serve chunks from the activated USearch generation when `enabled` and the
+/// `vector_generation` watermark verifies. Any failure logs one line to
+/// stderr and returns `None`, so the caller takes the index-v3 path.
+fn load_generation_served(
+    enabled: bool,
+    storage: &Storage,
+    index_dir: &Path,
+    reflection_count: usize,
+    budget: std::time::Duration,
+) -> Option<SearchEngine> {
+    if !enabled {
+        return None;
+    }
+    match SearchEngine::load_with_generation_budget(index_dir, storage, reflection_count, budget) {
+        Ok(found) => found,
+        Err(error) => {
+            eprintln!("CSR: vector generation not served, using the index-v3 path: {error:#}");
+            None
+        }
+    }
+}
+
+/// [`load_reconciled_expecting`] with the generation switch explicit.
+fn load_reconciled_gated(
+    use_generation: bool,
+    storage: &Storage,
+    index_dir: &Path,
+    chunk_count: usize,
+    reflection_count: usize,
+    persist: bool,
+    expected: Option<&(String, String)>,
+) -> Result<Option<LoadedIndex>> {
     let _operation = storage.publication_lock(index_dir)?;
-    let Some(mut search) = SearchEngine::load_from_disk(index_dir, chunk_count, reflection_count)?
-    else {
+    let served = load_generation_served(
+        use_generation,
+        storage,
+        index_dir,
+        reflection_count,
+        crate::search::INDEX_LOCK_TIMEOUT,
+    );
+    let loaded = match served {
+        Some(search) => Some(search),
+        None => SearchEngine::load_from_disk(index_dir, chunk_count, reflection_count)?,
+    };
+    let Some(mut search) = loaded else {
         return Ok(None);
     };
+    // A generation-served engine reads the chunks from the generation plus the
+    // delta it loaded from SQLite; the chunk graph reconciliation below does
+    // not apply to it.
+    let generation_served = search.is_generation_served();
     if expected.is_some_and(|expected| search.published_basenames() != Some(expected)) {
         return Ok(None);
     }
@@ -1336,7 +1410,12 @@ fn load_reconciled_expecting(
     // lets a stale-but-additive cache load in ~ms instead of triggering a
     // full HNSW rebuild (~tens of seconds), while keeping peak transient
     // memory O(batch) rather than O(corpus).
-    if let Ok(db_chunk_ids) = storage.load_all_chunk_ids() {
+    // (A generation-served engine has nothing to reconcile here: its delta is
+    // the chunks added or removed since the watermark.)
+    if let Some(db_chunk_ids) = (!generation_served)
+        .then(|| storage.load_all_chunk_ids())
+        .and_then(Result::ok)
+    {
         // The manifest count is written by whoever dumps, from the DB at
         // dump time. A long-running process that loaded before a purge
         // and dumps after it persists every purged vector under a count
@@ -1381,8 +1460,9 @@ fn load_reconciled_expecting(
     // `dump_to_disk`), so a corpus that loses a handful of ids every
     // few minutes would never cross the per-load threshold even as
     // its cumulative tombstone share grows without bound.
-    let orphans_material = search.chunk_tombstone_count() * ORPHAN_REBUILD_DIVISOR
-        > search.chunk_slot_count().max(1)
+    let orphans_material = (!generation_served
+        && search.chunk_tombstone_count() * ORPHAN_REBUILD_DIVISOR
+            > search.chunk_slot_count().max(1))
         || search.reflection_tombstone_count() * ORPHAN_REBUILD_DIVISOR
             > search.reflection_slot_count().max(1);
     if orphans_material && persist {
@@ -3013,6 +3093,144 @@ mod tests {
             assert_eq!(search.reflection_count(), 0);
             assert_eq!(search.unpublished_changes(), 0);
         }
+    }
+
+    // --- S5-FS2: serving chunk kNN from the USearch generation by watermark ---
+
+    const VG_N: usize = 24;
+
+    fn vg_vector(i: usize) -> Vec<f32> {
+        let mut state = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        let mut v: Vec<f32> = (0..384)
+            .map(|_| {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect();
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= norm);
+        v
+    }
+
+    /// `VG_N` chunks in SQLite, their index-v3 dump, and a generation of them;
+    /// the watermark row only when asked.
+    fn vg_fixture(watermark: bool) -> (tempfile::TempDir, std::path::PathBuf, Storage) {
+        let tmp = tempfile::tempdir().unwrap();
+        let index_dir = tmp.path().join("index-v3");
+        let storage = Storage::open_memory().unwrap();
+        let mut ids = Vec::new();
+        let mut flat = Vec::new();
+        for i in 0..VG_N {
+            let id = format!("chunk-{i}");
+            insert_test_chunk_with(&storage, &id, &vg_vector(i));
+            flat.extend(vg_vector(i));
+            ids.push(id);
+        }
+        storage
+            .insert_reflection("refl-0", "content", &[], &vg_vector(900))
+            .unwrap();
+        let (mut search, _, _, _) = rebuild_search_index_streaming(&storage, 8, 0).unwrap();
+        search.dump_to_disk(&index_dir, VG_N, 1).unwrap();
+        let seq = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COALESCE(MAX(seq),0) FROM embedding_changes",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap();
+        let manifest = crate::index_gen::build(&flat, 384, &ids, &index_dir, 1, seq, 2).unwrap();
+        if watermark {
+            crate::index_gen::write_watermark(&storage, &manifest).unwrap();
+        }
+        (tmp, index_dir, storage)
+    }
+
+    fn vg_answers(search: &SearchEngine) -> Vec<Vec<(String, f32)>> {
+        (0..VG_N)
+            .step_by(5)
+            .map(|i| {
+                search
+                    .search_chunks(&vg_vector(i), 5, 0.0)
+                    .into_iter()
+                    .map(|hit| (hit.id, hit.score))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vector_gen_engine_serves_from_the_generation_when_the_watermark_verifies() {
+        let (_tmp, index_dir, storage) = vg_fixture(true);
+        let loaded = load_reconciled_gated(true, &storage, &index_dir, VG_N, 1, true, None)
+            .unwrap()
+            .unwrap();
+        assert!(loaded.search.is_generation_served());
+        assert_eq!((loaded.chunks_added, loaded.reflections_added), (0, 0));
+        assert_eq!(loaded.search.chunk_count(), VG_N);
+        assert!(loaded.search.has_reflection("refl-0"));
+        let hit = &loaded.search.search_chunks(&vg_vector(4), 1, 0.0)[0];
+        assert_eq!(hit.id, "chunk-4");
+        assert!(hit.score > 0.99);
+        // Reconciliation did not mark the (unused) chunk side for compaction.
+        assert!(!crate::search::needs_compaction(&index_dir));
+
+        // A watermark that no longer verifies falls back to the index-v3 path.
+        let ids = crate::index_gen::ids_path(&index_dir, "chunks-g1");
+        let mut bytes = std::fs::read(&ids).unwrap();
+        bytes[0] = b'X';
+        std::fs::write(&ids, bytes).unwrap();
+        let fallback = load_reconciled_gated(true, &storage, &index_dir, VG_N, 1, true, None)
+            .unwrap()
+            .unwrap();
+        assert!(!fallback.search.is_generation_served());
+        assert_eq!(fallback.search.chunk_count(), VG_N);
+    }
+
+    #[test]
+    fn vector_gen_engine_without_a_watermark_matches_the_index_v3_path() {
+        let (_tmp, index_dir, storage) = vg_fixture(false);
+        let flipped = load_reconciled_gated(true, &storage, &index_dir, VG_N, 1, true, None)
+            .unwrap()
+            .unwrap();
+        let today = load_reconciled_gated(false, &storage, &index_dir, VG_N, 1, true, None)
+            .unwrap()
+            .unwrap();
+        assert!(!flipped.search.is_generation_served());
+        assert!(!today.search.is_generation_served());
+        assert_eq!(flipped.search.chunk_count(), today.search.chunk_count());
+        assert_eq!(vg_answers(&flipped.search), vg_answers(&today.search));
+        assert_eq!(vg_answers(&today.search)[0][0].0, "chunk-0");
+    }
+
+    #[test]
+    fn vector_gen_kill_switch_ignores_the_watermark() {
+        let (_tmp, index_dir, storage) = vg_fixture(true);
+        let off = load_reconciled_gated(false, &storage, &index_dir, VG_N, 1, true, None)
+            .unwrap()
+            .unwrap();
+        assert!(!off.search.is_generation_served());
+        assert_eq!(off.search.chunk_count(), VG_N);
+        let on = load_reconciled_gated(true, &storage, &index_dir, VG_N, 1, true, None)
+            .unwrap()
+            .unwrap();
+        assert!(on.search.is_generation_served());
+        // The switch itself: CSR_NO_VECTOR_GEN=1 (only the value "1") turns it off.
+        std::env::set_var("CSR_NO_VECTOR_GEN", "1");
+        assert!(vector_gen_disabled());
+        let by_env = load_reconciled_expecting(&storage, &index_dir, VG_N, 1, true, None)
+            .unwrap()
+            .unwrap();
+        std::env::set_var("CSR_NO_VECTOR_GEN", "0");
+        assert!(!vector_gen_disabled());
+        std::env::remove_var("CSR_NO_VECTOR_GEN");
+        assert!(!vector_gen_disabled());
+        assert!(!by_env.search.is_generation_served());
+        assert_eq!(vg_answers(&by_env.search), vg_answers(&off.search));
     }
 }
 
