@@ -360,6 +360,56 @@ fn reflection_in_family(tags: &[String], scope: &SearchProjectScope) -> bool {
 /// that arrived through `reflections_fts` rather than the vector index, with
 /// the same `[keyword] ` prefix keyword-only chunks carry. It always builds a result row, it does not filter; out-of-family rows are
 /// handled by `sink_out_of_family_under_explicit_scope`.
+/// The session a candidate belongs to for session-level fusion: its
+/// conversation, except that a plan chunk or a sidechain chunk belongs to the
+/// conversation it came from when provenance records one. A reflection is its
+/// own session (its conversation id is its id).
+fn session_key_of(storage: &Storage, chunk: &crate::import::ConversationChunk) -> String {
+    if chunk.conversation_id.starts_with("plan:") || chunk.is_sidechain {
+        if let Ok(Some(provenance)) = storage.get_chunk_provenance(&chunk.id) {
+            if !provenance.source_conv_id.is_empty() {
+                return provenance.source_conv_id;
+            }
+        }
+    }
+    chunk.conversation_id.clone()
+}
+
+/// Posting count of each query identifier, capped just past the heavy-channel
+/// threshold (counting stops there). All zeros when the table is absent or the
+/// count fails.
+fn postings_term_dfs(
+    storage: &Storage,
+    idents: &[crate::search::identifiers::QueryIdent],
+) -> Vec<usize> {
+    let cap = crate::search::hybrid::ID_HEAVY_DF_MAX as i64 + 1;
+    storage
+        .with_connection(|conn| {
+            let table: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                   WHERE type = 'table' AND name = 'identifier_postings')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !table {
+                return Ok(vec![0; idents.len()]);
+            }
+            let mut stmt = conn.prepare_cached(
+                "SELECT COUNT(*) FROM
+                   (SELECT 1 FROM identifier_postings WHERE term = ?1 LIMIT ?2)",
+            )?;
+            idents
+                .iter()
+                .map(|ident| {
+                    let count: i64 =
+                        stmt.query_row(rusqlite::params![ident.term, cap], |row| row.get(0))?;
+                    Ok(count.max(0) as usize)
+                })
+                .collect()
+        })
+        .unwrap_or_else(|_| vec![0; idents.len()])
+}
+
 fn reflection_result(
     id: &str,
     score: f32,
@@ -807,7 +857,9 @@ pub(crate) enum RecallRerankMode<'a> {
     Candidate(&'a crate::search::trained_rerank::LinearModel),
 }
 
-use crate::search::hybrid::{fuse_rrf, keyword_chunk_hits, RRF_K};
+use crate::search::hybrid::{
+    collapse_to_sessions_by, id_channel_weight, keyword_chunk_hits, RRF_K,
+};
 pub use crate::search::hybrid::{search_mode_from, SearchMode};
 
 /// An out-of-family reflection keeps its fused rank under an explicit project
@@ -1971,6 +2023,11 @@ async fn reflect_gather_pass(
         .collect();
 
     let mut fts_order = Vec::new();
+    // Identifier-postings channel (hybrid only): ranked chunk ids, best first,
+    // and the channel weight the query's identifiers earn. Empty and 0.0 when
+    // the query has no identifiers or the postings table is absent or empty.
+    let mut postings_hits: Vec<(String, f64)> = Vec::new();
+    let mut postings_weight = 0.0_f64;
     let mut reflection_fts_hits: Vec<(String, usize, f64)> = Vec::new();
     let mut reflection_prefix_ids: Vec<String> = Vec::new();
     // Hybrid always supplements semantic retrieval with FTS5. Vector mode
@@ -1980,6 +2037,18 @@ async fn reflect_gather_pass(
             .effective_project
             .is_some()
             .then(|| scope.family_projects.iter().map(String::as_str).collect());
+        if search_mode == SearchMode::Hybrid {
+            let idents = crate::search::identifiers::analyze_query(query);
+            if !idents.is_empty() {
+                postings_hits = storage
+                    .search_postings(&idents, fetch, family.as_deref())
+                    .unwrap_or_default();
+                if !postings_hits.is_empty() {
+                    postings_weight =
+                        id_channel_weight(&idents, &postings_term_dfs(storage, &idents));
+                }
+            }
+        }
         let keyword = keyword_chunk_hits(storage, query, fetch, family);
         let mut fts_window_full = keyword.window_full;
         let fts_hits = keyword.hits;
@@ -2038,13 +2107,33 @@ async fn reflect_gather_pass(
             }
             ordered
         };
-        if !fts_hits.is_empty() {
-            window_full |= fts_window_full;
+        // Chunks only the postings channel reached: loaded here and appended
+        // through the same enrichment path the keyword-only chunks take below.
+        let postings_only: Vec<crate::import::ConversationChunk> = if postings_weight > 0.0 {
+            let known: HashSet<&str> = enriched
+                .iter()
+                .map(|e| e.chunk.id.as_str())
+                .chain(fts_hits.iter().map(|(chunk, _, _)| chunk.id.as_str()))
+                .collect();
+            let missing: Vec<String> = postings_hits
+                .iter()
+                .map(|(id, _)| id.clone())
+                .filter(|id| !known.contains(id.as_str()))
+                .collect();
+            storage.get_chunks_by_ids(&missing).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !fts_hits.is_empty() || !postings_only.is_empty() {
+            if !fts_hits.is_empty() {
+                window_full |= fts_window_full;
+            }
             let existing_ids: HashSet<String> =
                 enriched.iter().map(|e| e.chunk.id.clone()).collect();
             let appended: Vec<crate::import::ConversationChunk> = fts_hits
                 .into_iter()
                 .map(|(chunk, _, _)| chunk)
+                .chain(postings_only)
                 .filter(|chunk| !existing_ids.contains(&chunk.id))
                 .collect();
             // Validity was resolved over the SEMANTIC candidate set only —
@@ -2146,6 +2235,18 @@ async fn reflect_gather_pass(
             }
         }
     }
+
+    // The postings ranking restricted to rows that made it into `enriched`.
+    let postings_order: Vec<String> = if postings_weight > 0.0 {
+        let present: HashSet<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
+        postings_hits
+            .iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| present.contains(id.as_str()))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Only built while a stage probe is active: `enriched_conv` exists solely
     // to feed the `rerank`/`fuse_rrf` stage-probe checkpoints further down
@@ -2368,8 +2469,48 @@ async fn reflect_gather_pass(
     // partition runs later: it preserves the valid section byte-for-byte,
     // while active forgetting may reorder only the demoted section by
     // accelerated decay in hybrid, vector, and FTS modes alike.
+    //
+    // Hybrid fuses at the session level: semantic, keyword and postings
+    // rankings give each session the rank of its best chunk, and the session
+    // is represented by that chunk. A channel with weight 0.0 is skipped.
+    let mut collapsed_sessions: Option<(HashSet<String>, HashMap<String, String>)> = None;
     let final_order = match search_mode {
-        SearchMode::Hybrid => fuse_rrf(&semantic_order, &fts_order, RRF_K),
+        SearchMode::Hybrid => {
+            let session_keys: HashMap<String, String> = enriched
+                .iter()
+                .map(|e| (e.chunk.id.clone(), session_key_of(storage, &e.chunk)))
+                .collect();
+            let answer_class: HashMap<&str, u8> = enriched
+                .iter()
+                .map(|e| {
+                    (
+                        e.chunk.id.as_str(),
+                        non_answer_class(&e.chunk.content, query),
+                    )
+                })
+                .collect();
+            let collapsed = collapse_to_sessions_by(
+                &[
+                    (&semantic_order, 1.0),
+                    (&fts_order, 1.0),
+                    (&postings_order, postings_weight),
+                ],
+                |id| {
+                    session_keys
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| id.to_string())
+                },
+                |id| answer_class.get(id).copied().unwrap_or(0),
+                RRF_K,
+            );
+            let represented: HashSet<String> = collapsed
+                .iter()
+                .filter_map(|id| session_keys.get(id).cloned())
+                .collect();
+            collapsed_sessions = Some((represented, session_keys));
+            collapsed
+        }
         SearchMode::Vector => order,
         SearchMode::Fts => fts_order,
     };
@@ -2393,6 +2534,19 @@ async fn reflect_gather_pass(
                 )
             })
             .collect();
+        if search_mode == SearchMode::Hybrid {
+            let ranked: Vec<(String, String, f32)> = postings_order
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        enriched_conv.get(id).cloned().unwrap_or_default(),
+                        adjusted_scores.get(id).copied().unwrap_or(0.0),
+                    )
+                })
+                .collect();
+            crate::mcp::stage_probe::record_stage("postings", &ranked);
+        }
         crate::mcp::stage_probe::record_stage("fuse_rrf", &ranked);
         // FTS-side rank is separate from the fused rank just recorded above:
         // it's the target's position in the keyword ranking that RRF fused
@@ -2408,6 +2562,18 @@ async fn reflect_gather_pass(
             .unwrap_or(usize::MAX)
     };
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
+    // One row per session: a chunk that lost its session to a better chunk
+    // leaves the page. Rows in no ranking at all (a demoted chunk the rerank
+    // left out) keep their tail place unless their session already has a row.
+    if let Some((represented, session_keys)) = collapsed_sessions.as_ref() {
+        let kept: HashSet<&str> = final_order.iter().map(String::as_str).collect();
+        enriched.retain(|e| {
+            kept.contains(e.chunk.id.as_str())
+                || session_keys
+                    .get(&e.chunk.id)
+                    .is_none_or(|session| !represented.contains(session))
+        });
+    }
     // Rows that carry no answer sink below the rows that do. Runs before the
     // out-of-family sink so that sink, which is the stronger statement about
     // where a row belongs, keeps the last word on order.
@@ -5169,6 +5335,7 @@ fn settle_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::hybrid::fuse_rrf;
     // Pure parsing seam — tests drive it by parameter instead of mutating
     // the process env, so the non-test build has no use for it.
     use crate::storage::recap_feeds::{dream_consumption_mode_from, ConsumptionMode};
@@ -5263,13 +5430,21 @@ mod tests {
                 "hnsw_fetch",
                 "decay_enriched",
                 "rerank",
+                "postings",
                 "fuse_rrf",
                 "dedupe",
                 "final_page",
             ],
             "every documented stage must record exactly once, in pipeline order"
         );
-        for sample in &samples {
+        // The fixture query names no identifier: the postings stage is
+        // recorded, and empty.
+        let postings_sample = samples
+            .iter()
+            .find(|sample| sample.stage == "postings")
+            .unwrap();
+        assert_eq!(postings_sample.total_candidates, 0);
+        for sample in samples.iter().filter(|sample| sample.stage != "postings") {
             assert!(
                 sample.target_rank.is_some(),
                 "target present at every stage with these fixtures: {} had none",
@@ -8277,7 +8452,7 @@ mod tests {
         let keyword = make_chunk(
             "rrf-keyword-only",
             "rrf-keyword-conversation",
-            "rrf_conflict_identifier keyword-only result",
+            "rrfconflictword keyword-only result",
         );
         let semantic_vec = vec![1.0, 0.0, 0.0, 0.0];
         let keyword_vec = vec![0.0, 1.0, 0.0, 0.0];
@@ -8293,7 +8468,7 @@ mod tests {
                 &storage,
                 &search,
                 &[1.0, 0.0, 0.0, 0.0],
-                "rrf_conflict_identifier",
+                "rrfconflictword",
                 1,
                 0.5,
                 Some("all"),
@@ -8312,6 +8487,130 @@ mod tests {
             assert!(output.contains("<id>rrf-semantic</id>"), "{output}");
             assert!(!output.contains("<id>rrf-keyword-only</id>"), "{output}");
         }
+    }
+
+    #[tokio::test]
+    async fn hybrid_identifier_query_lifts_the_exact_name_through_the_postings_channel() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        let make_chunk =
+            |id: &str, conversation_id: &str, content: &str| crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: "test".into(),
+                timestamp: now.clone(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+        let semantic = make_chunk(
+            "id-semantic",
+            "id-semantic-conversation",
+            "true semantic result without the name",
+        );
+        let named = make_chunk(
+            "id-named",
+            "id-named-conversation",
+            "rrf_conflict_identifier keyword-only result",
+        );
+        let semantic_vec = vec![1.0, 0.0, 0.0, 0.0];
+        let named_vec = vec![0.0, 1.0, 0.0, 0.0];
+        storage.insert_chunk(&semantic, &semantic_vec).unwrap();
+        storage.insert_chunk(&named, &named_vec).unwrap();
+        let mut engine = SearchEngine::new(8);
+        engine.insert_chunk(semantic.id.clone(), semantic_vec);
+        engine.insert_chunk(named.id.clone(), named_vec);
+        let search = Arc::new(RwLock::new(engine));
+
+        let output = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "rrf_conflict_identifier",
+            1,
+            0.5,
+            Some("all"),
+            0,
+            true,
+            ConsumptionMode::Full,
+            false,
+            "other",
+            SearchMode::Hybrid,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("<id>id-named</id>"), "{output}");
+        assert!(!output.contains("<id>id-semantic</id>"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn hybrid_returns_one_row_per_session_with_its_best_chunk() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        let make_chunk =
+            |id: &str, conversation_id: &str, content: &str| crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: "test".into(),
+                timestamp: now.clone(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+        let chunks = [
+            make_chunk(
+                "sess-a-1",
+                "sess-a",
+                "sessionword first note about sessionword",
+            ),
+            make_chunk("sess-a-2", "sess-a", "sessionword second note elsewhere"),
+            make_chunk("sess-b-1", "sess-b", "sessionword third note"),
+        ];
+        let vectors = [
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.9, 0.1, 0.0, 0.0],
+            vec![0.8, 0.2, 0.0, 0.0],
+        ];
+        let mut engine = SearchEngine::new(8);
+        for (chunk, vector) in chunks.iter().zip(vectors.iter()) {
+            storage.insert_chunk(chunk, vector).unwrap();
+            engine.insert_chunk(chunk.id.clone(), vector.clone());
+        }
+        let search = Arc::new(RwLock::new(engine));
+
+        let output = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "sessionword",
+            10,
+            0.1,
+            Some("all"),
+            0,
+            true,
+            ConsumptionMode::Full,
+            false,
+            "other",
+            SearchMode::Hybrid,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.matches("<cid>sess-a</cid>").count(), 1, "{output}");
+        assert_eq!(output.matches("<cid>sess-b</cid>").count(), 1, "{output}");
+        assert!(output.contains("<id>sess-a-1</id>"), "{output}");
+        assert!(!output.contains("<id>sess-a-2</id>"), "{output}");
     }
 
     #[tokio::test]
@@ -13401,7 +13700,10 @@ mod echo_recall_tests {
     async fn the_answer_outranks_every_echo_of_its_own_question() {
         let (rows, reflections) = probe_rows();
         let order = recall(&rows, &reflections).await;
-        let first_echo = ["story_conv1", "extracted_v3_conv1", "echo-chunk"]
+        // `echo-chunk` shares conv1 with `answer-chunk`: one row per session,
+        // and the answer is the row that stands for conv1.
+        assert!(!order.contains(&"echo-chunk".to_string()), "{order:?}");
+        let first_echo = ["story_conv1", "extracted_v3_conv1"]
             .iter()
             .map(|id| position(&order, id))
             .min()
@@ -13446,7 +13748,9 @@ mod echo_recall_tests {
         rows.push(chunk("keystroke-frames", "conv7", 0.90, KEYSTROKE_FRAMES));
         rows.push(chunk("spinner-frames", "conv7", 0.88, SPINNER_FRAMES));
         let order = recall(&rows, &reflections).await;
-        for frames in ["keystroke-frames", "spinner-frames"] {
+        // Both recordings are conv7: one row stands for the session.
+        assert!(!order.contains(&"spinner-frames".to_string()), "{order:?}");
+        for frames in ["keystroke-frames"] {
             for answer in ["answer-chunk", "answer-chunk-2"] {
                 assert!(
                     position(&order, answer) < position(&order, frames),
@@ -13473,7 +13777,9 @@ mod echo_recall_tests {
     async fn csr_why_and_search_output_do_not_outrank_answers() {
         let (rows, reflections) = probe_rows();
         let order = recall(&rows, &reflections).await;
-        for noise in ["why-row", "search-row"] {
+        // `search-row` shares conv9 with `why-row`: one row per session.
+        assert!(!order.contains(&"search-row".to_string()), "{order:?}");
+        for noise in ["why-row"] {
             for answer in ["answer-chunk", "answer-chunk-2"] {
                 assert!(
                     position(&order, answer) < position(&order, noise),
@@ -13493,7 +13799,9 @@ mod echo_recall_tests {
             "why did we drop Docker and Qdrant? Because installing Docker was too painful and an embedded index was faster.",
         ));
         let order = recall(&rows, &reflections).await;
-        for echo in ["story_conv1", "extracted_v3_conv1", "echo-chunk"] {
+        // `echo-chunk` shares conv1 with `answer-chunk`: one row per session.
+        assert!(!order.contains(&"echo-chunk".to_string()), "{order:?}");
+        for echo in ["story_conv1", "extracted_v3_conv1"] {
             assert!(
                 position(&order, "repeat-with-answer") < position(&order, echo),
                 "a question that carries its answer must lead the bare echoes: {order:?}"
