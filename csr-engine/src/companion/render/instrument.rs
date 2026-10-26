@@ -227,11 +227,39 @@ pub struct Composition {
     pub clocks: Clocks,
     pub now: f64,
 }
+/// The layout width in pt that the pictures' x positions are measured in.
+pub const LAYOUT_WIDTH: f32 = W;
+/// One of the circles of the quota row. A tap on a circle opens the `i` page cut to its facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gauge {
+    FiveHour,
+    Week,
+    Cache,
+    Codex,
+}
+impl Gauge {
+    /// The code the circle carries in `Metrics.quota_gauges` and in a pane action.
+    pub fn code(self) -> &'static str {
+        match self {
+            Gauge::FiveHour => "5H",
+            Gauge::Week => "7D",
+            Gauge::Cache => "cache",
+            Gauge::Codex => "Codex 7D",
+        }
+    }
+    pub fn from_code(code: &str) -> Option<Gauge> {
+        [Gauge::FiveHour, Gauge::Week, Gauge::Cache, Gauge::Codex]
+            .into_iter()
+            .find(|g| g.code() == code)
+    }
+}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Open {
     pub scroll: usize,
     pub agents: bool,
     pub figure: bool,
+    /// With `figure`: the one circle whose facts the page shows. `None` lists every fact.
+    pub gauge: Option<Gauge>,
     pub changes: bool,
     pub threads: bool,
     pub dreams: bool,
@@ -980,7 +1008,11 @@ fn observation_fold_h() -> f32 {
 const DRILL_LINE: f32 = 17.;
 /// The figure card's height for the expanded chart (95 + 40), its labels and payback (72) and the
 /// gauge offset (84).
-const FIGURE_EXPANDED_H: f32 = 291.;
+const FIGURE_EXPANDED_BASE: f32 = 291.;
+/// The expanded figure's height: the history chart keeps its room when the legend is drawn.
+fn figure_expanded_h(g: &Value) -> f32 {
+    FIGURE_EXPANDED_BASE + legend_h(g)
+}
 /// Fewest lines a clipped section keeps, its "+N more" line included.
 const DRILL_MIN_LINES: usize = 4;
 /// Most thread bands an open `t` draws at once.
@@ -1179,9 +1211,14 @@ fn changes_note(c: &Composition) -> String {
 }
 const NO_THREADS: &str = "No threads yet: the session has said nothing out loud.";
 /// The figure's text rows: the closed pane's facts, or with `i` open one fact to a row.
-pub fn figure_text_rows(c: &Composition, cols: usize, open_figure: bool) -> Vec<String> {
+pub fn figure_text_rows(
+    c: &Composition,
+    cols: usize,
+    open_figure: bool,
+    gauge: Option<Gauge>,
+) -> Vec<String> {
     if open_figure {
-        figure_detail_lines(c)
+        figure_detail_lines(c, gauge)
             .iter()
             .flat_map(|line| {
                 // A fact whose pieces do not fit a row wraps; fact_rows would drop them.
@@ -1340,7 +1377,7 @@ fn assemble(
         }
     }
     // `i` opens the figure: one fact to a row, then the history in words.
-    let fig_lines = figure_text_rows(c, cols, open.figure);
+    let fig_lines = figure_text_rows(c, cols, open.figure, open.gauge);
     if open.changes || open.threads || open.dreams || open.agents {
         let details = out.drain(details_start..).collect::<Vec<_>>();
         let figure_rows = if show_figure { fig_lines.len() } else { 4 };
@@ -1638,6 +1675,46 @@ fn figure_facts(c: &Composition) -> (Vec<String>, Vec<String>) {
     (top, quotas)
 }
 
+/// The facts of one circle of the quota row, a line each. Empty when that circle is not drawn.
+fn gauge_facts(c: &Composition, gauge: Gauge) -> Vec<String> {
+    let g = &c.figure;
+    let quota = |code: &str| {
+        array(&g["quotas"])
+            .iter()
+            .find(|q| q["code"] == code && q["used"].is_number())
+    };
+    match gauge {
+        Gauge::FiveHour => quota("5H")
+            .map(|q| vec![text::paced(q)])
+            .unwrap_or_default(),
+        Gauge::Week => quota("7D")
+            .map(|q| {
+                let mut out = vec![format!(
+                    "{} · CSR {} pts",
+                    text::paced(q),
+                    c.csr_cost.share_label()
+                )];
+                let money = money_fact(c);
+                if !money.is_empty() {
+                    out.push(money);
+                }
+                out
+            })
+            .unwrap_or_default(),
+        Gauge::Cache => {
+            if g["cache"]["left"].is_number() || g["cache"]["cold"] == true {
+                vec![string(&g["cache"]["text"]).replace("CACHE ", "◷ ")]
+            } else {
+                vec![]
+            }
+        }
+        Gauge::Codex => c.codex_week["percent"]
+            .as_f64()
+            .map(|n| vec![format!("Codex 7D {n:.0}%")])
+            .unwrap_or_default(),
+    }
+}
+
 fn money_fact(c: &Composition) -> String {
     if has_week(c) && c.csr_cost.usd.is_some() {
         c.csr_cost.money_line()
@@ -1656,7 +1733,11 @@ fn figure_lines(c: &Composition) -> Vec<String> {
 
 /// What `i` opens: every fact of the figure on a line of its own, then the per-turn history in
 /// words. Says so when there is nothing to show.
-fn figure_detail_lines(c: &Composition) -> Vec<String> {
+fn figure_detail_lines(c: &Composition, gauge: Option<Gauge>) -> Vec<String> {
+    // A tapped circle shows its own facts; a circle with nothing to say falls back to the list.
+    if let Some(own) = gauge.map(|g| gauge_facts(c, g)).filter(|f| !f.is_empty()) {
+        return own;
+    }
     let (top, quotas) = figure_facts(c);
     let g = &c.figure;
     // The cost line alone is not a measurement: with only that, the pane still says nothing was measured.
@@ -1683,6 +1764,18 @@ fn figure_detail_lines(c: &Composition) -> Vec<String> {
         ));
     }
     out
+}
+
+/// The legend names the circles that are drawn, so it needs a Claude quota circle to sit under.
+fn has_legend(g: &Value) -> bool {
+    array(&g["quotas"]).iter().any(|q| q["used"].is_number())
+}
+fn legend_h(g: &Value) -> f32 {
+    if has_legend(g) {
+        LEGEND_H
+    } else {
+        0.
+    }
 }
 
 fn has_week(data: &Composition) -> bool {
@@ -1720,16 +1813,17 @@ fn quota_ring(c: &mut Canvas, data: &Composition, q: &Value, x: f32, y: f32, r: 
     if let Some((rest_end, from, to)) = csr {
         // Butt caps preserve the one-output-pixel notch without round-cap overlap.
         c.arc(x, y, r, 0., 1., t.ring, t.track, false);
-        c.arc(x, y, r, 0., rest_end, t.ring, t.sky, false);
+        c.arc(x, y, r, 0., rest_end, t.ring, t.claude, false);
         c.arc(x, y, r, from, to, t.ring, t.csr_share, false);
     } else {
-        c.ring(x, y, r, t.ring, t.track, &[(0., used, t.sky)]);
+        c.ring(x, y, r, t.ring, t.track, &[(0., used, t.claude)]);
     }
     c.quota_gauges.push(QuotaGauge {
         code: string(&q["code"]).into(),
         center: (x, y),
         radius: r,
         csr_segment: csr,
+        tap: None,
     });
 }
 
@@ -1838,6 +1932,7 @@ fn quota_row(
     r: f32,
     label_y: f32,
     caption_size: f32,
+    legend: bool,
     t: &Tokens,
 ) -> (f32, f32) {
     let g = &data.figure;
@@ -1861,6 +1956,9 @@ fn quota_row(
         bounds.0 = bounds.0.min(x - r);
         bounds.1 = bounds.1.max(x + r);
         quota_ring(c, data, q, x, cy, r, t);
+        if let Some(gauge) = c.quota_gauges.last_mut() {
+            gauge.tap = Some(tap_box(x, unit, cy, r, label_y));
+        }
         c.text(
             f,
             &format!("{:.0}%", num(&q["used"])),
@@ -1910,6 +2008,7 @@ fn quota_row(
             center: (x, cy),
             radius: r,
             csr_segment: None,
+            tap: Some(tap_box(x, unit, cy, r, label_y)),
         });
         // The minute shown is the one drawn: a seconds sweep repaints the whole picture.
         let left = (num(&g["cache"]["left"]) / 60.).floor() * 60.;
@@ -1970,14 +2069,16 @@ fn quota_row(
             center: (x, cy),
             radius: r,
             csr_segment: None,
+            tap: Some(tap_box(x, unit, cy, r, label_y)),
         });
+        // Black on a light pane, white on a dark one: Codex is the one provider drawn in ink.
         c.ring(
             x,
             cy,
             r,
             t.ring,
             t.track,
-            &[(0., (used / 100.).clamp(0., 1.) as f32, t.asked)],
+            &[(0., (used / 100.).clamp(0., 1.) as f32, t.ink)],
         );
         c.text(
             f,
@@ -2007,6 +2108,7 @@ fn quota_row(
             center: (x, cy),
             radius: 0.,
             csr_segment: None,
+            tap: None,
         });
         let card_w = (slot - S2).min(180.);
         let top = cy - r;
@@ -2058,7 +2160,137 @@ fn quota_row(
         bounds.0 = bounds.0.min(x - card_w / 2.);
         bounds.1 = bounds.1.max(x + card_w / 2.);
     }
+    if legend {
+        quota_legend(c, f, data, left, width, label_y + LEGEND_OFFSET, t);
+    }
     bounds
+}
+
+/// Height a layout gives the legend row under the quota captions.
+pub(super) const LEGEND_H: f32 = theme::CAPTION_LINE + S2;
+/// Baseline of the legend row below the captions' first line: two caption lines, then the row.
+const LEGEND_OFFSET: f32 = 2. * theme::CAPTION_LINE + S1;
+const LEGEND_SIZE: f32 = 9.;
+/// A circle's tap: its whole slot, from the top of the ring to below its second caption line.
+fn tap_box(x: f32, slot: f32, cy: f32, r: f32, label_y: f32) -> (f32, f32, f32, f32) {
+    (
+        x - slot / 2.,
+        cy - r,
+        x + slot / 2.,
+        label_y + theme::CAPTION_LINE + S1,
+    )
+}
+
+/// One swatch of the legend: a filled shape in the colour the circle is drawn in.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Swatch {
+    Disc(Rgba),
+    /// Codex: half ink, half track, as the ring is black or white on its track.
+    Half(Rgba, Rgba),
+    Bar(Rgba),
+    Glyph,
+}
+/// What the legend names under the circles that are drawn: (swatch, meaning).
+fn legend_entries(data: &Composition, t: &Tokens) -> Vec<(Swatch, &'static str)> {
+    let quotas: Vec<_> = array(&data.figure["quotas"])
+        .iter()
+        .filter(|q| q["used"].is_number())
+        .collect();
+    let mut out = vec![];
+    if !quotas.is_empty() {
+        out.push((Swatch::Disc(t.claude), "Claude"));
+    }
+    if data.codex_week["percent"].is_number() {
+        out.push((Swatch::Half(t.ink, t.track), "Codex"));
+    }
+    if data.figure["cache"]["left"].is_number() || data.figure["cache"]["cold"] == true {
+        out.push((Swatch::Disc(t.mint), "cache left"));
+    }
+    if data.csr_cost.share.is_some_and(|s| s > 0.) && has_week(data) {
+        out.push((Swatch::Bar(t.csr_share), "CSR share"));
+    }
+    if quotas.iter().any(|q| {
+        q["pace"]
+            .as_f64()
+            .is_some_and(|p| num(&q["used"]) / 100. > p)
+    }) {
+        out.push((Swatch::Glyph, "» ahead of pace"));
+    }
+    out
+}
+/// A row of filled swatches under the quota circles, one per meaning. Entries that do not fit
+/// the row are dropped from the end; a row that holds none is not drawn.
+fn quota_legend(
+    c: &mut Canvas,
+    f: &Fonts,
+    data: &Composition,
+    left: f32,
+    width: f32,
+    baseline: f32,
+    t: &Tokens,
+) {
+    const SWATCH: f32 = 7.;
+    const GAP: f32 = S1 + 1.;
+    const BETWEEN: f32 = S3;
+    let st = sans(LEGEND_SIZE, t.medium);
+    let measured: Vec<_> = legend_entries(data, t)
+        .into_iter()
+        .map(|(swatch, name)| {
+            let lead = if swatch == Swatch::Glyph {
+                0.
+            } else {
+                SWATCH + GAP
+            };
+            (swatch, name, lead + f.width(name, st))
+        })
+        .collect();
+    let mut shown = measured.len();
+    let total = |n: usize| {
+        measured[..n].iter().map(|m| m.2).sum::<f32>() + BETWEEN * n.saturating_sub(1) as f32
+    };
+    while shown > 0 && total(shown) > width {
+        shown -= 1;
+    }
+    if shown == 0 {
+        return;
+    }
+    let mut x = left + (width - total(shown)) / 2.;
+    let mid = baseline - f.cap(st) / 2.;
+    for (swatch, name, _) in &measured[..shown] {
+        match *swatch {
+            Swatch::Disc(col) => {
+                c.circle(x + SWATCH / 2., mid, SWATCH / 2., col);
+                x += SWATCH + GAP;
+            }
+            Swatch::Half(a, b) => {
+                c.circle(x + SWATCH / 2., mid, SWATCH / 2., a);
+                // The right half-disc: a stroke as wide as the disc's radius, around its middle.
+                c.arc(
+                    x + SWATCH / 2.,
+                    mid,
+                    SWATCH / 4.,
+                    0.,
+                    0.5,
+                    SWATCH / 2.,
+                    b,
+                    false,
+                );
+                x += SWATCH + GAP;
+            }
+            Swatch::Bar(col) => {
+                c.rrect(x + 1.5, mid - SWATCH / 2., SWATCH - 3., SWATCH, 1., col);
+                x += SWATCH + GAP;
+            }
+            Swatch::Glyph => {}
+        }
+        let ink = if *swatch == Swatch::Glyph {
+            t.quiet
+        } else {
+            t.ink
+        };
+        c.text(f, name, x, baseline, st, ink, A::L);
+        x += f.width(name, st) + BETWEEN;
+    }
 }
 
 // The geometry and primitives below are the approved B prototype's glass, serif and ring design.
@@ -2556,7 +2788,7 @@ pub fn draw(
     let figure_floor: f32 = if quotas_only { 154. } else { 110. };
     // `i` adds a card of the figure's facts, one to a line, under the figure.
     let fig_detail_all: Vec<String> = if open.figure {
-        figure_detail_lines(c)
+        figure_detail_lines(c, open.gauge)
             .iter()
             .flat_map(|line| f.wrap(line, sans(11.5, t.regular), IW))
             .collect()
@@ -2624,7 +2856,7 @@ pub fn draw(
     let figure_target = if quotas_only {
         empty_quota_height(c)
     } else if open.figure && fresh_bar_heights(&c.requests).is_some() {
-        FIGURE_EXPANDED_H
+        figure_expanded_h(&c.figure)
     } else {
         collapsed_context_layout(&c.figure, 0.).2
     };
@@ -3301,7 +3533,7 @@ pub fn draw(
         y,
         figure_layout_h,
         t,
-        open.figure && figure_h >= FIGURE_EXPANDED_H,
+        open.figure && figure_h >= FIGURE_EXPANDED_BASE,
         narrow,
     );
     if let Some((cy, ring, group, avail, mid)) = fig_info {
@@ -3687,7 +3919,13 @@ fn empty_quota_radius(c: &Composition) -> f32 {
     ((IW / count.max(1) as f32 - S3) / 2.).clamp(30., 64.)
 }
 fn empty_quota_height(c: &Composition) -> f32 {
-    P + theme::TITLE_LINE + S2 + 2. * empty_quota_radius(c) + 46. + theme::CAPTION_LINE + P
+    P + theme::TITLE_LINE
+        + S2
+        + 2. * empty_quota_radius(c)
+        + 46.
+        + theme::CAPTION_LINE
+        + legend_h(&c.figure)
+        + P
 }
 
 fn context_title_height(g: &Value) -> f32 {
@@ -3814,6 +4052,10 @@ fn figure(
     let mut collapsed_pay_y = None;
     let mut collapsed_sat_cy = None;
     let mut context_quota_radius = 30.;
+    // Whether the quota row's legend has room. The expanded chart keeps its height and the
+    // collapsed ring may have none to spare: then the legend is not drawn.
+    let mut legend_drawn = !expanded || h >= figure_expanded_h(g);
+    let legend_gap = if legend_drawn { legend_h(g) } else { 0. };
     label(
         c,
         f,
@@ -3895,7 +4137,7 @@ fn figure(
     if let (Some(n), Some(size)) = (tokens, size) {
         if expanded {
             // Fresh input has its own scale. A context-window ceiling/band would be a different unit.
-            let gauge_cy = y + h - 84.;
+            let gauge_cy = y + h - 84. - legend_gap;
             let chart_bottom = (gauge_cy - 72.).max(y + 135.);
             expanded_chart_bottom = chart_bottom;
             history_plot(c, f, data, y + 70., chart_bottom - (y + 70.) + S2, t);
@@ -3938,20 +4180,40 @@ fn figure(
             let ring_extent = r + S3;
             let needed = collapsed_context_layout(g, h).2;
             let slack = (h - needed).max(0.);
-            let history_h = if fresh_bar_heights(&data.requests).is_some() && slack >= 50. {
+            // The closed pane's height is the least the ring needs, so the legend takes only
+            // room that is spare: from the history plot's, which keeps its own minimum, or from
+            // the slack around the group. With none to spare it is not drawn.
+            let spare = legend_h(g);
+            let mut history_h = if fresh_bar_heights(&data.requests).is_some() && slack >= 50. {
                 slack
             } else {
                 0.
             };
+            if history_h > 0. && history_h - spare >= 50. {
+                history_h -= spare;
+            } else if history_h > 0. {
+                legend_drawn = false;
+            }
             if history_h == 0. {
                 context_quota_radius = (30. + slack / 4.).min(54.).min(empty_quota_radius(data));
             }
             let gauge_growth = 2. * (context_quota_radius - 30.);
+            let loose = if history_h > 0. {
+                0.
+            } else {
+                slack - gauge_growth
+            };
+            let legend_room = if history_h > 0. {
+                legend_drawn
+            } else {
+                loose >= spare + S2
+            };
+            legend_drawn = legend_drawn && legend_room;
             let group_top = title_bottom
                 + if history_h > 0. {
                     0.
                 } else {
-                    (slack - gauge_growth) / 2.
+                    (loose - if legend_drawn { spare } else { 0. }) / 2.
                 };
             let cy = group_top + ring_extent;
             let cx = W / 2.;
@@ -4012,7 +4274,7 @@ fn figure(
     let pay = payback(g);
     // Gauge labels stay >= 24pt above the card bottom; collapsed uses the exact group geometry.
     let quota_radius = if tokens.is_none() {
-        ((h - (P + theme::TITLE_LINE + S2 + 46. + theme::CAPTION_LINE + P)) / 2.)
+        ((h - (P + theme::TITLE_LINE + S2 + 46. + theme::CAPTION_LINE + legend_h(g) + P)) / 2.)
             .clamp(30., empty_quota_radius(data))
     } else {
         context_quota_radius
@@ -4023,7 +4285,7 @@ fn figure(
             y + P + theme::TITLE_LINE,
         )
     } else if expanded {
-        let sat = y + h - 84.;
+        let sat = y + h - 84. - legend_gap;
         let below_chart = expanded_chart_bottom + 33.;
         let above_gauges = sat - 36.;
         (
@@ -4035,7 +4297,7 @@ fn figure(
     } else if let (Some(pay), Some(sat)) = (collapsed_pay_y, collapsed_sat_cy) {
         (sat, pay)
     } else {
-        (y + h - 84., y + h - 120.)
+        (y + h - 84. - legend_gap, y + h - 120. - legend_gap)
     };
     if g["compacting"].is_object() {
         if let Some(high) = g["compacting"]["usual"]["high"]
@@ -4079,6 +4341,7 @@ fn figure(
         quota_radius,
         sat_cy + quota_radius + S4,
         theme::CAPTION_SIZE,
+        has_legend(g) && legend_drawn,
         t,
     );
     Some((ceiling_y, ring_bounds, ring_group, ring_formula_avail, None))
@@ -4136,6 +4399,7 @@ fn draw_context_strip(
         16.,
         y + h - 28.,
         10.,
+        false,
         t,
     );
     (None, None, None, None, None)
@@ -4204,7 +4468,8 @@ fn draw_context_mid(
     let label_below = gauge_r + 12.;
     let details_gap = S3;
     let details_h = 6.;
-    let right_h = gauge_r + label_below + theme::CAPTION_LINE + details_gap + details_h;
+    let right_h =
+        gauge_r + label_below + theme::CAPTION_LINE + legend_h(g) + details_gap + details_h;
     let core_h = (2. * r).max(right_h);
     let history_h = if fresh_bar_heights(&data.requests).is_some() && slot - core_h - S3 >= 50. {
         slot - core_h - S3
@@ -4222,7 +4487,7 @@ fn draw_context_mid(
     let right_top = group_top + (core_h - right_h).max(0.) / 2.;
     let gauges_cy = right_top + gauge_r;
     let gauge_label_y = gauges_cy + label_below;
-    let details_y = gauge_label_y + theme::CAPTION_LINE + details_gap + 2.;
+    let details_y = gauge_label_y + theme::CAPTION_LINE + legend_h(g) + details_gap + 2.;
 
     let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
     if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64()) {
@@ -4270,6 +4535,7 @@ fn draw_context_mid(
         gauge_r,
         gauge_label_y,
         theme::CAPTION_SIZE,
+        has_legend(g),
         t,
     );
 
@@ -4465,7 +4731,7 @@ pub fn strip(
         let st = sans(10., t.medium);
         c.text(f, &f.fit(&pay, st, w - 86.), 76., 37., st, t.mint, A::L);
     }
-    quota_row(&mut c, f, data, 76., w - 86., 65., 16., 93., 8., t);
+    quota_row(&mut c, f, data, 76., w - 86., 65., 16., 93., 8., false, t);
     Some(c.pm)
 }
 
@@ -4734,6 +5000,174 @@ mod tests {
             ],
             "the compaction footer row is dropped, the rest keep their order"
         );
+    }
+
+    /// CIEDE2000 between two sRGB colours (Sharma, Wu, Dalal 2005).
+    fn ciede2000(a: [u8; 4], b: [u8; 4]) -> f64 {
+        fn lab(c: [u8; 4]) -> (f64, f64, f64) {
+            let lin = |v: u8| {
+                let v = f64::from(v) / 255.;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let (r, g, bl) = (lin(c[0]), lin(c[1]), lin(c[2]));
+            let x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * bl;
+            let y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * bl;
+            let z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * bl;
+            let f = |t: f64| {
+                if t > 216. / 24389. {
+                    t.cbrt()
+                } else {
+                    (24389. / 27. * t + 16.) / 116.
+                }
+            };
+            let (fx, fy, fz) = (f(x / 0.95047), f(y), f(z / 1.08883));
+            (116. * fy - 16., 500. * (fx - fy), 200. * (fy - fz))
+        }
+        let ((l1, a1, b1), (l2, a2, b2)) = (lab(a), lab(b));
+        let (c1, c2) = (a1.hypot(b1), a2.hypot(b2));
+        let cb = (c1 + c2) / 2.;
+        let g = 0.5 * (1. - (cb.powi(7) / (cb.powi(7) + 25f64.powi(7))).sqrt());
+        let (a1p, a2p) = ((1. + g) * a1, (1. + g) * a2);
+        let (c1p, c2p) = (a1p.hypot(b1), a2p.hypot(b2));
+        let hue = |b: f64, a: f64| b.atan2(a).to_degrees().rem_euclid(360.);
+        let (h1, h2) = (hue(b1, a1p), hue(b2, a2p));
+        let (dl, dc) = (l2 - l1, c2p - c1p);
+        let mut dh = h2 - h1;
+        if c1p * c2p == 0. {
+            dh = 0.;
+        } else if dh > 180. {
+            dh -= 360.;
+        } else if dh < -180. {
+            dh += 360.;
+        }
+        let dhh = 2. * (c1p * c2p).sqrt() * (dh.to_radians() / 2.).sin();
+        let (lb, cbp) = ((l1 + l2) / 2., (c1p + c2p) / 2.);
+        let hb = if c1p * c2p == 0. {
+            h1 + h2
+        } else if (h1 - h2).abs() <= 180. {
+            (h1 + h2) / 2.
+        } else if h1 + h2 < 360. {
+            (h1 + h2 + 360.) / 2.
+        } else {
+            (h1 + h2 - 360.) / 2.
+        };
+        let t = 1. - 0.17 * (hb - 30.).to_radians().cos()
+            + 0.24 * (2. * hb).to_radians().cos()
+            + 0.32 * (3. * hb + 6.).to_radians().cos()
+            - 0.20 * (4. * hb - 63.).to_radians().cos();
+        let dth = 30. * (-((hb - 275.) / 25.).powi(2)).exp();
+        let rc = 2. * (cbp.powi(7) / (cbp.powi(7) + 25f64.powi(7))).sqrt();
+        let sl = 1. + 0.015 * (lb - 50.).powi(2) / (20. + (lb - 50.).powi(2)).sqrt();
+        let (sc, sh) = (1. + 0.045 * cbp, 1. + 0.015 * cbp * t);
+        let rt = -(2. * dth).to_radians().sin() * rc;
+        ((dl / sl).powi(2) + (dc / sc).powi(2) + (dhh / sh).powi(2) + rt * (dc / sc) * (dhh / sh))
+            .sqrt()
+    }
+
+    #[test]
+    fn claude_orange_stays_visibly_apart_from_the_warning_amber_in_both_themes() {
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let claude = t.claude;
+            assert!(ciede2000(claude, t.amber) >= 20., "{theme:?} vs amber");
+            assert!(ciede2000(claude, t.warn) >= 20., "{theme:?} vs warn");
+            assert!(
+                ciede2000(claude, t.csr_share) >= 20.,
+                "{theme:?} vs CSR pink"
+            );
+        }
+    }
+
+    fn quota_composition() -> Composition {
+        let mut c = drill_composition(0, 0, true);
+        c.figure["quotas"] = json!([
+            {"code":"5H","used":18.,"pace":0.1,"text":"5H 18% · 3h left ↻ 11:20"},
+            {"code":"7D","used":45.,"pace":0.4,"text":"7D 45% · 4d left ↻ Sun 07:00"},
+        ]);
+        c.figure["cache"] = json!({"left": 1800., "ttl": 3600., "text": "CACHE 30m left"});
+        c.codex_week = json!({"percent": 41.});
+        c.csr_cost.share = Some(4.7);
+        c
+    }
+
+    #[test]
+    fn a_tapped_circle_lists_only_its_own_facts() {
+        let c = quota_composition();
+        let all = figure_text_rows(&c, 100, true, None).join("\n");
+        for code in ["5H 18%", "7D 45%", "30m left", "Codex 7D 41%"] {
+            assert!(all.contains(code), "{code}: {all}");
+        }
+        for (gauge, has, lacks) in [
+            (Gauge::FiveHour, "5H 18%", "7D 45%"),
+            (Gauge::Week, "7D 45%", "5H 18%"),
+            (Gauge::Cache, "30m left", "5H 18%"),
+            (Gauge::Codex, "Codex 7D 41%", "7D 45%"),
+        ] {
+            let own = figure_text_rows(&c, 100, true, Some(gauge)).join("\n");
+            assert!(own.contains(has), "{gauge:?}: {own}");
+            assert!(!own.contains(lacks), "{gauge:?}: {own}");
+            assert!(!own.contains("CTX"), "{gauge:?}: {own}");
+        }
+        // A circle that is not drawn falls back to the whole list.
+        let mut bare = quota_composition();
+        bare.codex_week = json!({});
+        assert_eq!(
+            figure_text_rows(&bare, 100, true, Some(Gauge::Codex)),
+            figure_text_rows(&bare, 100, true, None)
+        );
+    }
+
+    #[test]
+    fn every_drawn_circle_has_its_own_tap_and_a_legend_sits_under_the_row() {
+        let c = quota_composition();
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let (width, avail) = (1210_u32, 1800_u32);
+            let (pm, m) = draw(&c, width, avail, theme, Open::default(), false).expect("draws");
+            let codes: Vec<_> = m.quota_gauges.iter().map(|g| g.code.as_str()).collect();
+            assert_eq!(codes, vec!["5H", "7D", "cache", "Codex 7D"], "{theme:?}");
+            let taps: Vec<_> = m.quota_gauges.iter().map(|g| g.tap.expect("tap")).collect();
+            for (g, tap) in m.quota_gauges.iter().zip(&taps) {
+                assert!(tap.0 < g.center.0 && g.center.0 < tap.2, "{}", g.code);
+                assert!(tap.1 <= g.center.1 - g.radius + 0.01, "{}", g.code);
+                assert!(tap.3 > g.center.1 + g.radius, "{}", g.code);
+                assert_eq!(
+                    Gauge::from_code(&g.code).map(Gauge::code),
+                    Some(g.code.as_str())
+                );
+            }
+            for pair in taps.windows(2) {
+                assert!(pair[0].2 <= pair[1].0 + 0.01, "taps overlap: {pair:?}");
+            }
+            // The legend: filled Claude-orange swatch below every tap, none of it amber.
+            let scale = (width as f32 / W).min(avail as f32 / m.height);
+            let left = (width as f32 - (W * scale).round().min(width as f32)) / 2.;
+            let band = (
+                (taps[0].3 * scale).ceil() as u32,
+                ((taps[0].3 + LEGEND_H + 8.) * scale) as u32,
+            );
+            let near = |p: &[u8], c: [u8; 4]| {
+                (0..3).all(|i| (i32::from(p[i]) - i32::from(c[i])).abs() <= 6)
+            };
+            let (mut orange, mut amber) = (0, 0);
+            for y in band.0..band.1 {
+                for x in left as u32..(left as u32 + (W * scale) as u32).min(width) {
+                    let px = pm.pixel(x, y).expect("in the picture");
+                    let rgb = [px.red(), px.green(), px.blue()];
+                    orange += usize::from(near(&rgb, t.claude));
+                    amber += usize::from(near(&rgb, t.amber));
+                }
+            }
+            assert!(
+                orange >= 20,
+                "{theme:?}: {orange} Claude-orange px in the legend band"
+            );
+            assert_eq!(amber, 0, "{theme:?}: warning amber in the legend band");
+        }
     }
 
     #[test]
@@ -5449,7 +5883,7 @@ mod tests {
                             let (_, card) = m
                                 .figure_detail_region
                                 .unwrap_or_else(|| panic!("{at}: no facts card"));
-                            let lines = figure_detail_lines(&c).len().min(3);
+                            let lines = figure_detail_lines(&c, None).len().min(3);
                             assert!(card >= P * 2. + lines as f32 * DRILL_LINE, "{at}: {card}");
                         }
                     }

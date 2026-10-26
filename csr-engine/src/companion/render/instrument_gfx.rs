@@ -583,6 +583,9 @@ pub struct QuotaGauge {
     pub radius: f32,
     /// Fractions: end of other usage, start of CSR, end of CSR.
     pub csr_segment: Option<(f32, f32, f32)>,
+    /// The circle's own tap target in layout pt: left, top, right, bottom. Absent for a card that
+    /// is not a circle.
+    pub tap: Option<(f32, f32, f32, f32)>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]

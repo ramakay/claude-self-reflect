@@ -561,6 +561,10 @@ fn frame_main_100x70_open_compacted() {
     check_frame("frame-main-100x70-open-compacted");
 }
 #[test]
+fn frame_main_100x70_gauge_7d() {
+    check_frame("frame-main-100x70-gauge-7d");
+}
+#[test]
 fn frame_main_100x70_open_agent() {
     check_frame("frame-main-100x70-open-agent");
 }

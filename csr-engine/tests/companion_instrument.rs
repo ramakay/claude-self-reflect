@@ -1881,6 +1881,83 @@ fn gauge_centres_are_even_and_positive_csr_arcs_have_a_visible_separator() {
 }
 
 #[test]
+fn a_tap_on_each_quota_circle_opens_that_circles_page() {
+    use csr_engine::companion::render::instrument::{Gauge, LAYOUT_WIDTH};
+    // The row and the span of cells the circle `code` is a target in, on the frame as drawn now.
+    fn circle(pane: &Pane, code: &str) -> Option<(usize, (u64, u64))> {
+        pane.acts.iter().find_map(|(row, act)| {
+            act["gauges"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|s| s[2] == code)
+                .map(|s| (*row, (s[0].as_u64().unwrap(), s[1].as_u64().unwrap())))
+        })
+    }
+    for (cols, rows) in [(60, 40), (76, 67)] {
+        let (_home, paths) = state_home("02-running");
+        let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+        pane.pixels = true;
+        pane.enable_cards();
+        pane.frame(cols, rows, NOW);
+        let m = pane.instrument_metrics.clone().unwrap();
+        let drawn: Vec<_> = m
+            .quota_gauges
+            .iter()
+            .filter(|g| g.tap.is_some())
+            .map(|g| (g.code.clone(), g.center.0))
+            .collect();
+        assert!(drawn.len() >= 3, "{cols}x{rows}: {drawn:?}");
+        let mut seen = vec![];
+        for (code, centre_x) in &drawn {
+            let gauge = Gauge::from_code(code).unwrap_or_else(|| panic!("{code}"));
+            let centre = (m.content_left + centre_x / LAYOUT_WIDTH * m.content_width) * cols as f32;
+            let (row, span) = circle(&pane, code)
+                .unwrap_or_else(|| panic!("{cols}x{rows}: no tap row for {code}"));
+            assert!(
+                span.0 as f32 <= centre && centre <= span.1 as f32,
+                "{code}: centre {centre} outside {span:?}"
+            );
+            let col = ((span.0 + span.1) / 2) as usize;
+            assert!(pane.click(row, col, NOW));
+            assert_eq!(pane.instrument_open.gauge, Some(gauge), "{code}");
+            assert!(pane.instrument_open.figure, "{code}");
+            let text = pane.frame(cols, rows, NOW).join("\n");
+            let png = pane
+                .placed
+                .first()
+                .map(|p| p.png.to_vec())
+                .unwrap_or_default();
+            seen.push((code.clone(), (text, png)));
+            // The same circle again closes its page. The page moved the rows: find it again.
+            let (row, span) = circle(&pane, code)
+                .unwrap_or_else(|| panic!("{cols}x{rows}: {code} not a target while open"));
+            assert!(pane.click(row, ((span.0 + span.1) / 2) as usize, NOW));
+            assert!(
+                !pane.instrument_open.figure && pane.instrument_open.gauge.is_none(),
+                "{code}"
+            );
+            pane.frame(cols, rows, NOW);
+        }
+        // Each circle's page differs from the others'.
+        for (i, (ca, a)) in seen.iter().enumerate() {
+            for (cb, b) in &seen[i + 1..] {
+                assert_ne!(a, b, "{cols}x{rows}: {ca} and {cb} opened the same page");
+            }
+        }
+        // A cell on the figure that is on no circle still opens the plain list.
+        let row = pane
+            .acts
+            .iter()
+            .find(|(_, a)| a["key"] == "instrument:figure" && a["gauges"].is_null())
+            .map(|(r, _)| *r)
+            .expect("a figure row outside the circles");
+        assert!(pane.click(row, 0, NOW));
+        assert!(pane.instrument_open.figure && pane.instrument_open.gauge.is_none());
+    }
+}
+
+#[test]
 fn real_shaped_fresh_input_varies_and_flat_history_abstains() {
     for theme in [Theme::Dark, Theme::Light] {
         for expanded in [false, true] {
