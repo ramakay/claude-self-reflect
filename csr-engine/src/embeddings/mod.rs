@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod onnx_embed;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;

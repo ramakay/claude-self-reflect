@@ -11,6 +11,7 @@ pub mod bench;
 pub mod codegraph;
 pub mod contamination;
 pub mod continuity;
+pub mod embed_sample;
 pub mod health;
 pub mod lessons;
 pub mod probe;

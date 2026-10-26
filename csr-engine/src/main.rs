@@ -219,6 +219,11 @@ enum Commands {
         #[command(subcommand)]
         action: MirrorAction,
     },
+    /// Embedding model tools for the S4 comparison: sample, compare, query-bench.
+    Embed {
+        #[command(subcommand)]
+        action: EmbedAction,
+    },
     /// Identifier postings: the exact-match index of paths, symbols, flags and SHAs.
     /// Opens the database directly; runs only its own additive migration.
     Identifiers {
@@ -680,6 +685,73 @@ enum SymbolAction {
         /// `--file` still names the path and so the language
         #[arg(long)]
         stdin: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EmbedAction {
+    /// Embed a JSONL sample (chunk_id + text) and write vectors, ids and meta.
+    Sample {
+        /// gemma-q8, gemma-fp32, granite-int8, granite-fp32 or minilm.
+        #[arg(long)]
+        model: String,
+        /// Output widths, comma separated (Matryoshka prefix, re-normalised).
+        #[arg(long, value_delimiter = ',', required = true)]
+        dims: Vec<usize>,
+        /// Input JSONL with `chunk_id` and `text` fields.
+        #[arg(long = "in")]
+        input: PathBuf,
+        /// Output prefix: writes <prefix>.d<d>.f32, <prefix>.ids, <prefix>.meta.json.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 16)]
+        batch: usize,
+        /// Intra-op threads (default: all cores).
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+        #[arg(long = "max-tokens", default_value_t = 512)]
+        max_tokens: usize,
+        /// Directory holding the model folders.
+        #[arg(long = "model-root")]
+        model_root: Option<PathBuf>,
+        /// Overwrite a finished output.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Per-row cosine between two vector files, rows aligned by chunk_id.
+    Compare {
+        #[arg(long)]
+        a: PathBuf,
+        #[arg(long)]
+        b: PathBuf,
+        #[arg(long = "ids-a")]
+        ids_a: PathBuf,
+        #[arg(long = "ids-b")]
+        ids_b: PathBuf,
+        #[arg(long)]
+        dims: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Single-query embed latency (3 warm-ups, then one query at a time).
+    QueryBench {
+        #[arg(long)]
+        model: String,
+        /// Audit-queries JSON or probes JSON.
+        #[arg(long)]
+        queries: PathBuf,
+        #[arg(long)]
+        dims: Option<usize>,
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+        #[arg(long = "max-tokens", default_value_t = 512)]
+        max_tokens: usize,
+        #[arg(long = "model-root")]
+        model_root: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -1503,6 +1575,77 @@ async fn run(
         print!("{out}");
         if !out.ends_with('\n') {
             println!();
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::Embed { ref action }) = args.command {
+        use csr_engine::eval::embed_sample as es;
+        match action {
+            EmbedAction::Sample {
+                model,
+                dims,
+                input,
+                out,
+                limit,
+                batch,
+                threads,
+                max_tokens,
+                model_root,
+                force,
+            } => {
+                let meta = es::run_sample(es::SampleConfig {
+                    preset: es::Preset::parse(model)?,
+                    model_root: model_root.clone().unwrap_or_else(es::default_model_root),
+                    dims: dims.clone(),
+                    input: input.clone(),
+                    out_prefix: out.clone(),
+                    limit: *limit,
+                    batch: *batch,
+                    threads: *threads,
+                    max_tokens: *max_tokens,
+                    force: *force,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&meta)?);
+            }
+            EmbedAction::Compare {
+                a,
+                b,
+                ids_a,
+                ids_b,
+                dims,
+                out,
+            } => {
+                let stats = es::run_compare(es::CompareConfig {
+                    a: a.clone(),
+                    b: b.clone(),
+                    ids_a: ids_a.clone(),
+                    ids_b: ids_b.clone(),
+                    dims: *dims,
+                    out: out.clone(),
+                })?;
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            }
+            EmbedAction::QueryBench {
+                model,
+                queries,
+                dims,
+                threads,
+                max_tokens,
+                model_root,
+                out,
+            } => {
+                let report = es::run_query_bench(es::QueryBenchConfig {
+                    preset: es::Preset::parse(model)?,
+                    model_root: model_root.clone().unwrap_or_else(es::default_model_root),
+                    queries: queries.clone(),
+                    dims: *dims,
+                    threads: *threads,
+                    max_tokens: *max_tokens,
+                    out: out.clone(),
+                })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
         }
         return Ok(());
     }
