@@ -2426,6 +2426,9 @@ pub fn run(conn: &Connection) -> Result<()> {
 
     create_graph_gen_triggers(conn)?;
 
+    // Exact-match index of identifiers (paths, symbols, flags, SHAs). Additive.
+    super::identifier_postings::migrate_identifier_postings(conn)?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())

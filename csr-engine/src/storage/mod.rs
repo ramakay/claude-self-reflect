@@ -10,6 +10,7 @@ pub mod dream_delivery;
 pub mod dream_items;
 pub mod dream_report;
 pub(crate) mod embedding_changes;
+pub mod identifier_postings;
 pub mod intent_events;
 pub mod learnt_feeds;
 pub mod legacy_frontier;
@@ -1493,6 +1494,18 @@ impl Storage {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         Ok(result == "ok")
+    }
+
+    /// Chunks matching a query's identifier terms, best first
+    /// (see `identifier_postings::search_postings`). Empty when the table is absent.
+    pub fn search_postings(
+        &self,
+        idents: &[crate::search::identifiers::QueryIdent],
+        fetch: usize,
+        family: Option<&[&str]>,
+    ) -> Result<Vec<(String, f64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        identifier_postings::search_postings(&conn, idents, fetch, family)
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {

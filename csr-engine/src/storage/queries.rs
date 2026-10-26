@@ -608,7 +608,22 @@ pub fn insert_chunk_with_source(
         params![chunk.id, vec_to_bytes(embedding)],
     )?;
 
+    write_chunk_postings(conn, &chunk.id, &chunk.content)?;
+
     Ok(())
+}
+
+/// Identifier postings for a chunk just written, in the caller's transaction.
+/// A connection without the table (a hand-built test schema) writes none; the
+/// table is derived data and `identifiers backfill` fills it in.
+fn write_chunk_postings(conn: &Connection, id: &str, content: &str) -> Result<()> {
+    let rowid: i64 =
+        conn.query_row("SELECT rowid FROM chunks WHERE id = ?1", [id], |r| r.get(0))?;
+    match crate::storage::identifier_postings::write_postings(conn, rowid, content) {
+        Ok(_) => Ok(()),
+        Err(error) if format!("{error:#}").contains("no such table: identifier_postings") => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Read back a chunk's storage-level `source` ('conversation' | 'plan' | ...). The

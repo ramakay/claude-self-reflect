@@ -219,6 +219,12 @@ enum Commands {
         #[command(subcommand)]
         action: MirrorAction,
     },
+    /// Identifier postings: the exact-match index of paths, symbols, flags and SHAs.
+    /// Opens the database directly; runs only its own additive migration.
+    Identifiers {
+        #[command(subcommand)]
+        action: IdentifiersAction,
+    },
     /// Run ratification extraction for specific conversation IDs (one-off,
     /// bypasses the daemon queue ordering)
     Ratify {
@@ -550,6 +556,24 @@ enum ProvenanceAction {
 /// `--report` mean something entirely different from the witness-ledger
 /// `dream` command's flags of the same name, and clap subcommand namespaces
 /// keep the two from colliding.
+/// `identifiers` subcommands. Neither loads the embedding model, touches the
+/// HNSW index, or runs the full migrations. Each prints one JSON line.
+#[derive(Subcommand, Debug)]
+enum IdentifiersAction {
+    /// Write postings for every chunk past the watermark (resumable)
+    Backfill {
+        /// Database to fill (default: the global --db-path)
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Report how many path-bearing chunks have postings
+    Coverage {
+        /// Database to read (default: the global --db-path)
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+}
+
 /// `mirror` subcommands. None of them loads the embedding model or the index.
 /// `codemap` subcommands. They use the global `--db-path`; none loads the
 /// embedding model or the search index.
@@ -1348,6 +1372,33 @@ async fn run(
                 std::process::exit(1);
             }
         };
+    }
+
+    if let Some(Commands::Identifiers { ref action }) = args.command {
+        use csr_engine::storage::identifier_postings as postings;
+        use rusqlite::{Connection, OpenFlags};
+        let (IdentifiersAction::Backfill { db } | IdentifiersAction::Coverage { db }) = action;
+        let db_path = db.clone().unwrap_or_else(|| args.db_path.clone());
+        let data_dir = db_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        // Same courtesy as `Storage::open`: wait out an exclusive maintenance run.
+        let _maintenance = csr_engine::maintenance::shared(&data_dir)?;
+        let line = match action {
+            IdentifiersAction::Backfill { .. } => {
+                let conn =
+                    Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+                let report = postings::backfill(&conn, postings::DEFAULT_BATCH)?;
+                serde_json::to_string(&report)?
+            }
+            IdentifiersAction::Coverage { .. } => {
+                let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                serde_json::to_string(&postings::coverage(&conn)?)?
+            }
+        };
+        println!("{line}");
+        return Ok(());
     }
 
     if let Some(Commands::Codemap { ref action }) = args.command {

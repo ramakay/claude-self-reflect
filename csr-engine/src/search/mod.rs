@@ -3,6 +3,7 @@ pub mod cross_project;
 pub mod decay;
 pub mod echo;
 pub mod hybrid;
+pub mod identifiers;
 pub mod reinstatement;
 pub mod rerank;
 pub mod trained_rerank;
