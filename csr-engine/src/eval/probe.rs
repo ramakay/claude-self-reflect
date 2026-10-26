@@ -116,7 +116,13 @@ fn load_probes(text: &str) -> Result<(usize, Vec<CompiledProbe>)> {
     Ok((file.limit, probes))
 }
 
-/// `(rank, block text)` for every `<r rank="N">` block in the response.
+/// `(rank, block text)` for every top-level `<r rank="N">` block in the response.
+///
+/// A result excerpt can echo an earlier CSR response, so `<r rank=` tags also
+/// occur as text inside a block. Those are not boundaries. The top-level
+/// blocks are the ones `<summary count="N">` announces: walk ranks N..1 and
+/// take, for each rank, its last tag that lies before the start already
+/// chosen for rank k+1. Without a summary, N is the highest rank seen.
 fn split_blocks(text: &str) -> Vec<(usize, &str)> {
     let marker = Regex::new(r#"<r rank="(\d+)""#).expect("static regex");
     let found: Vec<(usize, usize)> = marker
@@ -127,14 +133,39 @@ fn split_blocks(text: &str) -> Vec<(usize, &str)> {
             Some((n, whole.start()))
         })
         .collect();
-    found
+    let Some(max_rank) = found.iter().map(|(n, _)| *n).max() else {
+        return Vec::new();
+    };
+    let top = summary_count(text).map_or(max_rank, |c| c.min(max_rank));
+    let mut starts: Vec<(usize, usize)> = Vec::new();
+    let mut limit = text.len() + 1;
+    for k in (1..=top).rev() {
+        if let Some(pos) = found
+            .iter()
+            .filter(|(n, pos)| *n == k && *pos < limit)
+            .map(|(_, pos)| *pos)
+            .next_back()
+        {
+            limit = pos;
+            starts.push((k, pos));
+        }
+    }
+    starts.reverse();
+    starts
         .iter()
         .enumerate()
         .map(|(i, (n, start))| {
-            let end = found.get(i + 1).map_or(text.len(), |next| next.1);
+            let end = starts.get(i + 1).map_or(text.len(), |next| next.1);
             (*n, &text[*start..end])
         })
         .collect()
+}
+
+/// The `count` of the first `<summary count="N"`: the top-level one, since the
+/// renderer writes it before any result and escapes everything it echoes.
+fn summary_count(text: &str) -> Option<usize> {
+    let marker = Regex::new(r#"<summary count="(\d+)""#).expect("static regex");
+    marker.captures(text)?.get(1)?.as_str().parse().ok()
 }
 
 /// The session a result block belongs to: its `session` attribute, else its
@@ -149,11 +180,17 @@ fn block_session(block: &str) -> Option<String> {
     tag_text(block, "cid")
 }
 
+/// The text of `<tag>` in a result block. The renderer writes `cid`/`id`
+/// after the excerpt, and an excerpt may echo another response that carries
+/// its own `<cid>`/`<id>`, so read only what follows the last `</excerpt>`.
 fn tag_text(block: &str, tag: &str) -> Option<String> {
+    let tail = block
+        .rfind("</excerpt>")
+        .map_or(block, |at| &block[at + "</excerpt>".len()..]);
     let open = format!("<{tag}>");
-    let start = block.find(&open)? + open.len();
-    let end = block[start..].find(&format!("</{tag}>"))?;
-    Some(block[start..start + end].to_string())
+    let start = tail.find(&open)? + open.len();
+    let end = tail[start..].find(&format!("</{tag}>"))?;
+    Some(tail[start..start + end].to_string())
 }
 
 fn block_eid(block: &str) -> Option<String> {
@@ -288,12 +325,29 @@ struct ProbeRow {
     session_scored: bool,
     session_hit_rank: Option<usize>,
     rank1_score: Option<f64>,
+    /// The chunk id (`<id>`) shown at rank 1.
+    rank1_id: Option<String>,
     wall_ms: f64,
 }
 
 struct AuditRow {
     wall_ms: f64,
     fingerprint: Option<String>,
+    /// First 12 hex of the sha256 of the query text: the key `probe_ab
+    /// compare` aligns two scorecards on (never the position).
+    query_key: String,
+    /// The chunk id (`<id>`) shown at rank 1.
+    top1_id: Option<String>,
+}
+
+/// First 12 hex of the sha256 of a query, the alignment key of an audit row.
+fn query_key(query: &str) -> String {
+    hex(&Sha256::digest(query.as_bytes()))[..12].to_string()
+}
+
+/// The chunk id shown in the rank-1 block.
+fn top1_id(text: &str) -> Option<String> {
+    tag_text(rank1_block(text)?, "id")
 }
 
 struct CardInputs<'a> {
@@ -332,6 +386,7 @@ fn build_scorecard(i: &CardInputs) -> Value {
                 "hit_rank": p.hit_rank,
                 "session_hit_rank": p.session_hit_rank,
                 "rank1_score": p.rank1_score,
+                "rank1_id": p.rank1_id,
                 "wall_ms": round3(p.wall_ms),
             })
         })
@@ -346,6 +401,8 @@ fn build_scorecard(i: &CardInputs) -> Value {
             "p50_ms": pct_json(&aw, 50.0),
             "p95_ms": pct_json(&aw, 95.0),
             "top1_fp": rows.iter().map(|r| r.fingerprint.clone()).collect::<Vec<_>>(),
+            "query_keys": rows.iter().map(|r| r.query_key.clone()).collect::<Vec<_>>(),
+            "top1_ids": rows.iter().map(|r| r.top1_id.clone()).collect::<Vec<_>>(),
         })
     });
     json!({
@@ -505,6 +562,46 @@ fn dump_line(
     Ok(())
 }
 
+/// Re-score a stored `--dump` ndjson with the current splitter and judge, so
+/// a fixed scorer can restate a number without re-running the retrieval that
+/// produced the responses. Reads each `kind: "probe"` record's `response`.
+pub fn rescore_dump(dump_ndjson: &str, probes_json: &str) -> Result<Value> {
+    let (limit, probes) = load_probes(probes_json)?;
+    let mut responses: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    for line in dump_ndjson.lines().filter(|l| !l.trim().is_empty()) {
+        let rec: Value = serde_json::from_str(line).context("parse dump line")?;
+        if rec["kind"] != "probe" {
+            continue;
+        }
+        let id = rec["id"].as_u64().context("probe record without id")? as u32;
+        let text = rec["response"].as_str().unwrap_or_default().to_string();
+        responses.insert(id, text);
+    }
+    let mut ranks = Vec::with_capacity(probes.len());
+    let mut per_probe = Vec::with_capacity(probes.len());
+    for p in &probes {
+        let text = responses
+            .get(&p.id)
+            .ok_or_else(|| anyhow!("dump has no response for probe {}", p.id))?;
+        let hit_rank = judge(text, &p.must, &p.must_not, limit);
+        ranks.push((p.id, hit_rank));
+        per_probe.push(json!({
+            "id": p.id,
+            "hit_rank": hit_rank,
+            "session_hit_rank": session_hit_rank(text, &p.expect_sessions, limit),
+            "rank1_id": top1_id(text),
+            "blocks": split_blocks(text).len(),
+        }));
+    }
+    let (rank1, rank1_ids, mrr5) = summarize(&ranks);
+    Ok(json!({
+        "rank1": rank1,
+        "rank1_ids": rank1_ids,
+        "mrr5": mrr5,
+        "per_probe": per_probe,
+    }))
+}
+
 /// Run the probe suite against the live database and return the scorecard.
 pub async fn run_probe(cfg: ProbeConfig) -> Result<Value> {
     let t_start = Instant::now();
@@ -589,6 +686,7 @@ pub async fn run_probe(cfg: ProbeConfig) -> Result<Value> {
             session_scored: !p.expect_sessions.is_empty(),
             session_hit_rank: session_hit_rank(&text, &p.expect_sessions, limit),
             rank1_score: rank1_score(&text),
+            rank1_id: top1_id(&text),
             wall_ms: ms,
         });
     }
@@ -613,6 +711,8 @@ pub async fn run_probe(cfg: ProbeConfig) -> Result<Value> {
                 rows.push(AuditRow {
                     wall_ms: ms,
                     fingerprint: top1_fingerprint(&text),
+                    query_key: query_key(q),
+                    top1_id: top1_id(&text),
                 });
             }
             Some(rows)
@@ -770,6 +870,7 @@ mod tests {
                 session_scored: true,
                 session_hit_rank: Some(2),
                 rank1_score: Some(0.7),
+                rank1_id: None,
                 wall_ms: 10.0,
             },
             ProbeRow {
@@ -778,12 +879,15 @@ mod tests {
                 session_scored: false,
                 session_hit_rank: None,
                 rank1_score: None,
+                rank1_id: None,
                 wall_ms: 20.0,
             },
         ];
         let audit = [AuditRow {
             wall_ms: 5.0,
             fingerprint: None,
+            query_key: query_key("q"),
+            top1_id: None,
         }];
         let card = build_scorecard(&CardInputs {
             binary_path: "/x".into(),
@@ -837,7 +941,15 @@ mod tests {
         ] {
             assert!(card["probes"].get(key).is_some(), "probes.{key}");
         }
-        for key in ["n", "empty", "p50_ms", "p95_ms", "top1_fp"] {
+        for key in [
+            "n",
+            "empty",
+            "p50_ms",
+            "p95_ms",
+            "top1_fp",
+            "query_keys",
+            "top1_ids",
+        ] {
             assert!(card["audit"].get(key).is_some(), "audit.{key}");
         }
         for key in ["n", "p50_ms", "p95_ms"] {
@@ -889,5 +1001,145 @@ mod tests {
         assert_eq!(off["policy"], "legacy");
         assert_eq!(off["loaded"], false);
         assert_eq!(off["pairs"], 0);
+    }
+    /// A real-shaped response: 3 top-level blocks, and block 1's excerpt echoes
+    /// an earlier response that carries its own `<r rank="1">` and `<r rank="2">`.
+    fn echoing_response() -> String {
+        let echoed = r#"=== earlier run
+<search>
+  <summary count="2" relevance="high">
+  <results>
+    <r rank="1">
+      <excerpt><![CDATA[echoed top hit: admin merge works]]></excerpt>
+      <cid>echo-cid</cid>
+      <id>echo-id-1</id>
+    </r>
+    <r rank="2">
+      <excerpt><![CDATA[echoed second]]></excerpt>
+      <cid>echo-cid-2</cid>
+      <id>echo-id-2</id>
+    </r>
+  </results>
+</search>"#;
+        format!(
+            r#"RESULTS
+<search>
+  <summary count="3" relevance="partial">
+    <preview>p</preview>
+  </summary>
+  <results>
+    <r rank="1">
+      <excerpt><![CDATA[{echoed}]]></excerpt>
+      <cid>real-cid-1</cid>
+      <id>real-id-1</id>
+    </r>
+    <r rank="2">
+      <excerpt><![CDATA[plain second]]></excerpt>
+      <cid>real-cid-2</cid>
+      <id>real-id-2</id>
+    </r>
+    <r rank="3">
+      <excerpt><![CDATA[plain third]]></excerpt>
+      <cid>real-cid-3</cid>
+      <id>real-id-3</id>
+    </r>
+  </results>
+</search>"#
+        )
+    }
+
+    #[test]
+    fn nested_echoed_rank_tags_do_not_split_a_block() {
+        let text = echoing_response();
+        let blocks = split_blocks(&text);
+        let ranks: Vec<usize> = blocks.iter().map(|(n, _)| *n).collect();
+        assert_eq!(ranks, vec![1, 2, 3], "echoed tags must not add blocks");
+        // The echo stays inside block 1 as text.
+        assert!(blocks[0].1.contains("echoed top hit"));
+        assert!(blocks[0].1.contains("echoed second"));
+        assert!(!blocks[1].1.contains("echoed"));
+        // Identity comes from the real tags after the excerpt, not the echo.
+        assert_eq!(tag_text(blocks[0].1, "id").as_deref(), Some("real-id-1"));
+        assert_eq!(tag_text(blocks[0].1, "cid").as_deref(), Some("real-cid-1"));
+        assert_eq!(top1_id(&text).as_deref(), Some("real-id-1"));
+        let dumped = dump_blocks(&text);
+        assert_eq!(dumped.len(), 3);
+        assert_eq!(dumped[0]["id"], "real-id-1");
+    }
+
+    #[test]
+    fn echoed_rank_one_cannot_pose_as_the_hit_at_rank_one() {
+        // Only the echoed text inside block 1 says "admin merge works", and the
+        // real rank-2 block holds nothing: the probe must see the hit at rank 1
+        // (the echo is part of block 1), never a phantom extra block.
+        let text = echoing_response();
+        let must = res(&["plain third"]);
+        assert_eq!(judge(&text, &must, &[], 5), Some(3));
+        let must = res(&["echoed top hit"]);
+        assert_eq!(judge(&text, &must, &[], 5), Some(1));
+        // The fingerprint is the whole real block 1, not the first echoed tag.
+        let fp = top1_fingerprint(&text).unwrap();
+        let whole = split_blocks(&text)[0].1;
+        assert_eq!(fp, hex(&Sha256::digest(whole.as_bytes()))[..12]);
+    }
+
+    #[test]
+    fn responses_without_echo_split_exactly_as_before() {
+        let blocks = split_blocks(XML);
+        assert_eq!(
+            blocks.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        // A summary count larger than what is shown does not invent blocks.
+        let short = r#"<summary count="9"><r rank="1">a</r><r rank="2">b</r>"#;
+        assert_eq!(split_blocks(short).len(), 2);
+    }
+
+    #[test]
+    fn audit_row_keys_do_not_depend_on_position() {
+        assert_eq!(query_key("same query"), query_key("same query"));
+        assert_ne!(query_key("a"), query_key("b"));
+        assert_eq!(query_key("a").len(), 12);
+    }
+    #[test]
+    fn rescore_dump_scores_stored_responses_with_the_fixed_splitter() {
+        let probes = format!(
+            r#"{{"schema":"{PROBES_SCHEMA}","limit":5,"probes":[{{"id":1,"query":"q1","must":["echoed top hit"]}},{{"id":2,"query":"q2","must":["plain third"]}}]}}"#
+        );
+        let echo = echoing_response();
+        let dump = [
+            json!({"kind":"probe","id":1,"response":echo}),
+            json!({"kind":"probe","id":2,"response":echo}),
+            json!({"kind":"audit","idx":0,"response":"x"}),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let out = rescore_dump(&dump, &probes).unwrap();
+        assert_eq!(out["per_probe"][0]["hit_rank"], 1);
+        assert_eq!(out["per_probe"][1]["hit_rank"], 3);
+        assert_eq!(out["per_probe"][0]["rank1_id"], "real-id-1");
+        assert_eq!(out["per_probe"][0]["blocks"], 3);
+        assert_eq!(out["rank1"], 1);
+        // A dump that lacks a probe is an error, not a zero.
+        let short = json!({"kind":"probe","id":1,"response":echo}).to_string();
+        assert!(rescore_dump(&short, &probes).is_err());
+    }
+
+    /// Manual: `CSR_RESCORE_DUMP=<dump.ndjson> CSR_RESCORE_PROBES=<probes.json>
+    /// cargo test --release --lib rescore_dump_from_env -- --ignored --nocapture`
+    /// prints the rescored JSON for a stored dump.
+    #[test]
+    #[ignore]
+    fn rescore_dump_from_env() {
+        let dump = std::env::var("CSR_RESCORE_DUMP").expect("CSR_RESCORE_DUMP");
+        let probes = std::env::var("CSR_RESCORE_PROBES").expect("CSR_RESCORE_PROBES");
+        let out = rescore_dump(
+            &std::fs::read_to_string(dump).unwrap(),
+            &std::fs::read_to_string(probes).unwrap(),
+        )
+        .unwrap();
+        println!("RESCORED {out}");
     }
 }
