@@ -1,0 +1,277 @@
+{
+ "spike": "S4",
+ "parts": [
+  "S4a INFO (spikes/S4a-CLOSURE.md, commit 6f529f65)",
+  "S4b (spikes/S4b-CLOSURE.md)"
+ ],
+ "rule": "parity cosine>=0.999 vs fp32 on 1k; Studio throughput recorded; 13,660-unit sample at 256/512; MRR@5 >= +3 pts over MiniLM at 256 or 512 (2.0..4.0 HOLD); query p50 recorded; runner-up Granite 97M r2 fp32 384",
+ "parity_gemma_q8_vs_fp32_n1000": {
+  "d768_min": 0.999845,
+  "d512_min": 0.999846,
+  "d256_min": 0.999861,
+  "met": true
+ },
+ "throughput_studio_units_per_s": {
+  "gemma-q8": 9.17,
+  "gemma-fp32": 9.68,
+  "granite-fp32": 44.92,
+  "granite-int8": 58.83,
+  "minilm": 64.75
+ },
+ "query_embed_laptop_ms_n310": {
+  "gemma-q8-256": {
+   "p50": 45.55,
+   "p95": 55.74,
+   "dims": 256
+  },
+  "minilm-384": {
+   "p50": 1.18,
+   "p95": 1.9,
+   "dims": 384
+  },
+  "granite-fp32-384": {
+   "p50": 4.4,
+   "p95": 6.39,
+   "dims": 384
+  }
+ },
+ "sample": {
+  "n": 13660,
+  "sha256": "9ab6318bf931a7ac36eb17f2c6cef53feb4a0113dff7fff04fe29e299f4bb8b8",
+  "echo_rows": 22,
+  "hits_unfiltered": {
+   "1": 18,
+   "2": 159,
+   "3": 102,
+   "4": 10,
+   "5": 28,
+   "6": 27,
+   "7": 92,
+   "8": 130,
+   "9": 60,
+   "10": 9,
+   "11": 8,
+   "12": 40
+  },
+  "hits_filtered": {
+   "1": 17,
+   "2": 158,
+   "3": 100,
+   "4": 7,
+   "5": 28,
+   "6": 27,
+   "7": 92,
+   "8": 127,
+   "9": 59,
+   "10": 9,
+   "11": 4,
+   "12": 39
+  }
+ },
+ "models": {
+  "minilm": {
+   "dims": 384,
+   "query_prompt": null,
+   "per_probe_rank_filtered": [
+    2,
+    2,
+    1,
+    1,
+    1,
+    1,
+    1,
+    3,
+    2,
+    1,
+    2585,
+    12
+   ],
+   "per_probe_rank_unfiltered": [
+    2,
+    2,
+    1,
+    1,
+    1,
+    1,
+    1,
+    3,
+    2,
+    1,
+    1731,
+    13
+   ],
+   "mrr5_filtered": 0.6527777777777778,
+   "mrr5_unfiltered": 0.6527777777777778,
+   "delta_pts_filtered": 0.0,
+   "delta_pts_unfiltered": 0.0,
+   "audit_top1_agree_vs_minilm": 1.0
+  },
+  "gemma-256": {
+   "dims": 256,
+   "query_prompt": "task: search result | query: ",
+   "per_probe_rank_filtered": [
+    2,
+    1,
+    1,
+    1,
+    2,
+    1,
+    1,
+    1,
+    1,
+    1,
+    674,
+    2
+   ],
+   "per_probe_rank_unfiltered": [
+    3,
+    1,
+    1,
+    1,
+    2,
+    1,
+    1,
+    1,
+    1,
+    1,
+    9,
+    2
+   ],
+   "mrr5_filtered": 0.7916666666666666,
+   "mrr5_unfiltered": 0.7777777777777778,
+   "delta_pts_filtered": 13.888888888888872,
+   "delta_pts_unfiltered": 12.5,
+   "audit_top1_agree_vs_minilm": 0.34516129032258064
+  },
+  "gemma-512": {
+   "dims": 512,
+   "query_prompt": "task: search result | query: ",
+   "per_probe_rank_filtered": [
+    3,
+    1,
+    1,
+    1,
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    285,
+    4
+   ],
+   "per_probe_rank_unfiltered": [
+    4,
+    1,
+    1,
+    1,
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    13,
+    4
+   ],
+   "mrr5_filtered": 0.7430555555555555,
+   "mrr5_unfiltered": 0.7361111111111112,
+   "delta_pts_filtered": 9.027777777777757,
+   "delta_pts_unfiltered": 8.333333333333329,
+   "audit_top1_agree_vs_minilm": 0.34516129032258064
+  },
+  "granite-fp32": {
+   "dims": 384,
+   "query_prompt": null,
+   "per_probe_rank_filtered": [
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    2,
+    1,
+    1,
+    3286,
+    1
+   ],
+   "per_probe_rank_unfiltered": [
+    4,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    2,
+    1,
+    1,
+    1884,
+    1
+   ],
+   "mrr5_filtered": 0.8194444444444445,
+   "mrr5_unfiltered": 0.8125,
+   "delta_pts_filtered": 16.66666666666667,
+   "delta_pts_unfiltered": 15.972222222222214,
+   "audit_top1_agree_vs_minilm": 0.35161290322580646
+  },
+  "granite-int8": {
+   "dims": 384,
+   "query_prompt": null,
+   "per_probe_rank_filtered": [
+    2,
+    1,
+    1,
+    1,
+    1,
+    2,
+    1,
+    1,
+    1,
+    1,
+    883,
+    1
+   ],
+   "per_probe_rank_unfiltered": [
+    3,
+    1,
+    1,
+    1,
+    1,
+    2,
+    1,
+    1,
+    1,
+    1,
+    885,
+    1
+   ],
+   "mrr5_filtered": 0.8333333333333334,
+   "mrr5_unfiltered": 0.8194444444444445,
+   "delta_pts_filtered": 18.055555555555557,
+   "delta_pts_unfiltered": 16.66666666666667,
+   "audit_top1_agree_vs_minilm": 0.27419354838709675
+  }
+ },
+ "verdict_script": {
+  "gemma_best_width": 256,
+  "g": 13.888888888888872,
+  "band": "PASS",
+  "granite_fp32_delta": 16.66666666666667,
+  "granite_band": "PASS",
+  "decision": "PASS: Gemma 256"
+ },
+ "decision": "Gemma 2 Q8 256-d (g=+13.89 pts filtered, PASS band >4.0)",
+ "notes": [
+  "probe 11 reciprocal rank 0 for every model (best rank 285)",
+  "one probe rank 1->2 moves MRR@5 by 4.17 pts",
+  "granite-fp32 +16.67 pts, 2.78 above gemma-256; runner-up applies only when Gemma loses"
+ ],
+ "code_commit": "53d8cb29",
+ "score_files": [
+  "s4/s4b-score.json",
+  "s4/s4b-score-run2.json (identical)"
+ ]
+}
