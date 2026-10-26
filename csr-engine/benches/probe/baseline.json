@@ -1,0 +1,408 @@
+{
+ "schema": "csr-probe-baseline/1",
+ "created_at": "2026-10-26T04:41:37Z",
+ "calibration": {
+  "rank1": 5,
+  "rank1_ids": [
+   2,
+   5,
+   6,
+   7,
+   10
+  ]
+ },
+ "parity": {
+  "rank1": 6,
+  "rank1_ids": [
+   2,
+   3,
+   5,
+   6,
+   7,
+   10
+  ],
+  "mrr5": 0.620833
+ },
+ "gates": {
+  "calibration_5_of_12": true,
+  "b_runs_differ_by_at_most_1_probe": true,
+  "dump_parity_with_b_run1": true
+ },
+ "a": {
+  "schema": "csr-probe-scorecard/1",
+  "side": "A",
+  "binary": {
+   "path": "/usr/local/bin/csr-engine",
+   "version": "csr-engine 10.1.0",
+   "sha256": "7b53f200308cd3de0d59df75165141ea48adba7c80faee8d6e1a37649c17959b"
+  },
+  "db": {
+   "path": "/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db",
+   "chunk_count": 859526
+  },
+  "started_at": "2026-10-26T04:33:23Z",
+  "limit": 5,
+  "cold_start_ms": 1589.283,
+  "peak_rss_bytes": 771604480,
+  "probes": {
+   "n": 12,
+   "rank1": 6,
+   "rank1_ids": [
+    2,
+    3,
+    5,
+    6,
+    7,
+    10
+   ],
+   "mrr5": 0.620833,
+   "per_probe": [
+    {
+     "id": 1,
+     "hit_rank": null,
+     "rank1_score": 0.697,
+     "wall_ms": 954.097
+    },
+    {
+     "id": 2,
+     "hit_rank": 1,
+     "rank1_score": 0.713,
+     "wall_ms": 428.017
+    },
+    {
+     "id": 3,
+     "hit_rank": 1,
+     "rank1_score": 0.504,
+     "wall_ms": 1790.316
+    },
+    {
+     "id": 4,
+     "hit_rank": 2,
+     "rank1_score": 0.598,
+     "wall_ms": 594.507
+    },
+    {
+     "id": 5,
+     "hit_rank": 1,
+     "rank1_score": 0.578,
+     "wall_ms": 1331.772
+    },
+    {
+     "id": 6,
+     "hit_rank": 1,
+     "rank1_score": 0.54,
+     "wall_ms": 633.901
+    },
+    {
+     "id": 7,
+     "hit_rank": 1,
+     "rank1_score": 0.753,
+     "wall_ms": 404.992
+    },
+    {
+     "id": 8,
+     "hit_rank": 2,
+     "rank1_score": 0.64,
+     "wall_ms": 729.107
+    },
+    {
+     "id": 9,
+     "hit_rank": 5,
+     "rank1_score": 0.551,
+     "wall_ms": 556.136
+    },
+    {
+     "id": 10,
+     "hit_rank": 1,
+     "rank1_score": 0.792,
+     "wall_ms": 903.942
+    },
+    {
+     "id": 11,
+     "hit_rank": null,
+     "rank1_score": 0.56,
+     "wall_ms": 551.436
+    },
+    {
+     "id": 12,
+     "hit_rank": 4,
+     "rank1_score": 0.687,
+     "wall_ms": 543.126
+    }
+   ]
+  },
+  "audit": {
+   "n": 5,
+   "empty": 0,
+   "p50_ms": 391.065,
+   "p95_ms": 643.161
+  },
+  "latency": {
+   "n": 17,
+   "p50_ms": 556.136,
+   "p95_ms": 1790.316
+  }
+ },
+ "b_run1": {
+  "audit": {
+   "empty": 0,
+   "n": 5,
+   "p50_ms": 300.236,
+   "p95_ms": 783.559
+  },
+  "binary": {
+   "git_dirty": "false",
+   "git_sha": "4adaea2ec7432e93bcbed1e7ced500111f05651c",
+   "path": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/.testbed/core-rewrite/bin/csr-engine",
+   "sha256": "38c9d9dc93cfb85ce675353338b7b06357b59fd290a137640726b300565a872b",
+   "version": "csr-engine 10.1.0"
+  },
+  "cold_start_ms": 7039.691,
+  "db": {
+   "chunk_count": 859551,
+   "index_chunk_count": 858417,
+   "path": "/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db"
+  },
+  "errors": 0,
+  "latency": {
+   "n": 17,
+   "p50_ms": 414.575,
+   "p95_ms": 1424.619
+  },
+  "limit": 5,
+  "peak_rss_bytes": 4074913792,
+  "probes": {
+   "mrr5": 0.620833,
+   "n": 12,
+   "per_probe": [
+    {
+     "hit_rank": null,
+     "id": 1,
+     "rank1_score": 0.697,
+     "wall_ms": 543.915
+    },
+    {
+     "hit_rank": 1,
+     "id": 2,
+     "rank1_score": 0.713,
+     "wall_ms": 395.246
+    },
+    {
+     "hit_rank": 1,
+     "id": 3,
+     "rank1_score": 0.504,
+     "wall_ms": 1424.619
+    },
+    {
+     "hit_rank": 2,
+     "id": 4,
+     "rank1_score": 0.598,
+     "wall_ms": 412.364
+    },
+    {
+     "hit_rank": 1,
+     "id": 5,
+     "rank1_score": 0.578,
+     "wall_ms": 675.304
+    },
+    {
+     "hit_rank": 1,
+     "id": 6,
+     "rank1_score": 0.54,
+     "wall_ms": 316.106
+    },
+    {
+     "hit_rank": 1,
+     "id": 7,
+     "rank1_score": 0.753,
+     "wall_ms": 352.104
+    },
+    {
+     "hit_rank": 2,
+     "id": 8,
+     "rank1_score": 0.64,
+     "wall_ms": 614.801
+    },
+    {
+     "hit_rank": 5,
+     "id": 9,
+     "rank1_score": 0.551,
+     "wall_ms": 479.114
+    },
+    {
+     "hit_rank": 1,
+     "id": 10,
+     "rank1_score": 0.792,
+     "wall_ms": 702.443
+    },
+    {
+     "hit_rank": null,
+     "id": 11,
+     "rank1_score": 0.56,
+     "wall_ms": 414.575
+    },
+    {
+     "hit_rank": 4,
+     "id": 12,
+     "rank1_score": 0.687,
+     "wall_ms": 449.449
+    }
+   ],
+   "rank1": 6,
+   "rank1_ids": [
+    2,
+    3,
+    5,
+    6,
+    7,
+    10
+   ]
+  },
+  "schema": "csr-probe-scorecard/1",
+  "side": "B",
+  "started_at": "2026-10-26T04:35:24Z"
+ },
+ "b_run2": {
+  "audit": {
+   "empty": 0,
+   "n": 5,
+   "p50_ms": 383.103,
+   "p95_ms": 1028.291
+  },
+  "binary": {
+   "git_dirty": "false",
+   "git_sha": "4adaea2ec7432e93bcbed1e7ced500111f05651c",
+   "path": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/.testbed/core-rewrite/bin/csr-engine",
+   "sha256": "38c9d9dc93cfb85ce675353338b7b06357b59fd290a137640726b300565a872b",
+   "version": "csr-engine 10.1.0"
+  },
+  "cold_start_ms": 7175.607,
+  "db": {
+   "chunk_count": 859554,
+   "index_chunk_count": 858417,
+   "path": "/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db"
+  },
+  "errors": 0,
+  "latency": {
+   "n": 17,
+   "p50_ms": 533.869,
+   "p95_ms": 1459.143
+  },
+  "limit": 5,
+  "peak_rss_bytes": 4070113280,
+  "probes": {
+   "mrr5": 0.620833,
+   "n": 12,
+   "per_probe": [
+    {
+     "hit_rank": null,
+     "id": 1,
+     "rank1_score": 0.697,
+     "wall_ms": 533.869
+    },
+    {
+     "hit_rank": 1,
+     "id": 2,
+     "rank1_score": 0.713,
+     "wall_ms": 411.624
+    },
+    {
+     "hit_rank": 1,
+     "id": 3,
+     "rank1_score": 0.504,
+     "wall_ms": 1459.143
+    },
+    {
+     "hit_rank": 2,
+     "id": 4,
+     "rank1_score": 0.598,
+     "wall_ms": 400.686
+    },
+    {
+     "hit_rank": 1,
+     "id": 5,
+     "rank1_score": 0.578,
+     "wall_ms": 740.036
+    },
+    {
+     "hit_rank": 1,
+     "id": 6,
+     "rank1_score": 0.54,
+     "wall_ms": 333.911
+    },
+    {
+     "hit_rank": 1,
+     "id": 7,
+     "rank1_score": 0.753,
+     "wall_ms": 322.184
+    },
+    {
+     "hit_rank": 2,
+     "id": 8,
+     "rank1_score": 0.64,
+     "wall_ms": 662.316
+    },
+    {
+     "hit_rank": 5,
+     "id": 9,
+     "rank1_score": 0.551,
+     "wall_ms": 491.03
+    },
+    {
+     "hit_rank": 1,
+     "id": 10,
+     "rank1_score": 0.792,
+     "wall_ms": 726.822
+    },
+    {
+     "hit_rank": null,
+     "id": 11,
+     "rank1_score": 0.56,
+     "wall_ms": 776.764
+    },
+    {
+     "hit_rank": 4,
+     "id": 12,
+     "rank1_score": 0.687,
+     "wall_ms": 838.552
+    }
+   ],
+   "rank1": 6,
+   "rank1_ids": [
+    2,
+    3,
+    5,
+    6,
+    7,
+    10
+   ]
+  },
+  "schema": "csr-probe-scorecard/1",
+  "side": "B",
+  "started_at": "2026-10-26T04:35:40Z"
+ },
+ "compare_b1_b2": {
+  "rank1_a": 6,
+  "rank1_b": 6,
+  "rank1_delta": 0,
+  "probe_flips": 0,
+  "flipped_ids": [],
+  "audit_top1_agreement": 1.0
+ },
+ "compare_a_b1": {
+  "rank1_a": 6,
+  "rank1_b": 6,
+  "rank1_delta": 0,
+  "probe_flips": 0,
+  "flipped_ids": [],
+  "audit_top1_agreement": 1.0
+ },
+ "compare_a_b2": {
+  "rank1_a": 6,
+  "rank1_b": 6,
+  "rank1_delta": 0,
+  "probe_flips": 0,
+  "flipped_ids": [],
+  "audit_top1_agreement": 1.0
+ }
+}
