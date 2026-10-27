@@ -138,6 +138,163 @@ pub fn is_question_echo(content: &str, query: &str) -> bool {
     questions > 0
 }
 
+// ---------------------------------------------------------------------------
+// Runtime drop: rows that are CSR's own output or a logged copy of the query
+// ---------------------------------------------------------------------------
+//
+// A recall candidate that is CSR's own output, or the log of the very query
+// being asked, is not evidence about anything: it is the search showing itself
+// to itself. The cross-encoder scores such a row highly (it repeats the query's
+// words) and lifts it into its pool, so these rows are left out BEFORE the pool
+// is built. The rule judges what the row is, by who wrote it and how it is
+// shaped, never by its similarity to the query, and it abstains when unsure.
+
+/// Why a candidate row is left out of recall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeDrop {
+    /// The row is CSR's own emission (an injected block pasted into the
+    /// conversation, or a whole search-result / `csr_why` payload).
+    CsrEmission,
+    /// The row is a logged copy of the query being asked.
+    QueryCopy,
+}
+
+/// Shortest query (folded characters) a logged copy is looked for with. A
+/// shorter one is a word or two that any chunk may hold.
+const MIN_COPY_QUERY_CHARS: usize = 20;
+
+/// Fewest words a query needs for a logged copy to be looked for.
+const MIN_COPY_QUERY_WORDS: usize = 3;
+
+/// How far back (bytes) from where the query sits in a row to read for the
+/// call or field it is the argument of.
+const LOGGED_ARG_WINDOW: usize = 160;
+
+/// What stands right before a query that was passed to a search: the CSR tool
+/// name a call rendering opens with (`[mcp__claude-self-reflect__csr_reflect_on_past: `),
+/// a `csr_*` call, a `query` key (`"query": "`, `{'query': '`, `query=`), a
+/// result envelope's `<q>` or a log's `q=`.
+static LOGGED_ARG_TAIL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?is)(?:mcp__claude[-_]self[-_]reflect__[a-z_]+|csr_[a-z_]+|\bquery|<q>|\bq=)["']?\s*[:=(]?\s*["'\[{(]*\s*$"#,
+    )
+    .expect("logged argument regex")
+});
+
+/// `text` folded for comparison: lowercase letters and digits, every other run
+/// of characters one space, no edge spaces. The second value maps each folded
+/// character to the byte offset in `text` it came from.
+fn fold(text: &str) -> (String, Vec<usize>) {
+    let mut folded = String::with_capacity(text.len());
+    let mut at = Vec::with_capacity(text.len());
+    let mut gap = true;
+    for (offset, c) in text.char_indices() {
+        if c.is_alphanumeric() {
+            for lower in c.to_lowercase() {
+                folded.push(lower);
+                at.push(offset);
+            }
+            gap = false;
+        } else if !gap {
+            folded.push(' ');
+            at.push(offset);
+            gap = true;
+        }
+    }
+    if folded.ends_with(' ') {
+        folded.pop();
+        at.pop();
+    }
+    (folded, at)
+}
+
+/// Where in `text` the folded `needle` first sits as whole words: its byte
+/// offset in `text`, and whether the row is nothing before it.
+fn find_folded(text: &str, needle: &str) -> Option<(usize, bool)> {
+    let (folded, at) = fold(text);
+    for (byte, _) in folded.match_indices(needle) {
+        let before_ok = byte == 0 || folded.as_bytes()[byte - 1] == b' ';
+        let end = byte + needle.len();
+        let after_ok = end == folded.len() || folded.as_bytes()[end] == b' ';
+        if before_ok && after_ok {
+            // `at` is per folded character; the match starts on a character
+            // boundary, so count characters up to it.
+            let chars_before = folded[..byte].chars().count();
+            return Some((at[chars_before], byte == 0));
+        }
+    }
+    None
+}
+
+/// Whether `content`, a recall row written by `author`, is a logged copy of
+/// `query`: the whole query (as words, case and punctuation aside) sits in it
+/// and the row is a record of the query being run, not prose that happens to
+/// repeat it.
+///
+/// - A tool result holding the whole query is a log, a dump or a replay of the
+///   call: tool output is never the answer to a search for its own arguments.
+/// - A user or assistant row holds it as a copy when the query is the argument
+///   of a call (`[mcp__claude-self-reflect__csr_reflect_on_past: <query>]`,
+///   `"query": "<query>"`, `<q>...</q>`, `q='...'`), or when a person's row
+///   opens with it (the prompt typed as the query).
+///
+/// A query of fewer than [`MIN_COPY_QUERY_WORDS`] words or
+/// [`MIN_COPY_QUERY_CHARS`] characters abstains; so does a plan document, which
+/// holds a question and its answer on purpose.
+pub fn is_logged_query_copy(
+    content: &str,
+    author: Option<crate::provenance::Speaker>,
+    conversation_id: &str,
+    query: &str,
+) -> bool {
+    use crate::provenance::Speaker;
+    if conversation_id.starts_with("plan:") {
+        return false;
+    }
+    let (needle, _) = fold(query);
+    if needle.chars().count() < MIN_COPY_QUERY_CHARS
+        || needle.split(' ').count() < MIN_COPY_QUERY_WORDS
+    {
+        return false;
+    }
+    let Some((offset, opens)) = find_folded(content, &needle) else {
+        return false;
+    };
+    if author == Some(Speaker::ToolResult) {
+        return true;
+    }
+    if opens && author == Some(Speaker::User) {
+        return true;
+    }
+    let start = content.floor_char_boundary(offset.saturating_sub(LOGGED_ARG_WINDOW));
+    LOGGED_ARG_TAIL.is_match(&content[start..offset])
+}
+
+/// The reason a transcript row is left out of recall, or `None` to keep it.
+/// `author` is the row's provenance author (`None`: no provenance row, a legacy
+/// chunk). A CSR emission is looked for only in what a person or Claude wrote:
+/// a tool result that quotes CSR's text is a mention (a code read of this
+/// repository is the answer to a question about it), and only a whole payload
+/// is CSR's own.
+pub fn runtime_drop(
+    content: &str,
+    author: Option<crate::provenance::Speaker>,
+    conversation_id: &str,
+    query: &str,
+) -> Option<RuntimeDrop> {
+    use crate::provenance::Speaker;
+    let body = content.strip_prefix("[keyword] ").unwrap_or(content);
+    let prose = author != Some(Speaker::ToolResult)
+        && !conversation_id.starts_with("plan:")
+        && !conversation_id.starts_with("codex:");
+    if (prose && crate::extraction::provenance::is_csr_emission(body))
+        || crate::import::contamination::is_csr_tool_payload(body)
+    {
+        return Some(RuntimeDrop::CsrEmission);
+    }
+    is_logged_query_copy(body, author, conversation_id, query).then_some(RuntimeDrop::QueryCopy)
+}
+
 /// A progress announcement short enough to carry no finding.
 fn is_filler(sentence: &str) -> bool {
     sentence.chars().count() <= MAX_FILLER_CHARS && FILLER.is_match(sentence)
@@ -608,5 +765,157 @@ mod tests {
         assert!(!echo(""));
         assert!(!echo("[story] --- Signature: {}"));
         assert!(!echo("fix the flaky test in hooks_integration"));
+    }
+
+    // ---- runtime drop ----
+
+    use crate::provenance::Speaker;
+
+    const COPY_QUERY: &str = "compaction loses state, PreCompact backup, what survives compaction";
+
+    fn copy_of(content: &str, author: Option<Speaker>) -> bool {
+        is_logged_query_copy(content, author, "conv1", COPY_QUERY)
+    }
+
+    #[test]
+    fn a_tool_result_that_holds_the_whole_query_is_a_logged_copy() {
+        let dump =
+            format!("2026-10-14 csr_reflect_on_past {{\"query\": \"{COPY_QUERY}\", \"limit\": 6}}");
+        assert!(copy_of(&dump, Some(Speaker::ToolResult)));
+        // The result envelope names the query in its `<meta>`.
+        let envelope = format!("</summary>\n  <meta>\n    <q>{COPY_QUERY}</q>\n  </meta>");
+        assert!(copy_of(&envelope, Some(Speaker::ToolResult)));
+        // Case, punctuation and spacing do not matter.
+        assert!(copy_of(
+            "COMPACTION loses state -- precompact BACKUP; what   survives compaction!",
+            Some(Speaker::ToolResult)
+        ));
+    }
+
+    #[test]
+    fn a_call_rendering_or_logged_argument_is_a_copy_in_prose_rows() {
+        let call = format!(
+            "Pulling CSR context.\n\n[mcp__claude-self-reflect__csr_reflect_on_past: {COPY_QUERY}]"
+        );
+        assert!(copy_of(&call, Some(Speaker::Assistant)));
+        assert!(copy_of(&call, None));
+        assert!(copy_of(
+            &format!("{{'query': '{COPY_QUERY}', 'limit': 3}}"),
+            Some(Speaker::Assistant)
+        ));
+        assert!(copy_of(&format!("q='{COPY_QUERY}'"), Some(Speaker::User)));
+    }
+
+    #[test]
+    fn a_prompt_that_opens_with_the_query_is_a_copy_only_for_a_person() {
+        let prompt = format!("{COPY_QUERY}. Then tell me what to fix.");
+        assert!(copy_of(&prompt, Some(Speaker::User)));
+        assert!(!copy_of(&prompt, Some(Speaker::Assistant)));
+    }
+
+    #[test]
+    fn prose_that_repeats_the_query_midway_is_not_a_copy() {
+        let answer = format!(
+            "You asked about this: {COPY_QUERY}. The answer is that the PreCompact hook backs up the todo list."
+        );
+        assert!(!copy_of(&answer, Some(Speaker::Assistant)));
+        assert!(!copy_of(&answer, Some(Speaker::User)));
+        // Whole words only: the query inside a longer word run is not it.
+        assert!(!copy_of(
+            &format!("x{COPY_QUERY}y"),
+            Some(Speaker::ToolResult)
+        ));
+    }
+
+    #[test]
+    fn a_short_query_or_a_plan_document_abstains() {
+        assert!(!is_logged_query_copy(
+            "two words here",
+            Some(Speaker::ToolResult),
+            "conv1",
+            "two words"
+        ));
+        assert!(!is_logged_query_copy(
+            "a b c d e f g h",
+            Some(Speaker::ToolResult),
+            "conv1",
+            "a b c d e f g h"
+        ));
+        let plan = format!("Q: {COPY_QUERY}\nA: the backup hook writes the todo list.");
+        assert!(!is_logged_query_copy(
+            &plan,
+            Some(Speaker::ToolResult),
+            "plan:release",
+            COPY_QUERY
+        ));
+    }
+
+    #[test]
+    fn csr_emissions_are_dropped_from_what_a_person_or_claude_wrote_only() {
+        let recap = "recap [2h ago]: shipped the fix. Settled: x. [[CSR:RECAP]]";
+        assert_eq!(
+            runtime_drop(
+                recap,
+                Some(Speaker::User),
+                "conv1",
+                "unrelated query words here"
+            ),
+            Some(RuntimeDrop::CsrEmission)
+        );
+        assert_eq!(
+            runtime_drop(
+                &format!("[keyword] {recap}"),
+                None,
+                "conv1",
+                "unrelated query words here"
+            ),
+            Some(RuntimeDrop::CsrEmission)
+        );
+        // A read of CSR's own source quotes the headers; it is the answer to a
+        // question about them.
+        let code = "const A: &str = \"LAST:\"; const B: &str = \"NEXT:\"; // TODOS: ANCHORS:";
+        assert_eq!(
+            runtime_drop(
+                code,
+                Some(Speaker::ToolResult),
+                "conv1",
+                "unrelated query words here"
+            ),
+            None
+        );
+        // Codex rollouts carry script output; only a whole payload is CSR's.
+        assert_eq!(
+            runtime_drop(
+                recap,
+                Some(Speaker::User),
+                "codex:rollout",
+                "unrelated query words here"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_whole_search_result_envelope_is_dropped_whatever_its_author() {
+        let envelope = "\u{1F3AF} RESULTS: 1 matches (high relevance, top score: 0.900)\n\u{26A1} PERFORMANCE: 6ms (1 collection searched)\n\n<search>\n  <summary count=\"1\">\n  </summary>\n  <meta>\n    <q>x</q>\n  </meta>\n  <results>\n    <r rank=\"1\">\n    </r>\n  </results>\n</search>\n";
+        for author in [Some(Speaker::ToolResult), Some(Speaker::Assistant), None] {
+            assert_eq!(
+                runtime_drop(envelope, author, "conv1", "unrelated query words here"),
+                Some(RuntimeDrop::CsrEmission)
+            );
+        }
+    }
+
+    #[test]
+    fn the_logged_argument_reader_survives_multibyte_text() {
+        let query = "bhajan main to giridhar ke gar jaooon did we already create";
+        let text =
+            "\u{0928}\u{092e}\u{0938}\u{094d}\u{0924}\u{0947} ".repeat(40) + "query: " + query;
+        assert!(is_logged_query_copy(
+            &text,
+            Some(Speaker::Assistant),
+            "conv1",
+            query
+        ));
     }
 }
