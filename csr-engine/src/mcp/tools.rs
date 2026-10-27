@@ -2079,6 +2079,22 @@ fn ce_reorder(
     }
 }
 
+/// [`ce_reorder`], then the content-representative rule once more: the
+/// cross-encoder may pick a session's tool-output row, and the page shows the
+/// content chunk of the pool instead (the rule `apply_content_representatives`
+/// applies before the cross-encoder). Session order and scores stay as the
+/// cross-encoder computed them; only the displayed row is swapped.
+fn ce_reorder_with_representatives(
+    collapsed: &[String],
+    session_keys: &HashMap<String, String>,
+    scored: &[(String, String, u8, f32)],
+    pool: &HashMap<String, Vec<PoolChunk>>,
+) -> CeOrdered {
+    let mut ordered = ce_reorder(collapsed, session_keys, scored);
+    apply_content_representatives(&mut ordered.order, session_keys, pool);
+    ordered
+}
+
 /// Warn about a cross-encoder failure once per process, not once per query.
 fn warn_ce_unavailable(reason: &str) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2346,6 +2362,7 @@ fn ce_rerank_stage(
     enriched: &[EnrichedResult],
     session_keys: &HashMap<String, String>,
     answer_class: &HashMap<String, u8>,
+    representatives: &HashMap<String, Vec<PoolChunk>>,
 ) -> (Vec<String>, Option<format::CeSummary>) {
     if collapsed.is_empty() {
         return (collapsed, None);
@@ -2401,7 +2418,8 @@ fn ce_rerank_stage(
             )
         })
         .collect();
-    let ordered = ce_reorder(&collapsed, session_keys, &scored);
+    let ordered =
+        ce_reorder_with_representatives(&collapsed, session_keys, &scored, representatives);
     let summary = format::CeSummary::from_scores(&ordered.session_scores);
     (ordered.order, summary)
 }
@@ -3168,6 +3186,8 @@ async fn reflect_gather_pass(
             );
             // Session representative: a tool-output pick yields to the
             // session's best content chunk in the pool. Stored author only.
+            // The cross-encoder below applies the same rule to its own picks.
+            let mut representative_pool_map: HashMap<String, Vec<PoolChunk>> = HashMap::new();
             if policy == RetrievalPolicy::CrossEncoder {
                 let chunk_fused = crate::search::hybrid::fuse_rrf_weighted(
                     &[
@@ -3177,7 +3197,7 @@ async fn reflect_gather_pass(
                     ],
                     RRF_K,
                 );
-                let pool = representative_pool(
+                representative_pool_map = representative_pool(
                     storage,
                     &chunk_fused,
                     &enriched,
@@ -3185,7 +3205,11 @@ async fn reflect_gather_pass(
                     &answer_class,
                     &collapsed,
                 );
-                apply_content_representatives(&mut collapsed, &session_keys, &pool);
+                apply_content_representatives(
+                    &mut collapsed,
+                    &session_keys,
+                    &representative_pool_map,
+                );
             }
             // A session whose best unit is an episode shows that episode as
             // its excerpt, under the session's best chunk when it has one.
@@ -3230,6 +3254,7 @@ async fn reflect_gather_pass(
                     &enriched,
                     &session_keys,
                     &answer_class,
+                    &representative_pool_map,
                 );
                 ce_summary = summary;
                 if let Some(enriched_conv) = enriched_conv.as_ref() {
@@ -15774,5 +15799,36 @@ mod representative_tests {
         );
         apply_content_representatives(&mut collapsed, &keys, &pool);
         assert_eq!(collapsed, vec!["a1", "c2", "e3"]);
+    }
+
+    #[test]
+    fn s9r_ce_keeps_content_representative_over_tool_row() {
+        let collapsed = vec!["a1".to_string(), "c2".to_string()];
+        let keys: HashMap<String, String> = [("t1", "s1"), ("a1", "s1"), ("c2", "s2")]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let mut pool: HashMap<String, Vec<PoolChunk>> = HashMap::new();
+        pool.insert(
+            "s1".into(),
+            vec![chunk("t1", 0.9, true), chunk("a1", 0.3, false)],
+        );
+        pool.insert("s2".into(), vec![chunk("c2", 0.9, false)]);
+        // The cross-encoder scores the tool row of s1 highest and picks it.
+        let scored = vec![
+            ("t1".to_string(), "s1".to_string(), 0u8, 5.0f32),
+            ("a1".to_string(), "s1".to_string(), 0u8, 2.0f32),
+            ("c2".to_string(), "s2".to_string(), 0u8, 3.0f32),
+        ];
+        let plain = ce_reorder(&collapsed, &keys, &scored);
+        assert_eq!(plain.order, vec!["t1", "c2"], "CE alone picks the tool row");
+        let ordered = ce_reorder_with_representatives(&collapsed, &keys, &scored, &pool);
+        assert_eq!(ordered.order, vec!["a1", "c2"]);
+        assert_eq!(ordered.session_scores, plain.session_scores);
+        // A session without a boilerplate pick is untouched.
+        let only_content = vec![scored[1].clone(), scored[2].clone()];
+        let before = ce_reorder(&collapsed, &keys, &only_content);
+        let after = ce_reorder_with_representatives(&collapsed, &keys, &only_content, &pool);
+        assert_eq!(before, after);
     }
 }
