@@ -989,6 +989,71 @@ pub fn chunk_authors(
     Ok(authors)
 }
 
+/// One chunk of a conversation as the synthetic-content classifier reads it.
+#[derive(Debug, Clone)]
+pub struct EvalScanRow {
+    /// The chunk's id.
+    pub id: String,
+    /// Chunk number in its conversation (0 when the importer left it empty).
+    pub seq: i64,
+    /// Stored author token; `None` when the chunk has no provenance row.
+    pub author: Option<String>,
+    /// The chunk's text matches one of the `like_patterns`.
+    pub marked: bool,
+    /// The chunk's text matches one of the `output_patterns`.
+    pub output_marked: bool,
+    /// The chunk's text when an assistant chunk holds a Bash tool call; the
+    /// classifier reads the commands out of it. `None` for every other chunk.
+    pub bash_text: Option<String>,
+}
+
+/// Every chunk of `conversation_id`, as an [`EvalScanRow`]. `like_patterns`
+/// and `output_patterns` are SQL LIKE patterns; a chunk is `marked` /
+/// `output_marked` when any pattern of the matching list matches.
+pub fn conversation_eval_scan(
+    conn: &Connection,
+    conversation_id: &str,
+    like_patterns: &[&str],
+    output_patterns: &[&str],
+) -> Result<Vec<EvalScanRow>> {
+    let any_of = |first: usize, count: usize| {
+        if count == 0 {
+            "0".to_string()
+        } else {
+            (first..first + count)
+                .map(|i| format!("c.content LIKE ?{i}"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        }
+    };
+    let marked = any_of(2, like_patterns.len());
+    let output_marked = any_of(2 + like_patterns.len(), output_patterns.len());
+    let sql = format!(
+        "SELECT c.id, c.seq, p.author, ({marked}), ({output_marked}),
+                CASE WHEN p.author = 'assistant'
+                      AND (c.content LIKE '%[Bash:%'
+                           OR c.content LIKE '%external_agent_tool_call: Bash%')
+                     THEN c.content END
+         FROM chunks c LEFT JOIN chunk_provenance p ON p.chunk_id = c.id
+         WHERE c.conversation_id = ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut args: Vec<&dyn rusqlite::ToSql> = vec![&conversation_id];
+    args.extend(like_patterns.iter().map(|p| p as &dyn rusqlite::ToSql));
+    args.extend(output_patterns.iter().map(|p| p as &dyn rusqlite::ToSql));
+    let rows = stmt.query_map(args.as_slice(), |row| {
+        Ok(EvalScanRow {
+            id: row.get(0)?,
+            seq: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            author: row.get(2)?,
+            marked: row.get::<_, i64>(3)? != 0,
+            output_marked: row.get::<_, i64>(4)? != 0,
+            bash_text: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
 /// The cached trust floor and tool-result share of some chunks, one query per
 /// 500 ids. A chunk the table does not hold is absent from the map; a chunk
 /// imported before spans were recorded has a `None` share.

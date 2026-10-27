@@ -3,6 +3,7 @@ pub mod elicitation;
 pub mod opener_guard;
 pub mod resources;
 pub mod stage_probe;
+pub mod synthetic;
 pub mod tasks;
 pub mod tools;
 

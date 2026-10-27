@@ -2006,6 +2006,8 @@ struct CeOrdered {
     order: Vec<String>,
     /// The pooled sessions' scores, best first.
     session_scores: Vec<f32>,
+    /// The same scores by session key, for the final-list summary.
+    by_session: HashMap<String, f32>,
 }
 
 /// Re-order the S1 collapsed list (one representative chunk id per session)
@@ -2073,9 +2075,14 @@ fn ce_reorder(
             order.push(id.clone());
         }
     }
+    let by_session: HashMap<String, f32> = sessions
+        .iter()
+        .map(|session| ((*session).to_string(), scored[best[session]].3))
+        .collect();
     CeOrdered {
         order,
         session_scores,
+        by_session,
     }
 }
 
@@ -2384,6 +2391,39 @@ fn drop_echo_rows(
     dropped
 }
 
+/// Leave out of `enriched` the transcript rows that are eval or synthetic
+/// content by provenance ([`super::synthetic`]): rows of a bench/eval session
+/// and the tool output of a bench/eval call. Returns their ids. Runs at the
+/// echo filter's point, before any ranking. Stored reflections are never
+/// judged here.
+fn drop_synthetic_rows(
+    storage: &Storage,
+    enriched: &mut Vec<EnrichedResult>,
+    provenance: &HashMap<String, Option<crate::provenance::ChunkProvenance>>,
+    reflection_tags: &HashMap<String, Vec<String>>,
+) -> HashSet<String> {
+    if !super::synthetic::filter_enabled() {
+        return HashSet::new();
+    }
+    let candidates: Vec<super::synthetic::ChunkRef> = enriched
+        .iter()
+        .filter(|e| !reflection_tags.contains_key(&e.chunk.id))
+        .map(|e| super::synthetic::ChunkRef {
+            id: e.chunk.id.clone(),
+            conversation_id: e.chunk.conversation_id.clone(),
+            author: provenance
+                .get(&e.chunk.id)
+                .and_then(|row| row.as_ref())
+                .map(|row| row.author),
+        })
+        .collect();
+    let dropped = super::synthetic::synthetic_ids(storage, &candidates);
+    if !dropped.is_empty() {
+        enriched.retain(|e| !dropped.contains(&e.chunk.id));
+    }
+    dropped
+}
+
 /// The cross-encoder stage of hybrid recall: score the pool (first
 /// [`CE_POOL`] fused chunks plus the S1 top sessions' representatives) and
 /// return the new session order with its score summary. Fails open: with no
@@ -2396,9 +2436,9 @@ fn ce_rerank_stage(
     session_keys: &HashMap<String, String>,
     answer_class: &HashMap<String, u8>,
     representatives: &HashMap<String, Vec<PoolChunk>>,
-) -> (Vec<String>, Option<format::CeSummary>) {
+) -> (Vec<String>, HashMap<String, f32>) {
     if collapsed.is_empty() {
-        return (collapsed, None);
+        return (collapsed, HashMap::new());
     }
     let by_id: HashMap<&str, &EnrichedResult> = enriched
         .iter()
@@ -2417,7 +2457,7 @@ fn ce_rerank_stage(
     let pool = ce_pool_ids(&fused, &protected, CE_POOL);
     let Some(encoder) = cross_encoder::global() else {
         warn_ce_unavailable("model files unavailable");
-        return (collapsed, None);
+        return (collapsed, HashMap::new());
     };
     let texts: Vec<String> = pool
         .iter()
@@ -2432,11 +2472,11 @@ fn ce_rerank_stage(
                 scores.len(),
                 pool.len()
             ));
-            return (collapsed, None);
+            return (collapsed, HashMap::new());
         }
         Err(error) => {
             warn_ce_unavailable(&format!("{error:#}"));
-            return (collapsed, None);
+            return (collapsed, HashMap::new());
         }
     };
     let scored: Vec<(String, String, u8, f32)> = pool
@@ -2453,8 +2493,36 @@ fn ce_rerank_stage(
         .collect();
     let ordered =
         ce_reorder_with_representatives(&collapsed, session_keys, &scored, representatives);
-    let summary = format::CeSummary::from_scores(&ordered.session_scores);
-    (ordered.order, summary)
+    (ordered.order, ordered.by_session)
+}
+
+/// The cross-encoder summary of the list the caller finally shows, for the
+/// relevance label. `final_sessions` is the session of each final row, best
+/// first; `scores` the cross-encoder score per session. The top is the score of
+/// the row that ended up first, the runner-up the next scored row, the median
+/// over every scored row: the label reads the scores that order the output,
+/// not the pool's best before later filters and sinks moved rows. `None` when
+/// the first row has no finite score (not pooled, or the cross-encoder did not
+/// run), where the caller keeps the cosine label.
+fn final_ce_summary(
+    final_sessions: &[&str],
+    scores: &HashMap<String, f32>,
+) -> Option<format::CeSummary> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let ranked: Vec<Option<f32>> = final_sessions
+        .iter()
+        .filter(|session| seen.insert(**session))
+        .map(|session| scores.get(*session).copied().filter(|s| s.is_finite()))
+        .collect();
+    let top = (*ranked.first()?)?;
+    let runner_up = ranked.iter().skip(1).flatten().next().copied();
+    let all: Vec<f32> = ranked.iter().flatten().copied().collect();
+    let median = format::CeSummary::from_scores(&all)?.median;
+    Some(format::CeSummary {
+        top,
+        runner_up,
+        median,
+    })
 }
 
 /// One retrieval + enrichment pass for `reflect_on_past_with_vec`: HNSW
@@ -2891,7 +2959,17 @@ async fn reflect_gather_pass(
             )
         })
         .collect();
-    let echo_dropped = drop_echo_rows(&mut enriched, &chunk_provenance, &reflection_tags, query);
+    let mut echo_dropped =
+        drop_echo_rows(&mut enriched, &chunk_provenance, &reflection_tags, query);
+    // Eval and synthetic content leaves the pool at the same point, by
+    // provenance (the session ran the bench/eval rig, or the row is a rig
+    // call's output). The page counts both as dropped for the refetch.
+    echo_dropped.extend(drop_synthetic_rows(
+        storage,
+        &mut enriched,
+        &chunk_provenance,
+        &reflection_tags,
+    ));
     let postings_order: Vec<String> = postings_order
         .into_iter()
         .filter(|id| !echo_dropped.contains(id))
@@ -3134,7 +3212,7 @@ async fn reflect_gather_pass(
     // rankings give each session the rank of its best chunk, and the session
     // is represented by that chunk. A channel with weight 0.0 is skipped.
     let mut collapsed_sessions: Option<(HashSet<String>, HashMap<String, String>)> = None;
-    let mut ce_summary: Option<format::CeSummary> = None;
+    let mut ce_session_scores: HashMap<String, f32> = HashMap::new();
     let final_order = match search_mode {
         SearchMode::Hybrid => {
             // Episode channel: bm25 over `episodes_fts`, one more lexical
@@ -3280,7 +3358,7 @@ async fn reflect_gather_pass(
                 .into_iter()
                 .map(|id| episode_remap.get(&id).cloned().unwrap_or(id))
                 .collect();
-                let (reordered, summary) = ce_rerank_stage(
+                let (reordered, session_ce) = ce_rerank_stage(
                     query,
                     collapsed,
                     fused,
@@ -3289,7 +3367,7 @@ async fn reflect_gather_pass(
                     &answer_class,
                     &representative_pool_map,
                 );
-                ce_summary = summary;
+                ce_session_scores = session_ce;
                 if let Some(enriched_conv) = enriched_conv.as_ref() {
                     let ranked: Vec<(String, String, f32)> = reordered
                         .iter()
@@ -3481,6 +3559,22 @@ async fn reflect_gather_pass(
         ancestry_candidates_used,
         "release ancestry applied to search candidates"
     );
+    // The label reads the cross-encoder scores of the list as it finally
+    // stands: after the sinks, the dedupes and the exact-prefix promotion.
+    let ce = match collapsed_sessions.as_ref() {
+        Some((_, session_keys)) if !ce_session_scores.is_empty() => {
+            let final_sessions: Vec<&str> = enriched
+                .iter()
+                .map(|e| {
+                    session_keys
+                        .get(&e.chunk.id)
+                        .map_or(e.chunk.id.as_str(), String::as_str)
+                })
+                .collect();
+            final_ce_summary(&final_sessions, &ce_session_scores)
+        }
+        _ => None,
+    };
     Ok(GatherPass {
         enriched,
         display_rank_scores,
@@ -3488,7 +3582,7 @@ async fn reflect_gather_pass(
         window_full,
         echo_dropped: echo_dropped.len(),
         search_ms,
-        ce: ce_summary,
+        ce,
     })
 }
 
@@ -15909,5 +16003,32 @@ mod representative_tests {
         ];
         let ordered = ce_reorder_with_representatives(&collapsed, &keys, &scored, &pool);
         assert_eq!(ordered.order, vec!["t1", "c2"]);
+    }
+
+    #[test]
+    fn f1a_final_ce_summary_reads_the_final_order() {
+        let scores: HashMap<String, f32> = [("a", 9.0f32), ("b", 7.0), ("c", 1.0)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        // Pool order was a, b, c; a sink moved b to the top.
+        let summary = final_ce_summary(&["b", "a", "c"], &scores).unwrap();
+        assert_eq!(summary.top, 7.0);
+        assert_eq!(summary.runner_up, Some(9.0));
+        assert_eq!(summary.median, 7.0);
+        // Unpooled rows skip the runner-up and the median.
+        let summary = final_ce_summary(&["a", "x", "c", "a"], &scores).unwrap();
+        assert_eq!(summary.top, 9.0);
+        assert_eq!(summary.runner_up, Some(1.0));
+        assert_eq!(summary.median, 5.0);
+    }
+
+    #[test]
+    fn f1a_final_ce_summary_is_none_without_a_first_score() {
+        let scores: HashMap<String, f32> = [("a".to_string(), 9.0f32)].into_iter().collect();
+        assert!(final_ce_summary(&["x", "a"], &scores).is_none());
+        assert!(final_ce_summary(&[], &scores).is_none());
+        let nan: HashMap<String, f32> = [("a".to_string(), f32::NAN)].into_iter().collect();
+        assert!(final_ce_summary(&["a"], &nan).is_none());
     }
 }
