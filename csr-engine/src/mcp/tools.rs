@@ -2079,11 +2079,22 @@ fn ce_reorder(
     }
 }
 
+/// A content chunk may replace the cross-encoder's pick only when the
+/// cross-encoder scored it within this many logits of the pick: a near tie.
+/// A tool row that clearly outscores the session's content chunk is the better
+/// answer (a memory file read beats the prompt that asked about it), and the
+/// swap would hide it. Measured on the 12 probes (F1a): the swapped-out rows
+/// that held the answer led the content chunk by 0.5 to 3.8 logits.
+const CE_REPRESENTATIVE_TIE: f32 = 0.25;
+
 /// [`ce_reorder`], then the content-representative rule once more: the
-/// cross-encoder may pick a session's tool-output row, and the page shows the
-/// content chunk of the pool instead (the rule `apply_content_representatives`
+/// cross-encoder may pick a session's tool-output row, and when the pool's
+/// content chunk scored a near tie ([`CE_REPRESENTATIVE_TIE`]) the page shows
+/// the content chunk instead (the rule `apply_content_representatives`
 /// applies before the cross-encoder). Session order and scores stay as the
-/// cross-encoder computed them; only the displayed row is swapped.
+/// cross-encoder computed them; only the displayed row is swapped. A content
+/// chunk the cross-encoder did not score, or scored clearly lower, never
+/// replaces its pick.
 fn ce_reorder_with_representatives(
     collapsed: &[String],
     session_keys: &HashMap<String, String>,
@@ -2091,7 +2102,29 @@ fn ce_reorder_with_representatives(
     pool: &HashMap<String, Vec<PoolChunk>>,
 ) -> CeOrdered {
     let mut ordered = ce_reorder(collapsed, session_keys, scored);
+    let picked = ordered.order.clone();
     apply_content_representatives(&mut ordered.order, session_keys, pool);
+    let score_of = |id: &str| {
+        scored
+            .iter()
+            .find(|row| row.0 == id)
+            .map(|row| row.3)
+            .filter(|score| score.is_finite())
+    };
+    for (slot, pick) in ordered.order.iter_mut().zip(&picked) {
+        if slot == pick {
+            continue;
+        }
+        let near_tie = match (score_of(pick), score_of(slot)) {
+            (Some(pick_score), Some(content_score)) => {
+                content_score + CE_REPRESENTATIVE_TIE >= pick_score
+            }
+            _ => false,
+        };
+        if !near_tie {
+            slot.clone_from(pick);
+        }
+    }
     ordered
 }
 
@@ -15801,8 +15834,13 @@ mod representative_tests {
         assert_eq!(collapsed, vec!["a1", "c2", "e3"]);
     }
 
-    #[test]
-    fn s9r_ce_keeps_content_representative_over_tool_row() {
+    type RepFixture = (
+        Vec<String>,
+        HashMap<String, String>,
+        HashMap<String, Vec<PoolChunk>>,
+    );
+
+    fn f1a_rep_fixture() -> RepFixture {
         let collapsed = vec!["a1".to_string(), "c2".to_string()];
         let keys: HashMap<String, String> = [("t1", "s1"), ("a1", "s1"), ("c2", "s2")]
             .into_iter()
@@ -15814,10 +15852,18 @@ mod representative_tests {
             vec![chunk("t1", 0.9, true), chunk("a1", 0.3, false)],
         );
         pool.insert("s2".into(), vec![chunk("c2", 0.9, false)]);
-        // The cross-encoder scores the tool row of s1 highest and picks it.
+        (collapsed, keys, pool)
+    }
+
+    #[test]
+    fn s9r_ce_keeps_content_representative_over_tool_row() {
+        // The cross-encoder scores the tool row of s1 highest by a hair and
+        // picks it; the content chunk scores within the tie margin, so the
+        // content chunk is shown.
+        let (collapsed, keys, pool) = f1a_rep_fixture();
         let scored = vec![
             ("t1".to_string(), "s1".to_string(), 0u8, 5.0f32),
-            ("a1".to_string(), "s1".to_string(), 0u8, 2.0f32),
+            ("a1".to_string(), "s1".to_string(), 0u8, 4.9f32),
             ("c2".to_string(), "s2".to_string(), 0u8, 3.0f32),
         ];
         let plain = ce_reorder(&collapsed, &keys, &scored);
@@ -15830,5 +15876,38 @@ mod representative_tests {
         let before = ce_reorder(&collapsed, &keys, &only_content);
         let after = ce_reorder_with_representatives(&collapsed, &keys, &only_content, &pool);
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn f1a_ce_keeps_tool_row_that_clearly_outscores_the_content_chunk() {
+        // Bisected cause of the probe rank-1 drop (58de0ee5): a tool-result row
+        // holding the answer (a memory file read) beat the session's user-text
+        // chunk by 0.5 to 3.8 logits and was swapped out anyway.
+        let (collapsed, keys, pool) = f1a_rep_fixture();
+        for content_score in [4.5f32, 2.0, -3.0] {
+            let scored = vec![
+                ("t1".to_string(), "s1".to_string(), 0u8, 5.0f32),
+                ("a1".to_string(), "s1".to_string(), 0u8, content_score),
+                ("c2".to_string(), "s2".to_string(), 0u8, 3.0f32),
+            ];
+            let ordered = ce_reorder_with_representatives(&collapsed, &keys, &scored, &pool);
+            assert_eq!(
+                ordered.order,
+                vec!["t1", "c2"],
+                "content at {content_score}"
+            );
+        }
+    }
+
+    #[test]
+    fn f1a_ce_keeps_tool_row_when_the_content_chunk_was_not_scored() {
+        // No score for the content chunk: nothing says it is as good as the pick.
+        let (collapsed, keys, pool) = f1a_rep_fixture();
+        let scored = vec![
+            ("t1".to_string(), "s1".to_string(), 0u8, 5.0f32),
+            ("c2".to_string(), "s2".to_string(), 0u8, 3.0f32),
+        ];
+        let ordered = ce_reorder_with_representatives(&collapsed, &keys, &scored, &pool);
+        assert_eq!(ordered.order, vec!["t1", "c2"]);
     }
 }
