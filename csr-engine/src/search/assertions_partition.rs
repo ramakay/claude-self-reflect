@@ -66,6 +66,9 @@ fn one_line(text: &str) -> String {
 pub fn note_for(source: &str, state: &str, key: &str, receipt: &str) -> String {
     let label = match state {
         "superseded" => "superseded",
+        // The `task` source holds annotate rows only for DB evidence from a
+        // later memory (`feed_memory_evolved`): the claim has evolved.
+        "annotate" if source == "task" => "evolved",
         "annotate" => "annotated",
         "proposed" => "proposed",
         other => other,
@@ -117,10 +120,12 @@ pub fn partition(
         };
         let from_row = |a: &Assertion| {
             state_strength(&a.state).map(|strength| {
-                (
-                    strength,
-                    note_for(&a.source, &a.state, &a.source, &a.receipt),
-                )
+                let key = if a.source == "task" && a.state == "annotate" {
+                    "later-memory"
+                } else {
+                    a.source.as_str()
+                };
+                (strength, note_for(&a.source, &a.state, key, &a.receipt))
             })
         };
         if let Some(a) = by_target.get(unit.id).filter(|a| a.target_kind == "chunk") {
@@ -610,5 +615,43 @@ mod tests {
         let short = f1b_ids(&["a"]);
         let page = keep_sunk_in_page(short, &f1b_ids(&["a", "c"]), &sunk, 5);
         assert_eq!(page, f1b_ids(&["a", "c"]));
+    }
+
+    #[test]
+    fn f2b_12_task_annotate_row_renders_evolved_and_never_sinks() {
+        let by_target = map(vec![assertion("task", "chunk", "c1", "annotate", None)]);
+        let out = partition(&[unit("c1", "s1", "text")], &by_target, &[]);
+        assert!(
+            out.sunk.is_empty(),
+            "annotate-only: nothing leaves the ranking"
+        );
+        let note = &out.notes["c1"];
+        assert!(
+            note.starts_with("[evolved] later-memory (receipt "),
+            "{note}"
+        );
+        assert!(!note.contains("[annotated]"), "{note}");
+        // A csr_resolve annotation keeps its own wording.
+        let by_target = map(vec![assertion(
+            "csr_resolve",
+            "chunk",
+            "c1",
+            "annotate",
+            None,
+        )]);
+        let out = partition(&[unit("c1", "s1", "text")], &by_target, &[]);
+        assert!(
+            out.notes["c1"].starts_with("[annotated] csr_resolve"),
+            "{:?}",
+            out.notes
+        );
+        // A proposal stays a proposal.
+        let by_target = map(vec![assertion("task", "chunk", "c1", "proposed", None)]);
+        let out = partition(&[unit("c1", "s1", "text")], &by_target, &[]);
+        assert!(
+            out.notes["c1"].starts_with("[proposed] task"),
+            "{:?}",
+            out.notes
+        );
     }
 }

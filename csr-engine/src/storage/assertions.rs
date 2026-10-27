@@ -7,7 +7,18 @@
 //! * `witness`: the latest live `witness_verdicts` event per witness, expanded to
 //!   its chunks through `witness_chunk_bindings`.
 //! * `task`: every `resolution_proposals` row, state `proposed` (annotate only,
-//!   never sinks: proposals stay invisible until a human promotes one).
+//!   never sinks: proposals stay invisible until a human promotes one), and the
+//!   memory-link rows below, state `annotate`.
+//!
+//! The memory-link rows are the only mark that needs no seed file. A memory
+//! file that a later session wrote and that links exactly one older memory (by
+//! slug, one way only) says the older memory was overtaken. The older memory was
+//! written in one conversation: the one conversation of its project with
+//! chunks on both sides of the memory's `modified_ts`. Its assistant chunks in
+//! the ten minutes before that write get one annotate-only row, which
+//! renders as `[evolved]`. It never supersedes and never sinks. Every step
+//! abstains: no link, a hub memory with several links, a link both ways, same-session link, two candidate
+//! conversations, or a link written before the old memory all write nothing.
 //!
 //! A row with no receipt is never written; it is counted in `skipped_no_receipt`.
 //! The table is additive and derived. [`Storage::rebuild_assertions`] deletes and
@@ -32,6 +43,13 @@ const EVIDENCE_RECEIPT_CHARS: usize = 80;
 const OID_RECEIPT_CHARS: usize = 7;
 /// Most bound parameters per batched read statement.
 const MAX_PARAMS: usize = 500;
+/// Seconds either side of a memory's `modified_ts` searched for the
+/// conversation that wrote it.
+const MEMORY_WRITE_SLACK_SECS: i64 = 120;
+/// Seconds before the memory write whose assistant chunks get the mark.
+const MEMORY_LOOKBACK_SECS: i64 = 600;
+/// Receipt text cut for the memory-link rows (two slugs and a date).
+const MEMORY_RECEIPT_CHARS: usize = 160;
 
 /// Additive migration: table and lookup index. Safe to run twice.
 pub fn migrate_assertions(conn: &Connection) -> Result<()> {
@@ -432,6 +450,160 @@ fn feed_task(tx: &Transaction<'_>, report: &mut AssertionBuildReport) -> Result<
     Ok(())
 }
 
+/// The `task` / `annotate` rows: chunks whose session wrote a memory that a
+/// later session's memory links. Annotate only, `INSERT OR IGNORE` so a
+/// proposal on the same chunk keeps the one `task` slot. Fails open when the
+/// memory registry or the chunk tables are missing.
+fn feed_memory_evolved(tx: &Transaction<'_>, report: &mut AssertionBuildReport) -> Result<()> {
+    struct Pair {
+        old_slug: String,
+        old_project: String,
+        t_old: String,
+        new_slug: String,
+        t_new: String,
+        new_session: String,
+    }
+    let pairs = {
+        let Ok(mut stmt) = tx.prepare(
+            "SELECT o.slug, o.project, o.modified_ts, n.slug, n.modified_ts,
+                    COALESCE(n.origin_session_id, '')
+             FROM memory_registry n, json_each(n.links_json) l
+             JOIN memory_registry o ON o.slug = l.value
+             WHERE json_array_length(n.links_json) = 1
+               AND o.file_path <> n.file_path
+               AND o.project = n.project
+               AND o.mem_type = n.mem_type
+               AND o.modified_ts < n.modified_ts
+               AND NOT EXISTS (SELECT 1 FROM json_each(o.links_json) b
+                               WHERE b.value = n.slug)
+             ORDER BY n.modified_ts DESC, n.slug, o.slug",
+        ) else {
+            return Ok(());
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok(Pair {
+                old_slug: r.get(0)?,
+                old_project: r.get(1)?,
+                t_old: r.get(2)?,
+                new_slug: r.get(3)?,
+                t_new: r.get(4)?,
+                new_session: r.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for pair in pairs {
+        // The memory dir name is `-` plus the project path with `/` as `-`; a
+        // chunk's project name is that path's last component(s).
+        let project_matches = |name: &str| {
+            !name.is_empty()
+                && pair.old_project.len() > name.len()
+                && pair.old_project.ends_with(name)
+                && pair.old_project.as_bytes()[pair.old_project.len() - name.len() - 1] == b'-'
+        };
+        let writers = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT conversation_id, project_name, MIN(timestamp), MAX(timestamp)
+                 FROM chunks
+                 WHERE timestamp BETWEEN strftime('%Y-%m-%dT%H:%M:%fZ', ?1, ?2)
+                                     AND strftime('%Y-%m-%dT%H:%M:%fZ', ?1, ?3)
+                   AND is_sidechain = 0 AND source = 'conversation'
+                 GROUP BY conversation_id, project_name",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    pair.t_old,
+                    format!("-{MEMORY_WRITE_SLACK_SECS} seconds"),
+                    format!("+{MEMORY_WRITE_SLACK_SECS} seconds")
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut candidates = writers
+            .into_iter()
+            .filter(|(_, project, _, _)| project_matches(project));
+        let (Some((conv, project, first, last)), None) = (candidates.next(), candidates.next())
+        else {
+            continue;
+        };
+        // The conversation straddles the write, and the link comes from a
+        // different conversation that began after this one ended.
+        if !(first <= pair.t_old && pair.t_old <= last) || pair.new_session == conv {
+            continue;
+        }
+        let conv_last: Option<String> = tx.query_row(
+            "SELECT MAX(timestamp) FROM chunks WHERE conversation_id = ?1",
+            [&conv],
+            |r| r.get(0),
+        )?;
+        if conv_last.is_none_or(|t| t >= pair.t_new) {
+            continue;
+        }
+        let targets = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT c.id
+                 FROM chunks c JOIN chunk_provenance p ON p.chunk_id = c.id
+                 WHERE c.project_name = ?1 AND c.conversation_id = ?2
+                   AND c.timestamp BETWEEN strftime('%Y-%m-%dT%H:%M:%fZ', ?3, ?4) AND ?3
+                   AND p.author = 'assistant'
+                 ORDER BY c.timestamp, c.id",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    project,
+                    conv,
+                    pair.t_old,
+                    format!("-{MEMORY_LOOKBACK_SECS} seconds")
+                ],
+                |r| r.get::<_, String>(0),
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let day: String = pair.t_new.chars().take(10).collect();
+        let receipt = cut(
+            &format!("memory {} ({day}) links {}", pair.new_slug, pair.old_slug),
+            MEMORY_RECEIPT_CHARS,
+        );
+        let pattern = serde_json::json!({
+            "kind": "memory_link",
+            "old_memory": pair.old_slug,
+            "new_memory": pair.new_slug,
+            "session": conv,
+        })
+        .to_string();
+        for chunk_id in targets {
+            let n = tx.execute(
+                "INSERT OR IGNORE INTO assertions
+                    (source, target_kind, target_id, state, claim, pattern_json, receipt,
+                     asserted_at, source_row)
+                 VALUES ('task', 'chunk', ?1, 'annotate', NULL, ?2, ?3, ?4, ?5)",
+                params![
+                    chunk_id,
+                    pattern,
+                    receipt,
+                    pair.t_new,
+                    format!("memory_registry:{}", pair.new_slug)
+                ],
+            )?;
+            if n > 0 {
+                *report
+                    .by_source_state
+                    .entry("task/annotate".to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Re-derive the csr_resolve assertion of each chunk from its newest ledger row,
 /// inside the caller's transaction. The write path of csr_resolve calls this
 /// after it appends ledger rows. No-op when the table is missing. A newest row
@@ -532,6 +704,7 @@ impl Storage {
             feed_csr_resolve(&tx, &mut report)?;
             feed_witness(&tx, &mut report)?;
             feed_task(&tx, &mut report)?;
+            feed_memory_evolved(&tx, &mut report)?;
             tx.commit()?;
             report.elapsed_ms = started.elapsed().as_millis() as u64;
             Ok(report)
@@ -540,7 +713,8 @@ impl Storage {
 
     /// Rebuild the assertions only when an input changed. The fingerprint is
     /// `max(resolution_ledger.id)`, `max(witness_verdicts.id)`,
-    /// `count(resolution_proposals)` and the blake3 of the decisions file bytes
+    /// `count(resolution_proposals)`, the memory registry's row count and newest
+    /// file mtime, and the blake3 of the decisions file bytes
     /// (empty when there is none), kept in the `assertions_fingerprint` meta
     /// row. A missing table is created first; an empty table is rebuilt unless
     /// the last build wrote no rows (then the same inputs would write none
@@ -569,11 +743,13 @@ impl Storage {
             // A table an older build never had reads as -1, not as an error.
             let scalar = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
             let fingerprint = format!(
-                "v1|ledger={}|verdicts={}|proposals={}|decisions={}",
+                "v1|ledger={}|verdicts={}|proposals={}|decisions={}|memories={}.{}",
                 scalar("SELECT COALESCE(MAX(id),0) FROM resolution_ledger"),
                 scalar("SELECT COALESCE(MAX(id),0) FROM witness_verdicts"),
                 scalar("SELECT COUNT(*) FROM resolution_proposals"),
                 decisions_hash,
+                scalar("SELECT COUNT(*) FROM memory_registry"),
+                scalar("SELECT COALESCE(MAX(file_mtime),0) FROM memory_registry"),
             );
             let empty = missing || scalar("SELECT EXISTS(SELECT 1 FROM assertions)") == 0;
             Ok((
@@ -1230,5 +1406,276 @@ mod tests {
         assert!(s
             .ensure_assertions_fresh(Some(&dir.path().join("missing.json")))
             .is_err());
+    }
+
+    // ---- F2b item 12: annotate-only marks from DB evidence, no seed file ----
+
+    const F2B_OLD_T: &str = "2026-08-09T23:38:52.569Z";
+
+    fn f2b_chunk(s: &Storage, id: &str, conv: &str, project: &str, ts: &str, author: &str) {
+        exec(
+            s,
+            &format!(
+                "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
+                   VALUES ('{id}','{conv}','{project}','{ts}','body',1);
+                 INSERT INTO chunk_provenance (chunk_id, author, source_conv_id)
+                   VALUES ('{id}','{author}','{conv}');"
+            ),
+        );
+    }
+
+    fn f2b_memory(s: &Storage, slug: &str, modified: &str, origin: &str, links: &str) {
+        exec(
+            s,
+            &format!(
+                "INSERT INTO memory_registry
+                   (file_path, project, slug, mem_type, origin_session_id, modified_ts,
+                    file_mtime, content_hash, links_json, last_seen_scan)
+                 VALUES ('/m/{slug}.md','-Users-u-projects-csr','{slug}','project','{origin}',
+                         '{modified}',1,'h','{links}',1);"
+            ),
+        );
+    }
+
+    /// Session `sess-old` wrote the old memory at F2B_OLD_T; a later session
+    /// wrote a memory that links it.
+    fn f2b_fixture(s: &Storage) {
+        f2b_memory(s, "gotcha", F2B_OLD_T, "origin-old", "[]");
+        f2b_memory(
+            s,
+            "works",
+            "2026-08-18T23:43:40.459Z",
+            "sess-new",
+            "[\"gotcha\"]",
+        );
+        f2b_chunk(
+            s,
+            "c-claim",
+            "sess-old",
+            "csr",
+            "2026-08-09T23:31:16.350Z",
+            "assistant",
+        );
+        f2b_chunk(
+            s,
+            "c-tool",
+            "sess-old",
+            "csr",
+            "2026-08-09T23:35:00.000Z",
+            "tool_result",
+        );
+        f2b_chunk(
+            s,
+            "c-far",
+            "sess-old",
+            "csr",
+            "2026-08-09T22:50:00.000Z",
+            "assistant",
+        );
+        f2b_chunk(
+            s,
+            "c-write",
+            "sess-old",
+            "csr",
+            "2026-08-09T23:38:38.286Z",
+            "assistant",
+        );
+        f2b_chunk(
+            s,
+            "c-after",
+            "sess-old",
+            "csr",
+            "2026-08-09T23:39:09.020Z",
+            "tool_result",
+        );
+        f2b_chunk(
+            s,
+            "n-1",
+            "sess-new",
+            "csr",
+            "2026-08-18T23:00:00.000Z",
+            "assistant",
+        );
+    }
+
+    #[test]
+    fn f2b_12_later_memory_link_marks_old_session_chunks_annotate_only() {
+        let s = Storage::open_memory().unwrap();
+        f2b_fixture(&s);
+        // No decisions file: the DB evidence alone writes the mark.
+        let report = s.ensure_assertions_fresh(None).unwrap().expect("built");
+        assert_eq!(report.by_source_state["task/annotate"], 2);
+        let map = s
+            .assertions_for_targets(
+                &["c-claim", "c-write", "c-tool", "c-far", "c-after", "n-1"],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(map["c-claim"].state, "annotate");
+        assert_eq!(map["c-claim"].source, "task");
+        assert!(
+            map["c-claim"].receipt.contains("works"),
+            "{:?}",
+            map["c-claim"]
+        );
+        assert!(
+            map["c-claim"].receipt.contains("gotcha"),
+            "{:?}",
+            map["c-claim"]
+        );
+        assert!(map.contains_key("c-write"));
+        assert!(!map.contains_key("c-tool"), "tool results are not claims");
+        assert!(!map.contains_key("c-far"), "outside the lookback window");
+        assert!(!map.contains_key("c-after"), "after the memory write");
+        assert!(!map.contains_key("n-1"), "the later session is not marked");
+        let sunk_rows: i64 = s
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM assertions WHERE state = 'superseded'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(sunk_rows, 0, "no seed, no sink");
+        // Unchanged inputs do not rebuild again.
+        assert!(s.ensure_assertions_fresh(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn f2b_12_abstains_without_a_unique_session_or_a_later_link() {
+        // Two conversations of the same project overlap the write: abstain.
+        let s = Storage::open_memory().unwrap();
+        f2b_fixture(&s);
+        f2b_chunk(
+            &s,
+            "c-twin",
+            "sess-twin",
+            "csr",
+            "2026-08-09T23:38:00.000Z",
+            "assistant",
+        );
+        s.rebuild_assertions(&[]).unwrap();
+        assert!(s
+            .assertions_for_targets(&["c-claim"], &[])
+            .unwrap()
+            .is_empty());
+
+        // A concurrent conversation of another project does not block the mark.
+        let s = Storage::open_memory().unwrap();
+        f2b_fixture(&s);
+        f2b_chunk(
+            &s,
+            "c-other",
+            "sess-other",
+            "elsewhere",
+            "2026-08-09T23:38:00.000Z",
+            "assistant",
+        );
+        s.rebuild_assertions(&[]).unwrap();
+        assert!(s
+            .assertions_for_targets(&["c-claim"], &[])
+            .unwrap()
+            .contains_key("c-claim"));
+        assert!(!s
+            .assertions_for_targets(&["c-other"], &[])
+            .unwrap()
+            .contains_key("c-other"));
+
+        // The linking memory is older than the linked one: no later evidence.
+        let s = Storage::open_memory().unwrap();
+        f2b_fixture(&s);
+        exec(&s, "UPDATE memory_registry SET modified_ts = '2026-08-01T00:00:00.000Z' WHERE slug = 'works'");
+        s.rebuild_assertions(&[]).unwrap();
+        assert!(s
+            .assertions_for_targets(&["c-claim"], &[])
+            .unwrap()
+            .is_empty());
+
+        // The newer memory links two memories (a see-also hub, not a revision).
+        let s = Storage::open_memory().unwrap();
+        f2b_fixture(&s);
+        exec(
+            &s,
+            "UPDATE memory_registry SET links_json = '[\"gotcha\",\"other\"]' WHERE slug = 'works'",
+        );
+        s.rebuild_assertions(&[]).unwrap();
+        assert!(s
+            .assertions_for_targets(&["c-claim"], &[])
+            .unwrap()
+            .is_empty());
+
+        // The linked memory links back (a see-also pair): abstain.
+        let s = Storage::open_memory().unwrap();
+        f2b_fixture(&s);
+        exec(
+            &s,
+            "UPDATE memory_registry SET links_json = '[\"works\"]' WHERE slug = 'gotcha'",
+        );
+        s.rebuild_assertions(&[]).unwrap();
+        assert!(s
+            .assertions_for_targets(&["c-claim"], &[])
+            .unwrap()
+            .is_empty());
+
+        // The linking memory came from the very session that wrote the old one.
+        let s = Storage::open_memory().unwrap();
+        f2b_fixture(&s);
+        exec(
+            &s,
+            "UPDATE memory_registry SET origin_session_id = 'sess-old' WHERE slug = 'works'",
+        );
+        s.rebuild_assertions(&[]).unwrap();
+        assert!(s
+            .assertions_for_targets(&["c-claim"], &[])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn f2b_12_proposal_row_wins_and_memory_change_rebuilds() {
+        let s = Storage::open_memory().unwrap();
+        f2b_chunk(
+            &s,
+            "c-claim",
+            "sess-old",
+            "csr",
+            "2026-08-09T23:31:16.350Z",
+            "assistant",
+        );
+        f2b_chunk(
+            &s,
+            "c-after",
+            "sess-old",
+            "csr",
+            "2026-08-09T23:39:09.020Z",
+            "tool_result",
+        );
+        f2b_memory(&s, "gotcha", F2B_OLD_T, "origin-old", "[]");
+        s.insert_resolution_proposal("c-claim", None, "task finished", "sess")
+            .unwrap();
+        s.ensure_assertions_fresh(None).unwrap().expect("built");
+        assert!(
+            s.assertions_for_targets(&["c-claim"], &[]).unwrap()["c-claim"].state == "proposed"
+        );
+        // A later memory arrives: the fingerprint moves, the proposal still wins
+        // the one task slot and the rebuild does not fail on it.
+        f2b_memory(
+            &s,
+            "works",
+            "2026-08-18T23:43:40.459Z",
+            "sess-new",
+            "[\"gotcha\"]",
+        );
+        let report = s
+            .ensure_assertions_fresh(None)
+            .unwrap()
+            .expect("memory change rebuilds");
+        assert_eq!(report.by_source_state["task/proposed"], 1);
+        assert!(!report.by_source_state.contains_key("task/annotate"));
+        assert_eq!(
+            s.assertions_for_targets(&["c-claim"], &[]).unwrap()["c-claim"].state,
+            "proposed"
+        );
     }
 }
