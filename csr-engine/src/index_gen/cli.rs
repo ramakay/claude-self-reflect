@@ -16,7 +16,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
-    build, decode_f32, delta_since, ids_path, manifest_path, read_watermark, usearch_path,
+    build, build_episode_generation, decode_f32, delta_since, ids_path, manifest_path,
+    open_episode_generation, read_watermark, usearch_path, write_episode_watermark,
     write_watermark, GenManifest, Generation, DIMS,
 };
 use crate::search::SearchEngine;
@@ -61,6 +62,16 @@ pub enum VindexAction {
         gen_dir: PathBuf,
         #[arg(long, default_value_t = 1)]
         generation: u64,
+    },
+    /// Build the Granite episode vectors (embed-sample prefixes, last wins) into
+    /// <db parent>/index-v3 as `episodes-g<N>` and write `episode_vector_generation` last.
+    EpisodesActivate {
+        #[arg(long = "vec-prefix", required = true)]
+        vec_prefix: Vec<PathBuf>,
+        #[arg(long)]
+        generation: u64,
+        #[arg(long, default_value_t = 6)]
+        threads: usize,
     },
     /// Recall@k of the activated generation or today's hnsw_rs index against a truth file.
     Recall {
@@ -127,6 +138,11 @@ pub fn run(db_path: &Path, action: &VindexAction) -> Result<()> {
             gen_dir,
             generation,
         } => activate(db_path, gen_dir, *generation),
+        VindexAction::EpisodesActivate {
+            vec_prefix,
+            generation,
+            threads,
+        } => episodes_activate(db_path, vec_prefix, *generation, *threads),
         VindexAction::Recall {
             truth,
             vec_dir,
@@ -536,6 +552,33 @@ fn activate(db_path: &Path, gen_dir: &Path, generation: u64) -> Result<()> {
     for line in list_dir(&index_dir)? {
         println!("  {line}");
     }
+    Ok(())
+}
+
+/// Build + activate the episode family in one step. The only stdout line is the
+/// result (MCP channel rule); everything else goes to stderr.
+fn episodes_activate(
+    db_path: &Path,
+    prefixes: &[PathBuf],
+    generation: u64,
+    threads: usize,
+) -> Result<()> {
+    let index_dir = index_dir_of(db_path);
+    std::fs::create_dir_all(&index_dir)?;
+    let storage = Storage::open(db_path)?;
+    let (manifest, report) =
+        build_episode_generation(&storage, prefixes, &index_dir, generation, threads)?;
+    // Verify what landed on disk before the watermark names it.
+    let opened = open_episode_generation(&index_dir, &manifest)
+        .context("episode files fail the blake3 check; watermark not written")?;
+    write_episode_watermark(&storage, &manifest)?;
+    println!(
+        "activated family=episodes generation={} count={} missing={} stale={} blake3_ok=true",
+        manifest.generation,
+        opened.len(),
+        report.missing,
+        report.stale
+    );
     Ok(())
 }
 

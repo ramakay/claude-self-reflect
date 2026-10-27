@@ -23,6 +23,9 @@ use crate::storage::Storage;
 
 /// Meta row that names the active generation (JSON of [`GenManifest`]).
 pub const WATERMARK_KEY: &str = "vector_generation";
+/// Meta row that names the active episode-vector generation. A separate key so
+/// the chunk watermark is never touched by the episode family.
+pub const EPISODE_WATERMARK_KEY: &str = "episode_vector_generation";
 pub const DIMS: usize = 384;
 pub const CONNECTIVITY: usize = 16;
 pub const EXPANSION_ADD: usize = 128;
@@ -61,6 +64,11 @@ fn options(dims: usize) -> IndexOptions {
 
 pub fn basename(generation: u64) -> String {
     format!("chunks-g{generation}")
+}
+
+/// Episode family basename (`episodes-g<N>`); same file layout as the chunk family.
+pub fn episode_basename(generation: u64) -> String {
+    format!("episodes-g{generation}")
 }
 
 pub fn usearch_path(dir: &Path, basename: &str) -> PathBuf {
@@ -105,6 +113,31 @@ pub fn build(
     seq: i64,
     threads: usize,
 ) -> Result<GenManifest> {
+    build_family(
+        basename(generation),
+        vectors,
+        dims,
+        ids,
+        out_dir,
+        generation,
+        seq,
+        threads,
+    )
+}
+
+/// [`build`] with the file basename chosen by the caller (the chunk and
+/// episode families share every other step).
+#[allow(clippy::too_many_arguments)]
+fn build_family(
+    base: String,
+    vectors: &[f32],
+    dims: usize,
+    ids: &[String],
+    out_dir: &Path,
+    generation: u64,
+    seq: i64,
+    threads: usize,
+) -> Result<GenManifest> {
     let n = ids.len();
     if dims == 0 || vectors.len() != n * dims {
         bail!(
@@ -118,7 +151,6 @@ pub fn build(
         bail!("id contains a newline: {bad:?}");
     }
     std::fs::create_dir_all(out_dir)?;
-    let base = basename(generation);
     let threads = threads.max(1);
 
     let index = Index::new(&options(dims)).map_err(|e| anyhow!("usearch new: {e}"))?;
@@ -323,6 +355,169 @@ pub fn read_watermark(storage: &Storage) -> Result<Option<GenManifest>> {
 
 pub fn write_watermark(storage: &Storage, manifest: &GenManifest) -> Result<()> {
     storage.set_meta(WATERMARK_KEY, &serde_json::to_string(manifest)?)
+}
+
+// ------------------------------------------------------- episode family
+
+/// Counts the episode build reports next to the manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeBuildReport {
+    /// Vectors kept in the generation.
+    pub count: usize,
+    /// Live episodes (rows in `episodes`) that have no vector.
+    pub missing: usize,
+    /// Distinct vector ids dropped because no live episode has them.
+    pub stale: usize,
+}
+
+pub fn read_episode_watermark(storage: &Storage) -> Result<Option<GenManifest>> {
+    match storage.get_meta(EPISODE_WATERMARK_KEY)? {
+        Some(text) => Ok(Some(
+            serde_json::from_str(&text).context("parse episode_vector_generation watermark")?,
+        )),
+        None => Ok(None),
+    }
+}
+
+pub fn write_episode_watermark(storage: &Storage, manifest: &GenManifest) -> Result<()> {
+    storage.set_meta(EPISODE_WATERMARK_KEY, &serde_json::to_string(manifest)?)
+}
+
+/// Open an episode generation: same blake3 check and mmap as the chunk family,
+/// but only for a manifest that names an `episodes-g<N>` file set.
+pub fn open_episode_generation(index_dir: &Path, manifest: &GenManifest) -> Result<Generation> {
+    if manifest.basename != episode_basename(manifest.generation) {
+        bail!(
+            "manifest basename {:?} is not an episode generation",
+            manifest.basename
+        );
+    }
+    Generation::open(index_dir, manifest)
+}
+
+/// Ids of every episode in the DB's episodes table (built with `--since-days 90`).
+pub fn live_episode_ids(storage: &Storage) -> Result<HashSet<String>> {
+    storage.with_connection(|conn| {
+        let mut stmt = conn.prepare("SELECT id FROM episodes")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for id in rows {
+            out.insert(id?);
+        }
+        Ok(out)
+    })
+}
+
+/// One embed-sample prefix: `<prefix>.d384.f32`, `<prefix>.ids`, `<prefix>.meta.json`.
+fn read_vec_prefix(prefix: &Path) -> Result<(Vec<String>, Vec<f32>)> {
+    let with = |ext: &str| {
+        let mut name = prefix.as_os_str().to_os_string();
+        name.push(ext);
+        PathBuf::from(name)
+    };
+    let meta_file = with(".meta.json");
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_file).with_context(|| {
+            format!(
+                "read {} (written last; is the run finished?)",
+                meta_file.display()
+            )
+        })?)
+        .with_context(|| format!("parse {}", meta_file.display()))?;
+    let dims: Vec<u64> = match meta.get("dims") {
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_u64()).collect(),
+        Some(v) => v.as_u64().into_iter().collect(),
+        None => Vec::new(),
+    };
+    if dims != [DIMS as u64] {
+        bail!("{}: dims {dims:?}, expected [{DIMS}]", meta_file.display());
+    }
+    let ids_file = with(".ids");
+    let ids: Vec<String> = std::fs::read_to_string(&ids_file)
+        .with_context(|| format!("read {}", ids_file.display()))?
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let f32_file = with(&format!(".d{DIMS}.f32"));
+    let bytes = std::fs::read(&f32_file).with_context(|| format!("read {}", f32_file.display()))?;
+    let want = ids.len() * DIMS * 4;
+    if bytes.len() != want {
+        bail!(
+            "{}: {} bytes, expected {} ids x {DIMS} x 4 = {want}",
+            f32_file.display(),
+            bytes.len(),
+            ids.len()
+        );
+    }
+    Ok((ids, decode_f32(&bytes)))
+}
+
+/// Merge prefixes (last one wins per id), keep live ids only, in sorted id order.
+pub fn merge_episode_vectors(
+    prefixes: &[PathBuf],
+    live: &HashSet<String>,
+) -> Result<(Vec<String>, Vec<f32>, EpisodeBuildReport)> {
+    if prefixes.is_empty() {
+        bail!("no vector prefix given");
+    }
+    let mut winner: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    let mut loaded: Vec<Vec<f32>> = Vec::with_capacity(prefixes.len());
+    for (pi, prefix) in prefixes.iter().enumerate() {
+        let (ids, vectors) = read_vec_prefix(prefix)?;
+        for (row, id) in ids.into_iter().enumerate() {
+            winner.insert(id, (pi, row));
+        }
+        loaded.push(vectors);
+    }
+    let stale = winner.keys().filter(|id| !live.contains(*id)).count();
+    let mut keep: Vec<&String> = winner.keys().filter(|id| live.contains(*id)).collect();
+    keep.sort_unstable();
+    let missing = live.len() - keep.len();
+    let mut ids = Vec::with_capacity(keep.len());
+    let mut vectors = Vec::with_capacity(keep.len() * DIMS);
+    for id in keep {
+        let (pi, row) = winner[id];
+        vectors.extend_from_slice(&loaded[pi][row * DIMS..(row + 1) * DIMS]);
+        ids.push(id.clone());
+    }
+    let report = EpisodeBuildReport {
+        count: ids.len(),
+        missing,
+        stale,
+    };
+    Ok((ids, vectors, report))
+}
+
+/// Build `episodes-g<generation>` into `out_dir` from embed-sample prefixes,
+/// keeping only episodes live in the DB. Does not write the watermark.
+pub fn build_episode_generation(
+    storage: &Storage,
+    prefixes: &[PathBuf],
+    out_dir: &Path,
+    generation: u64,
+    threads: usize,
+) -> Result<(GenManifest, EpisodeBuildReport)> {
+    let live = live_episode_ids(storage)?;
+    let (ids, vectors, report) = merge_episode_vectors(prefixes, &live)?;
+    eprintln!(
+        "episodes build live={} kept={} missing={} stale={}",
+        live.len(),
+        report.count,
+        report.missing,
+        report.stale
+    );
+    let manifest = build_family(
+        episode_basename(generation),
+        &vectors,
+        DIMS,
+        &ids,
+        out_dir,
+        generation,
+        0,
+        threads,
+    )?;
+    Ok((manifest, report))
 }
 
 /// Chunk embeddings that changed after `seq`: current vectors for rows that
@@ -558,6 +753,143 @@ mod tests {
         let a = up.iter().find(|(id, _)| id == "a").unwrap();
         assert_eq!(a.1.len(), DIMS);
         assert_eq!(a.1[0], 5.0);
+    }
+
+    fn write_prefix(dir: &Path, name: &str, ids: &[&str], vectors: &[f32]) -> PathBuf {
+        let prefix = dir.join(name);
+        let with = |ext: &str| PathBuf::from(format!("{}{ext}", prefix.display()));
+        let mut bytes = Vec::new();
+        for x in vectors {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(with(".d384.f32"), bytes).unwrap();
+        std::fs::write(with(".ids"), ids.join("\n") + "\n").unwrap();
+        std::fs::write(
+            with(".meta.json"),
+            format!("{{\"dims\":[384],\"n\":{}}}", ids.len()),
+        )
+        .unwrap();
+        prefix
+    }
+
+    fn insert_episodes(storage: &Storage, ids: &[&str]) {
+        storage
+            .with_connection(|conn| {
+                for (i, id) in ids.iter().enumerate() {
+                    conn.execute(
+                        "INSERT INTO episodes(id,conversation_id,project_name,ordinal,first_uuid,last_uuid,timestamp,text,token_est) VALUES(?1,'conv','project',?2,'a','b','2026-10-01T00:00:00Z','text',1)",
+                        rusqlite::params![id, i as i64],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn episode_watermark_is_independent_of_chunk_watermark() {
+        let storage = Storage::open_memory().unwrap();
+        assert!(read_episode_watermark(&storage).unwrap().is_none());
+        let chunk = sample_manifest();
+        write_watermark(&storage, &chunk).unwrap();
+        let before = storage.get_meta(WATERMARK_KEY).unwrap();
+
+        let episode = GenManifest {
+            generation: 2,
+            basename: episode_basename(2),
+            count: 5,
+            seq: 0,
+            ..sample_manifest()
+        };
+        write_episode_watermark(&storage, &episode).unwrap();
+        assert_eq!(read_episode_watermark(&storage).unwrap(), Some(episode));
+        assert_eq!(storage.get_meta(WATERMARK_KEY).unwrap(), before);
+        assert_eq!(read_watermark(&storage).unwrap(), Some(chunk));
+        assert_eq!(basename(2), "chunks-g2");
+        assert_eq!(EPISODE_WATERMARK_KEY, "episode_vector_generation");
+    }
+
+    #[test]
+    fn stale_id_dropped_and_missing_id_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open_memory().unwrap();
+        insert_episodes(&storage, &["ep:a", "ep:b", "ep:c"]);
+        let mut v = gaussian(3, 11);
+        v.chunks_mut(DIMS).for_each(normalise);
+        let prefix = write_prefix(dir.path(), "base", &["ep:a", "ep:b", "ep:gone"], &v);
+        let out = dir.path().join("index-v3");
+        let (m, report) = build_episode_generation(&storage, &[prefix], &out, 1, 2).unwrap();
+        assert_eq!(
+            report,
+            EpisodeBuildReport {
+                count: 2,
+                missing: 1,
+                stale: 1
+            }
+        );
+        assert_eq!(m.basename, "episodes-g1");
+        assert_eq!(m.count, 2);
+        assert!(out.join("episodes-g1.usearch").exists());
+        assert!(!out.join("chunks-g1.usearch").exists());
+        let generation = open_episode_generation(&out, &m).unwrap();
+        assert_eq!(generation.ids(), ["ep:a", "ep:b"]);
+        assert!(open_episode_generation(
+            &out,
+            &GenManifest {
+                basename: "chunks-g1".into(),
+                ..m
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn last_prefix_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = gaussian(3, 21);
+        v.chunks_mut(DIMS).for_each(normalise);
+        let base = write_prefix(dir.path(), "base", &["ep:a", "ep:b"], &v[..2 * DIMS]);
+        let delta = write_prefix(dir.path(), "delta", &["ep:a"], &v[2 * DIMS..]);
+        let live: HashSet<String> = ["ep:a", "ep:b"].iter().map(|s| s.to_string()).collect();
+
+        let (ids, vectors, report) =
+            merge_episode_vectors(&[base.clone(), delta.clone()], &live).unwrap();
+        assert_eq!(ids, ["ep:a", "ep:b"]);
+        assert_eq!(&vectors[..DIMS], &v[2 * DIMS..]);
+        assert_eq!(&vectors[DIMS..], &v[DIMS..2 * DIMS]);
+        assert_eq!((report.count, report.missing, report.stale), (2, 0, 0));
+
+        let (_, vectors, _) = merge_episode_vectors(&[delta, base], &live).unwrap();
+        assert_eq!(&vectors[..DIMS], &v[..DIMS]);
+    }
+
+    #[test]
+    fn size_mismatch_and_wrong_dims_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = gaussian(2, 31);
+        let prefix = write_prefix(dir.path(), "short", &["ep:a", "ep:b"], &v);
+        let f32_file = PathBuf::from(format!("{}.d384.f32", prefix.display()));
+        let mut bytes = std::fs::read(&f32_file).unwrap();
+        bytes.truncate(bytes.len() - 4);
+        std::fs::write(&f32_file, bytes).unwrap();
+        let live: HashSet<String> = ["ep:a"].iter().map(|s| s.to_string()).collect();
+        let err = merge_episode_vectors(std::slice::from_ref(&prefix), &live)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("expected 2 ids x 384 x 4"), "{err}");
+
+        let prefix = write_prefix(dir.path(), "dims", &["ep:a"], &v[..DIMS]);
+        std::fs::write(
+            format!("{}.meta.json", prefix.display()),
+            "{\"dims\":[768]}",
+        )
+        .unwrap();
+        let err = merge_episode_vectors(&[prefix], &live)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("dims"), "{err}");
     }
 
     /// Unit vectors drawn around `centers` cluster centres, the shape real
