@@ -1807,7 +1807,14 @@ fn figure_detail_lines(c: &Composition, gauge: Option<Gauge>) -> Vec<String> {
     if !measured {
         out.push("No figures yet: nothing has been measured in this session.".into());
     }
-    out.extend(top.into_iter().chain(quotas));
+    out.extend(top);
+    // The words about the last turn, where the text pane has a row to spare for them.
+    out.extend(
+        breakdown_of(g)
+            .and_then(|b| b["caption"].as_str())
+            .map(str::to_owned),
+    );
+    out.extend(quotas);
     let money = money_fact(c);
     if !money.is_empty() {
         out.push(money);
@@ -1822,6 +1829,61 @@ fn figure_detail_lines(c: &Composition, gauge: Option<Gauge>) -> Vec<String> {
         ));
     }
     out
+}
+
+/// The breakdown of what fills the context, when the figure has one.
+fn breakdown_of(g: &Value) -> Option<&Value> {
+    g["breakdown"].is_object().then(|| &g["breakdown"])
+}
+/// The Context card's line about the change per turn: the last turn's parts when they are known,
+/// else the median change.
+fn turn_line(g: &Value) -> Option<String> {
+    if let Some(caption) = breakdown_of(g).and_then(|b| b["caption"].as_str()) {
+        return Some(caption.to_owned());
+    }
+    g["trend"].as_f64().map(|trend| {
+        format!(
+            "{}{}/turn",
+            if trend >= 0. { "+" } else { "−" },
+            short(trend.abs())
+        )
+    })
+}
+/// Height of the breakdown bar in the mid layout, and the room it takes under the lines.
+const BREAKDOWN_BAR_H: f32 = 8.;
+const BREAKDOWN_ROOM: f32 = 12.;
+/// What fills the context as one bar over the whole window: the floor under the conversation
+/// (system prompt, tools, memory), the messages, the tool results, CSR's injections, and what is
+/// free. A part that exists is never thinner than a hairline, so CSR's share stays visible.
+fn breakdown_bar(c: &mut Canvas, g: &Value, x: f32, y: f32, w: f32, t: &Tokens) {
+    let Some(b) = breakdown_of(g) else {
+        return;
+    };
+    let size = num(&b["size"]);
+    if size <= 0. || w <= 0. {
+        return;
+    }
+    c.rrect(x, y, w, BREAKDOWN_BAR_H, 2., t.track);
+    let wide = |key: &str| {
+        let n = num(&b[key]);
+        if n > 0. {
+            ((n / size) as f32 * w).max(1.5)
+        } else {
+            0.
+        }
+    };
+    let (text, tool, csr) = (wide("text"), wide("tool"), wide("csr"));
+    let used = ((num(&b["total"]) / size) as f32 * w).max(text + tool + csr);
+    let floor = (used - text - tool - csr).max(0.);
+    c.rrect(x, y, floor + 2., BREAKDOWN_BAR_H, 2., t.faint);
+    let mut at = x + floor;
+    for (part, ink) in [(text, t.sky), (tool, t.mint), (csr, t.csr_share)] {
+        if part > 0. {
+            c.rect(at, y, part, BREAKDOWN_BAR_H, ink);
+            at += part;
+        }
+    }
+    c.breakdown_bars.push((x, y, w, BREAKDOWN_BAR_H));
 }
 
 /// Whether a line of notes sits under the quota captions: a window with a forecast has one.
@@ -2550,6 +2612,8 @@ pub struct Metrics {
     pub quota_gauges: Vec<QuotaGauge>,
     /// Baseline of the line of notes drawn under the quota circles, in layout pt.
     pub note_rows: Vec<f32>,
+    /// Left, top, width and height of each context breakdown bar drawn, in layout pt.
+    pub breakdown_bars: Vec<(f32, f32, f32, f32)>,
     /// Top and bottom of each "N by CSR" caption drawn, in layout pt.
     pub by_csr: Vec<(f32, f32)>,
     pub fresh_plots: Vec<FreshPlot>,
@@ -3863,6 +3927,7 @@ pub fn draw(
             csr_cost: c.csr_cost.clone(),
             quota_gauges: canvas.quota_gauges.clone(),
             note_rows: canvas.note_rows.clone(),
+            breakdown_bars: canvas.breakdown_bars.clone(),
             by_csr: canvas.by_csr.clone(),
             fresh_plots: canvas.fresh_plots.clone(),
             question_size: qs.size,
@@ -3959,7 +4024,7 @@ fn empty_quota_height(c: &Composition) -> f32 {
 fn context_title_height(g: &Value) -> f32 {
     P + theme::TITLE_LINE
         + S2
-        + if g["trend"].as_f64().is_some() {
+        + if turn_line(g).is_some() {
             theme::CAPTION_LINE + S3
         } else {
             0.
@@ -4111,24 +4176,20 @@ fn figure(
         t.ink,
         t.bold,
     );
-    if let Some(trend) = g["trend"]
-        .as_f64()
-        .filter(|_| tokens.is_some() && !expanded)
-    {
-        label(
+    if let Some(line) = turn_line(g).filter(|_| tokens.is_some() && !expanded) {
+        let caption_y = y + P + theme::TITLE_LINE + S2;
+        single(
             c,
             f,
-            &format!(
-                "{}{}/turn",
-                if trend >= 0. { "+" } else { "−" },
-                short(trend.abs())
-            ),
+            &line,
             IX,
-            y + P + theme::TITLE_LINE + S2 + f.cap(sans(theme::CAPTION_SIZE, t.regular)),
+            caption_y + f.cap(sans(theme::CAPTION_SIZE, t.regular)),
+            IW,
             11.5,
             t.quiet,
-            t.regular,
+            t,
         );
+        breakdown_bar(c, g, IX, caption_y + theme::CAPTION_LINE + S1, IW, t);
     }
     if let Some(n) = data.tally["by_csr"].as_u64().filter(|n| *n > 0) {
         by_csr_mark(c, f, t, n, y);
@@ -4164,22 +4225,10 @@ fn figure(
             let chart_bottom = (gauge_cy - 72.).max(y + 70. - S2 + EXPANDED_PLOT_MIN);
             expanded_chart_bottom = chart_bottom;
             history_plot(c, f, data, y + 70., chart_bottom - (y + 70.) + S2, t);
-            if let Some(trend) = g["trend"].as_f64() {
-                label(
-                    c,
-                    f,
-                    &format!(
-                        "{}{}/turn",
-                        if trend >= 0. { "+" } else { "−" },
-                        short(trend.abs())
-                    ),
-                    IX,
-                    chart_bottom + 15.,
-                    11.5,
-                    t.quiet,
-                    t.regular,
-                );
+            if let Some(line) = turn_line(g) {
+                single(c, f, &line, IX, chart_bottom + 15., IW, 11.5, t.quiet, t);
             }
+            breakdown_bar(c, g, IX + 130., y + 49., IW - 130., t);
             c.text(f, &short(n), IX, y + 60., serif(25., t.medium), t.ink, A::L);
             label(
                 c,
@@ -4509,25 +4558,55 @@ fn draw_context_mid(
     let details_gap = S3;
     let details_h = 6.;
     // The trend and payback line, under the notes line. "N by CSR" sits in the title row instead.
-    let mut details = Vec::new();
-    if let Some(trend) = g["trend"].as_f64() {
-        details.push(format!(
-            "{}{}/turn",
-            if trend >= 0. { "+" } else { "−" },
-            short(trend.abs())
-        ));
-    }
+    // The breakdown's words take a line of their own; the median change and the payback share one.
     let pay = payback(g);
-    if !pay.is_empty() {
-        details.push(pay);
-    }
+    let broken = breakdown_of(g).is_some_and(|b| b["caption"].is_string());
+    let details: Vec<String> = if broken {
+        turn_line(g)
+            .into_iter()
+            .chain((!pay.is_empty()).then_some(pay))
+            .collect()
+    } else {
+        let line: Vec<_> = turn_line(g)
+            .into_iter()
+            .chain((!pay.is_empty()).then_some(pay))
+            .collect();
+        if line.is_empty() {
+            vec![]
+        } else {
+            vec![line.join(" · ")]
+        }
+    };
+    let compacting = g["compacting"].is_object();
+    let bar_wanted = breakdown_of(g).is_some() && !compacting;
     let right_bare = gauge_r + label_below + theme::CAPTION_LINE + notes_h(g);
-    let right_full = right_bare + details_gap + details_h;
-    // The line takes its room from the card or is not drawn: it never hangs below the card.
-    // The compaction bar sits where the line would, so it keeps the room too.
-    let wants_row = !details.is_empty() || g["compacting"].is_object();
-    let show_details = wants_row && (2. * r).max(right_full) <= slot + 0.5;
-    let right_h = if show_details || (wants_row && details.is_empty()) {
+    let right_for = |lines: usize, bar: bool| {
+        right_bare
+            + details_gap
+            + details_h
+            + lines.saturating_sub(1) as f32 * theme::CAPTION_LINE
+            + if bar { BREAKDOWN_ROOM } else { 0. }
+    };
+    let right_full = right_for(1, false);
+    // The lines take their room from the card or are not drawn: they never hang below the card.
+    // The richest set that fits wins: the lines and the bar, the lines, the first line and the
+    // bar, the first line. The compaction bar sits where the line would, so it keeps the room too.
+    let wants_row = !details.is_empty() || compacting || bar_wanted;
+    let first = details.len().min(1);
+    let (shown_lines, shown_bar) = [
+        (details.len(), bar_wanted),
+        (details.len(), false),
+        (first, bar_wanted),
+        (first, false),
+    ]
+    .into_iter()
+    .find(|(n, bar)| (2. * r).max(right_for((*n).max(1), *bar)) <= slot + 0.5)
+    .unwrap_or((0, false));
+    let show_details =
+        wants_row && (2. * r).max(right_for(shown_lines.max(1), shown_bar)) <= slot + 0.5;
+    let right_h = if show_details {
+        right_for(shown_lines.max(1), shown_bar)
+    } else if wants_row && details.is_empty() && !bar_wanted {
         right_full
     } else {
         right_bare
@@ -4605,16 +4684,26 @@ fn draw_context_mid(
         t,
     );
 
-    if show_details && !details.is_empty() {
-        let line = details.join(" · ");
-        let col = if g["payback"]["sev"] == "amber" {
-            t.amber
-        } else if g["compacting"].is_object() {
-            t.mint
-        } else {
-            t.quiet
-        };
-        single(c, f, &line, right_x0, details_y, right_w, 10.5, col, t);
+    if show_details {
+        for (i, line) in details.iter().take(shown_lines).enumerate() {
+            // The payback keeps its warning ink; the words about the turn stay quiet.
+            let is_payback = !broken || i + 1 == details.len() && details.len() > 1;
+            let col = if is_payback && g["payback"]["sev"] == "amber" {
+                t.amber
+            } else if is_payback && compacting {
+                t.mint
+            } else {
+                t.quiet
+            };
+            let at = details_y + i as f32 * theme::CAPTION_LINE;
+            single(c, f, line, right_x0, at, right_w, 10.5, col, t);
+        }
+        if shown_bar {
+            let top = details_y
+                + shown_lines.saturating_sub(1) as f32 * theme::CAPTION_LINE
+                + if shown_lines > 0 { 4. } else { -6. };
+            breakdown_bar(c, g, right_x0, top, right_w.min(240.), t);
+        }
     }
     if g["compacting"].is_object() {
         if let Some(high) = g["compacting"]["usual"]["high"]
@@ -5430,6 +5519,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn breakdown_composition() -> Composition {
+        let mut c = quota_composition();
+        c.figure["breakdown"] = json!({
+            "caption": "+9k this turn: tool results 6k, CSR 1.1k est.",
+            "floor": 28000., "text": 20000., "tool": 60000., "csr": 12000.,
+            "free": 880000., "total": 120000., "size": 1000000.,
+            "turn": null, "estimated": true,
+        });
+        c
+    }
+
+    #[test]
+    fn the_context_card_draws_what_fills_the_context_and_what_the_last_turn_added() {
+        let with = breakdown_composition();
+        let bare = quota_composition();
+        for open in [
+            Open::default(),
+            Open {
+                figure: true,
+                ..Open::default()
+            },
+        ] {
+            let frames = figure_sweep(&with, open);
+            assert!(frames.len() > 30, "{} frames drawn", frames.len());
+            let mut drawn = 0;
+            for (top, h, m) in &frames {
+                assert!(m.breakdown_bars.len() <= 1, "figure={}", open.figure);
+                for (_, y, w, bh) in &m.breakdown_bars {
+                    drawn += 1;
+                    assert!(*w > 60., "bar {w}pt wide");
+                    assert!(
+                        *y >= *top && y + bh <= top + h,
+                        "figure={}: bar {y:.1}..{:.1} outside the card {top:.1}..{:.1}",
+                        open.figure,
+                        y + bh,
+                        top + h
+                    );
+                }
+            }
+            // Most card heights have room for it; the rest keep the words and drop the bar.
+            assert!(
+                drawn * 2 > frames.len(),
+                "figure={}: {drawn}/{}",
+                open.figure,
+                frames.len()
+            );
+            for (_, _, m) in figure_sweep(&bare, open) {
+                assert!(m.breakdown_bars.is_empty(), "no breakdown, no bar");
+            }
+        }
+        // The bar shows CSR's share in CSR's ink, and the words are in the facts.
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let (width, avail) = (1210_u32, 2000_u32);
+            let (pm, m) = draw(&with, width, avail, theme, Open::default(), false).expect("draws");
+            let scale = (width as f32 / W).min(avail as f32 / m.height);
+            let left = ((width as f32 - (W * scale).round().min(width as f32)) / 2.) as u32;
+            let (x, y, w, bh) = *m.breakdown_bars.first().expect("a bar");
+            let band = (y, y + bh);
+            let wide = (W * scale) as u32;
+            assert!(
+                ink_px(&pm, band, scale, left, wide, t.csr_share) >= 4,
+                "{theme:?}: no CSR share"
+            );
+            assert!(
+                ink_px(&pm, band, scale, left, wide, t.mint) >= 4,
+                "{theme:?}: no tool results"
+            );
+            assert!(x >= 0. && x + w <= W);
+        }
+        let rows = figure_text_rows(&with, 100, true, None).join("\n");
+        assert!(
+            rows.contains("+9k this turn: tool results 6k, CSR 1.1k est."),
+            "{rows}"
+        );
+        assert!(!figure_text_rows(&bare, 100, true, None)
+            .join("\n")
+            .contains("this turn"));
     }
 
     #[test]

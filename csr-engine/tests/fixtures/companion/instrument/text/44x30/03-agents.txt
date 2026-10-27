@@ -8,7 +8,6 @@ pane, as you wanted on 10-09?
 Confused Claude · 1 · o opens
 Should be a skill / memory / tool · 1 · o
 opens
-3 notes kept · 2 findings confirmed
 1 fact retired
 Story · refreshed <1m ago
 Text parity is ready for review.
@@ -19,6 +18,7 @@ CTX 192k/1M
 +6k/turn
 ♻ >15 prompts
 1 by CSR
++3k this turn: you + Claude 3k est.
 7D 52%» · CSR 1.2 pts
 5H 2%
 ◷ 59m

@@ -9,7 +9,6 @@ the star of the pane, as you wanted on
 Confused Claude · 1 · o opens
 Should be a skill / memory / tool · 1
 · o opens
-Text parity is ready for review.
 ~ reader.rs · read ⌗8e4e3f27
 + render/instrument.rs · meta
 ⌗7625eed7
@@ -19,6 +18,7 @@ CTX 192k/1M
 +6k/turn
 ♻ >15 prompts
 1 by CSR
++3k this turn: you + Claude 3k est.
 7D 52%» · CSR 1.2 pts
 5H 2%
 ◷ 59m
