@@ -1904,8 +1904,19 @@ mod tests {
 
     /// Send raw bytes; `Some(reply)` if the server answered a full frame.
     fn raw(data_dir: &Path, bytes: &[u8], close_after: bool) -> Option<Vec<u8>> {
+        raw_within(data_dir, bytes, close_after, Duration::from_secs(2))
+    }
+
+    /// [`raw`] with the client's give-up time chosen by the caller: a client
+    /// that gives up before the server admits it is never counted as a job.
+    fn raw_within(
+        data_dir: &Path,
+        bytes: &[u8],
+        close_after: bool,
+        wait: Duration,
+    ) -> Option<Vec<u8>> {
         let mut stream = std::os::unix::net::UnixStream::connect(socket_path(data_dir)).ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        stream.set_read_timeout(Some(wait)).ok()?;
         stream.write_all(bytes).ok()?;
         if close_after {
             stream.shutdown(std::net::Shutdown::Write).ok()?;
@@ -2037,13 +2048,17 @@ mod tests {
         let stuck: Vec<_> = (0..SERVER_SLOTS)
             .map(|_| {
                 let (dir, bytes) = (dir.clone(), search_frame.clone());
-                std::thread::spawn(move || raw(&dir, &bytes, false))
+                // A loaded machine may admit a client late; one that gave up
+                // first would never hold a slot, so these wait long.
+                std::thread::spawn(move || {
+                    raw_within(&dir, &bytes, false, Duration::from_secs(120))
+                })
             })
             .collect();
         // All eight admitted (and blocked on the lock)...
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(90), async {
             while slots.available_permits() > 0 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
             }
         })
         .await

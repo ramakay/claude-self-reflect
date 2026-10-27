@@ -2101,6 +2101,104 @@ fn episode_row(
     }
 }
 
+/// One chunk of a session's candidate pool: its fused score and whether its
+/// stored author marks it as tool output.
+#[derive(Debug, Clone, PartialEq)]
+struct PoolChunk {
+    id: String,
+    score: f64,
+    boilerplate: bool,
+}
+
+/// The chunk that stands for a session. `current` is the collapse's pick. When
+/// it is tool output (stored author `tool_result`) and the pool holds a content
+/// chunk of the session, the highest-scored content chunk stands instead;
+/// otherwise `current` keeps the place. Decided by stored metadata only. An
+/// unknown chunk, or a pool without content, abstains.
+fn session_representative(current: &str, pool: &[PoolChunk]) -> String {
+    let current_is_boilerplate = pool.iter().any(|c| c.id == current && c.boilerplate);
+    if !current_is_boilerplate {
+        return current.to_string();
+    }
+    pool.iter()
+        .filter(|c| !c.boilerplate)
+        .max_by(|a, b| a.score.total_cmp(&b.score))
+        .map(|c| c.id.clone())
+        .unwrap_or_else(|| current.to_string())
+}
+
+/// Swap, in place, each session's collapsed pick for [`session_representative`].
+/// `pool` maps a session key to its candidate chunks; `eligible` says whether a
+/// chunk may stand for the page (it has a row and shares the pick's standing).
+fn apply_content_representatives(
+    collapsed: &mut [String],
+    session_keys: &HashMap<String, String>,
+    pool: &HashMap<String, Vec<PoolChunk>>,
+) {
+    for slot in collapsed.iter_mut() {
+        let Some(session) = session_keys.get(slot.as_str()) else {
+            continue;
+        };
+        let Some(chunks) = pool.get(session) else {
+            continue;
+        };
+        *slot = session_representative(slot, chunks);
+    }
+}
+
+/// Build the candidate pool for [`apply_content_representatives`] from the
+/// chunk-level fused order. Only chunks that have a row, are not episodes, and
+/// whose standing is at least the pick's can stand for a session. Provenance
+/// authors are read once; a chunk with no known author is content.
+fn representative_pool(
+    storage: &Storage,
+    chunk_fused: &[String],
+    enriched: &[EnrichedResult],
+    session_keys: &HashMap<String, String>,
+    answer_class: &HashMap<String, u8>,
+    collapsed: &[String],
+) -> HashMap<String, Vec<PoolChunk>> {
+    let have_row: HashSet<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
+    let mut best_class: HashMap<&str, u8> = HashMap::new();
+    for id in collapsed {
+        if let Some(session) = session_keys.get(id.as_str()) {
+            best_class.insert(
+                session.as_str(),
+                answer_class.get(id.as_str()).copied().unwrap_or(0),
+            );
+        }
+    }
+    let wanted: Vec<String> = chunk_fused
+        .iter()
+        .filter(|id| have_row.contains(id.as_str()))
+        .filter(|id| {
+            session_keys
+                .get(id.as_str())
+                .is_some_and(|s| best_class.contains_key(s.as_str()))
+        })
+        .cloned()
+        .collect();
+    let authors = storage
+        .with_connection(|conn| crate::storage::queries::chunk_authors(conn, &wanted))
+        .unwrap_or_default();
+    let mut pool: HashMap<String, Vec<PoolChunk>> = HashMap::new();
+    for (position, id) in wanted.iter().enumerate() {
+        let session = &session_keys[id.as_str()];
+        let class = answer_class.get(id.as_str()).copied().unwrap_or(0);
+        if class > best_class[session.as_str()] {
+            continue;
+        }
+        pool.entry(session.clone()).or_default().push(PoolChunk {
+            id: id.clone(),
+            score: 1.0 / (RRF_K + position) as f64,
+            boilerplate: authors.get(id) == Some(&crate::provenance::Speaker::ToolResult),
+        });
+    }
+    // The pick itself may sit outside the fused order's rows; it stays unknown
+    // (content) in that case, which abstains.
+    pool
+}
+
 /// Settle the sessions whose collapsed representative is an episode. When the
 /// session has a chunk in the pool, that chunk (its best by chunk fusion) keeps
 /// its id and carries the episode as its excerpt; otherwise the episode row
@@ -2913,8 +3011,8 @@ async fn reflect_gather_pass(
         SearchMode::Hybrid => {
             // Episode channel: bm25 over `episodes_fts`, one more lexical
             // list fused at session level with the chunk channels. Off (None)
-            // under CSR_NO_EPISODES=1 or an empty episodes table, where this
-            // arm is the chunk-only path.
+            // unless CSR_EPISODES=1 (CSR_NO_EPISODES wins) or with an empty
+            // episodes table, where this arm is the chunk-only path.
             let episode_hits = {
                 let family: Option<Vec<&str>> = scope
                     .effective_project
@@ -2991,6 +3089,27 @@ async fn reflect_gather_pass(
                 |id| answer_class.get(id).copied().unwrap_or(0),
                 RRF_K,
             );
+            // Session representative: a tool-output pick yields to the
+            // session's best content chunk in the pool. Stored author only.
+            if policy == RetrievalPolicy::CrossEncoder {
+                let chunk_fused = crate::search::hybrid::fuse_rrf_weighted(
+                    &[
+                        (&semantic_order, 1.0),
+                        (&fts_order, 1.0),
+                        (&postings_order, postings_weight),
+                    ],
+                    RRF_K,
+                );
+                let pool = representative_pool(
+                    storage,
+                    &chunk_fused,
+                    &enriched,
+                    &session_keys,
+                    &answer_class,
+                    &collapsed,
+                );
+                apply_content_representatives(&mut collapsed, &session_keys, &pool);
+            }
             // A session whose best unit is an episode shows that episode as
             // its excerpt, under the session's best chunk when it has one.
             let mut episode_remap: HashMap<String, String> = HashMap::new();
@@ -9459,6 +9578,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CSR_NO_EPISODES");
+        std::env::set_var("CSR_EPISODES", "1");
         let (storage, search) = episode_fixture();
         // Pre-change path: no episodes at all.
         let before = episode_fixture_page(&storage, &search).await;
@@ -15225,5 +15345,72 @@ mod echo_recall_tests {
             order[0], "5eb5aebb-65ab-4fba-9917-86cb83845154",
             "{order:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod representative_tests {
+    use super::*;
+
+    fn chunk(id: &str, score: f64, boilerplate: bool) -> PoolChunk {
+        PoolChunk {
+            id: id.to_string(),
+            score,
+            boilerplate,
+        }
+    }
+
+    #[test]
+    fn boilerplate_top_with_content_second_picks_content() {
+        let pool = vec![chunk("tool", 0.9, true), chunk("talk", 0.5, false)];
+        assert_eq!(session_representative("tool", &pool), "talk");
+    }
+
+    #[test]
+    fn highest_scored_content_wins_over_lower_content() {
+        let pool = vec![
+            chunk("tool", 0.9, true),
+            chunk("low", 0.2, false),
+            chunk("mid", 0.5, false),
+        ];
+        assert_eq!(session_representative("tool", &pool), "mid");
+    }
+
+    #[test]
+    fn boilerplate_only_keeps_the_pick() {
+        let pool = vec![chunk("tool", 0.9, true), chunk("tool2", 0.4, true)];
+        assert_eq!(session_representative("tool", &pool), "tool");
+    }
+
+    #[test]
+    fn content_top_is_unchanged() {
+        let pool = vec![chunk("talk", 0.9, false), chunk("tool", 0.5, true)];
+        assert_eq!(session_representative("talk", &pool), "talk");
+    }
+
+    #[test]
+    fn unknown_pick_abstains() {
+        let pool = vec![chunk("talk", 0.9, false)];
+        assert_eq!(session_representative("missing", &pool), "missing");
+    }
+
+    #[test]
+    fn apply_swaps_only_sessions_with_a_boilerplate_pick() {
+        let mut collapsed = vec!["t1".to_string(), "c2".to_string(), "e3".to_string()];
+        let keys: HashMap<String, String> = [("t1", "s1"), ("c2", "s2"), ("e3", "s3")]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let mut pool: HashMap<String, Vec<PoolChunk>> = HashMap::new();
+        pool.insert(
+            "s1".into(),
+            vec![chunk("t1", 0.9, true), chunk("a1", 0.3, false)],
+        );
+        pool.insert(
+            "s2".into(),
+            vec![chunk("c2", 0.9, false), chunk("t2", 0.3, true)],
+        );
+        apply_content_representatives(&mut collapsed, &keys, &pool);
+        assert_eq!(collapsed, vec!["a1", "c2", "e3"]);
     }
 }

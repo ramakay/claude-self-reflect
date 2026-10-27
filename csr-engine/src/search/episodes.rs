@@ -2,9 +2,10 @@
 //! nearest-neighbour list over the episode vector generation, the pair merged
 //! by RRF into one list, then fused with the chunk channels at session level.
 //! A session's standing in a channel is its single best unit (max, never a
-//! sum); a unit is a chunk or an episode. `CSR_NO_EPISODES=1`, or an empty
-//! `episodes` table, switches the channel off and recall is exactly the
-//! chunk-only path. `CSR_NO_EPISODE_VECTORS=1`, no episode watermark, a
+//! sum); a unit is a chunk or an episode. The channel is opt-in:
+//! `CSR_EPISODES=1` turns it on. `CSR_NO_EPISODES=1` wins over it, and so does
+//! an empty `episodes` table; either leaves recall exactly the chunk-only
+//! path. `CSR_NO_EPISODE_VECTORS=1`, no episode watermark, a
 //! missing model file or a failed embed leaves the lexical list alone.
 
 use std::collections::HashMap;
@@ -53,9 +54,14 @@ pub struct EpisodeHit {
 #[cfg(test)]
 pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Kill switch: `CSR_NO_EPISODES` set to anything but empty or `0`.
+fn flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Off unless opted in: `CSR_EPISODES` must be set to anything but empty or
+/// `0`, and the kill switch `CSR_NO_EPISODES` (same reading) must not be.
 pub fn disabled() -> bool {
-    std::env::var("CSR_NO_EPISODES").is_ok_and(|v| !v.is_empty() && v != "0")
+    flag("CSR_NO_EPISODES") || !flag("CSR_EPISODES")
 }
 
 /// Kill switch for the dense half: `CSR_NO_EPISODE_VECTORS` set to anything
@@ -461,12 +467,19 @@ mod tests {
     #[test]
     fn kill_switch_values() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CSR_NO_EPISODES", "1");
+        std::env::remove_var("CSR_NO_EPISODES");
+        std::env::remove_var("CSR_EPISODES");
+        assert!(disabled(), "off by default");
+        std::env::set_var("CSR_EPISODES", "0");
         assert!(disabled());
+        std::env::set_var("CSR_EPISODES", "1");
+        assert!(!disabled());
+        std::env::set_var("CSR_NO_EPISODES", "1");
+        assert!(disabled(), "the kill switch wins over the opt-in");
         std::env::set_var("CSR_NO_EPISODES", "0");
         assert!(!disabled());
         std::env::remove_var("CSR_NO_EPISODES");
-        assert!(!disabled());
+        std::env::remove_var("CSR_EPISODES");
     }
 
     fn memory_with(rows: &[(&str, i64, &str, i64)]) -> Storage {
@@ -486,6 +499,7 @@ mod tests {
     fn dense_only_hit_lifts_right_session() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CSR_NO_EPISODES");
+        std::env::set_var("CSR_EPISODES", "1");
         std::env::remove_var("CSR_NO_EPISODE_VECTORS");
         let storage = memory_with(&[
             ("a", 0, "the answer split across two halves", 0),
@@ -518,6 +532,7 @@ mod tests {
     fn dense_hits_respect_family_scope_and_merge_by_rrf() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CSR_NO_EPISODES");
+        std::env::set_var("CSR_EPISODES", "1");
         std::env::remove_var("CSR_NO_EPISODE_VECTORS");
         let storage = memory_with(&[
             ("a", 0, "widget parser failed", 0),
@@ -542,6 +557,7 @@ mod tests {
     fn dense_kill_switch_matches_lexical_only() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CSR_NO_EPISODES");
+        std::env::set_var("CSR_EPISODES", "1");
         let storage = memory_with(&[
             ("a", 0, "widget parser failed", 0),
             ("c", 0, "dense neighbour only", 0),
@@ -566,6 +582,7 @@ mod tests {
     fn no_watermark_fails_open_to_lexical() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CSR_NO_EPISODES");
+        std::env::set_var("CSR_EPISODES", "1");
         std::env::remove_var("CSR_NO_EPISODE_VECTORS");
         let storage = memory_with(&[
             ("a", 0, "widget parser failed", 0),
