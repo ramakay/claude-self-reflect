@@ -2288,6 +2288,223 @@ fn apply_status_recency(
     reorder_near_ties(&order, &candidates, limit, CE_REPRESENTATIVE_TIE)
 }
 
+/// Sessions a status query admits new report chunks for, and report chunks
+/// admitted per session.
+const STATUS_POOL_SESSIONS: usize = 3;
+const STATUS_POOL_PER_SESSION: usize = 3;
+
+/// What the status-intent pool added to a call.
+#[derive(Debug, Default)]
+struct StatusAdmission {
+    /// Chunk ids added to the cross-encoder pool beyond the fused window. They
+    /// have rows in `enriched`; the page limit does not count them.
+    admitted: Vec<String>,
+    /// Matched session key -> its newest eligible report chunk.
+    picks: HashMap<String, String>,
+}
+
+/// The session rows the status rules read, one per chunk row with a stored
+/// author. `report` marks a stored user or assistant chunk that is not an echo
+/// of the query; tool output, reflections and episodes (no stored author)
+/// never are.
+fn status_session_row(
+    storage: &Storage,
+    result: &EnrichedResult,
+    author: Option<crate::provenance::Speaker>,
+    query: &str,
+) -> crate::search::status_intent::SessionRow {
+    crate::search::status_intent::SessionRow {
+        id: result.chunk.id.clone(),
+        session: session_key_of(storage, &result.chunk),
+        content: result.chunk.content.clone(),
+        when: chrono::DateTime::parse_from_rfc3339(&result.chunk.timestamp)
+            .ok()
+            .map(|time| time.timestamp()),
+        seq: result.chunk.seq,
+        report: matches!(
+            author,
+            Some(crate::provenance::Speaker::User | crate::provenance::Speaker::Assistant)
+        ) && non_answer_class(&result.chunk.content, query) == 0,
+    }
+}
+
+/// Status-intent pool admission (status queries only; any other query returns
+/// the default and touches nothing). The sessions of the first-stage rows that
+/// carry the subject, at most [`STATUS_POOL_SESSIONS`], get their newest report
+/// chunks read straight from the table. Those the first stage did not hold go
+/// through the echo and synthetic/artefact filters and join `enriched` as
+/// keyword-lane rows, ready for the cross-encoder pool. Each matched session
+/// is then represented by its newest eligible report chunk.
+#[allow(clippy::too_many_arguments)]
+fn status_pool_admission(
+    storage: &Arc<Storage>,
+    query: &str,
+    enriched: &mut Vec<EnrichedResult>,
+    chunk_fused: &[String],
+    provenance: &HashMap<String, Option<crate::provenance::ChunkProvenance>>,
+    signals: &mut CandidateSignals,
+    scope: &SearchProjectScope,
+    active_forgetting: bool,
+    policy: RetrievalPolicy,
+    partition_enabled: bool,
+    consumption_mode: ConsumptionMode,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> StatusAdmission {
+    use crate::search::status_intent::{
+        is_status_query, matched_sessions, min_subject_hits, newest_eligible, subject_stems,
+    };
+    if policy != RetrievalPolicy::CrossEncoder || !is_status_query(query) {
+        return StatusAdmission::default();
+    }
+    let stems = subject_stems(query);
+    if stems.is_empty() {
+        return StatusAdmission::default();
+    }
+    let started = Instant::now();
+    let mut authors: HashMap<String, crate::provenance::Speaker> = provenance
+        .iter()
+        .filter_map(|(id, row)| row.as_ref().map(|row| (id.clone(), row.author)))
+        .collect();
+    let by_id: HashMap<&str, &EnrichedResult> = enriched
+        .iter()
+        .map(|result| (result.chunk.id.as_str(), result))
+        .collect();
+    let first_stage: Vec<crate::search::status_intent::SessionRow> = chunk_fused
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()))
+        .map(|result| {
+            status_session_row(
+                storage,
+                result,
+                authors.get(&result.chunk.id).copied(),
+                query,
+            )
+        })
+        .collect();
+    let matched = matched_sessions(&first_stage, &stems, STATUS_POOL_SESSIONS);
+    if matched.is_empty() {
+        super::stage_timing::stage("status_pool", started);
+        return StatusAdmission::default();
+    }
+    let held: HashSet<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
+    let newest = storage
+        .with_connection(|conn| {
+            crate::storage::status_pool::newest_report_chunks(
+                conn,
+                &matched,
+                STATUS_POOL_PER_SESSION,
+                &stems,
+                min_subject_hits(&stems),
+            )
+        })
+        .unwrap_or_default();
+    let new_ids: Vec<String> = newest
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .filter(|id| !held.contains(id))
+        .collect();
+    let mut admitted: Vec<String> = Vec::new();
+    if !new_ids.is_empty() {
+        let chunks = storage.get_chunks_by_ids(&new_ids).unwrap_or_default();
+        let id_refs: Vec<&str> = chunks.iter().map(|chunk| chunk.id.as_str()).collect();
+        let found = storage
+            .get_chunk_provenance_many(&id_refs)
+            .unwrap_or_default();
+        let new_provenance: HashMap<String, Option<crate::provenance::ChunkProvenance>> = chunks
+            .iter()
+            .map(|chunk| (chunk.id.clone(), found.get(&chunk.id).cloned()))
+            .collect();
+        let mut fresh: Vec<EnrichedResult> = chunks
+            .into_iter()
+            .map(|chunk| EnrichedResult {
+                score: 0.0,
+                chunk,
+                resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
+                validity_demoted: false,
+            })
+            .collect();
+        // Harness boilerplate is not a report and never enters the pool.
+        fresh
+            .retain(|result| !crate::search::status_intent::is_harness_text(&result.chunk.content));
+        // The same echo and synthetic/artefact filters the first stage passed.
+        let no_tags: HashMap<String, Vec<String>> = HashMap::new();
+        drop_echo_rows(&mut fresh, &new_provenance, &no_tags, query);
+        drop_synthetic_rows(storage, &mut fresh, &new_provenance, &no_tags);
+        let kept: Vec<crate::import::ConversationChunk> =
+            fresh.iter().map(|result| result.chunk.clone()).collect();
+        signals.extend(storage, &kept, partition_enabled, consumption_mode);
+        for result in fresh {
+            let chunk = result.chunk;
+            let (fts_score, _) = score_fts_candidate(
+                &chunk,
+                now,
+                &signals.validity,
+                signals.ancestry.get(&chunk.conversation_id),
+                active_forgetting,
+                policy,
+            );
+            if let Some(Some(row)) = new_provenance.get(&chunk.id) {
+                authors.insert(chunk.id.clone(), row.author);
+            }
+            admitted.push(chunk.id.clone());
+            enriched.push(EnrichedResult {
+                score: fts_score * project_scope_multiplier(&chunk.project_name, scope),
+                chunk: crate::import::ConversationChunk {
+                    content: format!("[keyword] {}", chunk.content),
+                    ..chunk
+                },
+                resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
+                validity_demoted: false,
+            });
+        }
+    }
+    let rows: Vec<crate::search::status_intent::SessionRow> = enriched
+        .iter()
+        .map(|result| {
+            status_session_row(
+                storage,
+                result,
+                authors.get(&result.chunk.id).copied(),
+                query,
+            )
+        })
+        .collect();
+    let picks: HashMap<String, String> = matched
+        .iter()
+        .filter_map(|session| {
+            newest_eligible(&rows, session, &stems).map(|id| (session.clone(), id))
+        })
+        .collect();
+    super::stage_timing::count("status_pool_admitted", admitted.len() as u64);
+    super::stage_timing::stage("status_pool", started);
+    StatusAdmission { admitted, picks }
+}
+
+/// Show each matched session by its newest eligible report chunk. A pick that
+/// was superseded (`sunk`) never stands. Order and length stay as they came;
+/// only the displayed chunk of a matched session changes.
+fn apply_status_picks(
+    order: Vec<String>,
+    session_keys: &HashMap<String, String>,
+    picks: &HashMap<String, String>,
+    sunk: &HashSet<String>,
+) -> Vec<String> {
+    if picks.is_empty() {
+        return order;
+    }
+    order
+        .into_iter()
+        .map(
+            |id| match session_keys.get(&id).and_then(|s| picks.get(s)) {
+                Some(pick) if !sunk.contains(pick) => pick.clone(),
+                _ => id,
+            },
+        )
+        .collect()
+}
+
 /// Key of a chunk's text for the cross-source dedupe: whitespace collapsed,
 /// lower-cased, the keyword-lane marker removed, hashed.
 fn cross_source_key(content: &str) -> [u8; 32] {
@@ -2689,6 +2906,7 @@ fn ce_rerank_stage(
     session_keys: &HashMap<String, String>,
     answer_class: &HashMap<String, u8>,
     representatives: &HashMap<String, Vec<PoolChunk>>,
+    admitted: &[String],
     memo: &CallMemo,
 ) -> (Vec<String>, HashMap<String, f32>) {
     if collapsed.is_empty() {
@@ -2703,6 +2921,7 @@ fn ce_rerank_stage(
         session_keys,
         answer_class,
         representatives,
+        admitted,
         memo,
     );
     super::stage_timing::stage("ce", ce_start);
@@ -2718,6 +2937,7 @@ fn ce_rerank_stage_inner(
     session_keys: &HashMap<String, String>,
     answer_class: &HashMap<String, u8>,
     representatives: &HashMap<String, Vec<PoolChunk>>,
+    admitted: &[String],
     memo: &CallMemo,
 ) -> (Vec<String>, HashMap<String, f32>) {
     let by_id: HashMap<&str, &EnrichedResult> = enriched
@@ -2734,7 +2954,13 @@ fn ce_rerank_stage_inner(
         .filter(|id| by_id.contains_key(id.as_str()))
         .cloned()
         .collect();
-    let pool = ce_pool_ids(&fused, &protected, CE_POOL);
+    let mut pool = ce_pool_ids(&fused, &protected, CE_POOL);
+    // Status-intent admissions ride on top of the window (empty otherwise).
+    for id in admitted {
+        if by_id.contains_key(id.as_str()) && !pool.contains(id) {
+            pool.push(id.clone());
+        }
+    }
     let Some(encoder) = cross_encoder::global() else {
         warn_ce_unavailable("model files unavailable");
         return (collapsed, HashMap::new());
@@ -3538,6 +3764,36 @@ async fn reflect_gather_pass(
                 }
             }
             let episode_weight = if episode_hits.is_some() { 1.0 } else { 0.0 };
+            // Status-intent queries only: the newest report chunks of the
+            // matched sessions join the cross-encoder pool (default otherwise).
+            let status_admission = if policy == RetrievalPolicy::CrossEncoder
+                && crate::search::status_intent::is_status_query(query)
+            {
+                let chunk_fused = crate::search::hybrid::fuse_rrf_weighted(
+                    &[
+                        (&semantic_order, 1.0),
+                        (&fts_order, 1.0),
+                        (&postings_order, postings_weight),
+                    ],
+                    RRF_K,
+                );
+                status_pool_admission(
+                    storage,
+                    query,
+                    &mut enriched,
+                    &chunk_fused,
+                    &chunk_provenance,
+                    &mut signals,
+                    scope,
+                    active_forgetting,
+                    policy,
+                    partition_enabled,
+                    consumption_mode,
+                    &now,
+                )
+            } else {
+                StatusAdmission::default()
+            };
             let session_keys_start = Instant::now();
             let session_keys: HashMap<String, String> = enriched
                 .iter()
@@ -3672,9 +3928,12 @@ async fn reflect_gather_pass(
                     &session_keys,
                     &answer_class,
                     &representative_pool_map,
+                    &status_admission.admitted,
                     memo,
                 );
                 ce_session_scores = session_ce;
+                let reordered =
+                    apply_status_picks(reordered, &session_keys, &status_admission.picks, &sunk);
                 let reordered = apply_status_recency(
                     storage,
                     query,
@@ -10033,6 +10292,236 @@ mod tests {
             ),
             order
         );
+    }
+
+    /// Insert `id` with stored `author` into `storage`; return its enriched row.
+    fn f3b_put(
+        storage: &Storage,
+        id: &str,
+        session: &str,
+        when: &str,
+        author: crate::provenance::Speaker,
+        text: &str,
+    ) -> EnrichedResult {
+        let mut chunk = f1b_chunk(id, session, text);
+        chunk.timestamp = when.into();
+        chunk.author = author;
+        storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
+        storage
+            .insert_chunk_provenance(
+                id,
+                &crate::provenance::ChunkProvenance {
+                    author,
+                    source_conv_id: String::new(),
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+        EnrichedResult {
+            score: 0.5,
+            chunk,
+            resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
+            validity_demoted: false,
+        }
+    }
+
+    const F3B_STATUS: &str =
+        "what is the current state of the Vidhi Android maestro hardening workflow and what is left";
+
+    /// A session whose first-stage row is an old report, with a newer report, a
+    /// newer harness tail and a newer tool row outside the first stage.
+    fn f3b_session() -> (Arc<Storage>, Vec<EnrichedResult>) {
+        use crate::provenance::Speaker;
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let report = "Vidhi Android maestro hardening: sweeps status";
+        let first = f3b_put(
+            &storage,
+            "old-report",
+            "s1",
+            "2026-09-15T02:32:22Z",
+            Speaker::User,
+            report,
+        );
+        f3b_put(
+            &storage,
+            "new-report",
+            "s1",
+            "2026-09-15T04:58:24Z",
+            Speaker::Assistant,
+            "Prod is live. Vidhi Android maestro receipts: green",
+        );
+        f3b_put(
+            &storage,
+            "harness-tail",
+            "s1",
+            "2026-09-15T05:00:30Z",
+            Speaker::User,
+            "vidhi Android maestro PASS\n</result>\n</task-notification>",
+        );
+        f3b_put(
+            &storage,
+            "tool-newest",
+            "s1",
+            "2026-09-15T05:10:00Z",
+            Speaker::ToolResult,
+            report,
+        );
+        (storage, vec![first])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn f3b_admit(
+        storage: &Arc<Storage>,
+        query: &str,
+        enriched: &mut Vec<EnrichedResult>,
+    ) -> StatusAdmission {
+        let fused: Vec<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
+        let provenance: HashMap<String, Option<crate::provenance::ChunkProvenance>> = fused
+            .iter()
+            .map(|id| (id.clone(), storage.get_chunk_provenance(id).unwrap()))
+            .collect();
+        let mut signals = CandidateSignals::load(storage, &[], false, ConsumptionMode::Off);
+        status_pool_admission(
+            storage,
+            query,
+            enriched,
+            &fused,
+            &provenance,
+            &mut signals,
+            &unscoped_search_scope(),
+            false,
+            RetrievalPolicy::CrossEncoder,
+            false,
+            ConsumptionMode::Off,
+            &chrono::Utc::now(),
+        )
+    }
+
+    #[test]
+    fn f3b_status_query_admits_a_newer_same_session_report_outside_the_page() {
+        let (storage, mut enriched) = f3b_session();
+        let admission = f3b_admit(&storage, F3B_STATUS, &mut enriched);
+        // The newer report was outside the first stage and joins the pool. The
+        // tool row is never read; the harness tail is read but dropped.
+        assert_eq!(admission.admitted, ["new-report"], "{admission:?}");
+        let ids: HashSet<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
+        assert!(ids.contains("new-report") && !ids.contains("harness-tail"));
+        // Admitted rows are keyword-lane rows with a row of their own.
+        let row = enriched
+            .iter()
+            .find(|e| e.chunk.id == "new-report")
+            .unwrap();
+        assert!(row.chunk.content.starts_with("[keyword] "));
+        // The pool takes them on top of the window.
+        let mut pool = ce_pool_ids(&["old-report".into()], &[], CE_POOL);
+        pool.extend(admission.admitted.iter().cloned());
+        assert_eq!(pool, ["old-report", "new-report"]);
+    }
+
+    #[test]
+    fn f3b_status_newest_eligible_chunk_represents_its_session() {
+        let (storage, mut enriched) = f3b_session();
+        let admission = f3b_admit(&storage, F3B_STATUS, &mut enriched);
+        // The harness tail is newer, but the harness wrote it: the newest
+        // eligible report is the assistant chunk.
+        assert_eq!(
+            admission.picks.get("s1").map(String::as_str),
+            Some("new-report")
+        );
+        let keys: HashMap<String, String> = enriched
+            .iter()
+            .map(|e| (e.chunk.id.clone(), "s1".to_string()))
+            .collect();
+        let swapped = apply_status_picks(
+            vec!["old-report".into()],
+            &keys,
+            &admission.picks,
+            &HashSet::new(),
+        );
+        assert_eq!(swapped, ["new-report"]);
+        // A superseded pick never stands.
+        let sunk: HashSet<String> = ["new-report".to_string()].into();
+        assert_eq!(
+            apply_status_picks(vec!["old-report".into()], &keys, &admission.picks, &sunk),
+            ["old-report"]
+        );
+    }
+
+    #[test]
+    fn f3b_status_non_status_query_changes_nothing() {
+        let (storage, mut enriched) = f3b_session();
+        let before: Vec<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
+        let plain = "vidhi android maestro hardening workflow notes";
+        let admission = f3b_admit(&storage, plain, &mut enriched);
+        assert!(admission.admitted.is_empty() && admission.picks.is_empty());
+        let after: Vec<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
+        assert_eq!(before, after);
+        let order = vec!["old-report".to_string()];
+        let keys: HashMap<String, String> = [("old-report".to_string(), "s1".to_string())].into();
+        assert_eq!(
+            apply_status_picks(order.clone(), &keys, &admission.picks, &HashSet::new()),
+            order
+        );
+        // A status query under the legacy policy admits nothing either.
+        let fused = before.clone();
+        let mut signals = CandidateSignals::load(&storage, &[], false, ConsumptionMode::Off);
+        let legacy = status_pool_admission(
+            &storage,
+            F3B_STATUS,
+            &mut enriched,
+            &fused,
+            &HashMap::new(),
+            &mut signals,
+            &unscoped_search_scope(),
+            false,
+            RetrievalPolicy::Legacy,
+            false,
+            ConsumptionMode::Off,
+            &chrono::Utc::now(),
+        );
+        assert!(legacy.admitted.is_empty() && legacy.picks.is_empty());
+        assert_eq!(enriched.len(), before.len());
+    }
+
+    #[test]
+    fn f3b_status_harness_or_tool_result_row_is_never_the_representative() {
+        use crate::provenance::Speaker;
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let first = f3b_put(
+            &storage,
+            "report",
+            "s1",
+            "2026-09-15T02:00:00Z",
+            Speaker::Assistant,
+            "Vidhi Android maestro hardening: status",
+        );
+        // Newer, same subject, but the harness wrote one and the other is tool
+        // output: neither may stand for the session.
+        f3b_put(
+            &storage,
+            "harness-only",
+            "s1",
+            "2026-09-15T05:00:30Z",
+            Speaker::User,
+            "<task-notification> Vidhi Android maestro PASS </task-notification>",
+        );
+        let tool = f3b_put(
+            &storage,
+            "tool-newer",
+            "s1",
+            "2026-09-15T06:00:00Z",
+            Speaker::ToolResult,
+            "Vidhi Android maestro log",
+        );
+        let mut enriched = vec![first, tool];
+        let admission = f3b_admit(&storage, F3B_STATUS, &mut enriched);
+        assert!(admission.admitted.is_empty(), "{admission:?}");
+        assert_eq!(
+            admission.picks.get("s1").map(String::as_str),
+            Some("report")
+        );
+        assert!(!enriched.iter().any(|e| e.chunk.id == "harness-only"));
     }
 
     #[tokio::test]

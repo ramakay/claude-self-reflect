@@ -20,6 +20,7 @@ pub mod queries;
 pub mod queued_prompts;
 pub mod recap_feeds;
 pub mod sidechain_provenance;
+pub mod status_pool;
 pub mod trained_rerank;
 pub mod transcript_mirror;
 pub mod usage_reservation;
