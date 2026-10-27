@@ -532,9 +532,23 @@ async fn call(
     )
     .await;
     let ms = t.elapsed().as_secs_f64() * 1000.0;
+    finish_call(result, ms)
+}
+
+/// Redact the response (or error text) before anything splits, scores or
+/// dumps it: stored chunks written before a key pattern existed still hold
+/// their keys.
+fn finish_call(result: Result<String>, ms: f64) -> (String, f64, Option<String>) {
     match result {
-        Ok(text) => (text, ms, None),
-        Err(e) => (String::new(), ms, Some(format!("{e:#}"))),
+        Ok(text) => (redact_response(text), ms, None),
+        Err(e) => (String::new(), ms, Some(redact_response(format!("{e:#}")))),
+    }
+}
+
+fn redact_response(text: String) -> String {
+    match crate::redact::redact_secrets(&text) {
+        std::borrow::Cow::Owned(redacted) => redacted,
+        std::borrow::Cow::Borrowed(_) => text,
     }
 }
 
@@ -547,6 +561,7 @@ fn dump_line(
     error: Option<&str>,
 ) -> Result<()> {
     if let Some(w) = dump.as_mut() {
+        let response = &*crate::redact::redact_secrets(response);
         let mut line = json!({
             "kind": kind,
             "wall_ms": round3(wall_ms),
@@ -758,6 +773,33 @@ mod tests {
     }
 
     const XML: &str = r#"<search><r rank="1"><s>0.61</s>unrelated text</r><r rank="2"><s>0.58</s>Admin Merge works</r><r rank="3">admin merge but unmergeable</r></search>"#;
+
+    #[test]
+    fn f1b_secret_probe_response_redacted() {
+        let key = format!("phx_{}", "C".repeat(43));
+        let response =
+            format!(r#"<search><r rank="1"><s>0.61</s>the key is {key} here</r></search>"#);
+        // What `call` hands back: redacted before it is split, scored or dumped.
+        let (text, _, err) = finish_call(Ok(response.clone()), 1.0);
+        assert!(err.is_none());
+        assert!(!text.contains(&key), "{text}");
+        assert!(text.contains("[secret redacted: posthog_key]"), "{text}");
+        assert!(text.contains(r#"<r rank="1">"#), "block structure survives");
+        let (_, _, err) = finish_call(Err(anyhow::anyhow!("failed near {key}")), 1.0);
+        assert!(!err.unwrap().contains(&key));
+
+        // The dump writer redacts too, so no caller can write a raw key.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.ndjson");
+        let mut dump = Some(std::io::BufWriter::new(
+            std::fs::File::create(&path).unwrap(),
+        ));
+        dump_line(&mut dump, "probe", ("id", 1), 1.0, &response, None).unwrap();
+        drop(dump);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains(&key));
+        assert!(written.contains("[secret redacted: posthog_key]"));
+    }
 
     #[test]
     fn judge_finds_the_hit_at_rank_two_case_insensitively() {

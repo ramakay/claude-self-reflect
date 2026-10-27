@@ -67,6 +67,9 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// - Collapses multiple newlines to single newline
 /// - Strips control characters
 pub fn sanitize_for_injection(content: &str) -> String {
+    // Provider keys never reach injected text, including keys in chunks stored
+    // before the redactor knew their shape.
+    let content = crate::redact::redact_secrets(content);
     let mut result = String::with_capacity(content.len());
     let mut prev_was_newline = false;
 
@@ -309,6 +312,21 @@ pub fn truncate_item(content: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::injection::InjectionItem;
+
+    #[test]
+    fn f1b_secret_injection_redacted() {
+        let phx = format!("phx_{}", "A".repeat(43));
+        let ghp = format!("ghp_{}", "B".repeat(36));
+        let content = format!("## Notes\nthe key is {phx} and the token {ghp}\nplain line");
+        let out = sanitize_for_injection(&content);
+        assert!(!out.contains(&phx), "{out}");
+        assert!(!out.contains(&ghp), "{out}");
+        assert!(out.contains("[secret redacted: posthog_key]"), "{out}");
+        assert!(out.contains("[secret redacted: github_token]"), "{out}");
+        assert!(out.contains("plain line"), "{out}");
+        // Idempotent through a second sanitize pass.
+        assert_eq!(sanitize_for_injection(&out), out);
+    }
 
     #[test]
     fn test_estimate_tokens() {

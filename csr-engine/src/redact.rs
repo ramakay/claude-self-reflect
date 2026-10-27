@@ -13,7 +13,7 @@ use std::sync::LazyLock;
 use regex::{Captures, Regex};
 
 /// Every kind the scrubber reports, in status order.
-pub const KINDS: [&str; 12] = [
+pub const KINDS: [&str; 13] = [
     "anthropic_key",
     "openai_key",
     "openrouter_key",
@@ -26,6 +26,7 @@ pub const KINDS: [&str; 12] = [
     "private_key_block",
     "jwt",
     "env_secret",
+    "posthog_key",
 ];
 
 const ANTHROPIC: usize = 0;
@@ -40,6 +41,7 @@ const NPM: usize = 8;
 const PRIVATE_KEY: usize = 9;
 const JWT: usize = 10;
 const ENV_SECRET: usize = 11;
+const POSTHOG: usize = 12;
 
 /// Per-kind hit counts, indexed like [`KINDS`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +122,7 @@ impl SecretCounts {
 /// keeps the common no-secret case cheap: import runs this over every chunk.
 static PREFILTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"sk-|_live_|gh[pousr]_|github_pat_|AKIA|ASIA|xox[abprs]-|AIza|npm_|-----BEGIN|eyJ|SECRET|TOKEN|API_KEY|APIKEY|PASSWORD|PASSWD",
+        r"sk-|_live_|gh[pousr]_|github_pat_|AKIA|ASIA|xox[abprs]-|AIza|npm_|-----BEGIN|eyJ|SECRET|TOKEN|API_KEY|APIKEY|PASSWORD|PASSWD|phx_|phc_",
     )
     .expect("secret prefilter compiles")
 });
@@ -134,7 +136,7 @@ struct TokenRule {
 static TOKEN_RULES: LazyLock<Vec<TokenRule>> = LazyLock::new(|| {
     // Order matters: the narrow `sk-` shapes run before the generic OpenAI one,
     // which would otherwise also match them.
-    let rules: [(usize, &str); 9] = [
+    let rules: [(usize, &str); 10] = [
         (ANTHROPIC, r"\bsk-ant-[A-Za-z0-9_\-]{20,}"),
         (OPENROUTER, r"\bsk-or-v1-[a-f0-9]{40,}"),
         (OPENAI, r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{32,}"),
@@ -147,6 +149,7 @@ static TOKEN_RULES: LazyLock<Vec<TokenRule>> = LazyLock::new(|| {
         (GOOGLE, r"AIza[0-9A-Za-z_\-]{35}"),
         (STRIPE, r"(?:sk|rk)_live_[A-Za-z0-9]{20,}"),
         (NPM, r"npm_[A-Za-z0-9]{36}"),
+        (POSTHOG, r"\bph[xc]_[A-Za-z0-9]{30,}"),
     ];
     rules
         .into_iter()
@@ -412,6 +415,8 @@ mod tests {
             ("stripe_key", rep("sk_live_", 'Z', 24)),
             ("stripe_key", rep("rk_live_", 'Z', 24)),
             ("npm_token", rep("npm_", 'n', 36)),
+            ("posthog_key", rep("phx_", 'P', 43)),
+            ("posthog_key", format!("phc_{}", varied(43))),
             ("jwt", jwt),
         ]
     }
@@ -640,6 +645,105 @@ mod tests {
         let out = redact_secrets_counted(&secret, &mut counts);
         assert_eq!(out, secret);
         assert!(counts.is_empty());
+    }
+
+    fn f1b_secret_kind_case(kind: &str, secret: String) {
+        let text = format!("before {secret} after");
+        let mut counts = SecretCounts::default();
+        let out = redact_secrets_counted(&text, &mut counts);
+        assert_eq!(
+            out,
+            format!("before [secret redacted: {kind}] after"),
+            "{kind}"
+        );
+        assert_eq!(counts.get(kind), 1, "{kind}");
+        assert_eq!(counts.total(), 1, "{kind}");
+        // Idempotent: a second pass finds nothing.
+        let mut again = SecretCounts::default();
+        let twice = redact_secrets_counted(&out, &mut again);
+        assert!(matches!(twice, Cow::Borrowed(_)), "{kind}");
+        assert!(again.is_empty(), "{kind}");
+    }
+
+    #[test]
+    fn f1b_secret_each_kind_redacted_phx() {
+        f1b_secret_kind_case("posthog_key", format!("phx_{}", "A".repeat(43)));
+    }
+
+    #[test]
+    fn f1b_secret_each_kind_redacted_sk() {
+        f1b_secret_kind_case("openai_key", format!("sk-{}", varied(48)));
+    }
+
+    #[test]
+    fn f1b_secret_each_kind_redacted_ghp() {
+        f1b_secret_kind_case("github_token", format!("ghp_{}", "A".repeat(36)));
+    }
+
+    #[test]
+    fn f1b_secret_each_kind_redacted_xoxb() {
+        f1b_secret_kind_case("slack_token", format!("xoxb-{}", "1234567890"));
+    }
+
+    #[test]
+    fn f1b_secret_posthog_counts_round_trip_and_old_rows_read_zero() {
+        let mut counts = SecretCounts::default();
+        redact_secrets_counted(&format!("k phx_{}", "B".repeat(43)), &mut counts);
+        let json = counts.to_json().expect("one hit");
+        assert_eq!(json, r#"{"posthog_key":1}"#);
+        assert_eq!(SecretCounts::from_json(Some(&json)), counts);
+        // A row written before the kind existed reads as zero for it.
+        let old = SecretCounts::from_json(Some(r#"{"github_token":2}"#));
+        assert_eq!(old.get("github_token"), 2);
+        assert_eq!(old.get("posthog_key"), 0);
+        // A short phx_ token is not a key.
+        assert!(matches!(
+            redact_secrets("see phx_short and phc_tiny here"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn f1b_secret_phx_redacted_at_import() {
+        let key = format!("phx_{}", "A".repeat(43));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("posthog-session.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u-1",
+                "timestamp": "2026-10-14T10:00:00Z",
+                "message": {"content": format!("the PostHog personal key is {key} for the reel dashboard")}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": "a-1",
+                "timestamp": "2026-10-14T10:00:05Z",
+                "message": {"content": [{"type": "text", "text": "Noted the key and will query events."}]}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let parsed = crate::import::parse_jsonl_file_with_stats(&path, "proj").unwrap();
+        let stored = parsed
+            .chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!stored.contains(&key), "the key reached a chunk");
+        assert!(
+            stored.contains("[secret redacted: posthog_key]"),
+            "missing marker: {stored}"
+        );
+        assert_eq!(parsed.suppression.secrets.get("posthog_key"), 1);
     }
 
     #[test]

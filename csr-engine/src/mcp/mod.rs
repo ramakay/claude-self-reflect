@@ -461,7 +461,7 @@ impl CsrServer {
             && !elicitation::request_confirmation(&p.content, &context).await
         {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
-                "Reflection storage declined by user.",
+                redact_out("Reflection storage declined by user.".to_string()),
             )]));
         }
 
@@ -480,10 +480,12 @@ impl CsrServer {
                 .await
                 .unwrap_or(false);
             if !available {
-                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Reflection not stored: {}. Try again shortly.",
-                    crate::search::vector_ipc::KEYWORD_ONLY_NOTE
-                ))]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                    redact_out(format!(
+                        "Reflection not stored: {}. Try again shortly.",
+                        crate::search::vector_ipc::KEYWORD_ONLY_NOTE
+                    )),
+                )]));
             }
         }
         let result = tools::store_reflection(
@@ -821,7 +823,9 @@ impl CsrServer {
             &p.conversation_id,
             p.project.as_deref(),
         );
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            redact_out(text),
+        )]))
     }
 
     #[tool(
@@ -1033,11 +1037,26 @@ fn wrap_untrusted_transcript_output(text: &str) -> String {
     )
 }
 
+/// Redact provider keys from tool-result text. Stored chunks written before a
+/// pattern existed still hold their keys, so every result passes through here.
+/// Borrowed (unchanged) text is returned as-is; the scrub is idempotent.
+fn redact_out(text: String) -> String {
+    match crate::redact::redact_secrets(&text) {
+        std::borrow::Cow::Owned(redacted) => redacted,
+        std::borrow::Cow::Borrowed(_) => text,
+    }
+}
+
 /// Helper to convert Result<String> to tool result.
 fn tool_result(result: anyhow::Result<String>) -> Result<CallToolResult, rmcp::ErrorData> {
     match result {
-        Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
-        Err(e) => Err(rmcp::ErrorData::internal_error(format!("{e}"), None)),
+        Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(
+            redact_out(text),
+        )])),
+        Err(e) => Err(rmcp::ErrorData::internal_error(
+            redact_out(format!("{e}")),
+            None,
+        )),
     }
 }
 
@@ -1747,5 +1766,91 @@ mod tests {
             assert!(reply.starts_with(KEYWORD_ONLY_NOTE), "{reply}");
             assert!(reply.contains(marker), "{reply}");
         }
+    }
+    /// A chunk stored before the redactor knew a key shape (inserted raw,
+    /// bypassing import) still comes out of every tool result redacted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn f1b_secret_mcp_output_redacts_stored_chunk() {
+        use crate::search::vector_ipc::{ProxyTimings, VectorClient, VectorProxy};
+        let key = format!("phx_{}", "D".repeat(43));
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        storage
+            .insert_chunk(
+                &crate::import::ConversationChunk {
+                    id: "chunk-raw".into(),
+                    conversation_id: "conv-raw".into(),
+                    project_name: "alpha".into(),
+                    timestamp: "2026-10-14T10:00:00Z".into(),
+                    content: format!("the needle dashboard uses the key {key} for reel events"),
+                    message_count: 2,
+                    summary: None,
+                    author: crate::provenance::Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &[0.0; 384],
+            )
+            .unwrap();
+        let proxy = Arc::new(VectorProxy::new(
+            VectorClient::for_database(&dir.path().join("csr-engine.db")).unwrap(),
+            storage.clone(),
+        ));
+        proxy.set_timings(ProxyTimings {
+            backoff_first: std::time::Duration::from_millis(1),
+            backoff_total: std::time::Duration::from_millis(2),
+            down_window: std::time::Duration::from_secs(30),
+        });
+        let server = CsrServer::new(
+            storage,
+            Arc::new(EmbeddingEngine::disabled()),
+            Arc::new(RwLock::new(SearchEngine::proxied(proxy))),
+            dir.path().to_path_buf(),
+            dir.path().join("index-v3"),
+            None,
+            None,
+        );
+        let reflect = text(
+            server
+                .reflect_on_past(Parameters(ReflectOnPastParams {
+                    query: "needle dashboard".into(),
+                    limit: Some(5),
+                    min_score: Some(0.0),
+                    project: Some("all".into()),
+                }))
+                .await,
+        );
+        assert!(
+            reflect.contains("needle"),
+            "the chunk must be found: {reflect}"
+        );
+        assert!(!reflect.contains(&key), "a key reached the MCP result");
+        assert!(
+            reflect.contains("[secret redacted: posthog_key]"),
+            "{reflect}"
+        );
+        let quick = text(
+            server
+                .quick_check(Parameters(QuickCheckParams {
+                    query: "needle dashboard".into(),
+                    min_score: None,
+                    project: Some("all".into()),
+                }))
+                .await,
+        );
+        assert!(
+            !quick.contains(&key),
+            "a key reached the quick_check result"
+        );
+    }
+
+    #[test]
+    fn f1b_secret_redact_out_is_idempotent_and_leaves_clean_text() {
+        let key = format!("phx_{}", "E".repeat(43));
+        let once = redact_out(format!("a {key} b"));
+        assert_eq!(once, "a [secret redacted: posthog_key] b");
+        assert_eq!(redact_out(once.clone()), once);
+        assert_eq!(redact_out("plain text".to_string()), "plain text");
     }
 }
