@@ -1054,6 +1054,69 @@ pub fn conversation_eval_scan(
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
+/// [`conversation_eval_scan`] for several conversations in one query per 200
+/// ids: the rows of each conversation, keyed by conversation id. A
+/// conversation with no chunk is absent from the map.
+pub fn conversation_eval_scan_many(
+    conn: &Connection,
+    conversation_ids: &[String],
+    like_patterns: &[&str],
+    output_patterns: &[&str],
+) -> Result<HashMap<String, Vec<EvalScanRow>>> {
+    let any_of = |first: usize, count: usize| {
+        if count == 0 {
+            "0".to_string()
+        } else {
+            (first..first + count)
+                .map(|i| format!("c.content LIKE ?{i}"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        }
+    };
+    let marked = any_of(1, like_patterns.len());
+    let output_marked = any_of(1 + like_patterns.len(), output_patterns.len());
+    let first_id = 1 + like_patterns.len() + output_patterns.len();
+    let mut found: HashMap<String, Vec<EvalScanRow>> = HashMap::new();
+    for batch in conversation_ids.chunks(200) {
+        let marks = (first_id..first_id + batch.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT c.conversation_id, c.id, c.seq, p.author, ({marked}), ({output_marked}),
+                    CASE WHEN p.author = 'assistant'
+                          AND (c.content LIKE '%[Bash:%'
+                               OR c.content LIKE '%external_agent_tool_call: Bash%')
+                         THEN c.content END
+             FROM chunks c LEFT JOIN chunk_provenance p ON p.chunk_id = c.id
+             WHERE c.conversation_id IN ({marks})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut args: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        args.extend(like_patterns.iter().map(|p| p as &dyn rusqlite::ToSql));
+        args.extend(output_patterns.iter().map(|p| p as &dyn rusqlite::ToSql));
+        args.extend(batch.iter().map(|id| id as &dyn rusqlite::ToSql));
+        let rows = stmt.query_map(args.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                EvalScanRow {
+                    id: row.get(1)?,
+                    seq: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    author: row.get(3)?,
+                    marked: row.get::<_, i64>(4)? != 0,
+                    output_marked: row.get::<_, i64>(5)? != 0,
+                    bash_text: row.get(6)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (conversation, scan) = row?;
+            found.entry(conversation).or_default().push(scan);
+        }
+    }
+    Ok(found)
+}
+
 /// The cached trust floor and tool-result share of some chunks, one query per
 /// 500 ids. A chunk the table does not hold is absent from the map; a chunk
 /// imported before spans were recorded has a `None` share.

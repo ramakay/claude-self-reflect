@@ -350,6 +350,8 @@ impl CrossEncoder {
         if seq == 0 {
             bail!("tokenizer produced empty sequences");
         }
+        crate::mcp::stage_timing::count("ce_pairs", b as u64);
+        crate::mcp::stage_timing::max_count("ce_max_tokens", seq as u64);
         let mut ids = vec![self.pad_id; b * seq];
         let mut mask = vec![0i64; b * seq];
         for (r, e) in encodings.iter().enumerate() {

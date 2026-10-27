@@ -226,40 +226,6 @@ fn cache() -> &'static Cache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn session_verdict(storage: &Storage, conversation_id: &str) -> Arc<SessionVerdict> {
-    {
-        let held = cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, verdict)) = held.get(conversation_id) {
-            if at.elapsed() < VERDICT_TTL {
-                return Arc::clone(verdict);
-            }
-        }
-    }
-    // A failed read is a pass: the filter never removes what it cannot judge.
-    let verdict = Arc::new(
-        storage
-            .with_connection(|conn| {
-                crate::storage::queries::conversation_eval_scan(
-                    conn,
-                    conversation_id,
-                    MARKER_LIKE,
-                    OUTPUT_LIKE,
-                )
-            })
-            .map(|rows| judge_session(&rows))
-            .unwrap_or_default(),
-    );
-    let mut held = cache().lock().unwrap_or_else(|e| e.into_inner());
-    if held.len() >= CACHE_CAP {
-        held.clear();
-    }
-    held.insert(
-        conversation_id.to_string(),
-        (Instant::now(), Arc::clone(&verdict)),
-    );
-    verdict
-}
-
 /// Ids among `candidates` that are synthetic or eval content. Empty when the
 /// kill switch is set. Stored reflections must not be passed in: they are
 /// written on purpose and judged elsewhere.
@@ -272,16 +238,80 @@ fn synthetic_ids_if(enabled: bool, storage: &Storage, candidates: &[ChunkRef]) -
     if !enabled {
         return dropped;
     }
-    let mut verdicts: HashMap<&str, Arc<SessionVerdict>> = HashMap::new();
+    // Distinct conversations, first-seen order. The ones the process cache
+    // cannot answer are read in one query, not one query each.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let conversations: Vec<&str> = candidates
+        .iter()
+        .map(|chunk| chunk.conversation_id.as_str())
+        .filter(|conversation| seen.insert(*conversation))
+        .collect();
+    crate::mcp::stage_timing::count("synthetic_conversations", conversations.len() as u64);
+    let verdicts = session_verdicts(storage, &conversations);
     for chunk in candidates {
-        let verdict = verdicts
-            .entry(chunk.conversation_id.as_str())
-            .or_insert_with(|| session_verdict(storage, &chunk.conversation_id));
-        if dropped_by(verdict, chunk) {
-            dropped.insert(chunk.id.clone());
+        if let Some(verdict) = verdicts.get(chunk.conversation_id.as_str()) {
+            if dropped_by(verdict, chunk) {
+                dropped.insert(chunk.id.clone());
+            }
         }
     }
     dropped
+}
+
+/// The verdict of each of `conversations`: from the process cache while it is
+/// fresh, the rest from one batched scan (cached on the way out).
+fn session_verdicts<'a>(
+    storage: &Storage,
+    conversations: &[&'a str],
+) -> HashMap<&'a str, Arc<SessionVerdict>> {
+    let mut verdicts: HashMap<&'a str, Arc<SessionVerdict>> = HashMap::new();
+    let mut uncached: Vec<String> = Vec::new();
+    {
+        let held = cache().lock().unwrap_or_else(|e| e.into_inner());
+        for &conversation in conversations {
+            match held.get(conversation) {
+                Some((at, verdict)) if at.elapsed() < VERDICT_TTL => {
+                    verdicts.insert(conversation, Arc::clone(verdict));
+                }
+                _ => uncached.push(conversation.to_string()),
+            }
+        }
+    }
+    crate::mcp::stage_timing::count(
+        "synthetic_cache_hits",
+        (conversations.len() - uncached.len()) as u64,
+    );
+    if uncached.is_empty() {
+        return verdicts;
+    }
+    // A failed read is a pass: the filter never removes what it cannot judge.
+    let mut scanned = storage
+        .with_connection(|conn| {
+            crate::storage::queries::conversation_eval_scan_many(
+                conn,
+                &uncached,
+                MARKER_LIKE,
+                OUTPUT_LIKE,
+            )
+        })
+        .unwrap_or_default();
+    let mut held = cache().lock().unwrap_or_else(|e| e.into_inner());
+    if held.len() + uncached.len() >= CACHE_CAP {
+        held.clear();
+    }
+    for &conversation in conversations {
+        if verdicts.contains_key(conversation) {
+            continue;
+        }
+        let rows = scanned.remove(conversation).unwrap_or_default();
+        let verdict = Arc::new(judge_session(&rows));
+        held.insert(
+            conversation.to_string(),
+            (Instant::now(), Arc::clone(&verdict)),
+        );
+        verdicts.insert(conversation, verdict);
+    }
+    verdicts
 }
 
 #[cfg(test)]
@@ -342,6 +372,70 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn f2a_synthetic_batch_scan_matches_per_conversation() {
+        let storage = Storage::open_memory().unwrap();
+        // An eval session: bench calls in assistant chunks.
+        let bench = "[Bash: csr-engine bench --probe --db-path /x/.testbed/db]";
+        for seq in 0..6 {
+            put(&storage, "rig", seq, Speaker::Assistant, bench);
+        }
+        // A normal session with a tool-result run printing CSR output.
+        put(&storage, "plain", 0, Speaker::User, "how do I sort a vec");
+        put(&storage, "plain", 1, Speaker::Assistant, "use sort_by");
+        for seq in 2..6 {
+            put(
+                &storage,
+                "plain",
+                seq,
+                Speaker::ToolResult,
+                "mcp__claude-self-reflect__csr_reflect_on_past output",
+            );
+        }
+        let ids: Vec<String> = ["rig", "plain", "absent"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let many = storage
+            .with_connection(|conn| {
+                crate::storage::queries::conversation_eval_scan_many(
+                    conn,
+                    &ids,
+                    MARKER_LIKE,
+                    OUTPUT_LIKE,
+                )
+            })
+            .unwrap();
+        assert!(!many.contains_key("absent"));
+        for id in &ids {
+            let single = storage
+                .with_connection(|conn| {
+                    crate::storage::queries::conversation_eval_scan(
+                        conn,
+                        id,
+                        MARKER_LIKE,
+                        OUTPUT_LIKE,
+                    )
+                })
+                .unwrap();
+            let batched = many.get(id).cloned().unwrap_or_default();
+            assert_eq!(judge_session(&batched), judge_session(&single), "{id}");
+            assert_eq!(batched.len(), single.len(), "{id}");
+        }
+        // Through the public entry: one call over three conversations.
+        let mut candidates = refs(&storage, "rig", 6);
+        candidates.extend(refs(&storage, "plain", 6));
+        candidates.push(ChunkRef {
+            id: "absent-0".into(),
+            conversation_id: "absent".into(),
+            author: Some(Speaker::User),
+        });
+        let dropped = synthetic_ids_if(true, &storage, &candidates);
+        assert!(dropped.contains("rig-0") && dropped.contains("rig-5"));
+        assert!(dropped.contains("plain-3"));
+        assert!(!dropped.contains("plain-0") && !dropped.contains("absent-0"));
     }
 
     #[test]

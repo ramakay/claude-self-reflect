@@ -602,6 +602,24 @@ pub async fn reflect_on_past(
     min_score: f32,
     project: Option<&str>,
 ) -> Result<String> {
+    super::stage_timing::scope(
+        query,
+        reflect_on_past_untimed(
+            storage, embeddings, search, query, limit, min_score, project,
+        ),
+    )
+    .await
+}
+
+async fn reflect_on_past_untimed(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+    limit: usize,
+    min_score: f32,
+    project: Option<&str>,
+) -> Result<String> {
     validate_page(0, limit)?;
     let search_mode = search_mode_from(std::env::var("CSR_SEARCH_MODE").ok().as_deref());
     // `partition_enabled` (the pre-existing `CSR_NO_VALIDITY_PARTITION` kill
@@ -633,7 +651,10 @@ pub async fn reflect_on_past(
     let embed_start = Instant::now();
     let query_vec = embed_query(embeddings, query).await?;
     let embed_ms = embed_start.elapsed().as_millis() as u64;
+    super::stage_timing::stage("embed", embed_start);
+    let intent_start = Instant::now();
     let rerank_intent = resolve_rerank_intent(embeddings, &query_vec).await;
+    super::stage_timing::stage("intent", intent_start);
 
     reflect_on_past_with_vec_intent(
         storage,
@@ -1275,6 +1296,7 @@ pub(crate) async fn reflect_for_bench_with_vec(
             mode,
             RecallRerankMode::Baseline,
             0,
+            &CallMemo::default(),
         )
         .await?;
         apply_resolutions_before_limit(
@@ -1384,6 +1406,7 @@ async fn reflect_on_past_with_vec_in_scope_mode(
         record_retrievals,
     )
     .await?;
+    let format_start = Instant::now();
     let xml = format::format_search_results_with_ce(
         &page.enriched,
         query,
@@ -1394,6 +1417,7 @@ async fn reflect_on_past_with_vec_in_scope_mode(
         page.ce.as_ref(),
     );
     let xml = annotate_cross_source(xml, page.cross_source_collapsed);
+    super::stage_timing::stage("format", format_start);
     // Session attributes appear only while the episode channel runs; with it
     // off the page is the chunk-only page, byte for byte.
     if search_mode == SearchMode::Hybrid && crate::search::episodes::channel_active(storage) {
@@ -1762,6 +1786,7 @@ async fn settled_pool(
     // displace the valid N+1 candidate — it was never fetched, so the sink has
     // nothing to promote. Fetch extra, sink over the full set, cut at the end.
     let first = recall_pool(need);
+    let memo = CallMemo::default();
     let mut pass = reflect_gather_pass(
         storage,
         search,
@@ -1778,6 +1803,7 @@ async fn settled_pool(
         search_mode,
         rerank_mode,
         need,
+        &memo,
     )
     .await?;
     let mut search_ms = pass.search_ms;
@@ -1820,6 +1846,7 @@ async fn settled_pool(
                 search_mode,
                 rerank_mode,
                 need,
+                &memo,
             )
             .await?;
             search_ms += pass.search_ms;
@@ -1840,6 +1867,56 @@ async fn settled_pool(
         published: 0,
         cross_source_collapsed: pass.cross_source_collapsed,
     })
+}
+
+/// What the passes of one recall share. The adaptive refetch runs the gather
+/// pass a second time over a wider window for the same query; a chunk already
+/// scored in the first pass keeps its score instead of going through the
+/// cross-encoder again.
+#[derive(Default)]
+struct CallMemo {
+    ce: std::sync::Mutex<HashMap<String, f32>>,
+}
+
+impl CallMemo {
+    /// Memo key of one (chunk id, pair text): the text is part of the key, so a
+    /// row whose excerpt changed between passes is scored again.
+    fn ce_key(id: &str, text: &str) -> String {
+        let digest = blake3::hash(text.as_bytes()).to_hex();
+        format!("{id}\u{0}{}", &digest.as_str()[..16])
+    }
+
+    /// One score per key, in order: memoised scores as they were, the others
+    /// from `score` over their texts (one call, only when something is new).
+    fn ce_scores<F>(&self, keys: &[String], texts: &[&str], score: F) -> Result<Vec<f32>>
+    where
+        F: FnOnce(&[&str]) -> Result<Vec<f32>>,
+    {
+        let held: Vec<Option<f32>> = {
+            let memo = self.ce.lock().unwrap_or_else(|e| e.into_inner());
+            keys.iter().map(|key| memo.get(key).copied()).collect()
+        };
+        let missing: Vec<usize> = (0..keys.len()).filter(|i| held[*i].is_none()).collect();
+        super::stage_timing::count("ce_memo_hits", (keys.len() - missing.len()) as u64);
+        if missing.is_empty() {
+            return Ok(held.into_iter().flatten().collect());
+        }
+        let fresh_texts: Vec<&str> = missing.iter().map(|&i| texts[i]).collect();
+        let fresh = score(&fresh_texts)?;
+        anyhow::ensure!(
+            fresh.len() == missing.len(),
+            "scorer returned {} scores for {} units",
+            fresh.len(),
+            missing.len()
+        );
+        let mut memo = self.ce.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = held;
+        for (&i, value) in missing.iter().zip(fresh) {
+            memo.insert(keys[i].clone(), value);
+            out[i] = Some(value);
+        }
+        Ok(out.into_iter().flatten().collect())
+    }
 }
 
 /// Output of one [`reflect_gather_pass`]: candidates fully enriched,
@@ -2590,7 +2667,9 @@ fn drop_synthetic_rows(
                 .map(|row| row.author),
         })
         .collect();
+    let synthetic_start = Instant::now();
     let dropped = super::synthetic::synthetic_ids(storage, &candidates);
+    super::stage_timing::stage("synthetic_filter", synthetic_start);
     if !dropped.is_empty() {
         enriched.retain(|e| !dropped.contains(&e.chunk.id));
     }
@@ -2601,6 +2680,7 @@ fn drop_synthetic_rows(
 /// [`CE_POOL`] fused chunks plus the S1 top sessions' representatives) and
 /// return the new session order with its score summary. Fails open: with no
 /// model or a scoring error the S1 order comes back unchanged, no summary.
+#[allow(clippy::too_many_arguments)]
 fn ce_rerank_stage(
     query: &str,
     collapsed: Vec<String>,
@@ -2609,10 +2689,37 @@ fn ce_rerank_stage(
     session_keys: &HashMap<String, String>,
     answer_class: &HashMap<String, u8>,
     representatives: &HashMap<String, Vec<PoolChunk>>,
+    memo: &CallMemo,
 ) -> (Vec<String>, HashMap<String, f32>) {
     if collapsed.is_empty() {
         return (collapsed, HashMap::new());
     }
+    let ce_start = Instant::now();
+    let result = ce_rerank_stage_inner(
+        query,
+        collapsed,
+        fused,
+        enriched,
+        session_keys,
+        answer_class,
+        representatives,
+        memo,
+    );
+    super::stage_timing::stage("ce", ce_start);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ce_rerank_stage_inner(
+    query: &str,
+    collapsed: Vec<String>,
+    fused: Vec<String>,
+    enriched: &[EnrichedResult],
+    session_keys: &HashMap<String, String>,
+    answer_class: &HashMap<String, u8>,
+    representatives: &HashMap<String, Vec<PoolChunk>>,
+    memo: &CallMemo,
+) -> (Vec<String>, HashMap<String, f32>) {
     let by_id: HashMap<&str, &EnrichedResult> = enriched
         .iter()
         .map(|result| (result.chunk.id.as_str(), result))
@@ -2637,7 +2744,12 @@ fn ce_rerank_stage(
         .map(|id| ce_pair_text(&by_id[id.as_str()].chunk))
         .collect();
     let units: Vec<&str> = texts.iter().map(String::as_str).collect();
-    let scores = match encoder.score(query, &units) {
+    let keys: Vec<String> = pool
+        .iter()
+        .zip(&texts)
+        .map(|(id, text)| CallMemo::ce_key(id, text))
+        .collect();
+    let scores = match memo.ce_scores(&keys, &units, |fresh| encoder.score(query, fresh)) {
         Ok(scores) if scores.len() == pool.len() => scores,
         Ok(scores) => {
             warn_ce_unavailable(&format!(
@@ -2719,6 +2831,7 @@ async fn reflect_gather_pass(
     search_mode: SearchMode,
     rerank_mode: RecallRerankMode<'_>,
     page: usize,
+    memo: &CallMemo,
 ) -> Result<GatherPass> {
     // The one read of CSR_RETRIEVAL_LEGACY for this call; everything below
     // takes the policy as a parameter.
@@ -2728,6 +2841,7 @@ async fn reflect_gather_pass(
     } else {
         fetch
     };
+    super::stage_timing::count("passes", 1);
     let search_start = Instant::now();
 
     // Search BOTH chunks and reflections unless keyword-only ablation is active.
@@ -2748,6 +2862,8 @@ async fn reflect_gather_pass(
         (chunks, reflections)
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
+    super::stage_timing::stage("hnsw", search_start);
+    let decay_start = Instant::now();
     let mut window_full =
         chunk_results.len() == vector_fetch || reflection_results.len() == vector_fetch;
 
@@ -2890,6 +3006,8 @@ async fn reflect_gather_pass(
         .map(|result| result.chunk.id.clone())
         .collect();
 
+    super::stage_timing::stage("decay_enrich", decay_start);
+    let fts_start = Instant::now();
     let mut fts_order = Vec::new();
     // Identifier-postings channel (hybrid only): ranked chunk ids, best first,
     // and the channel weight the query's identifiers earn. Empty and 0.0 when
@@ -3077,6 +3195,7 @@ async fn reflect_gather_pass(
         }
     }
 
+    super::stage_timing::stage("fts", fts_start);
     // Keyword-only reflections: reached through `reflections_fts` or the
     // exact-prefix channel but not the vector window. No validity partition
     // applies (verdicts bind to chunk ids).
@@ -3123,6 +3242,7 @@ async fn reflect_gather_pass(
     // is left out here. The pool above is wider than the page, so the rows
     // behind take the freed places, and the adaptive refetch in `settled_pool`
     // counts what is left.
+    let echo_start = Instant::now();
     let chunk_provenance: HashMap<String, Option<crate::provenance::ChunkProvenance>> = enriched
         .iter()
         .filter(|e| !reflection_tags.contains_key(&e.chunk.id))
@@ -3135,6 +3255,7 @@ async fn reflect_gather_pass(
         .collect();
     let mut echo_dropped =
         drop_echo_rows(&mut enriched, &chunk_provenance, &reflection_tags, query);
+    super::stage_timing::stage("echo_filter", echo_start);
     // Eval and synthetic content leaves the pool at the same point, by
     // provenance (the session ran the bench/eval rig, or the row is a rig
     // call's output). The page counts both as dropped for the refetch.
@@ -3185,6 +3306,7 @@ async fn reflect_gather_pass(
     // is stable, so excluded ids land at the tail in their pre-rerank
     // relative order — `apply_validity_partition`'s explicit partition below
     // is still the authoritative, independently-testable guarantee.
+    let rerank_start = Instant::now();
     let candidates: Vec<crate::search::rerank::RankCandidate> = enriched
         .iter()
         .filter(|e| !is_demote_channel(&signals.validity, &e.chunk.id))
@@ -3313,6 +3435,7 @@ async fn reflect_gather_pass(
         .into_iter()
         .map(|c| c.id)
         .collect();
+    super::stage_timing::stage("rerank", rerank_start);
     if let Some(enriched_conv) = enriched_conv.as_ref() {
         let ranked: Vec<(String, String, f32)> = order
             .iter()
@@ -3410,10 +3533,12 @@ async fn reflect_gather_pass(
                 }
             }
             let episode_weight = if episode_hits.is_some() { 1.0 } else { 0.0 };
+            let session_keys_start = Instant::now();
             let session_keys: HashMap<String, String> = enriched
                 .iter()
                 .map(|e| (e.chunk.id.clone(), session_key_of(storage, &e.chunk)))
                 .collect();
+            super::stage_timing::stage("session_keys", session_keys_start);
             let answer_class: HashMap<String, u8> = enriched
                 .iter()
                 .map(|e| {
@@ -3482,6 +3607,7 @@ async fn reflect_gather_pass(
                     ],
                     RRF_K,
                 );
+                let representatives_start = Instant::now();
                 representative_pool_map = representative_pool(
                     storage,
                     &chunk_fused,
@@ -3490,6 +3616,7 @@ async fn reflect_gather_pass(
                     &answer_class,
                     &collapsed,
                 );
+                super::stage_timing::stage("representatives", representatives_start);
                 apply_content_representatives(
                     &mut collapsed,
                     &session_keys,
@@ -3540,6 +3667,7 @@ async fn reflect_gather_pass(
                     &session_keys,
                     &answer_class,
                     &representative_pool_map,
+                    memo,
                 );
                 ce_session_scores = session_ce;
                 let reordered = apply_status_recency(
@@ -3713,6 +3841,7 @@ async fn reflect_gather_pass(
     // ranked plan chunk survive while its origin conversation fell outside the
     // page — inverting the authoritative-origin rule — and could return a short
     // page after filtering.
+    let dedupe_start = Instant::now();
     format::dedupe_results(&mut enriched);
     // Plan-doc chunks defer to their origin conversation when both matched (v9.4):
     // the plan restates the decision; the conversation is where it was made.
@@ -3747,6 +3876,7 @@ async fn reflect_gather_pass(
     let cross_source_collapsed = collapse_cross_source_duplicates(&mut enriched, |id| {
         storage.get_chunk_source(id).ok().flatten()
     });
+    super::stage_timing::stage("dedupe", dedupe_start);
 
     if crate::mcp::stage_probe::is_active() {
         let ranked: Vec<(String, String, f32)> = enriched
@@ -6485,8 +6615,12 @@ fn run_assertions_stage(
     if !enabled || enriched.is_empty() {
         return HashSet::new();
     }
+    let started = Instant::now();
     let claims = cached_claims(storage);
-    run_assertions_stage_with(storage, &claims, enriched, session_keys, validity)
+    super::stage_timing::count("claims_read", claims.len() as u64);
+    let sunk = run_assertions_stage_with(storage, &claims, enriched, session_keys, validity);
+    super::stage_timing::stage("assertions", started);
+    sunk
 }
 
 /// A cached witness assertion is a copy of a verdict that may since have been
@@ -6660,6 +6794,52 @@ fn settle_window(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f2a_refetch_reuses_first_pass_ce_scores() {
+        let memo = CallMemo::default();
+        let texts = ["alpha", "beta", "gamma"];
+        let keys: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .zip(texts)
+            .map(|(id, text)| CallMemo::ce_key(id, text))
+            .collect();
+        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let scorer = |fresh: &[&str]| -> Result<Vec<f32>> {
+            calls
+                .borrow_mut()
+                .push(fresh.iter().map(|t| t.to_string()).collect());
+            Ok(fresh.iter().map(|t| t.len() as f32).collect())
+        };
+        let first = memo.ce_scores(&keys, &texts, scorer).unwrap();
+        assert_eq!(first, vec![5.0, 4.0, 5.0]);
+        // Second pass: a wider pool holding the same three chunks plus one new.
+        let texts2 = ["delta!", "alpha", "beta", "gamma"];
+        let keys2: Vec<String> = ["d", "a", "b", "c"]
+            .iter()
+            .zip(texts2)
+            .map(|(id, text)| CallMemo::ce_key(id, text))
+            .collect();
+        let second = memo.ce_scores(&keys2, &texts2, scorer).unwrap();
+        assert_eq!(second, vec![6.0, 5.0, 4.0, 5.0]);
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1],
+            vec!["delta!".to_string()],
+            "only the new unit is scored"
+        );
+        // A third pass of already scored units never calls the scorer.
+        let third = memo
+            .ce_scores(&keys, &texts, |_| panic!("scorer must not run"))
+            .unwrap();
+        assert_eq!(third, first);
+        // The same id with changed text is a new unit.
+        assert_ne!(
+            CallMemo::ce_key("a", "alpha"),
+            CallMemo::ce_key("a", "alpha2")
+        );
+    }
+
     use super::*;
     use crate::search::hybrid::fuse_rrf;
     // Pure parsing seam — tests drive it by parameter instead of mutating
