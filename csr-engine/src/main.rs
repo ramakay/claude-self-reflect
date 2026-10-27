@@ -987,6 +987,28 @@ fn default_projects_dir() -> PathBuf {
         .join("projects")
 }
 
+/// Build or refresh the S8 assertions before anything reads them. Fails open:
+/// a failure is one line on stderr (stdout may be the JSON-RPC channel) and the
+/// run goes on with the table as it was.
+fn refresh_assertions_at_startup(
+    storage: &csr_engine::storage::Storage,
+    db_path: &std::path::Path,
+) {
+    use csr_engine::storage::assertions as asr;
+    let decisions = asr::default_decisions_path(db_path);
+    match storage.ensure_assertions_fresh(decisions.as_deref()) {
+        Ok(Some(report)) => {
+            let rows: i64 = report.by_source_state.values().sum();
+            eprintln!(
+                "CSR: assertions built at startup: {rows} rows in {} ms",
+                report.elapsed_ms
+            );
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("CSR: assertions not refreshed (failing open): {e:#}"),
+    }
+}
+
 fn main() -> Result<()> {
     // Captured as the literal first thing this process does, before ANY
     // other work — `Engine::new()` alone (storage open, HNSW load/rebuild,
@@ -1856,6 +1878,14 @@ async fn run(
     }) = &args.command
     {
         if *probe {
+            // The probe reads the assertions table: make sure it is built.
+            match csr_engine::storage::Storage::open(&args.db_path) {
+                Ok(storage) => {
+                    let _ = storage.set_busy_timeout(std::time::Duration::from_secs(30));
+                    refresh_assertions_at_startup(&storage, &args.db_path);
+                }
+                Err(e) => eprintln!("CSR: assertions not refreshed (failing open): {e:#}"),
+            }
             let card = csr_engine::eval::probe::run_probe(csr_engine::eval::probe::ProbeConfig {
                 db_path: args.db_path.clone(),
                 probes: probes.clone(),
@@ -2665,6 +2695,8 @@ async fn run(
     };
 
     if should_serve {
+        // Once, before the first request can read the assertions table.
+        refresh_assertions_at_startup(eng.storage(), &args.db_path);
         eng.serve_mcp(jsonrpc_stdout, startup_identity, startup_exe_path)
             .await?;
     } else if args.watch {

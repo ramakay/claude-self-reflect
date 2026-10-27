@@ -202,6 +202,53 @@ pub fn trail_sunk(
     collapsed
 }
 
+/// Keep the sunk units that were in the pre-partition top `limit` on the page,
+/// so the `[superseded] ... (receipt ...)` note they carry is still read.
+/// `shown` is the ranking with the sunk units trailing ([`trail_sunk`],
+/// [`sunk_to_tail`]); `fused` is the order of every unit before the partition.
+///
+/// A unit already inside the first `limit` of `shown` is left alone. The
+/// others fill the page's last slots, best pre-partition rank first, so the
+/// worst of them holds the last shown slot. A unit counts even when a healthy
+/// unit of its session is on the page: the note is on the retired row, not on
+/// its session. At most `limit / 2` slots (one at least) go to retired units,
+/// and the first slot never does: a page of one has no such slot, and a page
+/// with no healthy unit is left as it is.
+pub fn keep_sunk_in_page(
+    shown: Vec<String>,
+    fused: &[String],
+    sunk: &HashSet<String>,
+    limit: usize,
+) -> Vec<String> {
+    if sunk.is_empty() || limit < 2 {
+        return shown;
+    }
+    let on_page: HashSet<&String> = shown.iter().take(limit).collect();
+    let wanted: Vec<String> = fused
+        .iter()
+        .take(limit)
+        .filter(|id| sunk.contains(*id) && !on_page.contains(id))
+        .take((limit / 2).max(1))
+        .cloned()
+        .collect();
+    if wanted.is_empty() {
+        return shown;
+    }
+    let mut rest: Vec<String> = shown
+        .into_iter()
+        .filter(|id| !wanted.contains(id))
+        .collect();
+    if rest.is_empty() {
+        return wanted;
+    }
+    let first_slot = limit - wanted.len();
+    for (i, id) in wanted.into_iter().enumerate() {
+        let at = (first_slot + i).min(rest.len()).max(1);
+        rest.insert(at, id);
+    }
+    rest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +506,109 @@ mod tests {
         let out = trail_sunk(collapsed, &fused, &sunk, session_of);
         // a and b are represented already; c and d trail, c first (fused first).
         assert_eq!(out, vec!["a-1", "b-1", "c-0", "d-0"]);
+    }
+
+    // ---- F1b: a sunk unit that was in the top `limit` stays on the page ----
+
+    fn f1b_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Pre-partition fused order a b c d e f g; `c` is the sunk user-decision
+    /// unit. After the partition the page is a b d e f g with `c` trailed.
+    fn f1b_case() -> (Vec<String>, Vec<String>, HashSet<String>, PartitionOutcome) {
+        let texts = [
+            ("a", "alpha"),
+            ("b", "beta"),
+            ("c", "no fork PR can merge, not even with --admin"),
+            ("d", "delta"),
+            ("e", "eps"),
+            ("f", "zeta"),
+            ("g", "eta"),
+        ];
+        let units: Vec<Unit<'_>> = texts
+            .iter()
+            .map(|(id, text)| Unit {
+                id,
+                session: id,
+                text,
+            })
+            .collect();
+        let claims = vec![ClaimAssertion {
+            key: "fork-pr-admin-merge".into(),
+            subject_terms: vec!["fork".into(), "PR".into()],
+            superseded_phrases: vec!["no fork PR can merge".into()],
+            current_phrases: vec!["--admin --squash".into()],
+            receipt: "memory fork_pr_admin_merge_works.md".into(),
+        }];
+        let outcome = partition(&units, &HashMap::new(), &claims);
+        let fused = f1b_ids(&["a", "b", "c", "d", "e", "f", "g"]);
+        let collapsed = f1b_ids(&["a", "b", "d", "e", "f", "g"]);
+        let shown = trail_sunk(collapsed, &fused, &outcome.sunk, |id| id.to_string());
+        (shown, fused, outcome.sunk.clone(), outcome)
+    }
+
+    #[test]
+    fn f1b_assert_sunk_unit_in_topk_renders_last_with_note() {
+        let (shown, fused, sunk, outcome) = f1b_case();
+        // Before: the tail of the trailed list is past a limit-5 page.
+        assert_eq!(shown.iter().position(|id| id == "c"), Some(6));
+        let page = keep_sunk_in_page(shown, &fused, &sunk, 5);
+        assert_eq!(
+            page.iter().position(|id| id == "c"),
+            Some(4),
+            "last shown slot"
+        );
+        assert_eq!(page[..4], f1b_ids(&["a", "b", "d", "e"])[..]);
+        let note = &outcome.notes["c"];
+        assert!(
+            note.starts_with("[superseded] fork-pr-admin-merge (receipt "),
+            "{note}"
+        );
+        // A unit that was not in the pre-partition top 5 is left at the tail.
+        let far = f1b_ids(&["a", "b", "d", "e", "f", "g", "c"]);
+        let fused_far = f1b_ids(&["a", "b", "d", "e", "f", "g", "c"]);
+        let page = keep_sunk_in_page(far.clone(), &fused_far, &sunk, 5);
+        assert_eq!(page, far);
+        // Already on the page: untouched.
+        let near = f1b_ids(&["a", "c", "b"]);
+        let page = keep_sunk_in_page(near.clone(), &fused, &sunk, 5);
+        assert_eq!(page, near);
+        // A healthy unit of the same session on the page does not hide the
+        // retired row: the note is on the row. Two retired units in the top 5
+        // fill the last two slots, best pre-partition rank first; the cap for
+        // a page of 5 is 2, so the third stays out.
+        let sunk3: HashSet<String> = ["c", "d", "e"].iter().map(|s| s.to_string()).collect();
+        let shown3 = f1b_ids(&["a", "b", "f", "g", "h", "c", "d", "e"]);
+        let page = keep_sunk_in_page(shown3, &fused, &sunk3, 5);
+        assert_eq!(page[..5], f1b_ids(&["a", "b", "f", "c", "d"])[..]);
+        assert!(!page[..5].contains(&"e".to_string()));
+    }
+
+    #[test]
+    fn f1b_assert_sunk_unit_never_rank1() {
+        let (shown, _, sunk, _) = f1b_case();
+        // The sunk unit led the pre-partition order.
+        let fused = f1b_ids(&["c", "a", "b", "d", "e", "f", "g"]);
+        let page = keep_sunk_in_page(shown.clone(), &fused, &sunk, 5);
+        assert_eq!(page.iter().position(|id| id == "c"), Some(4));
+        assert_ne!(page[0], "c");
+        // A page of one has no slot that is not rank 1: the unit stays out.
+        let page = keep_sunk_in_page(shown.clone(), &fused, &sunk, 1);
+        assert_eq!(page, shown);
+        // So does a page of zero.
+        let page = keep_sunk_in_page(shown.clone(), &fused, &sunk, 0);
+        assert_eq!(page, shown);
+        // Page of two: slot 2 (index 1), still not rank 1.
+        let page = keep_sunk_in_page(shown, &fused, &sunk, 2);
+        assert_eq!(page.iter().position(|id| id == "c"), Some(1));
+        // Nothing healthy to lead the page: left as it is.
+        let only = f1b_ids(&["c"]);
+        let page = keep_sunk_in_page(only.clone(), &fused, &sunk, 5);
+        assert_eq!(page, only);
+        // A short list puts the unit after the healthy ones, never first.
+        let short = f1b_ids(&["a"]);
+        let page = keep_sunk_in_page(short, &f1b_ids(&["a", "c"]), &sunk, 5);
+        assert_eq!(page, f1b_ids(&["a", "c"]));
     }
 }

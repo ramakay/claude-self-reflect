@@ -1274,6 +1274,7 @@ pub(crate) async fn reflect_for_bench_with_vec(
             "explore",
             mode,
             RecallRerankMode::Baseline,
+            0,
         )
         .await?;
         apply_resolutions_before_limit(
@@ -1769,6 +1770,7 @@ async fn settled_pool(
         rerank_intent,
         search_mode,
         rerank_mode,
+        need,
     )
     .await?;
     let mut search_ms = pass.search_ms;
@@ -1810,6 +1812,7 @@ async fn settled_pool(
                 rerank_intent,
                 search_mode,
                 rerank_mode,
+                need,
             )
             .await?;
             search_ms += pass.search_ms;
@@ -2545,6 +2548,7 @@ async fn reflect_gather_pass(
     rerank_intent: &str,
     search_mode: SearchMode,
     rerank_mode: RecallRerankMode<'_>,
+    page: usize,
 ) -> Result<GatherPass> {
     // The one read of CSR_RETRIEVAL_LEGACY for this call; everything below
     // takes the policy as a parameter.
@@ -3385,13 +3389,26 @@ async fn reflect_gather_pass(
             } else {
                 collapsed
             };
-            let collapsed =
-                assertions_partition::trail_sunk(collapsed, &fused_before_partition, &sunk, |id| {
-                    session_keys
-                        .get(id)
-                        .cloned()
-                        .unwrap_or_else(|| id.to_string())
-                });
+            let session_of = |id: &str| {
+                session_keys
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| id.to_string())
+            };
+            let collapsed = assertions_partition::trail_sunk(
+                collapsed,
+                &fused_before_partition,
+                &sunk,
+                session_of,
+            );
+            // A superseded unit that was in the top `page` keeps the last
+            // shown slot, so its receipt note is still on the page.
+            let collapsed = assertions_partition::keep_sunk_in_page(
+                collapsed,
+                &fused_before_partition,
+                &sunk,
+                page,
+            );
             let represented: HashSet<String> = collapsed
                 .iter()
                 .filter_map(|id| session_keys.get(id).cloned())
@@ -3409,7 +3426,9 @@ async fn reflect_gather_pass(
                 &signals.validity,
                 enabled,
             );
-            assertions_partition::sunk_to_tail(order, &sunk)
+            let before = order.clone();
+            let tailed = assertions_partition::sunk_to_tail(order, &sunk);
+            assertions_partition::keep_sunk_in_page(tailed, &before, &sunk, page)
         }
         SearchMode::Fts => {
             let enabled = assertions_enabled();
@@ -3421,7 +3440,9 @@ async fn reflect_gather_pass(
                 &signals.validity,
                 enabled,
             );
-            assertions_partition::sunk_to_tail(fts_order, &sunk)
+            let before = fts_order.clone();
+            let tailed = assertions_partition::sunk_to_tail(fts_order, &sunk);
+            assertions_partition::keep_sunk_in_page(tailed, &before, &sunk, page)
         }
     };
     // Exact-prefix reflections win the keyword channel outright (see where

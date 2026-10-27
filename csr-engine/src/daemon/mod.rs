@@ -645,6 +645,14 @@ impl Daemon {
         };
         tracing::info!("plans loop started (~/.claude/plans → source='plan' chunks)");
 
+        // Assertions loop: S8 assertions are derived; keep them current with
+        // the ledgers and the decisions file without a manual build step.
+        let assertions_handle = tokio::spawn(assertions_refresh_loop(
+            self.storage.clone(),
+            db_path.clone(),
+            shutdown.clone(),
+        ));
+
         // Memory registry loop: every 30 minutes, scan <projects_root>/*/memory/*.md
         // and upsert metadata-only rows into memory_registry. Never embeds or
         // injects memory file bodies — scan_memory_dirs already enforces that.
@@ -1651,6 +1659,8 @@ impl Daemon {
         let _ = tokio::time::timeout(timeout, consolidation_handle).await;
         let _ = tokio::time::timeout(timeout, maintenance_handle).await;
         let _ = tokio::time::timeout(timeout, registry_handle).await;
+        // Derived-table rebuild in one transaction: a timeout loses nothing.
+        let _ = tokio::time::timeout(timeout, assertions_handle).await;
         if let Some(handle) = graph_drain_handle {
             let _ = tokio::time::timeout(timeout, handle).await;
         }
@@ -2048,6 +2058,43 @@ async fn ancestry_refresh_once(
     let publish_storage = storage.clone();
     let published = tokio::task::spawn_blocking(move || refresh.publish(&publish_storage)).await;
     finish_ancestry_refresh(&storage, published).map(Some)
+}
+
+/// One assertions freshness check: rebuild only when a ledger, a verdict, a
+/// proposal or the decisions file changed since the last build (see
+/// `Storage::ensure_assertions_fresh`). Fails open.
+fn assertions_refresh_once(storage: &Storage, db_path: &Path) {
+    let decisions = crate::storage::assertions::default_decisions_path(db_path);
+    match storage.ensure_assertions_fresh(decisions.as_deref()) {
+        Ok(Some(report)) => {
+            let rows: i64 = report.by_source_state.values().sum();
+            tracing::info!(rows, ms = report.elapsed_ms, "assertions rebuilt");
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "assertions refresh failed open"),
+    }
+}
+
+/// Check the assertions at once, then every five minutes. The check is three
+/// aggregates and a file hash; only a changed input pays for a rebuild.
+async fn assertions_refresh_loop(
+    storage: Arc<Storage>,
+    db_path: PathBuf,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let (s, p) = (storage.clone(), db_path.clone());
+        let _ = tokio::task::spawn_blocking(move || assertions_refresh_once(&s, &p)).await;
+        for _ in 0..30 {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
+    }
 }
 
 /// Refresh immediately, then once per hour. A fixed post-cycle delay makes

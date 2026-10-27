@@ -16,7 +16,7 @@
 //! a database without the table answers with nothing.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -91,6 +91,30 @@ pub fn load_decisions(path: &Path) -> Result<Vec<UserDecision>> {
     let file: DecisionFile = serde_json::from_str(&raw)
         .with_context(|| format!("parse decisions file {}", path.display()))?;
     Ok(file.decisions)
+}
+
+/// Meta key: fingerprint of the inputs the last rebuild read.
+const META_FINGERPRINT: &str = "assertions_fingerprint";
+/// Meta key: rows the last rebuild wrote.
+const META_BUILT_ROWS: &str = "assertions_built_rows";
+
+/// Where the owner-decision seed lives: `CSR_USER_DECISIONS` when set, else
+/// `user-decisions.json` beside the database. `None` when the file does not
+/// exist, so a data dir without one builds from the DB feeds alone.
+pub fn default_decisions_path(db_path: &Path) -> Option<PathBuf> {
+    let env = std::env::var("CSR_USER_DECISIONS")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    default_decisions_path_from(env.as_deref(), db_path)
+}
+
+/// [`default_decisions_path`] with the env value passed in.
+pub fn default_decisions_path_from(env: Option<&str>, db_path: &Path) -> Option<PathBuf> {
+    let candidate = match env {
+        Some(path) => PathBuf::from(path),
+        None => db_path.parent()?.join("user-decisions.json"),
+    };
+    candidate.is_file().then_some(candidate)
 }
 
 /// A `claim` row read back: the match rule of one user decision.
@@ -512,6 +536,62 @@ impl Storage {
             report.elapsed_ms = started.elapsed().as_millis() as u64;
             Ok(report)
         })
+    }
+
+    /// Rebuild the assertions only when an input changed. The fingerprint is
+    /// `max(resolution_ledger.id)`, `max(witness_verdicts.id)`,
+    /// `count(resolution_proposals)` and the blake3 of the decisions file bytes
+    /// (empty when there is none), kept in the `assertions_fingerprint` meta
+    /// row. A missing table is created first; an empty table is rebuilt unless
+    /// the last build wrote no rows (then the same inputs would write none
+    /// again). `Ok(None)` means nothing was due. An unreadable or unparsable
+    /// decisions file is an error and leaves the table as it was.
+    pub fn ensure_assertions_fresh(
+        &self,
+        decisions: Option<&Path>,
+    ) -> Result<Option<AssertionBuildReport>> {
+        let (decisions_hash, parsed) = match decisions {
+            Some(path) => {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("read decisions file {}", path.display()))?;
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                let file: DecisionFile = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse decisions file {}", path.display()))?;
+                (hash, file.decisions)
+            }
+            None => (String::new(), Vec::new()),
+        };
+        let (fingerprint, stored, built_rows, empty) = self.with_connection(|conn| {
+            let missing = !table_exists(conn);
+            if missing {
+                migrate_assertions(conn)?;
+            }
+            // A table an older build never had reads as -1, not as an error.
+            let scalar = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+            let fingerprint = format!(
+                "v1|ledger={}|verdicts={}|proposals={}|decisions={}",
+                scalar("SELECT COALESCE(MAX(id),0) FROM resolution_ledger"),
+                scalar("SELECT COALESCE(MAX(id),0) FROM witness_verdicts"),
+                scalar("SELECT COUNT(*) FROM resolution_proposals"),
+                decisions_hash,
+            );
+            let empty = missing || scalar("SELECT EXISTS(SELECT 1 FROM assertions)") == 0;
+            Ok((
+                fingerprint,
+                crate::storage::queries::get_meta(conn, META_FINGERPRINT)?,
+                crate::storage::queries::get_meta(conn, META_BUILT_ROWS)?,
+                empty,
+            ))
+        })?;
+        let wiped = empty && built_rows.as_deref() != Some("0");
+        if stored.as_deref() == Some(fingerprint.as_str()) && !wiped {
+            return Ok(None);
+        }
+        let report = self.rebuild_assertions(&parsed)?;
+        let rows: i64 = report.by_source_state.values().sum();
+        self.set_meta(META_FINGERPRINT, &fingerprint)?;
+        self.set_meta(META_BUILT_ROWS, &rows.to_string())?;
+        Ok(Some(report))
     }
 
     /// Assertions on the given chunks and sessions, keyed by target id. When
@@ -1016,5 +1096,139 @@ mod tests {
         assert!(!map.contains_key("nopat"));
         assert_eq!(map["ok"].state, "superseded");
         assert_eq!(map["open"].state, "annotate");
+    }
+    // ---- F1b: assertions are built at startup and on the daemon tick ----
+
+    fn f1b_decisions_file(dir: &Path, phrase: &str) -> PathBuf {
+        let path = dir.join("user-decisions.json");
+        let body = format!(
+            r#"{{"decisions":[{{"key":"k1","subject_terms":["fork","PR"],
+            "superseded_phrases":["{phrase}"],"current_phrases":["--admin --squash"],
+            "current_claim":"merge with --admin","decided_at":"2026-08-18",
+            "receipt":"memory file"}}]}}"#
+        );
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn f1b_count(s: &Storage) -> i64 {
+        s.with_connection(|c| Ok(c.query_row("SELECT COUNT(*) FROM assertions", [], |r| r.get(0))?))
+            .unwrap()
+    }
+
+    #[test]
+    fn f1b_assert_startup_builds_missing_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let decisions = f1b_decisions_file(dir.path(), "unmergeable");
+        let s = Storage::open_memory().unwrap();
+        exec(&s, "DROP TABLE assertions");
+        let report = s
+            .ensure_assertions_fresh(Some(&decisions))
+            .unwrap()
+            .expect("a missing table must be built");
+        assert_eq!(report.by_source_state["user_decision/superseded"], 1);
+        assert_eq!(f1b_count(&s), 1);
+        assert_eq!(s.claim_assertions().unwrap().len(), 1);
+        // The seed beside the database is found without a flag.
+        let db = dir.path().join("csr-engine.db");
+        assert_eq!(
+            default_decisions_path_from(None, &db),
+            Some(dir.path().join("user-decisions.json"))
+        );
+        let other = tempfile::tempdir().unwrap();
+        let elsewhere = f1b_decisions_file(other.path(), "x");
+        assert_eq!(
+            default_decisions_path_from(elsewhere.to_str(), &db),
+            Some(elsewhere.clone())
+        );
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(
+            default_decisions_path_from(None, &bare.path().join("csr-engine.db")),
+            None
+        );
+    }
+
+    #[test]
+    fn f1b_assert_fingerprint_skips_unchanged_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let decisions = f1b_decisions_file(dir.path(), "unmergeable");
+        let s = Storage::open_memory().unwrap();
+        assert!(s
+            .ensure_assertions_fresh(Some(&decisions))
+            .unwrap()
+            .is_some());
+        assert!(
+            s.ensure_assertions_fresh(Some(&decisions))
+                .unwrap()
+                .is_none(),
+            "same inputs, same fingerprint: no rebuild"
+        );
+        // A new ledger row changes the fingerprint.
+        s.insert_resolutions(
+            &["c1".into()],
+            "resolved",
+            "done",
+            Some("sha1234"),
+            "user_confirmed",
+        )
+        .unwrap();
+        assert!(s
+            .ensure_assertions_fresh(Some(&decisions))
+            .unwrap()
+            .is_some());
+        assert!(s
+            .ensure_assertions_fresh(Some(&decisions))
+            .unwrap()
+            .is_none());
+        // A proposal changes it too.
+        s.insert_resolution_proposal("t1", Some("claim"), "task finished with tests", "sess")
+            .unwrap();
+        assert!(s
+            .ensure_assertions_fresh(Some(&decisions))
+            .unwrap()
+            .is_some());
+        // An emptied table is rebuilt even with the same fingerprint.
+        exec(&s, "DELETE FROM assertions");
+        assert!(s
+            .ensure_assertions_fresh(Some(&decisions))
+            .unwrap()
+            .is_some());
+        assert!(f1b_count(&s) > 0);
+        assert!(s
+            .ensure_assertions_fresh(Some(&decisions))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn f1b_assert_decisions_file_change_triggers_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let decisions = f1b_decisions_file(dir.path(), "unmergeable");
+        let s = Storage::open_memory().unwrap();
+        assert!(s
+            .ensure_assertions_fresh(Some(&decisions))
+            .unwrap()
+            .is_some());
+        assert!(s
+            .ensure_assertions_fresh(Some(&decisions))
+            .unwrap()
+            .is_none());
+        f1b_decisions_file(dir.path(), "no fork PR can merge");
+        assert!(
+            s.ensure_assertions_fresh(Some(&decisions))
+                .unwrap()
+                .is_some(),
+            "new file bytes must rebuild"
+        );
+        let claims = s.claim_assertions().unwrap();
+        assert_eq!(claims[0].superseded_phrases, vec!["no fork PR can merge"]);
+        // Dropping the file is a change too: the claim rows go.
+        let report = s.ensure_assertions_fresh(None).unwrap();
+        assert!(report.is_some());
+        assert!(s.claim_assertions().unwrap().is_empty());
+        // An unreadable file fails closed on the table: the old rows stay.
+        assert!(s
+            .ensure_assertions_fresh(Some(&dir.path().join("missing.json")))
+            .is_err());
     }
 }
