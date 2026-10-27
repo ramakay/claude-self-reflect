@@ -145,12 +145,35 @@ fn cut(text: &str, chars: usize) -> String {
     text.trim().chars().take(chars).collect()
 }
 
-/// Assertion state for a ledger verdict.
-fn resolve_state(status: &str) -> &'static str {
+/// Assertion state for a ledger verdict. Only an owner-confirmed `resolved`
+/// supersedes (and so can sink a chunk); an agent's claim of resolution stays an
+/// annotation, the same gate `apply_resolutions` applies.
+fn resolve_state(status: &str, ledger_source: &str) -> &'static str {
     match status {
-        "resolved" => "superseded",
+        "resolved"
+            if ledger_source == crate::storage::queries::RESOLUTION_SOURCE_USER_CONFIRMED =>
+        {
+            "superseded"
+        }
         _ => "annotate",
     }
+}
+
+/// True for a `csr_resolve` row that claims `superseded` without an owner
+/// confirmation behind it. Tables built before the confirmation gate hold such
+/// rows; a reader must not let them rank anything. A row with no readable
+/// `ledger_source` counts as unconfirmed.
+fn unconfirmed_resolve_supersession(source: &str, state: &str, pattern_json: Option<&str>) -> bool {
+    if source != "csr_resolve" || state != "superseded" {
+        return false;
+    }
+    let ledger_source = pattern_json
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| {
+            v.get("ledger_source")
+                .and_then(|s| s.as_str().map(str::to_owned))
+        });
+    ledger_source.as_deref() != Some(crate::storage::queries::RESOLUTION_SOURCE_USER_CONFIRMED)
 }
 
 fn table_exists(conn: &Connection) -> bool {
@@ -272,7 +295,7 @@ fn resolve_row(
         source: "csr_resolve",
         target_kind: "chunk",
         target_id: chunk_id,
-        state: resolve_state(status),
+        state: resolve_state(status, ledger_source),
         claim,
         pattern_json: Some(
             serde_json::json!({ "status": status, "ledger_source": ledger_source }).to_string(),
@@ -511,7 +534,7 @@ impl Storage {
                         .collect::<Vec<_>>()
                         .join(",");
                     let sql = format!(
-                        "SELECT source, target_kind, target_id, state, claim, receipt
+                        "SELECT source, target_kind, target_id, state, claim, receipt, pattern_json
                          FROM assertions
                          WHERE target_kind = ?1 AND target_id IN ({marks})"
                     );
@@ -519,17 +542,26 @@ impl Storage {
                     let mut args: Vec<&dyn rusqlite::ToSql> = vec![&kind];
                     args.extend(batch.iter().map(|s| s as &dyn rusqlite::ToSql));
                     let rows = stmt.query_map(args.as_slice(), |r| {
-                        Ok(Assertion {
+                        let row = Assertion {
                             source: r.get(0)?,
                             target_kind: r.get(1)?,
                             target_id: r.get(2)?,
                             state: r.get(3)?,
                             claim: r.get(4)?,
                             receipt: r.get(5)?,
-                        })
+                        };
+                        let pattern_json: Option<String> = r.get(6)?;
+                        Ok((row, pattern_json))
                     })?;
                     for row in rows {
-                        let row = row?;
+                        let (row, pattern_json) = row?;
+                        if unconfirmed_resolve_supersession(
+                            &row.source,
+                            &row.state,
+                            pattern_json.as_deref(),
+                        ) {
+                            continue;
+                        }
                         let better = match out.get(&row.target_id) {
                             None => true,
                             Some(cur) => {
@@ -721,8 +753,14 @@ mod tests {
         let long = "x".repeat(120);
         s.insert_resolutions(&["c1".into()], "still_open", "first", None, "agent")
             .unwrap();
-        s.insert_resolutions(&["c1".into()], "resolved", &long, Some("done"), "agent")
-            .unwrap();
+        s.insert_resolutions(
+            &["c1".into()],
+            "resolved",
+            &long,
+            Some("done"),
+            "user_confirmed",
+        )
+        .unwrap();
         s.insert_resolutions(&["c2".into()], "regressed", "back again", None, "agent")
             .unwrap();
         s.insert_resolutions(&["c3".into()], "still_open", "open", None, "agent")
@@ -874,12 +912,12 @@ mod tests {
         assert_eq!(map["c1"].state, "annotate");
         assert_eq!(map["c1"].source, "csr_resolve");
         assert_eq!(map["c1"].receipt, "waiting on CI");
-        s.insert_resolutions_with_confirmation(
+        s.insert_resolutions(
             &["c1".into()],
             "resolved",
             "merged in abc123",
             Some("the claim"),
-            None,
+            "user_confirmed",
         )
         .unwrap();
         let map = s.assertions_for_targets(&["c1"], &[]).unwrap();
@@ -924,5 +962,59 @@ mod tests {
         let map = s.assertions_for_targets(&refs, &[]).unwrap();
         assert_eq!(map.len(), 701);
         assert_eq!(map["c1"].state, "annotate", "annotate beats proposed");
+    }
+
+    #[test]
+    fn s9r_p1_agent_resolution_is_annotate_only() {
+        let s = Storage::open_memory().unwrap();
+        s.insert_resolutions(&["c1".into()], "resolved", "fixed in abc", None, "agent")
+            .unwrap();
+        let map = s.assertions_for_targets(&["c1"], &[]).unwrap();
+        assert_eq!(map["c1"].state, "annotate", "write path");
+        s.rebuild_assertions(&[]).unwrap();
+        let map = s.assertions_for_targets(&["c1"], &[]).unwrap();
+        assert_eq!(map["c1"].state, "annotate", "rebuild path");
+    }
+
+    #[test]
+    fn s9r_p1_user_confirmed_resolution_supersedes() {
+        let s = Storage::open_memory().unwrap();
+        s.insert_resolutions(
+            &["c1".into()],
+            "resolved",
+            "fixed in abc",
+            None,
+            "user_confirmed",
+        )
+        .unwrap();
+        let map = s.assertions_for_targets(&["c1"], &[]).unwrap();
+        assert_eq!(map["c1"].state, "superseded", "write path");
+        s.rebuild_assertions(&[]).unwrap();
+        let map = s.assertions_for_targets(&["c1"], &[]).unwrap();
+        assert_eq!(map["c1"].state, "superseded", "rebuild path");
+    }
+
+    #[test]
+    fn s9r_p1_stale_row_dropped_by_targets_read() {
+        // An assertion table built before the fix holds agent rows as superseded.
+        let s = Storage::open_memory().unwrap();
+        exec(
+            &s,
+            "INSERT INTO assertions (source,target_kind,target_id,state,pattern_json,receipt)
+             VALUES ('csr_resolve','chunk','stale','superseded',
+                     '{\"status\":\"resolved\",\"ledger_source\":\"agent\"}','ev'),
+                    ('csr_resolve','chunk','nopat','superseded',NULL,'ev'),
+                    ('csr_resolve','chunk','ok','superseded',
+                     '{\"status\":\"resolved\",\"ledger_source\":\"user_confirmed\"}','ev'),
+                    ('csr_resolve','chunk','open','annotate',
+                     '{\"status\":\"still_open\",\"ledger_source\":\"agent\"}','ev');",
+        );
+        let map = s
+            .assertions_for_targets(&["stale", "nopat", "ok", "open"], &[])
+            .unwrap();
+        assert!(!map.contains_key("stale"));
+        assert!(!map.contains_key("nopat"));
+        assert_eq!(map["ok"].state, "superseded");
+        assert_eq!(map["open"].state, "annotate");
     }
 }

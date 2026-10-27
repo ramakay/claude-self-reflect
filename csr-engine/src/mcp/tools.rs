@@ -13715,6 +13715,41 @@ mod tests {
         );
     }
 
+    fn s9r_stage_store(rows: &str) -> Storage {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_connection(|c| Ok(c.execute_batch(rows)?))
+            .unwrap();
+        storage
+    }
+
+    fn s9r_run_stage(
+        storage: &Storage,
+        validity: &HashMap<String, ConvValidity>,
+    ) -> (HashSet<String>, Vec<EnrichedResult>) {
+        let mut rows = vec![
+            assertion_row("x", "convX", "some text"),
+            assertion_row("y", "convY", "other text"),
+        ];
+        let session_keys = keys(&[("x", "convX"), ("y", "convY")]);
+        let sunk = run_assertions_stage_with(storage, &[], &mut rows, &session_keys, validity);
+        (sunk, rows)
+    }
+
+    #[test]
+    fn s9r_p1_stale_agent_superseded_row_ignored_at_read() {
+        let storage = s9r_stage_store(
+            "INSERT INTO assertions (source,target_kind,target_id,state,pattern_json,receipt)
+             VALUES ('csr_resolve','chunk','x','superseded',
+                     '{\"status\":\"resolved\",\"ledger_source\":\"agent\"}','agent claimed fixed'),
+                    ('csr_resolve','chunk','y','superseded',
+                     '{\"status\":\"resolved\",\"ledger_source\":\"user_confirmed\"}','owner said fixed');",
+        );
+        let (sunk, rows) = s9r_run_stage(&storage, &HashMap::new());
+        assert_eq!(sunk, HashSet::from(["y".to_string()]));
+        assert!(rows[0].resolution.is_none(), "{:?}", rows[0].resolution);
+    }
+
     #[test]
     fn kill_switch_matches_a_store_with_no_assertions_table() {
         let with_rules = Storage::open_memory().unwrap();
