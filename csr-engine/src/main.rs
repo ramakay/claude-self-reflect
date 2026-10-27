@@ -92,7 +92,7 @@ enum Commands {
     },
     /// Handle Claude Code hook events
     Hook {
-        /// Hook name: session-start, session-end, precompact, stop, stop-work (internal: the detached worker stop starts), post-tool-use, prompt-submit, install, subagent-stop (deprecated, no-op)
+        /// Hook name: session-start, session-end, precompact, post-compact, stop, stop-work (internal: the detached worker stop starts), post-tool-use, prompt-submit, install, subagent-stop (deprecated, no-op)
         name: String,
 
         /// For install: auto-apply to settings.json
@@ -116,6 +116,11 @@ enum Commands {
         /// Skip AI narrative generation (Layer 1+2 only, no API key needed)
         #[arg(long)]
         no_ai: bool,
+
+        /// Serve only the prompt socket on a warm engine: no import, enrichment,
+        /// dream or narrative cycles, and no writes to the database. For benches.
+        #[arg(long)]
+        serve_only: bool,
     },
     /// Force a full HNSW index rebuild from SQLite now, in the foreground.
     /// Explicit maintenance command counterpart to the daemon's
@@ -1010,6 +1015,12 @@ fn main() -> Result<()> {
         }
         _ => None,
     };
+    if matches!(&args.command, Some(Commands::Hook { name, .. }) if name == "post-compact") {
+        let _ = std::panic::catch_unwind(|| {
+            csr_engine::hooks::post_compact::run_client(&args.db_path, &args.projects_dir);
+        });
+        return Ok(());
+    }
     if matches!(&args.command, Some(Commands::Hook { name, .. }) if name == "prompt-submit") {
         let _ = std::panic::catch_unwind(|| {
             csr_engine::hooks::prompt_transport::run_client(
@@ -1260,8 +1271,19 @@ async fn run(
         batch_size,
         batch_time,
         no_ai,
+        serve_only,
     }) = args.command
     {
+        if serve_only {
+            // The socket's own endpoint lock is the single-owner guard here, so
+            // this runs beside a real daemon on a different data directory.
+            if let Some(parent) = args.db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let eng = engine::Engine::new_for_daemon(&args.db_path, &args.projects_dir).await?;
+            eng.embeddings().warm()?;
+            return csr_engine::daemon::serve_only(std::sync::Arc::new(eng)).await;
+        }
         // The lock first: a second daemon (another launchd label, a terminal)
         // must lose here, cheaply, not after loading the engine and the model.
         let daemon_lock = csr_engine::daemon::Daemon::acquire_lock()?;

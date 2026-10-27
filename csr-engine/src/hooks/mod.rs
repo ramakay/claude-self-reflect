@@ -12,8 +12,10 @@ pub mod exposure;
 pub mod install;
 pub mod intent;
 pub mod learnt;
+pub mod post_compact;
 pub mod post_tool_use;
 pub mod precompact;
+pub mod prompt_fallback;
 pub mod prompt_submit;
 pub mod prompt_transport;
 pub mod reaction;
@@ -29,6 +31,7 @@ pub mod session_start;
 pub mod statusline_retire;
 pub mod stop;
 pub mod stop_work;
+pub mod turn_marks;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -67,6 +70,17 @@ pub struct HookInput {
     pub agent_id: Option<String>,
     #[serde(alias = "agentType")]
     pub agent_type: Option<String>,
+    /// Id of the prompt this hook belongs to (UserPromptSubmit, PostCompact).
+    #[serde(alias = "promptId")]
+    pub prompt_id: Option<String>,
+    /// What started a compaction ("manual" | "auto") for PostCompact.
+    pub trigger: Option<String>,
+    /// The summary Claude Code wrote at compaction, for PostCompact.
+    #[serde(alias = "compactSummary")]
+    pub compact_summary: Option<String>,
+    /// The event this input was sent for.
+    #[serde(alias = "hookEventName")]
+    pub hook_event_name: Option<String>,
 }
 
 impl HookInput {

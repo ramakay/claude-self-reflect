@@ -15,14 +15,37 @@ use tokio::sync::Semaphore;
 use super::HookInput;
 use crate::engine::Engine;
 
-pub const REQUEST_BUDGET: Duration = Duration::from_millis(800);
-pub const PROCESS_BUDGET: Duration = Duration::from_millis(1400);
-const VERSION: u32 = 1;
+/// Connect plus reply over the daemon socket. Also the daemon's own deadline
+/// for a request: an answer later than this is one nobody is waiting for.
+pub const SOCKET_BUDGET: Duration = Duration::from_millis(250);
+/// Whole-process wall, measured from `main`, within which the in-process
+/// fallback answers when the socket is refused or missing.
+pub const FALLBACK_BUDGET: Duration = Duration::from_millis(300);
+/// Hard stop for the hook process. Nothing, stdin included, outlives it.
+pub const PROCESS_BUDGET: Duration = Duration::from_millis(500);
+/// What the fallback leaves unspent of [`PROCESS_BUDGET`] after a stalled
+/// socket: flush, exit, and scheduling jitter.
+const FALLBACK_MARGIN: Duration = Duration::from_millis(40);
+/// Bumped to 2 with `kind`. A daemon on another version never answers a
+/// request of this one, and the client never accepts its answer.
+const VERSION: u32 = 2;
 const MAX_FRAME: usize = 256 * 1024;
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Kind {
+    /// Render the UserPromptSubmit injection.
+    #[default]
+    Prompt,
+    /// Store the PostCompact `compact_summary`.
+    PostCompact,
+}
 
 #[derive(Serialize, Deserialize)]
 struct Request {
     version: u32,
+    #[serde(default)]
+    kind: Kind,
     database: String,
     projects_dir: PathBuf,
     policy: Vec<Option<String>>,
@@ -58,15 +81,13 @@ pub fn socket_path(data_dir: &Path) -> PathBuf {
     data_dir.join("hook-ipc-v1").join("prompt.sock")
 }
 
-/// Called before runtime/storage construction. The independent thread also
-/// covers synchronous stdin, filesystem calls, and runtime shutdown. No Rust
-/// timeout can preempt those operations. Leave scheduling margin below 3s.
-pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
-    let Some(_operation) = super::try_start(db_path) else {
-        return;
-    };
+/// Start the independent deadline thread: at [`PROCESS_BUDGET`] after
+/// `started` the process is gone. The thread also covers synchronous stdin,
+/// filesystem calls, and runtime shutdown, which no Rust timeout can preempt.
+/// Returns false when the thread cannot start (the caller then does nothing).
+pub(super) fn spawn_watchdog(started: Instant) -> bool {
     let timing_probe = std::env::var_os("CSR_HOOK_TIMING_PROBE").is_some();
-    if std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("prompt-deadline".into())
         .spawn(move || {
             std::thread::sleep(PROCESS_BUDGET.saturating_sub(started.elapsed()));
@@ -86,8 +107,36 @@ pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
             #[cfg(not(unix))]
             std::process::exit(0);
         })
-        .is_err()
-    {
+        .is_ok()
+}
+
+/// How a prompt was answered, for the timing line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Transport {
+    /// The daemon answered over the socket.
+    Socket,
+    /// The in-process fallback answered.
+    Fallback,
+    /// Nothing was injected.
+    Unavailable,
+}
+
+impl Transport {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Socket => "socket",
+            Self::Fallback => "fallback",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Called before runtime/storage construction. Leave scheduling margin below 3s.
+pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
+    let Some(_operation) = super::try_start(db_path) else {
+        return;
+    };
+    if !spawn_watchdog(started) {
         return;
     }
     if std::env::var("CSR_DISABLE_RECURSIVE_HOOKS").as_deref() == Ok("1") {
@@ -113,6 +162,12 @@ pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
         input.cwd.as_deref().unwrap_or_default(),
     )
     .unwrap_or_else(|| "unknown".into());
+    // The turn mark goes down before any request, so FS2 sees a prompt that
+    // the daemon never answered.
+    if let (Some(data_dir), Some(session)) = (db_path.parent(), input.session_id.as_deref()) {
+        super::turn_marks::mark_prompt(data_dir, session);
+    }
+    let prompt_id = input.prompt_id.clone();
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -121,32 +176,67 @@ pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
     };
     let setup_elapsed = started.elapsed().saturating_sub(stdin_elapsed);
     let request_started = Instant::now();
-    let output = runtime.block_on(request_with_delivery(
-        db_path,
-        projects_dir,
-        input,
-        |output| {
+    let (_, transport) =
+        runtime.block_on(resolve(db_path, projects_dir, input, started, |output| {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
             stdout
                 .write_all(output.as_bytes())
                 .and_then(|_| stdout.flush())
                 .is_ok()
-        },
-    ));
+        }));
     runtime.shutdown_background();
     let line = format!(
-        "CSR hook prompt-submit [{}]: stdin={}ms setup={}ms hook={}ms flush=0ms total={}ms transport={} includes_startup=1",
+        "CSR hook prompt-submit [{}]: stdin={}ms setup={}ms hook={}ms flush=0ms total={}ms transport={} prompt_id={} includes_startup=1",
         project, stdin_elapsed.as_millis(), setup_elapsed.as_millis(),
         request_started.elapsed().as_millis(), started.elapsed().as_millis(),
-        if output.is_some() {
-            "ok"
-        } else {
-            "unavailable"
-        },
+        transport.label(),
+        prompt_id.as_deref().filter(|id| !id.is_empty()).unwrap_or("-"),
     );
     eprintln!("{line}");
     crate::telemetry::append_timing_line(&line);
+}
+
+/// Answer a prompt: the daemon socket first, the in-process fallback when the
+/// socket cannot. `deliver` writes the answer to the hook's stdout and says
+/// whether it landed; only a delivered answer counts.
+///
+/// - refused or missing socket: fallback, by `started + FALLBACK_BUDGET`;
+/// - socket that accepts and stalls, drops, or garbles: after
+///   [`SOCKET_BUDGET`], fallback with what remains of [`PROCESS_BUDGET`];
+/// - reply from another protocol version, or a stdout that fails: say nothing.
+pub(crate) async fn resolve(
+    db_path: &Path,
+    projects_dir: &Path,
+    input: HookInput,
+    started: Instant,
+    deliver: impl FnOnce(&str) -> bool,
+) -> (Option<String>, Transport) {
+    let mut deliver = Some(deliver);
+    let socket = exchange(
+        db_path,
+        projects_dir,
+        Kind::Prompt,
+        input.clone(),
+        SOCKET_BUDGET,
+        |text| deliver.take().is_some_and(|deliver| deliver(text)),
+    )
+    .await;
+    let deadline = match socket {
+        Socket::Answered(text) => return (Some(text), Transport::Socket),
+        Socket::Abstained => return (None, Transport::Unavailable),
+        Socket::Refused => started + FALLBACK_BUDGET,
+        Socket::Slow => started + PROCESS_BUDGET.saturating_sub(FALLBACK_MARGIN),
+    };
+    let Some(deliver) = deliver else {
+        return (None, Transport::Unavailable);
+    };
+    let db = db_path.to_path_buf();
+    let rendered = super::prompt_fallback::render(&db, &input, deadline);
+    match rendered {
+        Some(text) if deliver(&text) => (Some(text), Transport::Fallback),
+        _ => (None, Transport::Unavailable),
+    }
 }
 
 async fn read_frame<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Option<Vec<u8>> {
@@ -168,52 +258,111 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, bytes: &[
     Some(())
 }
 
+/// Socket-only exchange for a prompt: the daemon's answer or nothing. No fallback.
 pub async fn request(db_path: &Path, projects_dir: &Path, input: HookInput) -> Option<String> {
-    request_with_delivery(db_path, projects_dir, input, |_| true).await
+    match exchange(
+        db_path,
+        projects_dir,
+        Kind::Prompt,
+        input,
+        SOCKET_BUDGET,
+        |_| true,
+    )
+    .await
+    {
+        Socket::Answered(text) => Some(text),
+        _ => None,
+    }
 }
 
-async fn request_with_delivery(
+/// Ask the daemon to store a PostCompact summary. True once it answered.
+pub(crate) async fn post_compact(db_path: &Path, projects_dir: &Path, input: HookInput) -> bool {
+    matches!(
+        exchange(
+            db_path,
+            projects_dir,
+            Kind::PostCompact,
+            input,
+            SOCKET_BUDGET,
+            |_| true,
+        )
+        .await,
+        Socket::Answered(_)
+    )
+}
+
+/// What one socket exchange came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Socket {
+    /// A valid reply of this protocol version, accepted by `deliver`.
+    Answered(String),
+    /// The daemon replied but the answer cannot be used (other version) or the
+    /// caller could not deliver it. Nothing more is tried.
+    Abstained,
+    /// Nobody is listening: the socket is missing or refuses connections.
+    Refused,
+    /// Someone is listening and gave no usable answer in time: stalled,
+    /// dropped the connection, or sent garbage.
+    Slow,
+}
+
+async fn exchange(
     db_path: &Path,
     projects_dir: &Path,
+    kind: Kind,
     input: HookInput,
+    budget: Duration,
     deliver: impl FnOnce(&str) -> bool,
-) -> Option<String> {
+) -> Socket {
     #[cfg(unix)]
     {
-        tokio::time::timeout(REQUEST_BUDGET, async {
-            let data_dir = db_path.parent()?;
-            let mut stream = tokio::net::UnixStream::connect(socket_path(data_dir))
-                .await
-                .ok()?;
-            let bytes = serde_json::to_vec(&Request {
+        tokio::time::timeout(budget, async {
+            let Some(data_dir) = db_path.parent() else {
+                return Socket::Refused;
+            };
+            let Ok(mut stream) = tokio::net::UnixStream::connect(socket_path(data_dir)).await
+            else {
+                return Socket::Refused;
+            };
+            let Some(database) = db_path.file_name().and_then(|n| n.to_str()) else {
+                return Socket::Abstained;
+            };
+            let Ok(bytes) = serde_json::to_vec(&Request {
                 version: VERSION,
-                database: db_path.file_name()?.to_str()?.to_owned(),
+                kind,
+                database: database.to_owned(),
                 projects_dir: projects_dir
                     .canonicalize()
                     .unwrap_or_else(|_| projects_dir.to_path_buf()),
                 policy: policy(),
                 input,
-            })
-            .ok()?;
-            write_frame(&mut stream, &bytes).await?;
-            let bytes = read_frame(&mut stream).await?;
-            let response: Response = serde_json::from_slice(&bytes).ok()?;
+            }) else {
+                return Socket::Abstained;
+            };
+            if write_frame(&mut stream, &bytes).await.is_none() {
+                return Socket::Slow;
+            }
+            let Some(bytes) = read_frame(&mut stream).await else {
+                return Socket::Slow;
+            };
+            let Ok(response) = serde_json::from_slice::<Response>(&bytes) else {
+                return Socket::Slow;
+            };
             if response.version != VERSION || !deliver(&response.injection) {
-                return None;
+                return Socket::Abstained;
             }
             // Acknowledge only a fully validated response accepted by the stdout
             // writer. Failed/partial/timed-out replies never commit exposure state.
             let _ = stream.write_u8(1).await;
-            Some(response.injection)
+            Socket::Answered(response.injection)
         })
         .await
-        .ok()
-        .flatten()
+        .unwrap_or(Socket::Slow)
     }
     #[cfg(not(unix))]
     {
-        let _ = (db_path, projects_dir, input, deliver);
-        None
+        let _ = (db_path, projects_dir, kind, input, budget, deliver);
+        Socket::Refused
     }
 }
 
@@ -324,6 +473,34 @@ pub fn spawn_for_daemon(
     engine: Arc<Engine>,
     shutdown: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn(engine, shutdown, false)
+}
+
+/// The socket server of `csr-engine daemon --serve-only`: the same endpoint
+/// and renderer as the daemon's, on a warm engine, with every database
+/// connection set `query_only` and no background refresh, so serving a prompt
+/// changes nothing on disk. Receipt writes (retrieval events, exposure
+/// impressions) and dream claims therefore fail open instead of landing.
+pub fn spawn_serve_only(
+    engine: Arc<Engine>,
+    shutdown: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    spawn(engine, shutdown, true)
+}
+
+/// `PRAGMA query_only=ON` on a storage handle. Failure leaves it writable.
+fn make_query_only(storage: &crate::storage::Storage) {
+    let _ = storage.with_connection(|conn| {
+        conn.execute_batch("PRAGMA query_only=ON")?;
+        Ok(())
+    });
+}
+
+fn spawn(
+    engine: Arc<Engine>,
+    shutdown: Arc<AtomicBool>,
+    read_only: bool,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -355,9 +532,17 @@ pub fn spawn_for_daemon(
             // must not be lost, and may wait, stay on the daemon's connection:
             // `receipts`.
             let receipts = engine.storage().clone();
+            if read_only {
+                make_query_only(&receipts);
+            }
             let render_engine = match engine.storage().open_prompt_lane() {
                 Ok(Some(lane)) => Arc::new(Engine::from_parts_with_index_dir(
-                    Arc::new(lane),
+                    {
+                        if read_only {
+                            make_query_only(&lane);
+                        }
+                        Arc::new(lane)
+                    },
                     engine.embeddings().clone(),
                     engine.search().clone(),
                     engine.projects_dir().to_path_buf(),
@@ -375,7 +560,7 @@ pub fn spawn_for_daemon(
             // runs on the daemon's connection (reads, then one meta write that
             // may wait for another writer) and publishes into the cache the lane
             // shares; the lane's own mutex is never held for that.
-            {
+            if !read_only {
                 let engine = engine.clone();
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
@@ -406,13 +591,13 @@ pub fn spawn_for_daemon(
                 let receipts = receipts.clone();
                 let database = database.clone();
                 tokio::spawn(async move {
-                    let deadline = tokio::time::Instant::now() + REQUEST_BUDGET;
+                    let deadline = tokio::time::Instant::now() + SOCKET_BUDGET;
                     let _ = tokio::time::timeout_at(deadline, async {
                         let bytes = read_frame(&mut stream).await?;
                         let request: Request = serde_json::from_slice(&bytes).ok()?;
                         if request.version != VERSION
                             || request.database != database
-                            || request.policy != policy()
+                            || (request.kind == Kind::Prompt && request.policy != policy())
                             || request.projects_dir
                                 != engine
                                     .projects_dir()
@@ -420,6 +605,30 @@ pub fn spawn_for_daemon(
                                     .unwrap_or_else(|_| engine.projects_dir().to_path_buf())
                         {
                             return None;
+                        }
+                        if request.kind == Kind::PostCompact {
+                            // Stored on the daemon's own connection: a write that
+                            // may wait for another writer, never on the render lane.
+                            let input = request.input;
+                            let engine = engine.clone();
+                            let stored = tokio::task::spawn_blocking(move || {
+                                let _operation = engine.storage().operation_lock().ok()?;
+                                receipts
+                                    .with_connection(|conn| {
+                                        super::post_compact::store(conn, &input)
+                                    })
+                                    .ok()
+                            })
+                            .await
+                            .ok()
+                            .flatten()?;
+                            let bytes = serde_json::to_vec(&Response {
+                                version: VERSION,
+                                injection: if stored { "stored" } else { "duplicate" }.into(),
+                            })
+                            .ok()?;
+                            write_frame(&mut stream, &bytes).await?;
+                            return Some(());
                         }
                         let cwd = PathBuf::from(request.input.cwd.as_deref()?);
                         if !cwd.is_absolute() {
@@ -874,6 +1083,7 @@ mod tests {
             };
             let bytes = serde_json::to_vec(&Request {
                 version: VERSION,
+                kind: Kind::Prompt,
                 database: "csr-engine.db".into(),
                 projects_dir: dir.path().canonicalize().unwrap(),
                 policy: client_policy,
@@ -983,6 +1193,282 @@ mod tests {
             std::fs::read_to_string(socket_path(dir.path())).unwrap(),
             "keep me"
         );
+    }
+    // ---- FS1: stalled and old daemons, fallback, PostCompact over the socket ----
+
+    const FALLBACK_TEXT: &str =
+        "The refresh path in src/auth/token.rs rejects expired tokens before the retry middleware runs.";
+
+    /// A file database holding one chunk the fallback can find by identifier
+    /// and by words. The storage is returned to keep the database open.
+    fn fallback_db(dir: &Path) -> (PathBuf, crate::storage::Storage) {
+        let db = dir.join("csr-engine.db");
+        let storage = crate::storage::Storage::open(&db).unwrap();
+        storage
+            .insert_chunk(
+                &crate::import::ConversationChunk {
+                    id: "fb-1".into(),
+                    conversation_id: "abcdef12-0000-4000-8000-000000000000".into(),
+                    project_name: "proj".into(),
+                    timestamp: "2026-10-01T00:00:00Z".into(),
+                    content: FALLBACK_TEXT.into(),
+                    message_count: 2,
+                    summary: None,
+                    author: crate::provenance::Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &[0.0; 384],
+            )
+            .unwrap();
+        (db, storage)
+    }
+
+    fn fallback_input(dir: &Path) -> HookInput {
+        HookInput {
+            prompt: Some(FALLBACK_TEXT.into()),
+            cwd: Some(dir.to_string_lossy().into()),
+            session_id: Some("some-other-session".into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_listener_times_out_at_the_socket_budget_then_yields_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _storage) = fallback_db(dir.path());
+        let bound = BoundSocket::bind(dir.path()).unwrap();
+        // Accepts, reads the request, never replies.
+        let stalled = tokio::spawn(async move {
+            let (mut stream, _) = bound.listener.accept().await.unwrap();
+            read_frame(&mut stream).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(bound);
+        });
+        let started = Instant::now();
+        let (text, transport) =
+            resolve(&db, dir.path(), fallback_input(dir.path()), started, |_| {
+                true
+            })
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!(transport, Transport::Fallback);
+        let text = text.expect("the fallback answers when the socket stalls");
+        assert!(text.contains("src/auth/token.rs"), "{text}");
+        assert!(elapsed >= SOCKET_BUDGET, "{elapsed:?}");
+        assert!(
+            elapsed < SOCKET_BUDGET + Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        stalled.abort();
+    }
+
+    #[tokio::test]
+    async fn refused_and_missing_sockets_go_straight_to_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _storage) = fallback_db(dir.path());
+        // Missing socket.
+        let started = Instant::now();
+        let (text, transport) =
+            resolve(&db, dir.path(), fallback_input(dir.path()), started, |_| {
+                true
+            })
+            .await;
+        assert_eq!(transport, Transport::Fallback);
+        assert!(text.is_some());
+        assert!(
+            started.elapsed() < FALLBACK_BUDGET,
+            "{:?}",
+            started.elapsed()
+        );
+        // A socket file nobody listens on: connection refused.
+        std::fs::create_dir_all(socket_path(dir.path()).parent().unwrap()).unwrap();
+        let stale = std::os::unix::net::UnixListener::bind(socket_path(dir.path())).unwrap();
+        drop(stale);
+        let started = Instant::now();
+        let (text, transport) =
+            resolve(&db, dir.path(), fallback_input(dir.path()), started, |_| {
+                true
+            })
+            .await;
+        assert_eq!(transport, Transport::Fallback);
+        assert!(text.is_some());
+        assert!(
+            started.elapsed() < FALLBACK_BUDGET,
+            "{:?}",
+            started.elapsed()
+        );
+        // The fallback also stays quiet when stdout cannot take the answer.
+        let (text, transport) = resolve(
+            &db,
+            dir.path(),
+            fallback_input(dir.path()),
+            Instant::now(),
+            |_| false,
+        )
+        .await;
+        assert_eq!((text, transport), (None, Transport::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_daemon_makes_the_client_abstain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _storage) = fallback_db(dir.path());
+        for reply in [
+            // An old daemon that did understand the frame.
+            Some(br#"{"version":1,"injection":"CSR PICKUP \u2014 from an old daemon\n"}"#.to_vec()),
+            // A future one.
+            Some(br#"{"version":3,"injection":"from the future"}"#.to_vec()),
+        ] {
+            let bound = BoundSocket::bind(dir.path()).unwrap();
+            let peer = tokio::spawn(async move {
+                let (mut stream, _) = bound.listener.accept().await.unwrap();
+                let request = read_frame(&mut stream).await.unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                assert_eq!(json["version"], 2);
+                assert_eq!(json["kind"], "prompt");
+                write_frame(&mut stream, &reply.unwrap()).await.unwrap();
+            });
+            let started = Instant::now();
+            let delivered = std::cell::Cell::new(false);
+            let (text, transport) =
+                resolve(&db, dir.path(), fallback_input(dir.path()), started, |_| {
+                    delivered.set(true);
+                    true
+                })
+                .await;
+            peer.await.unwrap();
+            // Abstain: nothing delivered, and the fallback did not run in its place.
+            assert_eq!((text, transport), (None, Transport::Unavailable));
+            assert!(!delivered.get());
+            assert!(started.elapsed() < SOCKET_BUDGET);
+        }
+        // A daemon that drops a frame it does not understand is not "abstain":
+        // the client moves on to the fallback and still never hangs.
+        let bound = BoundSocket::bind(dir.path()).unwrap();
+        let dropper = tokio::spawn(async move {
+            let (mut stream, _) = bound.listener.accept().await.unwrap();
+            read_frame(&mut stream).await.unwrap();
+        });
+        let started = Instant::now();
+        let (_, transport) = resolve(&db, dir.path(), fallback_input(dir.path()), started, |_| {
+            true
+        })
+        .await;
+        dropper.await.unwrap();
+        assert_eq!(transport, Transport::Fallback);
+        assert!(started.elapsed() < PROCESS_BUDGET);
+    }
+
+    #[test]
+    fn request_frames_default_to_a_prompt_and_name_their_kind() {
+        let bytes = serde_json::to_vec(&Request {
+            version: VERSION,
+            kind: Kind::PostCompact,
+            database: "csr-engine.db".into(),
+            projects_dir: PathBuf::from("/p"),
+            policy: Vec::new(),
+            input: HookInput::default(),
+        })
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["kind"], "post_compact");
+        assert_eq!(VERSION, 2);
+        let mut without_kind = json;
+        without_kind.as_object_mut().unwrap().remove("kind");
+        let request: Request = serde_json::from_value(without_kind).unwrap();
+        assert_eq!(request.kind, Kind::Prompt);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Serializes process-wide policy environment during this test.
+    async fn post_compact_over_the_socket_stores_one_row_and_a_repeat_adds_none() {
+        let _env = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let engine = fixture_over(dir.path(), crate::storage::Storage::open(&db).unwrap());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = spawn_for_daemon(engine.clone(), shutdown.clone());
+        ready(dir.path()).await;
+        let payload = HookInput {
+            session_id: Some("sess-pc".into()),
+            compact_summary: Some("Compacted: the importer now dedupes by uuid.".into()),
+            trigger: Some("auto".into()),
+            prompt_id: Some("p-1".into()),
+            cwd: Some(dir.path().to_string_lossy().into()),
+            ..Default::default()
+        };
+        let mut sent = 0;
+        for _ in 0..40 {
+            if super::post_compact(&db, dir.path(), payload.clone()).await {
+                sent += 1;
+                if sent == 2 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(sent, 2, "the daemon never answered both PostCompact fires");
+        let rows: i64 = engine
+            .storage()
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM chunks WHERE source = 'native_compact'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+        shutdown.store(true, Ordering::SeqCst);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Serializes process-wide policy environment during this test.
+    async fn serve_only_renders_without_writing_and_removes_its_socket() {
+        let _env = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let engine = fixture_over(dir.path(), crate::storage::Storage::open(&db).unwrap());
+        let expected = super::super::prompt_submit::render(&input(dir.path()), &engine, dir.path())
+            .await
+            .unwrap();
+        let counts = |engine: &Engine| -> (i64, i64, i64) {
+            engine
+                .storage()
+                .with_connection(|conn| {
+                    let count = |table: &str| -> i64 {
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                            .unwrap()
+                    };
+                    Ok((
+                        count("retrieval_events"),
+                        count("rerank_exposure_impressions"),
+                        count("reflections"),
+                    ))
+                })
+                .unwrap()
+        };
+        let before = counts(&engine);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = spawn_serve_only(engine.clone(), shutdown.clone());
+        ready(dir.path()).await;
+        let mut served = None;
+        for _ in 0..40 {
+            served = request(dir.path(), input(dir.path())).await;
+            if served.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(served, Some(expected));
+        // Let any receipt write that was going to land do so, then compare.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(counts(&engine), before);
+        shutdown.store(true, Ordering::SeqCst);
+        server.await.unwrap();
+        assert!(!socket_path(dir.path()).exists());
     }
 }
 

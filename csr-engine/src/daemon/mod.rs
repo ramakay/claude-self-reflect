@@ -1801,6 +1801,25 @@ async fn wait_for_termination_signal() -> Result<()> {
     tokio::signal::ctrl_c().await.map_err(Into::into)
 }
 
+/// `csr-engine daemon --serve-only`: the prompt socket on a warm engine and
+/// nothing else. No import, watcher, enrichment, dream, narrative, journal or
+/// compaction cycle runs, and the engine's connections are `query_only`, so a
+/// bench measures the hook path alone and the database is left as it was.
+/// SIGTERM or Ctrl+C stops the server and removes the socket before this returns.
+pub async fn serve_only(engine: Arc<crate::engine::Engine>) -> Result<()> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut server = crate::hooks::prompt_transport::spawn_serve_only(engine, shutdown.clone());
+    let signalled = tokio::select! {
+        // The server task ends on its own only when it could not bind.
+        _ = &mut server => anyhow::bail!("prompt socket could not start"),
+        signalled = wait_for_termination_signal() => signalled,
+    };
+    shutdown.store(true, Ordering::SeqCst);
+    // The accept loop polls the flag every 100 ms; the socket file goes with it.
+    let _ = server.await;
+    signalled
+}
+
 /// Resolves to the process exit code `Daemon::run` should return, once
 /// EITHER `signal` (the plain Ctrl+C/SIGTERM wait) or `replaced` (the
 /// binary-replacement watch) resolves, whichever comes first: `0` for an
