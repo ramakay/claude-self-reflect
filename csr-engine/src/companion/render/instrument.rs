@@ -1614,6 +1614,24 @@ fn history_mark(outcome: &str) -> Option<&'static str> {
 fn earlier_intent(intent: &str) -> &str {
     intent.strip_prefix("you asked: ").unwrap_or(intent)
 }
+/// The agents bar's words: how many active agents are stalled, then the name of one agent. A
+/// live agent's name leads; when every active agent is stalled the first stalled one is named, so
+/// the count never trails an empty name. An agent with no description has no name to show, and
+/// then no dot is drawn either.
+fn agents_bar_label(agents: &[agents::Agent], now: f64) -> String {
+    let active = || agents.iter().filter(|a| agents::is_active(a));
+    let stalled = active().filter(|a| agents::stalled(a, now)).count();
+    let name = |a: &&agents::Agent| a.description.trim().to_owned();
+    let shown = active()
+        .filter(|a| !agents::stalled(a, now))
+        .map(|a| name(&a))
+        .chain(active().map(|a| name(&a)))
+        .find(|n| !n.is_empty());
+    match shown {
+        Some(name) => format!("{stalled} stalled · {name}"),
+        None => format!("{stalled} stalled"),
+    }
+}
 fn agent_lines(c: &Composition) -> Vec<String> {
     c.agents
         .agents
@@ -3598,7 +3616,6 @@ pub fn draw(
         let agents_draw_h = agents_h;
         panel(&mut canvas, y, agents_draw_h, t);
         let mut x = IX;
-        let mut stalled = 0;
         canvas.cut_title = "Agent in flight";
         for a in c
             .agents
@@ -3608,7 +3625,6 @@ pub fn draw(
             .take(10)
         {
             let is_stalled = agents::stalled(a, c.now);
-            stalled += usize::from(is_stalled);
             canvas.icon(
                 f,
                 Icon::Bot,
@@ -3620,17 +3636,10 @@ pub fn draw(
             );
             x += S5;
         }
-        let live = c
-            .agents
-            .agents
-            .iter()
-            .find(|a| agents::is_active(a) && !agents::stalled(a, c.now))
-            .map(|a| a.description.as_str())
-            .unwrap_or("");
         single(
             &mut canvas,
             f,
-            &format!("{stalled} stalled · {live}"),
+            &agents_bar_label(&c.agents.agents, c.now),
             x + S2,
             y + P + f.cap(body),
             W - x - 40.,
@@ -5136,6 +5145,45 @@ mod tests {
                 "{theme:?} vs CSR pink"
             );
         }
+    }
+
+    fn agent_at(description: &str, status: &str, last_at_ms: i64) -> agents::Agent {
+        serde_json::from_value(json!({
+            "id": description, "parent": null, "description": description, "type": "Explore",
+            "model": null, "status": status, "started": 1_799_999_000_000_i64,
+            "first_seen": 1_799_999_000_000_i64, "last_at": last_at_ms, "tools": 3, "tokens": 10,
+            "edits": [], "edits_omitted": 0, "overlaps": [], "overlaps_omitted": 0,
+            "last": "", "last_tool": null, "current_turn": null, "completion": null,
+            "listed": true,
+        }))
+        .expect("an agent row")
+    }
+
+    #[test]
+    fn the_agents_bar_names_an_agent_when_every_active_one_is_stalled() {
+        let now = 1_800_000_000.;
+        let stalled_at = 1_799_999_000_000_i64;
+        let live_at = 1_799_999_990_000_i64;
+        // The bug: one stalled agent, nothing else live, read "1 stalled · " with no name.
+        let only = [agent_at("Scan the repo", "running", stalled_at)];
+        assert_eq!(agents_bar_label(&only, now), "1 stalled · Scan the repo");
+        // A live agent still leads the name; the count is of the stalled ones.
+        let mixed = [
+            agent_at("Old build", "running", stalled_at),
+            agent_at("Fresh scan", "running", live_at),
+        ];
+        assert_eq!(agents_bar_label(&mixed, now), "1 stalled · Fresh scan");
+        let none = [agent_at("Fresh scan", "running", live_at)];
+        assert_eq!(agents_bar_label(&none, now), "0 stalled · Fresh scan");
+        // No name anywhere: no dot after the count.
+        let nameless = [agent_at("  ", "running", stalled_at)];
+        assert_eq!(agents_bar_label(&nameless, now), "1 stalled");
+        // A finished agent is not active, so it is neither counted nor named.
+        let done = [
+            agent_at("Old build", "completed", stalled_at),
+            agent_at("Stuck", "running", stalled_at),
+        ];
+        assert_eq!(agents_bar_label(&done, now), "1 stalled · Stuck");
     }
 
     fn quota_composition() -> Composition {
