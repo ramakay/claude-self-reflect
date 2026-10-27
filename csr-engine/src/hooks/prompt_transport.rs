@@ -134,6 +134,32 @@ impl Transport {
     }
 }
 
+/// Pre-dispatch step. Every prompt starts a model turn, so the mark goes down
+/// before the early-exit check; precompact::decide_veto reads it. Returns false
+/// when the early-exit check answers silently.
+fn pre_dispatch(
+    db_path: &Path,
+    source: Option<&str>,
+    prompt: &str,
+    session_id: Option<&str>,
+) -> bool {
+    record_turn_start(db_path, session_id);
+    if matches!(
+        super::prompt_submit::early_exit_for(source, prompt),
+        Some(super::prompt_submit::EarlyExit::Silent)
+    ) {
+        return false;
+    }
+    true
+}
+
+/// Record the turn start for a prompt that carries a session id.
+fn record_turn_start(db_path: &Path, session_id: Option<&str>) {
+    if let (Some(data_dir), Some(session)) = (db_path.parent(), session_id) {
+        super::turn_marks::mark_prompt(data_dir, session);
+    }
+}
+
 /// Called before runtime/storage construction. Leave scheduling margin below 3s.
 pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
     let Some(_operation) = super::try_start(db_path) else {
@@ -148,12 +174,11 @@ pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
     let stdin_started = Instant::now();
     let mut input = super::read_stdin_json();
     let stdin_elapsed = stdin_started.elapsed();
-    if matches!(
-        super::prompt_submit::early_exit_for(
-            input.source.as_deref(),
-            input.prompt.as_deref().unwrap_or_default()
-        ),
-        Some(super::prompt_submit::EarlyExit::Silent)
+    if !pre_dispatch(
+        db_path,
+        input.source.as_deref(),
+        input.prompt.as_deref().unwrap_or_default(),
+        input.session_id.as_deref(),
     ) {
         return;
     }
@@ -168,11 +193,6 @@ pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
         input.cwd.as_deref().unwrap_or_default(),
     )
     .unwrap_or_else(|| "unknown".into());
-    // The turn mark goes down before any request, so FS2 sees a prompt that
-    // the daemon never answered.
-    if let (Some(data_dir), Some(session)) = (db_path.parent(), input.session_id.as_deref()) {
-        super::turn_marks::mark_prompt(data_dir, session);
-    }
     let prompt_id = input.prompt_id.clone();
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1536,5 +1556,30 @@ mod endpoint_lock_tests {
         assert!(start.elapsed() < Duration::from_millis(200));
         // SAFETY: fcntl only probes the descriptor and does not take ownership.
         assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+    }
+}
+
+#[cfg(test)]
+mod s9r_turn_mark_tests {
+    use super::*;
+
+    fn marked_after(prompt: &str) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr.db");
+        let proceed = pre_dispatch(&db, None, prompt, Some("sess-1"));
+        assert!(!proceed, "{prompt:?} should still answer silently");
+        super::super::turn_marks::read(dir.path(), "sess-1")
+            .last_prompt
+            .is_some()
+    }
+
+    #[test]
+    fn s9r_slash_prompt_marks_turn_start() {
+        assert!(marked_after("/help"));
+    }
+
+    #[test]
+    fn s9r_short_prompt_marks_turn_start() {
+        assert!(marked_after("ok"));
     }
 }
