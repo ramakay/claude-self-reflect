@@ -115,6 +115,110 @@ pub const CE_SPREAD_GOOD: f32 = 2.0;
 /// `partial`. S2 first-cut value, kept.
 pub const CE_SPREAD_PARTIAL: f32 = 1.0;
 
+/// The six margin constants of the cross-encoder label rule, as one value so
+/// a model can carry its own.
+///
+/// `SHIPPED` is the `CE_*` constants above, calibrated on the S9 pairs with the
+/// shipped `ettin-reranker-32m-v1`. A model whose logit scale differs gets its
+/// own entry in [`CE_TUNED_BANDS`], keyed on the sha256 of its ONNX file, and
+/// only a model loaded from a file with that exact hash reads it. Every other
+/// model, and a model that cannot be hashed, reads `SHIPPED`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CeBands {
+    pub gap_high: f32,
+    pub gap_good: f32,
+    pub gap_tie: f32,
+    pub spread_high: f32,
+    pub spread_good: f32,
+    pub spread_partial: f32,
+}
+
+/// File name of the encoder graph inside a reranker model directory.
+const CE_ONNX_FILE: &str = "model_qint8_arm64.onnx";
+
+/// Per-model band entries: (sha256 of the ONNX file, bands).
+///
+/// STOPGAP, not a fix. Each entry quantile-matches the six `SHIPPED` constants
+/// onto that model's logit distribution so the label mix (the share of
+/// `high` / `good` / `partial` / `weak`) stays what the shipped model gave. It
+/// preserves label frequency, not label correctness: the labels still describe
+/// margin, and the inverted-label defect on exact answers is not addressed.
+pub const CE_TUNED_BANDS: &[(&str, CeBands)] = &[(
+    // tuned-run2 (ettin-tune), fit on the 310 audit queries.
+    "73b9d13ac00020e657dc43319a9717fbf0fc10d7243ad5710d48837c6137abab",
+    CeBands {
+        gap_high: 2.52,
+        gap_good: 1.72,
+        gap_tie: 0.145,
+        spread_high: 5.34,
+        spread_good: 4.32,
+        spread_partial: 2.86,
+    },
+)];
+
+impl CeBands {
+    pub const SHIPPED: Self = Self {
+        gap_high: CE_GAP_HIGH,
+        gap_good: CE_GAP_GOOD,
+        gap_tie: CE_GAP_TIE,
+        spread_high: CE_SPREAD_HIGH,
+        spread_good: CE_SPREAD_GOOD,
+        spread_partial: CE_SPREAD_PARTIAL,
+    };
+
+    /// Bands for a model whose ONNX file hashes to `sha256` (lower-case hex),
+    /// from `table`; `SHIPPED` when the hash is not listed.
+    pub fn lookup(sha256: &str, table: &[(&str, CeBands)]) -> Self {
+        table
+            .iter()
+            .find(|(sha, _)| sha.eq_ignore_ascii_case(sha256))
+            .map_or(Self::SHIPPED, |(_, bands)| *bands)
+    }
+
+    /// Bands for the reranker in `dir`, read from [`CE_TUNED_BANDS`];
+    /// `SHIPPED` when the ONNX file is absent, unreadable or not listed.
+    pub fn for_model_dir(dir: &std::path::Path) -> Self {
+        Self::for_model_dir_in(dir, CE_TUNED_BANDS)
+    }
+
+    pub(crate) fn for_model_dir_in(dir: &std::path::Path, table: &[(&str, CeBands)]) -> Self {
+        match file_sha256(&dir.join(CE_ONNX_FILE)) {
+            Some(sha) => Self::lookup(&sha, table),
+            None => Self::SHIPPED,
+        }
+    }
+
+    /// Bands for the reranker this process loads (`CSR_CE_MODEL_DIR` or the
+    /// cache dir), decided once per process.
+    pub fn active() -> &'static Self {
+        static ACTIVE: std::sync::OnceLock<CeBands> = std::sync::OnceLock::new();
+        ACTIVE.get_or_init(|| Self::for_model_dir(&crate::search::cross_encoder::model_dir()))
+    }
+}
+
+/// Lower-case hex sha256 of a file, streamed; `None` when it cannot be read.
+fn file_sha256(path: &std::path::Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+
 /// Cross-encoder score summary of one recall: the best pooled session score,
 /// the second best (when there is one) and the median, all in raw logits over
 /// the pooled sessions.
@@ -147,27 +251,44 @@ impl CeSummary {
         })
     }
 
-    /// The relevance label this summary earns.
+    /// The relevance label this summary earns under the bands of the loaded
+    /// reranker.
     pub fn label(&self) -> &'static str {
-        ce_relevance_label(self.top, self.runner_up, self.median)
+        self.label_with(CeBands::active())
+    }
+
+    /// The relevance label this summary earns under explicit `bands`.
+    pub fn label_with(&self, bands: &CeBands) -> &'static str {
+        ce_relevance_label_with(self.top, self.runner_up, self.median, bands)
     }
 }
 
 /// Band a cross-encoder result into the relevance vocabulary from margins
-/// only: `gap` is `top - runner_up` (0 when there is no runner-up) and
-/// `spread` is `top - median`. Absolute scores and cosines never enter.
+/// only, with the shipped model's bands: `gap` is `top - runner_up` (0 when
+/// there is no runner-up) and `spread` is `top - median`. Absolute scores and
+/// cosines never enter.
 ///
 /// `high` needs a clear gap and spread, `good` a spread and a real lead over
 /// the runner-up, `weak` a near-tie that is also no spread at all, and
 /// `partial` is everything between.
 pub fn ce_relevance_label(top: f32, runner_up: Option<f32>, median: f32) -> &'static str {
+    ce_relevance_label_with(top, runner_up, median, &CeBands::SHIPPED)
+}
+
+/// [`ce_relevance_label`] under explicit `bands`.
+pub fn ce_relevance_label_with(
+    top: f32,
+    runner_up: Option<f32>,
+    median: f32,
+    bands: &CeBands,
+) -> &'static str {
     let gap = runner_up.map_or(0.0, |second| top - second);
     let spread = top - median;
-    if gap >= CE_GAP_HIGH && spread >= CE_SPREAD_HIGH {
+    if gap >= bands.gap_high && spread >= bands.spread_high {
         "high"
-    } else if spread >= CE_SPREAD_GOOD && runner_up.is_none_or(|_| gap >= CE_GAP_GOOD) {
+    } else if spread >= bands.spread_good && runner_up.is_none_or(|_| gap >= bands.gap_good) {
         "good"
-    } else if spread < CE_SPREAD_PARTIAL && gap < CE_GAP_TIE {
+    } else if spread < bands.spread_partial && gap < bands.gap_tie {
         "weak"
     } else {
         "partial"
@@ -2842,6 +2963,182 @@ mod tests {
         assert_eq!(ce_relevance_label(9.0, None, 6.0), "good");
         // A lone candidate with no spread is weak.
         assert_eq!(ce_relevance_label(9.0, None, 9.0), "weak");
+    }
+
+    // ---- per-model bands: a stopgap that keeps the label mix, not a fix ----
+
+    const TUNED_RUN2_SHA: &str = "73b9d13ac00020e657dc43319a9717fbf0fc10d7243ad5710d48837c6137abab";
+
+    /// The label rule exactly as it stood before bands became a value: the
+    /// literal numbers, not the constants.
+    fn pre_stopgap_label(top: f32, runner_up: Option<f32>, median: f32) -> &'static str {
+        let gap = runner_up.map_or(0.0, |second| top - second);
+        let spread = top - median;
+        if gap >= 1.5 && spread >= 3.0 {
+            "high"
+        } else if spread >= 2.0 && runner_up.is_none_or(|_| gap >= 1.0) {
+            "good"
+        } else if spread < 1.0 && gap < 0.05 {
+            "weak"
+        } else {
+            "partial"
+        }
+    }
+
+    #[test]
+    fn ce_bands_shipped_are_the_s9_constants() {
+        let b = CeBands::SHIPPED;
+        assert_eq!(b.gap_high, 1.5);
+        assert_eq!(b.gap_good, 1.0);
+        assert_eq!(b.gap_tie, 0.05);
+        assert_eq!(b.spread_high, 3.0);
+        assert_eq!(b.spread_good, 2.0);
+        assert_eq!(b.spread_partial, 1.0);
+    }
+
+    #[test]
+    fn ce_shipped_labels_are_byte_identical_to_the_pre_stopgap_rule() {
+        // Every (gap, spread) cell on a 0.01 / 0.05 grid, with and without a
+        // runner-up, through the public entry point and through the explicit
+        // SHIPPED bands.
+        for g in 0..=800 {
+            for sp in -40..=240 {
+                let gap = g as f32 * 0.01;
+                let spread = sp as f32 * 0.05;
+                let median = 1.25f32;
+                let top = median + spread;
+                let runner_up = Some(top - gap);
+                let want = pre_stopgap_label(top, runner_up, median);
+                assert_eq!(ce_relevance_label(top, runner_up, median), want);
+                assert_eq!(
+                    ce_relevance_label_with(top, runner_up, median, &CeBands::SHIPPED),
+                    want
+                );
+                assert_eq!(
+                    CeSummary {
+                        top,
+                        runner_up,
+                        median
+                    }
+                    .label_with(&CeBands::SHIPPED),
+                    want
+                );
+            }
+        }
+        for sp in -40..=240 {
+            let median = -0.5f32;
+            let top = median + sp as f32 * 0.05;
+            assert_eq!(
+                ce_relevance_label(top, None, median),
+                pre_stopgap_label(top, None, median)
+            );
+        }
+    }
+
+    #[test]
+    fn ce_bands_apply_only_to_the_listed_onnx() {
+        let tuned = CeBands {
+            gap_high: 9.0,
+            ..CeBands::SHIPPED
+        };
+        let table = [("abc123", tuned)];
+        // Not listed, in any case: shipped.
+        assert_eq!(CeBands::lookup("def456", &table), CeBands::SHIPPED);
+        assert_eq!(CeBands::lookup("", &table), CeBands::SHIPPED);
+        assert_eq!(CeBands::lookup("ABC123", &table), tuned);
+
+        // A model directory is keyed on the hash of its ONNX file.
+        let dir = tempfile::tempdir().unwrap();
+        // No ONNX file at all.
+        assert_eq!(
+            CeBands::for_model_dir_in(dir.path(), &table),
+            CeBands::SHIPPED
+        );
+        // A missing directory.
+        assert_eq!(
+            CeBands::for_model_dir_in(&dir.path().join("nope"), &table),
+            CeBands::SHIPPED
+        );
+        // An ONNX file whose hash is not listed.
+        std::fs::write(dir.path().join(CE_ONNX_FILE), b"some other reranker").unwrap();
+        assert_eq!(
+            CeBands::for_model_dir_in(dir.path(), &table),
+            CeBands::SHIPPED
+        );
+        // The listed hash: sha256("tuned bytes").
+        std::fs::write(dir.path().join(CE_ONNX_FILE), b"tuned bytes").unwrap();
+        let sha = file_sha256(&dir.path().join(CE_ONNX_FILE)).unwrap();
+        assert_eq!(sha.len(), 64);
+        let listed = [(sha.as_str(), tuned)];
+        assert_eq!(CeBands::for_model_dir_in(dir.path(), &listed), tuned);
+        // The same bytes under a table that lists some other hash.
+        assert_eq!(
+            CeBands::for_model_dir_in(dir.path(), &table),
+            CeBands::SHIPPED
+        );
+        // A directory the shipped reranker would be read from is never listed.
+        assert!(CE_TUNED_BANDS
+            .iter()
+            .all(|(sha, _)| *sha
+                != "92cdd69ba25685f50b13663f83724d6e8cc77344bb7c0441a26a428564b1c2f6"));
+        // With the default table, an unlisted ONNX stays on SHIPPED.
+        assert_eq!(CeBands::for_model_dir(dir.path()), CeBands::SHIPPED);
+    }
+
+    #[test]
+    fn ce_file_sha256_is_the_sha256_of_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            file_sha256(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(file_sha256(&dir.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn ce_tuned_run2_entry_holds_the_quantile_matched_bands() {
+        // Fit: 281 shipped-model recalls vs 280 tuned-run2 recalls of the 310
+        // audit queries; each constant moved to the tuned value at the
+        // percentile the shipped constant sits at.
+        assert_eq!(CE_TUNED_BANDS.len(), 1);
+        let (sha, bands) = CE_TUNED_BANDS[0];
+        assert_eq!(sha, TUNED_RUN2_SHA);
+        assert_eq!(bands.gap_high, 2.52);
+        assert_eq!(bands.gap_good, 1.72);
+        assert_eq!(bands.gap_tie, 0.145);
+        assert_eq!(bands.spread_high, 5.34);
+        assert_eq!(bands.spread_good, 4.32);
+        assert_eq!(bands.spread_partial, 2.86);
+        assert_eq!(CeBands::lookup(TUNED_RUN2_SHA, CE_TUNED_BANDS), bands);
+    }
+
+    #[test]
+    fn ce_tuned_bands_stop_the_label_inflation_of_the_shipped_bands() {
+        // Rank-1 summaries on the tuned model's logit scale (wider gaps and
+        // spreads): (top, runner-up, median, shipped label, tuned label).
+        let tuned = CeBands::lookup(TUNED_RUN2_SHA, CE_TUNED_BANDS);
+        let rows = [
+            (6.0, Some(3.0), 0.0, "high", "high"),
+            (5.0, Some(3.0), 0.0, "high", "good"),
+            (3.0, Some(2.0), 0.0, "good", "partial"),
+            (2.0, Some(1.9), 0.0, "partial", "weak"),
+            (4.0, None, 0.0, "good", "partial"),
+        ];
+        for (top, runner_up, median, shipped_label, tuned_label) in rows {
+            let summary = CeSummary {
+                top,
+                runner_up,
+                median,
+            };
+            assert_eq!(
+                summary.label_with(&CeBands::SHIPPED),
+                shipped_label,
+                "{summary:?}"
+            );
+            assert_eq!(summary.label_with(&tuned), tuned_label, "{summary:?}");
+        }
     }
 
     #[test]
