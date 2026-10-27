@@ -1,3 +1,4 @@
+pub mod assertions_partition;
 pub mod code_rank;
 pub mod cross_encoder;
 pub mod cross_project;

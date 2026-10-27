@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
 use crate::format::{self, DisplayRankScore, EnrichedResult};
+use crate::search::assertions_partition;
 use crate::search::cross_encoder::{self, RetrievalPolicy, CE_POOL};
 use crate::search::cross_project;
 use crate::search::decay;
@@ -2947,6 +2948,33 @@ async fn reflect_gather_pass(
                     )
                 })
                 .collect();
+            // S8: superseded units leave every fused channel before session
+            // collapse, so session max and the cross-encoder pool never see
+            // them. They trail the page once per session, after the cross-encoder.
+            let sunk = run_assertions_stage(
+                storage,
+                &mut enriched,
+                &session_keys,
+                &signals.validity,
+                assertions_enabled(),
+            );
+            let fused_before_partition: Vec<String> = if sunk.is_empty() {
+                Vec::new()
+            } else {
+                crate::search::hybrid::fuse_rrf_weighted(
+                    &[
+                        (&semantic_order, 1.0),
+                        (&fts_order, 1.0),
+                        (&postings_order, postings_weight),
+                        (&episode_order, episode_weight),
+                    ],
+                    RRF_K,
+                )
+            };
+            let semantic_order = assertions_partition::without_sunk(&semantic_order, &sunk);
+            let fts_order = assertions_partition::without_sunk(&fts_order, &sunk);
+            let postings_order = assertions_partition::without_sunk(&postings_order, &sunk);
+            let episode_order = assertions_partition::without_sunk(&episode_order, &sunk);
             let mut collapsed = collapse_to_sessions_by(
                 &[
                     (&semantic_order, 1.0),
@@ -3025,6 +3053,13 @@ async fn reflect_gather_pass(
             } else {
                 collapsed
             };
+            let collapsed =
+                assertions_partition::trail_sunk(collapsed, &fused_before_partition, &sunk, |id| {
+                    session_keys
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| id.to_string())
+                });
             let represented: HashSet<String> = collapsed
                 .iter()
                 .filter_map(|id| session_keys.get(id).cloned())
@@ -3032,8 +3067,30 @@ async fn reflect_gather_pass(
             collapsed_sessions = Some((represented, session_keys));
             collapsed
         }
-        SearchMode::Vector => order,
-        SearchMode::Fts => fts_order,
+        SearchMode::Vector => {
+            let enabled = assertions_enabled();
+            let session_keys = assertions_session_keys(storage, &enriched, enabled);
+            let sunk = run_assertions_stage(
+                storage,
+                &mut enriched,
+                &session_keys,
+                &signals.validity,
+                enabled,
+            );
+            assertions_partition::sunk_to_tail(order, &sunk)
+        }
+        SearchMode::Fts => {
+            let enabled = assertions_enabled();
+            let session_keys = assertions_session_keys(storage, &enriched, enabled);
+            let sunk = run_assertions_stage(
+                storage,
+                &mut enriched,
+                &session_keys,
+                &signals.validity,
+                enabled,
+            );
+            assertions_partition::sunk_to_tail(fts_order, &sunk)
+        }
     };
     // Exact-prefix reflections win the keyword channel outright (see where
     // `reflection_prefix_ids` is built) — but RRF alone does not reliably
@@ -5764,6 +5821,167 @@ fn apply_validity_partition(
     }
     kept.extend(demoted);
     *enriched = kept;
+}
+
+/// Kill switch: `CSR_NO_ASSERTIONS=1` skips the S8 assertions stage. A thin
+/// wrapper around the process env; the stage itself takes the outcome as a
+/// parameter so tests never mutate the environment.
+fn assertions_enabled() -> bool {
+    assertions_partition::assertions_enabled_from(
+        std::env::var("CSR_NO_ASSERTIONS").ok().as_deref(),
+    )
+}
+
+/// How long the user-decision claim rules are reused before a re-read.
+const CLAIM_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct ClaimCache {
+    store: usize,
+    read_at: Instant,
+    claims: Arc<Vec<crate::storage::assertions::ClaimAssertion>>,
+}
+
+static CLAIM_CACHE: std::sync::Mutex<Option<ClaimCache>> = std::sync::Mutex::new(None);
+
+/// The claim rules, read once per store per [`CLAIM_CACHE_TTL`]. Fails open: a
+/// read error is an empty rule set and is not cached.
+fn cached_claims(storage: &Storage) -> Arc<Vec<crate::storage::assertions::ClaimAssertion>> {
+    let store = storage as *const Storage as usize;
+    if let Ok(guard) = CLAIM_CACHE.lock() {
+        if let Some(cache) = guard.as_ref() {
+            if cache.store == store && cache.read_at.elapsed() < CLAIM_CACHE_TTL {
+                return cache.claims.clone();
+            }
+        }
+    }
+    let Ok(claims) = storage.claim_assertions() else {
+        return Arc::new(Vec::new());
+    };
+    let claims = Arc::new(claims);
+    if let Ok(mut guard) = CLAIM_CACHE.lock() {
+        *guard = Some(ClaimCache {
+            store,
+            read_at: Instant::now(),
+            claims: claims.clone(),
+        });
+    }
+    claims
+}
+
+/// Session key of every candidate row, for the modes that do not build one.
+/// Empty when the stage is off, so the off path does no provenance reads.
+fn assertions_session_keys(
+    storage: &Storage,
+    enriched: &[EnrichedResult],
+    enabled: bool,
+) -> HashMap<String, String> {
+    if !enabled {
+        return HashMap::new();
+    }
+    enriched
+        .iter()
+        .map(|e| (e.chunk.id.clone(), session_key_of(storage, &e.chunk)))
+        .collect()
+}
+
+/// Merge the partition's receipt notes into `resolution` with the same
+/// `existing; note` join `apply_validity_partition` uses. A witness-source
+/// note is skipped for a chunk that already carries a `[stale anchor]` or
+/// `[evolved]` validity note: that is the same witness verdict, said twice.
+fn merge_assertion_notes(
+    enriched: &mut [EnrichedResult],
+    outcome: &assertions_partition::PartitionOutcome,
+    by_target: &HashMap<String, crate::storage::assertions::Assertion>,
+    validity: &HashMap<String, ConvValidity>,
+) {
+    for e in enriched.iter_mut() {
+        let Some(note) = outcome.notes.get(&e.chunk.id) else {
+            continue;
+        };
+        let witness_said = by_target.get(&e.chunk.id).is_some_and(|a| {
+            a.source == "witness"
+                && *note
+                    == assertions_partition::note_for(&a.source, &a.state, &a.source, &a.receipt)
+        });
+        let validity_said = validity
+            .get(&e.chunk.id)
+            .is_some_and(|v| v.note.contains("[stale anchor]") || v.note.contains("[evolved]"));
+        if witness_said && validity_said {
+            continue;
+        }
+        e.resolution = Some(match e.resolution.take() {
+            Some(existing) => format!("{existing}; {note}"),
+            None => note.clone(),
+        });
+    }
+}
+
+/// S8 stage over the candidate rows (chunks and episodes): one batched
+/// assertion read, claim matching over the candidate texts, receipt notes
+/// merged into the rows. Returns the ids that must leave every ranking. Fails
+/// open: a read error or a missing table is no partition and no note.
+fn run_assertions_stage(
+    storage: &Storage,
+    enriched: &mut [EnrichedResult],
+    session_keys: &HashMap<String, String>,
+    validity: &HashMap<String, ConvValidity>,
+    enabled: bool,
+) -> HashSet<String> {
+    if !enabled || enriched.is_empty() {
+        return HashSet::new();
+    }
+    let claims = cached_claims(storage);
+    run_assertions_stage_with(storage, &claims, enriched, session_keys, validity)
+}
+
+/// [`run_assertions_stage`] with the claim rules passed in.
+fn run_assertions_stage_with(
+    storage: &Storage,
+    claims: &[crate::storage::assertions::ClaimAssertion],
+    enriched: &mut [EnrichedResult],
+    session_keys: &HashMap<String, String>,
+    validity: &HashMap<String, ConvValidity>,
+) -> HashSet<String> {
+    let (outcome, by_target) = {
+        let units: Vec<assertions_partition::Unit<'_>> = enriched
+            .iter()
+            .map(|e| assertions_partition::Unit {
+                id: &e.chunk.id,
+                session: session_keys
+                    .get(&e.chunk.id)
+                    .map(String::as_str)
+                    .unwrap_or(&e.chunk.id),
+                text: &e.chunk.content,
+            })
+            .collect();
+        let chunk_ids: Vec<&str> = units.iter().map(|u| u.id).collect();
+        let mut seen = HashSet::new();
+        let session_ids: Vec<&str> = units
+            .iter()
+            .map(|u| u.session)
+            .filter(|s| seen.insert(*s))
+            .collect();
+        let by_target = storage
+            .assertions_for_targets(&chunk_ids, &session_ids)
+            .unwrap_or_default();
+        if by_target.is_empty() && claims.is_empty() {
+            return HashSet::new();
+        }
+        (
+            assertions_partition::partition(&units, &by_target, claims),
+            by_target,
+        )
+    };
+    merge_assertion_notes(enriched, &outcome, &by_target, validity);
+    if !outcome.sunk.is_empty() && crate::mcp::stage_probe::is_active() {
+        let ranked: Vec<(String, String, f32)> = enriched
+            .iter()
+            .filter(|e| outcome.sunk.contains(&e.chunk.id))
+            .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone(), e.score))
+            .collect();
+        crate::mcp::stage_probe::record_stage("assertions_partition", &ranked);
+    }
+    outcome.sunk
 }
 
 /// Label every result with its cached row-level floor. One indexed batch read
@@ -13112,6 +13330,240 @@ mod tests {
 
     fn row(id: &str, session: &str, class: u8, score: f32) -> (String, String, u8, f32) {
         (id.into(), session.into(), class, score)
+    }
+
+    // ---- S8: assertions partition, tools-level --------------------------------
+
+    fn assertion_decision() -> crate::storage::assertions::UserDecision {
+        crate::storage::assertions::UserDecision {
+            key: "merge-mode".into(),
+            subject_terms: vec!["admin".into(), "merge".into()],
+            superseded_phrases: vec!["carrier branch".into()],
+            current_phrases: vec!["--squash works".into()],
+            current_claim: "ANSWER-TEXT-THAT-MUST-NOT-APPEAR".into(),
+            decided_at: "2026-08-09".into(),
+            receipt: "rcpt-decision".into(),
+        }
+    }
+
+    fn assertion_row(id: &str, conv: &str, content: &str) -> EnrichedResult {
+        let mut row = enriched_result_conv(id, conv, 0.5, 0);
+        row.chunk.content = content.into();
+        row
+    }
+
+    /// The Hybrid arm's partition steps around the collapse, without the
+    /// cross-encoder: filter the lists, collapse, trail the sunk sessions.
+    fn collapse_with_partition(
+        lists: &[&[&str]; 2],
+        sunk: &HashSet<String>,
+        session_keys: &HashMap<String, String>,
+    ) -> Vec<String> {
+        let semantic = ids(lists[0]);
+        let fts = ids(lists[1]);
+        let fused =
+            crate::search::hybrid::fuse_rrf_weighted(&[(&semantic, 1.0), (&fts, 1.0)], RRF_K);
+        let semantic = assertions_partition::without_sunk(&semantic, sunk);
+        let fts = assertions_partition::without_sunk(&fts, sunk);
+        let session_of = |id: &str| {
+            session_keys
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| id.to_string())
+        };
+        let collapsed =
+            collapse_to_sessions_by(&[(&semantic, 1.0), (&fts, 1.0)], session_of, |_| 0, RRF_K);
+        assertions_partition::trail_sunk(collapsed, &fused, sunk, session_of)
+    }
+
+    #[test]
+    fn superseded_best_chunk_loses_the_session_slot_and_a_sunk_session_trails() {
+        // sA: a1 (best, superseded) and a2. sB: b1. sC: c1, c2 (both superseded).
+        let session_keys = keys(&[
+            ("a1", "sA"),
+            ("a2", "sA"),
+            ("b1", "sB"),
+            ("c1", "sC"),
+            ("c2", "sC"),
+        ]);
+        let lists: [&[&str]; 2] = [&["c1", "a1", "c2", "b1", "a2"], &["a1", "c1", "b1"]];
+        let none = HashSet::new();
+        let before = collapse_with_partition(&lists, &none, &session_keys);
+        // Unpartitioned, a1 holds sA's slot and sA's other chunk is not shown.
+        assert!(before.contains(&"a1".to_string()), "{before:?}");
+        assert!(!before.contains(&"a2".to_string()), "{before:?}");
+        let sunk: HashSet<String> = ["a1", "c1", "c2"].iter().map(|s| s.to_string()).collect();
+        let after = collapse_with_partition(&lists, &sunk, &session_keys);
+        // sB (b1) and sA (now its next chunk, a2) lead; sC trails alone.
+        assert_eq!(after, ids(&["b1", "a2", "c1"]));
+    }
+
+    #[test]
+    fn nothing_sunk_leaves_the_collapse_untouched() {
+        let session_keys = keys(&[("a1", "sA"), ("a2", "sA"), ("b1", "sB")]);
+        let lists: [&[&str]; 2] = [&["a1", "b1", "a2"], &["b1", "a1"]];
+        let semantic = ids(lists[0]);
+        let fts = ids(lists[1]);
+        let direct = collapse_to_sessions_by(
+            &[(&semantic, 1.0), (&fts, 1.0)],
+            |id| {
+                session_keys
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| id.to_string())
+            },
+            |_| 0,
+            RRF_K,
+        );
+        let staged = collapse_with_partition(&lists, &HashSet::new(), &session_keys);
+        assert_eq!(staged, direct);
+    }
+
+    #[test]
+    fn assertion_stage_sinks_a_claim_match_and_notes_it_without_claim_text() {
+        let storage = Storage::open_memory().unwrap();
+        storage.rebuild_assertions(&[assertion_decision()]).unwrap();
+        let claims = storage.claim_assertions().unwrap();
+        assert_eq!(claims.len(), 1);
+        let mut rows = vec![
+            assertion_row("old", "convA", "merge needs a carrier branch for admin"),
+            assertion_row("new", "convB", "admin merge: --squash works for admin"),
+            assertion_row("other", "convC", "unrelated"),
+        ];
+        rows[2].resolution = Some("existing note".into());
+        let session_keys = keys(&[("old", "convA"), ("new", "convB"), ("other", "convC")]);
+        let sunk =
+            run_assertions_stage_with(&storage, &claims, &mut rows, &session_keys, &HashMap::new());
+        assert_eq!(sunk, HashSet::from(["old".to_string()]));
+        let note = rows[0].resolution.as_deref().unwrap();
+        assert_eq!(note, "[superseded] merge-mode (receipt rcpt-decision)");
+        assert!(!note.contains("ANSWER-TEXT"), "{note}");
+        assert!(rows[1].resolution.is_none());
+        assert_eq!(rows[2].resolution.as_deref(), Some("existing note"));
+    }
+
+    #[test]
+    fn assertion_notes_join_existing_and_skip_a_repeated_witness_verdict() {
+        use crate::storage::assertions::Assertion;
+        let witness = Assertion {
+            source: "witness".into(),
+            target_kind: "chunk".into(),
+            target_id: "w".into(),
+            state: "superseded".into(),
+            claim: None,
+            receipt: "abc1234".into(),
+        };
+        let resolve = Assertion {
+            source: "csr_resolve".into(),
+            target_id: "r".into(),
+            receipt: "fixed".into(),
+            ..witness.clone()
+        };
+        let by_target: HashMap<String, Assertion> =
+            [("w".to_string(), witness), ("r".to_string(), resolve)]
+                .into_iter()
+                .collect();
+        let units_rows = || {
+            vec![
+                assertion_row("w", "cw", "text"),
+                assertion_row("r", "cr", "text"),
+            ]
+        };
+        let rows0 = units_rows();
+        let units: Vec<assertions_partition::Unit<'_>> = rows0
+            .iter()
+            .map(|e| assertions_partition::Unit {
+                id: &e.chunk.id,
+                session: &e.chunk.conversation_id,
+                text: &e.chunk.content,
+            })
+            .collect();
+        let outcome = assertions_partition::partition(&units, &by_target, &[]);
+        // The chunk "w" already has the dream's stale-anchor note; "r" has an older note.
+        let validity: HashMap<String, ConvValidity> = [(
+            "w".to_string(),
+            demote_validity("[stale anchor] foo no longer in current code (receipt abc1234)"),
+        )]
+        .into_iter()
+        .collect();
+        let mut rows = units_rows();
+        rows[1].resolution = Some("older".into());
+        merge_assertion_notes(&mut rows, &outcome, &by_target, &validity);
+        assert!(rows[0].resolution.is_none(), "{:?}", rows[0].resolution);
+        assert_eq!(
+            rows[1].resolution.as_deref(),
+            Some("older; [superseded] csr_resolve (receipt fixed)")
+        );
+        // Without the validity note the witness row is annotated.
+        let mut rows = units_rows();
+        merge_assertion_notes(&mut rows, &outcome, &by_target, &HashMap::new());
+        assert_eq!(
+            rows[0].resolution.as_deref(),
+            Some("[superseded] witness (receipt abc1234)")
+        );
+    }
+
+    #[test]
+    fn kill_switch_matches_a_store_with_no_assertions_table() {
+        let with_rules = Storage::open_memory().unwrap();
+        with_rules
+            .rebuild_assertions(&[assertion_decision()])
+            .unwrap();
+        let claims = with_rules.claim_assertions().unwrap();
+        let without_table = Storage::open_memory().unwrap();
+        without_table
+            .with_connection(|conn| Ok(conn.execute_batch("DROP TABLE assertions")?))
+            .unwrap();
+        assert!(without_table.claim_assertions().unwrap().is_empty());
+        assert!(without_table
+            .assertions_for_targets(&["old"], &["convA"])
+            .unwrap()
+            .is_empty());
+
+        let make = || {
+            vec![assertion_row(
+                "old",
+                "convA",
+                "merge needs a carrier branch for admin",
+            )]
+        };
+        let session_keys = keys(&[("old", "convA")]);
+
+        // Switch off: the stage is skipped, whatever the store holds.
+        assert!(!assertions_partition::assertions_enabled_from(Some("1")));
+        let mut off = make();
+        let sunk_off =
+            run_assertions_stage(&with_rules, &mut off, &session_keys, &HashMap::new(), false);
+        // No table, switch on: nothing sinks, nothing is noted.
+        let mut bare = make();
+        let sunk_bare = run_assertions_stage_with(
+            &without_table,
+            &[],
+            &mut bare,
+            &session_keys,
+            &HashMap::new(),
+        );
+        assert!(sunk_off.is_empty() && sunk_bare.is_empty());
+        assert_eq!(off[0].resolution, bare[0].resolution);
+        assert!(off[0].resolution.is_none());
+        // The same rows with the switch on and rules present do sink.
+        let mut on = make();
+        let sunk_on = run_assertions_stage_with(
+            &with_rules,
+            &claims,
+            &mut on,
+            &session_keys,
+            &HashMap::new(),
+        );
+        assert_eq!(sunk_on.len(), 1);
+        assert!(on[0].resolution.is_some());
+        // Switch off leaves the lists as they were.
+        let order = ids(&["old", "x"]);
+        assert_eq!(
+            assertions_partition::sunk_to_tail(order.clone(), &sunk_off),
+            order
+        );
+        assert_eq!(assertions_partition::without_sunk(&order, &sunk_off), order);
     }
 
     #[test]
