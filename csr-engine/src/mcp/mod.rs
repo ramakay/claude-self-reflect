@@ -45,6 +45,19 @@ pub struct StoreReflectionParams {
     pub tags: Option<Vec<String>>,
 }
 
+/// Arguments of `csr_hook_prompt`, the transport-measurement tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct HookPromptParams {
+    /// The prompt text, as UserPromptSubmit would carry it
+    pub prompt: String,
+    /// The session the prompt belongs to
+    pub session_id: String,
+    /// The prompt's `prompt_id`, when the host sent one
+    pub prompt_id: Option<String>,
+    /// Absolute working directory of the session
+    pub cwd: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QuickCheckParams {
     /// The search query to find semantically similar conversations
@@ -1027,7 +1040,82 @@ fn tool_result(result: anyhow::Result<String>) -> Result<CallToolResult, rmcp::E
     }
 }
 
+/// The environment switch that lists and enables `csr_hook_prompt`.
+pub const HOOK_TOOL_ENV: &str = "CSR_MCP_HOOK_TOOL";
+
+/// Whether `CSR_MCP_HOOK_TOOL=1` is set.
+pub fn hook_tool_enabled() -> bool {
+    hook_tool_on(std::env::var(HOOK_TOOL_ENV).ok().as_deref())
+}
+
+/// The switch's value rule: only `1` turns the tool on.
+fn hook_tool_on(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// The tool a measurement run uses to time the `mcp_tool` hook transport. It
+/// lives in a router of its own so the default router, and every count taken
+/// from it, never sees it; [`CsrServer::active_tool_router`] adds it only when
+/// the environment switch is on.
+#[tool_router(router = hook_tool_router)]
 impl CsrServer {
+    #[tool(
+        name = "csr_hook_prompt",
+        description = "Measurement only (CSR_MCP_HOOK_TOOL=1): render the UserPromptSubmit injection for a prompt through the same pipeline the daemon's hook socket runs, and return its text. Records no exposure and no retrieval.",
+        annotations(
+            title = "Hook Prompt Render",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn hook_prompt(
+        &self,
+        params: Parameters<HookPromptParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+        if !std::path::Path::new(&p.cwd).is_absolute() {
+            return Err(rmcp::ErrorData::invalid_params(
+                "cwd must be an absolute path",
+                None,
+            ));
+        }
+        let text = tools::hook_prompt(
+            &self.storage,
+            &self.embeddings,
+            &self.search,
+            &self.projects_dir,
+            &self.index_dir,
+            &p.prompt,
+            &p.session_id,
+            p.prompt_id.as_deref(),
+            &p.cwd,
+        )
+        .await;
+        tool_result(text)
+    }
+}
+
+impl CsrServer {
+    /// The router the server answers with. With `with_hook_tool` false it is
+    /// the default router, byte for byte; with it true it also carries
+    /// `csr_hook_prompt`. Taking the switch as an argument keeps tests off the
+    /// process environment.
+    pub fn router_with(
+        with_hook_tool: bool,
+    ) -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+        let mut router = Self::tool_router();
+        if with_hook_tool {
+            router += Self::hook_tool_router();
+        }
+        router
+    }
+
+    /// [`Self::router_with`] for the current environment.
+    fn active_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+        Self::router_with(hook_tool_enabled())
+    }
+
     /// Serve MCP over a byte-stream pair: stdio in production, an in-process
     /// duplex in tests. The [`opener_guard::LegacyOpenerGuard`] in front of
     /// rmcp's handshake keeps a `server/discover` probe for a protocol this
@@ -1113,7 +1201,7 @@ impl ServerHandler for CsrServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
         Ok(ListToolsResult::with_all_items(
-            Self::tool_router().list_all(),
+            Self::active_tool_router().list_all(),
         ))
     }
 
@@ -1147,7 +1235,7 @@ impl ServerHandler for CsrServer {
             let task = self.task_manager.spawn(task_options, move |task_context| {
                 Box::pin(async move {
                     let tool_call = ToolCallContext::new(&server, request, context);
-                    let tool_router = CsrServer::tool_router();
+                    let tool_router = CsrServer::active_tool_router();
                     tokio::select! {
                         _ = task_context.cancelled() => Err(TaskExit::Cancelled),
                         result = tool_router.call(tool_call) => match result {
@@ -1167,7 +1255,7 @@ impl ServerHandler for CsrServer {
         }
 
         let tool_call = ToolCallContext::new(self, request, context);
-        let response = Self::tool_router().call(tool_call).await?;
+        let response = Self::active_tool_router().call(tool_call).await?;
         Ok(match response {
             CallToolResponse::Complete(result) => CallToolResponse::Complete(
                 crate::binary_identity::append_binary_replaced_notice(result, binary_notice),
@@ -1451,6 +1539,85 @@ mod tests {
         let names = CsrServer::tool_names();
         assert_eq!(names.len(), CsrServer::tool_count());
         assert!(names.iter().any(|n| n == "csr_transcript"));
+    }
+
+    /// The default tool list is exactly what it was before the measurement
+    /// tool existed (16 on this branch: the 15 documented plus `csr_transcript`);
+    /// `CSR_MCP_HOOK_TOOL=1` adds `csr_hook_prompt` and nothing else.
+    #[test]
+    fn tools_list_is_unchanged_by_default_and_gains_only_csr_hook_prompt_with_the_env_var() {
+        const DEFAULT_TOOLS: usize = 16;
+        let default = CsrServer::router_with(false).list_all();
+        let measuring = CsrServer::router_with(true).list_all();
+        assert_eq!(default.len(), DEFAULT_TOOLS);
+        assert_eq!(CsrServer::tool_count(), DEFAULT_TOOLS);
+        assert_eq!(measuring.len(), DEFAULT_TOOLS + 1);
+        assert!(!CsrServer::tool_names()
+            .iter()
+            .any(|n| n == "csr_hook_prompt"));
+        assert!(!default.iter().any(|t| t.name == "csr_hook_prompt"));
+        let added: Vec<_> = measuring
+            .iter()
+            .filter(|t| !default.iter().any(|d| d.name == t.name))
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(added, ["csr_hook_prompt"]);
+        assert!(CsrServer::router_with(true).has_route("csr_hook_prompt"));
+        assert!(!CsrServer::router_with(false).has_route("csr_hook_prompt"));
+    }
+
+    #[test]
+    fn the_hook_tool_switch_reads_only_the_value_one() {
+        assert!(hook_tool_on(Some("1")));
+        for off in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+            assert!(!hook_tool_on(off), "{off:?}");
+        }
+        assert_eq!(HOOK_TOOL_ENV, "CSR_MCP_HOOK_TOOL");
+    }
+
+    #[tokio::test]
+    async fn hook_prompt_renders_through_the_hook_pipeline_and_a_slash_prompt_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::disabled());
+        let search = Arc::new(RwLock::new(SearchEngine::new(16)));
+        let text = tools::hook_prompt(
+            &storage,
+            &embeddings,
+            &search,
+            dir.path(),
+            &dir.path().join("index-v3"),
+            "/compact",
+            "sess",
+            Some("p1"),
+            &dir.path().to_string_lossy(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "");
+        let exposed: i64 = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM rerank_exposure_impressions",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(exposed, 0);
+    }
+
+    #[test]
+    fn hook_prompt_params_take_a_prompt_session_prompt_id_and_cwd() {
+        let json = r#"{"prompt":"why?","session_id":"s","prompt_id":"p1","cwd":"/tmp/x"}"#;
+        let params: HookPromptParams = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            (params.prompt.as_str(), params.prompt_id.as_deref()),
+            ("why?", Some("p1"))
+        );
+        let no_id: HookPromptParams =
+            serde_json::from_str(r#"{"prompt":"why?","session_id":"s","cwd":"/tmp/x"}"#).unwrap();
+        assert!(no_id.prompt_id.is_none());
     }
 
     #[test]

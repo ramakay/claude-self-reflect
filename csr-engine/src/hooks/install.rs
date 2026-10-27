@@ -88,6 +88,9 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
             "PreCompact": [{
                 "hooks": [{"type": "command", "command": format!("{} hook precompact", binary_path)}]
             }],
+            "PostCompact": [{
+                "hooks": [{"type": "command", "command": format!("{} hook post-compact", binary_path)}]
+            }],
             "Stop": [{
                 "hooks": [{"type": "command", "command": format!("{} hook stop", binary_path)}]
             }],
@@ -588,6 +591,48 @@ mod tests {
             post_tool_use[0]["matcher"].as_str().unwrap(),
             "Edit|Write|MultiEdit|NotebookEdit|Bash"
         );
+    }
+
+    #[test]
+    fn test_install_registers_post_compact_and_reinstall_does_not_duplicate_it() {
+        let config = generate_hook_config("/usr/local/bin/csr-engine");
+        let post_compact = config["hooks"]["PostCompact"].as_array().unwrap();
+        assert_eq!(post_compact.len(), 1);
+        assert_eq!(
+            post_compact[0]["hooks"][0]["type"].as_str().unwrap(),
+            "command"
+        );
+        assert_eq!(
+            post_compact[0]["hooks"][0]["command"].as_str().unwrap(),
+            "/usr/local/bin/csr-engine hook post-compact"
+        );
+
+        let user = serde_json::json!({
+            "hooks": [{"type": "command", "command": "/Users/me/bin/after-compact.sh"}]
+        });
+        let mut settings = serde_json::json!({"hooks": {"PostCompact": [user.clone()]}});
+        for _ in 0..3 {
+            merge_hook_config(&mut settings, &config).unwrap();
+        }
+        let entries = settings["hooks"]["PostCompact"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "the user's hook plus exactly one CSR entry"
+        );
+        assert_eq!(entries[0], user, "the user's hook survives");
+        assert_eq!(
+            entries.iter().filter(|entry| is_csr_entry(entry)).count(),
+            1
+        );
+        // The existing hooks are still registered once each.
+        for event in ["PreCompact", "Stop", "UserPromptSubmit", "SessionEnd"] {
+            assert_eq!(
+                settings["hooks"][event].as_array().unwrap().len(),
+                1,
+                "{event}"
+            );
+        }
     }
 
     /// A settings.json written by an earlier release carries the old PostToolUse

@@ -1024,6 +1024,42 @@ async fn reflect_on_past_with_vec_intent(
     .await
 }
 
+/// Render the UserPromptSubmit injection for one prompt through the pipeline
+/// the daemon's hook socket runs (`prompt_submit`), for `csr_hook_prompt`.
+///
+/// The text is the same; the side effects are not. Exposure rows, retrieval
+/// events and dream claims are dropped uncommitted, as for a reply the hook
+/// never acknowledged, so timing 50 prompts through the `mcp_tool` transport
+/// teaches the reranker nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn hook_prompt(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    projects_dir: &Path,
+    index_dir: &Path,
+    prompt: &str,
+    session_id: &str,
+    prompt_id: Option<&str>,
+    cwd: &str,
+) -> Result<String> {
+    let engine = crate::engine::Engine::from_parts_with_index_dir(
+        storage.clone(),
+        embeddings.clone(),
+        search.clone(),
+        projects_dir.to_path_buf(),
+        index_dir.to_path_buf(),
+    );
+    let input = crate::hooks::HookInput {
+        prompt: Some(prompt.to_string()),
+        session_id: Some(session_id.to_string()),
+        prompt_id: prompt_id.map(str::to_string),
+        cwd: Some(cwd.to_string()),
+        ..Default::default()
+    };
+    crate::hooks::prompt_submit::render_uncommitted(&input, &engine, Path::new(cwd)).await
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 async fn reflect_on_past_with_vec(

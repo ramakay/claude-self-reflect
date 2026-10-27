@@ -18,9 +18,12 @@ use crate::engine::Engine;
 /// Connect plus reply over the daemon socket. Also the daemon's own deadline
 /// for a request: an answer later than this is one nobody is waiting for.
 pub const SOCKET_BUDGET: Duration = Duration::from_millis(250);
-/// Whole-process wall, measured from `main`, within which the in-process
-/// fallback answers when the socket is refused or missing.
-pub const FALLBACK_BUDGET: Duration = Duration::from_millis(300);
+/// Deadline, measured from `main`, within which the in-process fallback
+/// answers when the socket is refused or missing. The process wall adds the
+/// exec and dynamic-link time before `main` (about 18 ms measured) and the
+/// stdout flush after it, so 255 ms here keeps the whole hook at or under
+/// 300 ms where 300 ms measured p95 318.5 ms.
+pub const FALLBACK_BUDGET: Duration = Duration::from_millis(255);
 /// Hard stop for the hook process. Nothing, stdin included, outlives it.
 pub const PROCESS_BUDGET: Duration = Duration::from_millis(500);
 /// What the fallback leaves unspent of [`PROCESS_BUDGET`] after a stalled
@@ -146,7 +149,10 @@ pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
     let mut input = super::read_stdin_json();
     let stdin_elapsed = stdin_started.elapsed();
     if matches!(
-        super::prompt_submit::early_exit(input.prompt.as_deref().unwrap_or_default()),
+        super::prompt_submit::early_exit_for(
+            input.source.as_deref(),
+            input.prompt.as_deref().unwrap_or_default()
+        ),
         Some(super::prompt_submit::EarlyExit::Silent)
     ) {
         return;
@@ -647,11 +653,12 @@ fn spawn(
                                 return None;
                             }
                             let prepared =
-                                runtime.block_on(super::prompt_submit::prepare_with_receipts(
+                                runtime.block_on(super::prompt_submit::prepare_with_receipts_mode(
                                     &request.input,
                                     &engine,
                                     &cwd,
                                     receipts,
+                                    read_only,
                                 ));
                             let prepared = prepared.ok()?;
                             if tokio::time::Instant::now() >= deadline {

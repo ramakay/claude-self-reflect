@@ -155,6 +155,13 @@ pub async fn render(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<St
     Ok(prepare(input, engine, cwd).await?.delivered())
 }
 
+/// The injection text [`render`] would produce, with nothing committed: no
+/// exposure row, no retrieval event, and any dream claim released. The
+/// measurement tool `csr_hook_prompt` times the render through this.
+pub async fn render_uncommitted(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<String> {
+    Ok(prepare(input, engine, cwd).await?.text)
+}
+
 pub(super) struct PreparedPrompt {
     pub text: String,
     effects: PendingEffects,
@@ -200,6 +207,19 @@ pub(super) async fn prepare_with_receipts(
     cwd: &Path,
     receipts: std::sync::Arc<crate::storage::Storage>,
 ) -> Result<PreparedPrompt> {
+    prepare_with_receipts_mode(input, engine, cwd, receipts, false).await
+}
+
+/// [`prepare_with_receipts`] for a `query_only` serve-only daemon when
+/// `serve_only` is set: the prompt-keyed exposure impression is the one write
+/// the delivered answer may make (see `exposure::record_impression_serve_only`).
+pub(super) async fn prepare_with_receipts_mode(
+    input: &HookInput,
+    engine: &Engine,
+    cwd: &Path,
+    receipts: std::sync::Arc<crate::storage::Storage>,
+    serve_only: bool,
+) -> Result<PreparedPrompt> {
     let mut prepared = PreparedPrompt {
         text: String::new(),
         effects: PendingEffects {
@@ -208,6 +228,13 @@ pub(super) async fn prepare_with_receipts(
             impressions: Vec::new(),
             retrievals: Vec::new(),
             dream_claims: Vec::new(),
+            prompt_id: input
+                .prompt_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
+            serve_only,
         },
     };
     handle_inner(
@@ -241,6 +268,12 @@ struct PendingEffects {
     impressions: Vec<PendingImpression>,
     retrievals: Vec<(String, String, String)>,
     dream_claims: Vec<(String, Option<String>)>,
+    /// The `prompt_id` of the prompt this render answers. Every exposure row
+    /// this render commits is keyed by it, so the consumption audit can join
+    /// an injection to its prompt.
+    prompt_id: Option<String>,
+    /// The daemon is `query_only`; only the keyed exposure write may land.
+    serve_only: bool,
 }
 
 impl PendingEffects {
@@ -271,9 +304,15 @@ impl PendingEffects {
         // The claims are now receipts and must survive this value's drop.
         self.dream_claims.clear();
         for item in self.impressions.drain(..) {
-            super::exposure::record_impression(
+            let record = if self.serve_only {
+                super::exposure::record_impression_serve_only
+            } else {
+                super::exposure::record_impression_keyed
+            };
+            record(
                 &self.storage,
                 item.session.as_deref(),
+                self.prompt_id.as_deref(),
                 &item.project,
                 &item.surface,
                 item.query.as_deref(),
@@ -328,6 +367,8 @@ fn undelivered_dream_claim_is_released_but_acknowledged_claim_survives() {
             impressions: Vec::new(),
             retrievals: Vec::new(),
             dream_claims: vec![("dream".into(), Some("session".into()))],
+            prompt_id: None,
+            serve_only: false,
         };
         if delivered {
             pending.commit_exposures();
@@ -361,7 +402,7 @@ async fn handle_inner(
     // the yardstick for "already in front of Claude" below.
     let asked = crate::extraction::provenance::strip_csr_emissions(pasted);
     let prompt = asked.as_str();
-    match early_exit(pasted) {
+    match early_exit_for(input.source.as_deref(), pasted) {
         Some(EarlyExit::Silent) => return Ok(()),
         Some(EarlyExit::LineagePickup) => {
             if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
@@ -1110,6 +1151,14 @@ pub(super) fn early_exit(prompt: &str) -> Option<EarlyExit> {
         return Some(EarlyExit::Silent);
     }
 
+    // A slash command or skill: UserPromptSubmit fires before it expands
+    // (Claude Code 2.1.299), so the expansion carries its own context and
+    // nothing is injected. Decided on the raw prompt, before any paste
+    // stripping or continuation matching.
+    if prompt.trim_start().starts_with('/') {
+        return Some(EarlyExit::Silent);
+    }
+
     // Nobody typed a harness turn, so nothing in it is a re-asked question.
     // Live failure 2026-09-19: background-task notifications and
     // cross-session messages each drew a PICKUP for an unrelated episode at
@@ -1157,6 +1206,38 @@ pub(super) fn early_exit(prompt: &str) -> Option<EarlyExit> {
     }
 
     None
+}
+
+/// What `UserPromptSubmit.source` says about who wrote the turn.
+///
+/// Claude Code 2.1.311 sends one of `user` (typed, queued or an accepted
+/// suggestion), `sdk` (a non-interactive caller), `system` (a meta turn) or
+/// `loop_wakeup` / `schedule_wakeup` (a scheduled wake-up). `Some(true)` is
+/// any value that is not a person typing; `Some(false)` is a typed turn;
+/// `None` is an absent or blank field, where the caller falls back to the
+/// text heuristic [`is_harness_turn`].
+pub(super) fn harness_source(source: Option<&str>) -> Option<bool> {
+    let source = source?.trim();
+    if source.is_empty() {
+        return None;
+    }
+    // `black_box` keeps the list as data: without it the compiler folds the
+    // five comparisons into register compares and the values leave the binary.
+    let typed = std::hint::black_box(["user", "prompt", "typed", "queued", "suggestion_accepted"])
+        .iter()
+        .any(|value| source.eq_ignore_ascii_case(value));
+    Some(!typed)
+}
+
+/// [`early_exit`] with the hook's `source` applied first. A harness source is
+/// silent whatever the text says; a typed or absent source still goes through
+/// the text rules, so the heuristic stays the fallback and a typed turn can
+/// only gain silence from it, never lose it.
+pub(super) fn early_exit_for(source: Option<&str>, prompt: &str) -> Option<EarlyExit> {
+    if harness_source(source) == Some(true) {
+        return Some(EarlyExit::Silent);
+    }
+    early_exit(prompt)
 }
 
 /// Whether this prompt is answered without the vector index, so the hook
@@ -4497,6 +4578,81 @@ mod tests {
             assert_eq!(early_exit(searched), None, "{searched}");
             assert!(!exits_before_search(Some(searched)), "{searched}");
         }
+    }
+
+    #[test]
+    fn a_slash_prompt_gets_no_injection_whatever_follows_the_slash() {
+        for slash in [
+            "/compact",
+            "  /review the auth module and tell me what is wrong with it",
+            "\n\t/skill-name with a long argument that would otherwise be searched",
+            "/Users/me/projects/app/src/main.rs fails to build, why does it do that?",
+        ] {
+            assert_eq!(early_exit(slash), Some(EarlyExit::Silent), "{slash}");
+            assert_eq!(early_exit_for(None, slash), Some(EarlyExit::Silent));
+            assert_eq!(early_exit_for(Some("user"), slash), Some(EarlyExit::Silent));
+            assert!(exits_before_search(Some(slash)), "{slash}");
+        }
+        // A slash later in the prompt is a path, not a command.
+        assert_eq!(early_exit("why does src/main.rs fail to build?"), None);
+    }
+
+    #[test]
+    fn the_source_field_names_a_harness_turn_when_it_is_present() {
+        for harness in [
+            "system",
+            "sdk",
+            "loop_wakeup",
+            "schedule_wakeup",
+            " System ",
+            "SDK",
+        ] {
+            assert_eq!(harness_source(Some(harness)), Some(true), "{harness}");
+        }
+        for typed in [
+            "user",
+            "prompt",
+            "typed",
+            "queued",
+            "suggestion_accepted",
+            "USER",
+        ] {
+            assert_eq!(harness_source(Some(typed)), Some(false), "{typed}");
+        }
+        assert_eq!(harness_source(None), None);
+        assert_eq!(harness_source(Some("")), None);
+        assert_eq!(harness_source(Some("   ")), None);
+    }
+
+    #[test]
+    fn a_harness_source_is_silent_even_for_a_searchable_prompt() {
+        let searchable = "fix the statusline badge count";
+        assert_eq!(early_exit(searchable), None);
+        for harness in ["system", "sdk", "loop_wakeup", "schedule_wakeup"] {
+            assert_eq!(
+                early_exit_for(Some(harness), searchable),
+                Some(EarlyExit::Silent),
+                "{harness}"
+            );
+        }
+        // A typed source leaves the text rules in charge.
+        assert_eq!(early_exit_for(Some("user"), searchable), None);
+    }
+
+    #[test]
+    fn an_absent_source_falls_back_to_the_text_heuristic() {
+        let notification =
+            "<task-notification>\n<status>completed</status>\n</task-notification> and then some more words";
+        assert_eq!(early_exit_for(None, notification), Some(EarlyExit::Silent));
+        assert_eq!(
+            early_exit_for(Some(""), notification),
+            Some(EarlyExit::Silent)
+        );
+        assert_eq!(early_exit_for(None, "fix the statusline badge count"), None);
+        assert_eq!(
+            early_exit_for(None, "continue"),
+            Some(EarlyExit::LineagePickup)
+        );
     }
 
     #[test]

@@ -1,0 +1,888 @@
+{
+ "schema": "s7-latency-v1",
+ "spike": "S7",
+ "closure": "fallback p95 <= 300 ms wall incl. process start; socket p50 <= 200, p95 < 500; stalled max < 500",
+ "bin_sha256": "ae498ad428e508bb54862d5c36373f059de760add594a574c9ff3b53e43fcde0",
+ "prompts_sha256": "0b14ff829103778c932aa0d7bcc8da59c5b3fd0329fd05874f4f5575e89122d1",
+ "n_prompts": 50,
+ "runs": [
+  {
+   "started": "2026-10-26T19:51:59-0700",
+   "errors": {},
+   "modes": {
+    "socket": {
+     "n": 50,
+     "p50_ms": 57.9,
+     "p95_ms": 238.13,
+     "max_ms": 395.7,
+     "exit_codes": {
+      "0": 50
+     },
+     "answered": 21,
+     "transports": {
+      "socket": 47,
+      "fallback": 3
+     },
+     "per_call_ms": [
+      23.79,
+      106.58,
+      120.41,
+      39.75,
+      152.83,
+      139.78,
+      136.43,
+      26.59,
+      87.86,
+      75.72,
+      228.94,
+      120.53,
+      55.13,
+      53.55,
+      82.71,
+      100.44,
+      180.88,
+      128.6,
+      33.72,
+      45.56,
+      140.64,
+      40.63,
+      57.9,
+      116.76,
+      119.91,
+      36.47,
+      25.22,
+      32.77,
+      103.54,
+      28.19,
+      44.04,
+      32.44,
+      8.52,
+      18.72,
+      162.96,
+      88.04,
+      51.83,
+      218.17,
+      395.7,
+      57.87,
+      230.88,
+      35.5,
+      35.03,
+      31.69,
+      243.38,
+      23.3,
+      29.91,
+      53.97,
+      238.13,
+      75.28
+     ],
+     "warmup": {
+      "calls": 8,
+      "transports": [
+       "socket",
+       "unavailable",
+       "fallback",
+       "fallback",
+       "fallback",
+       "socket",
+       "socket",
+       "socket"
+      ],
+      "settled": true
+     },
+     "daemon": {
+      "pid": 22050,
+      "ready_s": 2.55,
+      "socket": "$HOME/projects/claude-self-reflect/.testbed/s7d-22048/hook-ipc-v1/prompt.sock"
+     }
+    },
+    "policy": {
+     "daemon_up": true,
+     "cases": [
+      {
+       "kind": "slash",
+       "source": null,
+       "prompt_head": "/clear",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.49
+      },
+      {
+       "kind": "slash",
+       "source": null,
+       "prompt_head": "/review the diff",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.0
+      },
+      {
+       "kind": "slash",
+       "source": null,
+       "prompt_head": "  /compact now",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.32
+      },
+      {
+       "kind": "slash",
+       "source": null,
+       "prompt_head": "/model opus",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.36
+      },
+      {
+       "kind": "slash",
+       "source": null,
+       "prompt_head": "/help",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.15
+      },
+      {
+       "kind": "source",
+       "source": "harness",
+       "prompt_head": "Jaideva Jaideva vidhi campaign suno lyri",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.05
+      },
+      {
+       "kind": "source",
+       "source": "task_notification",
+       "prompt_head": "maestro-runner Android driver devicelab ",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 5.96
+      },
+      {
+       "kind": "source",
+       "source": "system",
+       "prompt_head": "Vidhi showcase creative video seedance h",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 5.71
+      },
+      {
+       "kind": "source",
+       "source": "hook",
+       "prompt_head": "Ganesh vidhi production OTA plan runtime",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 5.63
+      },
+      {
+       "kind": "source",
+       "source": "cron",
+       "prompt_head": "rmcp protocol versions advertising decis",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 5.63
+      }
+     ],
+     "n": 10,
+     "all_zero_bytes": true
+    },
+    "fallback": {
+     "n": 50,
+     "p50_ms": 164.33,
+     "p95_ms": 270.19,
+     "max_ms": 271.34,
+     "exit_codes": {
+      "0": 50
+     },
+     "answered": 37,
+     "transports": {
+      "fallback": 37,
+      "unavailable": 13
+     },
+     "per_call_ms": [
+      65.26,
+      69.98,
+      267.31,
+      160.98,
+      106.24,
+      267.18,
+      237.86,
+      267.1,
+      102.91,
+      267.15,
+      269.17,
+      266.52,
+      82.49,
+      269.33,
+      177.55,
+      133.19,
+      92.72,
+      49.48,
+      268.89,
+      271.34,
+      162.67,
+      200.75,
+      52.62,
+      171.03,
+      155.02,
+      251.32,
+      270.19,
+      120.29,
+      100.38,
+      158.66,
+      198.69,
+      137.97,
+      43.74,
+      224.34,
+      96.57,
+      119.91,
+      164.33,
+      270.4,
+      136.09,
+      51.19,
+      201.44,
+      140.47,
+      251.06,
+      229.72,
+      155.16,
+      248.86,
+      206.95,
+      262.14,
+      152.78,
+      165.75
+     ],
+     "warmup": {
+      "calls": 3,
+      "transports": [
+       "fallback",
+       "fallback",
+       "unavailable"
+      ],
+      "settled": true
+     },
+     "terminated_pid": 22050,
+     "socket_gone_before_run": true
+    },
+    "stalled": {
+     "n": 50,
+     "p50_ms": 412.33,
+     "p95_ms": 476.62,
+     "max_ms": 481.4,
+     "exit_codes": {
+      "0": 50
+     },
+     "answered": 30,
+     "transports": {
+      "fallback": 30,
+      "unavailable": 20
+     },
+     "per_call_ms": [
+      321.97,
+      340.9,
+      481.4,
+      418.35,
+      370.37,
+      474.49,
+      466.79,
+      480.03,
+      359.83,
+      475.45,
+      474.73,
+      475.31,
+      350.7,
+      475.44,
+      443.45,
+      385.84,
+      367.34,
+      318.57,
+      474.18,
+      472.36,
+      401.96,
+      402.19,
+      319.3,
+      398.88,
+      412.21,
+      473.07,
+      476.62,
+      388.0,
+      334.71,
+      398.28,
+      435.52,
+      403.67,
+      303.37,
+      470.53,
+      342.88,
+      380.4,
+      413.94,
+      472.53,
+      386.8,
+      303.43,
+      467.41,
+      379.5,
+      471.76,
+      466.92,
+      392.83,
+      474.91,
+      453.46,
+      470.41,
+      412.33,
+      417.36
+     ],
+     "warmup": {
+      "calls": 3,
+      "transports": [
+       "fallback",
+       "fallback",
+       "unavailable"
+      ],
+      "settled": true
+     },
+     "connections_held": 53,
+     "listener_removed": true
+    },
+    "mcp": {
+     "n": 50,
+     "p50_ms": 31.73,
+     "p95_ms": 155.51,
+     "max_ms": 174.17,
+     "exit_codes": {
+      "ok": 50
+     },
+     "answered": 20,
+     "transports": {
+      "mcp_tool": 50
+     },
+     "per_call_ms": [
+      18.2,
+      100.96,
+      41.69,
+      24.1,
+      153.69,
+      142.06,
+      139.16,
+      22.08,
+      36.3,
+      38.43,
+      138.09,
+      102.92,
+      22.84,
+      28.29,
+      34.43,
+      93.64,
+      71.1,
+      126.91,
+      18.59,
+      35.1,
+      155.51,
+      15.97,
+      21.71,
+      53.19,
+      47.16,
+      28.24,
+      14.85,
+      22.08,
+      26.08,
+      14.8,
+      31.73,
+      22.7,
+      1.47,
+      10.96,
+      54.54,
+      23.62,
+      19.71,
+      137.36,
+      174.17,
+      22.97,
+      163.74,
+      26.05,
+      20.9,
+      20.77,
+      95.5,
+      16.61,
+      20.09,
+      44.28,
+      70.7,
+      38.16
+     ],
+     "startup_s": 0.62,
+     "server": {
+      "name": "csr-engine",
+      "version": "10.1.0"
+     },
+     "exit_codes_note": "ok/error/timeout per tools/call; no process exit per call"
+    },
+    "postcompact": {
+     "session_id": "s7-pc-1793069564-a232bc",
+     "steps": [
+      {
+       "step": "daemon_up_1",
+       "ms": 11.53,
+       "exit": "0",
+       "transport": "direct",
+       "rows_after": 1
+      },
+      {
+       "step": "daemon_up_2",
+       "ms": 7.64,
+       "exit": "0",
+       "transport": "dropped",
+       "rows_after": 1
+      },
+      {
+       "step": "daemon_down",
+       "ms": 9.09,
+       "exit": "0",
+       "transport": "dropped",
+       "rows_after": 1
+      }
+     ],
+     "rows_native_compact": 1,
+     "expected_rows": 1,
+     "pass": true
+    }
+   }
+  },
+  {
+   "started": "2026-10-26T19:52:45-0700",
+   "errors": {},
+   "modes": {
+    "socket": {
+     "n": 50,
+     "p50_ms": 34.3,
+     "p95_ms": 155.15,
+     "max_ms": 160.99,
+     "exit_codes": {
+      "0": 50
+     },
+     "answered": 20,
+     "transports": {
+      "socket": 50
+     },
+     "per_call_ms": [
+      26.51,
+      110.45,
+      48.06,
+      29.9,
+      156.91,
+      146.98,
+      141.95,
+      29.95,
+      47.12,
+      47.01,
+      155.15,
+      107.09,
+      28.77,
+      34.3,
+      41.03,
+      100.04,
+      86.83,
+      122.19,
+      24.35,
+      38.71,
+      132.65,
+      20.39,
+      27.68,
+      58.32,
+      49.8,
+      31.08,
+      17.31,
+      23.83,
+      27.51,
+      17.59,
+      33.53,
+      25.34,
+      8.39,
+      15.14,
+      54.41,
+      25.97,
+      25.07,
+      150.58,
+      160.99,
+      21.68,
+      139.61,
+      30.53,
+      25.72,
+      25.31,
+      89.49,
+      21.93,
+      24.93,
+      49.51,
+      79.79,
+      46.18
+     ],
+     "warmup": {
+      "calls": 3,
+      "transports": [
+       "socket",
+       "socket",
+       "socket"
+      ],
+      "settled": true
+     },
+     "daemon": {
+      "pid": 26002,
+      "ready_s": 0.77,
+      "socket": "$HOME/projects/claude-self-reflect/.testbed/s7d-26001/hook-ipc-v1/prompt.sock"
+     }
+    },
+    "policy": {
+     "daemon_up": true,
+     "cases": [
+      {
+       "kind": "slash",
+       "source": null,
+       "prompt_head": "/clear",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 7.52
+      },
+      {
+       "kind": "slash",
+       "source": null,
+       "prompt_head": "/review the diff",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 7.74
+      },
+      {
+       "kind": "slash",
+       "source": null,
+       "prompt_head": "  /compact now",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.7
+      },
+      {
+       "kind": "slash",
+       "source": null,
+       "prompt_head": "/model opus",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.52
+      },
+      {
+       "kind": "slash",
+       "source": null,
+       "prompt_head": "/help",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.38
+      },
+      {
+       "kind": "source",
+       "source": "harness",
+       "prompt_head": "Jaideva Jaideva vidhi campaign suno lyri",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.1
+      },
+      {
+       "kind": "source",
+       "source": "task_notification",
+       "prompt_head": "maestro-runner Android driver devicelab ",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 5.78
+      },
+      {
+       "kind": "source",
+       "source": "system",
+       "prompt_head": "Vidhi showcase creative video seedance h",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 5.82
+      },
+      {
+       "kind": "source",
+       "source": "hook",
+       "prompt_head": "Ganesh vidhi production OTA plan runtime",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.05
+      },
+      {
+       "kind": "source",
+       "source": "cron",
+       "prompt_head": "rmcp protocol versions advertising decis",
+       "bytes": 0,
+       "exit": "0",
+       "transport": null,
+       "ms": 6.03
+      }
+     ],
+     "n": 10,
+     "all_zero_bytes": true
+    },
+    "fallback": {
+     "n": 50,
+     "p50_ms": 177.5,
+     "p95_ms": 272.88,
+     "max_ms": 274.74,
+     "exit_codes": {
+      "0": 50
+     },
+     "answered": 35,
+     "transports": {
+      "fallback": 35,
+      "unavailable": 15
+     },
+     "per_call_ms": [
+      66.41,
+      73.87,
+      272.88,
+      183.46,
+      119.49,
+      266.21,
+      230.62,
+      266.31,
+      99.77,
+      266.31,
+      273.05,
+      261.02,
+      79.72,
+      268.84,
+      170.07,
+      132.75,
+      92.25,
+      48.71,
+      268.8,
+      270.36,
+      149.62,
+      177.5,
+      50.2,
+      150.34,
+      165.33,
+      242.84,
+      271.65,
+      116.76,
+      91.82,
+      190.37,
+      258.48,
+      153.28,
+      46.87,
+      272.03,
+      117.6,
+      115.94,
+      156.88,
+      274.74,
+      143.82,
+      55.52,
+      225.96,
+      136.63,
+      247.03,
+      239.06,
+      168.35,
+      271.72,
+      226.71,
+      266.75,
+      184.21,
+      188.48
+     ],
+     "warmup": {
+      "calls": 3,
+      "transports": [
+       "fallback",
+       "fallback",
+       "unavailable"
+      ],
+      "settled": true
+     },
+     "terminated_pid": 26002,
+     "socket_gone_before_run": true
+    },
+    "stalled": {
+     "n": 50,
+     "p50_ms": 419.65,
+     "p95_ms": 474.82,
+     "max_ms": 479.96,
+     "exit_codes": {
+      "0": 50
+     },
+     "answered": 30,
+     "transports": {
+      "fallback": 30,
+      "unavailable": 20
+     },
+     "per_call_ms": [
+      343.84,
+      340.02,
+      479.96,
+      454.84,
+      387.18,
+      474.82,
+      469.34,
+      472.0,
+      365.85,
+      470.71,
+      473.31,
+      472.36,
+      335.96,
+      474.53,
+      433.63,
+      389.72,
+      350.09,
+      317.02,
+      470.91,
+      474.71,
+      409.43,
+      421.66,
+      310.58,
+      410.03,
+      403.6,
+      470.01,
+      479.6,
+      380.71,
+      352.84,
+      408.88,
+      453.0,
+      392.63,
+      296.41,
+      467.25,
+      344.23,
+      368.17,
+      422.57,
+      472.9,
+      391.22,
+      304.18,
+      455.68,
+      383.97,
+      471.89,
+      467.32,
+      394.65,
+      472.83,
+      473.74,
+      473.92,
+      419.65,
+      402.34
+     ],
+     "warmup": {
+      "calls": 3,
+      "transports": [
+       "fallback",
+       "fallback",
+       "unavailable"
+      ],
+      "settled": true
+     },
+     "connections_held": 53,
+     "listener_removed": true
+    },
+    "mcp": {
+     "n": 50,
+     "p50_ms": 29.93,
+     "p95_ms": 141.04,
+     "max_ms": 162.43,
+     "exit_codes": {
+      "ok": 50
+     },
+     "answered": 20,
+     "transports": {
+      "mcp_tool": 50
+     },
+     "per_call_ms": [
+      17.9,
+      99.69,
+      43.21,
+      24.92,
+      150.23,
+      137.01,
+      132.86,
+      21.83,
+      35.59,
+      37.94,
+      138.45,
+      103.16,
+      23.11,
+      26.77,
+      35.13,
+      88.59,
+      69.93,
+      107.36,
+      18.17,
+      32.28,
+      125.44,
+      13.23,
+      17.49,
+      47.8,
+      40.46,
+      25.24,
+      11.44,
+      18.03,
+      22.2,
+      13.26,
+      29.93,
+      20.57,
+      1.4,
+      9.48,
+      54.46,
+      21.76,
+      18.85,
+      129.03,
+      162.43,
+      16.54,
+      141.04,
+      25.87,
+      19.26,
+      20.1,
+      90.25,
+      16.85,
+      20.61,
+      46.88,
+      74.7,
+      36.52
+     ],
+     "startup_s": 0.62,
+     "server": {
+      "name": "csr-engine",
+      "version": "10.1.0"
+     },
+     "exit_codes_note": "ok/error/timeout per tools/call; no process exit per call"
+    },
+    "postcompact": {
+     "session_id": "s7-pc-1793069604-205155",
+     "steps": [
+      {
+       "step": "daemon_up_1",
+       "ms": 16.62,
+       "exit": "0",
+       "transport": "direct",
+       "rows_after": 1
+      },
+      {
+       "step": "daemon_up_2",
+       "ms": 8.8,
+       "exit": "0",
+       "transport": "dropped",
+       "rows_after": 1
+      },
+      {
+       "step": "daemon_down",
+       "ms": 9.23,
+       "exit": "0",
+       "transport": "dropped",
+       "rows_after": 1
+      }
+     ],
+     "rows_native_compact": 1,
+     "expected_rows": 1,
+     "pass": true
+    }
+   }
+  }
+ ]
+}

@@ -2998,6 +2998,17 @@ fn load_task_state_from_dir(dir: &Path) -> Option<TaskDirState> {
 /// Handle the stop hook.
 /// Always returns Ok(()) to never block Claude Code (C-1 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
+    // The turn ended: note it first, ahead of any import work, so the PreCompact
+    // veto can tell an idle session from one with a turn in flight. A mark never
+    // blocks and never fails. A subagent's id is its parent's, so it marks nothing.
+    if let Some(session_id) = input
+        .session_id
+        .as_deref()
+        .filter(|_| input.subagent().is_none())
+    {
+        super::turn_marks::mark_stop(engine.data_dir(), session_id);
+    }
+
     // Import growing transcript for ALL sessions (real-time searchability)
     super::import_current_transcript(input, engine, cwd).await;
 
@@ -4354,6 +4365,38 @@ mod tests {
         assert!(ep2.steer_count.is_none());
         assert!(ep2.steers.is_empty());
         assert!(ep2.correction_count.is_none());
+    }
+
+    // --- the Stop turn mark the PreCompact veto reads ---
+
+    #[tokio::test]
+    async fn stop_marks_the_session_stopped_and_a_subagent_stop_marks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::from_parts(
+            std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap()),
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::disabled()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
+                16,
+            ))),
+            dir.path().to_path_buf(),
+        );
+        let main: HookInput =
+            serde_json::from_value(serde_json::json!({"session_id": "s-main"})).unwrap();
+        let sub: HookInput = serde_json::from_value(
+            serde_json::json!({"session_id": "s-sub", "agent_id": "agent-1"}),
+        )
+        .unwrap();
+        assert!(super::super::turn_marks::read(dir.path(), "s-main")
+            .last_stop
+            .is_none());
+        handle(&main, &engine, dir.path()).await.unwrap();
+        handle(&sub, &engine, dir.path()).await.unwrap();
+        let marks = super::super::turn_marks::read(dir.path(), "s-main");
+        assert!(marks.last_stop.is_some());
+        assert!(marks.last_prompt.is_none() && marks.last_veto.is_none());
+        assert!(super::super::turn_marks::read(dir.path(), "s-sub")
+            .last_stop
+            .is_none());
     }
 
     // --- extract_and_store_episode instrumentation wiring (plan §4.1) ---

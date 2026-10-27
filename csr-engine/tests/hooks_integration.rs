@@ -426,7 +426,7 @@ mod prompt_process {
                 assert_eq!(json["input"]["session_id"], "latency-test");
                 assert_eq!(json["database"], "csr-engine.db");
                 let body =
-                    serde_json::to_vec(&serde_json::json!({"version": if valid {1} else {0},
+                    serde_json::to_vec(&serde_json::json!({"version": if valid {2} else {0},
                     "injection": "CSR PICKUP — exact bytes\nsecond line\n"}))
                     .unwrap();
                 stream
@@ -546,7 +546,7 @@ mod prompt_process {
             let mut request = vec![0; u32::from_be_bytes(header) as usize];
             stream.read_exact(&mut request).unwrap();
             let body = serde_json::to_vec(
-                &serde_json::json!({"version":1,"injection":"x".repeat(240_000)}),
+                &serde_json::json!({"version":2,"injection":"x".repeat(240_000)}),
             )
             .unwrap();
             stream

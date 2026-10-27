@@ -97,6 +97,14 @@ pub(crate) fn render_with(
     deadline: Instant,
     model: Option<&StaticModel>,
 ) -> Option<String> {
+    // The daemon's skips apply here too: a slash command or a harness source
+    // gets nothing, whichever path answers.
+    if matches!(
+        super::prompt_submit::early_exit_for(input.source.as_deref(), input.prompt.as_deref()?),
+        Some(super::prompt_submit::EarlyExit::Silent)
+    ) {
+        return None;
+    }
     let prompt = crate::extraction::provenance::strip_csr_emissions(input.prompt.as_deref()?);
     let prompt = prompt.trim();
     if prompt.is_empty() || out_of_time(deadline) {
