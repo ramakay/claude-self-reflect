@@ -1244,6 +1244,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     migrate_chunks_fts(conn)?;
     migrate_chunks_fts_au_content_scoped(conn)?;
     migrate_episodes(conn)?;
+    super::assertions::migrate_assertions(conn)?;
 
     // Engine metadata KV — caches expensive computed state (e.g. integrity_check
     // results, which cost ~10s on multi-GB DBs and must not run per status call).

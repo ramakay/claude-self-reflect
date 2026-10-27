@@ -1,6 +1,7 @@
 pub mod ancestry;
 pub mod artifact_backfill;
 pub mod artifact_provenance;
+pub mod assertions;
 pub mod chunk_binding;
 pub mod codegraph;
 pub mod dream_attribution;
@@ -352,6 +353,7 @@ impl Storage {
                 claim,
                 confirmation,
             )?;
+            assertions::upsert_resolution_assertions(&tx, chunk_ids)?;
             tx.commit()?;
             Ok(result)
         })
@@ -2788,8 +2790,37 @@ impl Storage {
         claim: Option<&str>,
         source: &str,
     ) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::insert_resolutions(&conn, chunk_ids, status, evidence, claim, source)
+        if chunk_ids.is_empty() {
+            return Ok(0);
+        }
+        if !matches!(
+            source,
+            queries::RESOLUTION_SOURCE_AGENT | queries::RESOLUTION_SOURCE_USER_CONFIRMED
+        ) {
+            anyhow::bail!(
+                "invalid resolution source '{}': must be agent or user_confirmed",
+                source
+            );
+        }
+        // Ledger rows and their assertion rows commit together, so the append
+        // is done here in one transaction rather than via queries::insert_resolutions
+        // (which opens its own and cannot nest).
+        self.with_connection(|conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO resolution_ledger (chunk_id, status, evidence, claim, source, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                for chunk_id in chunk_ids {
+                    stmt.execute(rusqlite::params![chunk_id, status, evidence, claim, source, now])?;
+                }
+            }
+            assertions::upsert_resolution_assertions(&tx, chunk_ids)?;
+            tx.commit()?;
+            Ok(chunk_ids.len())
+        })
     }
 
     /// Batch-fetch latest user-confirmed resolution entries keyed by chunk id.

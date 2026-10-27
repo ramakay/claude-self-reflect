@@ -234,6 +234,11 @@ enum Commands {
         #[command(subcommand)]
         action: EpisodesAction,
     },
+    /// S8 assertions: which claims later evidence retired. Build the table, list its rows.
+    Assertions {
+        #[command(subcommand)]
+        action: AssertionsAction,
+    },
     /// USearch chunk-vector generation tools (S5): export, truth, build, activate,
     /// recall, load-bench, serve-rss. Never touches the serving path.
     Vindex {
@@ -701,6 +706,27 @@ enum SymbolAction {
         /// `--file` still names the path and so the language
         #[arg(long)]
         stdin: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AssertionsAction {
+    /// Rebuild every assertion from the decisions file and the ledgers (no model).
+    Build {
+        /// Frozen user-decisions JSON (a `decisions` array).
+        #[arg(long)]
+        decisions: PathBuf,
+        /// Also write the report JSON here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Print assertion rows, newest first.
+    List {
+        /// user_decision, csr_resolve, witness or task.
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
 }
 
@@ -1644,6 +1670,20 @@ async fn run(
 
     if let Some(Commands::Vindex { ref action }) = args.command {
         return csr_engine::index_gen::cli::run(&args.db_path, action);
+    }
+
+    if let Some(Commands::Assertions { ref action }) = args.command {
+        use csr_engine::storage::assertions as asr;
+        let text = match action {
+            AssertionsAction::Build { decisions, out } => {
+                asr::cli_build(&args.db_path, decisions, out.as_deref())?
+            }
+            AssertionsAction::List { source, limit } => {
+                asr::cli_list(&args.db_path, source.as_deref(), *limit)?
+            }
+        };
+        println!("{text}");
+        return Ok(());
     }
 
     if let Some(Commands::Episodes { ref action }) = args.command {
