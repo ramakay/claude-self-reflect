@@ -18,7 +18,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use parse::{classify_drop, compact_record, row_text, Drops, Splitter};
+use parse::{classify_drop, compact_record, Drops, Splitter};
 use store::Watermark;
 
 const TAIL_BYTES: usize = 4096;
@@ -38,6 +38,7 @@ pub struct BuildStats {
     pub skipped_csr_agent_files: u64,
     pub skipped_conflicting_conversation_id: u64,
     pub skipped_old_files: u64,
+    pub rechecked_agent_watermarks: u64,
 }
 
 struct Origin {
@@ -175,12 +176,14 @@ fn run_pass(path: &Path, resume: Option<&Watermark>) -> Result<Pass> {
             continue;
         }
         if !opening_checked && ty != "assistant" {
-            let text = row_text(&row);
-            if crate::import::is_csr_agent_prompt(&text) {
-                agent_skipped = true;
-                break;
-            }
-            if !text.trim().is_empty() && !parse::is_harness_prompt(&text) {
+            // Same opening-prompt rule as the chunk importer: isMeta and
+            // compact-summary rows never open a session, and CSR hook
+            // wrappers are scrubbed before the signature check.
+            if let Some(prompt) = crate::import::opening_prompt_candidate(&row) {
+                if crate::import::is_csr_agent_prompt(&prompt) {
+                    agent_skipped = true;
+                    break;
+                }
                 opening_checked = true;
             }
         }
@@ -286,7 +289,20 @@ pub fn build(conn: &Connection, root: &Path, since_days: Option<i64>) -> Result<
         }
         stats.files += 1;
         let (out, from_zero, delete_from) = match &wm {
-            Some(w) if w.resume_ordinal < 0 => continue, // CSR agent run, nothing to extend
+            Some(w) if w.resume_ordinal < 0 => {
+                // Stored as a CSR agent run. The gate stops at the first real
+                // prompt, so re-checking from zero is cheap; a file that now
+                // passes (older, wider gate) gets its episodes.
+                stats.rechecked_agent_watermarks += 1;
+                match run_pass(&path, None)? {
+                    Pass::Done(out) if out.agent_skipped => {
+                        stats.skipped_csr_agent_files += 1;
+                        continue;
+                    }
+                    Pass::Done(out) => (out, false, None),
+                    Pass::NeedFull => unreachable!("a full pass never asks for a full pass"),
+                }
+            }
             Some(w) => match run_pass(&path, Some(w))? {
                 Pass::Done(out) => (out, false, Some(w.resume_ordinal)),
                 Pass::NeedFull => match run_pass(&path, None)? {
@@ -721,5 +737,109 @@ mod tests {
         assert_eq!(first["origin"], json!(["s6_tier"]));
         assert_eq!(first["probes"], json!([]));
         assert!(first["text"].as_str().unwrap().starts_with("U: "));
+    }
+
+    fn meta_user(uuid: &str, ts: &str, text: &str) -> String {
+        json!({"type":"user","uuid":uuid,"timestamp":ts,"isMeta":true,
+               "message":{"role":"user","content":text}})
+        .to_string()
+    }
+
+    const NARRATOR: &str = "You are summarizing a coding session for a later reader.";
+    const RECAP_MARKER: &str =
+        "[[CSR:RECAP]] machine-marker: this is a CSR narrator side-session, never corpus material.";
+
+    #[test]
+    fn meta_or_hook_opening_row_does_not_skip_a_real_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec![
+            meta_user("m1", "2026-10-01T09:59:00Z", RECAP_MARKER),
+            user(
+                "h1",
+                "2026-10-01T09:59:30Z",
+                "<local-command-caveat>Caveat: generated while running local commands</local-command-caveat>",
+            ),
+        ];
+        lines.extend(base_lines());
+        write(dir.path(), "proj/sess-meta.jsonl", &lines);
+        let conn = db();
+        let stats = build(&conn, dir.path(), None).unwrap();
+        assert_eq!(stats.skipped_csr_agent_files, 0);
+        assert_eq!(dump(&conn).len(), 2);
+    }
+
+    #[test]
+    fn narrator_prompt_is_still_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "proj/narrator.jsonl",
+            &[
+                user("n1", "2026-10-01T10:00:00Z", NARRATOR),
+                asst("n2", "2026-10-01T10:00:05Z", "A summary.", &[]),
+            ],
+        );
+        write(
+            dir.path(),
+            "proj/stdin-run.jsonl",
+            &[
+                user(
+                    "s1",
+                    "2026-10-01T10:00:00Z",
+                    "-\n# Ratification Dialog-Act Extraction\n\nYou are extracting.",
+                ),
+                asst("s2", "2026-10-01T10:00:05Z", "{}", &[]),
+            ],
+        );
+        let conn = db();
+        let stats = build(&conn, dir.path(), None).unwrap();
+        assert_eq!(stats.skipped_csr_agent_files, 2);
+        assert!(dump(&conn).is_empty());
+    }
+
+    #[test]
+    fn negative_watermark_is_rechecked_and_now_passing_file_gets_episodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec![meta_user("m1", "2026-10-01T09:59:00Z", RECAP_MARKER)];
+        lines.extend(base_lines());
+        write(dir.path(), "proj/sess-wm.jsonl", &lines);
+        write(
+            dir.path(),
+            "proj/narrator.jsonl",
+            &[
+                user("n1", "2026-10-01T10:00:00Z", NARRATOR),
+                asst("n2", "2026-10-01T10:00:05Z", "A summary.", &[]),
+            ],
+        );
+        let conn = db();
+        for rel in ["proj/sess-wm.jsonl", "proj/narrator.jsonl"] {
+            let conversation_id = rel
+                .trim_start_matches("proj/")
+                .trim_end_matches(".jsonl")
+                .to_string();
+            store::set_watermark(
+                &conn,
+                rel,
+                &Watermark {
+                    conversation_id,
+                    source_bytes: 10,
+                    tail_hash: "x".into(),
+                    resume_offset: 10,
+                    resume_ordinal: -1,
+                },
+                "2026-10-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        let stats = build(&conn, dir.path(), None).unwrap();
+        assert_eq!(stats.rechecked_agent_watermarks, 2);
+        assert_eq!(stats.skipped_csr_agent_files, 1); // the narrator stays skipped
+        let eps = dump(&conn);
+        assert_eq!(eps.len(), 2);
+        assert!(eps.iter().all(|e| e.0.starts_with("ep:sess-wm:")));
+        // Next build: the corrected watermark is positive, no re-check.
+        let again = build(&conn, dir.path(), None).unwrap();
+        assert_eq!(again.rechecked_agent_watermarks, 1); // only the narrator
+        assert_eq!(dump(&conn), eps);
     }
 }
