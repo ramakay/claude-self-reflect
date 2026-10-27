@@ -709,6 +709,16 @@ impl Storage {
         queries::get_chunk_provenance(&conn, chunk_id)
     }
 
+    /// Provenance for many chunks in one statement. A missing id has no key; a
+    /// batch error is an empty map (the caller reads each id as `None`).
+    pub fn get_chunk_provenance_many(
+        &self,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, crate::provenance::ChunkProvenance>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_provenance_many(&conn, ids)
+    }
+
     /// The session that ran conversation `conversation_id` (a subagent's
     /// parent), if provenance records one.
     pub fn parent_session_of_conversation(&self, conversation_id: &str) -> Result<Option<String>> {
@@ -834,6 +844,15 @@ impl Storage {
     pub fn load_all_reflection_vectors(&self) -> Result<Vec<(String, Vec<f32>)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::load_all_reflection_vectors(&conn)
+    }
+
+    /// Many reflections in one statement; a missing or ledger id has no key.
+    pub fn get_reflections_by_ids(
+        &self,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, queries::ReflectionBody>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_reflections_by_ids(&conn, ids)
     }
 
     pub fn get_reflection_by_id(&self, id: &str) -> Result<Option<(String, Vec<String>, String)>> {

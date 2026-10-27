@@ -2966,9 +2966,13 @@ async fn reflect_gather_pass(
     // handing it out to every legacy-shaped memory regardless of similarity.
     let mut reflection_tags: HashMap<String, Vec<String>> = HashMap::new();
     let mut reflection_raw_cosine: HashMap<String, f32> = HashMap::new();
+    let reflection_rows = {
+        let ids: Vec<&str> = reflection_results.iter().map(|r| r.id.as_str()).collect();
+        storage.get_reflections_by_ids(&ids).unwrap_or_default()
+    };
     for r in &reflection_results {
         reflection_raw_cosine.insert(r.id.clone(), r.score);
-        if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
+        if let Some((content, tags, timestamp)) = reflection_rows.get(&r.id).cloned() {
             let decayed_score = if let Some(ts) = crate::temporal::parse_timestamp(&timestamp) {
                 let events = reflection_tad_events
                     .get(&r.id)
@@ -3243,16 +3247,17 @@ async fn reflect_gather_pass(
     // behind take the freed places, and the adaptive refetch in `settled_pool`
     // counts what is left.
     let echo_start = Instant::now();
-    let chunk_provenance: HashMap<String, Option<crate::provenance::ChunkProvenance>> = enriched
-        .iter()
-        .filter(|e| !reflection_tags.contains_key(&e.chunk.id))
-        .map(|e| {
-            (
-                e.chunk.id.clone(),
-                storage.get_chunk_provenance(&e.chunk.id).ok().flatten(),
-            )
-        })
-        .collect();
+    let chunk_provenance: HashMap<String, Option<crate::provenance::ChunkProvenance>> = {
+        let ids: Vec<&str> = enriched
+            .iter()
+            .filter(|e| !reflection_tags.contains_key(&e.chunk.id))
+            .map(|e| e.chunk.id.as_str())
+            .collect();
+        let found = storage.get_chunk_provenance_many(&ids).unwrap_or_default();
+        ids.iter()
+            .map(|id| (id.to_string(), found.get(*id).cloned()))
+            .collect()
+    };
     let mut echo_dropped =
         drop_echo_rows(&mut enriched, &chunk_provenance, &reflection_tags, query);
     super::stage_timing::stage("echo_filter", echo_start);

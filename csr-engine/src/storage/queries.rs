@@ -507,6 +507,39 @@ pub fn get_chunk_provenance(conn: &Connection, chunk_id: &str) -> Result<Option<
     }
 }
 
+/// Provenance for many chunks in one statement. Same per-id values as
+/// [`get_chunk_provenance`]; an id with no row has no key.
+pub fn get_chunk_provenance_many(
+    conn: &Connection,
+    chunk_ids: &[&str],
+) -> Result<HashMap<String, ChunkProvenance>> {
+    if chunk_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids_json = serde_json::to_string(chunk_ids)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT chunk_id, author, source_conv_id, supersedes FROM chunk_provenance \
+         WHERE chunk_id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let rows = stmt.query_map(params![ids_json], |row| {
+        let author_str: String = row.get(1)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            ChunkProvenance {
+                author: author_str.parse().unwrap_or(Speaker::ToolResult),
+                source_conv_id: row.get(2)?,
+                supersedes: row.get(3)?,
+            },
+        ))
+    })?;
+    let mut map = HashMap::with_capacity(chunk_ids.len());
+    for row in rows {
+        let (id, prov) = row?;
+        map.insert(id, prov);
+    }
+    Ok(map)
+}
+
 /// The session that ran the conversation `conversation_id`, as its chunks'
 /// provenance records it (`source_conv_id`): for a subagent's `agent-` id, the
 /// parent session. `None` when no chunk of it carries one.
@@ -1249,6 +1282,44 @@ pub fn get_reflection_by_id(
     } else {
         Ok(None)
     }
+}
+
+/// A reflection's (content, tags, timestamp), as [`get_reflection_by_id`] returns it.
+pub type ReflectionBody = (String, Vec<String>, String);
+
+/// Many reflections in one statement. Same per-id values as
+/// [`get_reflection_by_id`] (a Shift Ledger row is left out); an id with no
+/// visible row has no key.
+pub fn get_reflections_by_ids(
+    conn: &Connection,
+    ids: &[&str],
+) -> Result<HashMap<String, ReflectionBody>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids_json = serde_json::to_string(ids)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, content, tags, timestamp FROM reflections \
+         WHERE id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let rows = stmt.query_map(params![ids_json], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut map = HashMap::with_capacity(ids.len());
+    for row in rows {
+        let (id, content, tags_json, timestamp) = row?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        if crate::story_map::store::is_ledger_row(&tags) {
+            continue;
+        }
+        map.insert(id, (content, tags, timestamp));
+    }
+    Ok(map)
 }
 
 // ─── Project filtering queries ───
@@ -8377,6 +8448,75 @@ mod tests {
                 assert_eq!(batched.get(id), Some(&one), "{id} window {window}");
             }
         }
+    }
+
+    #[test]
+    fn get_chunk_provenance_many_matches_single_row_reads() {
+        let conn = mem();
+        for (id, author, supersedes) in [
+            ("p1", Speaker::User, Some("older".to_string())),
+            ("p2", Speaker::Assistant, None),
+        ] {
+            insert_chunk(&conn, &test_chunk(id, "body"), &[0.0; 4]).unwrap();
+            insert_chunk_provenance(
+                &conn,
+                id,
+                &ChunkProvenance {
+                    author,
+                    source_conv_id: format!("conv-{id}"),
+                    supersedes,
+                },
+            )
+            .unwrap();
+        }
+        insert_chunk(&conn, &test_chunk("p3", "no provenance row"), &[0.0; 4]).unwrap();
+        // An unknown author token degrades to ToolResult in both readers.
+        conn.execute(
+            "UPDATE chunk_provenance SET author = 'martian' WHERE chunk_id = 'p2'",
+            [],
+        )
+        .unwrap();
+
+        let ids = ["p1", "p2", "p3", "missing", "p1"];
+        let many = get_chunk_provenance_many(&conn, &ids).unwrap();
+        for id in ids {
+            assert_eq!(
+                many.get(id),
+                get_chunk_provenance(&conn, id).unwrap().as_ref(),
+                "{id}"
+            );
+        }
+        assert_eq!(many.len(), 2);
+        assert_eq!(many["p2"].author, Speaker::ToolResult);
+        assert!(get_chunk_provenance_many(&conn, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_reflections_by_ids_matches_single_row_reads() {
+        let conn = mem();
+        let vec = [0.5f32, 0.5, 0.5, 0.5];
+        insert_reflection(&conn, "r1", "first", &["a".to_string()], &vec).unwrap();
+        insert_reflection(&conn, "r2", "second", &[], &vec).unwrap();
+        insert_reflection(
+            &conn,
+            "r-ledger",
+            "shift text",
+            &["narrative_shift".to_string()],
+            &vec,
+        )
+        .unwrap();
+
+        let ids = ["r1", "r2", "r-ledger", "missing", "r1"];
+        let many = get_reflections_by_ids(&conn, &ids).unwrap();
+        for id in ids {
+            assert_eq!(
+                many.get(id),
+                get_reflection_by_id(&conn, id).unwrap().as_ref(),
+                "{id}"
+            );
+        }
+        assert_eq!(many.len(), 2);
+        assert!(get_reflections_by_ids(&conn, &[]).unwrap().is_empty());
     }
 
     #[test]
