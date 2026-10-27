@@ -1009,15 +1009,15 @@ const DRILL_LINE: f32 = 17.;
 /// The figure card's height for the expanded chart (95 + 40), its labels and payback (72) and the
 /// gauge offset (84).
 const FIGURE_EXPANDED_BASE: f32 = 291.;
-/// The expanded figure's height: the history chart keeps its room when the legend is drawn.
+/// The expanded figure's height: the history chart keeps its room when the notes line is drawn.
 fn figure_expanded_h(g: &Value) -> f32 {
-    FIGURE_EXPANDED_BASE + legend_h(g)
+    FIGURE_EXPANDED_BASE + notes_h(g)
 }
 /// The history plot's height at the expanded figure's full height, and the least it is shrunk to
-/// so the legend stays: its title row, a few bars and the gap under them.
+/// so the notes line stays: its title row, a few bars and the gap under them.
 const EXPANDED_PLOT_FULL: f32 = 73.;
 const EXPANDED_PLOT_MIN: f32 = 48.;
-/// The least height the expanded figure draws in: the chart gives back what the legend needs.
+/// The least height the expanded figure draws in: the chart gives back what the notes line needs.
 /// A shorter card drops the chart and draws the collapsed ring.
 fn figure_expanded_min_h(g: &Value) -> f32 {
     figure_expanded_h(g) - (EXPANDED_PLOT_FULL - EXPANDED_PLOT_MIN)
@@ -1026,11 +1026,11 @@ fn figure_expanded_min_h(g: &Value) -> f32 {
 /// out at `mid_min_h` to within rounding.
 const MID_MIN_SLOP: f32 = 0.5;
 /// The least height of a Context card in the mid layout: the title, the small circles with their
-/// captions and the legend, and the bottom clearance. A card shorter than this is the strip.
+/// captions and the notes line, and the bottom clearance. A card shorter than this is the strip.
 fn mid_min_h(g: &Value) -> f32 {
     const MIN_GAUGE_R: f32 = 16.;
     const LABEL_BELOW: f32 = MIN_GAUGE_R + 12.;
-    P + theme::TITLE_LINE + S2 + MIN_GAUGE_R + LABEL_BELOW + theme::CAPTION_LINE + legend_h(g) + S4
+    P + theme::TITLE_LINE + S2 + MIN_GAUGE_R + LABEL_BELOW + theme::CAPTION_LINE + notes_h(g) + S4
 }
 /// Fewest lines a clipped section keeps, its "+N more" line included.
 const DRILL_MIN_LINES: usize = 4;
@@ -1803,13 +1803,15 @@ fn figure_detail_lines(c: &Composition, gauge: Option<Gauge>) -> Vec<String> {
     out
 }
 
-/// The legend names the circles that are drawn, so it needs a Claude quota circle to sit under.
-fn has_legend(g: &Value) -> bool {
-    array(&g["quotas"]).iter().any(|q| q["used"].is_number())
+/// Whether a line of notes sits under the quota captions: a window with a forecast has one.
+fn has_notes(g: &Value) -> bool {
+    array(&g["quotas"])
+        .iter()
+        .any(|q| q["used"].is_number() && q["forecast"]["text"].is_string())
 }
-fn legend_h(g: &Value) -> f32 {
-    if has_legend(g) {
-        LEGEND_H
+fn notes_h(g: &Value) -> f32 {
+    if has_notes(g) {
+        NOTES_H
     } else {
         0.
     }
@@ -1892,7 +1894,8 @@ fn fitted_caption_ink(
     c.text(f, line, x, y, sans(size, t.medium), ink, A::M);
 }
 
-/// Weekly identity and CSR attribution keep separate inks on the same measured line.
+/// Weekly identity and CSR attribution keep separate inks on the same measured line, led by the
+/// swatch of the ring they belong to.
 fn weekly_caption(
     c: &mut Canvas,
     f: &Fonts,
@@ -1906,12 +1909,15 @@ fn weekly_caption(
 ) {
     let line = quota_caption(data, q);
     let st = sans(size, t.medium);
+    let room = width - SWATCH_LEAD;
     let st = sans(
-        (size * width / f.width(&line, st).max(width)).min(size),
+        (size * room / f.width(&line, st).max(room)).min(size),
         t.medium,
     );
     let prefix = "7D · ";
-    let left = x - f.width(&line, st) / 2.;
+    let w = f.width(&line, st);
+    let x = caption_swatch(c, x, w, y, f.cap(st), Swatch::Disc(t.claude));
+    let left = x - w / 2.;
     let prefix_w = c.text(f, prefix, left, y, st, t.quiet, A::L);
     c.text(
         f,
@@ -1932,7 +1938,8 @@ fn quota_money_caption(f: &Fonts, line: &str, width: f32, size: f32, t: &Tokens)
     }
 }
 
-/// Caption fitting never affects the equal-width gauge slots.
+/// Caption fitting never affects the equal-width gauge slots. A swatch leads the first line, and
+/// the two are centred together.
 fn quota_label(
     c: &mut Canvas,
     f: &Fonts,
@@ -1942,20 +1949,39 @@ fn quota_label(
     width: f32,
     size: f32,
     ink: Rgba,
+    swatch: Option<Swatch>,
     t: &Tokens,
 ) {
     let st = sans(size, t.medium);
-    for (i, line) in f.wrap(line, st, width).iter().take(2).enumerate() {
-        c.text(
-            f,
-            line,
-            x,
-            y + i as f32 * theme::CAPTION_LINE,
-            st,
-            ink,
-            A::M,
-        );
+    let room = width - if swatch.is_some() { SWATCH_LEAD } else { 0. };
+    for (i, line) in f.wrap(line, st, room).iter().take(2).enumerate() {
+        let base = y + i as f32 * theme::CAPTION_LINE;
+        let x = match swatch.filter(|_| i == 0) {
+            Some(swatch) => caption_swatch(c, x, f.width(line, st), base, f.cap(st), swatch),
+            None => x,
+        };
+        c.text(f, line, x, base, st, ink, A::M);
     }
+}
+
+/// `fitted_caption`, led by a swatch.
+fn swatch_caption(
+    c: &mut Canvas,
+    f: &Fonts,
+    line: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    size: f32,
+    swatch: Swatch,
+    t: &Tokens,
+) {
+    let st = sans(size, t.medium);
+    let room = width - SWATCH_LEAD;
+    let size = (size * room / f.width(line, st).max(room)).min(size);
+    let st = sans(size, t.medium);
+    let x = caption_swatch(c, x, f.width(line, st), y, f.cap(st), swatch);
+    c.text(f, line, x, y, st, t.quiet, A::M);
 }
 
 /// Quota row shared by full, mid-height and narrow text-mode strips.
@@ -1969,7 +1995,6 @@ fn quota_row(
     r: f32,
     label_y: f32,
     caption_size: f32,
-    legend: bool,
     t: &Tokens,
 ) -> (f32, f32) {
     let g = &data.figure;
@@ -2017,6 +2042,7 @@ fn quota_row(
                 slot - S2,
                 caption_size,
                 t.quiet,
+                Some(Swatch::Disc(t.claude)),
                 t,
             );
         }
@@ -2093,6 +2119,7 @@ fn quota_row(
             unit - S2,
             caption_size,
             t.quiet,
+            Some(Swatch::Disc(if cold { t.amber } else { t.mint })),
             t,
         );
     }
@@ -2126,7 +2153,7 @@ fn quota_row(
             t.ink,
             A::M,
         );
-        fitted_caption(
+        swatch_caption(
             c,
             f,
             "\u{e181} Codex 7D",
@@ -2134,6 +2161,7 @@ fn quota_row(
             label_y,
             unit - S2,
             caption_size,
+            Swatch::Half(t.ink, t.track),
             t,
         );
     }
@@ -2188,6 +2216,7 @@ fn quota_row(
                 card_w - S2,
                 caption_size,
                 t.quiet,
+                None,
                 t,
             );
         } else {
@@ -2197,17 +2226,11 @@ fn quota_row(
         bounds.0 = bounds.0.min(x - card_w / 2.);
         bounds.1 = bounds.1.max(x + card_w / 2.);
     }
-    if legend {
-        quota_legend(c, f, data, left, width, label_y + LEGEND_OFFSET, t);
-    }
     bounds
 }
 
-/// Height a layout gives the legend row under the quota captions.
-pub(super) const LEGEND_H: f32 = theme::CAPTION_LINE + S2;
-/// Baseline of the legend row below the captions' first line: two caption lines, then the row.
-const LEGEND_OFFSET: f32 = 2. * theme::CAPTION_LINE + S1;
-const LEGEND_SIZE: f32 = 9.;
+/// Height a layout gives the line of notes under the quota captions.
+pub(super) const NOTES_H: f32 = theme::CAPTION_LINE + S2;
 /// A circle's tap: its whole slot, from the top of the ring to below its second caption line.
 fn tap_box(x: f32, slot: f32, cy: f32, r: f32, label_y: f32) -> (f32, f32, f32, f32) {
     (
@@ -2218,117 +2241,42 @@ fn tap_box(x: f32, slot: f32, cy: f32, r: f32, label_y: f32) -> (f32, f32, f32, 
     )
 }
 
-/// One swatch of the legend: a filled shape in the colour the circle is drawn in.
+/// One swatch beside a caption: a filled shape in the colour its circle is drawn in.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Swatch {
     Disc(Rgba),
     /// Codex: half ink, half track, as the ring is black or white on its track.
     Half(Rgba, Rgba),
-    Bar(Rgba),
-    Glyph,
 }
-/// What the legend names under the circles that are drawn: (swatch, meaning).
-fn legend_entries(data: &Composition, t: &Tokens) -> Vec<(Swatch, &'static str)> {
-    let quotas: Vec<_> = array(&data.figure["quotas"])
-        .iter()
-        .filter(|q| q["used"].is_number())
-        .collect();
-    let mut out = vec![];
-    if !quotas.is_empty() {
-        out.push((Swatch::Disc(t.claude), "Claude"));
-    }
-    if data.codex_week["percent"].is_number() {
-        out.push((Swatch::Half(t.ink, t.track), "Codex"));
-    }
-    if data.figure["cache"]["left"].is_number() || data.figure["cache"]["cold"] == true {
-        out.push((Swatch::Disc(t.mint), "cache left"));
-    }
-    if data.csr_cost.share.is_some_and(|s| s > 0.) && has_week(data) {
-        out.push((Swatch::Bar(t.csr_share), "CSR share"));
-    }
-    if quotas.iter().any(|q| {
-        q["pace"]
-            .as_f64()
-            .is_some_and(|p| num(&q["used"]) / 100. > p)
-    }) {
-        out.push((Swatch::Glyph, "» ahead of pace"));
-    }
-    out
-}
-/// A row of filled swatches under the quota circles, one per meaning. Entries that do not fit
-/// the row are dropped from the end; a row that holds none is not drawn.
-fn quota_legend(
-    c: &mut Canvas,
-    f: &Fonts,
-    data: &Composition,
-    left: f32,
-    width: f32,
-    baseline: f32,
-    t: &Tokens,
-) {
-    const SWATCH: f32 = 7.;
-    const GAP: f32 = S1 + 1.;
-    const BETWEEN: f32 = S3;
-    let st = sans(LEGEND_SIZE, t.medium);
-    let measured: Vec<_> = legend_entries(data, t)
-        .into_iter()
-        .map(|(swatch, name)| {
-            let lead = if swatch == Swatch::Glyph {
-                0.
-            } else {
-                SWATCH + GAP
-            };
-            (swatch, name, lead + f.width(name, st))
-        })
-        .collect();
-    let mut shown = measured.len();
-    let total = |n: usize| {
-        measured[..n].iter().map(|m| m.2).sum::<f32>() + BETWEEN * n.saturating_sub(1) as f32
-    };
-    while shown > 0 && total(shown) > width {
-        shown -= 1;
-    }
-    if shown == 0 {
-        return;
-    }
-    c.legend_rows.push(baseline);
-    let mut x = left + (width - total(shown)) / 2.;
-    let mid = baseline - f.cap(st) / 2.;
-    for (swatch, name, _) in &measured[..shown] {
-        match *swatch {
-            Swatch::Disc(col) => {
-                c.circle(x + SWATCH / 2., mid, SWATCH / 2., col);
-                x += SWATCH + GAP;
-            }
-            Swatch::Half(a, b) => {
-                c.circle(x + SWATCH / 2., mid, SWATCH / 2., a);
-                // The right half-disc: a stroke as wide as the disc's radius, around its middle.
-                c.arc(
-                    x + SWATCH / 2.,
-                    mid,
-                    SWATCH / 4.,
-                    0.,
-                    0.5,
-                    SWATCH / 2.,
-                    b,
-                    false,
-                );
-                x += SWATCH + GAP;
-            }
-            Swatch::Bar(col) => {
-                c.rrect(x + 1.5, mid - SWATCH / 2., SWATCH - 3., SWATCH, 1., col);
-                x += SWATCH + GAP;
-            }
-            Swatch::Glyph => {}
+/// A swatch's width, and the gap between it and its caption.
+const SWATCH: f32 = 8.;
+const SWATCH_GAP: f32 = S1 + 1.;
+/// What a swatch adds to the width of the caption it leads.
+const SWATCH_LEAD: f32 = SWATCH + SWATCH_GAP;
+/// Draw `swatch` at the left of a caption of width `w` that is centred on `x`, level with the
+/// middle of its capital letters. Returns the x the caption is now centred on: the swatch and the
+/// words are centred as one.
+fn caption_swatch(c: &mut Canvas, x: f32, w: f32, baseline: f32, cap: f32, swatch: Swatch) -> f32 {
+    let left = x - (w + SWATCH_LEAD) / 2.;
+    let mid = baseline - cap / 2.;
+    match swatch {
+        Swatch::Disc(col) => c.circle(left + SWATCH / 2., mid, SWATCH / 2., col),
+        Swatch::Half(a, b) => {
+            c.circle(left + SWATCH / 2., mid, SWATCH / 2., a);
+            // The right half-disc: a stroke as wide as the disc's radius, around its middle.
+            c.arc(
+                left + SWATCH / 2.,
+                mid,
+                SWATCH / 4.,
+                0.,
+                0.5,
+                SWATCH / 2.,
+                b,
+                false,
+            );
         }
-        let ink = if *swatch == Swatch::Glyph {
-            t.quiet
-        } else {
-            t.ink
-        };
-        c.text(f, name, x, baseline, st, ink, A::L);
-        x += f.width(name, st) + BETWEEN;
     }
+    x + SWATCH_LEAD / 2.
 }
 
 // The geometry and primitives below are the approved B prototype's glass, serif and ring design.
@@ -2562,8 +2510,6 @@ fn recent_request_compactions(s: &Value) -> Vec<usize> {
 pub struct Metrics {
     pub csr_cost: InstrumentCost,
     pub quota_gauges: Vec<QuotaGauge>,
-    /// Baseline of each legend row drawn under the quota circles, in layout pt.
-    pub legend_rows: Vec<f32>,
     /// Top and bottom of each "N by CSR" caption drawn, in layout pt.
     pub by_csr: Vec<(f32, f32)>,
     pub fresh_plots: Vec<FreshPlot>,
@@ -2828,7 +2774,7 @@ pub fn draw(
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
     // The figure card's smallest height: its one-row gauge strip (or the quotas row).
     let figure_floor: f32 = if quotas_only { 154. } else { 110. };
-    // A closed pane keeps the Context card tall enough for the small circles, their legend and
+    // A closed pane keeps the Context card tall enough for the small circles, their notes line and
     // the caption; a card an open section squeezed below that is the strip.
     let figure_closed_floor: f32 = if quotas_only || narrow {
         figure_floor
@@ -3876,7 +3822,6 @@ pub fn draw(
         Metrics {
             csr_cost: c.csr_cost.clone(),
             quota_gauges: canvas.quota_gauges.clone(),
-            legend_rows: canvas.legend_rows.clone(),
             by_csr: canvas.by_csr.clone(),
             fresh_plots: canvas.fresh_plots.clone(),
             question_size: qs.size,
@@ -3966,7 +3911,7 @@ fn empty_quota_height(c: &Composition) -> f32 {
         + 2. * empty_quota_radius(c)
         + 46.
         + theme::CAPTION_LINE
-        + legend_h(&c.figure)
+        + notes_h(&c.figure)
         + P
 }
 
@@ -4107,10 +4052,10 @@ fn figure(
     let mut collapsed_pay_y = None;
     let mut collapsed_sat_cy = None;
     let mut context_quota_radius = 30.;
-    // Whether the quota row's legend has room. The expanded chart shrinks to make it; the
-    // collapsed ring may have none to spare: then the legend is not drawn.
-    let mut legend_drawn = true;
-    let legend_gap = if legend_drawn { legend_h(g) } else { 0. };
+    // Whether the quota row's notes line has room. The expanded chart shrinks to make it; the
+    // collapsed ring may have none to spare: then the notes line is not drawn.
+    let mut notes_drawn = true;
+    let notes_gap = if notes_drawn { notes_h(g) } else { 0. };
     label(
         c,
         f,
@@ -4174,7 +4119,7 @@ fn figure(
     if let (Some(n), Some(size)) = (tokens, size) {
         if expanded {
             // Fresh input has its own scale. A context-window ceiling/band would be a different unit.
-            let gauge_cy = y + h - 84. - legend_gap;
+            let gauge_cy = y + h - 84. - notes_gap;
             let chart_bottom = (gauge_cy - 72.).max(y + 70. - S2 + EXPANDED_PLOT_MIN);
             expanded_chart_bottom = chart_bottom;
             history_plot(c, f, data, y + 70., chart_bottom - (y + 70.) + S2, t);
@@ -4217,12 +4162,12 @@ fn figure(
             let ring_extent = r + S3;
             let needed = collapsed_context_layout(g, h).2;
             let slack = (h - needed).max(0.);
-            // The closed pane's height is the least the ring needs, so the legend takes only
+            // The closed pane's height is the least the ring needs, so the notes line takes only
             // room that is spare: from the history plot's, which keeps its own minimum, or from
-            // the slack around the group. The legend matters more than the plot: a plot that
-            // would fall under its minimum is dropped, and the slack goes to the legend.
-            let spare = legend_h(g);
-            let legend_floor = spare + S2;
+            // the slack around the group. The notes line matters more than the plot: a plot that
+            // would fall under its minimum is dropped, and the slack goes to the notes line.
+            let spare = notes_h(g);
+            let notes_floor = spare + S2;
             let mut history_h = if fresh_bar_heights(&data.requests).is_some() && slack >= 50. {
                 slack
             } else {
@@ -4248,23 +4193,23 @@ fn figure(
             } else {
                 slack - gauge_growth
             };
-            if history_h == 0. && spare > 0. && slack >= legend_floor && loose < legend_floor {
-                // The circles grew into the legend's room: they grow from what is left of it.
-                context_quota_radius = quota_radius_in(slack - legend_floor);
+            if history_h == 0. && spare > 0. && slack >= notes_floor && loose < notes_floor {
+                // The circles grew into the notes line's room: they grow from what is left of it.
+                context_quota_radius = quota_radius_in(slack - notes_floor);
                 gauge_growth = 2. * (context_quota_radius - 30.);
                 loose = slack - gauge_growth;
             }
-            let legend_room = if history_h > 0. {
-                legend_drawn
+            let notes_room = if history_h > 0. {
+                notes_drawn
             } else {
                 loose >= spare + S2
             };
-            legend_drawn = legend_drawn && legend_room;
+            notes_drawn = notes_drawn && notes_room;
             let group_top = title_bottom
                 + if history_h > 0. {
                     0.
                 } else {
-                    (loose - if legend_drawn { spare } else { 0. }) / 2.
+                    (loose - if notes_drawn { spare } else { 0. }) / 2.
                 };
             let cy = group_top + ring_extent;
             let cx = W / 2.;
@@ -4325,7 +4270,7 @@ fn figure(
     let pay = payback(g);
     // Gauge labels stay >= 24pt above the card bottom; collapsed uses the exact group geometry.
     let quota_radius = if tokens.is_none() {
-        ((h - (P + theme::TITLE_LINE + S2 + 46. + theme::CAPTION_LINE + legend_h(g) + P)) / 2.)
+        ((h - (P + theme::TITLE_LINE + S2 + 46. + theme::CAPTION_LINE + notes_h(g) + P)) / 2.)
             .clamp(30., empty_quota_radius(data))
     } else {
         context_quota_radius
@@ -4336,7 +4281,7 @@ fn figure(
             y + P + theme::TITLE_LINE,
         )
     } else if expanded {
-        let sat = y + h - 84. - legend_gap;
+        let sat = y + h - 84. - notes_gap;
         let below_chart = expanded_chart_bottom + 33.;
         let above_gauges = sat - 36.;
         (
@@ -4348,7 +4293,7 @@ fn figure(
     } else if let (Some(pay), Some(sat)) = (collapsed_pay_y, collapsed_sat_cy) {
         (sat, pay)
     } else {
-        (y + h - 84. - legend_gap, y + h - 120. - legend_gap)
+        (y + h - 84. - notes_gap, y + h - 120. - notes_gap)
     };
     if g["compacting"].is_object() {
         if let Some(high) = g["compacting"]["usual"]["high"]
@@ -4392,7 +4337,6 @@ fn figure(
         quota_radius,
         sat_cy + quota_radius + S4,
         theme::CAPTION_SIZE,
-        has_legend(g) && legend_drawn,
         t,
     );
     Some((ceiling_y, ring_bounds, ring_group, ring_formula_avail, None))
@@ -4450,7 +4394,6 @@ fn draw_context_strip(
         16.,
         y + h - 28.,
         10.,
-        false,
         t,
     );
     (None, None, None, None, None)
@@ -4522,7 +4465,7 @@ fn draw_context_mid(
     let label_below = gauge_r + 12.;
     let details_gap = S3;
     let details_h = 6.;
-    // The trend and payback line, under the legend. "N by CSR" sits in the title row instead.
+    // The trend and payback line, under the notes line. "N by CSR" sits in the title row instead.
     let mut details = Vec::new();
     if let Some(trend) = g["trend"].as_f64() {
         details.push(format!(
@@ -4535,7 +4478,7 @@ fn draw_context_mid(
     if !pay.is_empty() {
         details.push(pay);
     }
-    let right_bare = gauge_r + label_below + theme::CAPTION_LINE + legend_h(g);
+    let right_bare = gauge_r + label_below + theme::CAPTION_LINE + notes_h(g);
     let right_full = right_bare + details_gap + details_h;
     // The line takes its room from the card or is not drawn: it never hangs below the card.
     // The compaction bar sits where the line would, so it keeps the room too.
@@ -4566,7 +4509,7 @@ fn draw_context_mid(
     let details_y = if right_h == right_bare {
         group_bottom
     } else {
-        gauge_label_y + theme::CAPTION_LINE + legend_h(g) + details_gap + 2.
+        gauge_label_y + theme::CAPTION_LINE + notes_h(g) + details_gap + 2.
     };
 
     let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
@@ -4615,7 +4558,6 @@ fn draw_context_mid(
         gauge_r,
         gauge_label_y,
         theme::CAPTION_SIZE,
-        has_legend(g),
         t,
     );
 
@@ -4796,7 +4738,7 @@ pub fn strip(
         let st = sans(10., t.medium);
         c.text(f, &f.fit(&pay, st, w - 86.), 76., 37., st, t.mint, A::L);
     }
-    quota_row(&mut c, f, data, 76., w - 86., 65., 16., 93., 8., false, t);
+    quota_row(&mut c, f, data, 76., w - 86., 65., 16., 93., 8., t);
     Some(c.pm)
 }
 
@@ -5225,8 +5167,29 @@ mod tests {
         );
     }
 
+    /// Pixels within `tol` of `ink` in a band of rows (layout pt) across the card.
+    fn ink_px(
+        pm: &tiny_skia::Pixmap,
+        rows: (f32, f32),
+        scale: f32,
+        left: u32,
+        w: u32,
+        ink: Rgba,
+    ) -> usize {
+        let near =
+            |p: &[u8], c: [u8; 4]| (0..3).all(|i| (i32::from(p[i]) - i32::from(c[i])).abs() <= 6);
+        let mut n = 0;
+        for y in (rows.0 * scale) as u32..(rows.1 * scale) as u32 {
+            for x in left..(left + w).min(pm.width()) {
+                let px = pm.pixel(x, y).expect("in the picture");
+                n += usize::from(near(&[px.red(), px.green(), px.blue()], ink));
+            }
+        }
+        n
+    }
+
     #[test]
-    fn every_drawn_circle_has_its_own_tap_and_a_legend_sits_under_the_row() {
+    fn every_drawn_circle_has_its_own_tap_and_its_swatch_sits_in_its_caption() {
         let c = quota_composition();
         for theme in [Theme::Dark, Theme::Light] {
             let t = theme.tokens();
@@ -5247,35 +5210,52 @@ mod tests {
             for pair in taps.windows(2) {
                 assert!(pair[0].2 <= pair[1].0 + 0.01, "taps overlap: {pair:?}");
             }
-            // The legend: filled Claude-orange swatch below every tap, none of it amber.
+            // The swatch is in the caption, not in a row of its own: each slot's caption band
+            // (the two caption lines under its ring) holds the colour its ring is drawn in.
             let scale = (width as f32 / W).min(avail as f32 / m.height);
             let left = (width as f32 - (W * scale).round().min(width as f32)) / 2.;
-            let band = (
-                (taps[0].3 * scale).ceil() as u32,
-                ((taps[0].3 + LEGEND_H + 8.) * scale) as u32,
-            );
-            let near = |p: &[u8], c: [u8; 4]| {
-                (0..3).all(|i| (i32::from(p[i]) - i32::from(c[i])).abs() <= 6)
-            };
-            let (mut orange, mut amber) = (0, 0);
-            for y in band.0..band.1 {
-                for x in left as u32..(left as u32 + (W * scale) as u32).min(width) {
-                    let px = pm.pixel(x, y).expect("in the picture");
-                    let rgb = [px.red(), px.green(), px.blue()];
-                    orange += usize::from(near(&rgb, t.claude));
-                    amber += usize::from(near(&rgb, t.amber));
-                }
+            for (i, (code, ink)) in [("5H", t.claude), ("7D", t.claude), ("cache", t.mint)]
+                .into_iter()
+                .enumerate()
+            {
+                let tap = taps[i];
+                let band = (tap.3 - 2. * theme::CAPTION_LINE - S1, tap.3);
+                let slot = ((tap.2 - tap.0) * scale) as u32;
+                let found = ink_px(
+                    &pm,
+                    band,
+                    scale,
+                    (tap.0 * scale).max(left) as u32,
+                    slot,
+                    ink,
+                );
+                assert!(
+                    found >= 15,
+                    "{theme:?}: {found} {code}-coloured px in its caption"
+                );
+                let amber = ink_px(
+                    &pm,
+                    band,
+                    scale,
+                    (tap.0 * scale).max(left) as u32,
+                    slot,
+                    t.amber,
+                );
+                assert_eq!(amber, 0, "{theme:?}: {code} caption has warning amber");
             }
-            assert!(
-                orange >= 20,
-                "{theme:?}: {orange} Claude-orange px in the legend band"
+            // Nothing under the captions: the old legend row's band is empty of swatch colour.
+            let below = (taps[0].3 + 1., taps[0].3 + NOTES_H);
+            let width_px = (W * scale) as u32;
+            assert_eq!(
+                ink_px(&pm, below, scale, left as u32, width_px, t.claude),
+                0,
+                "{theme:?}: a legend row is still drawn under the captions"
             );
-            assert_eq!(amber, 0, "{theme:?}: warning amber in the legend band");
         }
     }
 
     /// Every pane height a terminal can give, as frames whose figure card is a full card (tall
-    /// enough for the mid layout; a shorter one is the strip, which has no legend and no caption):
+    /// enough for the mid layout; a shorter one is the strip, which has no notes line and no caption):
     /// the figure's top and height, and the frame's metrics.
     fn figure_sweep(c: &Composition, open: Open) -> Vec<(f32, f32, Metrics)> {
         let closed = !open.figure;
@@ -5295,54 +5275,6 @@ mod tests {
             }
         }
         out
-    }
-
-    #[test]
-    fn the_legend_stays_under_the_circles_when_the_figure_is_short() {
-        let c = quota_composition();
-        for open in [
-            Open::default(),
-            Open {
-                figure: true,
-                ..Open::default()
-            },
-        ] {
-            let frames = figure_sweep(&c, open);
-            assert!(frames.len() > 30, "{} frames drawn", frames.len());
-            // The sweep reaches the plot under the ring and the expanded chart, not only the mid
-            // layout.
-            let kinds =
-                |f: &dyn Fn(&Metrics) -> bool| frames.iter().filter(|(_, _, m)| f(m)).count();
-            if open.figure {
-                assert!(kinds(&|m| m.ring_bounds.is_none() && m.mid_layout.is_none()) > 3);
-            } else {
-                assert!(kinds(&|m| m.ring_bounds.is_some() && !m.fresh_plots.is_empty()) > 0);
-            }
-            for (top, h, m) in &frames {
-                // A full ring on a card with no spare room keeps the ring: the legend takes only
-                // room that is spare there (see `figure`). Every other card shows it.
-                let spare = h - collapsed_context_layout(&c.figure, *h).2;
-                if m.ring_bounds.is_some()
-                    && m.fresh_plots.is_empty()
-                    && spare < legend_h(&c.figure) + S2
-                {
-                    continue;
-                }
-                assert_eq!(
-                    m.legend_rows.len(),
-                    1,
-                    "figure={}: figure card {h:.1}pt has no legend row",
-                    open.figure
-                );
-                let row = m.legend_rows[0];
-                assert!(
-                    *top < row && row < top + h,
-                    "figure={}: legend row {row:.1} outside the card {top:.1}..{:.1}",
-                    open.figure,
-                    top + h
-                );
-            }
-        }
     }
 
     #[test]
