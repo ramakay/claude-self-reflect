@@ -1637,23 +1637,37 @@ fn quota_fact(q: &Value) -> String {
         None => line,
     }
 }
-/// The agents bar's words: how many active agents are stalled, then the name of one agent. A
-/// live agent's name leads; when every active agent is stalled the first stalled one is named, so
-/// the count never trails an empty name. An agent with no description has no name to show, and
-/// then no dot is drawn either.
-fn agents_bar_label(agents: &[agents::Agent], now: f64) -> String {
+/// The name an agent shows under, when it has one.
+fn agent_name(a: &agents::Agent) -> Option<&str> {
+    Some(a.description.trim()).filter(|n| !n.is_empty())
+}
+/// The agents bar's words, and whether they warn. Nothing stalled: how many agents run and the
+/// name of the newest, in plain ink. One or more stalled: the count and the name of a stalled
+/// agent (the one stuck longest), in the warning. An agent with no description has no name to
+/// show, and then no dot is drawn either.
+fn agents_bar(agents: &[agents::Agent], now: f64) -> (String, bool) {
     let active = || agents.iter().filter(|a| agents::is_active(a));
-    let stalled = active().filter(|a| agents::stalled(a, now)).count();
-    let name = |a: &&agents::Agent| a.description.trim().to_owned();
-    let shown = active()
-        .filter(|a| !agents::stalled(a, now))
-        .map(|a| name(&a))
-        .chain(active().map(|a| name(&a)))
-        .find(|n| !n.is_empty());
-    match shown {
-        Some(name) => format!("{stalled} stalled · {name}"),
-        None => format!("{stalled} stalled"),
-    }
+    let stalled: Vec<_> = active().filter(|a| agents::stalled(a, now)).collect();
+    let (count, word, shown) = if stalled.is_empty() {
+        let newest = active()
+            .filter(|a| agent_name(a).is_some())
+            .max_by(|a, b| a.first_seen.total_cmp(&b.first_seen));
+        (
+            active().count(),
+            "running",
+            newest.and_then(|a| agent_name(a)),
+        )
+    } else {
+        let mut by_age = stalled.clone();
+        by_age.sort_by(|a, b| a.last_at.total_cmp(&b.last_at));
+        let longest = by_age.iter().find_map(|a| agent_name(a));
+        (stalled.len(), "stalled", longest)
+    };
+    let text = match shown {
+        Some(name) => format!("{count} {word} · {name}"),
+        None => format!("{count} {word}"),
+    };
+    (text, !stalled.is_empty())
 }
 fn agent_lines(c: &Composition) -> Vec<String> {
     c.agents
@@ -3686,15 +3700,21 @@ pub fn draw(
             );
             x += S5;
         }
+        let (words, warns) = agents_bar(&c.agents.agents, c.now);
+        let (words, ink) = if warns {
+            (format!("{} {words}", Icon::TriangleAlert.glyph()), t.amber)
+        } else {
+            (words, t.quiet)
+        };
         single(
             &mut canvas,
             f,
-            &agents_bar_label(&c.agents.agents, c.now),
+            &words,
             x + S2,
             y + P + f.cap(body),
             W - x - 40.,
             11.5,
-            t.amber,
+            ink,
             t,
         );
         canvas.cut_title = recording;
@@ -4555,7 +4575,8 @@ fn draw_context_mid(
     let gauge_r = (r * 0.32).clamp(16., if variable_history { 20. } else { 30. });
 
     let label_below = gauge_r + 12.;
-    let details_gap = S3;
+    // Under a forecast line the lines are already apart: the gap shrinks so the bar keeps its room.
+    let details_gap = if has_notes(g) { S1 } else { S3 };
     let details_h = 6.;
     // The trend and payback line, under the notes line. "N by CSR" sits in the title row instead.
     // The breakdown's words take a line of their own; the median change and the payback share one.
@@ -5235,30 +5256,84 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_bar_names_an_agent_when_every_active_one_is_stalled() {
+    fn the_agents_bar_warns_only_of_stalled_agents_and_names_one_of_them() {
         let now = 1_800_000_000.;
         let stalled_at = 1_799_999_000_000_i64;
         let live_at = 1_799_999_990_000_i64;
-        // The bug: one stalled agent, nothing else live, read "1 stalled · " with no name.
+        let said = |a: &[agents::Agent]| agents_bar(a, now).0;
+        // Nothing stalled: running agents, plainly. No warning word, no "stalled" at all.
+        let one = [agent_at("Fresh scan", "running", live_at)];
+        assert_eq!(said(&one), "1 running · Fresh scan");
+        let mut two = vec![
+            agent_at("Early scan", "running", live_at),
+            agent_at("Late scan", "running", live_at - 5000),
+        ];
+        two[0].first_seen -= 100_000.;
+        assert_eq!(
+            said(&two),
+            "2 running · Late scan",
+            "the newest agent is named"
+        );
+        let waiting = [agent_at("  ", "waiting", live_at)];
+        assert_eq!(said(&waiting), "1 running");
+        // One stalled agent: the warning, naming that agent even when a live one is newer.
         let only = [agent_at("Scan the repo", "running", stalled_at)];
-        assert_eq!(agents_bar_label(&only, now), "1 stalled · Scan the repo");
-        // A live agent still leads the name; the count is of the stalled ones.
+        assert_eq!(said(&only), "1 stalled · Scan the repo");
         let mixed = [
             agent_at("Old build", "running", stalled_at),
             agent_at("Fresh scan", "running", live_at),
         ];
-        assert_eq!(agents_bar_label(&mixed, now), "1 stalled · Fresh scan");
-        let none = [agent_at("Fresh scan", "running", live_at)];
-        assert_eq!(agents_bar_label(&none, now), "0 stalled · Fresh scan");
-        // No name anywhere: no dot after the count.
+        assert_eq!(said(&mixed), "1 stalled · Old build");
+        // Several stalled: the one stuck longest is named.
+        let many = [
+            agent_at("Stuck a while", "running", stalled_at + 300_000),
+            agent_at("Stuck longest", "running", stalled_at),
+            agent_at("Fresh scan", "running", live_at),
+        ];
+        assert_eq!(said(&many), "2 stalled · Stuck longest");
+        // A stalled agent with no name leaves no dot, and another stalled name is used if any.
         let nameless = [agent_at("  ", "running", stalled_at)];
-        assert_eq!(agents_bar_label(&nameless, now), "1 stalled");
-        // A finished agent is not active, so it is neither counted nor named.
+        assert_eq!(said(&nameless), "1 stalled");
+        let some = [
+            agent_at("  ", "running", stalled_at),
+            agent_at("Named", "running", stalled_at + 1000),
+        ];
+        assert_eq!(said(&some), "2 stalled · Named");
+        // A finished agent is neither counted nor named.
         let done = [
             agent_at("Old build", "completed", stalled_at),
             agent_at("Stuck", "running", stalled_at),
         ];
-        assert_eq!(agents_bar_label(&done, now), "1 stalled · Stuck");
+        assert_eq!(said(&done), "1 stalled · Stuck");
+    }
+
+    #[test]
+    fn the_agents_bar_is_amber_only_when_an_agent_is_stalled() {
+        let stalled_at = 1_799_999_000_000_i64;
+        let live_at = 1_799_999_990_000_i64;
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let amber_in_bar = |rows: Vec<agents::Agent>| {
+                let mut c = quota_composition();
+                c.now = 1_800_000_000.;
+                c.agents.agents = rows;
+                let (width, avail) = (1210_u32, 2000_u32);
+                let (pm, m) = draw(&c, width, avail, theme, Open::default(), false).expect("draws");
+                let scale = (width as f32 / W).min(avail as f32 / m.height);
+                let left = ((width as f32 - (W * scale).round().min(width as f32)) / 2.) as u32;
+                let (y, h) = m.agents_region.expect("an agents bar");
+                ink_px(&pm, (y, y + h), scale, left, (W * scale) as u32, t.amber)
+            };
+            assert_eq!(
+                amber_in_bar(vec![agent_at("Fresh scan", "running", live_at)]),
+                0,
+                "{theme:?}: a bar with nothing stalled has no warning ink"
+            );
+            assert!(
+                amber_in_bar(vec![agent_at("Old build", "running", stalled_at)]) > 40,
+                "{theme:?}: a stalled agent is drawn in the warning ink"
+            );
+        }
     }
 
     fn quota_composition() -> Composition {
@@ -5530,6 +5605,40 @@ mod tests {
             "turn": null, "estimated": true,
         });
         c
+    }
+
+    #[test]
+    fn a_forecast_never_takes_the_breakdown_bars_row_in_the_mid_card() {
+        let mut c = breakdown_composition();
+        for q in c.figure["quotas"].as_array_mut().unwrap() {
+            q["forecast"] = json!({"text": "→ ~15% at reset", "out": false});
+        }
+        let mut no_forecast = breakdown_composition();
+        no_forecast.figure["quotas"] = c.figure["quotas"].clone();
+        for q in no_forecast.figure["quotas"].as_array_mut().unwrap() {
+            q.as_object_mut().unwrap().remove("forecast");
+        }
+        // The live 44x30 pane's closed card is 163pt tall: the mid layout, a forecast under the
+        // circles, the caption and the bar all in it.
+        let mut checked = 0;
+        for (comp, forecast) in [(&c, true), (&no_forecast, false)] {
+            for (top, h, m) in figure_sweep(comp, Open::default()) {
+                if m.mid_layout.is_none() || h < 160. {
+                    continue;
+                }
+                checked += 1;
+                assert_eq!(m.note_rows.len(), usize::from(forecast), "card {h:.1}pt");
+                assert_eq!(
+                    m.breakdown_bars.len(),
+                    1,
+                    "card {h:.1}pt at {top:.1}: forecast={forecast}: no breakdown bar"
+                );
+            }
+        }
+        assert!(
+            checked >= 4,
+            "{checked} mid cards of 160pt or more were swept"
+        );
     }
 
     #[test]

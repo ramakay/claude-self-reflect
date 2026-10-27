@@ -1974,9 +1974,12 @@ fn the_reset_forecast_shows_with_enough_history_and_says_nothing_without() {
     for (cols, rows) in [(76, 67), (44, 30)] {
         let (_home, paths) = state_home("02-running");
         // No history file: the window shows its percentage and no projection.
-        assert!(
-            frame(&paths, cols, rows).note_rows.is_empty(),
-            "{cols}x{rows}"
+        let m = frame(&paths, cols, rows);
+        assert!(m.note_rows.is_empty(), "{cols}x{rows}");
+        assert_eq!(
+            m.breakdown_bars.len(),
+            1,
+            "{cols}x{rows}: bar without a forecast"
         );
         // Five readings are too few.
         let history = paths.keep.join("usage-history.jsonl");
@@ -1995,6 +1998,12 @@ fn the_reset_forecast_shows_with_enough_history_and_says_nothing_without() {
         fs::write(&history, &enough).unwrap();
         let m = frame(&paths, cols, rows);
         assert_eq!(m.note_rows.len(), 1, "{cols}x{rows}: forecast line");
+        // The forecast line never takes the breakdown bar's row.
+        assert_eq!(
+            m.breakdown_bars.len(),
+            1,
+            "{cols}x{rows}: bar with a forecast"
+        );
     }
 }
 
