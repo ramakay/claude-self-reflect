@@ -144,15 +144,17 @@ const CE_ONNX_FILE: &str = "model_qint8_arm64.onnx";
 /// preserves label frequency, not label correctness: the labels still describe
 /// margin, and the inverted-label defect on exact answers is not addressed.
 pub const CE_TUNED_BANDS: &[(&str, CeBands)] = &[(
-    // tuned-run2 (ettin-tune), fit on the 310 audit queries.
+    // tuned-run2 (ettin-tune), fit on the 310 audit queries run on the Apple
+    // laptop CPU. The same ONNX scores on a Mac Studio differ (narrower, other
+    // rank-1s), so these bands are for the machine they were fit on.
     "73b9d13ac00020e657dc43319a9717fbf0fc10d7243ad5710d48837c6137abab",
     CeBands {
-        gap_high: 2.52,
-        gap_good: 1.72,
-        gap_tie: 0.145,
-        spread_high: 5.34,
-        spread_good: 4.32,
-        spread_partial: 2.86,
+        gap_high: 4.21,
+        gap_good: 3.03,
+        gap_tie: 0.215,
+        spread_high: 7.355,
+        spread_good: 6.01,
+        spread_partial: 3.98,
     },
 )];
 
@@ -3099,18 +3101,19 @@ mod tests {
 
     #[test]
     fn ce_tuned_run2_entry_holds_the_quantile_matched_bands() {
-        // Fit: 281 shipped-model recalls vs 280 tuned-run2 recalls of the 310
-        // audit queries; each constant moved to the tuned value at the
-        // percentile the shipped constant sits at.
+        // Fit: the 281 recalls with a cross-encoder summary of the 310 audit
+        // queries, shipped model vs tuned-run2, both run on this laptop's CPU
+        // over the same database clone; each constant moved to the tuned
+        // value at the percentile the shipped constant sits at.
         assert_eq!(CE_TUNED_BANDS.len(), 1);
         let (sha, bands) = CE_TUNED_BANDS[0];
         assert_eq!(sha, TUNED_RUN2_SHA);
-        assert_eq!(bands.gap_high, 2.52);
-        assert_eq!(bands.gap_good, 1.72);
-        assert_eq!(bands.gap_tie, 0.145);
-        assert_eq!(bands.spread_high, 5.34);
-        assert_eq!(bands.spread_good, 4.32);
-        assert_eq!(bands.spread_partial, 2.86);
+        assert_eq!(bands.gap_high, 4.21);
+        assert_eq!(bands.gap_good, 3.03);
+        assert_eq!(bands.gap_tie, 0.215);
+        assert_eq!(bands.spread_high, 7.355);
+        assert_eq!(bands.spread_good, 6.01);
+        assert_eq!(bands.spread_partial, 3.98);
         assert_eq!(CeBands::lookup(TUNED_RUN2_SHA, CE_TUNED_BANDS), bands);
     }
 
@@ -3120,11 +3123,11 @@ mod tests {
         // spreads): (top, runner-up, median, shipped label, tuned label).
         let tuned = CeBands::lookup(TUNED_RUN2_SHA, CE_TUNED_BANDS);
         let rows = [
-            (6.0, Some(3.0), 0.0, "high", "high"),
-            (5.0, Some(3.0), 0.0, "high", "good"),
+            (9.0, Some(4.0), 0.0, "high", "high"),
+            (7.0, Some(3.5), 0.0, "high", "good"),
             (3.0, Some(2.0), 0.0, "good", "partial"),
             (2.0, Some(1.9), 0.0, "partial", "weak"),
-            (4.0, None, 0.0, "good", "partial"),
+            (5.0, None, 0.0, "good", "partial"),
         ];
         for (top, runner_up, median, shipped_label, tuned_label) in rows {
             let summary = CeSummary {
