@@ -1393,6 +1393,7 @@ async fn reflect_on_past_with_vec_in_scope_mode(
         &page.display_rank_scores,
         page.ce.as_ref(),
     );
+    let xml = annotate_cross_source(xml, page.cross_source_collapsed);
     // Session attributes appear only while the episode channel runs; with it
     // off the page is the chunk-only page, byte for byte.
     if search_mode == SearchMode::Hybrid && crate::search::episodes::channel_active(storage) {
@@ -1409,6 +1410,8 @@ struct FinalPage {
     search_ms: u64,
     /// Cross-encoder summary of the recall; `None` off the CE path.
     ce: Option<format::CeSummary>,
+    /// Codex rows left out because a Claude session row carries the same text.
+    cross_source_collapsed: usize,
 }
 
 /// Candidates fetched from each keyword lane to fill a page of `n` rows: four
@@ -1453,6 +1456,8 @@ struct SettledPool {
     /// frozen: a pool rebuilt wider keeps these rows, in this order, and only
     /// what follows them is new.
     published: usize,
+    /// Codex rows the cross-source dedupe left out of this pool.
+    cross_source_collapsed: usize,
 }
 
 impl SettledPool {
@@ -1488,6 +1493,7 @@ impl SettledPool {
             search_ms: fresh.search_ms,
             ce: fresh.ce,
             exhausted: fresh.exhausted,
+            cross_source_collapsed: fresh.cross_source_collapsed,
         }
     }
 }
@@ -1728,6 +1734,7 @@ async fn reflect_final_page(
         display_rank_scores: pool.display_rank_scores,
         search_ms: pool.search_ms,
         ce: pool.ce,
+        cross_source_collapsed: pool.cross_source_collapsed,
     })
 }
 
@@ -1831,6 +1838,7 @@ async fn settled_pool(
         ce: pass.ce,
         exhausted: !pass.window_full,
         published: 0,
+        cross_source_collapsed: pass.cross_source_collapsed,
     })
 }
 
@@ -1856,6 +1864,8 @@ struct GatherPass {
     /// Cross-encoder summary over the pooled sessions (hybrid, CE policy,
     /// model available); `None` otherwise.
     ce: Option<format::CeSummary>,
+    /// Codex rows dropped because a Claude session row has the same text.
+    cross_source_collapsed: usize,
 }
 
 /// Compute the exact score used by recall reranking, including its conversation
@@ -2136,6 +2146,103 @@ fn ce_reorder_with_representatives(
         }
     }
     ordered
+}
+
+/// Key of a chunk's text for the cross-source dedupe: whitespace collapsed,
+/// lower-cased, the keyword-lane marker removed, hashed.
+fn cross_source_key(content: &str) -> [u8; 32] {
+    let text = content.strip_prefix("[keyword] ").unwrap_or(content);
+    let normalized = text.to_lowercase();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    *blake3::hash(collapsed.as_bytes()).as_bytes()
+}
+
+/// Leave a Codex rollout row out of `enriched` when a Claude session row
+/// (stored source `conversation` or `sidechain`) carries the same normalized
+/// text; the Claude row is the origin and keeps the row, the same way a parent
+/// session beats its sidechain. When the Codex copy ranked higher, the origin
+/// row takes that place, so the text keeps its best rank. Runs before the page
+/// cut, so the freed slots refill from the pool. Returns how many rows it left out. A row whose
+/// source is unknown never collapses.
+fn collapse_cross_source_duplicates(
+    enriched: &mut Vec<EnrichedResult>,
+    source_of: impl Fn(&str) -> Option<String>,
+) -> usize {
+    let mut groups: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+    for (index, row) in enriched.iter().enumerate() {
+        if row.chunk.content.trim().is_empty() {
+            continue;
+        }
+        groups
+            .entry(cross_source_key(&row.chunk.content))
+            .or_default()
+            .push(index);
+    }
+    let mut dropped: HashSet<usize> = HashSet::new();
+    for members in groups.values().filter(|members| members.len() > 1) {
+        let sources: Vec<Option<String>> = members
+            .iter()
+            .map(|index| source_of(&enriched[*index].chunk.id))
+            .collect();
+        let is_origin = |source: &Option<String>| {
+            matches!(source.as_deref(), Some("conversation" | "sidechain"))
+        };
+        let Some(keeper) = members
+            .iter()
+            .zip(&sources)
+            .filter(|(_, source)| is_origin(source))
+            .map(|(index, _)| *index)
+            .min()
+        else {
+            continue;
+        };
+        let mut codex: Vec<usize> = members
+            .iter()
+            .zip(&sources)
+            .filter(|(_, source)| source.as_deref() == Some("codex_rollout"))
+            .map(|(index, _)| *index)
+            .collect();
+        let Some(first) = codex.iter().copied().min() else {
+            continue;
+        };
+        // The text ranked at the Codex row's place: the origin row takes that
+        // place and its score, and the Codex row goes to the origin's old one.
+        if first < keeper {
+            let placed = enriched[first].score;
+            enriched.swap(first, keeper);
+            if enriched[first].score < placed {
+                enriched[first].score = placed;
+            }
+            for index in codex.iter_mut().filter(|index| **index == first) {
+                *index = keeper;
+            }
+        }
+        dropped.extend(codex);
+    }
+    if dropped.is_empty() {
+        return 0;
+    }
+    let mut index = 0;
+    enriched.retain(|_| {
+        let keep = !dropped.contains(&index);
+        index += 1;
+        keep
+    });
+    dropped.len()
+}
+
+/// Add the per-search cross-source collapse counter to the `<meta>` block of a
+/// rendered page. Absent when nothing collapsed, so a page without the event
+/// is byte for byte what it was.
+fn annotate_cross_source(xml: String, collapsed: usize) -> String {
+    if collapsed == 0 {
+        return xml;
+    }
+    xml.replacen(
+        "  </meta>\n",
+        &format!("    <cross-source-collapsed>{collapsed}</cross-source-collapsed>\n  </meta>\n"),
+        1,
+    )
 }
 
 /// Warn about a cross-encoder failure once per process, not once per query.
@@ -3563,6 +3670,11 @@ async fn reflect_gather_pass(
         })
         .collect();
     format::dedupe_sidechain_origins(&mut enriched, &parent_of);
+    // The same text imported from a Codex rollout and from a Claude session is
+    // one memory: the Claude session is the origin and keeps the row.
+    let cross_source_collapsed = collapse_cross_source_duplicates(&mut enriched, |id| {
+        storage.get_chunk_source(id).ok().flatten()
+    });
 
     if crate::mcp::stage_probe::is_active() {
         let ranked: Vec<(String, String, f32)> = enriched
@@ -3604,6 +3716,7 @@ async fn reflect_gather_pass(
         echo_dropped: echo_dropped.len(),
         search_ms,
         ce,
+        cross_source_collapsed,
     })
 }
 
@@ -9401,6 +9514,165 @@ mod tests {
         assert!(output.contains("<id>fts-parent</id>"), "{output}");
         assert!(output.contains("<id>fts-extra-"), "{output}");
         assert!(!output.contains("<id>fts-child-"), "{output}");
+    }
+
+    fn f1b_chunk(
+        id: &str,
+        conversation_id: &str,
+        content: &str,
+    ) -> crate::import::ConversationChunk {
+        crate::import::ConversationChunk {
+            id: id.into(),
+            conversation_id: conversation_id.into(),
+            project_name: "test".into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        }
+    }
+
+    async fn f1b_fts_search(storage: &Arc<Storage>, query: &str, limit: usize) -> String {
+        let search = Arc::new(RwLock::new(SearchEngine::new(8)));
+        reflect_on_past_with_vec(
+            storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            query,
+            limit,
+            0.1,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn f1b_dedupe_codex_and_claude_identical_text_collapse_to_origin() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let codex = f1b_chunk(
+            "f1b-codex",
+            "codex-session",
+            "Dedupetoken the   rollout NOTES say the gate is green",
+        );
+        storage
+            .insert_chunk_with_source(&codex, &[0.0; 4], "codex_rollout")
+            .unwrap();
+        let claude = f1b_chunk(
+            "f1b-claude",
+            "claude-session",
+            "dedupetoken the rollout notes say\nthe gate is green",
+        );
+        storage
+            .insert_chunk_with_source(&claude, &[0.0; 4], "conversation")
+            .unwrap();
+
+        let output = f1b_fts_search(&storage, "dedupetoken", 5).await;
+        assert!(output.contains("<count>1</count>"), "{output}");
+        assert!(output.contains("<cid>claude-session</cid>"), "{output}");
+        assert!(!output.contains("codex-session"), "{output}");
+        assert!(
+            output.contains("<cross-source-collapsed>1</cross-source-collapsed>"),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f1b_dedupe_different_text_not_collapsed() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let codex = f1b_chunk(
+            "f1b-codex",
+            "codex-session",
+            "dedupetoken the gate is green",
+        );
+        storage
+            .insert_chunk_with_source(&codex, &[0.0; 4], "codex_rollout")
+            .unwrap();
+        let claude = f1b_chunk(
+            "f1b-claude",
+            "claude-session",
+            "dedupetoken the gate is red",
+        );
+        storage
+            .insert_chunk_with_source(&claude, &[0.0; 4], "conversation")
+            .unwrap();
+
+        let output = f1b_fts_search(&storage, "dedupetoken", 5).await;
+        assert!(output.contains("<count>2</count>"), "{output}");
+        assert!(output.contains("codex-session"), "{output}");
+        assert!(output.contains("claude-session"), "{output}");
+        assert!(!output.contains("cross-source-collapsed"), "{output}");
+    }
+
+    #[test]
+    fn f1b_dedupe_origin_row_takes_the_best_rank_of_the_text() {
+        let row = |id: &str, text: &str, score: f32| EnrichedResult {
+            score,
+            chunk: f1b_chunk(id, id, text),
+            resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
+            validity_demoted: false,
+        };
+        let source = |id: &str| match id {
+            "codex-a" | "codex-b" => Some("codex_rollout".to_string()),
+            "claude-a" => Some("conversation".to_string()),
+            "other" => Some("sidechain".to_string()),
+            _ => None,
+        };
+        let mut rows = vec![
+            row("codex-a", "the Answer  text", 0.9),
+            row("other", "something else", 0.8),
+            row("claude-a", "the answer text", 0.7),
+            row("codex-b", "unmatched codex text", 0.6),
+        ];
+        let collapsed = collapse_cross_source_duplicates(&mut rows, source);
+        assert_eq!(collapsed, 1);
+        let ids: Vec<&str> = rows.iter().map(|r| r.chunk.id.as_str()).collect();
+        assert_eq!(ids, ["claude-a", "other", "codex-b"]);
+        assert_eq!(rows[0].score, 0.9);
+        // A Codex copy with no Claude twin stays.
+        let mut alone = vec![row("codex-b", "unmatched codex text", 0.6)];
+        assert_eq!(collapse_cross_source_duplicates(&mut alone, source), 0);
+        assert_eq!(alone.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn f1b_dedupe_refills_slot() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let text = "refilltoken refilltoken refilltoken";
+        let codex = f1b_chunk("f1b-codex", "codex-session", text);
+        storage
+            .insert_chunk_with_source(&codex, &[0.0; 4], "codex_rollout")
+            .unwrap();
+        let claude = f1b_chunk("f1b-claude", "claude-session", text);
+        storage
+            .insert_chunk_with_source(&claude, &[0.0; 4], "conversation")
+            .unwrap();
+        for index in 0..2 {
+            let extra = f1b_chunk(
+                &format!("f1b-extra-{index}"),
+                &format!("f1b-extra-conversation-{index}"),
+                "refilltoken with lower density filler words for an additional result",
+            );
+            storage.insert_chunk(&extra, &[0.0; 4]).unwrap();
+        }
+
+        let output = f1b_fts_search(&storage, "refilltoken", 2).await;
+        assert!(output.contains("<count>2</count>"), "{output}");
+        assert!(output.contains("<id>f1b-claude</id>"), "{output}");
+        assert!(!output.contains("<id>f1b-codex</id>"), "{output}");
+        assert!(output.contains("<id>f1b-extra-"), "{output}");
+        assert!(
+            output.contains("<cross-source-collapsed>1</cross-source-collapsed>"),
+            "{output}"
+        );
     }
 
     #[tokio::test]
