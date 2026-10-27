@@ -1,0 +1,367 @@
+{
+  "spike": "S6F",
+  "verdict": "FAIL",
+  "runner_up": "keep chunks, session max only; episodes stay S8's unit",
+  "branch_head": "e2f0109b",
+  "commits": [
+    "e79a587a",
+    "759281e3",
+    "e2f0109b"
+  ],
+  "binary": {
+    "path": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/.testbed/core-rewrite/bin/csr-engine-s6f",
+    "sha256": "ae71b15bbb913fbd5ffe754815201293ea8009e537f0e8bbc75c422c9e27d92d",
+    "built_from": "759281e3 + episodes.rs before rustfmt (e2f0109b = that tree after rustfmt only)"
+  },
+  "row_items": {
+    "conv_id_match_rate": 0.9016050244242847,
+    "conv_id_required": 0.95,
+    "conv_id_round0": 0.9086,
+    "coverage": {
+      "denominator": 3198,
+      "with_episode": 1292,
+      "rate": 0.404,
+      "round0": 1292
+    },
+    "skipped_csr_agent_files": 18968,
+    "gate_sample": {
+      "n": 50,
+      "genuine": 50,
+      "false_skip": 0,
+      "other": 0
+    },
+    "gate_full": {
+      "genuine": 18968,
+      "false_skip": 0
+    },
+    "rechecked_agent_watermarks": 18968,
+    "skipped_conflicting_conversation_id": 62,
+    "drops": {
+      "hook_success": 98573,
+      "hook_additional_context": 177,
+      "relevant_memories": 0,
+      "away_summary": 186,
+      "is_compact_summary": 145,
+      "api_request": 68968
+    },
+    "drops_round0": {
+      "hook_success": 203540,
+      "hook_additional_context": 19737,
+      "relevant_memories": 0,
+      "away_summary": 843,
+      "is_compact_summary": 540,
+      "api_request": 99227
+    },
+    "drops_note": "round-1 build ran over existing watermarks (episodes_written 5851); counts are per-build, lower than round 0 on every non-zero type",
+    "episodes": 9477,
+    "session_cards": 1433,
+    "reparsed_from_zero": 0
+  },
+  "episode_vectors": {
+    "generation": 1,
+    "basename": "episodes-g1",
+    "count": 9477,
+    "missing": 0,
+    "stale": 0,
+    "blake3_ok": true,
+    "prefixes": [
+      "granite-fp32-384-episodes n=9376",
+      "granite-fp32-384-delta-00 n=101"
+    ],
+    "delta_parts": 1,
+    "delta_parts_done": 1
+  },
+  "runs": {
+    "dense": {
+      "file": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/.testbed/core-rewrite/s6f/smoke.json",
+      "rank1": 9,
+      "rank1_probe_ids": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        12
+      ],
+      "chunk_mrr5": 0.791667,
+      "session_mrr5": 0.833333,
+      "episode_eid_rank1": 0,
+      "episode_eid_any_rank": 0,
+      "latency": {
+        "n": 12,
+        "p50_ms": 1417.898,
+        "p95_ms": 4076.707
+      },
+      "binary_sha256": "ae71b15bbb913fbd5ffe754815201293ea8009e537f0e8bbc75c422c9e27d92d",
+      "per_probe": [
+        {
+          "id": 1,
+          "hit_rank": null,
+          "session_hit_rank": 2,
+          "rank1_id": "604ab517-bd89-5b9e-b9b3-c6e042b7e70c"
+        },
+        {
+          "id": 2,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "63703eb3-5bb2-5ce1-97b8-a094907c477d"
+        },
+        {
+          "id": 3,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "090ddd67-bd7a-5fab-89f1-67c294424b5a"
+        },
+        {
+          "id": 4,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "3b578a60-316f-55b0-ac6d-ad058599854e"
+        },
+        {
+          "id": 5,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "42ed1111-86d0-503a-ab1e-76003fd51319"
+        },
+        {
+          "id": 6,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "9a4ae3a7-ccba-5b0f-acd3-8e9cec7c865c"
+        },
+        {
+          "id": 7,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "c42d8783-3447-5507-89c1-b9ec06b37d42"
+        },
+        {
+          "id": 8,
+          "hit_rank": 2,
+          "session_hit_rank": 2,
+          "rank1_id": "4dd342de-ac40-5395-877b-0e64bd6dddf5"
+        },
+        {
+          "id": 9,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "c69137a3-1817-5091-a2ec-ae621b38943b"
+        },
+        {
+          "id": 10,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "3a1dd338-2c01-5e24-962e-2d95b5c6d770"
+        },
+        {
+          "id": 11,
+          "hit_rank": null,
+          "session_hit_rank": null,
+          "rank1_id": "17958ef8-af0d-5426-884f-20980c884901"
+        },
+        {
+          "id": 12,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "e2d83e20-694d-54a1-9c9e-afc95e9d737e"
+        }
+      ]
+    },
+    "control_CSR_NO_EPISODE_VECTORS": {
+      "file": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/.testbed/core-rewrite/s6f/smoke-lexical.json",
+      "rank1": 9,
+      "rank1_probe_ids": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        12
+      ],
+      "chunk_mrr5": 0.791667,
+      "session_mrr5": 0.833333,
+      "episode_eid_rank1": 0,
+      "episode_eid_any_rank": 0,
+      "latency": {
+        "n": 12,
+        "p50_ms": 941.305,
+        "p95_ms": 2297.775
+      },
+      "binary_sha256": "ae71b15bbb913fbd5ffe754815201293ea8009e537f0e8bbc75c422c9e27d92d",
+      "per_probe": [
+        {
+          "id": 1,
+          "hit_rank": null,
+          "session_hit_rank": 2,
+          "rank1_id": "604ab517-bd89-5b9e-b9b3-c6e042b7e70c"
+        },
+        {
+          "id": 2,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "63703eb3-5bb2-5ce1-97b8-a094907c477d"
+        },
+        {
+          "id": 3,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "090ddd67-bd7a-5fab-89f1-67c294424b5a"
+        },
+        {
+          "id": 4,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "3b578a60-316f-55b0-ac6d-ad058599854e"
+        },
+        {
+          "id": 5,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "42ed1111-86d0-503a-ab1e-76003fd51319"
+        },
+        {
+          "id": 6,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "9a4ae3a7-ccba-5b0f-acd3-8e9cec7c865c"
+        },
+        {
+          "id": 7,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "c42d8783-3447-5507-89c1-b9ec06b37d42"
+        },
+        {
+          "id": 8,
+          "hit_rank": 2,
+          "session_hit_rank": 2,
+          "rank1_id": "4dd342de-ac40-5395-877b-0e64bd6dddf5"
+        },
+        {
+          "id": 9,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "c69137a3-1817-5091-a2ec-ae621b38943b"
+        },
+        {
+          "id": 10,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "3a1dd338-2c01-5e24-962e-2d95b5c6d770"
+        },
+        {
+          "id": 11,
+          "hit_rank": null,
+          "session_hit_rank": null,
+          "rank1_id": "17958ef8-af0d-5426-884f-20980c884901"
+        },
+        {
+          "id": 12,
+          "hit_rank": 1,
+          "session_hit_rank": 1,
+          "rank1_id": "e2d83e20-694d-54a1-9c9e-afc95e9d737e"
+        }
+      ]
+    },
+    "run2": null,
+    "note": "run1/run2/control bench not run in Verify: spike clock past the 45-min close (55 min at Verify start); numbers are FS3 smoke (dense) and smoke-lexical (control), no --audit, n=12"
+  },
+  "compare": {
+    "control_vs_dense": {
+      "rank1_a": 9,
+      "rank1_b": 9,
+      "rank1_delta": 0,
+      "probe_flips": 0,
+      "flipped_ids": [],
+      "exit": 0
+    },
+    "run1_vs_run2": null
+  },
+  "baseline": {
+    "file": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/.testbed/core-rewrite/rescore/after-s6-rescored.json",
+    "rank1": 9,
+    "rank1_probe_ids": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      12
+    ],
+    "mrr5": 0.791667,
+    "session_mrr5_round0": 0.833,
+    "by_id": [
+      {
+        "id": 1,
+        "base_hit_rank": null,
+        "dense_hit_rank": null
+      },
+      {
+        "id": 2,
+        "base_hit_rank": 1,
+        "dense_hit_rank": 1
+      },
+      {
+        "id": 3,
+        "base_hit_rank": 1,
+        "dense_hit_rank": 1
+      },
+      {
+        "id": 4,
+        "base_hit_rank": 1,
+        "dense_hit_rank": 1
+      },
+      {
+        "id": 5,
+        "base_hit_rank": 1,
+        "dense_hit_rank": 1
+      },
+      {
+        "id": 6,
+        "base_hit_rank": 1,
+        "dense_hit_rank": 1
+      },
+      {
+        "id": 7,
+        "base_hit_rank": 1,
+        "dense_hit_rank": 1
+      },
+      {
+        "id": 8,
+        "base_hit_rank": 2,
+        "dense_hit_rank": 2
+      },
+      {
+        "id": 9,
+        "base_hit_rank": 1,
+        "dense_hit_rank": 1
+      },
+      {
+        "id": 10,
+        "base_hit_rank": 1,
+        "dense_hit_rank": 1
+      },
+      {
+        "id": 11,
+        "base_hit_rank": null,
+        "dense_hit_rank": null
+      },
+      {
+        "id": 12,
+        "base_hit_rank": 1,
+        "dense_hit_rank": 1
+      }
+    ]
+  },
+  "probe_11": "unreachable for every model (log #11)"
+}
