@@ -6131,6 +6131,25 @@ fn run_assertions_stage(
     run_assertions_stage_with(storage, &claims, enriched, session_keys, validity)
 }
 
+/// A cached witness assertion is a copy of a verdict that may since have been
+/// reinstated, or that the consumption mode keeps from ranking. It may sink or
+/// annotate a chunk only while the live validity for that chunk says demote
+/// now. Anything else leaves the chunk to the validity pass: a `[stale anchor]`
+/// or `[evolved]` note without a sink in annotate-only mode, nothing when the
+/// verdict is gone. A demote that only labels CSR text is not a witness verdict.
+fn retain_live_witness_assertions(
+    by_target: &mut HashMap<String, crate::storage::assertions::Assertion>,
+    validity: &HashMap<String, ConvValidity>,
+) {
+    by_target.retain(|id, assertion| {
+        assertion.source != "witness"
+            || assertion.target_kind != "chunk"
+            || validity
+                .get(id)
+                .is_some_and(|v| v.demote && !v.csr_only_demote)
+    });
+}
+
 /// [`run_assertions_stage`] with the claim rules passed in.
 fn run_assertions_stage_with(
     storage: &Storage,
@@ -6158,9 +6177,10 @@ fn run_assertions_stage_with(
             .map(|u| u.session)
             .filter(|s| seen.insert(*s))
             .collect();
-        let by_target = storage
+        let mut by_target = storage
             .assertions_for_targets(&chunk_ids, &session_ids)
             .unwrap_or_default();
+        retain_live_witness_assertions(&mut by_target, validity);
         if by_target.is_empty() && claims.is_empty() {
             return HashSet::new();
         }
@@ -13747,6 +13767,71 @@ mod tests {
         );
         let (sunk, rows) = s9r_run_stage(&storage, &HashMap::new());
         assert_eq!(sunk, HashSet::from(["y".to_string()]));
+        assert!(rows[0].resolution.is_none(), "{:?}", rows[0].resolution);
+    }
+
+    const S9R_WITNESS_X: &str =
+        "INSERT INTO assertions (source,target_kind,target_id,state,receipt)
+         VALUES ('witness','chunk','x','superseded','abc1234');";
+
+    #[test]
+    fn s9r_witness_reinstated_does_not_sink() {
+        // A later anchor_reinstated leaves no live verdict: the validity map
+        // holds nothing for the chunk, so the cached assertion must not sink it.
+        let storage = s9r_stage_store(S9R_WITNESS_X);
+        let (sunk, rows) = s9r_run_stage(&storage, &HashMap::new());
+        assert!(sunk.is_empty(), "{sunk:?}");
+        assert!(rows[0].resolution.is_none(), "{:?}", rows[0].resolution);
+    }
+
+    #[test]
+    fn s9r_witness_annotate_only_mode_does_not_sink() {
+        // Annotate-only or off consumption: validity carries the note but no demote.
+        let storage = s9r_stage_store(S9R_WITNESS_X);
+        let validity: HashMap<String, ConvValidity> = [(
+            "x".to_string(),
+            ConvValidity {
+                demote: false,
+                note: "[stale anchor] foo gone (receipt abc1234)".into(),
+                csr_only_demote: false,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let (sunk, rows) = s9r_run_stage(&storage, &validity);
+        assert!(sunk.is_empty(), "{sunk:?}");
+        assert!(rows[0].resolution.is_none(), "{:?}", rows[0].resolution);
+    }
+
+    #[test]
+    fn s9r_witness_csr_text_demote_does_not_keep_the_assertion() {
+        let storage = s9r_stage_store(S9R_WITNESS_X);
+        let validity: HashMap<String, ConvValidity> = [(
+            "x".to_string(),
+            ConvValidity {
+                demote: true,
+                note: "[CSR text] this chunk holds CSR's own output (f)".into(),
+                csr_only_demote: true,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let (sunk, _) = s9r_run_stage(&storage, &validity);
+        assert!(sunk.is_empty(), "{sunk:?}");
+    }
+
+    #[test]
+    fn s9r_witness_live_demote_still_sinks() {
+        let storage = s9r_stage_store(S9R_WITNESS_X);
+        let validity: HashMap<String, ConvValidity> = [(
+            "x".to_string(),
+            demote_validity("[stale anchor] foo gone (receipt abc1234)"),
+        )]
+        .into_iter()
+        .collect();
+        let (sunk, rows) = s9r_run_stage(&storage, &validity);
+        assert_eq!(sunk, HashSet::from(["x".to_string()]));
+        // The dream note already says it; the assertion does not repeat it.
         assert!(rows[0].resolution.is_none(), "{:?}", rows[0].resolution);
     }
 
