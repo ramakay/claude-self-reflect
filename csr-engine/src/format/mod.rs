@@ -74,18 +74,45 @@ pub fn relevance_label(score: f32) -> &'static str {
 
 /// Gap (cross-encoder logits, top minus runner-up) a `high` label needs.
 ///
-/// The four `CE_*` bands are S2 first-cut values, not yet calibrated on the
-/// fabricated-probe set. They are in raw cross-encoder logit units and read
-/// margins only, never an absolute score or a cosine.
+/// The `CE_*` bands are in raw cross-encoder logit units and read margins
+/// only, never an absolute score or a cosine. The two gap floors below
+/// (`CE_GAP_TIE`, `CE_GAP_GOOD`) and the spread edges were calibrated on the
+/// 40 judged pairs of the S9 blind judging (`s9/judge-s9`), reading each
+/// rank-1 from the final ranker summary (`ce-top`, `ce-margin`, `ce-median`):
+/// 33 of the 40 rank-1s were one of the two judged chunks.
+///
+/// What those pairs showed: the rank-1 was the rater's pick about 74% of the
+/// time in every band (weak 7 of 10 decided pairs, partial 7 of 9, good 3 of
+/// 4), so no logit margin predicts correctness here. Two failures were
+/// visible and are what the floors fix. A `good` from the spread alone fired
+/// on a near-tie at the top (gap 0.04, the rater picked the other side), and
+/// the old `weak` band (spread under 1) held 7 rank-1s the rater picked. The
+/// bands now say how much evidence separates the top from the rest, not that
+/// the top is right.
 pub const CE_GAP_HIGH: f32 = 1.5;
+/// Gap a `good` label needs. Calibrated on the 40 judged pairs: the two
+/// rater-picked rank-1s with a real lead sat at a gap of 1.11 and 1.73 and
+/// stay `good`/`high`; the echo of the query itself (gap 0.53) and the
+/// near-tie miss (gap 0.04) fall to `partial`. A third picked rank-1 (gap
+/// 0.37) falls to `partial` with them. A recall with no runner-up has no
+/// rival and is not held to the floor.
+pub const CE_GAP_GOOD: f32 = 1.0;
+/// Gap below which the top is a near-tie with the runner-up (logits). A
+/// `weak` label needs this and a spread under `CE_SPREAD_PARTIAL`: nothing
+/// singles the top out of the pool. Calibrated on the 40 judged pairs: 0.05 leaves
+/// one rater-picked rank-1 labelled `weak` (gap 0.01); the next picked one
+/// sits at a gap of 0.06.
+pub const CE_GAP_TIE: f32 = 0.05;
 /// Spread (top minus median of the pooled session scores) a `high` label needs.
-/// S2 first-cut, not yet calibrated on the fabricated-probe set.
+/// S2 first-cut value, kept: the judged pairs held one `high`, and it was a
+/// rater-picked rank-1.
 pub const CE_SPREAD_HIGH: f32 = 3.0;
-/// Spread a `good` label needs. S2 first-cut, not yet calibrated on the
-/// fabricated-probe set.
+/// Spread a `good` label needs. S2 first-cut value, kept: the 40 judged pairs
+/// give no case for moving it.
 pub const CE_SPREAD_GOOD: f32 = 2.0;
-/// Spread a `partial` label needs; below it the label is `weak`. S2 first-cut,
-/// not yet calibrated on the fabricated-probe set.
+/// Spread a `partial` label needs when the top is also a near-tie (see
+/// `CE_GAP_TIE`); every recall that fails `high`, `good` and `weak` is
+/// `partial`. S2 first-cut value, kept.
 pub const CE_SPREAD_PARTIAL: f32 = 1.0;
 
 /// Cross-encoder score summary of one recall: the best pooled session score,
@@ -129,17 +156,21 @@ impl CeSummary {
 /// Band a cross-encoder result into the relevance vocabulary from margins
 /// only: `gap` is `top - runner_up` (0 when there is no runner-up) and
 /// `spread` is `top - median`. Absolute scores and cosines never enter.
+///
+/// `high` needs a clear gap and spread, `good` a spread and a real lead over
+/// the runner-up, `weak` a near-tie that is also no spread at all, and
+/// `partial` is everything between.
 pub fn ce_relevance_label(top: f32, runner_up: Option<f32>, median: f32) -> &'static str {
     let gap = runner_up.map_or(0.0, |second| top - second);
     let spread = top - median;
     if gap >= CE_GAP_HIGH && spread >= CE_SPREAD_HIGH {
         "high"
-    } else if spread >= CE_SPREAD_GOOD {
+    } else if spread >= CE_SPREAD_GOOD && runner_up.is_none_or(|_| gap >= CE_GAP_GOOD) {
         "good"
-    } else if spread >= CE_SPREAD_PARTIAL {
-        "partial"
-    } else {
+    } else if spread < CE_SPREAD_PARTIAL && gap < CE_GAP_TIE {
         "weak"
+    } else {
+        "partial"
     }
 }
 
@@ -623,7 +654,10 @@ pub(crate) fn format_search_results_with_ce(
                 || "n/a".to_string(),
                 |second| format!("{:.2}", summary.top - second),
             );
-            format!(" ce-top=\"{:.2}\" ce-margin=\"{}\"", summary.top, gap)
+            format!(
+                " ce-top=\"{:.2}\" ce-margin=\"{}\" ce-median=\"{:.2}\"",
+                summary.top, gap, summary.median
+            )
         });
         out.push_str(&format!(
             "  <summary count=\"{}\" relevance=\"{}\" top-score=\"{:.3}\" rank1-score=\"{:.3}\" margin=\"{}\"{}>\n",
@@ -2752,18 +2786,62 @@ mod tests {
         assert_eq!(ce_relevance_label(6.0, Some(5.0), 1.0), "good");
         // spread just under high with a big gap is good
         assert_eq!(ce_relevance_label(3.9, Some(1.0), 1.0), "good");
-        // good at the spread edge
-        assert_eq!(ce_relevance_label(3.0, Some(2.9), 1.0), "good");
+        // the gap edge of good: 1.0 is good, just under is partial
+        assert_eq!(ce_relevance_label(3.0, Some(2.0), 1.0), "good");
+        assert_eq!(ce_relevance_label(3.0, Some(2.9), 1.0), "partial");
         // partial between 1.0 and 2.0
         assert_eq!(ce_relevance_label(2.5, Some(2.4), 1.0), "partial");
         assert_eq!(ce_relevance_label(2.0, None, 1.0), "partial");
-        // weak below 1.0 spread
-        assert_eq!(ce_relevance_label(1.9, Some(1.8), 1.0), "weak");
+        // weak needs a spread under 1.0 and a near-tie gap
+        assert_eq!(ce_relevance_label(1.9, Some(1.88), 1.0), "weak");
+        assert_eq!(ce_relevance_label(1.9, Some(1.8), 1.0), "partial");
         // no runner-up means gap 0: never high, however large the spread
         assert_eq!(ce_relevance_label(9.0, None, 0.0), "good");
         // margins only: shifting every score leaves the label unchanged
         assert_eq!(ce_relevance_label(-4.0, Some(-7.0), -9.0), "high");
         assert_eq!(ce_relevance_label(16.0, Some(13.0), 11.0), "high");
+    }
+
+    #[test]
+    fn ce_label_thresholds_are_the_s9_judged_pair_calibration() {
+        assert_eq!(CE_GAP_HIGH, 1.5);
+        assert_eq!(CE_GAP_GOOD, 1.0);
+        assert_eq!(CE_GAP_TIE, 0.05);
+        assert_eq!(CE_SPREAD_HIGH, 3.0);
+        assert_eq!(CE_SPREAD_GOOD, 2.0);
+        assert_eq!(CE_SPREAD_PARTIAL, 1.0);
+        // Rank-1 rows of the 40 judged pairs, (top, runner-up, median) in
+        // logits as the final ranker summary printed them.
+        // Pair 40: picked, clear lead.
+        assert_eq!(ce_relevance_label(11.71, Some(11.71 - 1.73), 8.69), "high");
+        // Pair 21: picked, real lead.
+        assert_eq!(ce_relevance_label(11.97, Some(11.97 - 1.11), 8.75), "good");
+        // Pair 38: an echo of the query, gap 0.53, no longer good.
+        assert_eq!(
+            ce_relevance_label(11.04, Some(11.04 - 0.53), 6.60),
+            "partial"
+        );
+        // Pair 10: a near-tie at the top with a wide pool spread, not good.
+        assert_eq!(
+            ce_relevance_label(10.89, Some(10.89 - 0.04), 7.89),
+            "partial"
+        );
+        // Pair 12: picked, gap 0.01 and no spread, the one picked weak.
+        assert_eq!(ce_relevance_label(12.00, Some(12.00 - 0.01), 11.91), "weak");
+        // Pair 11: picked, gap 0.06, no longer weak.
+        assert_eq!(
+            ce_relevance_label(10.56, Some(10.56 - 0.06), 10.19),
+            "partial"
+        );
+        // Pair 4: picked, gap 0.17, no longer weak.
+        assert_eq!(
+            ce_relevance_label(11.15, Some(11.15 - 0.17), 10.65),
+            "partial"
+        );
+        // A lone candidate has no rival: a spread alone can call it good.
+        assert_eq!(ce_relevance_label(9.0, None, 6.0), "good");
+        // A lone candidate with no spread is weak.
+        assert_eq!(ce_relevance_label(9.0, None, 9.0), "weak");
     }
 
     #[test]
@@ -2818,7 +2896,7 @@ mod tests {
             "got: {xml}"
         );
         assert!(
-            xml.contains("ce-top=\"6.00\" ce-margin=\"3.00\">"),
+            xml.contains("ce-top=\"6.00\" ce-margin=\"3.00\" ce-median=\"1.00\">"),
             "got: {xml}"
         );
         assert!(
