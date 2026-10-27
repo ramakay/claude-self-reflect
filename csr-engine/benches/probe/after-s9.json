@@ -1,0 +1,163 @@
+{
+  "audit": null,
+  "binary": {
+    "git_dirty": "false",
+    "git_sha": "0dba51dc956f0584827ccc8336d0021fe4ef2f24",
+    "path": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/.testbed/core-rewrite/bin/csr-engine-s9",
+    "sha256": "648bb642062d300974a8c8ce8713b97c7f5ba950e15f77557ddaabcccf5e4a13",
+    "version": "csr-engine 10.1.0"
+  },
+  "cold_start_ms": 9656.1,
+  "cross_encoder": {
+    "calls": 13,
+    "loaded": true,
+    "pairs": 312,
+    "policy": "cross_encoder",
+    "total_ms": 3935
+  },
+  "db": {
+    "chunk_count": 861469,
+    "index_chunk_count": 859916,
+    "path": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/.testbed/core-rewrite/s6/data/csr-engine.db"
+  },
+  "errors": 0,
+  "latency": {
+    "n": 12,
+    "p50_ms": 999.724,
+    "p95_ms": 3033.457
+  },
+  "limit": 5,
+  "peak_rss_bytes": 4623515648,
+  "probes": {
+    "mrr5": 0.808333,
+    "n": 12,
+    "per_probe": [
+      {
+        "hit_rank": 1,
+        "id": 1,
+        "rank1_id": "52023bd7-97a3-541a-a1da-d57b8c259e19",
+        "rank1_score": 0.743,
+        "session_hit_rank": 1,
+        "wall_ms": 1725.883
+      },
+      {
+        "hit_rank": 1,
+        "id": 2,
+        "rank1_id": "3519f6d4-1b7f-56a1-976f-6264875c5a2c",
+        "rank1_score": 0.683,
+        "session_hit_rank": 1,
+        "wall_ms": 956.993
+      },
+      {
+        "hit_rank": 1,
+        "id": 3,
+        "rank1_id": "7662d661-7a1d-58a6-8303-6b8b99661cd6",
+        "rank1_score": null,
+        "session_hit_rank": 1,
+        "wall_ms": 3033.457
+      },
+      {
+        "hit_rank": 1,
+        "id": 4,
+        "rank1_id": "3b578a60-316f-55b0-ac6d-ad058599854e",
+        "rank1_score": 0.786,
+        "session_hit_rank": 1,
+        "wall_ms": 999.724
+      },
+      {
+        "hit_rank": 1,
+        "id": 5,
+        "rank1_id": "42ed1111-86d0-503a-ab1e-76003fd51319",
+        "rank1_score": 0.586,
+        "session_hit_rank": 1,
+        "wall_ms": 1234.789
+      },
+      {
+        "hit_rank": 1,
+        "id": 6,
+        "rank1_id": "5901dba5-c62b-5772-a0d4-d32c28c1bb40",
+        "rank1_score": 0.688,
+        "session_hit_rank": 1,
+        "wall_ms": 922.642
+      },
+      {
+        "hit_rank": 1,
+        "id": 7,
+        "rank1_id": "c42d8783-3447-5507-89c1-b9ec06b37d42",
+        "rank1_score": 0.767,
+        "session_hit_rank": 1,
+        "wall_ms": 657.866
+      },
+      {
+        "hit_rank": 2,
+        "id": 8,
+        "rank1_id": "4dd342de-ac40-5395-877b-0e64bd6dddf5",
+        "rank1_score": 0.655,
+        "session_hit_rank": 2,
+        "wall_ms": 1167.663
+      },
+      {
+        "hit_rank": 1,
+        "id": 9,
+        "rank1_id": "c69137a3-1817-5091-a2ec-ae621b38943b",
+        "rank1_score": null,
+        "session_hit_rank": 1,
+        "wall_ms": 1040.895
+      },
+      {
+        "hit_rank": 5,
+        "id": 10,
+        "rank1_id": "3d4fc2a8-471a-5d9b-bb12-7052ea265fd9",
+        "rank1_score": 0.557,
+        "session_hit_rank": 1,
+        "wall_ms": 1416.532
+      },
+      {
+        "hit_rank": null,
+        "id": 11,
+        "rank1_id": "ace6f9ae-027c-56ae-b805-0fd387d0dbe9",
+        "rank1_score": 0.612,
+        "session_hit_rank": 4,
+        "wall_ms": 839.259
+      },
+      {
+        "hit_rank": 1,
+        "id": 12,
+        "rank1_id": "e2d83e20-694d-54a1-9c9e-afc95e9d737e",
+        "rank1_score": 0.56,
+        "session_hit_rank": 1,
+        "wall_ms": 822.605
+      }
+    ],
+    "rank1": 9,
+    "rank1_ids": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      12
+    ],
+    "session_mrr5": 0.895833,
+    "session_n": 12,
+    "session_rank1": 10,
+    "session_rank1_ids": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      12
+    ]
+  },
+  "schema": "csr-probe-scorecard/1",
+  "side": "B",
+  "started_at": "2026-10-27T04:42:58Z"
+}
