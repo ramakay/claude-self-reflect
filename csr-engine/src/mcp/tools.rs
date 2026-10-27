@@ -2148,6 +2148,69 @@ fn ce_reorder_with_representatives(
     ordered
 }
 
+/// Status-intent queries ("current state of X", "what is left") ask for the
+/// newest report on X. After the cross-encoder, the eligible candidates of the
+/// first `limit` rows whose score is within [`CE_REPRESENTATIVE_TIE`] of the
+/// best eligible one trade slots so the newest session leads. Eligible means a
+/// user or assistant chunk (stored author; tool output and boilerplate never
+/// qualify) that carries the query subject and is not an echo of the query.
+/// Any other query, an unscored session, a missing timestamp or a clear winner
+/// leaves `order` exactly as it came.
+fn apply_status_recency(
+    storage: &Storage,
+    query: &str,
+    order: Vec<String>,
+    enriched: &[EnrichedResult],
+    session_keys: &HashMap<String, String>,
+    ce_scores: &HashMap<String, f32>,
+    limit: usize,
+) -> Vec<String> {
+    use crate::search::status_intent::{
+        is_status_query, matches_subject, reorder_near_ties, subject_stems, StatusCandidate,
+    };
+    if limit == 0 || ce_scores.is_empty() || !is_status_query(query) {
+        return order;
+    }
+    let stems = subject_stems(query);
+    if stems.is_empty() {
+        return order;
+    }
+    let top: Vec<String> = order.iter().take(limit).cloned().collect();
+    let by_id: HashMap<&str, &EnrichedResult> = enriched
+        .iter()
+        .map(|result| (result.chunk.id.as_str(), result))
+        .collect();
+    let authors = storage
+        .with_connection(|conn| crate::storage::queries::chunk_authors(conn, &top))
+        .unwrap_or_default();
+    let mut candidates: HashMap<String, StatusCandidate> = HashMap::new();
+    for id in &top {
+        let Some(row) = by_id.get(id.as_str()) else {
+            continue;
+        };
+        let report = matches!(
+            authors.get(id),
+            Some(crate::provenance::Speaker::User | crate::provenance::Speaker::Assistant)
+        );
+        candidates.insert(
+            id.clone(),
+            StatusCandidate {
+                score: session_keys
+                    .get(id.as_str())
+                    .and_then(|session| ce_scores.get(session))
+                    .copied(),
+                when: chrono::DateTime::parse_from_rfc3339(&row.chunk.timestamp)
+                    .ok()
+                    .map(|time| time.timestamp()),
+                eligible: report
+                    && non_answer_class(&row.chunk.content, query) == 0
+                    && matches_subject(&row.chunk.content, &stems),
+            },
+        );
+    }
+    reorder_near_ties(&order, &candidates, limit, CE_REPRESENTATIVE_TIE)
+}
+
 /// Key of a chunk's text for the cross-source dedupe: whitespace collapsed,
 /// lower-cased, the keyword-lane marker removed, hashed.
 fn cross_source_key(content: &str) -> [u8; 32] {
@@ -3479,6 +3542,15 @@ async fn reflect_gather_pass(
                     &representative_pool_map,
                 );
                 ce_session_scores = session_ce;
+                let reordered = apply_status_recency(
+                    storage,
+                    query,
+                    reordered,
+                    &enriched,
+                    &session_keys,
+                    &ce_session_scores,
+                    page,
+                );
                 if let Some(enriched_conv) = enriched_conv.as_ref() {
                     let ranked: Vec<(String, String, f32)> = reordered
                         .iter()
@@ -9672,6 +9744,109 @@ mod tests {
         assert!(
             output.contains("<cross-source-collapsed>1</cross-source-collapsed>"),
             "{output}"
+        );
+    }
+
+    #[test]
+    fn f1b_status_recency_stage_reads_stored_author_and_subject() {
+        use crate::provenance::Speaker;
+        let storage = Storage::open_memory().unwrap();
+        let mut rows: Vec<EnrichedResult> = Vec::new();
+        let mut keys: HashMap<String, String> = HashMap::new();
+        for (id, session, when, author, text) in [
+            (
+                "old-report",
+                "s-old",
+                "2026-09-13T10:00:00Z",
+                Speaker::Assistant,
+                "Vidhi maestro hardening workflow: launched, sweeps pending",
+            ),
+            (
+                "new-tool",
+                "s-tool",
+                "2026-10-01T10:00:00Z",
+                Speaker::ToolResult,
+                "vidhi maestro hardening workflow log tail",
+            ),
+            (
+                "new-report",
+                "s-new",
+                "2026-09-20T10:00:00Z",
+                Speaker::Assistant,
+                "Vidhi maestro hardening workflow: done, two flows left",
+            ),
+            (
+                "new-offtopic",
+                "s-off",
+                "2026-10-02T10:00:00Z",
+                Speaker::Assistant,
+                "unrelated note about radio stations",
+            ),
+        ] {
+            let mut chunk = f1b_chunk(id, session, text);
+            chunk.timestamp = when.into();
+            chunk.author = author;
+            storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
+            storage
+                .insert_chunk_provenance(
+                    id,
+                    &crate::provenance::ChunkProvenance {
+                        author,
+                        source_conv_id: String::new(),
+                        supersedes: None,
+                    },
+                )
+                .unwrap();
+            keys.insert(id.into(), session.into());
+            rows.push(EnrichedResult {
+                score: 0.5,
+                chunk,
+                resolution: None,
+                trust: crate::provenance::TrustTier::Unknown,
+                validity_demoted: false,
+            });
+        }
+        let ce: HashMap<String, f32> = [
+            ("s-old", 10.0),
+            ("s-tool", 9.9),
+            ("s-new", 9.9),
+            ("s-off", 9.9),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let order: Vec<String> = ["old-report", "new-tool", "new-report", "new-offtopic"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let status =
+            "what is the current state of the Vidhi maestro hardening workflow and what is left";
+
+        let out = apply_status_recency(&storage, status, order.clone(), &rows, &keys, &ce, 4);
+        // The newer report takes the older report's slot; the tool row and the
+        // off-topic row hold theirs.
+        assert_eq!(
+            out,
+            ["new-report", "new-tool", "old-report", "new-offtopic"]
+        );
+        // Not a status query: untouched.
+        let plain = "vidhi maestro hardening workflow notes";
+        assert_eq!(
+            apply_status_recency(&storage, plain, order.clone(), &rows, &keys, &ce, 4),
+            order
+        );
+        // No cross-encoder scores: untouched.
+        assert_eq!(
+            apply_status_recency(
+                &storage,
+                status,
+                order.clone(),
+                &rows,
+                &keys,
+                &HashMap::new(),
+                4
+            ),
+            order
         );
     }
 

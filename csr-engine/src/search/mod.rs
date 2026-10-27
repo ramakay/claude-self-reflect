@@ -9,6 +9,7 @@ pub mod hybrid;
 pub mod identifiers;
 pub mod reinstatement;
 pub mod rerank;
+pub mod status_intent;
 pub mod trained_rerank;
 pub mod vector_ipc;
 
