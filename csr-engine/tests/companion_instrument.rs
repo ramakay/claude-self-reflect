@@ -1961,15 +1961,18 @@ fn a_tap_on_each_quota_circle_opens_that_circles_page() {
 fn real_shaped_fresh_input_varies_and_flat_history_abstains() {
     for theme in [Theme::Dark, Theme::Light] {
         for expanded in [false, true] {
+            // The legend under the quota circles outranks the plot under the ring: the closed
+            // pane needs the taller 76x72 for both.
+            let rows = if expanded { 67 } else { 72 };
             let (_home, paths) = state_home("12-fresh");
-            let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+            let mut pane = Pane::new(paths, &args("main", "sess-now", 76, rows));
             pane.pixels = true;
             pane.enable_cards();
             pane.theme = theme;
             if expanded {
                 pane.key("i");
             }
-            pane.frame(76, 67, NOW);
+            pane.frame(76, rows, NOW);
             let plots = &pane.instrument_metrics.as_ref().unwrap().fresh_plots;
             assert_eq!(plots.len(), 1);
             let p = &plots[0];

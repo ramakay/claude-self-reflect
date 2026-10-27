@@ -1013,6 +1013,25 @@ const FIGURE_EXPANDED_BASE: f32 = 291.;
 fn figure_expanded_h(g: &Value) -> f32 {
     FIGURE_EXPANDED_BASE + legend_h(g)
 }
+/// The history plot's height at the expanded figure's full height, and the least it is shrunk to
+/// so the legend stays: its title row, a few bars and the gap under them.
+const EXPANDED_PLOT_FULL: f32 = 73.;
+const EXPANDED_PLOT_MIN: f32 = 48.;
+/// The least height the expanded figure draws in: the chart gives back what the legend needs.
+/// A shorter card drops the chart and draws the collapsed ring.
+fn figure_expanded_min_h(g: &Value) -> f32 {
+    figure_expanded_h(g) - (EXPANDED_PLOT_FULL - EXPANDED_PLOT_MIN)
+}
+/// Float noise in a card's height that never makes it the strip: a closed pane's card is laid
+/// out at `mid_min_h` to within rounding.
+const MID_MIN_SLOP: f32 = 0.5;
+/// The least height of a Context card in the mid layout: the title, the small circles with their
+/// captions and the legend, and the bottom clearance. A card shorter than this is the strip.
+fn mid_min_h(g: &Value) -> f32 {
+    const MIN_GAUGE_R: f32 = 16.;
+    const LABEL_BELOW: f32 = MIN_GAUGE_R + 12.;
+    P + theme::TITLE_LINE + S2 + MIN_GAUGE_R + LABEL_BELOW + theme::CAPTION_LINE + legend_h(g) + S4
+}
 /// Fewest lines a clipped section keeps, its "+N more" line included.
 const DRILL_MIN_LINES: usize = 4;
 /// Most thread bands an open `t` draws at once.
@@ -2254,6 +2273,7 @@ fn quota_legend(
     if shown == 0 {
         return;
     }
+    c.legend_rows.push(baseline);
     let mut x = left + (width - total(shown)) / 2.;
     let mid = baseline - f.cap(st) / 2.;
     for (swatch, name, _) in &measured[..shown] {
@@ -2524,6 +2544,10 @@ fn recent_request_compactions(s: &Value) -> Vec<usize> {
 pub struct Metrics {
     pub csr_cost: InstrumentCost,
     pub quota_gauges: Vec<QuotaGauge>,
+    /// Baseline of each legend row drawn under the quota circles, in layout pt.
+    pub legend_rows: Vec<f32>,
+    /// Top and bottom of each "N by CSR" caption drawn, in layout pt.
+    pub by_csr: Vec<(f32, f32)>,
     pub fresh_plots: Vec<FreshPlot>,
     pub question_size: f32,
     pub question_line_height: f32,
@@ -2786,6 +2810,13 @@ pub fn draw(
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
     // The figure card's smallest height: its one-row gauge strip (or the quotas row).
     let figure_floor: f32 = if quotas_only { 154. } else { 110. };
+    // A closed pane keeps the Context card tall enough for the small circles, their legend and
+    // the caption; a card an open section squeezed below that is the strip.
+    let figure_closed_floor: f32 = if quotas_only || narrow {
+        figure_floor
+    } else {
+        figure_floor.max(mid_min_h(&c.figure))
+    };
     // `i` adds a card of the figure's facts, one to a line, under the figure.
     let fig_detail_all: Vec<String> = if open.figure {
         figure_detail_lines(c, open.gauge)
@@ -2839,7 +2870,7 @@ pub fn draw(
     // The canvas is the closed pane's: an open section never makes it taller. Layout points may
     // scale to fit a narrow/wide terminal; reserve S3 in final pixels.
     let maxh = maxh.max(
-        (top_for(observed_full_h, story_h) + tail_base + figure_floor)
+        (top_for(observed_full_h, story_h) + tail_base + figure_closed_floor)
             / (1. - S3 / available_height as f32),
     );
     let key_gap = S3 * maxh / available_height as f32;
@@ -3836,6 +3867,8 @@ pub fn draw(
         Metrics {
             csr_cost: c.csr_cost.clone(),
             quota_gauges: canvas.quota_gauges.clone(),
+            legend_rows: canvas.legend_rows.clone(),
+            by_csr: canvas.by_csr.clone(),
             fresh_plots: canvas.fresh_plots.clone(),
             question_size: qs.size,
             question_line_height,
@@ -4018,6 +4051,15 @@ fn history_plot(c: &mut Canvas, f: &Fonts, data: &Composition, y: f32, h: f32, t
     });
 }
 
+/// "N by CSR" at the top right of the card that starts at `y`: CSR's own work this session.
+fn by_csr_mark(c: &mut Canvas, f: &Fonts, t: &Tokens, n: u64, y: f32) {
+    let st = serif(24., t.medium);
+    let base = y + P + f.cap(st);
+    c.by_csr.push((y + P, base));
+    c.text(f, &format!("{n}"), W - 100., base, st, t.ink, A::M);
+    label(c, f, "by CSR", W - 84., base, 10., t.quiet, t.regular);
+}
+
 /// Draw the figure card. Returns (ceiling_y, ring_bounds) for layout metrics.
 fn figure(
     c: &mut Canvas,
@@ -4029,14 +4071,18 @@ fn figure(
     expanded: bool,
     narrow: bool,
 ) -> Option<FigureInfo> {
-    let expanded = expanded && fresh_bar_heights(&data.requests).is_some();
     let g = &data.figure;
+    let expanded =
+        expanded && fresh_bar_heights(&data.requests).is_some() && h >= figure_expanded_min_h(g);
     let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
     let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.);
     let collapsed_scaled_fits = collapsed_context_fits(g, h);
     // Strip only for narrow panes or truly strip-height cards. Mid-height cards get their own layout.
     const STRIP_H: f32 = 110.;
-    let use_strip = tokens.is_some() && (narrow || h <= STRIP_H);
+    let use_strip = tokens.is_some()
+        && (narrow
+            || h <= STRIP_H
+            || (!expanded && !collapsed_scaled_fits && h < mid_min_h(g) - MID_MIN_SLOP));
     let use_mid = tokens.is_some() && !expanded && !use_strip && !collapsed_scaled_fits;
     panel(c, y, h, t);
     if use_strip {
@@ -4052,9 +4098,9 @@ fn figure(
     let mut collapsed_pay_y = None;
     let mut collapsed_sat_cy = None;
     let mut context_quota_radius = 30.;
-    // Whether the quota row's legend has room. The expanded chart keeps its height and the
+    // Whether the quota row's legend has room. The expanded chart shrinks to make it; the
     // collapsed ring may have none to spare: then the legend is not drawn.
-    let mut legend_drawn = !expanded || h >= figure_expanded_h(g);
+    let mut legend_drawn = true;
     let legend_gap = if legend_drawn { legend_h(g) } else { 0. };
     label(
         c,
@@ -4090,25 +4136,7 @@ fn figure(
         );
     }
     if let Some(n) = data.tally["by_csr"].as_u64().filter(|n| *n > 0) {
-        c.text(
-            f,
-            &format!("{n}"),
-            W - 100.,
-            y + P + f.cap(serif(24., t.medium)),
-            serif(24., t.medium),
-            t.ink,
-            A::M,
-        );
-        label(
-            c,
-            f,
-            "by CSR",
-            W - 84.,
-            y + P + f.cap(serif(24., t.medium)),
-            10.,
-            t.quiet,
-            t.regular,
-        );
+        by_csr_mark(c, f, t, n, y);
     }
     if let Some((line, sev)) = csr_status(g) {
         let col = if sev == "red" { t.risk } else { t.amber };
@@ -4138,7 +4166,7 @@ fn figure(
         if expanded {
             // Fresh input has its own scale. A context-window ceiling/band would be a different unit.
             let gauge_cy = y + h - 84. - legend_gap;
-            let chart_bottom = (gauge_cy - 72.).max(y + 135.);
+            let chart_bottom = (gauge_cy - 72.).max(y + 70. - S2 + EXPANDED_PLOT_MIN);
             expanded_chart_bottom = chart_bottom;
             history_plot(c, f, data, y + 70., chart_bottom - (y + 70.) + S2, t);
             if let Some(trend) = g["trend"].as_f64() {
@@ -4182,8 +4210,10 @@ fn figure(
             let slack = (h - needed).max(0.);
             // The closed pane's height is the least the ring needs, so the legend takes only
             // room that is spare: from the history plot's, which keeps its own minimum, or from
-            // the slack around the group. With none to spare it is not drawn.
+            // the slack around the group. The legend matters more than the plot: a plot that
+            // would fall under its minimum is dropped, and the slack goes to the legend.
             let spare = legend_h(g);
+            let legend_floor = spare + S2;
             let mut history_h = if fresh_bar_heights(&data.requests).is_some() && slack >= 50. {
                 slack
             } else {
@@ -4192,17 +4222,29 @@ fn figure(
             if history_h > 0. && history_h - spare >= 50. {
                 history_h -= spare;
             } else if history_h > 0. {
-                legend_drawn = false;
+                history_h = 0.;
             }
+            let quota_radius_in = |room: f32| {
+                (30. + room / 4.)
+                    .min(54.)
+                    .min(empty_quota_radius(data))
+                    .max(30.)
+            };
             if history_h == 0. {
-                context_quota_radius = (30. + slack / 4.).min(54.).min(empty_quota_radius(data));
+                context_quota_radius = quota_radius_in(slack);
             }
-            let gauge_growth = 2. * (context_quota_radius - 30.);
-            let loose = if history_h > 0. {
+            let mut gauge_growth = 2. * (context_quota_radius - 30.);
+            let mut loose = if history_h > 0. {
                 0.
             } else {
                 slack - gauge_growth
             };
+            if history_h == 0. && spare > 0. && slack >= legend_floor && loose < legend_floor {
+                // The circles grew into the legend's room: they grow from what is left of it.
+                context_quota_radius = quota_radius_in(slack - legend_floor);
+                gauge_growth = 2. * (context_quota_radius - 30.);
+                loose = slack - gauge_growth;
+            }
             let legend_room = if history_h > 0. {
                 legend_drawn
             } else {
@@ -4452,6 +4494,9 @@ fn draw_context_mid(
             t,
         );
     }
+    if let Some(n) = data.tally["by_csr"].as_u64().filter(|n| *n > 0) {
+        by_csr_mark(c, f, t, n, y);
+    }
     let (Some(n), Some(size)) = (tokens, size) else {
         return (None, None, None, None, None);
     };
@@ -4468,8 +4513,30 @@ fn draw_context_mid(
     let label_below = gauge_r + 12.;
     let details_gap = S3;
     let details_h = 6.;
-    let right_h =
-        gauge_r + label_below + theme::CAPTION_LINE + legend_h(g) + details_gap + details_h;
+    // The trend and payback line, under the legend. "N by CSR" sits in the title row instead.
+    let mut details = Vec::new();
+    if let Some(trend) = g["trend"].as_f64() {
+        details.push(format!(
+            "{}{}/turn",
+            if trend >= 0. { "+" } else { "−" },
+            short(trend.abs())
+        ));
+    }
+    let pay = payback(g);
+    if !pay.is_empty() {
+        details.push(pay);
+    }
+    let right_bare = gauge_r + label_below + theme::CAPTION_LINE + legend_h(g);
+    let right_full = right_bare + details_gap + details_h;
+    // The line takes its room from the card or is not drawn: it never hangs below the card.
+    // The compaction bar sits where the line would, so it keeps the room too.
+    let wants_row = !details.is_empty() || g["compacting"].is_object();
+    let show_details = wants_row && (2. * r).max(right_full) <= slot + 0.5;
+    let right_h = if show_details || (wants_row && details.is_empty()) {
+        right_full
+    } else {
+        right_bare
+    };
     let core_h = (2. * r).max(right_h);
     let history_h = if fresh_bar_heights(&data.requests).is_some() && slot - core_h - S3 >= 50. {
         slot - core_h - S3
@@ -4487,7 +4554,11 @@ fn draw_context_mid(
     let right_top = group_top + (core_h - right_h).max(0.) / 2.;
     let gauges_cy = right_top + gauge_r;
     let gauge_label_y = gauges_cy + label_below;
-    let details_y = gauge_label_y + theme::CAPTION_LINE + legend_h(g) + details_gap + 2.;
+    let details_y = if right_h == right_bare {
+        group_bottom
+    } else {
+        gauge_label_y + theme::CAPTION_LINE + legend_h(g) + details_gap + 2.
+    };
 
     let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
     if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64()) {
@@ -4539,22 +4610,7 @@ fn draw_context_mid(
         t,
     );
 
-    let mut details = Vec::new();
-    if let Some(trend) = g["trend"].as_f64() {
-        details.push(format!(
-            "{}{}/turn",
-            if trend >= 0. { "+" } else { "−" },
-            short(trend.abs())
-        ));
-    }
-    let pay = payback(g);
-    if !pay.is_empty() {
-        details.push(pay);
-    }
-    if let Some(n) = data.tally["by_csr"].as_u64().filter(|n| *n > 0) {
-        details.push(format!("{n} by CSR"));
-    }
-    if !details.is_empty() {
+    if show_details && !details.is_empty() {
         let line = details.join(" · ");
         let col = if g["payback"]["sev"] == "amber" {
             t.amber
@@ -5168,6 +5224,103 @@ mod tests {
             );
             assert_eq!(amber, 0, "{theme:?}: warning amber in the legend band");
         }
+    }
+
+    /// Every pane height a terminal can give, as frames whose figure card is a full card (tall
+    /// enough for the mid layout; a shorter one is the strip, which has no legend and no caption):
+    /// the figure's top and height, and the frame's metrics.
+    fn figure_sweep(c: &Composition, open: Open) -> Vec<(f32, f32, Metrics)> {
+        let closed = !open.figure;
+        let mut out = vec![];
+        for width in [560_u32, 704] {
+            for avail in (600..=1400).step_by(12) {
+                let Some((_, m)) = draw(c, width, avail, Theme::Dark, open, false) else {
+                    continue;
+                };
+                let (top, h) = m.figure_region;
+                if h >= mid_min_h(&c.figure) - MID_MIN_SLOP {
+                    out.push((top, h, m));
+                } else {
+                    // Only an open section squeezes the card to a strip; a closed pane never.
+                    assert!(!closed, "closed pane {width}x{avail}: figure card {h:.1}pt");
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_legend_stays_under_the_circles_when_the_figure_is_short() {
+        let c = quota_composition();
+        for open in [
+            Open::default(),
+            Open {
+                figure: true,
+                ..Open::default()
+            },
+        ] {
+            let frames = figure_sweep(&c, open);
+            assert!(frames.len() > 30, "{} frames drawn", frames.len());
+            // The sweep reaches the plot under the ring and the expanded chart, not only the mid
+            // layout.
+            let kinds =
+                |f: &dyn Fn(&Metrics) -> bool| frames.iter().filter(|(_, _, m)| f(m)).count();
+            if open.figure {
+                assert!(kinds(&|m| m.ring_bounds.is_none() && m.mid_layout.is_none()) > 3);
+            } else {
+                assert!(kinds(&|m| m.ring_bounds.is_some() && !m.fresh_plots.is_empty()) > 0);
+            }
+            for (top, h, m) in &frames {
+                // A full ring on a card with no spare room keeps the ring: the legend takes only
+                // room that is spare there (see `figure`). Every other card shows it.
+                let spare = h - collapsed_context_layout(&c.figure, *h).2;
+                if m.ring_bounds.is_some()
+                    && m.fresh_plots.is_empty()
+                    && spare < legend_h(&c.figure) + S2
+                {
+                    continue;
+                }
+                assert_eq!(
+                    m.legend_rows.len(),
+                    1,
+                    "figure={}: figure card {h:.1}pt has no legend row",
+                    open.figure
+                );
+                let row = m.legend_rows[0];
+                assert!(
+                    *top < row && row < top + h,
+                    "figure={}: legend row {row:.1} outside the card {top:.1}..{:.1}",
+                    open.figure,
+                    top + h
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_by_csr_caption_stays_inside_the_context_card() {
+        let mut c = quota_composition();
+        c.tally = json!({"by_csr": 3});
+        let mut mid = 0;
+        for open in [
+            Open::default(),
+            Open {
+                figure: true,
+                ..Open::default()
+            },
+        ] {
+            for (top, h, m) in figure_sweep(&c, open) {
+                mid += usize::from(m.mid_layout.is_some());
+                assert_eq!(m.by_csr.len(), 1, "figure card {h:.1}pt: caption count");
+                let (cap_top, cap_bottom) = m.by_csr[0];
+                assert!(
+                    cap_top >= top && cap_bottom <= top + h,
+                    "figure card {top:.1}..{:.1}: caption at {cap_top:.1}..{cap_bottom:.1}",
+                    top + h
+                );
+            }
+        }
+        assert!(mid > 0, "the sweep never reached the mid layout");
     }
 
     #[test]

@@ -601,6 +601,10 @@ pub struct Canvas {
     /// Final output pixels per logical point (before supersampling/downsampling).
     pub output_scale: f32,
     pub quota_gauges: Vec<QuotaGauge>,
+    /// Baseline of each legend row drawn under the quota circles, in layout pt.
+    pub legend_rows: Vec<f32>,
+    /// Top and bottom of each "N by CSR" caption drawn, in layout pt.
+    pub by_csr: Vec<(f32, f32)>,
     pub fresh_plots: Vec<FreshPlot>,
     /// Every row drawn with a trailing "…": where it sits and its words in full.
     pub cuts: Vec<Cut>,
@@ -874,6 +878,8 @@ impl Canvas {
             dry: false,
             output_scale: S,
             quota_gauges: Vec::new(),
+            legend_rows: Vec::new(),
+            by_csr: Vec::new(),
             fresh_plots: Vec::new(),
             cuts: Vec::new(),
             cut_title: "In full",
@@ -885,6 +891,8 @@ impl Canvas {
             dry: true,
             output_scale: S,
             quota_gauges: Vec::new(),
+            legend_rows: Vec::new(),
+            by_csr: Vec::new(),
             fresh_plots: Vec::new(),
             cuts: Vec::new(),
             cut_title: "In full",
@@ -1281,6 +1289,8 @@ pub fn contact(f: &Fonts, tiles: &[(String, Pixmap, String)], path: &str, bg: Rg
         dry: false,
         output_scale: S,
         quota_gauges: Vec::new(),
+        legend_rows: Vec::new(),
+        by_csr: Vec::new(),
         fresh_plots: Vec::new(),
         cuts: Vec::new(),
         cut_title: "",
