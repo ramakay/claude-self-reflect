@@ -601,6 +601,8 @@ pub struct Canvas {
     /// Final output pixels per logical point (before supersampling/downsampling).
     pub output_scale: f32,
     pub quota_gauges: Vec<QuotaGauge>,
+    /// Baseline of the line of notes drawn under the quota circles, in layout pt.
+    pub note_rows: Vec<f32>,
     /// Top and bottom of each "N by CSR" caption drawn, in layout pt.
     pub by_csr: Vec<(f32, f32)>,
     pub fresh_plots: Vec<FreshPlot>,
@@ -876,6 +878,7 @@ impl Canvas {
             dry: false,
             output_scale: S,
             quota_gauges: Vec::new(),
+            note_rows: Vec::new(),
             by_csr: Vec::new(),
             fresh_plots: Vec::new(),
             cuts: Vec::new(),
@@ -888,6 +891,7 @@ impl Canvas {
             dry: true,
             output_scale: S,
             quota_gauges: Vec::new(),
+            note_rows: Vec::new(),
             by_csr: Vec::new(),
             fresh_plots: Vec::new(),
             cuts: Vec::new(),
@@ -1285,6 +1289,7 @@ pub fn contact(f: &Fonts, tiles: &[(String, Pixmap, String)], path: &str, bg: Rg
         dry: false,
         output_scale: S,
         quota_gauges: Vec::new(),
+        note_rows: Vec::new(),
         by_csr: Vec::new(),
         fresh_plots: Vec::new(),
         cuts: Vec::new(),

@@ -577,6 +577,22 @@ impl Pane {
         let records = &self.dreams.records;
         let root = self.root.to_string_lossy().into_owned();
         let kept = masthead::kept_status(&self.paths, &self.sid, now);
+        let limits = masthead::account_limits(&self.paths, now);
+        // The windows the masthead shows: this session's own figures, else the account's.
+        let rates = if kept["fields"]["rate_limits"]
+            .as_object()
+            .is_some_and(|v| !v.is_empty())
+        {
+            &kept["fields"]["rate_limits"]
+        } else {
+            &limits
+        };
+        if self.persist {
+            if let Some(at) = kept["at"].as_f64() {
+                super::forecast::record(&self.paths.keep, at, &kept["fields"]["rate_limits"]);
+            }
+        }
+        let forecast = super::forecast::for_limits(&self.paths.keep, rates, now);
         let story = self
             .db
             .as_ref()
@@ -600,7 +616,8 @@ impl Pane {
             "story": story,
             "claude_fields": kept["fields"],
             "claude_at": kept["at"],
-            "limits": masthead::account_limits(&self.paths, now),
+            "limits": limits,
+            "forecast": forecast,
             "sts": masthead::csr_status_at(&self.paths, now),
             "compacting": masthead::compacting_info(
                 &self.paths,

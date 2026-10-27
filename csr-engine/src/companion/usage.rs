@@ -57,7 +57,14 @@ pub fn write(keep: &Path, sid: &str, event: &Value, at: f64) -> Result<()> {
         bail!("usage: refusing a conversation id that is not a plain name");
     }
     let path = keep.join(FOLDER).join(format!("{sid}.json"));
-    private::write_atomic(&path, &kept(event, at).to_string(), keep)?;
+    let body = kept(event, at);
+    private::write_atomic(&path, &body.to_string(), keep)?;
+    // The window readings also join the history the reset forecast reads.
+    super::forecast::record(
+        keep,
+        at,
+        &super::sources::usage_fields(&body)["rate_limits"],
+    );
     Ok(())
 }
 
@@ -97,6 +104,35 @@ mod tests {
         assert_eq!(got["rateLimits"][1]["kind"], "seven_day");
         assert_eq!(got["rateLimits"][1]["resetsAt"], "2026-10-25T14:00:00.000Z");
         assert!(got.get("changed").is_none());
+    }
+
+    #[test]
+    fn test_each_measure_adds_its_window_readings_to_the_history() {
+        let d = tempfile::tempdir().unwrap();
+        let keep = d.path().join("csr-companion");
+        let lines = |keep: &Path| -> Vec<Value> {
+            std::fs::read_to_string(keep.join(crate::companion::forecast::FILE))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        write(&keep, "sess-1", &wp0_body(), 1792000000.5).unwrap();
+        let got = lines(&keep);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0]["kind"], "five_hour");
+        assert_eq!(got[0]["used"], 11.);
+        assert_eq!(got[0]["at"], 1792000000.5);
+        assert_eq!(got[1]["kind"], "seven_day");
+        assert_eq!(got[1]["used"], 25.);
+        assert_eq!(got[1]["resets"], 1792936800.);
+        // The same figures a moment later are not a new reading; a moved one is.
+        write(&keep, "sess-2", &wp0_body(), 1792000030.).unwrap();
+        assert_eq!(lines(&keep).len(), 2);
+        let mut moved = wp0_body();
+        moved["rateLimits"][0]["percentUsed"] = json!(12);
+        write(&keep, "sess-1", &moved, 1792000060.).unwrap();
+        assert_eq!(lines(&keep).len(), 3);
     }
 
     #[test]

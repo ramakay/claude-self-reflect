@@ -599,14 +599,17 @@ impl Composition {
             story,
             story_age: age,
             shifts,
-            figure: masthead::gauges_compacting(
-                &data["claude_fields"],
-                data["claude_at"].as_f64(),
-                s,
-                now,
-                &data["limits"],
-                &data["sts"],
-                &drawn_compaction(&data["compacting"]),
+            figure: with_forecast(
+                masthead::gauges_compacting(
+                    &data["claude_fields"],
+                    data["claude_at"].as_f64(),
+                    s,
+                    now,
+                    &data["limits"],
+                    &data["sts"],
+                    &drawn_compaction(&data["compacting"]),
+                ),
+                &data["forecast"],
             ),
             tally: if notice
                 .as_deref()
@@ -1614,6 +1617,26 @@ fn history_mark(outcome: &str) -> Option<&'static str> {
 fn earlier_intent(intent: &str) -> &str {
     intent.strip_prefix("you asked: ").unwrap_or(intent)
 }
+/// A figure whose windows carry their forecast, where `forecast` has one for the window.
+fn with_forecast(mut figure: Value, forecast: &Value) -> Value {
+    if let Some(quotas) = figure["quotas"].as_array_mut() {
+        for q in quotas {
+            let window = forecast[string(&q["code"])].clone();
+            if q["used"].is_number() && window["text"].is_string() {
+                q["forecast"] = window;
+            }
+        }
+    }
+    figure
+}
+/// One window's line in the facts: its words, then where it is headed when that is known.
+fn quota_fact(q: &Value) -> String {
+    let line = text::paced(q);
+    match q["forecast"]["text"].as_str() {
+        Some(forecast) => format!("{line} · {forecast}"),
+        None => line,
+    }
+}
 /// The agents bar's words: how many active agents are stalled, then the name of one agent. A
 /// live agent's name leads; when every active agent is stalled the first stalled one is named, so
 /// the count never trails an empty name. An agent with no description has no name to show, and
@@ -1689,7 +1712,7 @@ fn figure_facts(c: &Composition) -> (Vec<String>, Vec<String>) {
         .iter()
         .filter(|q| q["used"].is_number())
         .map(|q| {
-            let line = text::paced(q);
+            let line = quota_fact(q);
             if q["code"] == "7D" {
                 format!("{line} · CSR {} pts", c.csr_cost.share_label())
             } else {
@@ -1721,14 +1744,12 @@ fn gauge_facts(c: &Composition, gauge: Gauge) -> Vec<String> {
             .find(|q| q["code"] == code && q["used"].is_number())
     };
     match gauge {
-        Gauge::FiveHour => quota("5H")
-            .map(|q| vec![text::paced(q)])
-            .unwrap_or_default(),
+        Gauge::FiveHour => quota("5H").map(|q| vec![quota_fact(q)]).unwrap_or_default(),
         Gauge::Week => quota("7D")
             .map(|q| {
                 let mut out = vec![format!(
                     "{} · CSR {} pts",
-                    text::paced(q),
+                    quota_fact(q),
                     c.csr_cost.share_label()
                 )];
                 let money = money_fact(c);
@@ -1995,9 +2016,12 @@ fn quota_row(
     r: f32,
     label_y: f32,
     caption_size: f32,
+    notes: bool,
     t: &Tokens,
 ) -> (f32, f32) {
     let g = &data.figure;
+    // The tap reaches down over the line of notes when one is drawn.
+    let tap_to = label_y + if notes { theme::CAPTION_LINE } else { 0. };
     let mut quotas = array(&g["quotas"])
         .iter()
         .filter(|q| q["used"].is_number())
@@ -2019,7 +2043,7 @@ fn quota_row(
         bounds.1 = bounds.1.max(x + r);
         quota_ring(c, data, q, x, cy, r, t);
         if let Some(gauge) = c.quota_gauges.last_mut() {
-            gauge.tap = Some(tap_box(x, unit, cy, r, label_y));
+            gauge.tap = Some(tap_box(x, unit, cy, r, tap_to));
         }
         c.text(
             f,
@@ -2046,6 +2070,20 @@ fn quota_row(
                 t,
             );
         }
+        if notes {
+            if let Some(text) = q["forecast"]["text"].as_str() {
+                let at = label_y + 2. * theme::CAPTION_LINE;
+                let ink = if q["forecast"]["out"] == true {
+                    t.amber
+                } else {
+                    t.quiet
+                };
+                fitted_caption_ink(c, f, text, x, at, slot - S2, caption_size, ink, t);
+                if c.note_rows.last() != Some(&at) {
+                    c.note_rows.push(at);
+                }
+            }
+        }
         if weekly && data.csr_cost.usd.is_some() {
             let money =
                 quota_money_caption(f, &data.csr_cost.money_line(), slot - S2, caption_size, t);
@@ -2071,7 +2109,7 @@ fn quota_row(
             center: (x, cy),
             radius: r,
             csr_segment: None,
-            tap: Some(tap_box(x, unit, cy, r, label_y)),
+            tap: Some(tap_box(x, unit, cy, r, tap_to)),
         });
         // The minute shown is the one drawn: a seconds sweep repaints the whole picture.
         let left = (num(&g["cache"]["left"]) / 60.).floor() * 60.;
@@ -2133,7 +2171,7 @@ fn quota_row(
             center: (x, cy),
             radius: r,
             csr_segment: None,
-            tap: Some(tap_box(x, unit, cy, r, label_y)),
+            tap: Some(tap_box(x, unit, cy, r, tap_to)),
         });
         // Black on a light pane, white on a dark one: Codex is the one provider drawn in ink.
         c.ring(
@@ -2510,6 +2548,8 @@ fn recent_request_compactions(s: &Value) -> Vec<usize> {
 pub struct Metrics {
     pub csr_cost: InstrumentCost,
     pub quota_gauges: Vec<QuotaGauge>,
+    /// Baseline of the line of notes drawn under the quota circles, in layout pt.
+    pub note_rows: Vec<f32>,
     /// Top and bottom of each "N by CSR" caption drawn, in layout pt.
     pub by_csr: Vec<(f32, f32)>,
     pub fresh_plots: Vec<FreshPlot>,
@@ -3822,6 +3862,7 @@ pub fn draw(
         Metrics {
             csr_cost: c.csr_cost.clone(),
             quota_gauges: canvas.quota_gauges.clone(),
+            note_rows: canvas.note_rows.clone(),
             by_csr: canvas.by_csr.clone(),
             fresh_plots: canvas.fresh_plots.clone(),
             question_size: qs.size,
@@ -4337,6 +4378,7 @@ fn figure(
         quota_radius,
         sat_cy + quota_radius + S4,
         theme::CAPTION_SIZE,
+        has_notes(g) && notes_drawn,
         t,
     );
     Some((ceiling_y, ring_bounds, ring_group, ring_formula_avail, None))
@@ -4394,6 +4436,7 @@ fn draw_context_strip(
         16.,
         y + h - 28.,
         10.,
+        false,
         t,
     );
     (None, None, None, None, None)
@@ -4558,6 +4601,7 @@ fn draw_context_mid(
         gauge_r,
         gauge_label_y,
         theme::CAPTION_SIZE,
+        has_notes(g),
         t,
     );
 
@@ -4738,7 +4782,7 @@ pub fn strip(
         let st = sans(10., t.medium);
         c.text(f, &f.fit(&pay, st, w - 86.), 76., 37., st, t.mint, A::L);
     }
-    quota_row(&mut c, f, data, 76., w - 86., 65., 16., 93., 8., t);
+    quota_row(&mut c, f, data, 76., w - 86., 65., 16., 93., 8., false, t);
     Some(c.pm)
 }
 
@@ -5254,6 +5298,78 @@ mod tests {
         }
     }
 
+    fn forecast_composition(text: &str, out: bool) -> Composition {
+        let mut c = quota_composition();
+        for q in c.figure["quotas"].as_array_mut().unwrap() {
+            q["forecast"] = json!({"text": text, "out": out});
+        }
+        c
+    }
+
+    #[test]
+    fn a_forecast_is_a_line_under_the_circles_and_no_forecast_is_no_line() {
+        let with = forecast_composition("→ ~74% at reset", false);
+        let hot = forecast_composition("out ~15:40", true);
+        let bare = quota_composition();
+        assert!(mid_min_h(&with.figure) > mid_min_h(&bare.figure));
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let (width, avail) = (1210_u32, 2000_u32);
+            let band_of = |c: &Composition| {
+                let (pm, m) = draw(c, width, avail, theme, Open::default(), false).expect("draws");
+                let scale = (width as f32 / W).min(avail as f32 / m.height);
+                let left = (width as f32 - (W * scale).round().min(width as f32)) / 2.;
+                (pm, m, scale, left as u32, (W * scale) as u32)
+            };
+            let (pm, m, scale, left, w) = band_of(&with);
+            assert_eq!(m.note_rows.len(), 1, "{theme:?}");
+            let row = m.note_rows[0];
+            let band = (row - theme::CAPTION_LINE + S1, row + S1);
+            assert!(
+                ink_px(&pm, band, scale, left, w, t.quiet) >= 8,
+                "{theme:?}: no forecast text in the notes line"
+            );
+            // The tap of each circle reaches over the line.
+            for g in &m.quota_gauges {
+                if matches!(g.code.as_str(), "5H" | "7D") {
+                    assert!(
+                        g.tap.unwrap().3 >= row,
+                        "{}: tap ends above the notes line",
+                        g.code
+                    );
+                }
+            }
+            // A forecast of a window that fills early is drawn in the warning ink.
+            let (pm, m, scale, left, w) = band_of(&hot);
+            let row = m.note_rows[0];
+            let band = (row - theme::CAPTION_LINE + S1, row + S1);
+            assert!(
+                ink_px(&pm, band, scale, left, w, t.amber) >= 8,
+                "{theme:?}: out is not amber"
+            );
+            // With nothing to say there is no line at all.
+            let (pm, m, scale, left, w) = band_of(&bare);
+            assert!(m.note_rows.is_empty(), "{theme:?}");
+            let below = (
+                m.quota_gauges[0].tap.unwrap().3 + 1.,
+                m.quota_gauges[0].tap.unwrap().3 + NOTES_H,
+            );
+            assert_eq!(ink_px(&pm, below, scale, left, w, t.amber), 0);
+        }
+        // The facts say it in words, for the text pane and a tapped circle.
+        let rows = figure_text_rows(&with, 100, true, None).join("\n");
+        assert!(
+            rows.lines()
+                .any(|l| l.starts_with("5H 18%") && l.ends_with("· → ~74% at reset")),
+            "{rows}"
+        );
+        let own = figure_text_rows(&with, 100, true, Some(Gauge::FiveHour)).join("\n");
+        assert!(own.contains("→ ~74% at reset"), "{own}");
+        assert!(!figure_text_rows(&bare, 100, true, None)
+            .join("\n")
+            .contains("at reset"));
+    }
+
     /// Every pane height a terminal can give, as frames whose figure card is a full card (tall
     /// enough for the mid layout; a shorter one is the strip, which has no notes line and no caption):
     /// the figure's top and height, and the frame's metrics.
@@ -5275,6 +5391,45 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn the_forecast_line_stays_under_the_circles_when_the_figure_is_short() {
+        let c = forecast_composition("→ ~74% at reset", false);
+        for open in [
+            Open::default(),
+            Open {
+                figure: true,
+                ..Open::default()
+            },
+        ] {
+            let frames = figure_sweep(&c, open);
+            assert!(frames.len() > 30, "{} frames drawn", frames.len());
+            for (top, h, m) in &frames {
+                // A full ring on a card with no spare room keeps the ring: the line takes only
+                // room that is spare there (see `figure`). Every other card shows it.
+                let spare = h - collapsed_context_layout(&c.figure, *h).2;
+                if m.ring_bounds.is_some()
+                    && m.fresh_plots.is_empty()
+                    && spare < notes_h(&c.figure) + S2
+                {
+                    continue;
+                }
+                assert_eq!(
+                    m.note_rows.len(),
+                    1,
+                    "figure={}: figure card {h:.1}pt has no notes line",
+                    open.figure
+                );
+                let row = m.note_rows[0];
+                assert!(
+                    *top < row && row < top + h,
+                    "figure={}: notes line {row:.1} outside the card {top:.1}..{:.1}",
+                    open.figure,
+                    top + h
+                );
+            }
+        }
     }
 
     #[test]

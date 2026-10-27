@@ -1958,6 +1958,47 @@ fn a_tap_on_each_quota_circle_opens_that_circles_page() {
 }
 
 #[test]
+fn the_reset_forecast_shows_with_enough_history_and_says_nothing_without() {
+    use csr_engine::companion::paths::epoch;
+    let resets = epoch("2026-10-18T14:08:00Z").unwrap();
+    let line = |at: f64, used: f64| {
+        format!("{{\"at\":{at},\"kind\":\"five_hour\",\"used\":{used},\"resets\":{resets}}}\n")
+    };
+    let frame = |paths: &Paths, cols: usize, rows: usize| {
+        let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", cols, rows));
+        pane.pixels = true;
+        pane.enable_cards();
+        pane.frame(cols, rows, NOW);
+        pane.instrument_metrics.clone().unwrap()
+    };
+    for (cols, rows) in [(76, 67), (44, 30)] {
+        let (_home, paths) = state_home("02-running");
+        // No history file: the window shows its percentage and no projection.
+        assert!(
+            frame(&paths, cols, rows).note_rows.is_empty(),
+            "{cols}x{rows}"
+        );
+        // Five readings are too few.
+        let history = paths.keep.join("usage-history.jsonl");
+        let few: String = (0..5)
+            .map(|i| line(NOW - 4800. + 900. * i as f64, 1.))
+            .collect();
+        fs::write(&history, &few).unwrap();
+        assert!(
+            frame(&paths, cols, rows).note_rows.is_empty(),
+            "{cols}x{rows}: 5 readings"
+        );
+        // Ten readings over the last hour and a half back a forecast.
+        let enough: String = (0..10)
+            .map(|i| line(NOW - 5400. + 540. * i as f64, 1. + (i / 4) as f64 * 0.5))
+            .collect();
+        fs::write(&history, &enough).unwrap();
+        let m = frame(&paths, cols, rows);
+        assert_eq!(m.note_rows.len(), 1, "{cols}x{rows}: forecast line");
+    }
+}
+
+#[test]
 fn real_shaped_fresh_input_varies_and_flat_history_abstains() {
     for theme in [Theme::Dark, Theme::Light] {
         for expanded in [false, true] {
