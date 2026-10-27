@@ -1402,6 +1402,7 @@ fn collapsed_context_hugs_exact_group_with_bottom_clearance() {
         }
         let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
         pane.pixels = true;
+        pane.rings = true;
         pane.enable_cards();
         pane.frame(cols, rows, NOW);
         let metrics = pane.instrument_metrics.as_ref().unwrap();
@@ -1445,6 +1446,7 @@ fn mid_height_context_uses_side_ring_and_small_gauges() {
                 let (_home, paths) = state_home(state);
                 let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
                 pane.pixels = true;
+                pane.rings = true;
                 pane.enable_cards();
                 pane.theme = theme;
                 pane.frame(cols, rows, NOW);
@@ -1829,6 +1831,7 @@ fn gauge_centres_are_even_and_positive_csr_arcs_have_a_visible_separator() {
                 let (_home, paths) = state_home(state);
                 let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
                 pane.pixels = true;
+                pane.rings = true;
                 pane.enable_cards();
                 pane.theme = theme;
                 if state == "03-agents" {
@@ -1898,6 +1901,7 @@ fn a_tap_on_each_quota_circle_opens_that_circles_page() {
         let (_home, paths) = state_home("02-running");
         let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
         pane.pixels = true;
+        pane.rings = true;
         pane.enable_cards();
         pane.frame(cols, rows, NOW);
         let m = pane.instrument_metrics.clone().unwrap();
@@ -1958,10 +1962,10 @@ fn a_tap_on_each_quota_circle_opens_that_circles_page() {
 }
 
 #[test]
-fn the_reset_forecast_shows_with_enough_history_and_says_nothing_without() {
+fn the_outlook_speaks_from_the_first_reading_and_blends_in_a_finished_window() {
     use csr_engine::companion::paths::epoch;
     let resets = epoch("2026-10-18T14:08:00Z").unwrap();
-    let line = |at: f64, used: f64| {
+    let line = |at: f64, used: f64, resets: f64| {
         format!("{{\"at\":{at},\"kind\":\"five_hour\",\"used\":{used},\"resets\":{resets}}}\n")
     };
     let frame = |paths: &Paths, cols: usize, rows: usize| {
@@ -1973,37 +1977,33 @@ fn the_reset_forecast_shows_with_enough_history_and_says_nothing_without() {
     };
     for (cols, rows) in [(76, 67), (44, 30)] {
         let (_home, paths) = state_home("02-running");
-        // No history file: the window shows its percentage and no projection.
+        // No history file at all: the dashboard still has its headline and a line for the window.
         let m = frame(&paths, cols, rows);
-        assert!(m.note_rows.is_empty(), "{cols}x{rows}");
-        assert_eq!(
-            m.breakdown_bars.len(),
-            1,
-            "{cols}x{rows}: bar without a forecast"
-        );
-        // Five readings are too few.
-        let history = paths.keep.join("usage-history.jsonl");
-        let few: String = (0..5)
-            .map(|i| line(NOW - 4800. + 900. * i as f64, 1.))
-            .collect();
-        fs::write(&history, &few).unwrap();
+        let before = m.dash.expect("the dashboard");
+        assert!(before.headline.is_some(), "{cols}x{rows}");
+        let five = before.limits.iter().find(|l| l.code == "5H").expect("5H");
         assert!(
-            frame(&paths, cols, rows).note_rows.is_empty(),
-            "{cols}x{rows}: 5 readings"
+            five.line.contains("resets in"),
+            "{cols}x{rows}: {}",
+            five.line
         );
-        // Ten readings over the last hour and a half back a forecast.
-        let enough: String = (0..10)
-            .map(|i| line(NOW - 5400. + 540. * i as f64, 1. + (i / 4) as f64 * 0.5))
+        assert!(!before.segments.is_empty(), "{cols}x{rows}: the bar");
+        // A finished window that peaked at 60% is in the history: it is blended in.
+        let history = paths.keep.join("usage-history.jsonl");
+        let past = resets - 18000.;
+        let body: String = (0..6)
+            .map(|i| line(past - 14400. + 2400. * i as f64, 10. + 10. * i as f64, past))
             .collect();
-        fs::write(&history, &enough).unwrap();
-        let m = frame(&paths, cols, rows);
-        assert_eq!(m.note_rows.len(), 1, "{cols}x{rows}: forecast line");
-        // The forecast line never takes the breakdown bar's row.
-        assert_eq!(
-            m.breakdown_bars.len(),
-            1,
-            "{cols}x{rows}: bar with a forecast"
+        fs::write(&history, &body).unwrap();
+        let after = frame(&paths, cols, rows).dash.expect("the dashboard");
+        let five_after = after.limits.iter().find(|l| l.code == "5H").unwrap();
+        assert_ne!(
+            five_after.tick, five.tick,
+            "{cols}x{rows}: the past window moves the forecast tick"
         );
+        // The breakdown bar keeps its segments with a forecast, and every one has its legend.
+        assert_eq!(after.segments.len(), before.segments.len(), "{cols}x{rows}");
+        assert!(after.segments.iter().all(|s| s.legend.is_some()));
     }
 }
 
@@ -2024,7 +2024,11 @@ fn real_shaped_fresh_input_varies_and_flat_history_abstains() {
             }
             pane.frame(76, rows, NOW);
             let plots = &pane.instrument_metrics.as_ref().unwrap().fresh_plots;
-            assert_eq!(plots.len(), 1);
+            // The dashboard draws its chart under the rows when `i` opens it, and not before.
+            assert_eq!(plots.len(), usize::from(expanded), "expanded={expanded}");
+            if !expanded {
+                continue;
+            }
             let p = &plots[0];
             assert_eq!(p.heights.len(), 24);
             let min = p.heights.iter().copied().fold(f32::INFINITY, f32::min);
@@ -2047,8 +2051,8 @@ fn real_shaped_fresh_input_varies_and_flat_history_abstains() {
             let m = pane.instrument_metrics.as_ref().unwrap();
             assert!(m.fresh_plots.is_empty());
             assert!(
-                m.ring_bounds.is_some(),
-                "flat expanded history returns its room to the ring"
+                m.dash.as_ref().is_some_and(|d| !d.chart),
+                "flat history draws no chart, and the dashboard keeps its room"
             );
         }
     }
@@ -2463,6 +2467,9 @@ fn l_t_and_i_each_change_the_picture_through_the_keys_the_footer_names() {
             assert_ne!(open, closed, "{cols}x{rows}: {key} changes the picture");
             let m = pane.instrument_metrics.as_ref().unwrap();
             match key {
+                "i" if m.dash.is_some() => {
+                    assert!(m.figure_detail_region.is_none(), "{cols}x{rows}")
+                }
                 "i" => assert!(m.figure_detail_region.is_some(), "{cols}x{rows}"),
                 _ => assert!(m.drill_region.is_some(), "{cols}x{rows}: {key} got a card"),
             }

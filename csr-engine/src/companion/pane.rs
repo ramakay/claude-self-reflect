@@ -245,6 +245,9 @@ pub struct Pane {
     pub pixels: bool,
     /// Pixel mode draws cards and the pill instead of the dark ramp's text; set by `enable_cards`.
     pub cards: bool,
+    /// Draw the Context card as the older rings and circles, not the dashboard. Set from
+    /// `CSR_PANE_RINGS=1`.
+    pub rings: bool,
     /// The pill the last frame drew in place of the masthead, for tests and the PNG export.
     pub pill: Option<super::render::cards::Pill>,
     pub placed: Vec<super::render::kitty::Placement>,
@@ -369,6 +372,7 @@ impl Pane {
             hold: None,
             pixels,
             cards: false,
+            rings: std::env::var("CSR_PANE_RINGS").is_ok_and(|v| v == "1"),
             pill: None,
             placed: vec![],
             picture_cache,
@@ -592,7 +596,7 @@ impl Pane {
                 super::forecast::record(&self.paths.keep, at, &kept["fields"]["rate_limits"]);
             }
         }
-        let forecast = super::forecast::for_limits(&self.paths.keep, rates, now);
+        let forecast = super::forecast::outlook(&self.paths.keep, rates, (now / 60.).floor() * 60.);
         let story = self
             .db
             .as_ref()
@@ -618,6 +622,7 @@ impl Pane {
             "claude_at": kept["at"],
             "limits": limits,
             "forecast": forecast,
+            "rings": self.rings,
             "sts": masthead::csr_status_at(&self.paths, now),
             "compacting": masthead::compacting_info(
                 &self.paths,

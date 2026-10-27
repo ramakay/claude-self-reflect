@@ -599,17 +599,20 @@ impl Composition {
             story,
             story_age: age,
             shifts,
-            figure: with_forecast(
-                masthead::gauges_compacting(
-                    &data["claude_fields"],
-                    data["claude_at"].as_f64(),
-                    s,
-                    now,
-                    &data["limits"],
-                    &data["sts"],
-                    &drawn_compaction(&data["compacting"]),
+            figure: with_layout(
+                with_forecast(
+                    masthead::gauges_compacting(
+                        &data["claude_fields"],
+                        data["claude_at"].as_f64(),
+                        s,
+                        now,
+                        &data["limits"],
+                        &data["sts"],
+                        &drawn_compaction(&data["compacting"]),
+                    ),
+                    &data["forecast"],
                 ),
-                &data["forecast"],
+                &data["rings"],
             ),
             tally: if notice
                 .as_deref()
@@ -757,6 +760,13 @@ impl Composition {
             if let Some(left) = cache["left"].as_f64().filter(|n| *n > 0.) {
                 due.push(now + left - 60. * (left / 60.).floor());
             }
+        }
+        // The outlook's lines count minutes: they move on the minute.
+        if self.figure["outlook"]["windows"]
+            .as_array()
+            .is_some_and(|w| !w.is_empty())
+        {
+            due.push((now / 60.).floor() * 60. + 60.);
         }
         let quotas = array(&self.figure["quotas"]);
         for q in quotas {
@@ -1617,15 +1627,29 @@ fn history_mark(outcome: &str) -> Option<&'static str> {
 fn earlier_intent(intent: &str) -> &str {
     intent.strip_prefix("you asked: ").unwrap_or(intent)
 }
-/// A figure whose windows carry their forecast, where `forecast` has one for the window.
+/// A figure that asks for the older ring layouts when `rings` is true.
+fn with_layout(mut figure: Value, rings: &Value) -> Value {
+    if *rings == true {
+        figure["layout"] = json!("rings");
+    }
+    figure
+}
+/// A figure carrying the outlook of its windows (`forecast::outlook`'s shape): the dashboard's
+/// headline and window lines, and for the circles of the older layouts a short caption each.
 fn with_forecast(mut figure: Value, forecast: &Value) -> Value {
     if let Some(quotas) = figure["quotas"].as_array_mut() {
         for q in quotas {
-            let window = forecast[string(&q["code"])].clone();
+            let window = forecast["quota"][string(&q["code"])].clone();
             if q["used"].is_number() && window["text"].is_string() {
                 q["forecast"] = window;
             }
         }
+    }
+    if forecast["windows"].is_array() {
+        figure["outlook"] = json!({
+            "headline": forecast["headline"],
+            "windows": forecast["windows"],
+        });
     }
     figure
 }
@@ -2628,6 +2652,8 @@ pub struct Metrics {
     pub note_rows: Vec<f32>,
     /// Left, top, width and height of each context breakdown bar drawn, in layout pt.
     pub breakdown_bars: Vec<(f32, f32, f32, f32)>,
+    /// The Context card's dashboard: its lines, bars and legend, when it is the layout.
+    pub dash: Option<Dash>,
     /// Top and bottom of each "N by CSR" caption drawn, in layout pt.
     pub by_csr: Vec<(f32, f32)>,
     pub fresh_plots: Vec<FreshPlot>,
@@ -2894,13 +2920,16 @@ pub fn draw(
     let figure_floor: f32 = if quotas_only { 154. } else { 110. };
     // A closed pane keeps the Context card tall enough for the small circles, their notes line and
     // the caption; a card an open section squeezed below that is the strip.
-    let figure_closed_floor: f32 = if quotas_only || narrow {
+    let dash = dash_plan(f, c, t);
+    let figure_closed_floor: f32 = if let Some(plan) = &dash {
+        figure_floor.max(dash_compact_h(plan))
+    } else if quotas_only || narrow {
         figure_floor
     } else {
         figure_floor.max(mid_min_h(&c.figure))
     };
     // `i` adds a card of the figure's facts, one to a line, under the figure.
-    let fig_detail_all: Vec<String> = if open.figure {
+    let fig_detail_all: Vec<String> = if open.figure && dash.is_none() {
         figure_detail_lines(c, open.gauge)
             .iter()
             .flat_map(|line| f.wrap(line, sans(11.5, t.regular), IW))
@@ -2908,14 +2937,19 @@ pub fn draw(
     } else {
         vec![]
     };
-    let (detail_want, detail_least) = if fig_detail_all.is_empty() {
-        (0., 0.)
-    } else {
-        (
-            line_card(fig_detail_all.len()),
-            line_card(fig_detail_all.len().min(DRILL_MIN_LINES)),
-        )
-    };
+    let (detail_want, detail_least) =
+        if dash.is_some() && open.figure && fresh_bar_heights(&c.requests).is_some() {
+            // The dashboard draws no card of its own under the figure, but `i` asks the figure for
+            // the room of its chart: the cards above fold to make it.
+            (DASH_CHART_WANT, DASH_CHART_WANT)
+        } else if fig_detail_all.is_empty() {
+            (0., 0.)
+        } else {
+            (
+                line_card(fig_detail_all.len()),
+                line_card(fig_detail_all.len().min(DRILL_MIN_LINES)),
+            )
+        };
     let observed = [
         (CONFUSED_TITLE, &c.confusing, false),
         (SHOULD_BE_TITLE, &c.should_be, true),
@@ -2968,6 +3002,13 @@ pub fn draw(
     };
     let figure_target = if quotas_only {
         empty_quota_height(c)
+    } else if let Some(plan) = &dash {
+        dash_full_h(plan)
+            + if open.figure && fresh_bar_heights(&c.requests).is_some() {
+                DASH_CHART_WANT
+            } else {
+                0.
+            }
     } else if open.figure && fresh_bar_heights(&c.requests).is_some() {
         figure_expanded_h(&c.figure)
     } else {
@@ -3948,6 +3989,7 @@ pub fn draw(
             quota_gauges: canvas.quota_gauges.clone(),
             note_rows: canvas.note_rows.clone(),
             breakdown_bars: canvas.breakdown_bars.clone(),
+            dash: canvas.dash.clone(),
             by_csr: canvas.by_csr.clone(),
             fresh_plots: canvas.fresh_plots.clone(),
             question_size: qs.size,
@@ -4152,6 +4194,13 @@ fn figure(
     narrow: bool,
 ) -> Option<FigureInfo> {
     let g = &data.figure;
+    if let Some(plan) = dash_plan(f, data, t) {
+        if h + 0.5 >= dash_compact_h(&plan) {
+            panel(c, y, h, t);
+            draw_dashboard(c, f, data, &plan, y, h, expanded, t);
+            return Some((None, None, None, None, None));
+        }
+    }
     let expanded =
         expanded && fresh_bar_heights(&data.requests).is_some() && h >= figure_expanded_min_h(g);
     let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
@@ -4451,6 +4500,555 @@ fn figure(
         t,
     );
     Some((ceiling_y, ring_bounds, ring_group, ring_formula_avail, None))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Context card as a dashboard that reads in words, top to bottom: one headline sentence for
+// where the limits are headed, the 5 Hour and Weekly bars with a tick at their forecast, the
+// context with a labelled bar and a row per part, what CSR did this session, then the fresh
+// tokens per turn. The older ring layouts stay for a card too short to hold it.
+// ---------------------------------------------------------------------------------------------
+const DASH_HEAD_LINE: f32 = 17.;
+const DASH_LABEL_W: f32 = 62.;
+const DASH_PCT_W: f32 = 40.;
+const DASH_LIMIT_PITCH: f32 = 36.;
+const DASH_BAR_H: f32 = 8.;
+const DASH_ROW: f32 = 14.;
+const DASH_CHART_MIN: f32 = 64.;
+/// The height the fresh-tokens chart is given when the card is expanded and has room.
+const DASH_CHART_WANT: f32 = 92.;
+/// The width of the name column of a part's row in the full layout.
+const DASH_PART_COL: f32 = 150.;
+
+/// The words and numbers the dashboard draws, from the composition alone.
+struct DashPlan {
+    head: Vec<String>,
+    head_sev: String,
+    /// (code, name, used percent, state, tick percent, line) of each window.
+    limits: Vec<(String, String, f64, String, Option<f64>, String)>,
+    codex: Option<(f64, String)>,
+    ctx: Option<(f64, f64, &'static str)>,
+    parts: Vec<(&'static str, f64, Rgba)>,
+    estimated: bool,
+    turn: Option<String>,
+    cache: Option<(String, bool)>,
+    csr: Vec<String>,
+    status: Option<(String, bool)>,
+}
+
+fn dash_sev_ink(sev: &str, t: &Tokens) -> Rgba {
+    match sev {
+        "red" => t.risk,
+        "amber" => t.amber,
+        "quiet" => t.quiet,
+        _ => t.mint,
+    }
+}
+
+fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
+    let g = &c.figure;
+    // A figure can ask for the older ring layouts, which the checks of their geometry draw.
+    if g["layout"] == "rings" {
+        return None;
+    }
+    let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.)?;
+    let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.)?;
+    let (head, head_sev) = match g["outlook"]["headline"]["text"].as_str() {
+        Some(text) => (
+            f.wrap(text, sans(12.5, t.bold), IW)
+                .into_iter()
+                .take(2)
+                .collect(),
+            string(&g["outlook"]["headline"]["sev"]).to_owned(),
+        ),
+        None => (vec![], String::new()),
+    };
+    let mut limits = vec![];
+    if let Some(windows) = g["outlook"]["windows"].as_array() {
+        for w in windows {
+            limits.push((
+                string(&w["code"]).to_owned(),
+                string(&w["name"]).to_owned(),
+                num(&w["used"]),
+                string(&w["sev"]).to_owned(),
+                w["tick"].as_f64(),
+                string(&w["line"]).to_owned(),
+            ));
+        }
+    } else {
+        // A figure with no outlook still shows its windows, with no pace.
+        let mut quotas: Vec<_> = array(&g["quotas"])
+            .iter()
+            .filter(|q| q["used"].is_number())
+            .collect();
+        quotas.sort_by_key(|q| if q["code"] == "5H" { 0 } else { 1 });
+        for q in quotas {
+            let used = num(&q["used"]);
+            let left = q["resets"]
+                .as_f64()
+                .map(|at| {
+                    format!(
+                        " · resets in {}",
+                        crate::companion::forecast::until(at - c.now)
+                    )
+                })
+                .unwrap_or_default();
+            limits.push((
+                string(&q["code"]).to_owned(),
+                if q["code"] == "5H" {
+                    "5 Hour"
+                } else {
+                    "Weekly"
+                }
+                .to_owned(),
+                used,
+                if used >= 90. {
+                    "red"
+                } else if used >= 75. {
+                    "amber"
+                } else {
+                    "ok"
+                }
+                .to_owned(),
+                None,
+                format!("{}% used{left}", used.round() as i64),
+            ));
+        }
+    }
+    let codex = c.codex_week["percent"].as_f64().map(|n| {
+        let left = c.codex_week["resets_at"]
+            .as_f64()
+            .filter(|at| *at > c.now)
+            .map(|at| {
+                format!(
+                    " · resets in {}",
+                    crate::companion::forecast::until(at - c.now)
+                )
+            })
+            .unwrap_or_default();
+        (n, format!("Codex weekly limit{left}"))
+    });
+    let ctx_state = match string(&g["ctx"]["sev"]) {
+        "red" => "red",
+        "amber" => "amber",
+        _ => "ok",
+    };
+    let (parts, estimated) = match breakdown_of(g) {
+        Some(b) => {
+            let messages = num(&b["text"]) + num(&b["you"]);
+            (
+                [
+                    ("System + tools", num(&b["floor"]), t.faint),
+                    ("Messages", messages, t.sky),
+                    ("Tool results", num(&b["tool"]), t.asked),
+                    ("CSR injected", num(&b["csr"]), t.csr_share),
+                ]
+                .into_iter()
+                .filter(|p| p.1 > 0.)
+                .collect(),
+                true,
+            )
+        }
+        None => (vec![("In use", tokens, t.mint)], false),
+    };
+    let turn = breakdown_of(g)
+        .and_then(|b| b["caption"].as_str())
+        .map(str::to_owned);
+    // The prompt cache as the status line measured it: warm with its time left, or cold with what
+    // re-reading would cost. No claim that CSR kept it warm: no feed says so.
+    let cache = g["cache"]["long"]
+        .as_str()
+        .filter(|l| *l != "--" && !l.is_empty())
+        .map(|l| {
+            let words = l.replacen("WARM", "warm", 1).replacen("COLD", "cold", 1);
+            (format!("Cache {words}"), g["cache"]["cold"] == true)
+        });
+    let mut csr = vec![];
+    if let Some(n) = c.tally["by_csr"].as_u64().filter(|n| *n > 0) {
+        csr.push(format!("{n} compaction{}", if n == 1 { "" } else { "s" }));
+    }
+    if let Some(n) = c.tally["payback"].as_f64().filter(|n| *n > 0.) {
+        csr.push(format!("~{} tokens saved", short(n)));
+    }
+    if let Some(n) = g["asks"].as_u64().filter(|n| *n > 0) {
+        csr.push(format!("{n} recall{} used", if n == 1 { "" } else { "s" }));
+    }
+    if c.csr_cost.share.is_some_and(|s| s > 0.) {
+        csr.push(format!(
+            "{} pts of the weekly limit",
+            c.csr_cost.share_label()
+        ));
+    }
+    let status = csr_status(g).map(|(line, sev)| (line, sev == "red"));
+    Some(DashPlan {
+        head,
+        head_sev,
+        limits,
+        codex,
+        ctx: Some((tokens, size, ctx_state)),
+        parts,
+        estimated,
+        turn,
+        cache,
+        csr,
+        status,
+    })
+}
+
+/// The heights of the dashboard's sections: (headline, limits, context, CSR) and their sum with
+/// the card's padding. `full` lists the parts one to a row; the compact layout sets two to a row.
+fn dash_heights(p: &DashPlan, full: bool) -> (f32, f32, f32, f32, f32) {
+    let head = if p.head.is_empty() {
+        0.
+    } else {
+        p.head.len() as f32 * DASH_HEAD_LINE + S2
+    };
+    let limits = (p.limits.len() + usize::from(p.codex.is_some())) as f32 * DASH_LIMIT_PITCH;
+    let rows = if full {
+        p.parts.len()
+    } else {
+        p.parts.len().div_ceil(2)
+    } as f32;
+    let note = p.turn.is_some() || (p.estimated && p.turn.is_none());
+    let ctx = if p.ctx.is_some() {
+        16. + S2
+            + DASH_BAR_H
+            + S2
+            + rows * DASH_ROW
+            + if note { DASH_ROW } else { 0. }
+            + if p.cache.is_some() { DASH_ROW } else { 0. }
+            + S2
+    } else {
+        0.
+    };
+    let csr = if p.csr.is_empty() { 0. } else { 20. }
+        + if p.status.is_some() {
+            DASH_ROW + S1
+        } else {
+            0.
+        };
+    (head, limits, ctx, csr, P + head + limits + ctx + csr + P)
+}
+
+fn dash_full_h(p: &DashPlan) -> f32 {
+    dash_heights(p, true).4
+}
+fn dash_compact_h(p: &DashPlan) -> f32 {
+    dash_heights(p, false).4
+}
+
+/// Draw the dashboard in the card at `y` of height `h`. `chart` asks for the fresh-tokens chart
+/// in what room is left under the rows.
+fn draw_dashboard(
+    c: &mut Canvas,
+    f: &Fonts,
+    data: &Composition,
+    p: &DashPlan,
+    y: f32,
+    h: f32,
+    chart: bool,
+    t: &Tokens,
+) {
+    let full = h + 0.5 >= dash_full_h(p);
+    let (head_h, limits_h, ctx_h, csr_h, total) = dash_heights(p, full);
+    let slack = (h - total).max(0.);
+    // The spare room goes between the sections, never into one section's rows.
+    let chart_room = if chart && fresh_bar_heights(&data.requests).is_some() {
+        DASH_CHART_WANT
+    } else {
+        0.
+    };
+    let gap = ((slack - chart_room) / 3.).clamp(0., S4);
+    let mut dash = Dash {
+        full,
+        ..Dash::default()
+    };
+    let mut at = y + P;
+    // A. the headline
+    if !p.head.is_empty() {
+        let st = sans(12.5, t.bold);
+        let ink = dash_sev_ink(&p.head_sev, t);
+        for (i, line) in p.head.iter().enumerate() {
+            let shown = if i + 1 == p.head.len() && p.head.len() == 2 {
+                f.fit(line, st, IW)
+            } else {
+                line.clone()
+            };
+            c.text(
+                f,
+                &shown,
+                IX,
+                at + f.cap(st) + i as f32 * DASH_HEAD_LINE,
+                st,
+                ink,
+                A::L,
+            );
+        }
+        dash.headline = Some((p.head.join(" "), p.head_sev.clone()));
+        at += head_h + gap;
+    }
+    // B. the limits
+    let label = sans(11.5, t.medium);
+    let caption = sans(theme::CAPTION_SIZE, t.regular);
+    let bar_x = IX + DASH_LABEL_W;
+    let bar_w = IW - DASH_LABEL_W - DASH_PCT_W;
+    let mut bars: Vec<(String, String, f64, String, Option<f64>, String)> = p.limits.clone();
+    if let Some((n, line)) = &p.codex {
+        bars.push((
+            "CX".into(),
+            "Codex 7D".into(),
+            *n,
+            if *n >= 90. {
+                "red"
+            } else if *n >= 75. {
+                "amber"
+            } else {
+                "ok"
+            }
+            .into(),
+            None,
+            line.clone(),
+        ));
+    }
+    for (code, name, used, sev, tick, line) in &bars {
+        let ink = dash_sev_ink(sev, t);
+        let base = at + f.cap(label);
+        c.text(f, name, IX, base, label, t.ink, A::L);
+        let bar_y = at + f.cap(label) / 2. - DASH_BAR_H / 2.;
+        c.rrect(bar_x, bar_y, bar_w, DASH_BAR_H, 3., t.track);
+        let fill = (used / 100.).clamp(0., 1.) as f32;
+        if *used > 0. {
+            c.rrect(bar_x, bar_y, (bar_w * fill).max(4.), DASH_BAR_H, 3., ink);
+        }
+        let tick_frac = tick.map(|n| (n / 100.).clamp(0., 1.) as f32);
+        if let Some(frac) = tick_frac {
+            let tx = (bar_x + bar_w * frac).min(bar_x + bar_w - 1.);
+            c.rect(tx - 1., bar_y - 3., 2., DASH_BAR_H + 6., t.quiet);
+        }
+        c.text(
+            f,
+            &format!("{}%", used.round() as i64),
+            IX + IW,
+            base,
+            sans(11.5, t.bold),
+            ink,
+            A::R,
+        );
+        let line_ink = if sev == "red" && line.starts_with("On pace to run out") {
+            t.risk
+        } else {
+            t.quiet
+        };
+        single(
+            c,
+            f,
+            line,
+            IX,
+            at + 17. + f.cap(caption),
+            IW,
+            theme::CAPTION_SIZE,
+            line_ink,
+            t,
+        );
+        dash.limits.push(DashLimit {
+            code: code.clone(),
+            name: name.clone(),
+            bar: (bar_x, bar_y, bar_w, DASH_BAR_H),
+            fill,
+            tick: tick_frac,
+            line: line.clone(),
+        });
+        at += DASH_LIMIT_PITCH;
+    }
+    at += gap;
+    // C. the context
+    if let Some((tokens, size, state)) = p.ctx {
+        at += S2;
+        let base = at + f.cap(label);
+        c.text(f, "Context", IX, base, label, t.ink, A::L);
+        let used = format!("{:.0}% used", (tokens / size * 100.).round());
+        let name_w = f.width("Context", label);
+        c.text(
+            f,
+            &used,
+            IX + name_w + S2,
+            base,
+            sans(11.5, t.bold),
+            dash_sev_ink(state, t),
+            A::L,
+        );
+        let free = format!("{} free of {}", short(size - tokens), short(size));
+        c.text(f, &free, IX + IW, base, caption, t.quiet, A::R);
+        dash.context_head = Some(format!("{used} · {free}"));
+        at += 16.;
+        let bar_y = at + S1;
+        c.rrect(IX, bar_y, IW, DASH_BAR_H, 3., t.track);
+        let mut x = IX;
+        let mut segs = vec![];
+        for (name, n, ink) in &p.parts {
+            let w = ((*n / size) as f32 * IW).max(1.5);
+            c.rect(x, bar_y, w, DASH_BAR_H, *ink);
+            segs.push(DashSegment {
+                name: (*name).into(),
+                tokens: *n,
+                x,
+                w,
+                legend: None,
+            });
+            x += w;
+        }
+        dash.context_bar = Some((IX, bar_y, IW, DASH_BAR_H));
+        at = bar_y + DASH_BAR_H + S2;
+        let sized = |n: f64| {
+            if p.estimated {
+                format!("~{}", short(n))
+            } else {
+                short(n)
+            }
+        };
+        let col_w = if full { DASH_PART_COL } else { IW / 2. };
+        for (i, (name, n, ink)) in p.parts.iter().enumerate() {
+            let (cx, row) = if full {
+                (IX, i)
+            } else {
+                (IX + (i % 2) as f32 * col_w, i / 2)
+            };
+            let ry = at + row as f32 * DASH_ROW;
+            let base = ry + f.cap(caption) + 1.;
+            c.rrect(cx, ry + 2.5, 8., 8., 2., *ink);
+            c.text(f, name, cx + 14., base, caption, t.quiet, A::L);
+            let right = cx + DASH_PART_COL - if full { 0. } else { S2 };
+            c.text(
+                f,
+                &sized(*n),
+                right,
+                base,
+                sans(theme::CAPTION_SIZE, t.medium),
+                t.ink,
+                A::R,
+            );
+            segs[i].legend = Some(format!("{name} {}", sized(*n)));
+        }
+        dash.segments = segs;
+        at += (if full {
+            p.parts.len()
+        } else {
+            p.parts.len().div_ceil(2)
+        }) as f32
+            * DASH_ROW;
+        match (&p.turn, p.estimated) {
+            (Some(line), _) => {
+                single(
+                    c,
+                    f,
+                    line,
+                    IX,
+                    at + 1. + f.cap(caption),
+                    IW,
+                    theme::CAPTION_SIZE,
+                    t.quiet,
+                    t,
+                );
+                dash.est_marks += line.matches("est.").count();
+                dash.turn = Some(line.clone());
+                at += DASH_ROW;
+            }
+            (None, true) => {
+                let line = "Part sizes est., scaled to the real total.";
+                single(
+                    c,
+                    f,
+                    line,
+                    IX,
+                    at + 1. + f.cap(caption),
+                    IW,
+                    theme::CAPTION_SIZE,
+                    t.quiet,
+                    t,
+                );
+                dash.est_marks += 1;
+                at += DASH_ROW;
+            }
+            _ => {}
+        }
+        if let Some((line, cold)) = &p.cache {
+            single(
+                c,
+                f,
+                line,
+                IX,
+                at + 1. + f.cap(caption),
+                IW,
+                theme::CAPTION_SIZE,
+                if *cold { t.amber } else { t.quiet },
+                t,
+            );
+            dash.cache_row = Some(line.clone());
+            at += DASH_ROW;
+        }
+        at += S2 + gap;
+        let _ = ctx_h;
+    }
+    // D. what CSR did this session
+    if !p.csr.is_empty() {
+        let st = sans(11., t.medium);
+        let lead = "CSR this session: ";
+        let lead_w = f.width(lead, sans(11., t.bold));
+        let mut parts = p.csr.clone();
+        while parts.len() > 1 && lead_w + f.width(&parts.join(" · "), st) > IW - 10. {
+            parts.pop();
+        }
+        let base = at + 2. + f.cap(st);
+        c.rrect(IX, at, 3., 15., 1.5, t.csr_share);
+        c.text(
+            f,
+            lead,
+            IX + 10.,
+            base,
+            sans(11., t.bold),
+            t.csr_share,
+            A::L,
+        );
+        let rest = f.fit(&parts.join(" · "), st, IW - 10. - lead_w);
+        c.text(f, &rest, IX + 10. + lead_w, base, st, t.ink, A::L);
+        dash.csr_row = Some(format!("{lead}{rest}"));
+        at += 20.;
+    }
+    if let Some((line, red)) = &p.status {
+        c.icon(
+            f,
+            Icon::CircleAlert,
+            IX,
+            at + f.cap(caption) + 1.,
+            12.,
+            10.,
+            if *red { t.risk } else { t.amber },
+        );
+        single(
+            c,
+            f,
+            line,
+            IX + 18.,
+            at + f.cap(caption) + 1.,
+            IW - 18.,
+            theme::CAPTION_SIZE,
+            t.quiet,
+            t,
+        );
+        at += DASH_ROW + S1;
+    }
+    let _ = (head_h, limits_h, csr_h);
+    // E. the fresh tokens per turn, under it all
+    if chart && fresh_bar_heights(&data.requests).is_some() {
+        let top = at;
+        let room = y + h - top - S2;
+        if room >= DASH_CHART_MIN {
+            let given = room.min(DASH_CHART_WANT + S5 * 3.);
+            history_plot(c, f, data, top, given, t);
+            dash.chart = true;
+        }
+    }
+    c.dash = Some(dash);
 }
 
 /// Compact side-ring strip for narrow panes or cards ≤ ~110 pt.
@@ -5345,6 +5943,8 @@ mod tests {
         c.figure["cache"] = json!({"left": 1800., "ttl": 3600., "text": "CACHE 30m left"});
         c.codex_week = json!({"percent": 41.});
         c.csr_cost.share = Some(4.7);
+        // The checks that use this draw the circles; the dashboard has its own.
+        c.figure["layout"] = json!("rings");
         c
     }
 
@@ -5596,10 +6196,329 @@ mod tests {
         }
     }
 
+    /// A figure the dashboard draws: windows with their outlook, a breakdown, CSR's tallies.
+    fn dash_composition(sev: &str) -> Composition {
+        let mut c = quota_composition();
+        c.figure.as_object_mut().unwrap().remove("layout");
+        c.figure["outlook"] = json!({
+            "headline": {"text": "On track. You should reach Thursday's reset with room to spare.", "sev": sev},
+            "windows": [
+                {"code":"5H","name":"5 Hour","used":18.,"sev":"ok","tick":46.,"early":false,
+                 "blended":false,"line":"On pace for about 46% by reset · resets in 4h 35m"},
+                {"code":"7D","name":"Weekly","used":45.,"sev":"ok","tick":71.,"early":true,
+                 "blended":true,"line":"On pace for about 71% by reset · resets in 2d 20h (early)"},
+            ],
+        });
+        c.figure["breakdown"] = json!({
+            "caption": "this turn +1.6k · Claude 1.3k · you 0.3k (est.)",
+            "floor": 28000., "text": 20000., "you": 4000., "tool": 60000., "csr": 8000.,
+            "free": 880000., "total": 120000., "size": 1000000.,
+            "turn": null, "estimated": true,
+        });
+        c.figure["asks"] = json!(4);
+        c.tally = json!({"by_csr": 2, "by_you": 0, "payback": 851_000.});
+        c
+    }
+
+    /// The dashboard's sizes: (width px, available height px) of a 35x30, the owner's 44x30 and a
+    /// 60x40 pane, at 16x34 px a cell.
+    const DASH_SIZES: [(u32, u32); 3] = [(560, 1020), (704, 1020), (960, 1360)];
+
+    #[test]
+    fn the_dashboard_reads_top_to_bottom_in_words_at_every_size_and_theme() {
+        let c = dash_composition("ok");
+        for theme in [Theme::Dark, Theme::Light] {
+            for (w, h) in DASH_SIZES {
+                for open in [
+                    Open::default(),
+                    Open {
+                        figure: true,
+                        ..Open::default()
+                    },
+                ] {
+                    let at = format!("{theme:?} {w}x{h} figure={}", open.figure);
+                    let (_, m) = draw(&c, w, h, theme, open, false).expect("draws");
+                    let d = m
+                        .dash
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{at}: no dashboard"));
+                    // A. one headline sentence, then B. the limits, C. the context, D. CSR.
+                    let (head, _) = d.headline.as_ref().expect("a headline");
+                    assert!(head.starts_with("On track."), "{at}: {head}");
+                    let codes: Vec<_> = d.limits.iter().map(|l| l.code.as_str()).collect();
+                    assert_eq!(codes, vec!["5H", "7D", "CX"], "{at}");
+                    assert!(d.limits[0].line.contains("On pace for about 46% by reset"));
+                    assert!(d.limits[1].line.ends_with("(early)"), "{at}");
+                    for l in &d.limits {
+                        let (bx, by, bw, bh) = l.bar;
+                        assert!(bw > 200. && bh >= 6., "{at}: {l:?}");
+                        assert!(bx >= IX && bx + bw <= IX + IW + 0.01, "{at}: {l:?}");
+                        assert!((0. ..=1.).contains(&l.fill), "{at}: {l:?}");
+                        assert!(
+                            by > m.figure_region.0 && by < m.figure_region.0 + m.figure_region.1
+                        );
+                    }
+                    // The forecast tick sits where the outlook said, on the bar.
+                    assert_eq!(d.limits[0].tick, Some(0.46));
+                    assert_eq!(d.limits[1].tick, Some(0.71));
+                    assert_eq!(d.limits[2].tick, None, "Codex has no forecast");
+                    assert!(
+                        d.context_head.as_deref().unwrap().contains("12% used"),
+                        "{at}"
+                    );
+                    assert!(d
+                        .context_head
+                        .as_deref()
+                        .unwrap()
+                        .contains("880k free of 1M"));
+                    let row = d.csr_row.as_deref().expect("a CSR row");
+                    assert!(
+                        row.starts_with("CSR this session: 2 compactions · ~851k tokens saved"),
+                        "{at}: {row}"
+                    );
+                    assert!(row.contains("4 recalls used"), "{at}: {row}");
+                    // E. the chart comes with `i`, never without it.
+                    if !open.figure {
+                        assert!(!d.chart, "{at}");
+                    }
+                    // The card holds all of it: the figure card is inside the picture.
+                    let (top, ch) = m.figure_region;
+                    assert!(top + ch <= m.height, "{at}");
+                    // The facts card that repeated the circles is gone, and so are the circles.
+                    assert!(m.figure_detail_region.is_none(), "{at}");
+                    assert!(m.quota_gauges.is_empty(), "{at}");
+                }
+            }
+        }
+        // The owner's size, expanded: the chart is under the rows.
+        let open = Open {
+            figure: true,
+            ..Open::default()
+        };
+        let (_, m) = draw(&c, 704, 1020, Theme::Dark, open, false).expect("draws");
+        assert!(m.dash.unwrap().chart);
+        assert_eq!(m.fresh_plots.len(), 1);
+    }
+
+    #[test]
+    fn every_bar_segment_has_a_labelled_swatch_row_and_est_is_said_once() {
+        let c = dash_composition("ok");
+        for theme in [Theme::Dark, Theme::Light] {
+            for (w, h) in DASH_SIZES {
+                for open in [
+                    Open::default(),
+                    Open {
+                        figure: true,
+                        ..Open::default()
+                    },
+                ] {
+                    let at = format!("{theme:?} {w}x{h} figure={}", open.figure);
+                    let (_, m) = draw(&c, w, h, theme, open, false).expect("draws");
+                    let d = m.dash.expect("dashboard");
+                    let names: Vec<_> = d.segments.iter().map(|s| s.name.as_str()).collect();
+                    assert_eq!(
+                        names,
+                        vec!["System + tools", "Messages", "Tool results", "CSR injected"],
+                        "{at}"
+                    );
+                    let (bx, _, bw, _) = d.context_bar.expect("the context bar");
+                    let mut end = bx;
+                    for s in &d.segments {
+                        let legend = s.legend.as_deref().unwrap_or_else(|| panic!("{at}: {s:?}"));
+                        assert!(
+                            legend.starts_with(&s.name) && legend.contains('~'),
+                            "{at}: {legend}"
+                        );
+                        assert!(s.w >= 1.5 && s.x >= end - 0.01 && s.x + s.w <= bx + bw + 0.01);
+                        end = s.x + s.w;
+                    }
+                    // Messages are the person's and Claude's text together: 24k of 120k.
+                    assert_eq!(d.segments[1].legend.as_deref(), Some("Messages ~24k"));
+                    assert_eq!(d.est_marks, 1, "{at}");
+                }
+            }
+        }
+        // With no turn caption the card still says est. once, and with none of the parts it
+        // draws one segment and says nothing of estimates.
+        let mut quiet = dash_composition("ok");
+        quiet.figure["breakdown"]["caption"] = Value::Null;
+        let (_, m) = draw(&quiet, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        let d = m.dash.unwrap();
+        assert!(d.turn.is_none() && d.est_marks == 1);
+        quiet.figure["breakdown"] = Value::Null;
+        let (_, m) = draw(&quiet, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        let d = m.dash.unwrap();
+        assert_eq!(d.segments.len(), 1);
+        assert_eq!(d.segments[0].name, "In use");
+        assert_eq!(d.est_marks, 0);
+    }
+
+    #[test]
+    fn the_headline_is_in_the_colour_of_its_state() {
+        type Pick = fn(&Tokens) -> Rgba;
+        let states: [(&str, Pick); 3] = [
+            ("ok", |t| t.mint),
+            ("amber", |t| t.amber),
+            ("red", |t| t.risk),
+        ];
+        for (sev, pick) in states {
+            for theme in [Theme::Dark, Theme::Light] {
+                let t = theme.tokens();
+                let c = dash_composition(sev);
+                let (w, h) = (704_u32, 1020_u32);
+                let (pm, m) = draw(&c, w, h, theme, Open::default(), false).expect("draws");
+                let scale = (w as f32 / W).min(h as f32 / m.height);
+                let left = ((w as f32 - (W * scale).round().min(w as f32)) / 2.) as u32;
+                let top = m.figure_region.0 + P;
+                let own = ink_px(
+                    &pm,
+                    (top, top + DASH_HEAD_LINE),
+                    scale,
+                    left,
+                    (W * scale) as u32,
+                    pick(t),
+                );
+                assert!(own >= 40, "{theme:?} {sev}: {own} px of its own ink");
+                // And the other states' inks are not in the headline.
+                for other in ["ok", "amber", "red"].into_iter().filter(|o| *o != sev) {
+                    let ink = match other {
+                        "ok" => t.mint,
+                        "amber" => t.amber,
+                        _ => t.risk,
+                    };
+                    let n = ink_px(
+                        &pm,
+                        (top, top + DASH_HEAD_LINE),
+                        scale,
+                        left,
+                        (W * scale) as u32,
+                        ink,
+                    );
+                    assert!(n < own / 4, "{theme:?} {sev}: {n} px of {other}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_csr_row_drops_each_part_that_has_no_data() {
+        let row = |edit: &dyn Fn(&mut Composition)| {
+            let mut c = dash_composition("ok");
+            c.csr_cost.share = Some(0.4);
+            edit(&mut c);
+            let (_, m) = draw(&c, 960, 1280, Theme::Dark, Open::default(), false).unwrap();
+            m.dash.unwrap().csr_row
+        };
+        let all = row(&|_| {}).expect("a row");
+        for part in [
+            "2 compactions",
+            "~851k tokens saved",
+            "4 recalls used",
+            "0.4 pts of the weekly limit",
+        ] {
+            assert!(all.contains(part), "{all}");
+        }
+        let no_tally = row(&|c| c.tally = Value::Null).unwrap();
+        assert!(
+            !no_tally.contains("compaction") && !no_tally.contains("saved"),
+            "{no_tally}"
+        );
+        assert!(no_tally.contains("4 recalls used"));
+        let no_asks = row(&|c| c.figure["asks"] = json!(0)).unwrap();
+        assert!(
+            !no_asks.contains("recall") && no_asks.contains("2 compactions"),
+            "{no_asks}"
+        );
+        let none = row(&|c| {
+            c.tally = Value::Null;
+            c.figure["asks"] = json!(0);
+            c.csr_cost.share = None;
+        });
+        assert_eq!(none, None, "no data, no row and no empty label");
+        // One compaction and one recall are singular.
+        let one = row(&|c| {
+            c.tally = json!({"by_csr": 1});
+            c.figure["asks"] = json!(1);
+        })
+        .unwrap();
+        assert!(
+            one.contains("1 compaction ·") && one.contains("1 recall used"),
+            "{one}"
+        );
+    }
+
+    #[test]
+    fn the_cache_row_says_warm_with_its_time_left_and_cold_with_its_cost() {
+        let row = |cache: Value| {
+            let mut c = dash_composition("ok");
+            c.figure["cache"] = cache;
+            let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+            m.dash.unwrap().cache_row
+        };
+        let warm = row(json!({"long": "WARM · 59m left", "cold": false, "left": 3540.}));
+        assert_eq!(warm.as_deref(), Some("Cache warm · 59m left"));
+        let cold = row(json!({"long": "COLD · re-reads ~92k", "cold": true}));
+        assert_eq!(cold.as_deref(), Some("Cache cold · re-reads ~92k"));
+        // No reading, no row, and the CSR row never claims the cache was kept warm.
+        assert_eq!(row(json!({"long": "--", "cold": false})), None);
+        let mut c = dash_composition("ok");
+        c.figure["cache"] = json!({"long": "WARM · 59m left", "cold": false});
+        let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        assert!(!m.dash.unwrap().csr_row.unwrap().contains("warm"));
+    }
+
+    #[test]
+    fn the_codex_bar_shows_only_when_codex_data_exists() {
+        let mut c = dash_composition("ok");
+        c.codex_week = json!({});
+        let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        let codes: Vec<_> = m
+            .dash
+            .unwrap()
+            .limits
+            .iter()
+            .map(|l| l.code.clone())
+            .collect();
+        assert_eq!(codes, vec!["5H", "7D"]);
+    }
+
+    #[test]
+    fn a_figure_without_an_outlook_still_shows_its_windows_and_no_headline() {
+        let mut c = dash_composition("ok");
+        c.figure.as_object_mut().unwrap().remove("outlook");
+        let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        let d = m.dash.unwrap();
+        assert!(d.headline.is_none());
+        assert_eq!(d.limits.len(), 3);
+        assert!(
+            d.limits[0].line.starts_with("18% used"),
+            "{}",
+            d.limits[0].line
+        );
+        assert_eq!(d.limits[0].tick, None);
+    }
+
+    #[test]
+    fn the_dashboard_fills_the_closed_card_at_the_live_44_column_size_without_a_blank_gap() {
+        // The closed card at 44x30 is the dashboard in its compact form: the rows two to a row.
+        let c = dash_composition("amber");
+        let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        let d = m.dash.unwrap();
+        assert!(!d.chart && !d.full);
+        let (top, h) = m.figure_region;
+        let plan = dash_plan(&fonts().unwrap(), &c, Theme::Dark.tokens()).unwrap();
+        assert!(
+            h + 0.5 >= dash_compact_h(&plan),
+            "{h} < compact {}",
+            dash_compact_h(&plan)
+        );
+        assert!(top > 0. && top + h <= m.height);
+    }
+
     fn breakdown_composition() -> Composition {
         let mut c = quota_composition();
         c.figure["breakdown"] = json!({
-            "caption": "+9k this turn: tool results 6k, CSR 1.1k est.",
+            "caption": "this turn +9k · tool results 6k · CSR 1.1k (est.)",
             "floor": 28000., "text": 20000., "tool": 60000., "csr": 12000.,
             "free": 880000., "total": 120000., "size": 1000000.,
             "turn": null, "estimated": true,
@@ -5702,7 +6621,7 @@ mod tests {
         }
         let rows = figure_text_rows(&with, 100, true, None).join("\n");
         assert!(
-            rows.contains("+9k this turn: tool results 6k, CSR 1.1k est."),
+            rows.contains("this turn +9k · tool results 6k · CSR 1.1k (est.)"),
             "{rows}"
         );
         assert!(!figure_text_rows(&bare, 100, true, None)
@@ -6359,6 +7278,10 @@ mod tests {
                     let (shown, m) = draw(&c, w, h, Theme::Dark, open, false).expect("draws");
                     assert_ne!(shown.data(), closed.data(), "{at}: the picture must change");
                     match key {
+                        "i" if m.dash.is_some() => {
+                            // The dashboard is its own facts: no second card repeats it.
+                            assert!(m.figure_detail_region.is_none(), "{at}");
+                        }
                         "i" => {
                             let (_, card) = m
                                 .figure_detail_region
@@ -6444,6 +7367,9 @@ mod tests {
                                 + MONOLOGUE_H
                                 + (bands as f32 * ROW_PITCH - ROW_GAP).max(40.);
                             assert!(card >= least, "{at}: {card} < {least}");
+                        }
+                        _ if m.dash.is_some() => {
+                            assert!(m.figure_detail_region.is_none(), "{at}");
                         }
                         _ => {
                             let (_, card) = m

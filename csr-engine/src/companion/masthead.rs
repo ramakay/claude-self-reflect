@@ -437,6 +437,7 @@ pub fn gauges(
             "sev": sev,
         },
         "breakdown": breakdown,
+        "asks": array(&s["asked"]).len(),
         "band": {"low": super::app::state::BAND_LOW, "high": super::app::state::BAND_HIGH},
         "floor": {
             "tokens": floor,
@@ -1268,7 +1269,7 @@ mod usage_tests {
         assert!(g["breakdown"]["caption"]
             .as_str()
             .unwrap()
-            .starts_with("+10k this turn"));
+            .starts_with("this turn +10k"));
         // A context that no longer matches the kept reply (after a compaction) has no breakdown.
         let s = json!({"main": [[T0 + 60., 9000]], "breakdown": s["breakdown"]});
         let g = gauges(&fields, Some(T0), &s, T0 + 70., &Value::Null, &Value::Null);

@@ -35,6 +35,6 @@ Text parity is ready for review.
 + render/instrument.rs · meta ⌗7625eed7
 ! render/instrument.rs · draw unverified
 CTX 192k/1M · +6k/turn · ♻ >15 prompts · 1 by CSR
-5H 2% · CSR cost: $1.20 this week · 37 calls · ◷ 59m
-Codex 7D 41%
+5H 2% · → ~7% at reset · CSR cost: $1.20 this week
+37 calls · ◷ 59m · Codex 7D 41%
  d queue  l changes  t threads  i figure  b theme  q close

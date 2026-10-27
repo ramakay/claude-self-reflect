@@ -139,6 +139,7 @@ fn instrument_png(
                     "content_width": metrics.content_width,
                     "quota_gauges": metrics.quota_gauges,
                     "fresh_plots": metrics.fresh_plots,
+                    "dash": metrics.dash,
                     "csr_share": theme.tokens().csr_share,
                     "sky": theme.tokens().sky,
                     "cols": cols, "rows": rows,

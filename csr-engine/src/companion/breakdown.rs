@@ -21,7 +21,9 @@ pub struct Chars {
     pub tool: u64,
     /// What CSR's hooks put in.
     pub csr: u64,
-    /// Everything else the conversation holds: prompts, replies, tool calls, other hooks.
+    /// What the person typed.
+    pub you: u64,
+    /// Everything else the conversation holds: Claude's replies and tool calls, other hooks.
     pub text: u64,
 }
 
@@ -30,14 +32,15 @@ impl Chars {
         Chars {
             tool: self.tool.saturating_sub(base.tool),
             csr: self.csr.saturating_sub(base.csr),
+            you: self.you.saturating_sub(base.you),
             text: self.text.saturating_sub(base.text),
         }
     }
     fn sum(self) -> u64 {
-        self.tool + self.csr + self.text
+        self.tool + self.csr + self.text + self.you
     }
     fn json(self) -> Value {
-        json!({"tool": self.tool, "csr": self.csr, "text": self.text})
+        json!({"tool": self.tool, "csr": self.csr, "text": self.text, "you": self.you})
     }
 }
 
@@ -63,6 +66,9 @@ impl Tally {
     }
     pub fn text(&mut self, chars: usize) {
         self.seen.text += chars as u64;
+    }
+    pub fn you(&mut self, chars: usize) {
+        self.seen.you += chars as u64;
     }
     /// A prompt came in: the turn it starts is measured from the newest reply.
     pub fn prompt(&mut self) {
@@ -92,12 +98,12 @@ impl Tally {
 }
 
 /// Split `tokens` over `chars` by share. All zero when there are no characters.
-fn shared(tokens: f64, chars: Chars) -> [f64; 3] {
+fn shared(tokens: f64, chars: Chars) -> [f64; 4] {
     let sum = chars.sum() as f64;
     if sum <= 0. || tokens <= 0. {
-        return [0.; 3];
+        return [0.; 4];
     }
-    [chars.tool, chars.text, chars.csr].map(|n| tokens * n as f64 / sum)
+    [chars.tool, chars.text, chars.csr, chars.you].map(|n| tokens * n as f64 / sum)
 }
 
 fn chars_of(v: &Value) -> Chars {
@@ -105,6 +111,7 @@ fn chars_of(v: &Value) -> Chars {
     Chars {
         tool: n("tool"),
         csr: n("csr"),
+        you: n("you"),
         text: n("text"),
     }
 }
@@ -122,18 +129,18 @@ pub fn figure(kept: &Value, tokens: f64, size: f64) -> Value {
         return Value::Null;
     }
     let floor = kept["floor"].as_f64().unwrap_or(0.).min(tokens);
-    let [tool, text, csr] = shared(tokens - floor, chars_of(&kept["chars"]));
+    let [tool, text, csr, you] = shared(tokens - floor, chars_of(&kept["chars"]));
     // Characters that explain nothing leave their share in the floor.
-    let floor = tokens - tool - text - csr;
+    let floor = tokens - tool - text - csr - you;
     let turn = kept["turn"]
         .as_object()
         .and_then(|t| {
             let from = t.get("from")?.as_f64()?;
             let grew = tokens - from;
             (grew > 0.).then(|| {
-                let [tool, text, csr] =
+                let [tool, text, csr, you] =
                     shared(grew, chars_of(t.get("chars").unwrap_or(&Value::Null)));
-                json!({"grew": grew, "tool": tool, "text": text, "csr": csr})
+                json!({"grew": grew, "tool": tool, "text": text, "csr": csr, "you": you})
             })
         })
         .unwrap_or(Value::Null);
@@ -142,6 +149,7 @@ pub fn figure(kept: &Value, tokens: f64, size: f64) -> Value {
         "caption": caption,
         "floor": floor,
         "text": text,
+        "you": you,
         "tool": tool,
         "csr": csr,
         "free": size - tokens,
@@ -152,29 +160,30 @@ pub fn figure(kept: &Value, tokens: f64, size: f64) -> Value {
     })
 }
 
-/// The last turn's change in words: what grew, and what it was made of (CSR's share always, the
-/// biggest other part with it). The total is the replies' own; the parts are estimates.
+/// The last turn's change in words, every number with its owner: what grew, then what it was
+/// made of, the biggest part first. The total is the replies' own; the parts are estimates.
 fn caption(turn: &Value) -> Option<String> {
     let grew = turn["grew"].as_f64()?;
     let least = (grew * 0.05).max(100.);
-    let part = |name: &'static str, key: &str| (name, turn[key].as_f64().unwrap_or(0.));
-    let csr = part("CSR", "csr");
-    let mut others = [part("tool results", "tool"), part("you + Claude", "text")];
-    others.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let mut shown: Vec<_> = [Some(others[0]), (csr.1 >= least).then_some(csr)]
-        .into_iter()
-        .flatten()
-        .filter(|p| p.1 >= least)
-        .collect();
-    shown.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let parts: Vec<_> = shown
-        .iter()
-        .map(|(name, n)| format!("{name} {}", short(*n)))
-        .collect();
+    let mut parts: Vec<(&str, f64)> = [
+        ("tool results", "tool"),
+        ("Claude", "text"),
+        ("you", "you"),
+        ("CSR", "csr"),
+    ]
+    .iter()
+    .map(|(name, key)| (*name, turn[*key].as_f64().unwrap_or(0.)))
+    .filter(|p| p.1 >= least)
+    .collect();
+    parts.sort_by(|a, b| b.1.total_cmp(&a.1));
     Some(if parts.is_empty() {
-        format!("+{} this turn", short(grew))
+        format!("this turn +{}", short(grew))
     } else {
-        format!("+{} this turn: {} est.", short(grew), parts.join(", "))
+        let owners: Vec<_> = parts
+            .iter()
+            .map(|(name, n)| format!("{name} {}", short(*n)))
+            .collect();
+        format!("this turn +{} · {} (est.)", short(grew), owners.join(" · "))
     })
 }
 
@@ -186,12 +195,19 @@ pub fn row_chars(row: &Value) -> Chars {
     match row["type"].as_str().unwrap_or("") {
         "assistant" | "user" => {
             let content = &message["content"];
+            let said = |out: &mut Chars, n: u64| {
+                if row["type"] == "user" {
+                    out.you += n;
+                } else {
+                    out.text += n;
+                }
+            };
             if let Some(text) = content.as_str() {
-                out.text += text.chars().count() as u64;
+                said(&mut out, text.chars().count() as u64);
             }
             for part in content.as_array().into_iter().flatten() {
                 match part["type"].as_str().unwrap_or("") {
-                    "text" => out.text += len(&part["text"]) as u64,
+                    "text" => said(&mut out, len(&part["text"]) as u64),
                     "tool_use" => out.text += part["input"].to_string().len() as u64,
                     "tool_result" => {
                         let body = &part["content"];
@@ -241,6 +257,7 @@ impl Tally {
         self.seen.tool += c.tool;
         self.seen.csr += c.csr;
         self.seen.text += c.text;
+        self.seen.you += c.you;
     }
 }
 
@@ -348,12 +365,11 @@ mod tests {
             row_chars(&tool),
             Chars {
                 tool: 750,
-                csr: 0,
-                text: 0
+                ..Chars::default()
             }
         );
         let prompt = json!({"type":"user","message":{"content":"hello there"}});
-        assert_eq!(row_chars(&prompt).text, 11);
+        assert_eq!(row_chars(&prompt).you, 11);
         let reply = json!({"type":"assistant","message":{"content":[
             {"type":"text","text":"done"},
             {"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}});
@@ -365,9 +381,8 @@ mod tests {
         assert_eq!(
             row_chars(&csr),
             Chars {
-                tool: 0,
                 csr: 1100,
-                text: 0
+                ..Chars::default()
             }
         );
         let other = json!({"type":"attachment","attachment":{"type":"hook_success",
@@ -376,9 +391,8 @@ mod tests {
         assert_eq!(
             row_chars(&other),
             Chars {
-                tool: 0,
-                csr: 0,
-                text: 5
+                text: 5,
+                ..Chars::default()
             }
         );
         let silent = json!({"type":"attachment","attachment":{"type":"hook_success",
@@ -387,18 +401,40 @@ mod tests {
     }
 
     #[test]
-    fn test_the_caption_names_the_turns_biggest_part_and_csr_and_says_est() {
+    fn test_what_the_person_typed_is_counted_apart_from_what_claude_wrote() {
+        let typed = json!({"type":"user","message":{"content":"x".repeat(40)}});
+        assert_eq!(
+            row_chars(&typed),
+            Chars {
+                you: 40,
+                ..Chars::default()
+            }
+        );
+        let said = json!({"type":"assistant","message":{"content":[
+            {"type":"text","text":"y".repeat(30)}]}});
+        assert_eq!(
+            row_chars(&said),
+            Chars {
+                text: 30,
+                ..Chars::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_the_caption_gives_every_number_its_owner_and_says_est_once() {
         let mut t = Tally::default();
         t.text(1000);
         t.reply(40_000.);
         t.prompt();
-        t.text(6_840);
+        t.you(2_160);
+        t.text(4_680);
         t.csr(3_960);
         t.tool_result(21_600);
         let f = figure(&t.reply(49_000.), 49_000., 1_000_000.);
         assert_eq!(
             f["caption"],
-            json!("+9k this turn: tool results 6k, CSR 1.1k est.")
+            json!("this turn +9k · tool results 6k · Claude 1.3k · CSR 1.1k · you 600 (est.)")
         );
         // CSR below a hundredth of the turn is not worth a name; a quiet turn names only its size.
         let mut t = Tally::default();
@@ -407,12 +443,15 @@ mod tests {
         t.tool_result(36_000);
         t.csr(36);
         let f = figure(&t.reply(50_000.), 50_000., 1_000_000.);
-        assert_eq!(f["caption"], json!("+10k this turn: tool results 10k est."));
+        assert_eq!(
+            f["caption"],
+            json!("this turn +10k · tool results 10k (est.)")
+        );
         let mut t = Tally::default();
         t.reply(40_000.);
         t.prompt();
         let f = figure(&t.reply(40_500.), 40_500., 1_000_000.);
-        assert_eq!(f["caption"], json!("+500 this turn"));
+        assert_eq!(f["caption"], json!("this turn +500"));
     }
 
     #[test]
