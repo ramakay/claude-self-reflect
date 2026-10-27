@@ -1785,7 +1785,15 @@ async fn settled_pool(
         .filter(|e| !is_demote_channel(&pass.validity, &e.chunk.id))
         .count();
     if valid < need && pass.window_full {
-        let refetch = need.saturating_mul(10);
+        // Echoes left out of the first window took places the page needs: ask
+        // for a window wider than the first, not just the 10x floor, which is
+        // smaller than the first window for a small page.
+        let widened = if pass.echo_dropped > 0 {
+            first.saturating_mul(3)
+        } else {
+            0
+        };
+        let refetch = need.saturating_mul(10).max(widened);
         if refetch > first {
             pass = reflect_gather_pass(
                 storage,
@@ -1837,6 +1845,10 @@ struct GatherPass {
     /// The HNSW window came back full — more candidates may exist beyond it,
     /// so a refetch could backfill demotion-vacated slots.
     window_full: bool,
+    /// Rows the echo filter left out of this pass (CSR's own output, logged
+    /// copies of the query). They cost the page places the window may have to
+    /// be widened to refill.
+    echo_dropped: usize,
     search_ms: u64,
     /// Cross-encoder summary over the pooled sessions (hybrid, CE policy,
     /// model available); `None` otherwise.
@@ -2278,6 +2290,49 @@ fn annotate_sessions(mut xml: String, rows: &[EnrichedResult]) -> String {
         xml = xml.replacen(&from, &to, 1);
     }
     xml
+}
+
+/// `CSR_NO_ECHO_FILTER=1` keeps every candidate in recall (the pre-filter
+/// behaviour), for comparing runs.
+fn echo_filter_enabled() -> bool {
+    std::env::var("CSR_NO_ECHO_FILTER").map_or(true, |value| value != "1")
+}
+
+/// Leave out of `enriched` the transcript rows that are CSR's own output or a
+/// logged copy of `query` ([`crate::search::echo::runtime_drop`]), and return
+/// their ids. Stored reflections, stories and narratives are never judged here:
+/// they are written on purpose, and the sinks further down order them.
+fn drop_echo_rows(
+    enriched: &mut Vec<EnrichedResult>,
+    provenance: &HashMap<String, Option<crate::provenance::ChunkProvenance>>,
+    reflection_tags: &HashMap<String, Vec<String>>,
+    query: &str,
+) -> HashSet<String> {
+    let mut dropped = HashSet::new();
+    if !echo_filter_enabled() {
+        return dropped;
+    }
+    enriched.retain(|e| {
+        if reflection_tags.contains_key(&e.chunk.id) {
+            return true;
+        }
+        let author = provenance
+            .get(&e.chunk.id)
+            .and_then(|row| row.as_ref())
+            .map(|row| row.author);
+        let drop = crate::search::echo::runtime_drop(
+            &e.chunk.content,
+            author,
+            &e.chunk.conversation_id,
+            query,
+        )
+        .is_some();
+        if drop {
+            dropped.insert(e.chunk.id.clone());
+        }
+        !drop
+    });
+    dropped
 }
 
 /// The cross-encoder stage of hybrid recall: score the pool (first
@@ -2770,6 +2825,28 @@ async fn reflect_gather_pass(
         Vec::new()
     };
 
+    // Echo filter (before any ranking, so before the cross-encoder pool): a
+    // transcript row that is CSR's own output, or a logged copy of this query,
+    // is left out here. The pool above is wider than the page, so the rows
+    // behind take the freed places, and the adaptive refetch in `settled_pool`
+    // counts what is left.
+    let chunk_provenance: HashMap<String, Option<crate::provenance::ChunkProvenance>> = enriched
+        .iter()
+        .filter(|e| !reflection_tags.contains_key(&e.chunk.id))
+        .map(|e| {
+            (
+                e.chunk.id.clone(),
+                storage.get_chunk_provenance(&e.chunk.id).ok().flatten(),
+            )
+        })
+        .collect();
+    let echo_dropped = drop_echo_rows(&mut enriched, &chunk_provenance, &reflection_tags, query);
+    let postings_order: Vec<String> = postings_order
+        .into_iter()
+        .filter(|id| !echo_dropped.contains(id))
+        .collect();
+    fts_order.retain(|id| !echo_dropped.contains(id));
+
     // Only built while a stage probe is active: `enriched_conv` exists solely
     // to feed the `rerank`/`fuse_rrf` stage-probe checkpoints further down
     // (see their record_stage calls), never the production ranking itself.
@@ -2812,7 +2889,7 @@ async fn reflect_gather_pass(
             id: e.chunk.id.clone(),
             cosine: e.score,
             content: e.chunk.content.clone(),
-            provenance: storage.get_chunk_provenance(&e.chunk.id).ok().flatten(),
+            provenance: chunk_provenance.get(&e.chunk.id).cloned().flatten(),
             // Reflection ids are not chunk ids: the chunk floor lookup would
             // read Unknown for every one of them.
             min_trust: match reflection_tags.get(&e.chunk.id) {
@@ -3351,6 +3428,7 @@ async fn reflect_gather_pass(
         display_rank_scores,
         validity: signals.validity,
         window_full,
+        echo_dropped: echo_dropped.len(),
         search_ms,
         ce: ce_summary,
     })
@@ -8600,28 +8678,37 @@ mod tests {
     }
 
     /// The pipeline, not just the map: with the dream switches unset (annotate
-    /// only) and with the validity kill switch (Off), a CSR-text result at 0.95
-    /// comes back after the clean one at 0.90, labeled, and both are present.
+    /// only) and with the validity kill switch (Off), a logged CSR emission in a
+    /// conversation is dropped before ranking and the clean result stays; the
+    /// same text in a plan document is not an emission and both come back.
     #[tokio::test]
-    async fn search_sinks_and_labels_csr_text_by_default_and_with_the_kill_switch() {
-        for (partition, mode) in [
-            (true, ConsumptionMode::AnnotateOnly),
-            (false, ConsumptionMode::Off),
+    async fn search_drops_logged_csr_emissions_and_keeps_plan_text() {
+        // CSR text in a plan document is kept. The same text in a user row of a
+        // conversation is a logged emission and the echo filter drops it. The
+        // `[CSR text]` label and sink for the tools that keep such rows are
+        // covered by the quick-check, recent-work and file-search tests below.
+        for (csr_conversation, partition, mode) in [
+            ("plan:conv-csr", true, ConsumptionMode::AnnotateOnly),
+            ("plan:conv-csr", false, ConsumptionMode::Off),
+            ("conv-csr", true, ConsumptionMode::AnnotateOnly),
         ] {
+            let kept = csr_conversation.starts_with("plan:");
             let storage = Arc::new(Storage::open_memory().unwrap());
             let mut search = SearchEngine::new(8);
-            for (id, conversation, content, vector) in [
+            for (id, conversation, content, vector, author) in [
                 (
                     "csr-chunk",
-                    "conv-csr",
+                    csr_conversation,
                     format!("shared recall text\n{CSR_RECAP_TEXT}"),
                     [1.0, 0.0, 0.0, 0.0],
+                    crate::provenance::Speaker::User,
                 ),
                 (
                     "clean-chunk",
                     "conv-clean",
                     "shared recall text about ordinary work".to_string(),
                     [0.9, 0.1, 0.0, 0.0],
+                    crate::provenance::Speaker::User,
                 ),
             ] {
                 let chunk = crate::import::ConversationChunk {
@@ -8632,7 +8719,7 @@ mod tests {
                     content,
                     message_count: 1,
                     summary: None,
-                    author: crate::provenance::Speaker::User,
+                    author,
                     seq: 0,
                     is_sidechain: false,
                 };
@@ -8641,7 +8728,7 @@ mod tests {
                     .insert_chunk_provenance(
                         &chunk.id,
                         &crate::provenance::ChunkProvenance {
-                            author: crate::provenance::Speaker::User,
+                            author,
                             source_conv_id: conversation.into(),
                             supersedes: None,
                         },
@@ -8665,14 +8752,19 @@ mod tests {
             )
             .await
             .unwrap();
-            let csr = out
-                .find("<id>csr-chunk</id>")
-                .expect("the CSR result is kept");
-            let clean = out
-                .find("<id>clean-chunk</id>")
-                .expect("the clean result is kept");
-            assert!(clean < csr, "{mode:?}: clean first, CSR second\n{out}");
-            assert!(out.contains("[CSR text]"), "{mode:?}: labeled\n{out}");
+            if !kept {
+                assert!(
+                    !out.contains("<id>csr-chunk</id>"),
+                    "{mode:?}: the logged emission is dropped\n{out}"
+                );
+                assert!(out.contains("<id>clean-chunk</id>"), "{out}");
+                continue;
+            }
+            assert!(
+                out.contains("<id>csr-chunk</id>"),
+                "{mode:?}: the plan row is kept\n{out}"
+            );
+            assert!(out.contains("<id>clean-chunk</id>"), "{out}");
         }
     }
 
@@ -15284,19 +15376,20 @@ mod echo_recall_tests {
         assert_eq!(order[0], "screen-with-answer", "{order:?}");
     }
 
+    /// CSR's own `csr_why` and search output is left out of recall before any
+    /// ranking (it used to sink to the bottom): the answers are all that is left.
     #[tokio::test]
-    async fn csr_why_and_search_output_do_not_outrank_answers() {
+    async fn csr_why_and_search_output_are_left_out_of_recall() {
         let (rows, reflections) = probe_rows();
         let order = recall(&rows, &reflections).await;
-        // `search-row` shares conv9 with `why-row`: one row per session.
-        assert!(!order.contains(&"search-row".to_string()), "{order:?}");
-        for noise in ["why-row"] {
-            for answer in ["answer-chunk", "answer-chunk-2"] {
-                assert!(
-                    position(&order, answer) < position(&order, noise),
-                    "{noise} is CSR's own output and must rank below {answer}: {order:?}"
-                );
-            }
+        for noise in ["why-row", "search-row"] {
+            assert!(
+                !order.contains(&noise.to_string()),
+                "{noise} is CSR's own output and must not be recalled: {order:?}"
+            );
+        }
+        for answer in ["answer-chunk", "answer-chunk-2"] {
+            assert!(order.contains(&answer.to_string()), "{order:?}");
         }
     }
 
@@ -15318,10 +15411,7 @@ mod echo_recall_tests {
                 "a question that carries its answer must lead the bare echoes: {order:?}"
             );
         }
-        assert!(
-            position(&order, "repeat-with-answer") < position(&order, "why-row"),
-            "{order:?}"
-        );
+        assert!(!order.contains(&"why-row".to_string()), "{order:?}");
     }
 
     #[tokio::test]
@@ -15345,6 +15435,158 @@ mod echo_recall_tests {
             order[0], "5eb5aebb-65ab-4fba-9917-86cb83845154",
             "{order:?}"
         );
+    }
+
+    // ---- echo filter: CSR's own output and logged copies of the query ----
+
+    fn set_author(storage: &Storage, id: &str, conv: &str, author: Speaker) {
+        storage
+            .insert_chunk_provenance(
+                id,
+                &crate::provenance::ChunkProvenance {
+                    author,
+                    source_conv_id: conv.into(),
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+    }
+
+    /// `echoes` rows that log the query being asked (a tool result, a call
+    /// rendering, a typed prompt) in the best vector places, then `answers`
+    /// rows that answer it.
+    fn echo_filled(echoes: usize, answers: usize) -> (Arc<Storage>, Arc<RwLock<SearchEngine>>) {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        for n in 0..echoes {
+            let (text, author) = match n % 3 {
+                0 => (
+                    format!("ECHO{n:03} {{\"query\": \"{QUERY}\", \"limit\": 5}}"),
+                    Speaker::ToolResult,
+                ),
+                1 => (
+                    format!("ECHO{n:03} Pulling CSR context.\n\n[mcp__claude-self-reflect__csr_reflect_on_past: {QUERY}]"),
+                    Speaker::Assistant,
+                ),
+                _ => (
+                    format!("{QUERY} and then fix it, please ECHO{n:03}"),
+                    Speaker::User,
+                ),
+            };
+            let (row, vector) = chunk(
+                &format!("echo-{n:03}"),
+                &format!("convecho{n:03}"),
+                0.99 - n as f32 * 0.002,
+                &text,
+            );
+            storage.insert_chunk(&row, &vector).unwrap();
+            set_author(&storage, &row.id, &row.conversation_id, author);
+            engine.insert_chunk(row.id.clone(), vector);
+        }
+        for n in 0..answers {
+            let (row, vector) = chunk(
+                &format!("answer-{n}"),
+                &format!("convanswer{n}"),
+                0.50 - n as f32 * 0.01,
+                // No word of the query, so only the vector lane can reach it.
+                &format!("ANSWER{n} installing a server was painful for reason {n}."),
+            );
+            storage.insert_chunk(&row, &vector).unwrap();
+            set_author(&storage, &row.id, &row.conversation_id, Speaker::Assistant);
+            engine.insert_chunk(row.id.clone(), vector);
+        }
+        (storage, Arc::new(RwLock::new(engine)))
+    }
+
+    async fn limit_five(storage: &Arc<Storage>, search: &Arc<RwLock<SearchEngine>>) -> String {
+        let scope =
+            SearchProjectScope::resolve_with(storage, Some("all"), Some("echoproj"), None, None)
+                .unwrap();
+        reflect_on_past_with_vec_in_scope(
+            storage,
+            search,
+            &Q4,
+            QUERY,
+            5,
+            0.0,
+            &scope,
+            0,
+            true,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The trap from the first attempt: a filter that drops the echoes from a
+    /// page fetched at exactly `limit` and never refills it returned three
+    /// weak rows at limit 5. Eight logged copies outrank six answers; the
+    /// page is still five answers.
+    #[tokio::test]
+    async fn a_limit_five_page_is_refilled_with_answers_when_logged_copies_outrank_them() {
+        let (storage, search) = echo_filled(8, 6);
+        let page = limit_five(&storage, &search).await;
+        let seen = marks(&page);
+        assert_eq!(seen.len(), 5, "five rows when six answers exist: {page}");
+        assert!(
+            seen.iter().all(|mark| mark.starts_with("ANSWER")),
+            "no logged copy of the query on the page: {seen:?}"
+        );
+    }
+
+    /// More logged copies than the first window holds: the window is widened
+    /// once and the page is still five answers.
+    #[tokio::test]
+    async fn a_limit_five_page_widens_the_window_when_it_held_only_logged_copies() {
+        let (storage, search) = echo_filled(130, 6);
+        let page = limit_five(&storage, &search).await;
+        let seen = marks(&page);
+        assert_eq!(seen.len(), 5, "five rows when six answers exist: {page}");
+        assert!(
+            seen.iter().all(|mark| mark.starts_with("ANSWER")),
+            "{seen:?}"
+        );
+    }
+
+    /// Fewer answers than the page: every answer shows, no logged copy fills
+    /// the rest.
+    #[tokio::test]
+    async fn a_page_with_fewer_answers_than_places_shows_no_logged_copy() {
+        let (storage, search) = echo_filled(8, 3);
+        let page = limit_five(&storage, &search).await;
+        let seen = marks(&page);
+        assert_eq!(seen, ["ANSWER0", "ANSWER1", "ANSWER2"], "{page}");
+    }
+
+    /// Rows that repeat the query's words but are not records of it stay.
+    #[tokio::test]
+    async fn prose_that_repeats_the_query_is_not_dropped() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let rows = [
+            // An answer that restates the question inside its own sentence.
+            (
+                "keep-prose",
+                Speaker::Assistant,
+                "ROW1 You asked why did we drop Docker and Qdrant, and the answer is install burden.".to_string(),
+            ),
+            // A code read that mentions the markers is a mention, not CSR's output.
+            (
+                "keep-code",
+                Speaker::ToolResult,
+                "ROW2 const NEXT: &str = \"NEXT:\"; const LAST: &str = \"LAST:\"; // TODOS: ANCHORS:".to_string(),
+            ),
+        ];
+        for (n, (id, author, text)) in rows.iter().enumerate() {
+            let (row, vector) = chunk(id, &format!("conv{n}"), 0.90 - n as f32 * 0.05, text);
+            storage.insert_chunk(&row, &vector).unwrap();
+            set_author(&storage, id, &row.conversation_id, *author);
+            engine.insert_chunk(row.id.clone(), vector);
+        }
+        let search = Arc::new(RwLock::new(engine));
+        let page = limit_five(&storage, &search).await;
+        assert_eq!(marks(&page), ["ROW1", "ROW2"], "{page}");
     }
 }
 
