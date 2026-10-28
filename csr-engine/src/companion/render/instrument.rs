@@ -2724,6 +2724,7 @@ fn heading(t: &Tokens) -> St {
     serif(theme::TITLE_SIZE, t.bold)
 }
 fn panel(c: &mut Canvas, y: f32, h: f32, t: &Tokens) {
+    c.panels.push((y, h));
     c.shadow(M, y, CW, h, 24., t.ambient_shadow);
     c.shadow(M, y, CW, h, 24., t.contact_shadow);
     c.glass(
@@ -2962,6 +2963,9 @@ pub struct Metrics {
     pub stack: Option<StackRow>,
     /// Every run of text drawn: left, top, right, bottom in layout pt, and the words.
     pub text_runs: Vec<(f32, f32, f32, f32, String)>,
+    /// Top and height of every card panel drawn (`panel`): the contract matches each to a
+    /// registered card region, so a card cannot draw without registering.
+    pub panels: Vec<(f32, f32)>,
     pub csr_cost: InstrumentCost,
     pub quota_gauges: Vec<QuotaGauge>,
     /// Baseline of the line of notes drawn under the quota circles, in layout pt.
@@ -3062,7 +3066,7 @@ pub fn draw(
     // none of the dashboard's cards.
     let page = open.threads || open.changes;
     let ratio = width as f32 / (W * S);
-    let mut maxh = (available_height as f32 / (S * ratio)).max(800.);
+    let maxh = (available_height as f32 / (S * ratio)).max(800.);
     let caption = sans(theme::CAPTION_SIZE, t.regular);
     let body = sans(theme::BODY_SIZE, t.regular);
     let title = heading(t);
@@ -3137,16 +3141,59 @@ pub fn draw(
     if !row.is_empty() {
         meta_rows.push(row);
     }
-    let status_lines = if compact_hero {
+    let mut status_lines = if compact_hero {
         vec![]
     } else {
         f.wrap(&status, caption, IW)
     };
     let (qs, question) = question_layout(f, &c.question(), width, t);
-    let question = if compact_hero { vec![] } else { question };
+    let mut question = if compact_hero { vec![] } else { question };
     let question_line_height = (qs.size * 1.25).round();
-    let qh = question.len() as f32 * question_line_height;
     let has_answers = c.dream.state == Batch::Ready || c.offer;
+    // The hero keeps to 30% of the pane-derived height: a long question or status loses its
+    // last lines ("…") instead of growing the canvas, which would shrink every font (rule 2).
+    let hero_rest = P * 2.
+        + theme::TITLE_LINE
+        + S2
+        + if meta_rows.is_empty() {
+            0.
+        } else {
+            (if compact_hero { 0. } else { S3 }) + meta_rows.len() as f32 * theme::CAPTION_LINE
+        }
+        + if has_answers {
+            S1 + theme::CAPTION_LINE
+        } else {
+            0.
+        };
+    let hero_budget = (maxh * 0.30).floor();
+    let hero_text_h = |q: usize, s: usize| {
+        q as f32 * question_line_height
+            + if s == 0 {
+                0.
+            } else {
+                S2 + s as f32 * theme::CAPTION_LINE
+            }
+    };
+    let (full_q, full_s) = (question.len(), status_lines.len());
+    while hero_rest + hero_text_h(question.len(), status_lines.len()) > hero_budget {
+        if status_lines.len() > 1 {
+            status_lines.pop();
+        } else if question.len() > 1 {
+            question.pop();
+        } else {
+            break;
+        }
+    }
+    let ellipsize = |lines: &mut Vec<String>, full: usize, st: St| {
+        if lines.len() < full {
+            if let Some(last) = lines.last_mut() {
+                *last = f.fit(&format!("{}…", last.trim_end()), st, IW);
+            }
+        }
+    };
+    ellipsize(&mut question, full_q, qs);
+    ellipsize(&mut status_lines, full_s, caption);
+    let qh = question.len() as f32 * question_line_height;
     let hero_h = P * 2.
         + theme::TITLE_LINE
         + S2
@@ -3168,8 +3215,6 @@ pub fn draw(
         };
     let hero_full_h = hero_h;
     let hero_h = if page { 0. } else { hero_full_h };
-    // Keep the full specified headline size and the hero's 30% budget together in short panes.
-    maxh = maxh.max((hero_h / 0.30).ceil());
     let active = !page && c.agents.agents.iter().any(agents::is_active);
     let agents_h = if active {
         P * 2. + theme::BODY_LINE
@@ -3200,6 +3245,13 @@ pub fn draw(
         0.
     };
     let empty_help = if page { 0. } else { sell_h };
+    // With an accordion open, the "What CSR can do" card keeps its first line only: it never
+    // folds (T1), but it yields its other two lines to the card the reader asked for.
+    let help_lean = if c.repo_recap.is_none() && empty_help > 0. {
+        P * 2. + theme::TITLE_LINE + S3 + theme::BODY_LINE + theme::CAPTION_LINE
+    } else {
+        empty_help
+    };
     let mut drill_lines = vec![];
     if open.changes {
         for v in &c.shifts {
@@ -3299,6 +3351,7 @@ pub fn draw(
         + if active { S3 } else { 0. }
         + empty_help
         + if empty_help > 0. { S3 } else { 0. };
+    let tail_lean = tail_base - empty_help + help_lean;
     // Text keeps one size: the width fit, `limit` pt of layout for this pane (PANE_RULES.md).
     // Content that does not fit gives way in a fixed order, the first to go first:
     //   1. the CSR performance card's check rows (a failing check stays),
@@ -3392,10 +3445,9 @@ pub fn draw(
         if step.fold & FOLD_PERF != 0 {
             0.
         } else {
-            c.soak
-                .as_ref()
-                .filter(|_| !page)
-                .map_or(0., |card| soak_plan(f, card, t, step.soak).h)
+            c.soak.as_ref().filter(|_| !page).map_or(0., |card| {
+                soak_plan(f, card, t, step.soak, step.soak_rows).h
+            })
         }
     };
     let step_story_h = |step: &FitStep| -> f32 {
@@ -3429,7 +3481,7 @@ pub fn draw(
             step_story_h(step),
             step_soak_h(step),
             stack_with(step.fold | open_bit),
-        ) + tail_base
+        ) + if accordion { tail_lean } else { tail_base }
             + figure
             + if section_open && !accordion {
                 section
@@ -3460,7 +3512,10 @@ pub fn draw(
     let accordion_kind = open
         .stack
         .filter(|_| !page && !section_open)
-        .filter(|k| !stack_kinds(closed_fit.fold).is_empty() && stack_kinds(FOLD_ALL).contains(k));
+        // Any stackable card with content opens on request, whether or not the closed layout
+        // folds it: `e` from an open section clears the section first, and the card it offered
+        // must still open.
+        .filter(|k| stack_kinds(FOLD_ALL).contains(k));
     let fit = if let Some(kind) = accordion_kind {
         let bit = STACKABLE[kind].0;
         let base = step(0, usize::MAX, false, true, FOLD_ALL & !bit, false, false);
@@ -3493,6 +3548,15 @@ pub fn draw(
                         ..base
                     });
                 }
+                // Past its leanest level the card cuts its failing rows, "+N more" last.
+                let failing = c.soak.as_ref().map_or(0, |card| soak_rows(card, 0).count());
+                for rows in (1..failing).rev() {
+                    choices.push(FitStep {
+                        soak: 0,
+                        soak_rows: rows,
+                        ..base
+                    });
+                }
             }
         }
         // A story of only changes keeps one change row: a card is never its title alone.
@@ -3508,6 +3572,11 @@ pub fn draw(
         closed_fit
     };
     let accordion = accordion_kind.is_some();
+    let (empty_help, tail_base) = if accordion {
+        (help_lean, tail_lean)
+    } else {
+        (empty_help, tail_base)
+    };
     let open_bit = accordion_kind.map_or(0, |k| STACKABLE[k].0);
     let fit_need = need(&fit, open_bit);
     let clipped = !page && fit_need > limit + 0.5;
@@ -3519,6 +3588,7 @@ pub fn draw(
         fold,
         story_lines: story_line_cap,
         story_shifts: story_shift_cap,
+        soak_rows: soak_row_cap,
         squeeze,
         least: section_least,
     } = fit;
@@ -3549,7 +3619,7 @@ pub fn draw(
         .soak
         .as_ref()
         .filter(|_| !page && fold & FOLD_PERF == 0)
-        .map(|card| soak_plan(f, card, t, soak_level));
+        .map(|card| soak_plan(f, card, t, soak_level, soak_row_cap));
     let soak_h = soak.as_ref().map_or(0., |p| p.h);
     let observed_full_h = observed_with(obs_cap, fold);
     let story_h = if story_hidden {
@@ -3701,7 +3771,8 @@ pub fn draw(
         // Cards always stack from the top. The final card owns surplus height.
         (figure_h, empty_help + (available - figure_h).max(0.))
     } else {
-        (maxh - top_core - tail_core - key_gap, empty_help)
+        // Past the last fit step (`clipped`) this can go below zero; never draw a negative card.
+        ((maxh - top_core - tail_core - key_gap).max(0.), empty_help)
     };
     let height = maxh;
     let mut canvas = Canvas::new(W, height);
@@ -4327,7 +4398,7 @@ pub fn draw(
             "CSR performance",
             y,
             plan.h,
-            plan.head.len() + soak_rows(card, plan.level).count(),
+            plan.head.len() + plan.shown,
         ));
         draw_soak(&mut canvas, f, card, plan, y, t);
         soak_region = Some((y, plan.h));
@@ -4588,7 +4659,8 @@ pub fn draw(
                     "Bring unfinished questions back when they matter.",
                 ),
             ];
-            for (line, (icon, caption_text)) in sells().iter().zip(features) {
+            let sell_lines = if accordion { 1 } else { features.len() };
+            for (line, (icon, caption_text)) in sells().iter().zip(features).take(sell_lines) {
                 let base = cursor + f.cap(body);
                 canvas.icon(f, icon, IX, base, 14., theme::BODY_SIZE, t.mint);
                 let x = IX + 14. + ICON_GAP;
@@ -4673,6 +4745,7 @@ pub fn draw(
             clipped: clipped.then_some(fit_need),
             stack: stack_row,
             text_runs: std::mem::take(&mut canvas.runs),
+            panels: std::mem::take(&mut canvas.panels),
             csr_cost: c.csr_cost.clone(),
             quota_gauges: canvas.quota_gauges.clone(),
             note_rows: canvas.note_rows.clone(),
@@ -5293,6 +5366,9 @@ struct SoakPlan {
     clock: bool,
     /// 2: every check row. 1 and 0: only a failing check; 0 also drops the clock and bar.
     level: u8,
+    /// The check rows drawn, and how many `level` has: fewer drawn ends in a "+N more" row.
+    shown: usize,
+    total: usize,
 }
 /// The height of the progress bar under the card's clock line.
 const SOAK_BAR_H: f32 = 6.;
@@ -5302,6 +5378,7 @@ fn soak_plan(
     card: &crate::companion::live_eval::Card,
     t: &Tokens,
     level: u8,
+    max_rows: usize,
 ) -> SoakPlan {
     let head: Vec<String> = f
         .wrap(&card.line1, heading(t), IW)
@@ -5309,7 +5386,9 @@ fn soak_plan(
         .take(2)
         .collect();
     let clock = level >= 1 && !card.line2.is_empty();
-    let rows = soak_rows(card, level).count() + usize::from(card.warning.is_some());
+    let total = soak_rows(card, level).count();
+    let shown = total.min(max_rows.max(1));
+    let rows = shown + usize::from(card.warning.is_some());
     let h = P
         + theme::TITLE_LINE
         + S2
@@ -5327,6 +5406,8 @@ fn soak_plan(
         h,
         clock,
         level,
+        shown,
+        total,
     }
 }
 /// The check rows a card shows at `level`: all of them at 2, only the failing ones below.
@@ -5405,11 +5486,13 @@ fn draw_soak(
         }
         at += SOAK_BAR_H;
     }
-    if soak_rows(card, plan.level).next().is_some() || card.warning.is_some() {
+    if plan.shown > 0 || card.warning.is_some() {
         at += S2;
     }
     let row_st = sans(11., t.regular);
-    for row in soak_rows(card, plan.level) {
+    let cut = plan.shown < plan.total;
+    let kept = if cut { plan.shown - 1 } else { plan.shown };
+    for row in soak_rows(card, plan.level).take(kept) {
         let mark = match row.sev.as_str() {
             "ok" => t.mint,
             "red" => t.risk,
@@ -5427,6 +5510,18 @@ fn draw_soak(
             11.,
             if row.sev == "quiet" { t.quiet } else { t.ink },
             t,
+        );
+        at += DASH_ROW;
+    }
+    if cut {
+        c.text(
+            f,
+            &more_line(plan.total - kept),
+            IX + 16.,
+            at + f.cap(row_st),
+            row_st,
+            t.quiet,
+            A::L,
         );
         at += DASH_ROW;
     }
@@ -5496,6 +5591,8 @@ struct FitStep {
     /// Most story rows and change rows the story card keeps (the accordion cuts them).
     story_lines: usize,
     story_shifts: usize,
+    /// Most check rows the performance card keeps (the accordion cuts them, "+N more" last).
+    soak_rows: usize,
     /// An open section squeezes the Context card to its floor.
     squeeze: bool,
     /// An open section is cut to its least rows.
@@ -5518,6 +5615,7 @@ const fn step(
         fold,
         story_lines: usize::MAX,
         story_shifts: usize::MAX,
+        soak_rows: usize::MAX,
         squeeze,
         least,
     }
@@ -5601,11 +5699,11 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
     // The bar spans the window Claude Code compacts to (`autoCompactWindow` or its env var, as
     // the compactor reads it), as /context does; its last NATIVE_UNDER is the auto-compact
     // buffer. With none set, the model's own window and no buffer.
-    let native = g["ctx"]["window"]
-        .as_f64()
-        .filter(|w| *w > crate::companion::app::compactor::rules::NATIVE_UNDER);
+    // Any positive window is the one configured (as `native_window_of` accepts it); a window of
+    // 33k or less is all buffer.
+    let native = g["ctx"]["window"].as_f64().filter(|w| *w > 0.);
     let size = native.unwrap_or(model_size);
-    let buffer = native.map(|_| crate::companion::app::compactor::rules::NATIVE_UNDER);
+    let buffer = native.map(|w| crate::companion::app::compactor::rules::NATIVE_UNDER.min(w));
     let (head, head_sev) = match g["outlook"]["headline"]["text"].as_str() {
         Some(text) => (
             f.wrap(text, heading(t), IW).into_iter().take(2).collect(),
@@ -6130,10 +6228,14 @@ fn draw_dashboard(
         let mut x = IX;
         let mut segs = vec![];
         for (name, n, ink) in &p.parts {
+            // The least visible width first, then the bar's end: a context past the window, or a
+            // tiny part at its end, never runs a segment off the bar.
             let w = ((*n / size) as f32 * bar_w)
-                .min(IX + bar_w - x)
-                .max(PARTS_GAP + 1.5);
-            c.rrect(x, bar_y, w - PARTS_GAP, PARTS_BAR_H, 1.5, *ink);
+                .max(PARTS_GAP + 1.5)
+                .min((IX + bar_w - x).max(0.));
+            if w > PARTS_GAP {
+                c.rrect(x, bar_y, w - PARTS_GAP, PARTS_BAR_H, 1.5, *ink);
+            }
             segs.push(DashSegment {
                 name: (*name).into(),
                 tokens: *n,
@@ -6848,6 +6950,26 @@ mod tests {
                 assert!(pixels > 3, "{theme:?}: missing caption ink {ink:?}");
             }
         }
+    }
+    /// Rule 12's threshold: Tools or Context at half the session or more names it; anything
+    /// else, an Other-majority session included, is "mixed" (the owner's three words).
+    #[test]
+    fn the_session_mix_verdict_follows_the_half_threshold() {
+        let ink = [0u8; 4];
+        let mix = |tools: f64, context: f64, other: f64| {
+            session_mix(&[
+                ("Tool results", tools, ink),
+                ("Messages", context, ink),
+                ("CSR", other, ink),
+            ])
+            .map(|(_, v)| v)
+        };
+        assert_eq!(mix(50., 30., 20.), Some("tool-heavy"));
+        assert_eq!(mix(49., 30., 21.), Some("mixed"));
+        assert_eq!(mix(20., 50., 30.), Some("context-heavy"));
+        assert_eq!(mix(10., 10., 80.), Some("mixed"));
+        assert_eq!(mix(0., 0., 0.), None);
+        assert_eq!(session_mix(&[("In use", 5., ink)]), None);
     }
 
     use super::*;

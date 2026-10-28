@@ -616,6 +616,8 @@ pub struct Canvas {
     pub cut_title: &'static str,
     /// Every run of text drawn: left, top, right, bottom in pt, and the words.
     pub runs: Vec<(f32, f32, f32, f32, String)>,
+    /// Top and height of every card panel drawn, in pt: each must be a registered card.
+    pub panels: Vec<(f32, f32)>,
 }
 
 /// One limit bar of the dashboard: a window used so far, with a tick where it is headed.
@@ -965,6 +967,7 @@ impl Canvas {
             cuts: Vec::new(),
             cut_title: "In full",
             runs: Vec::new(),
+            panels: Vec::new(),
         }
     }
     pub fn dry() -> Canvas {
@@ -981,6 +984,7 @@ impl Canvas {
             cuts: Vec::new(),
             cut_title: "In full",
             runs: Vec::new(),
+            panels: Vec::new(),
         }
     }
     pub fn fill(&mut self, p: &Path, col: Rgba) {
@@ -1392,6 +1396,7 @@ pub fn contact(f: &Fonts, tiles: &[(String, Pixmap, String)], path: &str, bg: Rg
         cuts: Vec::new(),
         cut_title: "",
         runs: Vec::new(),
+        panels: Vec::new(),
     };
     c.pm.fill(color(bg));
     let mut y = gap;

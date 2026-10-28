@@ -7,7 +7,7 @@ use csr_engine::companion::{
     pane::Pane,
     paths::Paths,
     render::{
-        instrument::{Metrics, CARD_REGISTRY, STACKABLE},
+        instrument::{Metrics, CARD_REGISTRY, LAYOUT_WIDTH, STACKABLE},
         kitty::{set_cell_override, Placement},
         theme::Theme,
     },
@@ -17,14 +17,16 @@ use serde_json::{json, Value};
 use std::fs;
 
 /// The pane sizes: cols x rows at the cell the terminal reports. 35x30 and 35x20 are the owner's
-/// pane at its real 26x58 cell; 30x16 is the smallest supported.
-const SIZES: [(usize, usize, (u32, u32)); 6] = [
+/// pane at its real 26x58 cell; 30x16 is the smallest supported (text rows); 32x16 the smallest
+/// that draws the picture.
+const SIZES: [(usize, usize, (u32, u32)); 7] = [
     (35, 30, (26, 58)),
     (44, 30, (16, 34)),
     (26, 58, (16, 34)),
     (35, 20, (26, 58)),
     (60, 24, (16, 34)),
     (30, 16, (16, 34)),
+    (32, 16, (16, 34)),
 ];
 const THEMES: [Theme; 2] = [Theme::Dark, Theme::Light];
 
@@ -151,6 +153,40 @@ fn window_300k() -> (tempfile::TempDir, Paths) {
     fs::write(&path, settings.to_string()).unwrap();
     (home, paths)
 }
+/// The owner's session with a performance trial failing 40 checks: the card's leanest level
+/// still has 40 rows, so the accordion must cut them.
+fn perf_red() -> (tempfile::TempDir, Paths) {
+    let (home, paths) = owner_home();
+    let path = paths
+        .home
+        .join(".claude-self-reflect/trials/combo-soak.json");
+    let mut trial: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    trial["checks"] = Value::Array(
+        (0..40)
+            .map(|i| {
+                json!({"id":format!("rss{i}"),"label":format!("Memory under 1 MB, probe {i}"),
+                    "metric":"rss_mb","op":"<=","threshold":1,"kind":"latest","unit":"MB",
+                    "warmup_hours":0.})
+            })
+            .collect(),
+    );
+    fs::write(&path, trial.to_string()).unwrap();
+    (home, paths)
+}
+/// The owner's pane with a configured window under the 33k buffer: all of it is buffer.
+fn window_20k() -> (tempfile::TempDir, Paths) {
+    let (home, paths) = owner_home();
+    let path = paths.home.join(".claude/settings.json");
+    let mut settings: Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    settings["autoCompactWindow"] = json!(20000);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, settings.to_string()).unwrap();
+    (home, paths)
+}
 fn after() -> (tempfile::TempDir, Paths) {
     state_home("06-after")
 }
@@ -158,7 +194,7 @@ fn away() -> (tempfile::TempDir, Paths) {
     state_home("07-away")
 }
 
-const FIXTURES: [Fixture; 21] = [
+const FIXTURES: [Fixture; 26] = [
     Fixture {
         name: "few",
         home: few,
@@ -264,6 +300,31 @@ const FIXTURES: [Fixture; 21] = [
         home: dreaming,
         keys: &["e", "n"],
     },
+    Fixture {
+        name: "perf-red",
+        home: perf_red,
+        keys: &[],
+    },
+    Fixture {
+        name: "perf-red-open",
+        home: perf_red,
+        keys: &["stack:3"],
+    },
+    Fixture {
+        name: "window-20k",
+        home: window_20k,
+        keys: &[],
+    },
+    Fixture {
+        name: "section-then-e",
+        home: agents,
+        keys: &["a", "e"],
+    },
+    Fixture {
+        name: "stack-esc",
+        home: dreaming,
+        keys: &["e", "escape"],
+    },
 ];
 
 struct Shot {
@@ -299,6 +360,33 @@ fn shot(
     }
     let out = pane.frame(cols, rows, NOW);
     set_cell_override(None);
+    Shot {
+        out,
+        placed: pane.placed.clone(),
+        metrics: pane.instrument_metrics.clone(),
+    }
+}
+/// A live pane after `keys`, for taps and resizes; the cell override stays set until `done`.
+fn live(
+    home: fn() -> (tempfile::TempDir, Paths),
+    keys: &[&str],
+    (cols, rows, cell): (usize, usize, (u32, u32)),
+) -> (tempfile::TempDir, Pane) {
+    set_cell_override(Some(cell));
+    let (dir, paths) = home();
+    let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+    pane.theme = Theme::Dark;
+    pane.pixels = true;
+    pane.enable_cards();
+    pane.frame(cols, rows, NOW);
+    for key in keys {
+        pane.key(key);
+        pane.frame(cols, rows, NOW);
+    }
+    (dir, pane)
+}
+fn shot_of(pane: &mut Pane, cols: usize, rows: usize) -> Shot {
+    let out = pane.frame(cols, rows, NOW);
     Shot {
         out,
         placed: pane.placed.clone(),
@@ -371,7 +459,21 @@ fn violations(
             ));
         }
     }
-    // #2 the canvas is the pane's: nothing grew it, nothing was cut.
+    // #2 the canvas is the pane's: nothing grew it, nothing was cut. The limit comes from the
+    // pane alone (a page keeps its own floor of rows).
+    let page = fixture.keys.iter().any(|k| matches!(*k, "t" | "l"));
+    let pane_limit = ((rows - 1) as f32 * cell.1 as f32 * LAYOUT_WIDTH
+        / (cols as f32 * cell.0 as f32))
+        .max(800.);
+    if !page && m.limit > pane_limit + 0.5 {
+        bad.push(redo(
+            2,
+            &what,
+            m.limit,
+            pane_limit,
+            "the limit grew past the pane's own",
+        ));
+    }
     if m.height > m.limit + 0.5 {
         bad.push(redo(2, &what, m.height, m.limit, "the canvas grew"));
     }
@@ -414,9 +516,28 @@ fn violations(
             }
         }
     }
-    // #5 content inside its card.
+    // #5 content inside its card: what the drawing code reports, and every text run inside
+    // some card's band, so a run in the gap between cards is caught whoever drew it.
     for (title, need, room) in &m.overdrawn {
         bad.push(redo(5, &what, *need, *room, title));
+    }
+    for run in &m.text_runs {
+        let inside = m
+            .cards
+            .iter()
+            .any(|c| run.1 >= c.top - 0.5 && run.3 <= c.top + c.height + 0.5);
+        if !inside {
+            bad.push(redo(
+                5,
+                &what,
+                run.3,
+                0.,
+                &format!(
+                    "text {:?} at {:.1}-{:.1} is in no card",
+                    run.4, run.1, run.3
+                ),
+            ));
+        }
     }
     // #6 no title-only card.
     for card in &m.cards {
@@ -449,6 +570,21 @@ fn violations(
                     ),
                 ));
             }
+        }
+    }
+    // #10 every panel drawn is a registered card region.
+    for (y, h) in &m.panels {
+        let owned = m.cards.iter().any(|c| {
+            (c.top - y).abs() < 0.5 && (c.height - h).abs() < 0.5 && registered(c.title).is_some()
+        });
+        if !owned {
+            bad.push(redo(
+                10,
+                &what,
+                *h,
+                0.,
+                &format!("a panel at {y:.1} ({h:.1} pt) belongs to no registered card"),
+            ));
         }
     }
     // #10 every drawn card is registered.
@@ -509,6 +645,8 @@ fn every_folded_card_opens_from_the_stack() {
                 let mut keys = vec!["e"];
                 keys.extend(std::iter::repeat_n("n", i));
                 let open = shot(fixture.home, &keys, size, Theme::Dark);
+                // An open card keeps every frame rule.
+                bad.extend(violations(fixture, size, Theme::Dark, &open));
                 let m = open.metrics.as_ref().expect("the instrument drew");
                 let titles = CARD_REGISTRY
                     .iter()
@@ -527,44 +665,88 @@ fn every_folded_card_opens_from_the_stack() {
                 } else {
                     opened += 1;
                 }
-                // A tap on the title opens it too.
-                let tapped = shot(
-                    fixture.home,
-                    &[Box::leak(format!("stack:{kind}").into_boxed_str())],
-                    size,
-                    Theme::Dark,
-                );
-                if tapped
+                // A tap on the title, at its cells in the stack's terminal row, opens it too.
+                let (_dir, mut pane) = live(fixture.home, &[], size);
+                let stack_rows: Vec<(usize, Value)> = pane
+                    .acts
+                    .iter()
+                    .filter(|(_, a)| a["key"] == "instrument:stack")
+                    .map(|(r, a)| (*r, a["stack"].clone()))
+                    .collect();
+                let span = stack_rows.first().and_then(|(r, spans)| {
+                    spans
+                        .as_array()?
+                        .iter()
+                        .find(|s| s[2].as_u64() == Some(*kind as u64))
+                        .and_then(|s| Some((*r, s[0].as_u64()? as usize, s[1].as_u64()? as usize)))
+                });
+                match span {
+                    Some((row, c0, c1)) if c1 > c0 => {
+                        let mut wrong = None;
+                        // Both edge cells (where rounding could hand a cell to a neighbour)
+                        // and the middle.
+                        let mut cols = vec![c0, (c0 + c1) / 2, c1 - 1];
+                        cols.dedup();
+                        for col in cols {
+                            let (_d, mut p) = live(fixture.home, &[], size);
+                            p.click(row, col, NOW);
+                            p.frame(size.0, size.1, NOW);
+                            let got = p
+                                .instrument_metrics
+                                .as_ref()
+                                .and_then(|m| m.stack.as_ref())
+                                .and_then(|s| s.open);
+                            if got != Some(*kind) {
+                                wrong = Some((col, got));
+                                break;
+                            }
+                        }
+                        if let Some((col, got)) = wrong {
+                            bad.push(redo(
+                                7,
+                                &what,
+                                0.,
+                                0.,
+                                &format!(
+                                    "a tap at row {row} col {col} on {} opened {got:?}",
+                                    STACKABLE[*kind].1
+                                ),
+                            ));
+                        }
+                    }
+                    _ => bad.push(redo(
+                        7,
+                        &what,
+                        0.,
+                        0.,
+                        &format!("{} has no tap target in the stack row", STACKABLE[*kind].1),
+                    )),
+                }
+                // Resized while open, the pane still keeps every frame rule.
+                pane.key("e");
+                pane.frame(size.0, size.1, NOW);
+                let smaller = (size.0, (size.1 * 2 / 3).max(16), size.2);
+                let resized = shot_of(&mut pane, smaller.0, smaller.1);
+                bad.extend(violations(fixture, smaller, Theme::Dark, &resized));
+                set_cell_override(None);
+            }
+            for close in [["e", "e"], ["e", "escape"]] {
+                let closed_again = shot(fixture.home, &close, size, Theme::Dark);
+                if closed_again
                     .metrics
                     .as_ref()
                     .and_then(|m| m.stack.as_ref())
                     .and_then(|s| s.open)
-                    != Some(*kind)
+                    .is_some()
                 {
                     bad.push(redo(
                         7,
                         &what,
                         0.,
                         0.,
-                        &format!("a tap on {} did not open it", STACKABLE[*kind].1),
+                        &format!("{close:?} did not close the open card"),
                     ));
                 }
-            }
-            let closed_again = shot(fixture.home, &["e", "e"], size, Theme::Dark);
-            if closed_again
-                .metrics
-                .as_ref()
-                .and_then(|m| m.stack.as_ref())
-                .and_then(|s| s.open)
-                .is_some()
-            {
-                bad.push(redo(
-                    7,
-                    &what,
-                    0.,
-                    0.,
-                    "`e` again did not close the open card",
-                ));
             }
         }
     }
@@ -658,8 +840,22 @@ fn the_session_mix_rides_the_bar_line_and_adds_no_row() {
             match (&d.mix, breakdown) {
                 (Some((verdict, shares, (_, cy, r))), true) => {
                     shown += 1;
-                    if !["tool-heavy", "context-heavy", "mixed"].contains(&verdict.as_str()) {
-                        bad.push(redo(12, &what, 0., 0., &format!("verdict {verdict:?}")));
+                    // Tools or Context at half the session or more names it; else "mixed".
+                    let want = if shares[0] >= 0.5 {
+                        "tool-heavy"
+                    } else if shares[1] >= 0.5 {
+                        "context-heavy"
+                    } else {
+                        "mixed"
+                    };
+                    if verdict != want {
+                        bad.push(redo(
+                            12,
+                            &what,
+                            0.,
+                            0.,
+                            &format!("verdict {verdict:?} for shares {shares:?}, want {want:?}"),
+                        ));
                     }
                     let sum: f32 = shares.iter().sum();
                     if (sum - 1.).abs() > 0.01 {
@@ -706,13 +902,18 @@ fn the_session_mix_rides_the_bar_line_and_adds_no_row() {
 #[test]
 fn the_context_bar_spans_the_auto_compact_window_from_settings() {
     let mut bad = vec![];
-    for (home, window) in [
+    let mut checked = [0; 3];
+    for (case, (home, window)) in [
         (
             window_300k as fn() -> (tempfile::TempDir, Paths),
-            Some(300000.),
+            Some(300000_f64),
         ),
+        (window_20k, Some(20000.)),
         (owner_home, None),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         for size in SIZES {
             let s = shot(home, &[], size, Theme::Dark);
             let Some(d) = s.metrics.as_ref().and_then(|m| m.dash.as_ref()) else {
@@ -721,13 +922,15 @@ fn the_context_bar_spans_the_auto_compact_window_from_settings() {
             let Some((bx, _, bw, _)) = d.context_bar else {
                 continue;
             };
+            checked[case] += 1;
             let what = format!("{window:?} {}x{}", size.0, size.1);
             let head = d.context_head.clone().unwrap_or_default();
             match window {
                 Some(w) => {
+                    let buffer = w.min(33000.);
                     if d.window != Some(w)
-                        || !head.contains("of 300k")
-                        || !head.contains("33k buffer")
+                        || !head.contains(&format!("of {}k", w / 1000.))
+                        || !head.contains(&format!("{}k buffer", buffer / 1000.))
                     {
                         bad.push(redo(
                             13,
@@ -737,10 +940,10 @@ fn the_context_bar_spans_the_auto_compact_window_from_settings() {
                             &format!("window {:?}, head {head:?}", d.window),
                         ));
                     }
-                    // The buffer is the bar's last 33/300.
+                    // The buffer is the bar's last 33k of the window (all of a smaller one).
                     match d.buffer {
                         Some((x, bwid))
-                            if ((bwid / bw) - 33. / 300.).abs() < 0.01
+                            if ((bwid / bw) as f64 - buffer / w).abs() < 0.01
                                 && (x + bwid - (bx + bw)).abs() < 0.1 => {}
                         other => bad.push(redo(
                             13,
@@ -765,6 +968,11 @@ fn the_context_bar_spans_the_auto_compact_window_from_settings() {
             }
         }
     }
+    eprintln!("pane contract: window frames checked {checked:?} (300k, 20k, none)");
+    assert!(
+        checked.iter().all(|n| *n > 0),
+        "a window case drew no Context bar: {checked:?}"
+    );
     assert!(
         bad.is_empty(),
         "{} violations:\n{}",

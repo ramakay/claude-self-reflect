@@ -9,7 +9,8 @@ is checked by `tests/pane_contract.rs` for every fixture, pane size and theme. A
    content and no text run ends below `limit`.
 2. **Fonts are never resized to fit.** The canvas is never taller than `limit`. Text size comes
    from the pane alone: the width fit, or the 800 pt floor of a short pane. Content that does
-   not fit gives way (rule 4); it never shrinks the type.
+   not fit gives way (rule 4); it never shrinks the type. The dreamer card keeps to 30% of that
+   height: a long question or status loses its last lines ("…"), never grows the canvas.
 3. **Tiers.** T0 is never folded: the dreamer card (hero), the Context card, an open section or
    page, the stack row and the open accordion card. T1 never folds and stays small: notice,
    agents bar, empty-session help. T2 folds into the stack: the two lists (Confused Claude,
@@ -22,26 +23,28 @@ is checked by `tests/pane_contract.rs` for every fixture, pane size and theme. A
 5. **Minimum and full heights.** Each card's height is computed by the function that sizes it
    for the fit (`observation_card_h`, `story_h_with`, `soak_plan`, `dash_heights_with`, the hero
    block). The drawing code draws exactly that: a card's content ends inside its card
-   (`Metrics::overdrawn` stays empty).
+   (`Metrics::overdrawn` stays empty), and every text run lies inside some card's band.
 6. **No title-only card.** A card is drawn with at least one body row or not at all.
 7. **The stack.** Folded cards become one stack row under the hero: `N more · title · title`.
    Every folded card can be opened from it: `e` opens the first, `n` the next, a tap on a title
    opens that one, `e` or Esc closes. The key hint `e more` shows only when a stack is drawn.
 8. **The accordion never grows the picture.** The open card takes the room of the stackable
    cards (they fold) and of the Context card down to its floor. Rows that still do not fit are
-   cut, the last one ending in "…".
+   cut, the last one ending in "…" or a "+N more" row (the performance card's failing checks).
 9. **No overlapping text.** No two text runs share any area.
 10. **A new card registers.** Add it to `instrument::CARD_REGISTRY` with its tier and stack
     index, size it in the fit's `need`, and add a fixture that draws it to `tests/pane_contract.rs`.
-    A card drawn but not registered, or registered but drawn by no fixture, fails the suite.
+    A card drawn but not registered, or registered but drawn by no fixture, fails the suite, as
+    does any `panel` drawn that is not a registered card's region.
 11. **Hover.** A hover state may change colour, shadow and a 1-2 pt rise inside the card's own
     box. It never changes any height, and it redraws only on enter and leave.
 12. **The session mix rides the bar.** The Context card's donut (Tools / Context / Other, from
     the breakdown's parts only) and its one-word verdict sit on the parts bar's line and add no
-    row. A slice at half the session or more names it ("tool-heavy", "context-heavy"), else
-    "mixed". No breakdown, no donut.
+    row. Tools or Context at half the session or more names it ("tool-heavy", "context-heavy");
+    anything else, an Other-majority session included, is "mixed". No breakdown, no donut.
 13. **The Context bar spans the auto-compact window.** The bar's full width is the window Claude
     Code compacts to (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else `autoCompactWindow` in
     settings.json, read once per frame as `compactor::rules::native_window_of` reads it), its
-    last 33k (`NATIVE_UNDER`) a hatched buffer with a tick at its start. The heading reads
-    "85k of 300k (28%)" and "182k free · 33k buffer". No setting: the model's window, no buffer.
+    last 33k (`NATIVE_UNDER`; all of a smaller window) a hatched buffer with a tick at its start.
+    The heading reads "85k of 300k (28%)" and "182k free · 33k buffer". No setting: the model's
+    window, no buffer. No segment runs past the bar's end, even with the context past the window.

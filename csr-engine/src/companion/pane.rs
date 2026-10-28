@@ -1322,30 +1322,6 @@ impl Pane {
                             self.acts.insert(row, json!({"key":"instrument:agents"}));
                         }
                     }
-                    if let Some(stack) = &metrics.stack {
-                        let to_col = |x: f32| {
-                            (metrics.content_left
-                                + x / instrument::LAYOUT_WIDTH * metrics.content_width)
-                                * cols as f32
-                        };
-                        let spans: Vec<Value> = stack
-                            .spans
-                            .iter()
-                            .map(|(x0, x1, kind)| {
-                                json!([
-                                    to_col(*x0).floor().max(0.) as usize,
-                                    (to_col(*x1).ceil().max(0.) as usize).min(cols),
-                                    kind
-                                ])
-                            })
-                            .collect();
-                        for row in to_row(stack.top)..=to_row(stack.top + stack.height - 8.) {
-                            self.acts.insert(
-                                row,
-                                json!({"key":"instrument:stack","stack":spans.clone()}),
-                            );
-                        }
-                    }
                     for y in &metrics.shift_hits {
                         self.acts
                             .insert(to_row(*y), json!({"key":"instrument:changes"}));
@@ -1356,6 +1332,45 @@ impl Pane {
                             ..=to_row(metrics.figure_region.0 + metrics.figure_region.1)
                         {
                             self.acts.insert(row, json!({"key":"instrument:figure"}));
+                        }
+                    }
+                    if let Some(stack) = &metrics.stack {
+                        let to_col = |x: f32| {
+                            (metrics.content_left
+                                + x / instrument::LAYOUT_WIDTH * metrics.content_width)
+                                * cols as f32
+                        };
+                        // Cell rounding must not let two titles share a column: each span
+                        // starts where the one before it ends, as the answer targets do.
+                        let mut last_end = 0;
+                        let spans: Vec<Value> = stack
+                            .spans
+                            .iter()
+                            .map(|(x0, x1, kind)| {
+                                let start = (to_col(*x0).floor().max(0.) as usize).max(last_end);
+                                let end =
+                                    (to_col(*x1).ceil().max(0.) as usize).min(cols).max(start);
+                                last_end = end;
+                                json!([start, end, kind])
+                            })
+                            .collect();
+                        // Registered after every other card's rows: a terminal row the stack
+                        // covers at least half of is the stack's, and its middle row always is.
+                        let row_pt = cell.1 as f32 * metrics.height / pm.height() as f32;
+                        let mid = to_row(stack.top + stack.height / 2.);
+                        let owned = |row: usize| {
+                            let (from, to) = (row as f32 * row_pt, (row + 1) as f32 * row_pt);
+                            row == mid
+                                || (stack.top + stack.height).min(to) - stack.top.max(from)
+                                    >= row_pt / 2.
+                        };
+                        for row in (to_row(stack.top)..=to_row(stack.top + stack.height))
+                            .filter(|r| owned(*r))
+                        {
+                            self.acts.insert(
+                                row,
+                                json!({"key":"instrument:stack","stack":spans.clone()}),
+                            );
                         }
                     }
                     // A scroll never runs past the page's last row.
@@ -1438,6 +1453,12 @@ impl Pane {
                     if let (Some(at), Some((top, bottom, _, _))) = (story, &metrics.story_open) {
                         spans.push((ObsCard::More, at, px(*top), px(*bottom)));
                     }
+                    // The stack row competes for its terminal rows like any card: a row it
+                    // fills more of is its own, so a tap on a title never opens the story.
+                    let stack_span = metrics
+                        .stack
+                        .as_ref()
+                        .map(|st| (px(st.top), px(st.top + st.height)));
                     hits.clear();
                     for row in 0..picture_rows {
                         let (from, to) = (
@@ -1451,8 +1472,12 @@ impl Pane {
                                 best = Some((overlap, *card, *index));
                             }
                         }
-                        if let Some((_, card, index)) = best {
-                            hits.insert(row, (card, index));
+                        let stack_overlap =
+                            stack_span.map_or(0., |(top, bottom)| bottom.min(to) - top.max(from));
+                        if let Some((overlap, card, index)) = best {
+                            if overlap > stack_overlap {
+                                hits.insert(row, (card, index));
+                            }
                         }
                     }
                     if let (Some(mut answer), Some(y)) = (answer, metrics.answer_y) {
@@ -1568,7 +1593,12 @@ impl Pane {
             }
             keys.push(("i", "figure"));
             // The stack's key shows only when a stack is drawn.
-            let stack_open = self.instrument_open.stack.is_some();
+            // From what was drawn, not the raw request: a hidden accordion shows no `e close`.
+            let stack_open = self
+                .instrument_metrics
+                .as_ref()
+                .and_then(|m| m.stack.as_ref())
+                .is_some_and(|s| s.open.is_some());
             if self
                 .instrument_metrics
                 .as_ref()
@@ -2264,6 +2294,8 @@ impl Pane {
                 let open = &mut self.instrument_open;
                 open.changes = false;
                 open.threads = false;
+                // The figure page replaces the accordion; closing it never brings one back.
+                open.stack = None;
                 if open.figure && open.gauge == Some(gauge) {
                     open.figure = false;
                     open.gauge = None;
