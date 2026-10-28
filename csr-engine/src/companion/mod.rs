@@ -28,6 +28,7 @@ pub mod live_eval;
 pub mod lost;
 pub mod lostmain;
 pub mod masthead;
+pub mod native_warn;
 pub mod note;
 pub mod pages;
 pub mod pane;

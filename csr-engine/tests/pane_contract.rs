@@ -187,6 +187,20 @@ fn window_20k() -> (tempfile::TempDir, Paths) {
     fs::write(&path, settings.to_string()).unwrap();
     (home, paths)
 }
+/// The owner's pane with Claude Code's 300k auto-compact window in settings.json and two native
+/// auto-compactions this week that came while CSR's compactor was on: the notice says the window
+/// beat CSR, and how to let CSR lead.
+fn native_warn() -> (tempfile::TempDir, Paths) {
+    let (home, paths) = window_300k();
+    let wins: String = [(3600., "auto"), (2. * 86400., "suggest")]
+        .iter()
+        .map(|(ago, compactor)| {
+            json!({"at": NOW - ago, "sid": "sess-old", "compactor": compactor}).to_string() + "\n"
+        })
+        .collect();
+    fs::write(paths.keep.join("native-wins.jsonl"), wins).unwrap();
+    (home, paths)
+}
 fn after() -> (tempfile::TempDir, Paths) {
     state_home("06-after")
 }
@@ -194,7 +208,7 @@ fn away() -> (tempfile::TempDir, Paths) {
     state_home("07-away")
 }
 
-const FIXTURES: [Fixture; 26] = [
+const FIXTURES: [Fixture; 27] = [
     Fixture {
         name: "few",
         home: few,
@@ -258,6 +272,11 @@ const FIXTURES: [Fixture; 26] = [
     Fixture {
         name: "window-300k",
         home: window_300k,
+        keys: &[],
+    },
+    Fixture {
+        name: "native-warn",
+        home: native_warn,
         keys: &[],
     },
     Fixture {
@@ -979,6 +998,52 @@ fn the_context_bar_spans_the_auto_compact_window_from_settings() {
         bad.len(),
         bad.join("\n")
     );
+}
+
+/// The native-window warning is a notice in the pane: both of its sentences reach the picture
+/// whole, at every size; without the evidence (no wins, no window, a 1M window, the kill switch
+/// is not tested here: env is shared) the notice is not drawn.
+#[test]
+fn the_native_window_warning_is_a_whole_notice_and_drops_without_evidence() {
+    let want_start = "Claude's 300k auto-compact window beat CSR 2\u{d7} this week.";
+    let want_end = "Remove autoCompactWindow from settings.json to let CSR lead.";
+    let mut bad = vec![];
+    let mut drawn = 0;
+    for size in SIZES {
+        let s = shot(native_warn, &[], size, Theme::Dark);
+        let Some(m) = &s.metrics else { continue };
+        let Some(card) = m.cards.iter().find(|c| c.title == "notice") else {
+            continue;
+        };
+        drawn += 1;
+        let text: Vec<&str> = m
+            .text_runs
+            .iter()
+            .filter(|r| r.1 >= card.top && r.3 <= card.top + card.height + 0.5)
+            .map(|r| r.4.as_str())
+            .collect();
+        let joined = text.join(" ");
+        let what = format!("native-warn {}x{}", size.0, size.1);
+        if !joined.contains(want_start) || !joined.contains(want_end) || joined.contains('\u{2026}')
+        {
+            bad.push(redo(5, &what, 0., 0., &format!("notice drew {joined:?}")));
+        }
+    }
+    assert!(drawn > 0, "no size drew the native-window notice");
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // no wins: no notice
+    for home in [
+        window_300k as fn() -> (tempfile::TempDir, Paths),
+        owner_home,
+    ] {
+        let s = shot(home, &[], SIZES[0], Theme::Dark);
+        let drew = s.metrics.as_ref().is_some_and(|m| {
+            m.text_runs
+                .iter()
+                .any(|r| r.4.contains("auto-compact window beat CSR"))
+        });
+        assert!(!drew, "the notice drew without a native win");
+    }
 }
 
 /// Frame time receipt: 240 frames of the owner's pane (35x30 at the 26x58 cell) through

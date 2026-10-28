@@ -489,7 +489,12 @@ impl Composition {
         stamps.sort_by(f64::total_cmp);
         // Only the latest return counts: an hour-long gap earlier in the session is old news.
         let gap = stamps.windows(2).last().filter(|w| w[1] - w[0] > 3600.);
-        let notice = gap
+        // CSR's one-a-day warning that Claude Code's own window beat it: first, while it is up.
+        let native_warn = data["native_warn"]["line"]
+            .as_str()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned);
+        let other_notice = gap
             .and_then(|w| {
                 let since = w[0];
                 let looks = records
@@ -528,12 +533,18 @@ impl Composition {
                         line
                     })
             });
+        let native_until = native_warn
+            .as_ref()
+            .and(data["native_warn"]["until"].as_f64());
+        let notice = native_warn.or(other_notice);
         let card = &data["infinite"]["card"];
-        let notice_until = notice
-            .as_deref()
-            .filter(|n| n.starts_with("Compacted."))
-            .and(card["at"].as_f64())
-            .map(|at| at + 120.);
+        let notice_until = native_until.or_else(|| {
+            notice
+                .as_deref()
+                .filter(|n| n.starts_with("Compacted."))
+                .and(card["at"].as_f64())
+                .map(|at| at + 120.)
+        });
         let clocks = Clocks {
             story_at: data["story"]["at"].as_f64(),
             notice_until,
@@ -2687,6 +2698,8 @@ fn caption_swatch(c: &mut Canvas, x: f32, w: f32, baseline: f32, cap: f32, swatc
 }
 
 // The geometry and primitives below are the approved B prototype's glass, serif and ring design.
+/// The most lines a notice takes in the picture.
+const NOTICE_LINES: usize = 3;
 pub(super) const M: f32 = S4;
 pub(super) const P: f32 = S4;
 pub(super) const CW: f32 = W - 2. * M;
@@ -3298,11 +3311,25 @@ pub fn draw(
         )
     };
     let notice = c.notice.as_ref().filter(|_| !page);
-    let notice_h = if notice.is_some() {
-        P * 2. + theme::BODY_LINE
-    } else {
-        0.
+    // A notice wraps to NOTICE_LINES at most: the warning that Claude Code's window beat CSR
+    // carries its advice in its last words, which one cut line would lose. It keeps its first
+    // line only (the "lean" notice) when the fit has no other room: with a section or a card
+    // open, or when every card has folded and the picture would still be cut.
+    let notice_lines_of = |lines: usize| -> Vec<String> {
+        notice
+            .map(|n| f.wrap_max(&icons::line(n), body, IW, lines))
+            .unwrap_or_default()
     };
+    let notice_height = |lines: &[String]| -> f32 {
+        if lines.is_empty() {
+            0.
+        } else {
+            P * 2. + theme::BODY_LINE * lines.len() as f32
+        }
+    };
+    let notice_full = notice_lines_of(NOTICE_LINES);
+    let notice_lean = notice_lines_of(1);
+    let (notice_full_h, notice_lean_h) = (notice_height(&notice_full), notice_height(&notice_lean));
     let notice_gap = if notice.is_some() { S3 } else { 0. };
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
     // The figure card's smallest height: its one-row gauge strip (or the quotas row).
@@ -3404,7 +3431,7 @@ pub fn draw(
             STACK_H + S3
         }
     };
-    let top_with = |observed_h: f32, story_h: f32, soak_h: f32, stack_h: f32| {
+    let top_with = |observed_h: f32, story_h: f32, soak_h: f32, stack_h: f32, notice_h: f32| {
         M + hero_h
             + S3
             + stack_h
@@ -3470,8 +3497,13 @@ pub fn draw(
     };
     // `open_bit` is the open accordion card's fold bit (0 with none): the stack row stays drawn
     // while it is open, listing it, so its close control never disappears.
-    let need = |step: &FitStep, open_bit: u8| {
+    let need = |step: &FitStep, open_bit: u8, lean: bool| {
         let accordion = open_bit != 0;
+        let notice_h = if lean || accordion || section_open {
+            notice_lean_h
+        } else {
+            notice_full_h
+        };
         let section = if step.least {
             drill_least + detail_least + gaps
         } else {
@@ -3492,6 +3524,7 @@ pub fn draw(
             step_story_h(step),
             step_soak_h(step),
             stack_with(step.fold | open_bit),
+            notice_h,
         ) + if accordion { tail_lean } else { tail_base }
             + figure
             + if section_open && !accordion {
@@ -3501,9 +3534,9 @@ pub fn draw(
             })
             / (1. - S3 / available_height as f32)
     };
-    let closed_fit = if page {
+    let (closed_fit, closed_lean) = if page {
         // A page is one card; nothing is traded for it.
-        FIT_STEPS[FIT_STEPS.len() - 1]
+        (FIT_STEPS[FIT_STEPS.len() - 1], false)
     } else {
         // A closed pane keeps the Context card at its closed floor; only an open section may
         // squeeze it, so the last steps repeat the one before them without one.
@@ -3512,10 +3545,13 @@ pub fn draw(
         } else {
             &FIT_STEPS[..FIT_STEPS.len() - 2]
         };
-        *steps
-            .iter()
-            .find(|step| need(step, 0) <= limit)
-            .unwrap_or(&steps[steps.len() - 1])
+        // The notice keeps its lines while any step fits with them; past the last step it gives
+        // up all but its first.
+        let fits = |lean: bool| steps.iter().find(|step| need(step, 0, lean) <= limit);
+        match fits(false) {
+            Some(step) => (*step, false),
+            None => (*fits(true).unwrap_or(&steps[steps.len() - 1]), true),
+        }
     };
     // The accordion: one stacked card open under the stack row. Every other stackable card
     // folds, the Context card goes to its floor, and the open card takes its richest form that
@@ -3577,7 +3613,7 @@ pub fn draw(
         let last = *choices.last().unwrap_or(&base);
         *choices
             .iter()
-            .find(|s| need(s, bit) <= limit)
+            .find(|s| need(s, bit, true) <= limit)
             .unwrap_or(&last)
     } else {
         closed_fit
@@ -3589,7 +3625,13 @@ pub fn draw(
         (empty_help, tail_base)
     };
     let open_bit = accordion_kind.map_or(0, |k| STACKABLE[k].0);
-    let fit_need = need(&fit, open_bit);
+    let lean_notice = closed_lean || accordion || section_open;
+    let fit_need = need(&fit, open_bit, lean_notice);
+    let (notice_lines, notice_h) = if lean_notice {
+        (notice_lean, notice_lean_h)
+    } else {
+        (notice_full, notice_full_h)
+    };
     let clipped = !page && fit_need > limit + 0.5;
     let FitStep {
         soak: soak_level,
@@ -3639,7 +3681,8 @@ pub fn draw(
         story_h_with(story_line_cap, story_shift_cap)
     };
     // Everything above the figure for one choice of observation cards and story card.
-    let top_for = |observed_h: f32, story_h: f32| top_with(observed_h, story_h, soak_h, stack_h);
+    let top_for =
+        |observed_h: f32, story_h: f32| top_with(observed_h, story_h, soak_h, stack_h, notice_h);
     // A page keeps at least the rows its heading promises, whatever the pane.
     let maxh = if page {
         maxh.max(
@@ -4110,20 +4153,22 @@ pub fn draw(
         y += h + card_gap;
     }
     canvas.cut_title = recording;
-    if let Some(notice) = notice {
-        cards.push(CardRegion::new("notice", y, notice_h, 1));
+    if notice.is_some() {
+        cards.push(CardRegion::new("notice", y, notice_h, notice_lines.len()));
         panel(&mut canvas, y, notice_h, t);
-        single(
-            &mut canvas,
-            f,
-            notice,
-            IX,
-            y + P + f.cap(body),
-            IW,
-            theme::BODY_SIZE,
-            t.ink,
-            t,
-        );
+        for (i, line) in notice_lines.iter().enumerate() {
+            single(
+                &mut canvas,
+                f,
+                line,
+                IX,
+                y + P + f.cap(body) + i as f32 * theme::BODY_LINE,
+                IW,
+                theme::BODY_SIZE,
+                t.ink,
+                t,
+            );
+        }
         y += notice_h + card_gap;
     }
     let mut shift_hits = vec![];

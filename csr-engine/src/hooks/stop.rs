@@ -5169,6 +5169,7 @@ mod tests {
                 retired_while_away: vec![],
                 corrections: vec![],
                 open_proposals: 0,
+                native_warn: None,
                 top_dream: None,
             },
             "2m ago",
@@ -5262,6 +5263,7 @@ mod tests {
                 retired_while_away: vec![],
                 corrections: vec![],
                 open_proposals: 0,
+                native_warn: None,
                 top_dream: None,
             },
             "3h ago",
@@ -6622,6 +6624,7 @@ mod tests {
             retired_while_away: vec![],
             corrections: vec![],
             open_proposals: 0,
+            native_warn: None,
             top_dream: None,
         }
     }

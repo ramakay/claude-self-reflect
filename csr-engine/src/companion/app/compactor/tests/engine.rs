@@ -857,3 +857,61 @@ async fn a_precompute_or_a_subagent_leaves_no_marker() {
     let writes = kit.out.writes.lock().unwrap().clone();
     assert!(!writes.iter().any(|path| path.contains("/compacting/")));
 }
+
+// ---------------------------------------------------------------- native wins for the warning
+
+fn wins(kit: &Kit) -> Vec<Value> {
+    kit.out.wins.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn a_native_auto_compaction_goes_into_the_ledger_with_the_compactors_setting() {
+    let kit = marker_kit(false);
+    kit.compact(json!({ "trigger": "auto", "messages": conversation() }))
+        .await
+        .unwrap();
+    let got = wins(&kit);
+    assert_eq!(got.len(), 1);
+    assert!(same(
+        &got[0],
+        &json!({ "at": MARKER_NOW / 1000., "sid": "sess-1", "compactor": "auto" })
+    ));
+}
+
+#[tokio::test]
+async fn a_native_win_while_the_compactor_was_off_says_off() {
+    let kit = Kit::new(Setup {
+        setting: Some("off"),
+        rm_removes: true,
+        ..Setup::auto(0.)
+    });
+    kit.clock.set(MARKER_NOW);
+    kit.compact(json!({ "trigger": "auto", "messages": conversation() }))
+        .await
+        .unwrap();
+    assert_eq!(wins(&kit)[0]["compactor"], "off");
+}
+
+#[tokio::test]
+async fn a_win_is_noted_also_when_the_native_compaction_fails() {
+    let kit = marker_kit(true);
+    assert!(kit
+        .compact(json!({ "trigger": "auto", "messages": conversation() }))
+        .await
+        .is_err());
+    assert_eq!(wins(&kit).len(), 1);
+}
+
+#[tokio::test]
+async fn only_an_auto_trigger_of_the_main_loop_is_a_native_win() {
+    let kit = marker_kit(false);
+    for trigger in ["manual", "plugin", "precompute"] {
+        kit.compact(json!({ "trigger": trigger, "messages": conversation() }))
+            .await
+            .unwrap();
+    }
+    kit.compact(json!({ "trigger": "auto", "agentId": "sub-1", "messages": conversation() }))
+        .await
+        .unwrap();
+    assert!(wins(&kit).is_empty());
+}

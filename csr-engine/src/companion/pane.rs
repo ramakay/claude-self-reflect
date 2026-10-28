@@ -619,8 +619,10 @@ impl Pane {
                 .as_deref(),
             std::env::var_os("DISABLE_AUTO_COMPACT").is_some(),
         );
+        let native_warn = self.native_warn(&settings, now);
         let mut data = json!({
             "native_window": native_window,
+            "native_warn": native_warn,
             "story_map": self.map.shown,
             "story_map_from": self.map.from,
             "story_map_messages": self.map.messages,
@@ -2043,6 +2045,36 @@ impl Pane {
     }
     /// The keys of the observation items dismissed in this session: those in the likes log with
     /// a no, and those dismissed here and perhaps not yet written.
+    /// The warning that Claude Code's own auto-compact window beat CSR, as the pane's notice:
+    /// `{line, until}` while this session holds the day's slot and the notice is up, else null.
+    /// The first frame that shows it keeps the slot, so it shows once in the session.
+    fn native_warn(&self, settings: &Value, now: f64) -> Value {
+        use super::native_warn as warn;
+        if warn::disabled() {
+            return Value::Null;
+        }
+        let env = std::env::var("CLAUDE_CODE_AUTO_COMPACT_WINDOW").ok();
+        let Some(found) = warn::evaluate(
+            &self.paths,
+            settings,
+            env.as_deref(),
+            std::env::var_os("DISABLE_AUTO_COMPACT").is_some(),
+            now,
+        ) else {
+            return Value::Null;
+        };
+        let until = match warn::pane_slot(&self.paths, &self.sid, now) {
+            warn::PaneSlot::No => return Value::Null,
+            warn::PaneSlot::Live { until } => until,
+            warn::PaneSlot::Fresh => {
+                if self.persist {
+                    warn::pane_shown(&self.paths, &self.sid, now);
+                }
+                now + warn::PANE_LIFE
+            }
+        };
+        json!({ "line": found.line(), "until": until })
+    }
     fn dismissed_keys(&self) -> Value {
         let mine = format!("observation:{}:", self.sid);
         let mut out = json!({});

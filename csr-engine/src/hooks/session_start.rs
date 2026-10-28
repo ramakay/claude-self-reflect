@@ -284,7 +284,21 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             .take(MAX_TIER0_VERIFY)
             .map(|a| (a.name.clone(), verify_anchor(a, cwd)))
             .collect();
-        let tier0 = format_session_start_tier0_for_session(
+        // The native-window warning, once a day: the slot is kept only when the paragraph
+        // carries the clause.
+        let native_paths = crate::companion::paths::Paths::from_env();
+        let native_sid = input.session_id.as_deref().unwrap_or("");
+        let native_now = Utc::now().timestamp() as f64;
+        let native_shown =
+            || crate::companion::native_warn::recap_shown(&native_paths, native_sid, native_now);
+        let native =
+            crate::companion::native_warn::recap_line(&native_paths, native_sid, native_now).map(
+                |line| NativeWarnFeed {
+                    line,
+                    on_shown: &native_shown,
+                },
+            );
+        let tier0 = format_session_start_tier0_with_native(
             engine.storage(),
             project_name,
             ep,
@@ -292,6 +306,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             age,
             input.session_id.as_deref(),
             input.source.as_deref(),
+            native.as_ref(),
         );
         output.push_str(&tier0);
         // What CSR stored last session: its own line after the Tier-0 block, so the
@@ -1150,6 +1165,14 @@ fn recap_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// The native-window warning for the recap: its line, and what to do once the paragraph carries
+/// it (keep the day's slot).
+pub(crate) struct NativeWarnFeed<'a> {
+    pub line: String,
+    pub on_shown: &'a dyn Fn(),
+}
+
+#[cfg(test)]
 pub(crate) fn format_session_start_tier0_for_session(
     storage: &crate::storage::Storage,
     project: &str,
@@ -1158,6 +1181,29 @@ pub(crate) fn format_session_start_tier0_for_session(
     age: &str,
     target_session_id: Option<&str>,
     source: Option<&str>,
+) -> String {
+    format_session_start_tier0_with_native(
+        storage,
+        project,
+        ep,
+        anchor_verdicts,
+        age,
+        target_session_id,
+        source,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn format_session_start_tier0_with_native(
+    storage: &crate::storage::Storage,
+    project: &str,
+    ep: &Episode,
+    anchor_verdicts: &[(String, AnchorVerdict)],
+    age: &str,
+    target_session_id: Option<&str>,
+    source: Option<&str>,
+    native: Option<&NativeWarnFeed>,
 ) -> String {
     let recap = if recap_disabled() {
         None
@@ -1211,6 +1257,7 @@ pub(crate) fn format_session_start_tier0_for_session(
             retired_while_away,
             corrections,
             open_proposals,
+            native_warn: native.map(|feed| feed.line.clone()),
             top_dream,
         };
         let mut refreshed = None;
@@ -1228,6 +1275,11 @@ pub(crate) fn format_session_start_tier0_for_session(
         }
         let recap_ep = recap_episode(refreshed.as_ref().unwrap_or(ep), source, target_session_id);
         let composed = crate::hooks::recap::compose_recap_with_deliveries(&recap_ep, &feeds, age);
+        if let (Some(composed), Some(feed)) = (composed.as_ref(), native) {
+            if composed.text.contains(&feed.line) {
+                (feed.on_shown)();
+            }
+        }
         if let (Some(composed), Some(id)) = (composed.as_ref(), dream_id) {
             let text = &composed.text;
             if text.contains(crate::hooks::recap::DREAM_CLAUSE_PREFIX) {
@@ -2830,6 +2882,52 @@ mod tests {
         assert!(block.contains(r#"Full state: csr_reflect_on_past("conv_s")"#));
     }
 
+    const NATIVE_LINE: &str = "Claude's 300k auto-compact window beat CSR 2\u{d7} this week. \
+         Remove autoCompactWindow from settings.json to let CSR lead.";
+
+    #[test]
+    fn session_start_recap_carries_the_native_window_warning_and_keeps_the_slot_once() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let ep = minimal_episode("Fix the auth middleware", "Fixed it", Some("Deploy"));
+        let shown = std::cell::Cell::new(0);
+        let keep = || shown.set(shown.get() + 1);
+        let feed = NativeWarnFeed {
+            line: NATIVE_LINE.into(),
+            on_shown: &keep,
+        };
+        let run = |native: Option<&NativeWarnFeed>| {
+            format_session_start_tier0_with_native(
+                &storage,
+                &ep.project,
+                &ep,
+                &[],
+                "2h ago",
+                Some("sess-1"),
+                Some("startup"),
+                native,
+            )
+        };
+        let block = run(Some(&feed));
+        assert!(block.contains(&format!("\n{NATIVE_LINE}\n")), "{block}");
+        assert_eq!(
+            shown.get(),
+            1,
+            "the slot is kept when the clause is carried"
+        );
+        // no evidence, no clause, no slot kept
+        let plain = run(None);
+        assert!(!plain.contains("auto-compact window"), "{plain}");
+        assert_eq!(shown.get(), 1);
+        // the recap off: neither the clause nor the slot
+        std::env::set_var("CSR_NO_RECAP", "1");
+        let off = run(Some(&feed));
+        std::env::remove_var("CSR_NO_RECAP");
+        assert!(!off.contains("auto-compact window"), "{off}");
+        assert_eq!(shown.get(), 1);
+    }
+
     #[test]
     fn session_start_recap_shows_recent_correction_and_receipts_delivery() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
@@ -3747,6 +3845,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
             retired_while_away: vec![],
             corrections: vec![],
             open_proposals: 0,
+            native_warn: None,
             top_dream: None,
         };
         let text = crate::hooks::recap::compose_recap(&shown, &feeds, "1h ago")

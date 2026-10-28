@@ -315,7 +315,10 @@ pub fn is_csr_emission(text: &str) -> bool {
     }
     // Single lines the formatters write that carry too few field tokens to
     // trip the count below once the outcome label is withheld.
-    if INDEX_ENTRY_LINE.is_match(text) || CONTINUUM_LAST_LINE.is_match(text) {
+    if INDEX_ENTRY_LINE.is_match(text)
+        || CONTINUUM_LAST_LINE.is_match(text)
+        || NATIVE_WARN_LINE.is_match(text)
+    {
         return true;
     }
     EMISSION_FIELD_TOKENS
@@ -961,6 +964,23 @@ static CONTINUUM_LAST_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyL
     regex::Regex::new(r"(?m)^[ \t]*LAST: .+ \((?:outcome=[^)\n]*, )?trust=(?:unknown|external|trusted_tool|user_history|user_confirmed|system)\)[ \t]*$")
         .expect("continuum last regex")
 });
+
+/// The line saying Claude Code's own auto-compact window beat CSR, which the recap carries as a
+/// clause and the pane shows as a notice (`companion::native_warn::Warning::line`), alone on its
+/// line: `Claude's <N>k auto-compact window beat CSR <n>× this week. <fix> to let CSR lead.`,
+/// where the fix is one of the two the emitter writes. A person's prose about the setting does
+/// not match: every word of the sentence is the emitter's.
+static NATIVE_WARN_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?m)^[ \t]*Claude's [0-9]{1,4}k auto-compact window beat CSR [0-9]{1,4}\x{d7} this week\. (?:Remove autoCompactWindow from settings\.json|Unset CLAUDE_CODE_AUTO_COMPACT_WINDOW) to let CSR lead\.[ \t]*$",
+    )
+    .expect("native warn regex")
+});
+
+/// Whether `line` is exactly the native-window warning in the emitted grammar.
+pub fn is_native_warn_line(line: &str) -> bool {
+    NATIVE_WARN_LINE.is_match(line) && !line.trim().contains('\n')
+}
 
 /// Byte offset just past the ellipsis `one_line` appends when it cut a send
 /// text that starts at `start`, if it did.
@@ -2340,5 +2360,55 @@ mod companion_tests {
             strip_companion_forwards(text),
             Some("My own words.\n\nMy reply.".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod native_warn_tests {
+    use super::*;
+    use crate::companion::native_warn::{Source, Warning};
+
+    fn emitted(source: Source) -> String {
+        Warning {
+            window: 300_000.,
+            wins: 2,
+            source,
+        }
+        .line()
+    }
+
+    /// The exact grammar the emitter writes, in both forms, is CSR's own output.
+    #[test]
+    fn the_native_window_warning_is_suppressed_from_reimport_in_both_forms() {
+        for source in [Source::Settings, Source::Env] {
+            let line = emitted(source);
+            assert!(is_native_warn_line(&line), "{line}");
+            assert!(is_csr_emission(&line), "{line}");
+            assert!(extractable(&line).is_none(), "{line}");
+            // pasted into a longer message, alone on its line
+            let around = format!("Look at this.\n{line}\nWhy?");
+            assert!(is_csr_emission(&around));
+        }
+        assert_eq!(
+            emitted(Source::Settings),
+            "Claude's 300k auto-compact window beat CSR 2\u{d7} this week. \
+             Remove autoCompactWindow from settings.json to let CSR lead."
+        );
+    }
+
+    /// A person's own words about the setting are not the emitter's grammar.
+    #[test]
+    fn prose_about_the_auto_compact_window_stays_extractable() {
+        for text in [
+            "Claude's 300k auto-compact window beat CSR twice, so I removed autoCompactWindow.",
+            "Claude's 300k auto-compact window beat CSR 2\u{d7} this week, I think.",
+            "Remove autoCompactWindow from settings.json to let CSR lead.",
+            "Claude's Nk auto-compact window beat CSR n\u{d7} this week. Remove autoCompactWindow from settings.json to let CSR lead.",
+            "My note: Claude's 300k auto-compact window beat CSR 2\u{d7} this week. Remove autoCompactWindow from settings.json to let CSR lead.",
+        ] {
+            assert!(!is_csr_emission(text), "{text}");
+            assert_eq!(extractable(text).as_deref(), Some(text), "{text}");
+        }
+        assert!(!is_native_warn_line("a\nClaude's 300k auto-compact window beat CSR 2\u{d7} this week. Remove autoCompactWindow from settings.json to let CSR lead."));
     }
 }

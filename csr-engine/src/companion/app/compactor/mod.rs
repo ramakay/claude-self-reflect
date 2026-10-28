@@ -375,6 +375,22 @@ async fn mark_compacting(cx: &Ctx, out: &Out, trigger: &Value) -> Option<String>
     Some(path)
 }
 
+/// A compaction Claude Code starts on its own (`trigger: "auto"`) goes into the ledger the
+/// native-window warning counts, with the compactor's setting at that moment. Nothing here can
+/// fail the compaction.
+async fn note_native_win(cx: &Ctx, out: &Out, trigger: &Value) {
+    if trigger != "auto" {
+        return;
+    }
+    let compactor = setting(cx).await;
+    out.native_win(json!({
+        "at": num(cx.clock.now() / 1000.),
+        "sid": cx.sid,
+        "compactor": compactor.as_str(),
+    }))
+    .await;
+}
+
 /// Removed with rm; where that cannot run, the marker is overwritten as ended, which the pane
 /// reads as none.
 async fn unmark_compacting(out: &Out, path: &str) {
@@ -508,6 +524,7 @@ pub fn register_with(t: &mut Table, out: Out) {
                 if has_agent(&e) {
                     return Ok(Reply::none());
                 }
+                note_native_win(&cx, &out, &e["trigger"]).await;
                 let left = mark_compacting(&cx, &out, &e["trigger"])
                     .await
                     .map(Value::from);

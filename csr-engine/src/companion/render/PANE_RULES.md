@@ -20,6 +20,9 @@ is checked by `tests/pane_contract.rs` for every fixture, pane size and theme. A
    line, both lists fold, the story folds, performance folds; with a section open, the Context
    card to its floor, then the section to its least rows. A T2 card is never drawn while a card
    that folds before it is folded (the open accordion card aside).
+   The notice (T1) wraps to three lines so its words are never cut. It keeps its first line only
+   when a section or the accordion card is open, or when every card has folded and the picture
+   would still be cut; it is never the first thing to give way.
 5. **Minimum and full heights.** Each card's height is computed by the function that sizes it
    for the fit (`observation_card_h`, `story_h_with`, `soak_plan`, `dash_heights_with`, the hero
    block). The drawing code draws exactly that: a card's content ends inside its card

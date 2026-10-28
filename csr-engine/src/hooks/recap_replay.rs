@@ -19,6 +19,7 @@ fn empty_feeds() -> RecapFeeds {
         retired_while_away: vec![],
         corrections: vec![],
         open_proposals: 0,
+        native_warn: None,
         top_dream: None,
     }
 }

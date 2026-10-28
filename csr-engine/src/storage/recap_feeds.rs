@@ -1055,6 +1055,7 @@ mod tests {
             retired_while_away,
             corrections: vec![],
             open_proposals: 0,
+            native_warn: None,
             top_dream: None,
         };
 

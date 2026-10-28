@@ -309,6 +309,8 @@ impl Hold {
 pub struct FakeOutside {
     setup: Setup,
     pub kept: Mutex<Vec<Value>>,
+    /// Each native compaction the ledger was told of.
+    pub wins: Mutex<Vec<Value>>,
     /// `(sid, ctx)` of each call of the removed `pane.py --compact-plan`.
     pub plans: Mutex<Vec<(String, usize)>>,
     pub lost_asked: Mutex<Vec<(String, String)>>,
@@ -329,6 +331,7 @@ impl FakeOutside {
         Self {
             setup,
             kept: Mutex::default(),
+            wins: Mutex::default(),
             plans: Mutex::default(),
             lost_asked: Mutex::default(),
             gits: Mutex::default(),
@@ -404,6 +407,10 @@ impl Outside for FakeOutside {
 
     async fn native_window(&self) -> Option<f64> {
         None
+    }
+
+    async fn native_win(&self, win: Value) {
+        locked(&self.wins).push(win);
     }
 
     async fn write(&self, path: &str, text: &str, _redact: Redact) -> Result<()> {

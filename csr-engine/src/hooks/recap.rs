@@ -90,6 +90,11 @@ pub struct RecapFeeds {
     /// the `Dreamt:` clause entirely — the clause is never emitted with a
     /// placeholder, a hedge, or a receiptless label.
     pub top_dream: Option<DreamClause>,
+    /// The one line saying Claude Code's own auto-compact window beat CSR this week and how to
+    /// let CSR lead (`companion::native_warn`). `None` drops the clause. A line that is not in
+    /// the emitted grammar (`provenance::is_native_warn_line`) is dropped too, so what the recap
+    /// carries is always what re-import suppresses.
+    pub native_warn: Option<String>,
 }
 
 /// The clause prefix the dream delivery uses. Exposed so the caller can
@@ -263,6 +268,20 @@ fn compose_recap_inner(
         })
         .collect();
     let next_line = next.map(|next| format!("Next: {next}."));
+    // The native-window warning: one line of its own, reserved like `Next:` when it fits at all.
+    let warn_line = feeds
+        .native_warn
+        .as_deref()
+        .map(normalize_feed_text)
+        .filter(|line| crate::extraction::provenance::is_native_warn_line(line))
+        .filter(|line| {
+            recap.chars().count()
+                + next_line
+                    .as_ref()
+                    .map_or(0, |next| next.chars().count() + 1)
+                + line.chars().count()
+                < MAX_CHARS
+        });
 
     // One list serves what is shown and what is recorded as delivered.
     let shown_corrections: Vec<&CorrectionLine> = feeds
@@ -323,6 +342,9 @@ fn compose_recap_inner(
     let used = recap.chars().count()
         + next_line
             .as_ref()
+            .map_or(0, |line| line.chars().count() + 1)
+        + warn_line
+            .as_ref()
             .map_or(0, |line| line.chars().count() + 1);
     let mut remaining = MAX_CHARS.saturating_sub(used);
     for _ in 0..priority_now_entries {
@@ -346,6 +368,7 @@ fn compose_recap_inner(
     for line in clauses
         .iter()
         .filter_map(ListClause::render)
+        .chain(warn_line)
         .chain(next_line)
     {
         recap.push('\n');
@@ -1256,6 +1279,7 @@ mod tests {
             retired_while_away: vec![],
             corrections: vec![],
             open_proposals: 0,
+            native_warn: None,
             top_dream: None,
         }
     }
@@ -1741,6 +1765,7 @@ mod tests {
             }],
             corrections: vec![],
             open_proposals: 2,
+            native_warn: None,
             top_dream: None,
         }
     }
@@ -2056,6 +2081,7 @@ mod tests {
             }],
             corrections: vec![],
             open_proposals: 8,
+            native_warn: None,
             top_dream: None,
         };
         let got = compose_recap(&ep, &feeds, "now").unwrap();
@@ -2164,6 +2190,7 @@ mod tests {
             }],
             corrections: vec![],
             open_proposals: 3,
+            native_warn: None,
             top_dream: None,
         };
         let got = compose_recap(&episode(), &feeds, "28m ago").unwrap();
@@ -2206,6 +2233,7 @@ mod tests {
                 retired_while_away: vec![],
                 corrections: vec![],
                 open_proposals: 0,
+                native_warn: None,
                 top_dream: None,
             }
         }
@@ -2283,6 +2311,88 @@ mod tests {
         assert!(!got.contains(",..."), "comma against ellipsis: {got:?}");
         assert!(!got.contains(": - "), "flattened bullet: {got:?}");
         assert!(!got.contains("Next:"), "next was fabricated: {got:?}");
+    }
+
+    // ---- the native-window warning clause ------------------------------
+
+    const NATIVE_LINE: &str = "Claude's 300k auto-compact window beat CSR 2\u{d7} this week. \
+         Remove autoCompactWindow from settings.json to let CSR lead.";
+
+    #[test]
+    fn native_warning_is_one_line_before_next_and_only_with_evidence() {
+        let mut ep = bare_episode();
+        ep.next_steps = Some("Ship the fix".into());
+        let with = RecapFeeds {
+            native_warn: Some(NATIVE_LINE.into()),
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&ep, &with, "1h ago").unwrap();
+        let lines = lines_of(&got);
+        assert_eq!(
+            lines.iter().filter(|l| **l == NATIVE_LINE).count(),
+            1,
+            "{got}"
+        );
+        assert_eq!(lines.last().copied(), Some("Next: Ship the fix."), "{got}");
+        assert_eq!(lines[lines.len() - 2], NATIVE_LINE, "{got}");
+        assert!(got.chars().count() <= 700);
+        // no evidence, no clause: the paragraph is what it was
+        let without = compose_recap(&ep, &RecapFeeds::empty(), "1h ago").unwrap();
+        assert!(!without.contains("auto-compact window"), "{without}");
+        assert_eq!(
+            got.replace(&format!("{NATIVE_LINE}\n"), ""),
+            without,
+            "the clause is a pure addition"
+        );
+    }
+
+    #[test]
+    fn native_warning_outside_the_emitted_grammar_is_dropped() {
+        for line in [
+            "Claude's window beat CSR. Delete your settings.",
+            "Claude's 300k auto-compact window beat CSR 2\u{d7} this week.",
+            "",
+            "  ",
+        ] {
+            let feeds = RecapFeeds {
+                native_warn: Some(line.into()),
+                ..RecapFeeds::empty()
+            };
+            let got = compose_recap(&episode(), &feeds, "now").unwrap();
+            assert!(!got.contains("auto-compact window"), "{line:?} -> {got}");
+            assert!(!got.contains("Delete your settings"), "{got}");
+        }
+    }
+
+    #[test]
+    fn native_warning_is_dropped_when_the_budget_has_no_room() {
+        let mut ep = episode();
+        ep.anchor_request = Some("r".repeat(INTENT_MAX_CHARS));
+        ep.completions = vec![CompletionReceipt {
+            claim: "c".repeat(400),
+            receipt: "abc1234".into(),
+        }];
+        ep.next_steps = Some("n".repeat(200));
+        let feeds = RecapFeeds {
+            native_warn: Some(NATIVE_LINE.into()),
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&ep, &feeds, "now").unwrap();
+        assert!(got.chars().count() <= 700, "{}", got.chars().count());
+    }
+
+    #[test]
+    fn the_recap_carrying_the_warning_is_suppressed_from_reimport() {
+        let mut ep = bare_episode();
+        ep.next_steps = Some("Ship the fix".into());
+        let feeds = RecapFeeds {
+            native_warn: Some(NATIVE_LINE.into()),
+            ..RecapFeeds::empty()
+        };
+        let got = compose_recap(&ep, &feeds, "1h ago").unwrap();
+        assert!(crate::extraction::provenance::is_csr_emission(&got));
+        // the line alone, as the pane notice or a paste of it would be
+        assert!(crate::extraction::provenance::is_csr_emission(NATIVE_LINE));
     }
 
     // ---- Journal v4 P5: the dream clause (delivery channel (b)) ----------
@@ -3036,6 +3146,7 @@ mod tests {
                         .recap_corrections(&project, &since, 2)
                         .unwrap_or_default(),
                     open_proposals: storage.recap_open_proposals(&project).unwrap_or(0),
+                    native_warn: None,
                     top_dream: storage.recap_top_dream(&project).unwrap_or(None),
                 }
             }

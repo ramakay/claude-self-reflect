@@ -327,6 +327,7 @@ fn full_feeds() -> crate::hooks::recap::RecapFeeds {
             date: "2026-10-12".to_string(),
         }],
         open_proposals: 2,
+        native_warn: None,
         top_dream: Some(DreamClause {
             label: "scrub".to_string(),
             verdict: "went stale".to_string(),
@@ -343,6 +344,7 @@ fn empty_feeds() -> crate::hooks::recap::RecapFeeds {
         retired_while_away: Vec::new(),
         corrections: Vec::new(),
         open_proposals: 0,
+        native_warn: None,
         top_dream: None,
     }
 }

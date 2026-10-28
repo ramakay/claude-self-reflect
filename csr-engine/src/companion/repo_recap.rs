@@ -289,6 +289,7 @@ fn session_recap(
         retired_while_away: vec![],
         corrections: vec![],
         open_proposals: 0,
+        native_warn: None,
         top_dream: None,
     };
     // A legacy request is the raw FIRST prompt, not an evidenced session intent.

@@ -11,7 +11,7 @@ use crate::{
         app::carry::{in_process, Threads},
         compact,
         db::Db,
-        dreams,
+        dreams, native_warn,
         paths::{self, Paths},
         private,
     },
@@ -59,6 +59,9 @@ pub trait Outside: Send + Sync {
     async fn exists(&self, path: &str) -> bool;
     /// The window Claude Code's own auto-compact works to, when one is set and it is on.
     async fn native_window(&self) -> Option<f64>;
+    /// One compaction Claude Code started on its own (`trigger: "auto"`), for the ledger the
+    /// native-window warning counts. A failure is nothing.
+    async fn native_win(&self, win: Value);
 }
 
 /// The engine doing it itself.
@@ -141,6 +144,16 @@ impl Outside for Here {
                 .as_deref(),
             std::env::var_os("DISABLE_AUTO_COMPACT").is_some(),
         )
+    }
+
+    async fn native_win(&self, win: Value) {
+        let Ok(win) = serde_json::from_value::<native_warn::Win>(win) else {
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            native_warn::record_win(&Paths::from_env(), &win);
+        })
+        .await;
     }
 
     async fn write(&self, path: &str, text: &str, redact: Redact) -> Result<()> {
