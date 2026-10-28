@@ -762,7 +762,10 @@ impl Pane {
             {
                 let dir =
                     super::api_credit::dir(&self.paths.home, std::env::var_os("API_LANES_HOME"));
-                self.credit = Some((now, super::api_credit::read(&dir, now)));
+                self.credit = Some((
+                    now,
+                    super::api_credit::read_live(&dir, &self.paths.home, now),
+                ));
             }
             data["api_credit"] = json!(self.credit.as_ref().and_then(|c| c.1.clone()));
             if array(&s["main"]).is_empty()

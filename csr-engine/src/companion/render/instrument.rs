@@ -7130,11 +7130,62 @@ mod tests {
             active,
             running_caps: caps,
             week,
+            ..Default::default()
         }
     }
     fn dash_of(c: &Composition, size: (u32, u32), theme: Theme, open: Open) -> (Dash, Metrics) {
         let (_, m) = draw(c, size.0, size.1, theme, open, false).expect("draws");
         (m.dash.clone().expect("a dashboard"), m)
+    }
+
+    #[test]
+    fn every_admin_key_state_fits_its_credit_row_inside_the_card_at_every_size() {
+        use crate::companion::api_credit::KeyNote;
+        let notes = [
+            ("connected", KeyNote::Connected, false, None),
+            ("missing", KeyNote::Missing, false, None),
+            ("rejected", KeyNote::Rejected("usr".into()), true, None),
+            ("individual", KeyNote::Individual, false, None),
+            ("offline", KeyNote::Offline, false, None),
+            ("stale", KeyNote::Connected, true, Some(7200.)),
+            // A connected row with two days the API lacks, counted from the ledger.
+            ("ledger", KeyNote::Connected, false, None),
+        ];
+        let png = std::env::var_os("CSR_KEY_PNG");
+        for (name, key, dup, stale) in notes {
+            let mut c = dash_composition("ok");
+            let mut credit = credit_of(231.76, 11.8, 1, 5.);
+            (credit.key, credit.dup, credit.stale) = (key, dup, stale);
+            if name == "ledger" {
+                credit.ledger_added = vec![("on 10-27".into(), 3.), ("today".into(), 14.4)];
+            }
+            let row = credit.row();
+            c.credit = Some(credit);
+            // Every size in the dark theme, and the narrowest in the light one.
+            for (theme, size) in [
+                (Theme::Dark, DASH_SIZES[0]),
+                (Theme::Dark, DASH_SIZES[1]),
+                (Theme::Dark, DASH_SIZES[2]),
+                (Theme::Light, DASH_SIZES[0]),
+            ] {
+                let (d, m) = dash_of(&c, size, theme, Open::default());
+                assert_eq!(
+                    d.credit_row.as_deref(),
+                    Some(row.as_str()),
+                    "{name} {size:?}"
+                );
+                let (top, h) = m.figure_region;
+                assert!(
+                    top + h <= m.height,
+                    "{name} {size:?}: the row is inside the card"
+                );
+            }
+            if let Some(dir) = &png {
+                let (pm, _) =
+                    draw(&c, 704, 1020, Theme::Dark, Open::default(), false).expect("draws");
+                save(&format!("{}/{name}.png", dir.to_string_lossy()), &pm);
+            }
+        }
     }
 
     #[test]

@@ -9,7 +9,21 @@ use std::path::{Path, PathBuf};
 /// Under this many days of credit the usage headline says so.
 pub const WARN_DAYS: f64 = 3.;
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+/// What the pane knows of the Anthropic admin key, for the credit row.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum KeyNote {
+    /// Not looked at (admin cost reporting is off): the row says "by ledger".
+    #[default]
+    Unchecked,
+    Connected,
+    Missing,
+    /// Rejected; the key's type tag.
+    Rejected(String),
+    Individual,
+    Offline,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Credit {
     /// `credit.json` less the ledger since its date. A ledger estimate, not an account balance.
     pub left: f64,
@@ -18,6 +32,17 @@ pub struct Credit {
     pub running_caps: f64,
     /// The ledger rows of the last seven days.
     pub week: f64,
+    #[serde(default)]
+    pub key: KeyNote,
+    /// Two keychain entries that differ.
+    #[serde(default)]
+    pub dup: bool,
+    /// Seconds since the real-spend figures were fetched, when the last fetch failed.
+    #[serde(default)]
+    pub stale: Option<f64>,
+    /// Ledger spend counted for UTC days the cost API has not returned yet: (label, dollars), "today" or "on MM-DD".
+    #[serde(default)]
+    pub ledger_added: Vec<(String, f64)>,
 }
 
 /// The folder the runner keeps its files in: `$API_LANES_HOME`, else `~/.agents/api-lanes`.
@@ -119,11 +144,42 @@ pub fn read_in<Tz: TimeZone>(dir: &Path, now: f64, tz: &Tz) -> Option<Credit> {
         active,
         running_caps,
         week,
+        ..Default::default()
     })
 }
 
 pub fn read(dir: &Path, now: f64) -> Option<Credit> {
     read_in(dir, now, &Local)
+}
+
+/// [`read`], with real Anthropic spend from the admin cost cache in place of the ledger's when
+/// the key allows it, and the key's state either way. A stale cache starts a fetch on a thread;
+/// this call only ever reads the cache.
+pub fn read_live(dir: &Path, home: &Path, now: f64) -> Option<Credit> {
+    use super::admin_cost as ac;
+    let mut credit = read(dir, now)?;
+    if !ac::enabled() {
+        return Some(credit);
+    }
+    let file = read_json(&dir.join("credit.json"))?;
+    let amount = file["amount"].as_f64()?;
+    let since = file["since"]
+        .as_str()
+        .and_then(ac::since_date)
+        .unwrap_or_else(|| {
+            DateTime::from_timestamp(now as i64, 0)
+                .map_or_else(Default::default, |t| t.date_naive())
+                - chrono::Duration::days(30)
+        });
+    let from = ac::wanted_from(since, now);
+    let cache = ac::load(&ac::cache_path(home));
+    if !cache.as_ref().is_some_and(|c| ac::fresh(c, &from, now)) {
+        ac::spawn_refresh(home.to_owned(), from, now);
+    }
+    let ledger =
+        ac::ledger_by_day(&std::fs::read_to_string(dir.join("ledger.jsonl")).unwrap_or_default());
+    ac::apply(&mut credit, cache.as_ref(), amount, since, now, &ledger);
+    Some(credit)
 }
 
 impl Credit {
@@ -144,19 +200,56 @@ impl Credit {
         };
         (self.per_day() > 0.).then(|| (basis / self.per_day()).max(0.))
     }
-    /// The row under the limit bars.
+    /// The row under the limit bars: what is left, where the figure comes from, and (when the
+    /// Anthropic admin key is not giving real spend) what to tell Claude.
     pub fn row(&self) -> String {
-        let mut out = format!("API credit ${:.2} left by ledger", self.left.max(0.));
-        match self.days() {
-            Some(days) => out.push_str(&format!(
-                " · {} at this week's pace (${}/day)",
-                span(days),
-                money_a_day(self.per_day())
+        let left = self.left.max(0.);
+        let mut out = match &self.key {
+            KeyNote::Unchecked => format!("API credit ${left:.2} left by ledger"),
+            KeyNote::Connected => {
+                let mut t =
+                    format!("API credit ${left:.2} left \u{b7} real Anthropic spend (admin key)");
+                for (label, cost) in &self.ledger_added {
+                    t.push_str(&format!(" + ${cost:.2} {label}"));
+                }
+                if !self.ledger_added.is_empty() {
+                    t.push_str(" by ledger");
+                }
+                t
+            }
+            _ => format!("API credit ${left:.2} left (ledger estimate)"),
+        };
+        match &self.key {
+            KeyNote::Unchecked | KeyNote::Connected => match self.days() {
+                Some(days) => out.push_str(&format!(
+                    " \u{b7} {} at this week's pace (${}/day)",
+                    span(days),
+                    money_a_day(self.per_day())
+                )),
+                None => out.push_str(" \u{b7} no spend in 7 days"),
+            },
+            KeyNote::Missing => out.push_str(
+                " \u{b7} for real spend, tell Claude: connect my Anthropic admin key",
+            ),
+            KeyNote::Rejected(tag) => out.push_str(&format!(
+                " \u{b7} Admin key rejected ({tag} key) \u{b7} needs an admin or org-scoped key \u{b7} tell Claude: fix my admin key"
             )),
-            None => out.push_str(" · no spend in 7 days"),
+            KeyNote::Individual => {
+                out.push_str(" \u{b7} Admin API not available on this account \u{b7} using the ledger")
+            }
+            KeyNote::Offline => out.push_str(" \u{b7} Anthropic cost API unreachable"),
         }
         if self.active > 0 {
-            out.push_str(&format!(" · up to ${:.2} still running", self.running_caps));
+            out.push_str(&format!(
+                " \u{b7} up to ${:.2} still running",
+                self.running_caps
+            ));
+        }
+        if let Some(age) = self.stale {
+            out.push_str(&format!(" \u{b7} spend as of {}", ago(age)));
+        }
+        if self.dup {
+            out.push_str(" \u{b7} 2 keychain entries; using the admin one");
         }
         out
     }
@@ -170,6 +263,16 @@ impl Credit {
             format!("API credit runs out in {}", span(days))
         };
         Some((text, if days < 1. { "red" } else { "amber" }))
+    }
+}
+
+/// "just now", "12 min ago", "2 h ago", "3 days ago".
+fn ago(secs: f64) -> String {
+    match secs {
+        s if s < 60. => "just now".into(),
+        s if s < 3600. => format!("{} min ago", (s / 60.).round() as i64),
+        s if s < 86400. => format!("{} h ago", (s / 3600.).round() as i64),
+        s => format!("{} days ago", (s / 86400.).round() as i64),
     }
 }
 
@@ -249,6 +352,7 @@ mod tests {
             active: 0,
             running_caps: 0.,
             week: 94.63,
+            ..Default::default()
         };
         assert_eq!(
             c.row(),
@@ -268,6 +372,7 @@ mod tests {
             active: 2,
             running_caps: 12.,
             week: 94.63,
+            ..Default::default()
         };
         assert_eq!(c.floor(), 17.23);
         assert_eq!(
@@ -306,6 +411,7 @@ mod tests {
             active: 0,
             running_caps: 0.,
             week: 94.63,
+            ..Default::default()
         };
         assert_eq!(
             two.headline(),
@@ -316,6 +422,7 @@ mod tests {
             active: 0,
             running_caps: 0.,
             week: 94.63,
+            ..Default::default()
         };
         assert_eq!(
             less.headline(),
@@ -326,6 +433,7 @@ mod tests {
             active: 0,
             running_caps: 0.,
             week: 21.75,
+            ..Default::default()
         };
         assert_eq!(plenty.headline(), None);
         let spent = Credit {
@@ -333,6 +441,7 @@ mod tests {
             active: 0,
             running_caps: 0.,
             week: 10.,
+            ..Default::default()
         };
         assert_eq!(
             spent.headline(),
@@ -347,6 +456,7 @@ mod tests {
             active: 0,
             running_caps: 0.,
             week: 0.,
+            ..Default::default()
         };
         assert_eq!(c.days(), None);
         assert_eq!(
