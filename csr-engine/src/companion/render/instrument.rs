@@ -225,6 +225,10 @@ pub struct Composition {
     pub notice: Option<String>,
     pub asked_away: bool,
     pub clocks: Clocks,
+    /// The live eval of a running trial, when one is on show: the CSR performance card.
+    pub soak: Option<crate::companion::live_eval::Card>,
+    /// The API credit left by the api-lanes ledger, when it keeps one.
+    pub credit: Option<crate::companion::api_credit::Credit>,
     pub now: f64,
 }
 /// The layout width in pt that the pictures' x positions are measured in.
@@ -627,6 +631,8 @@ impl Composition {
             asked_away: gap.is_some_and(|w| num(&top["at"]) > w[0] && num(&top["at"]) < w[1]),
             notice,
             clocks,
+            soak: serde_json::from_value(data["soak"].clone()).ok(),
+            credit: serde_json::from_value(data["api_credit"].clone()).ok(),
             now,
         }
     }
@@ -788,6 +794,7 @@ impl Composition {
                 due.push(resets - len * (1. - (used / 100. - 0.05)));
             }
         }
+        due.extend(self.soak.as_ref().and_then(|card| card.next_change));
         // The Codex week passes its reset on its own clock too: the figure it shows goes with it.
         due.extend(self.codex_week["resets_at"].as_f64());
         if quotas.iter().any(|q| q["resets"].is_number())
@@ -1424,6 +1431,22 @@ fn assemble(
         short = take < wanted.min(8);
         out.extend(details.into_iter().skip(open.scroll).take(take));
     }
+    // The CSR performance card, as two lines (and any failing check) above the figure's rows.
+    if let Some(card) = &c.soak {
+        out.extend(wrap(&card.line1));
+        if !card.line2.is_empty() {
+            out.extend(wrap(&card.line2));
+        }
+        for row in card.rows.iter().filter(|r| r.mark == "✗") {
+            out.extend(wrap(&format!("{} {}", row.mark, row.text)));
+        }
+        if let Some(warning) = &card.warning {
+            out.extend(wrap(warning));
+        }
+    }
+    if let Some(credit) = &c.credit {
+        out.extend(fact_rows(&credit.row(), cols));
+    }
     if show_figure {
         out.extend(fig_lines);
     } else {
@@ -1569,7 +1592,7 @@ fn starter_questions() -> [(&'static str, &'static str); 8] {
 }
 /// "Try a question" with as many starter questions as fit between `cursor` and `bottom`.
 fn starter_cards(canvas: &mut Canvas, f: &Fonts, mut cursor: f32, bottom: f32, t: &Tokens) {
-    let title = sans(theme::TITLE_SIZE, t.bold);
+    let title = heading(t);
     let body = sans(theme::BODY_SIZE, t.regular);
     let caption = sans(theme::CAPTION_SIZE, t.regular);
     if bottom - cursor < theme::TITLE_LINE + S3 + theme::BODY_LINE + theme::CAPTION_LINE {
@@ -2438,7 +2461,21 @@ fn label(c: &mut Canvas, f: &Fonts, s: &str, x: f32, y: f32, size: f32, col: Rgb
     } else {
         x
     };
-    c.text(f, &icons::line(s), x, y, sans(size, w), col, A::L);
+    // A heading is the pane's serif, at the one heading size.
+    let st = if size == theme::TITLE_SIZE {
+        serif(size, w)
+    } else {
+        sans(size, w)
+    };
+    c.text(f, &icons::line(s), x, y, st, col, A::L);
+}
+/// How far a "Context" heading reaches from the card's inner left edge: its icon, then its word.
+fn context_title_w(f: &Fonts, t: &Tokens) -> f32 {
+    14. + ICON_GAP + f.width("Context", heading(t))
+}
+/// The style of every card heading: the serif the dreamer's question is set in, at one size.
+fn heading(t: &Tokens) -> St {
+    serif(theme::TITLE_SIZE, t.bold)
 }
 fn panel(c: &mut Canvas, y: f32, h: f32, t: &Tokens) {
     c.shadow(M, y, CW, h, 24., t.ambient_shadow);
@@ -2654,6 +2691,8 @@ pub struct Metrics {
     pub breakdown_bars: Vec<(f32, f32, f32, f32)>,
     /// The Context card's dashboard: its lines, bars and legend, when it is the layout.
     pub dash: Option<Dash>,
+    /// Top and height of the CSR performance card, in layout pt, when one is drawn.
+    pub soak_region: Option<(f32, f32)>,
     /// Top and bottom of each "N by CSR" caption drawn, in layout pt.
     pub by_csr: Vec<(f32, f32)>,
     pub fresh_plots: Vec<FreshPlot>,
@@ -2743,7 +2782,7 @@ pub fn draw(
     let mut maxh = (available_height as f32 / (S * ratio)).max(800.);
     let caption = sans(theme::CAPTION_SIZE, t.regular);
     let body = sans(theme::BODY_SIZE, t.regular);
-    let title = sans(theme::TITLE_SIZE, t.bold);
+    let title = heading(t);
     let story_st = body;
     let story_lines_fit = if c.story.is_empty() {
         Vec::new()
@@ -2915,6 +2954,10 @@ pub fn draw(
         0.
     };
     let notice_gap = if c.notice.is_some() { S3 } else { 0. };
+    // The CSR performance card sits right above the Context card.
+    let soak = c.soak.as_ref().map(|card| soak_plan(f, card, t));
+    let soak_h = soak.as_ref().map_or(0., |p| p.h);
+    let soak_gap = if soak_h > 0. { S3 } else { 0. };
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
     // The figure card's smallest height: its one-row gauge strip (or the quotas row).
     let figure_floor: f32 = if quotas_only { 154. } else { 110. };
@@ -2982,6 +3025,8 @@ pub fn draw(
             + if story_h > 0. { S3 } else { 0. }
             + notice_h
             + notice_gap
+            + soak_h
+            + soak_gap
     };
     // The canvas is the closed pane's: an open section never makes it taller. Layout points may
     // scale to fit a narrow/wide terminal; reserve S3 in final pixels.
@@ -3677,6 +3722,12 @@ pub fn draw(
     let mut ring_group = None;
     let mut ring_formula_avail = None;
     let mut mid_layout = None;
+    let mut soak_region = None;
+    if let (Some(card), Some(plan)) = (&c.soak, &soak) {
+        draw_soak(&mut canvas, f, card, plan, y, t);
+        soak_region = Some((y, plan.h));
+        y += plan.h + card_gap;
+    }
     let figure_draw_h = figure_h;
     let figure_layout_h = figure_h;
     let figure_region = (y, figure_draw_h);
@@ -3990,6 +4041,7 @@ pub fn draw(
             note_rows: canvas.note_rows.clone(),
             breakdown_bars: canvas.breakdown_bars.clone(),
             dash: canvas.dash.clone(),
+            soak_region,
             by_csr: canvas.by_csr.clone(),
             fresh_plots: canvas.fresh_plots.clone(),
             question_size: qs.size,
@@ -4240,7 +4292,7 @@ fn figure(
             "Quotas"
         },
         IX,
-        y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+        y + P + f.cap(heading(t)),
         theme::TITLE_SIZE,
         t.ink,
         t.bold,
@@ -4268,8 +4320,8 @@ fn figure(
         c.icon(
             f,
             Icon::CircleAlert,
-            IX + 87.,
-            y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+            IX + context_title_w(f, t) + S3,
+            y + P + f.cap(heading(t)),
             12.,
             10.,
             col,
@@ -4278,8 +4330,8 @@ fn figure(
             c,
             f,
             &line,
-            IX + 105.,
-            y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+            IX + context_title_w(f, t) + S3 + 18.,
+            y + P + f.cap(heading(t)),
             220.,
             10.,
             t.quiet,
@@ -4508,7 +4560,7 @@ fn figure(
 // context with a labelled bar and a row per part, what CSR did this session, then the fresh
 // tokens per turn. The older ring layouts stay for a card too short to hold it.
 // ---------------------------------------------------------------------------------------------
-const DASH_HEAD_LINE: f32 = 17.;
+const DASH_HEAD_LINE: f32 = theme::TITLE_LINE;
 const DASH_LABEL_W: f32 = 62.;
 const DASH_PCT_W: f32 = 40.;
 const DASH_LIMIT_PITCH: f32 = 36.;
@@ -4521,9 +4573,157 @@ const DASH_CHART_WANT: f32 = 92.;
 const DASH_PART_COL: f32 = 150.;
 
 /// The words and numbers the dashboard draws, from the composition alone.
+/// The CSR performance card's lines, fitted, and its height.
+struct SoakPlan {
+    head: Vec<String>,
+    h: f32,
+}
+/// The height of the progress bar under the card's clock line.
+const SOAK_BAR_H: f32 = 6.;
+
+fn soak_plan(f: &Fonts, card: &crate::companion::live_eval::Card, t: &Tokens) -> SoakPlan {
+    let head: Vec<String> = f
+        .wrap(&card.line1, heading(t), IW)
+        .into_iter()
+        .take(2)
+        .collect();
+    let rows = card.rows.len() + usize::from(card.warning.is_some());
+    let h = P
+        + theme::TITLE_LINE
+        + S2
+        + head.len() as f32 * DASH_HEAD_LINE
+        + if card.line2.is_empty() {
+            0.
+        } else {
+            S1 + theme::CAPTION_LINE + S1 + SOAK_BAR_H
+        }
+        + if rows > 0 { S2 } else { 0. }
+        + rows as f32 * DASH_ROW
+        + P;
+    SoakPlan { head, h }
+}
+
+/// The CSR performance card at `y`: its heading, the big number and headline, the clock with its
+/// progress bar, then a line to each check and the stale-data warning.
+fn draw_soak(
+    c: &mut Canvas,
+    f: &Fonts,
+    card: &crate::companion::live_eval::Card,
+    plan: &SoakPlan,
+    y: f32,
+    t: &Tokens,
+) {
+    panel(c, y, plan.h, t);
+    let caption = sans(theme::CAPTION_SIZE, t.regular);
+    let ink = dash_sev_ink(&card.sev, t);
+    label(
+        c,
+        f,
+        &card.title,
+        IX,
+        y + P + f.cap(heading(t)),
+        theme::TITLE_SIZE,
+        t.ink,
+        t.bold,
+    );
+    if !card.candidate.is_empty() {
+        c.text(
+            f,
+            &card.candidate,
+            IX + IW,
+            y + P + f.cap(caption),
+            caption,
+            t.quiet,
+            A::R,
+        );
+    }
+    let mut at = y + P + theme::TITLE_LINE + S2;
+    let st = heading(t);
+    for (i, line) in plan.head.iter().enumerate() {
+        let shown = if i + 1 == plan.head.len() && plan.head.len() == 2 {
+            f.fit(line, st, IW)
+        } else {
+            line.clone()
+        };
+        c.text(f, &shown, IX, at + f.cap(st), st, ink, A::L);
+        at += DASH_HEAD_LINE;
+    }
+    if !card.line2.is_empty() {
+        at += S1;
+        single(
+            c,
+            f,
+            &card.line2,
+            IX,
+            at + f.cap(caption),
+            IW,
+            theme::CAPTION_SIZE,
+            t.quiet,
+            t,
+        );
+        at += theme::CAPTION_LINE + S1;
+        c.rrect(IX, at, IW, SOAK_BAR_H, SOAK_BAR_H / 2., t.track);
+        if card.progress > 0. {
+            let w = (IW * card.progress as f32).clamp(SOAK_BAR_H, IW);
+            c.rrect(IX, at, w, SOAK_BAR_H, SOAK_BAR_H / 2., ink);
+        }
+        at += SOAK_BAR_H;
+    }
+    if !card.rows.is_empty() || card.warning.is_some() {
+        at += S2;
+    }
+    let row_st = sans(11., t.regular);
+    for row in &card.rows {
+        let mark = match row.sev.as_str() {
+            "ok" => t.mint,
+            "red" => t.risk,
+            _ => t.quiet,
+        };
+        let base = at + f.cap(row_st);
+        c.text(f, &row.mark, IX, base, sans(11., t.bold), mark, A::L);
+        single(
+            c,
+            f,
+            &row.text,
+            IX + 16.,
+            base,
+            IW - 16.,
+            11.,
+            if row.sev == "quiet" { t.quiet } else { t.ink },
+            t,
+        );
+        at += DASH_ROW;
+    }
+    if let Some(warning) = &card.warning {
+        c.icon(
+            f,
+            Icon::CircleAlert,
+            IX,
+            at + f.cap(caption) + 1.,
+            12.,
+            10.,
+            t.amber,
+        );
+        single(
+            c,
+            f,
+            warning,
+            IX + 18.,
+            at + f.cap(caption) + 1.,
+            IW - 18.,
+            theme::CAPTION_SIZE,
+            t.amber,
+            t,
+        );
+    }
+}
+
 struct DashPlan {
     head: Vec<String>,
     head_sev: String,
+    /// The API credit row, wrapped, and whether it warns.
+    credit: Vec<String>,
+    credit_warns: bool,
     /// (code, name, used percent, state, tick percent, line) of each window.
     limits: Vec<(String, String, f64, String, Option<f64>, String)>,
     codex: Option<(f64, String)>,
@@ -4532,9 +4732,22 @@ struct DashPlan {
     estimated: bool,
     turn: Option<String>,
     cache: Option<(String, bool)>,
-    csr: Vec<String>,
+    csr: Vec<CsrRing>,
+    /// The most lines any ring's label wraps to.
+    csr_label_lines: usize,
     status: Option<(String, bool)>,
 }
+
+/// One ring of "CSR this session": the number in it, the words under it, and the fraction of the
+/// ring it fills when that fraction means something. A count has none: it is a full ring.
+#[derive(Clone, Debug)]
+struct CsrRing {
+    number: String,
+    label: String,
+    fill: Option<f64>,
+}
+/// The radius of a "CSR this session" ring, in layout points.
+const CSR_RING_R: f32 = 24.;
 
 fn dash_sev_ink(sev: &str, t: &Tokens) -> Rgba {
     match sev {
@@ -4555,14 +4768,35 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
     let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.)?;
     let (head, head_sev) = match g["outlook"]["headline"]["text"].as_str() {
         Some(text) => (
-            f.wrap(text, sans(12.5, t.bold), IW)
-                .into_iter()
-                .take(2)
-                .collect(),
+            f.wrap(text, heading(t), IW).into_iter().take(2).collect(),
             string(&g["outlook"]["headline"]["sev"]).to_owned(),
         ),
         None => (vec![], String::new()),
     };
+    let (mut head, mut head_sev) = (head, head_sev);
+    // Credit that runs out within days takes the headline, unless a limit warning is more severe.
+    let rank = |sev: &str| match sev {
+        "red" => 2,
+        "amber" => 1,
+        _ => 0,
+    };
+    let credit_head = c.credit.as_ref().and_then(|credit| credit.headline());
+    if let Some((text, sev)) = &credit_head {
+        if head.is_empty() || rank(sev) >= rank(&head_sev) {
+            head = f.wrap(text, heading(t), IW).into_iter().take(2).collect();
+            head_sev = (*sev).to_owned();
+        }
+    }
+    let credit = c
+        .credit
+        .as_ref()
+        .map(|credit| {
+            f.wrap(&credit.row(), sans(theme::CAPTION_SIZE, t.regular), IW)
+                .into_iter()
+                .take(2)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut limits = vec![];
     if let Some(windows) = g["outlook"]["windows"].as_array() {
         for w in windows {
@@ -4663,26 +4897,57 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
             let words = l.replacen("WARM", "warm", 1).replacen("COLD", "cold", 1);
             (format!("Cache {words}"), g["cache"]["cold"] == true)
         });
+    // Only what was measured gets a ring. A count has no fraction of anything: a full ring.
     let mut csr = vec![];
     if let Some(n) = c.tally["by_csr"].as_u64().filter(|n| *n > 0) {
-        csr.push(format!("{n} compaction{}", if n == 1 { "" } else { "s" }));
+        csr.push(CsrRing {
+            number: n.to_string(),
+            label: format!("{n} compaction{}", if n == 1 { "" } else { "s" }),
+            fill: None,
+        });
     }
     if let Some(n) = c.tally["payback"].as_f64().filter(|n| *n > 0.) {
-        csr.push(format!("~{} tokens saved", short(n)));
+        csr.push(CsrRing {
+            number: format!("~{}", short(n)),
+            label: format!("~{} tokens saved", short(n)),
+            fill: None,
+        });
     }
     if let Some(n) = g["asks"].as_u64().filter(|n| *n > 0) {
-        csr.push(format!("{n} recall{} used", if n == 1 { "" } else { "s" }));
+        csr.push(CsrRing {
+            number: n.to_string(),
+            label: format!("{n} recall{} used", if n == 1 { "" } else { "s" }),
+            fill: None,
+        });
     }
-    if c.csr_cost.share.is_some_and(|s| s > 0.) {
-        csr.push(format!(
-            "{} pts of the weekly limit",
-            c.csr_cost.share_label()
-        ));
+    if let Some(share) = c.csr_cost.share.filter(|s| *s > 0.) {
+        csr.push(CsrRing {
+            number: c.csr_cost.share_label(),
+            label: format!("{} pts of the weekly limit", c.csr_cost.share_label()),
+            // The share of the weekly limit is a real fraction of a real ring.
+            fill: Some(share / 100.),
+        });
     }
+    let slot = IW / csr.len().max(1) as f32 - S2;
+    let csr_label_lines = csr
+        .iter()
+        .map(|r| {
+            f.wrap(
+                &r.label,
+                sans(theme::CAPTION_SIZE, t.medium),
+                slot - SWATCH_LEAD,
+            )
+            .len()
+            .min(2)
+        })
+        .max()
+        .unwrap_or(0);
     let status = csr_status(g).map(|(line, sev)| (line, sev == "red"));
     Some(DashPlan {
         head,
         head_sev,
+        credit,
+        credit_warns: credit_head.is_some(),
         limits,
         codex,
         ctx: Some((tokens, size, ctx_state)),
@@ -4691,6 +4956,7 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
         turn,
         cache,
         csr,
+        csr_label_lines,
         status,
     })
 }
@@ -4703,7 +4969,12 @@ fn dash_heights(p: &DashPlan, full: bool) -> (f32, f32, f32, f32, f32) {
     } else {
         p.head.len() as f32 * DASH_HEAD_LINE + S2
     };
-    let limits = (p.limits.len() + usize::from(p.codex.is_some())) as f32 * DASH_LIMIT_PITCH;
+    let limits = (p.limits.len() + usize::from(p.codex.is_some())) as f32 * DASH_LIMIT_PITCH
+        + if p.credit.is_empty() {
+            0.
+        } else {
+            p.credit.len() as f32 * DASH_ROW + S1
+        };
     let rows = if full {
         p.parts.len()
     } else {
@@ -4721,12 +4992,20 @@ fn dash_heights(p: &DashPlan, full: bool) -> (f32, f32, f32, f32, f32) {
     } else {
         0.
     };
-    let csr = if p.csr.is_empty() { 0. } else { 20. }
-        + if p.status.is_some() {
-            DASH_ROW + S1
-        } else {
-            0.
-        };
+    let csr = if p.csr.is_empty() {
+        0.
+    } else {
+        theme::TITLE_LINE
+            + S2
+            + 2. * CSR_RING_R
+            + S2
+            + p.csr_label_lines.max(1) as f32 * theme::CAPTION_LINE
+            + S2
+    } + if p.status.is_some() {
+        DASH_ROW + S1
+    } else {
+        0.
+    };
     (head, limits, ctx, csr, P + head + limits + ctx + csr + P)
 }
 
@@ -4766,7 +5045,7 @@ fn draw_dashboard(
     let mut at = y + P;
     // A. the headline
     if !p.head.is_empty() {
-        let st = sans(12.5, t.bold);
+        let st = heading(t);
         let ink = dash_sev_ink(&p.head_sev, t);
         for (i, line) in p.head.iter().enumerate() {
             let shown = if i + 1 == p.head.len() && p.head.len() == 2 {
@@ -4788,7 +5067,7 @@ fn draw_dashboard(
         at += head_h + gap;
     }
     // B. the limits
-    let label = sans(11.5, t.medium);
+    let name_st = sans(11.5, t.medium);
     let caption = sans(theme::CAPTION_SIZE, t.regular);
     let bar_x = IX + DASH_LABEL_W;
     let bar_w = IW - DASH_LABEL_W - DASH_PCT_W;
@@ -4812,9 +5091,9 @@ fn draw_dashboard(
     }
     for (code, name, used, sev, tick, line) in &bars {
         let ink = dash_sev_ink(sev, t);
-        let base = at + f.cap(label);
-        c.text(f, name, IX, base, label, t.ink, A::L);
-        let bar_y = at + f.cap(label) / 2. - DASH_BAR_H / 2.;
+        let base = at + f.cap(name_st);
+        c.text(f, name, IX, base, name_st, t.ink, A::L);
+        let bar_y = at + f.cap(name_st) / 2. - DASH_BAR_H / 2.;
         c.rrect(bar_x, bar_y, bar_w, DASH_BAR_H, 3., t.track);
         let fill = (used / 100.).clamp(0., 1.) as f32;
         if *used > 0. {
@@ -4860,14 +5139,31 @@ fn draw_dashboard(
         });
         at += DASH_LIMIT_PITCH;
     }
+    // The API credit, under the bars it sits with: a warning once it runs out within days.
+    if !p.credit.is_empty() {
+        let ink = if p.credit_warns { t.amber } else { t.quiet };
+        for (i, line) in p.credit.iter().enumerate() {
+            c.text(
+                f,
+                line,
+                IX,
+                at + f.cap(caption) + i as f32 * DASH_ROW,
+                caption,
+                ink,
+                A::L,
+            );
+        }
+        dash.credit_row = Some(p.credit.join(" "));
+        at += p.credit.len() as f32 * DASH_ROW + S1;
+    }
     at += gap;
     // C. the context
     if let Some((tokens, size, state)) = p.ctx {
         at += S2;
-        let base = at + f.cap(label);
-        c.text(f, "Context", IX, base, label, t.ink, A::L);
+        let base = at + f.cap(name_st);
+        c.text(f, "Context", IX, base, name_st, t.ink, A::L);
         let used = format!("{:.0}% used", (tokens / size * 100.).round());
-        let name_w = f.width("Context", label);
+        let name_w = f.width("Context", name_st);
         c.text(
             f,
             &used,
@@ -4989,30 +5285,74 @@ fn draw_dashboard(
         at += S2 + gap;
         let _ = ctx_h;
     }
-    // D. what CSR did this session
+    // D. what CSR did this session: a ring to each measured value, its words under it
     if !p.csr.is_empty() {
-        let st = sans(11., t.medium);
-        let lead = "CSR this session: ";
-        let lead_w = f.width(lead, sans(11., t.bold));
-        let mut parts = p.csr.clone();
-        while parts.len() > 1 && lead_w + f.width(&parts.join(" · "), st) > IW - 10. {
-            parts.pop();
-        }
-        let base = at + 2. + f.cap(st);
-        c.rrect(IX, at, 3., 15., 1.5, t.csr_share);
-        c.text(
+        label(
+            c,
             f,
-            lead,
-            IX + 10.,
-            base,
-            sans(11., t.bold),
-            t.csr_share,
-            A::L,
+            "CSR this session",
+            IX,
+            at + f.cap(heading(t)),
+            theme::TITLE_SIZE,
+            t.ink,
+            t.bold,
         );
-        let rest = f.fit(&parts.join(" · "), st, IW - 10. - lead_w);
-        c.text(f, &rest, IX + 10. + lead_w, base, st, t.ink, A::L);
-        dash.csr_row = Some(format!("{lead}{rest}"));
-        at += 20.;
+        at += theme::TITLE_LINE + S2;
+        let slot = IW / p.csr.len() as f32;
+        let cy = at + CSR_RING_R;
+        for (i, ring) in p.csr.iter().enumerate() {
+            let x = IX + slot * (i as f32 + 0.5);
+            let fill = ring.fill.map_or(1., |n| n.clamp(0., 1.) as f32);
+            // A sliver is still seen; a count fills the ring.
+            let drawn = if ring.fill.is_some() {
+                fill.max(6. / 360.)
+            } else {
+                fill
+            };
+            c.ring(
+                x,
+                cy,
+                CSR_RING_R,
+                t.ring,
+                t.track,
+                &[(0., drawn, t.csr_share)],
+            );
+            let st = serif((CSR_RING_R * 0.6).clamp(10., 18.), t.medium);
+            let room = 2. * CSR_RING_R - 2. * S2;
+            let st = serif(
+                st.size * room / f.width(&ring.number, st).max(room),
+                t.medium,
+            );
+            c.text(f, &ring.number, x, cy + st.size * 0.3, st, t.ink, A::M);
+            quota_label(
+                c,
+                f,
+                &ring.label,
+                x,
+                cy + CSR_RING_R + S2 + f.cap(caption),
+                slot - S2,
+                theme::CAPTION_SIZE,
+                t.quiet,
+                Some(Swatch::Disc(t.csr_share)),
+                t,
+            );
+            dash.csr_rings.push(DashRing {
+                number: ring.number.clone(),
+                label: ring.label.clone(),
+                fill: ring.fill.map(|n| n.clamp(0., 1.) as f32),
+                center: (x, cy),
+                radius: CSR_RING_R,
+            });
+        }
+        dash.csr_row = Some(format!(
+            "CSR this session: {}",
+            p.csr
+                .iter()
+                .map(|r| r.label.as_str())
+                .collect::<Vec<_>>()
+                .join(" · ")
+        ));
+        at += 2. * CSR_RING_R + S2 + p.csr_label_lines.max(1) as f32 * theme::CAPTION_LINE + S2;
     }
     if let Some((line, red)) = &p.status {
         c.icon(
@@ -5128,7 +5468,7 @@ fn draw_context_mid(
         f,
         "Context",
         IX,
-        y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+        y + P + f.cap(heading(t)),
         theme::TITLE_SIZE,
         t.ink,
         t.bold,
@@ -5138,8 +5478,8 @@ fn draw_context_mid(
         c.icon(
             f,
             Icon::CircleAlert,
-            IX + 87.,
-            y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+            IX + context_title_w(f, t) + S3,
+            y + P + f.cap(heading(t)),
             12.,
             10.,
             col,
@@ -5148,8 +5488,8 @@ fn draw_context_mid(
             c,
             f,
             &line,
-            IX + 105.,
-            y + P + f.cap(sans(theme::TITLE_SIZE, t.bold)),
+            IX + context_title_w(f, t) + S3 + 18.,
+            y + P + f.cap(heading(t)),
             220.,
             10.,
             t.quiet,
@@ -6447,6 +6787,330 @@ mod tests {
         );
     }
 
+    fn credit_of(
+        left: f64,
+        week: f64,
+        active: usize,
+        caps: f64,
+    ) -> crate::companion::api_credit::Credit {
+        crate::companion::api_credit::Credit {
+            left,
+            active,
+            running_caps: caps,
+            week,
+        }
+    }
+    fn dash_of(c: &Composition, size: (u32, u32), theme: Theme, open: Open) -> (Dash, Metrics) {
+        let (_, m) = draw(c, size.0, size.1, theme, open, false).expect("draws");
+        (m.dash.clone().expect("a dashboard"), m)
+    }
+
+    #[test]
+    fn the_api_credit_row_sits_under_the_limit_bars_and_says_it_is_by_ledger() {
+        let mut c = dash_composition("ok");
+        c.credit = Some(credit_of(188.25, 21.75, 0, 0.));
+        for theme in [Theme::Dark, Theme::Light] {
+            for size in DASH_SIZES {
+                let (d, m) = dash_of(&c, size, theme, Open::default());
+                assert_eq!(
+                    d.credit_row.as_deref(),
+                    Some("API credit $188.25 left by ledger \u{b7} about 61 days at this week's pace ($3.11/day)"),
+                    "{theme:?} {size:?}"
+                );
+                // Plenty of credit: the headline is still the limits'.
+                assert!(d.headline.as_ref().unwrap().0.starts_with("On track."));
+                let (top, h) = m.figure_region;
+                assert!(top + h <= m.height, "{size:?}: the row is inside the card");
+            }
+        }
+        // Running workers: the days count from the credit after their caps, and the caps are said.
+        c.credit = Some(credit_of(29.23, 94.63, 2, 12.));
+        let (d, _) = dash_of(&c, DASH_SIZES[1], Theme::Dark, Open::default());
+        let row = d.credit_row.unwrap();
+        assert!(
+            row.contains("about 1 day at") && row.ends_with("up to $12.00 still running"),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn credit_under_three_days_takes_the_headline_unless_a_limit_warning_is_more_severe() {
+        let headline = |sev: &str, credit: crate::companion::api_credit::Credit| {
+            let mut c = dash_composition(sev);
+            c.credit = Some(credit);
+            dash_of(&c, DASH_SIZES[1], Theme::Dark, Open::default())
+                .0
+                .headline
+                .unwrap()
+        };
+        let two_days = credit_of(29.23, 94.63, 0, 0.);
+        let hours = credit_of(5., 94.63, 0, 0.);
+        // Over a calm limit headline, the credit warns in amber.
+        assert_eq!(
+            headline("ok", two_days.clone()),
+            ("API credit runs out in about 2 days".into(), "amber".into())
+        );
+        // An amber limit warning is no more severe than amber credit: the credit speaks.
+        assert_eq!(
+            headline("amber", two_days.clone()).0,
+            "API credit runs out in about 2 days"
+        );
+        // A red limit warning stays.
+        let red = headline("red", two_days.clone());
+        assert!(red.0.starts_with("On track."), "{red:?}");
+        assert_eq!(red.1, "red");
+        // Under a day the credit is red and takes over from amber.
+        assert_eq!(
+            headline("amber", hours),
+            (
+                "API credit runs out in less than a day".into(),
+                "red".into()
+            )
+        );
+    }
+
+    #[test]
+    fn no_credit_on_record_no_row_and_no_spend_in_a_week_no_days_figure() {
+        let c = dash_composition("ok");
+        assert_eq!(
+            dash_of(&c, DASH_SIZES[1], Theme::Dark, Open::default())
+                .0
+                .credit_row,
+            None
+        );
+        let mut idle = dash_composition("ok");
+        idle.credit = Some(credit_of(29.23, 0., 0, 0.));
+        let (d, _) = dash_of(&idle, DASH_SIZES[1], Theme::Dark, Open::default());
+        assert_eq!(
+            d.credit_row.as_deref(),
+            Some("API credit $29.23 left by ledger \u{b7} no spend in 7 days")
+        );
+        assert!(
+            d.headline.unwrap().0.starts_with("On track."),
+            "no days figure, no warning"
+        );
+    }
+
+    #[test]
+    fn csr_this_session_is_a_ring_to_each_measured_value_with_its_words_under_it() {
+        let c = {
+            let mut c = dash_composition("ok");
+            c.csr_cost.share = Some(0.4);
+            c
+        };
+        for theme in [Theme::Dark, Theme::Light] {
+            for size in DASH_SIZES {
+                let at = format!("{theme:?} {size:?}");
+                let (d, m) = dash_of(&c, size, theme, Open::default());
+                let rings: Vec<_> = d
+                    .csr_rings
+                    .iter()
+                    .map(|r| (r.number.as_str(), r.label.as_str()))
+                    .collect();
+                assert_eq!(
+                    rings,
+                    [
+                        ("2", "2 compactions"),
+                        ("~851k", "~851k tokens saved"),
+                        ("4", "4 recalls used"),
+                        ("0.4", "0.4 pts of the weekly limit"),
+                    ],
+                    "{at}"
+                );
+                // A count has no fraction: a full ring. The weekly share is a real one.
+                let fills: Vec<_> = d.csr_rings.iter().map(|r| r.fill).collect();
+                assert_eq!(fills[..3], [None, None, None], "{at}");
+                assert!((fills[3].unwrap() - 0.004).abs() < 1e-6, "{at}: {fills:?}");
+                let (top, h) = m.figure_region;
+                for pair in d.csr_rings.windows(2) {
+                    assert!(
+                        pair[1].center.0 - pair[0].center.0 >= 2. * pair[0].radius,
+                        "{at}: rings overlap"
+                    );
+                }
+                for r in &d.csr_rings {
+                    assert!(
+                        r.center.0 - r.radius >= IX && r.center.0 + r.radius <= IX + IW,
+                        "{at}: {r:?}"
+                    );
+                    assert!(
+                        r.center.1 - r.radius > top && r.center.1 + r.radius < top + h,
+                        "{at}: {r:?}"
+                    );
+                }
+                assert!(
+                    d.csr_row
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("CSR this session: 2 compactions"),
+                    "{at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_value_with_no_measure_gets_no_ring_and_no_values_no_heading() {
+        let mut c = dash_composition("ok");
+        c.tally = Value::Null;
+        c.csr_cost.share = None;
+        let (d, _) = dash_of(&c, DASH_SIZES[1], Theme::Dark, Open::default());
+        assert_eq!(d.csr_rings.len(), 1, "only the recalls were measured");
+        assert_eq!(d.csr_rings[0].label, "4 recalls used");
+        c.figure["asks"] = json!(0);
+        let (d, _) = dash_of(&c, DASH_SIZES[1], Theme::Dark, Open::default());
+        assert!(d.csr_rings.is_empty() && d.csr_row.is_none());
+    }
+
+    #[test]
+    fn every_heading_is_the_serif_at_one_size_and_fits_beside_its_count() {
+        let fonts = fonts().unwrap();
+        let f = &*fonts;
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let st = heading(t);
+            assert!(
+                matches!(st.fam, Fam::Serif),
+                "headings are the dreamer's serif"
+            );
+            assert_eq!(st.size, theme::TITLE_SIZE);
+            const {
+                assert!(
+                    theme::TITLE_SIZE >= 16.,
+                    "bigger than the 13pt sans they were"
+                );
+                assert!(theme::TITLE_LINE > theme::TITLE_SIZE);
+            }
+            let counts = f.width("5 \u{b7} o opens", sans(theme::CAPTION_SIZE, t.regular));
+            for title in [
+                "CSR's dreamer",
+                "The dreamer asks \u{b7} asked while you were away",
+                CONFUSED_TITLE,
+                SHOULD_BE_TITLE,
+                "Where the work stands",
+                "CSR performance",
+                "CSR this session",
+                "Context",
+            ] {
+                let w = 14. + ICON_GAP + f.width(title, st);
+                assert!(w + counts + S4 < IW, "{title}: {w}pt of {IW}pt");
+            }
+        }
+    }
+
+    fn soak_card(rows: usize) -> crate::companion::live_eval::Card {
+        use crate::companion::live_eval::{Card, Row};
+        let checks = [
+            ("\u{2713}", "ok", "Daemon errors 0 \u{2192} (limit 0)"),
+            (
+                "\u{2713}",
+                "ok",
+                "Memory trend -5943 MB/h \u{2193} (limit +150)",
+            ),
+            (
+                "\u{2713}",
+                "ok",
+                "Prompt hook p95, worst 481 ms \u{2192} (limit 800)",
+            ),
+            ("\u{2026}", "quiet", "Replay finished: no, need yes by end"),
+            ("\u{2026}", "quiet", "Dream cycles 0, need 1 by end"),
+        ];
+        Card {
+            title: "CSR performance".into(),
+            candidate: "combo ac9c24c3".into(),
+            sev: "ok".into(),
+            line1: "3 of 5 checks passing \u{b7} 2 waiting \u{b7} On track".into(),
+            line2: "Combo soak \u{b7} ends 7:04 AM \u{b7} 6h 22m left".into(),
+            progress: 0.2,
+            rows: checks[..rows]
+                .iter()
+                .map(|(mark, sev, text)| Row {
+                    mark: (*mark).into(),
+                    sev: (*sev).into(),
+                    text: (*text).into(),
+                })
+                .collect(),
+            warning: None,
+            next_change: None,
+        }
+    }
+
+    #[test]
+    fn the_performance_card_sits_right_above_the_context_card_at_every_size_and_theme() {
+        let mut c = dash_composition("ok");
+        for theme in [Theme::Dark, Theme::Light] {
+            for size in DASH_SIZES {
+                c.soak = None;
+                let (_, bare) = draw(&c, size.0, size.1, theme, Open::default(), false).unwrap();
+                assert_eq!(bare.soak_region, None, "no trial, no card");
+                c.soak = Some(soak_card(5));
+                let (_, m) = draw(&c, size.0, size.1, theme, Open::default(), false).unwrap();
+                let (top, h) = m.soak_region.expect("the card is drawn");
+                let (fig_top, fig_h) = m.figure_region;
+                assert!(
+                    (top + h + S3 - fig_top).abs() < 0.01,
+                    "{theme:?} {size:?}: {top}+{h} vs {fig_top}"
+                );
+                assert!(fig_top + fig_h <= m.height + 0.01);
+                assert!(
+                    m.dash.is_some(),
+                    "the Context card still draws its dashboard"
+                );
+                assert!(h > 100., "a big number, a clock and five checks: {h}pt");
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_warning_and_an_unreadable_trial_each_get_their_line() {
+        let mut c = dash_composition("ok");
+        let mut card = soak_card(2);
+        let plain = {
+            c.soak = Some(card.clone());
+            draw(&c, 704, 1020, Theme::Dark, Open::default(), false)
+                .unwrap()
+                .1
+                .soak_region
+                .unwrap()
+                .1
+        };
+        card.warning = Some("No new data for 35m, expected every 10m".into());
+        c.soak = Some(card);
+        let warned = draw(&c, 704, 1020, Theme::Dark, Open::default(), false)
+            .unwrap()
+            .1
+            .soak_region
+            .unwrap()
+            .1;
+        assert!(warned > plain, "{warned} vs {plain}");
+        c.soak = Some(crate::companion::live_eval::unreadable(
+            None,
+            "gone.log not found",
+            0.,
+            &chrono::Utc,
+        ));
+        let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        assert!(
+            m.soak_region.is_some(),
+            "unreadable data is a card that says so, never a hole"
+        );
+    }
+
+    #[test]
+    fn the_performance_card_is_scheduled_by_the_minute_and_text_rows_carry_it() {
+        let mut c = dash_composition("ok");
+        let mut card = soak_card(5);
+        card.next_change = Some(c.now + 17.);
+        c.soak = Some(card);
+        assert_eq!(c.next_change_at(Open::default()), Some(c.now + 17. + 0.01));
+        let text = text_rows(&c, 60, 40, Open::default()).join("\n");
+        assert!(
+            text.contains("3 of 5 checks passing")
+                && text.contains("Combo soak \u{b7} ends 7:04 AM"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn the_cache_row_says_warm_with_its_time_left_and_cold_with_its_cost() {
         let row = |cache: Value| {
@@ -6542,7 +7206,8 @@ mod tests {
         let mut checked = 0;
         for (comp, forecast) in [(&c, true), (&no_forecast, false)] {
             for (top, h, m) in figure_sweep(comp, Open::default()) {
-                if m.mid_layout.is_none() || h < 160. {
+                // 160pt before the headings grew to 17pt serif: the card's title line is taller.
+                if m.mid_layout.is_none() || h < 160. + (theme::TITLE_LINE - 18.) {
                     continue;
                 }
                 checked += 1;

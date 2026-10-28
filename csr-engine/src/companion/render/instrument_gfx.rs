@@ -641,6 +641,18 @@ pub struct DashSegment {
     pub legend: Option<String>,
 }
 
+/// One ring of "CSR this session" as drawn.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DashRing {
+    /// The number inside the ring, and the words under it.
+    pub number: String,
+    pub label: String,
+    /// The fraction of the ring filled, when it means something; `None` is a full ring.
+    pub fill: Option<f32>,
+    pub center: (f32, f32),
+    pub radius: f32,
+}
+
 /// The Context card as the dashboard drew it: every line in words, and where the bars are.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Dash {
@@ -653,6 +665,9 @@ pub struct Dash {
     pub segments: Vec<DashSegment>,
     pub turn: Option<String>,
     pub csr_row: Option<String>,
+    pub csr_rings: Vec<DashRing>,
+    /// The API credit row, when the ledger keeps one.
+    pub credit_row: Option<String>,
     pub cache_row: Option<String>,
     /// Whether the fresh-tokens chart was drawn under the rows.
     pub chart: bool,
