@@ -377,16 +377,15 @@ fn m_folds_changes_a_shift_click_opened() {
     assert!(!pane.instrument_open.changes);
 }
 #[test]
-fn changes_is_an_in_place_panel_even_when_the_feed_is_empty() {
+fn changes_never_opens_an_empty_page_when_the_feed_is_empty() {
     let (_home, paths) = home();
     put_map(&paths, "sess-now", None);
     let mut pane = Pane::new(paths, &args(46, 30));
     pane.key("m");
     pane.frame(46, 30, NOW);
-    assert!(pane.instrument_open.changes);
-    assert_eq!(pane.view, "main");
-    pane.key("escape");
+    // No shifts, no page: the key does nothing the pane would have to explain.
     assert!(!pane.instrument_open.changes);
+    assert_eq!(pane.view, "main");
 }
 #[test]
 fn a_shift_click_opens_changes_and_a_second_closes_without_sending() {

@@ -1062,6 +1062,14 @@ impl Pane {
         } else {
             composition
         };
+        // A page with nothing to show is not opened: `l` needs a change, `t` a row of the
+        // monologue. A page that runs dry while open closes.
+        if composition.shifts.is_empty() {
+            self.instrument_open.changes = false;
+        }
+        if composition.river.is_empty() {
+            self.instrument_open.threads = false;
+        }
         let mut open = self.instrument_open;
         open.popup = None;
         self.popup_copy = None;
@@ -1150,15 +1158,6 @@ impl Pane {
         let mut hits: BTreeMap<usize, (ObsCard, usize)> = BTreeMap::new();
         for (card, should) in [(ObsCard::Confusing, false), (ObsCard::ShouldBe, true)] {
             let items = composition.items(card);
-            let fold = instrument::fold_row(card.title(), items.len());
-            if let Some(row) = semantic.iter().position(|l| *l == fold) {
-                for r in row..row + text::wrap(&fold, cols.max(1), 1000).len() {
-                    self.acts
-                        .insert(r, json!({"key": format!("observe:{}:0", card as usize)}));
-                    hits.insert(r, (card, 0));
-                }
-                continue;
-            }
             // The card's title opens its first item.
             let title = text::wrap(card.title(), cols.max(1), 1000);
             if let Some(row) = title
@@ -1316,10 +1315,17 @@ impl Pane {
                         self.acts
                             .insert(to_row(*y), json!({"key":"instrument:changes"}));
                     }
-                    for row in to_row(metrics.figure_region.0)
-                        ..=to_row(metrics.figure_region.0 + metrics.figure_region.1)
-                    {
-                        self.acts.insert(row, json!({"key":"instrument:figure"}));
+                    // A page has no figure card to tap.
+                    if metrics.figure_region.1 > 0. {
+                        for row in to_row(metrics.figure_region.0)
+                            ..=to_row(metrics.figure_region.0 + metrics.figure_region.1)
+                        {
+                            self.acts.insert(row, json!({"key":"instrument:figure"}));
+                        }
+                    }
+                    // A scroll never runs past the page's last row.
+                    if let Some(max) = metrics.page_scroll_max {
+                        self.instrument_open.scroll = self.instrument_open.scroll.min(max);
                     }
                     // Each quota circle is its own target, in the cells it covers.
                     let to_col = |x: f32| {
@@ -1514,9 +1520,21 @@ impl Pane {
         if !composition.dream.queue.is_empty() {
             keys.push(("d", "queue"));
         }
-        keys.extend([("l", "changes"), ("t", "threads"), ("i", "figure")]);
-        if !composition.confusing.is_empty() || !composition.should_be.is_empty() {
-            keys.push(("o", "details"));
+        if open.threads || open.changes {
+            // A full-pane page: its own key (or Esc) goes back, j/k scroll it.
+            keys.push((if open.threads { "t" } else { "l" }, "back"));
+            keys.push(("j/k", "scroll"));
+        } else {
+            if !composition.shifts.is_empty() {
+                keys.push(("l", "changes"));
+            }
+            if !composition.river.is_empty() {
+                keys.push(("t", "threads"));
+            }
+            keys.push(("i", "figure"));
+            if !composition.confusing.is_empty() || !composition.should_be.is_empty() {
+                keys.push(("o", "details"));
+            }
         }
         keys.extend([("b", "theme"), ("q", "close")]);
         if open.popup.is_some() {
@@ -1568,6 +1586,8 @@ impl Pane {
                 ("theme", "thm"),
                 ("queue", "q"),
                 ("fig", "fig"),
+                ("scroll", ""),
+                ("back", ""),
             ]
         } else {
             [
@@ -1577,6 +1597,8 @@ impl Pane {
                 ("fig", ""),
                 ("changes", "chg"),
                 ("threads", "thr"),
+                ("scroll", ""),
+                ("back", ""),
             ]
         };
         for (full, short) in shorten {
@@ -2128,6 +2150,9 @@ impl Pane {
             "i" => {
                 self.instrument_open.figure = !self.instrument_open.figure;
                 self.instrument_open.gauge = None;
+                // The figure is the dashboard's: it leaves a page.
+                self.instrument_open.changes = false;
+                self.instrument_open.threads = false;
                 self.view = "main".into();
                 return true;
             }
@@ -2140,6 +2165,8 @@ impl Pane {
                     return true;
                 };
                 let open = &mut self.instrument_open;
+                open.changes = false;
+                open.threads = false;
                 if open.figure && open.gauge == Some(gauge) {
                     open.figure = false;
                     open.gauge = None;
