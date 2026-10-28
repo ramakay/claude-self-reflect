@@ -416,15 +416,44 @@ pub fn spawn_refresh(home: PathBuf, from: String, now: f64) {
     }
 }
 
+/// The api-lanes ledger's spend by UTC day (`YYYY-MM-DD`): rows with no `runner` or `runner ==
+/// "claude"` only; Pi rows bill another provider.
+pub fn ledger_by_day(text: &str) -> BTreeMap<String, f64> {
+    let mut days = BTreeMap::new();
+    for line in text.lines() {
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if row["runner"].as_str().is_some_and(|r| r != "claude") {
+            continue;
+        }
+        let (Some(ts), Some(cost)) = (row["ts"].as_f64(), row["cost"].as_f64()) else {
+            continue;
+        };
+        *days
+            .entry(day_of(ts).format("%Y-%m-%d").to_string())
+            .or_insert(0.) += cost;
+    }
+    days
+}
+
 /// Put the cache's real spend into `credit`: `left` is `amount` less the spend since `since`
 /// (UTC days), `week` the last seven UTC days; and say the key's state. With no cache yet the
 /// credit stays the ledger's.
-pub fn apply(credit: &mut Credit, c: Option<&Cache>, amount: f64, since: NaiveDate, now: f64) {
+pub fn apply(
+    credit: &mut Credit,
+    c: Option<&Cache>,
+    amount: f64,
+    since: NaiveDate,
+    now: f64,
+    ledger: &BTreeMap<String, f64>,
+) {
     let Some(c) = c else {
         return;
     };
     credit.dup = c.dup;
     credit.stale = None;
+    credit.ledger_added.clear();
     credit.key = match &c.state {
         State::Missing => KeyNote::Missing,
         State::Rejected(tag) => KeyNote::Rejected(tag.clone()),
@@ -444,8 +473,31 @@ pub fn apply(credit: &mut Credit, c: Option<&Cache>, amount: f64, since: NaiveDa
                     .map(|d| d.1)
                     .sum()
             };
-            credit.left = amount - sum(&since_s);
-            credit.week = sum(&week_s);
+            // The API publishes a day late: for each UTC day from `since` to today it did not
+            // return, the ledger's Claude spend stands in. A day it did return is the API's alone.
+            let today = day_of(now).format("%Y-%m-%d").to_string();
+            let (mut left, mut week) = (sum(&since_s), sum(&week_s));
+            credit.ledger_added.clear();
+            for (day, cost) in ledger.range::<str, _>((
+                std::ops::Bound::Included(since_s.as_str()),
+                std::ops::Bound::Included(today.as_str()),
+            )) {
+                if c.days.contains_key(day) || *cost <= 0. {
+                    continue;
+                }
+                left += cost;
+                if day.as_str() >= week_s.as_str() {
+                    week += cost;
+                }
+                let label = if *day == today {
+                    "today".to_owned()
+                } else {
+                    format!("on {}", day.get(5..).unwrap_or(day))
+                };
+                credit.ledger_added.push((label, *cost));
+            }
+            credit.left = amount - left;
+            credit.week = week;
             credit.stale = c.stale.then(|| (now - c.fetched_at).max(0.));
             KeyNote::Connected
         }
@@ -470,6 +522,9 @@ mod tests {
     }
     fn now() -> f64 {
         at(2026, 10, 28, 10)
+    }
+    fn none() -> BTreeMap<String, f64> {
+        BTreeMap::new()
     }
     fn dump(accts: &[&str]) -> String {
         let mut out = String::from("keychain: \"/Users/x/Library/Keychains/login.keychain-db\"\nversion: 512\nclass: \"inet\"\nattributes:\n    \"acct\"<blob>=\"other\"\n    \"svce\"<blob>=<NULL>\n");
@@ -809,6 +864,7 @@ mod tests {
                 243.56,
                 since,
                 n,
+                &none(),
             );
             let row = credit.row();
             assert!(!row.contains("sk-ant-") && !row.contains("SECRET"), "{row}");
@@ -857,7 +913,14 @@ mod tests {
             ("2026-10-23", 7.),
             ("2026-10-28", 11.8),
         ]);
-        apply(&mut credit, Some(&c), 243.56, d(2026, 10, 27), now());
+        apply(
+            &mut credit,
+            Some(&c),
+            243.56,
+            d(2026, 10, 27),
+            now(),
+            &none(),
+        );
         assert_eq!(credit.key, KeyNote::Connected);
         assert!((credit.left - 231.76).abs() < 1e-9, "{}", credit.left);
         // Seven UTC days ending today: 10-22 .. 10-28.
@@ -873,7 +936,7 @@ mod tests {
         let c = cache_of(&[("2026-10-28", 11.8)]);
         for since in [d(2026, 10, 27), d(2026, 10, 28)] {
             let mut credit = Credit::default();
-            apply(&mut credit, Some(&c), 243.56, since, now());
+            apply(&mut credit, Some(&c), 243.56, since, now(), &none());
             assert!(
                 (credit.left - 231.76).abs() < 1e-9,
                 "{since} {}",
@@ -887,6 +950,7 @@ mod tests {
             243.56,
             d(2026, 10, 29),
             now() + 86400.,
+            &none(),
         );
         assert_eq!(credit.left, 243.56);
     }
@@ -920,7 +984,7 @@ mod tests {
                 left: 1.,
                 ..Default::default()
             };
-            apply(&mut credit, Some(&c), 243.56, d(2026, 10, 27), n);
+            apply(&mut credit, Some(&c), 243.56, d(2026, 10, 27), n, &none());
             credit.row()
         };
         assert_eq!(
@@ -958,7 +1022,7 @@ mod tests {
             ..Default::default()
         };
         let before = credit.clone();
-        apply(&mut credit, None, 200., d(2026, 10, 1), now());
+        apply(&mut credit, None, 200., d(2026, 10, 1), now(), &none());
         assert_eq!(credit, before);
         assert!(credit.row().starts_with("API credit $29.23 left by ledger"));
     }
@@ -971,8 +1035,139 @@ mod tests {
             left: 5.,
             ..Default::default()
         };
-        apply(&mut credit, Some(&c), 243.56, d(2026, 10, 16), now());
+        apply(
+            &mut credit,
+            Some(&c),
+            243.56,
+            d(2026, 10, 16),
+            now(),
+            &none(),
+        );
         assert_eq!(credit.key, KeyNote::Offline);
         assert_eq!(credit.left, 5.);
+    }
+
+    fn row_of(ts: f64, runner: Option<&str>, cost: f64) -> String {
+        let mut v = serde_json::json!({"ts": ts, "run": "x", "cost": cost});
+        if let Some(r) = runner {
+            v["runner"] = r.into();
+        }
+        v.to_string()
+    }
+    fn ledger_of(rows: &[String]) -> BTreeMap<String, f64> {
+        ledger_by_day(&rows.join("\n"))
+    }
+    fn credit_with(c: &Cache, since: NaiveDate, n: f64, rows: &[String]) -> Credit {
+        let mut credit = Credit::default();
+        apply(&mut credit, Some(c), 243.56, since, n, &ledger_of(rows));
+        credit
+    }
+
+    #[test]
+    fn a_day_the_api_has_not_returned_is_counted_from_the_ledger_and_the_row_says_so() {
+        // 03:20Z on 10-28: the API has only 10-27 ($0.00); the ledger has $14.40 on 10-28 UTC.
+        let n = at(2026, 10, 28, 3) + 1200.;
+        let c = cache_of(&[("2026-10-27", 0.)]);
+        let rows = [
+            row_of(at(2026, 10, 28, 2), None, 14.4),
+            row_of(at(2026, 10, 27, 20), Some("claude"), 0.),
+        ];
+        let credit = credit_with(&c, d(2026, 10, 27), n, &rows);
+        assert!((credit.left - 229.16).abs() < 1e-9, "{}", credit.left);
+        assert!((credit.week - 14.4).abs() < 1e-9, "{}", credit.week);
+        assert_eq!(
+            credit.row(),
+            "API credit $229.16 left \u{b7} real Anthropic spend (admin key) + $14.40 today by ledger \u{b7} about 111 days at this week's pace ($2.06/day)"
+        );
+    }
+
+    #[test]
+    fn an_earlier_day_the_api_lacks_is_named_and_counted_too() {
+        let n = at(2026, 10, 28, 3);
+        let c = cache_of(&[("2026-10-26", 1.)]);
+        let rows = [
+            row_of(at(2026, 10, 27, 12), None, 3.),
+            row_of(at(2026, 10, 28, 1), None, 2.),
+            // Before `since`, and after today: never counted.
+            row_of(at(2026, 10, 20, 12), None, 50.),
+            row_of(at(2026, 10, 29, 12), None, 60.),
+        ];
+        let credit = credit_with(&c, d(2026, 10, 26), n, &rows);
+        assert!(
+            (credit.left - (243.56 - 6.)).abs() < 1e-9,
+            "{}",
+            credit.left
+        );
+        assert!(credit
+            .row()
+            .contains("real Anthropic spend (admin key) + $3.00 on 10-27 + $2.00 today by ledger"));
+    }
+
+    #[test]
+    fn a_day_the_api_returned_does_not_get_the_ledger_figure_added_again() {
+        let n = now();
+        let rows = [row_of(at(2026, 10, 28, 1), None, 14.4)];
+        for api in [11.8, 0.] {
+            let c = cache_of(&[("2026-10-28", api)]);
+            let credit = credit_with(&c, d(2026, 10, 27), n, &rows);
+            assert!(
+                (credit.left - (243.56 - api)).abs() < 1e-9,
+                "{}",
+                credit.left
+            );
+            assert!(credit.ledger_added.is_empty());
+            assert!(!credit.row().contains("by ledger"), "{}", credit.row());
+        }
+    }
+
+    #[test]
+    fn pi_rows_bill_another_provider_and_are_not_counted() {
+        let rows = [
+            row_of(at(2026, 10, 28, 2), Some("pi"), 9.),
+            row_of(at(2026, 10, 28, 2), Some("claude"), 1.5),
+            row_of(at(2026, 10, 28, 3), None, 2.5),
+            "not json".to_owned(),
+        ];
+        let by_day = ledger_of(&rows);
+        assert_eq!(by_day.len(), 1);
+        assert!((by_day["2026-10-28"] - 4.).abs() < 1e-9);
+        let c = cache_of(&[("2026-10-27", 0.)]);
+        let credit = credit_with(&c, d(2026, 10, 27), now(), &rows);
+        assert!(
+            (credit.left - (243.56 - 4.)).abs() < 1e-9,
+            "{}",
+            credit.left
+        );
+        assert!(credit.row().contains("+ $4.00 today by ledger"));
+    }
+
+    #[test]
+    fn a_run_at_0108z_is_a_utc_midnight_case_the_ledger_puts_on_the_new_utc_day() {
+        // 18:08 PDT on 10-27 is 01:08Z on 10-28. The API has not published 10-28 yet, and a
+        // row a minute before midnight UTC still belongs to 10-27, which it has.
+        let n = at(2026, 10, 28, 1) + 25. * 60.;
+        let c = cache_of(&[("2026-10-27", 5.)]);
+        let rows = [
+            row_of(at(2026, 10, 28, 1) + 8. * 60., None, 11.8),
+            row_of(at(2026, 10, 28, 0) - 1., None, 7.),
+        ];
+        assert_eq!(
+            ledger_of(&rows).keys().collect::<Vec<_>>(),
+            ["2026-10-27", "2026-10-28"]
+        );
+        for since in [d(2026, 10, 27), d(2026, 10, 28)] {
+            let credit = credit_with(&c, since, n, &rows);
+            let spent = if since == d(2026, 10, 27) {
+                5. + 11.8
+            } else {
+                11.8
+            };
+            assert!(
+                (credit.left - (243.56 - spent)).abs() < 1e-9,
+                "{since} {}",
+                credit.left
+            );
+            assert!(credit.row().contains("+ $11.80 today by ledger"));
+        }
     }
 }

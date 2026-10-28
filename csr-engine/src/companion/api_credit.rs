@@ -40,6 +40,9 @@ pub struct Credit {
     /// Seconds since the real-spend figures were fetched, when the last fetch failed.
     #[serde(default)]
     pub stale: Option<f64>,
+    /// Ledger spend counted for UTC days the cost API has not returned yet: (label, dollars), "today" or "on MM-DD".
+    #[serde(default)]
+    pub ledger_added: Vec<(String, f64)>,
 }
 
 /// The folder the runner keeps its files in: `$API_LANES_HOME`, else `~/.agents/api-lanes`.
@@ -173,7 +176,9 @@ pub fn read_live(dir: &Path, home: &Path, now: f64) -> Option<Credit> {
     if !cache.as_ref().is_some_and(|c| ac::fresh(c, &from, now)) {
         ac::spawn_refresh(home.to_owned(), from, now);
     }
-    ac::apply(&mut credit, cache.as_ref(), amount, since, now);
+    let ledger =
+        ac::ledger_by_day(&std::fs::read_to_string(dir.join("ledger.jsonl")).unwrap_or_default());
+    ac::apply(&mut credit, cache.as_ref(), amount, since, now, &ledger);
     Some(credit)
 }
 
@@ -202,7 +207,15 @@ impl Credit {
         let mut out = match &self.key {
             KeyNote::Unchecked => format!("API credit ${left:.2} left by ledger"),
             KeyNote::Connected => {
-                format!("API credit ${left:.2} left \u{b7} real Anthropic spend (admin key)")
+                let mut t =
+                    format!("API credit ${left:.2} left \u{b7} real Anthropic spend (admin key)");
+                for (label, cost) in &self.ledger_added {
+                    t.push_str(&format!(" + ${cost:.2} {label}"));
+                }
+                if !self.ledger_added.is_empty() {
+                    t.push_str(" by ledger");
+                }
+                t
             }
             _ => format!("API credit ${left:.2} left (ledger estimate)"),
         };

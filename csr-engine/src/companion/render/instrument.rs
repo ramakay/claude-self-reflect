@@ -6999,12 +6999,17 @@ mod tests {
             ("individual", KeyNote::Individual, false, None),
             ("offline", KeyNote::Offline, false, None),
             ("stale", KeyNote::Connected, true, Some(7200.)),
+            // A connected row with two days the API lacks, counted from the ledger.
+            ("ledger", KeyNote::Connected, false, None),
         ];
         let png = std::env::var_os("CSR_KEY_PNG");
         for (name, key, dup, stale) in notes {
             let mut c = dash_composition("ok");
             let mut credit = credit_of(231.76, 11.8, 1, 5.);
             (credit.key, credit.dup, credit.stale) = (key, dup, stale);
+            if name == "ledger" {
+                credit.ledger_added = vec![("on 10-27".into(), 3.), ("today".into(), 14.4)];
+            }
             let row = credit.row();
             c.credit = Some(credit);
             // Every size in the dark theme, and the narrowest in the light one.
