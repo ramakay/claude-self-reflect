@@ -6981,6 +6981,7 @@ mod tests {
             active,
             running_caps: caps,
             week,
+            ..Default::default()
         }
     }
     fn dash_of(c: &Composition, size: (u32, u32), theme: Theme, open: Open) -> (Dash, Metrics) {
