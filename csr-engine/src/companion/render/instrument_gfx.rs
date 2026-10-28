@@ -583,6 +583,9 @@ pub struct QuotaGauge {
     pub radius: f32,
     /// Fractions: end of other usage, start of CSR, end of CSR.
     pub csr_segment: Option<(f32, f32, f32)>,
+    /// The circle's own tap target in layout pt: left, top, right, bottom. Absent for a card that
+    /// is not a circle.
+    pub tap: Option<(f32, f32, f32, f32)>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -598,11 +601,63 @@ pub struct Canvas {
     /// Final output pixels per logical point (before supersampling/downsampling).
     pub output_scale: f32,
     pub quota_gauges: Vec<QuotaGauge>,
+    /// Baseline of the line of notes drawn under the quota circles, in layout pt.
+    pub note_rows: Vec<f32>,
+    /// Left, top, width and height of each context breakdown bar drawn, in layout pt.
+    pub breakdown_bars: Vec<(f32, f32, f32, f32)>,
+    /// What the Context card's dashboard drew, when it is the layout.
+    pub dash: Option<Dash>,
+    /// Top and bottom of each "N by CSR" caption drawn, in layout pt.
+    pub by_csr: Vec<(f32, f32)>,
     pub fresh_plots: Vec<FreshPlot>,
     /// Every row drawn with a trailing "…": where it sits and its words in full.
     pub cuts: Vec<Cut>,
     /// What the next cut rows are called in their popup. Empty: do not record them.
     pub cut_title: &'static str,
+}
+
+/// One limit bar of the dashboard: a window used so far, with a tick where it is headed.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DashLimit {
+    pub code: String,
+    pub name: String,
+    /// Left, top, width and height of the bar in layout pt.
+    pub bar: (f32, f32, f32, f32),
+    /// Fraction of the bar filled, and the fraction the forecast tick sits at, when there is one.
+    pub fill: f32,
+    pub tick: Option<f32>,
+    pub line: String,
+}
+
+/// One drawn part of the context bar and the legend row that names it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DashSegment {
+    pub name: String,
+    pub tokens: f64,
+    /// Left and width of the part on the bar, in layout pt.
+    pub x: f32,
+    pub w: f32,
+    /// The legend row's words: the name, then the size.
+    pub legend: Option<String>,
+}
+
+/// The Context card as the dashboard drew it: every line in words, and where the bars are.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct Dash {
+    /// Whether the rows have the room of the full layout (a list) or the compact one (a grid).
+    pub full: bool,
+    pub headline: Option<(String, String)>,
+    pub limits: Vec<DashLimit>,
+    pub context_head: Option<String>,
+    pub context_bar: Option<(f32, f32, f32, f32)>,
+    pub segments: Vec<DashSegment>,
+    pub turn: Option<String>,
+    pub csr_row: Option<String>,
+    pub cache_row: Option<String>,
+    /// Whether the fresh-tokens chart was drawn under the rows.
+    pub chart: bool,
+    /// How many times the word "est." is on the card.
+    pub est_marks: usize,
 }
 
 /// One row the picture drew shortened, so a click on it can show the whole text.
@@ -871,6 +926,10 @@ impl Canvas {
             dry: false,
             output_scale: S,
             quota_gauges: Vec::new(),
+            note_rows: Vec::new(),
+            breakdown_bars: Vec::new(),
+            dash: None,
+            by_csr: Vec::new(),
             fresh_plots: Vec::new(),
             cuts: Vec::new(),
             cut_title: "In full",
@@ -882,6 +941,10 @@ impl Canvas {
             dry: true,
             output_scale: S,
             quota_gauges: Vec::new(),
+            note_rows: Vec::new(),
+            breakdown_bars: Vec::new(),
+            dash: None,
+            by_csr: Vec::new(),
             fresh_plots: Vec::new(),
             cuts: Vec::new(),
             cut_title: "In full",
@@ -1278,6 +1341,10 @@ pub fn contact(f: &Fonts, tiles: &[(String, Pixmap, String)], path: &str, bg: Rg
         dry: false,
         output_scale: S,
         quota_gauges: Vec::new(),
+        note_rows: Vec::new(),
+        breakdown_bars: Vec::new(),
+        dash: None,
+        by_csr: Vec::new(),
         fresh_plots: Vec::new(),
         cuts: Vec::new(),
         cut_title: "",

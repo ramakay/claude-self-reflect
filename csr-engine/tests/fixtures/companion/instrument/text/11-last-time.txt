@@ -1,4 +1,3 @@
-
 ☾ The dreamer looks as you work.
 dreamer 0 of 40k
 It asks a what-if from your past sessions.
@@ -62,6 +61,7 @@ What did we decide about this repo? Find a decision and its source session.
 What was unfinished last time? Recover the next steps from earlier work.
 Why did we change this file? Follow the conversation behind the code.
 Where did we fix this bug before? Find earlier attempts and the final fix.
-7D 52%» · CSR 0 pts · 5H 3% · Codex 7D 41%
+7D 52%» · out ~Wed 06:40 · CSR 0 pts · 5H 3% · → ~10% at reset
+Codex 7D 41%
 $0 this week
  l changes  t threads  i figure  b theme  q close

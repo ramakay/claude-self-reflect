@@ -902,6 +902,29 @@
       "tall": true
     },
     {
+      "name": "frame-main-100x70-gauge-7d",
+      "cols": 100,
+      "rows": 70,
+      "sid": "sess-now",
+      "pixels": false,
+      "phone": false,
+      "zoomed": false,
+      "steps": [
+        {
+          "at": 1792320000.0,
+          "do": [
+            {
+              "key": "gauge:7D"
+            }
+          ]
+        }
+      ],
+      "answered": null,
+      "note": "",
+      "regions": [],
+      "tall": true
+    },
+    {
       "name": "frame-main-100x70-open-agent",
       "cols": 100,
       "rows": 70,

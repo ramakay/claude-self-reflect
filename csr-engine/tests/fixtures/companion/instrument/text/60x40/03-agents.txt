@@ -9,7 +9,6 @@
 
 
 
-
 ☾ What if one of Fable's three prototypes made the what-if
 question the star of the pane, as you wanted on 10-09?
 0.82 · pane redesign · ⌗6ca2a4d5 10-09 · +2 more
@@ -30,8 +29,9 @@ CTX 192k/1M
 +6k/turn
 ♻ >15 prompts
 1 by CSR
-7D 52%» · CSR 1.2 pts
-5H 2%
+this turn +3k · you 1.6k · Claude 1.4k (est.)
+7D 52%» · out ~Wed 06:40 · CSR 1.2 pts
+5H 2% · → ~7% at reset
 ◷ 59m
 Codex 7D 41%
 5¢ this week

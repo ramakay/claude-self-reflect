@@ -6,9 +6,9 @@
 [48;2;18;20;23m[38;2;242;244;246mMonologue · the session thinking out loud                                                           [0m
 [48;2;18;20;23m[38;2;242;244;246m1 min ago · ☾ wondered · What if a frame failed while the agent was busy?                           [0m
 [48;2;18;20;23m[38;2;242;244;246m2 min ago · ↳ asked · Confirm the retry limit with you, awaiting your approval. · handed            [0m
-[48;2;18;20;23m[38;2;242;244;246m2 min ago · ↳ asked · Install the queue dashboard after the retry limit is set. · open              [0m
-[48;2;18;20;23m[38;2;242;244;246m2 min ago · ↳ asked · Fix the flaky export test before merging. · open                              [0m
-[48;2;18;20;23m[38;2;242;244;246m2 min ago · ↳ asked · Run the export job once against the staging queue. · open                     [0m
+[48;2;18;20;23m[38;2;242;244;246m2 min ago · ↳ left open · Install the queue dashboard after the retry limit is set. · open          [0m
+[48;2;18;20;23m[38;2;242;244;246m2 min ago · ↳ left open · Fix the flaky export test before merging. · open                          [0m
+[48;2;18;20;23m[38;2;242;244;246m2 min ago · ↳ left open · Run the export job once against the staging queue. · open                 [0m
 [48;2;18;20;23m[38;2;242;244;246m2 min ago · ♻ made room · Compacted                                                                 [0m
 [48;2;18;20;23m[38;2;242;244;246m5 min ago · ✓ heard back · Review the reader finished                                               [0m
 [48;2;18;20;23m[38;2;242;244;246m6 min ago · ✓ heard back · Compare two queue clients finished                                       [0m
@@ -23,7 +23,7 @@
 [48;2;18;20;23m[38;2;242;244;246m20 min ago · ○ delegated · Check retry limits started                                               [0m
 [48;2;18;20;23m[38;2;242;244;246m22 min ago · ○ delegated · Summarize the logs started                                               [0m
 [48;2;18;20;23m[38;2;242;244;246m25 min ago · ○ delegated · Port the export test started                                             [0m
-[48;2;18;20;23m[38;2;242;244;246m29 min ago · ↳ asked · Update the nightly schedule once the queue is ready. · handed                [0m
+[48;2;18;20;23m[38;2;242;244;246m29 min ago · ↳ noted · Update the nightly schedule once the queue is ready. · handed                [0m
 [48;2;18;20;23m[38;2;242;244;246m29 min ago · ↳ asked · Publish the exporter release notes, waiting for your approval. · answered    [0m
 [48;2;18;20;23m[38;2;242;244;246m30 min ago · ♻ made room · Compacted                                                                [0m
 [48;2;18;20;23m[38;2;242;244;246m30 min ago · ○ delegated · Review the reader started                                                [0m
@@ -31,10 +31,10 @@
 [48;2;18;20;23m[38;2;242;244;246m09:30 · ↳ asked · Cut off before Claude finished answering: “wait, hold that” · carried             [0m
 [48;2;18;20;23m[38;2;242;244;246m09:20 · ☾ wondered · What if the queue kept every job? · not relevant                               [0m
 [48;2;18;20;23m[38;2;242;244;246m08:50 · ↳ asked · Verify the worker restarts after a crash, awaiting your approval. · carried       [0m
-[48;2;18;20;23m[38;2;242;244;246m08:50 · ↳ asked · Install the queue metrics exporter. · carried                                     [0m
-[48;2;18;20;23m[38;2;242;244;246m07:58 · ~ landed · reader.rs · The reader streams chunks.                                           [0m
+[48;2;18;20;23m[38;2;242;244;246m08:50 · ↳ noted · Install the queue metrics exporter. · carried                                     [0m
 [48;2;18;20;23m[38;2;242;244;246mCTX 78k/1M · 2 by CSR                                                                               [0m
-[48;2;18;20;23m[38;2;242;244;246m[38;2;184;193;203m7D[38;2;242;244;246m 62%» · [38;2;255;151;209mCSR 4.7 pts[38;2;242;244;246m · 5H 41% · ◷ 4m · Codex [38;2;184;193;203m7D[38;2;242;244;246m 41% · ● CSR: daemon down                           [0m
+[48;2;18;20;23m[38;2;242;244;246m[38;2;184;193;203m7D[38;2;242;244;246m 62%» · out ~Tue 07:49 · [38;2;255;151;209mCSR 4.7 pts[38;2;242;244;246m · 5H 41% · → ~77% at reset · ◷ 4m · Codex [38;2;184;193;203m7D[38;2;242;244;246m 41%             [0m
+[48;2;18;20;23m[38;2;242;244;246m● CSR: daemon down                                                                                  [0m
 [48;2;18;20;23m[38;2;242;244;246m27¢ this week                                                                                       [0m
 [48;2;18;20;23m[38;2;242;244;246m3 in flight · 1 stalled                                                                             [0m
 [48;2;18;20;23m[38;2;184;193;203m l changes  t threads  i figure  b theme  q close                                                   [0m

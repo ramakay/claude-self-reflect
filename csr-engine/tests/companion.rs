@@ -976,7 +976,23 @@ mod lease_process_tests {
     use std::process::{Child, Stdio};
     use std::time::{Duration, Instant};
 
+    /// Run the engine once and wait for it to exit, so the timed phases below measure the lease
+    /// and not the first run of a freshly built binary: macOS scans a new file the first time it
+    /// runs, which cost 1.5 to 4.9 s on the dev laptop against these tests' 5 s waits.
+    fn warm() {
+        static WARM: std::sync::Once = std::sync::Once::new();
+        WARM.call_once(|| {
+            let status = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+                .arg("--version")
+                .stdout(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        });
+    }
+
     fn start(folder: &std::path::Path, root: &str, pause: &str) -> Child {
+        warm();
         Command::new(env!("CARGO_BIN_EXE_csr-engine"))
             .env("HOME", folder)
             .env("CSR_LEASE_PAUSE_MS", pause)

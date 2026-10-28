@@ -3,7 +3,6 @@
 
 
 
-
 ☾ What if one of Fable's three prototypes
 made the what-if question the star of the
 pane, as you wanted on 10-09?
@@ -25,6 +24,7 @@ Text parity is ready for review.
 ! render/instrument.rs · draw unverified
 CTX 192k/1M · +6k/turn · ♻ >15 prompts
 1 by CSR
-5H 2% · CSR cost: $1.20 this week · 37 calls
-◷ 59m · Codex 7D 41%
+5H 2% · → ~7% at reset
+CSR cost: $1.20 this week · 37 calls · ◷ 59m
+Codex 7D 41%
  d l changes t threads i fig b thm q close

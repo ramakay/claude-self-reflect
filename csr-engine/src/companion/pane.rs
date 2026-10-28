@@ -245,6 +245,9 @@ pub struct Pane {
     pub pixels: bool,
     /// Pixel mode draws cards and the pill instead of the dark ramp's text; set by `enable_cards`.
     pub cards: bool,
+    /// Draw the Context card as the older rings and circles, not the dashboard. Set from
+    /// `CSR_PANE_RINGS=1`.
+    pub rings: bool,
     /// The pill the last frame drew in place of the masthead, for tests and the PNG export.
     pub pill: Option<super::render::cards::Pill>,
     pub placed: Vec<super::render::kitty::Placement>,
@@ -369,6 +372,7 @@ impl Pane {
             hold: None,
             pixels,
             cards: false,
+            rings: std::env::var("CSR_PANE_RINGS").is_ok_and(|v| v == "1"),
             pill: None,
             placed: vec![],
             picture_cache,
@@ -577,6 +581,22 @@ impl Pane {
         let records = &self.dreams.records;
         let root = self.root.to_string_lossy().into_owned();
         let kept = masthead::kept_status(&self.paths, &self.sid, now);
+        let limits = masthead::account_limits(&self.paths, now);
+        // The windows the masthead shows: this session's own figures, else the account's.
+        let rates = if kept["fields"]["rate_limits"]
+            .as_object()
+            .is_some_and(|v| !v.is_empty())
+        {
+            &kept["fields"]["rate_limits"]
+        } else {
+            &limits
+        };
+        if self.persist {
+            if let Some(at) = kept["at"].as_f64() {
+                super::forecast::record(&self.paths.keep, at, &kept["fields"]["rate_limits"]);
+            }
+        }
+        let forecast = super::forecast::outlook(&self.paths.keep, rates, (now / 60.).floor() * 60.);
         let story = self
             .db
             .as_ref()
@@ -600,7 +620,9 @@ impl Pane {
             "story": story,
             "claude_fields": kept["fields"],
             "claude_at": kept["at"],
-            "limits": masthead::account_limits(&self.paths, now),
+            "limits": limits,
+            "forecast": forecast,
+            "rings": self.rings,
             "sts": masthead::csr_status_at(&self.paths, now),
             "compacting": masthead::compacting_info(
                 &self.paths,
@@ -1149,7 +1171,7 @@ impl Pane {
         }
         // An open figure lists its facts a row each; every row of the list is the figure's.
         if open.figure {
-            let rows_of = instrument::figure_text_rows(composition, cols, true);
+            let rows_of = instrument::figure_text_rows(composition, cols, true, open.gauge);
             if let Some(row) = rows_of
                 .first()
                 .and_then(|first| semantic.iter().position(|l| l == first))
@@ -1265,6 +1287,33 @@ impl Pane {
                         ..=to_row(metrics.figure_region.0 + metrics.figure_region.1)
                     {
                         self.acts.insert(row, json!({"key":"instrument:figure"}));
+                    }
+                    // Each quota circle is its own target, in the cells it covers.
+                    let to_col = |x: f32| {
+                        (metrics.content_left
+                            + x / instrument::LAYOUT_WIDTH * metrics.content_width)
+                            * cols as f32
+                    };
+                    let mut taps: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
+                    for gauge in &metrics.quota_gauges {
+                        let Some((x0, y0, x1, y1)) = gauge.tap else {
+                            continue;
+                        };
+                        let span = json!([
+                            to_col(x0).ceil().max(0.) as usize,
+                            (to_col(x1).floor().max(0.) as usize).min(cols),
+                            gauge.code
+                        ]);
+                        for row in to_row(y0)..=to_row(y1) {
+                            taps.entry(row).or_default().push(span.clone());
+                        }
+                    }
+                    for (row, spans) in taps {
+                        if let Some(act) = self.acts.get_mut(&row) {
+                            if act["key"] == "instrument:figure" {
+                                act["gauges"] = json!(spans);
+                            }
+                        }
                     }
                     // Every row drawn with a trailing "…" opens its words in full.
                     more.clear();
@@ -2045,6 +2094,26 @@ impl Pane {
             }
             "i" => {
                 self.instrument_open.figure = !self.instrument_open.figure;
+                self.instrument_open.gauge = None;
+                self.view = "main".into();
+                return true;
+            }
+            // A tap on one quota circle: the `i` page cut to that circle. Tapping the circle
+            // that is open closes the page, as `i` does.
+            _ if key.starts_with("gauge:") => {
+                let Some(gauge) =
+                    super::render::instrument::Gauge::from_code(&key["gauge:".len()..])
+                else {
+                    return true;
+                };
+                let open = &mut self.instrument_open;
+                if open.figure && open.gauge == Some(gauge) {
+                    open.figure = false;
+                    open.gauge = None;
+                } else {
+                    open.figure = true;
+                    open.gauge = Some(gauge);
+                }
                 self.view = "main".into();
                 return true;
             }
@@ -2327,6 +2396,15 @@ impl Pane {
         if let Some(key) = string(&act["key"]).strip_prefix("instrument:") {
             if key == "dreams-on" {
                 return self.press_dreams_offer();
+            }
+            // The cell under the tap decides which circle of the figure it is on.
+            if key == "figure" {
+                if let Some(span) = array(&act["gauges"])
+                    .iter()
+                    .find(|s| num(&s[0]) <= col as f64 && (col as f64) < num(&s[1]))
+                {
+                    return self.key(&format!("gauge:{}", string(&span[2])));
+                }
             }
             return self.key(match key {
                 "dreams" => "d",

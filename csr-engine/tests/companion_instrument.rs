@@ -1402,6 +1402,7 @@ fn collapsed_context_hugs_exact_group_with_bottom_clearance() {
         }
         let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
         pane.pixels = true;
+        pane.rings = true;
         pane.enable_cards();
         pane.frame(cols, rows, NOW);
         let metrics = pane.instrument_metrics.as_ref().unwrap();
@@ -1445,6 +1446,7 @@ fn mid_height_context_uses_side_ring_and_small_gauges() {
                 let (_home, paths) = state_home(state);
                 let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
                 pane.pixels = true;
+                pane.rings = true;
                 pane.enable_cards();
                 pane.theme = theme;
                 pane.frame(cols, rows, NOW);
@@ -1829,6 +1831,7 @@ fn gauge_centres_are_even_and_positive_csr_arcs_have_a_visible_separator() {
                 let (_home, paths) = state_home(state);
                 let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
                 pane.pixels = true;
+                pane.rings = true;
                 pane.enable_cards();
                 pane.theme = theme;
                 if state == "03-agents" {
@@ -1881,20 +1884,151 @@ fn gauge_centres_are_even_and_positive_csr_arcs_have_a_visible_separator() {
 }
 
 #[test]
+fn a_tap_on_each_quota_circle_opens_that_circles_page() {
+    use csr_engine::companion::render::instrument::{Gauge, LAYOUT_WIDTH};
+    // The row and the span of cells the circle `code` is a target in, on the frame as drawn now.
+    fn circle(pane: &Pane, code: &str) -> Option<(usize, (u64, u64))> {
+        pane.acts.iter().find_map(|(row, act)| {
+            act["gauges"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|s| s[2] == code)
+                .map(|s| (*row, (s[0].as_u64().unwrap(), s[1].as_u64().unwrap())))
+        })
+    }
+    for (cols, rows) in [(60, 40), (76, 67)] {
+        let (_home, paths) = state_home("02-running");
+        let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+        pane.pixels = true;
+        pane.rings = true;
+        pane.enable_cards();
+        pane.frame(cols, rows, NOW);
+        let m = pane.instrument_metrics.clone().unwrap();
+        let drawn: Vec<_> = m
+            .quota_gauges
+            .iter()
+            .filter(|g| g.tap.is_some())
+            .map(|g| (g.code.clone(), g.center.0))
+            .collect();
+        assert!(drawn.len() >= 3, "{cols}x{rows}: {drawn:?}");
+        let mut seen = vec![];
+        for (code, centre_x) in &drawn {
+            let gauge = Gauge::from_code(code).unwrap_or_else(|| panic!("{code}"));
+            let centre = (m.content_left + centre_x / LAYOUT_WIDTH * m.content_width) * cols as f32;
+            let (row, span) = circle(&pane, code)
+                .unwrap_or_else(|| panic!("{cols}x{rows}: no tap row for {code}"));
+            assert!(
+                span.0 as f32 <= centre && centre <= span.1 as f32,
+                "{code}: centre {centre} outside {span:?}"
+            );
+            let col = ((span.0 + span.1) / 2) as usize;
+            assert!(pane.click(row, col, NOW));
+            assert_eq!(pane.instrument_open.gauge, Some(gauge), "{code}");
+            assert!(pane.instrument_open.figure, "{code}");
+            let text = pane.frame(cols, rows, NOW).join("\n");
+            let png = pane
+                .placed
+                .first()
+                .map(|p| p.png.to_vec())
+                .unwrap_or_default();
+            seen.push((code.clone(), (text, png)));
+            // The same circle again closes its page. The page moved the rows: find it again.
+            let (row, span) = circle(&pane, code)
+                .unwrap_or_else(|| panic!("{cols}x{rows}: {code} not a target while open"));
+            assert!(pane.click(row, ((span.0 + span.1) / 2) as usize, NOW));
+            assert!(
+                !pane.instrument_open.figure && pane.instrument_open.gauge.is_none(),
+                "{code}"
+            );
+            pane.frame(cols, rows, NOW);
+        }
+        // Each circle's page differs from the others'.
+        for (i, (ca, a)) in seen.iter().enumerate() {
+            for (cb, b) in &seen[i + 1..] {
+                assert_ne!(a, b, "{cols}x{rows}: {ca} and {cb} opened the same page");
+            }
+        }
+        // A cell on the figure that is on no circle still opens the plain list.
+        let row = pane
+            .acts
+            .iter()
+            .find(|(_, a)| a["key"] == "instrument:figure" && a["gauges"].is_null())
+            .map(|(r, _)| *r)
+            .expect("a figure row outside the circles");
+        assert!(pane.click(row, 0, NOW));
+        assert!(pane.instrument_open.figure && pane.instrument_open.gauge.is_none());
+    }
+}
+
+#[test]
+fn the_outlook_speaks_from_the_first_reading_and_blends_in_a_finished_window() {
+    use csr_engine::companion::paths::epoch;
+    let resets = epoch("2026-10-18T14:08:00Z").unwrap();
+    let line = |at: f64, used: f64, resets: f64| {
+        format!("{{\"at\":{at},\"kind\":\"five_hour\",\"used\":{used},\"resets\":{resets}}}\n")
+    };
+    let frame = |paths: &Paths, cols: usize, rows: usize| {
+        let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", cols, rows));
+        pane.pixels = true;
+        pane.enable_cards();
+        pane.frame(cols, rows, NOW);
+        pane.instrument_metrics.clone().unwrap()
+    };
+    for (cols, rows) in [(76, 67), (44, 30)] {
+        let (_home, paths) = state_home("02-running");
+        // No history file at all: the dashboard still has its headline and a line for the window.
+        let m = frame(&paths, cols, rows);
+        let before = m.dash.expect("the dashboard");
+        assert!(before.headline.is_some(), "{cols}x{rows}");
+        let five = before.limits.iter().find(|l| l.code == "5H").expect("5H");
+        assert!(
+            five.line.contains("resets in"),
+            "{cols}x{rows}: {}",
+            five.line
+        );
+        assert!(!before.segments.is_empty(), "{cols}x{rows}: the bar");
+        // A finished window that peaked at 60% is in the history: it is blended in.
+        let history = paths.keep.join("usage-history.jsonl");
+        let past = resets - 18000.;
+        let body: String = (0..6)
+            .map(|i| line(past - 14400. + 2400. * i as f64, 10. + 10. * i as f64, past))
+            .collect();
+        fs::write(&history, &body).unwrap();
+        let after = frame(&paths, cols, rows).dash.expect("the dashboard");
+        let five_after = after.limits.iter().find(|l| l.code == "5H").unwrap();
+        assert_ne!(
+            five_after.tick, five.tick,
+            "{cols}x{rows}: the past window moves the forecast tick"
+        );
+        // The breakdown bar keeps its segments with a forecast, and every one has its legend.
+        assert_eq!(after.segments.len(), before.segments.len(), "{cols}x{rows}");
+        assert!(after.segments.iter().all(|s| s.legend.is_some()));
+    }
+}
+
+#[test]
 fn real_shaped_fresh_input_varies_and_flat_history_abstains() {
     for theme in [Theme::Dark, Theme::Light] {
         for expanded in [false, true] {
+            // The legend under the quota circles outranks the plot under the ring: the closed
+            // pane needs the taller 76x72 for both.
+            let rows = if expanded { 67 } else { 72 };
             let (_home, paths) = state_home("12-fresh");
-            let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+            let mut pane = Pane::new(paths, &args("main", "sess-now", 76, rows));
             pane.pixels = true;
             pane.enable_cards();
             pane.theme = theme;
             if expanded {
                 pane.key("i");
             }
-            pane.frame(76, 67, NOW);
+            pane.frame(76, rows, NOW);
             let plots = &pane.instrument_metrics.as_ref().unwrap().fresh_plots;
-            assert_eq!(plots.len(), 1);
+            // The dashboard draws its chart under the rows when `i` opens it, and not before.
+            assert_eq!(plots.len(), usize::from(expanded), "expanded={expanded}");
+            if !expanded {
+                continue;
+            }
             let p = &plots[0];
             assert_eq!(p.heights.len(), 24);
             let min = p.heights.iter().copied().fold(f32::INFINITY, f32::min);
@@ -1917,8 +2051,8 @@ fn real_shaped_fresh_input_varies_and_flat_history_abstains() {
             let m = pane.instrument_metrics.as_ref().unwrap();
             assert!(m.fresh_plots.is_empty());
             assert!(
-                m.ring_bounds.is_some(),
-                "flat expanded history returns its room to the ring"
+                m.dash.as_ref().is_some_and(|d| !d.chart),
+                "flat history draws no chart, and the dashboard keeps its room"
             );
         }
     }
@@ -2333,6 +2467,9 @@ fn l_t_and_i_each_change_the_picture_through_the_keys_the_footer_names() {
             assert_ne!(open, closed, "{cols}x{rows}: {key} changes the picture");
             let m = pane.instrument_metrics.as_ref().unwrap();
             match key {
+                "i" if m.dash.is_some() => {
+                    assert!(m.figure_detail_region.is_none(), "{cols}x{rows}")
+                }
                 "i" => assert!(m.figure_detail_region.is_some(), "{cols}x{rows}"),
                 _ => assert!(m.drill_region.is_some(), "{cols}x{rows}: {key} got a card"),
             }

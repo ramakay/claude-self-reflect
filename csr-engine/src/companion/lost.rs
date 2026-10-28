@@ -225,6 +225,12 @@ pub fn section_items(lines: &[String]) -> Vec<(String, Vec<String>)> {
         .map(|(h, n)| (plain(&h), n.iter().map(|s| plain(s)).collect()))
         .collect()
 }
+/// Claude Code's own closing paragraph of a compaction summary ("If you need specific details
+/// from before compaction ... read the full transcript at: ..."). It is not something owed.
+pub fn is_summary_footer(text: &str) -> bool {
+    text.to_lowercase()
+        .contains("specific details from before compaction")
+}
 pub fn summary_items(text: &str) -> Vec<(String, Vec<String>)> {
     let mut out = vec![];
     for name in ["Pending Tasks", "Optional Next Step"] {
@@ -241,7 +247,11 @@ pub fn summary_items(text: &str) -> Vec<(String, Vec<String>)> {
                 );
                 nested.drain(..nested.len().min(2));
             }
-            if !head.is_empty() && !BOOKKEEPING.is_match(&head) && OWED.is_match(&head) {
+            if !head.is_empty()
+                && !is_summary_footer(&head)
+                && !BOOKKEEPING.is_match(&head)
+                && OWED.is_match(&head)
+            {
                 out.push((head, nested));
             }
         }
@@ -691,4 +701,26 @@ pub fn carried_threads(paths: &Paths, prev: &Session) -> Vec<Thread> {
         out.push(tail);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_compaction_summary_footer_is_never_a_thread() {
+        let footer = "If you need specific details from before compaction (like exact code \
+                      snippets, error messages, or content you generated), read the full \
+                      transcript at: /tmp/a.jsonl";
+        assert!(is_summary_footer(footer));
+        assert!(!is_summary_footer("Still need to push the branch"));
+        let summary = format!(
+            "6. Pending Tasks:\n   - Still need to push the branch\n\n7. Optional Next Step:\n\n{footer}\n"
+        );
+        let heads: Vec<_> = summary_items(&summary)
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        assert_eq!(heads, vec!["Still need to push the branch".to_owned()]);
+    }
 }

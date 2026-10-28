@@ -102,8 +102,6 @@ pub fn line(s: &str) -> String {
         Some((Icon::Archive, s))
     } else if s.starts_with("refreshed ") {
         Some((Icon::Refresh, s))
-    } else if s.contains(" stalled ·") {
-        Some((Icon::TriangleAlert, s))
     } else if s.contains("/turn") && (s.starts_with('+') || s.starts_with('−')) {
         Some((Icon::Activity, s))
     } else {

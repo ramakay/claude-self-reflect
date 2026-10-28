@@ -94,6 +94,7 @@ pub struct Session {
     reading_waiting: bool,
     track_readings: bool,
     replies: BTreeMap<String, Value>,
+    tally: super::breakdown::Tally,
 }
 impl Session {
     pub fn new(sid: &str) -> Self {
@@ -106,6 +107,7 @@ impl Session {
             main_id: None,
             measuring: None,
             replies: BTreeMap::new(),
+            tally: super::breakdown::Tally::default(),
             file_order: vec![],
             readings: vec![],
             reading_waiting: false,
@@ -133,6 +135,7 @@ impl Session {
                 "turn_end": 0.,
                 "messages": 0,
                 "model": null,
+                "breakdown": null,
                 "told": null,
                 "last_session": null,
                 "todos": [],
@@ -226,6 +229,10 @@ impl Session {
             return;
         };
         let m = &e["message"];
+        if !side {
+            // What the context holds, row by row (see `breakdown`).
+            self.tally.row(&e);
+        }
         if kind == "assistant" {
             let context = [
                 "input_tokens",
@@ -264,6 +271,7 @@ impl Session {
                     self.push("main", json!([t, context]));
                 }
                 self.main_id = id.map(str::to_owned);
+                self.data["breakdown"] = self.tally.reply(context as f64);
                 if let Some(model) = m["model"]
                     .as_str()
                     .filter(|s| !s.is_empty() && !s.starts_with('<'))
@@ -371,6 +379,9 @@ impl Session {
                 .any(|text| !text.trim().is_empty() && !text.trim_start().starts_with(['<', '/']))
             {
                 self.push("prompts", json!(t));
+                if !side {
+                    self.tally.prompt();
+                }
                 if !side
                     && !text
                         .trim_start()
@@ -394,6 +405,7 @@ impl Session {
                 .unwrap_or_else(|| super::truthy(&a["prompt"]));
             if a["type"] == "queued_command" && super::truthy(&a["humanTurn"]) && typed {
                 self.push("prompts", json!(t));
+                self.tally.prompt();
             }
             if a["type"] == "hook_success"
                 && a["hookEvent"] == "SessionStart"
@@ -414,6 +426,8 @@ impl Session {
                 });
             }
         } else if kind == "system" && e["subtype"] == "compact_boundary" {
+            self.tally.compacted();
+            self.data["breakdown"] = Value::Null;
             self.push("compacts", json!(t));
             let meta = &e["compactMetadata"];
             self.push(
@@ -1009,6 +1023,75 @@ mod reader_regressions {
             "message":{"content":text}})
         .to_string()
             + "\n"
+    }
+    fn jsonl(rows: &[Value]) -> String {
+        rows.iter().map(|r| r.to_string() + "\n").collect()
+    }
+    fn at(sec: u32) -> String {
+        format!("2026-10-18T10:00:{sec:02}Z")
+    }
+    fn reply(id: &str, sec: u32, total: u64) -> Value {
+        json!({"type":"assistant","timestamp":at(sec),
+            "message":{"id":id,"model":"m","content":[{"type":"text","text":"ok"}],
+                "usage":{"input_tokens":1,"cache_read_input_tokens":total-1,"output_tokens":5}}})
+    }
+    #[test]
+    fn the_context_breakdown_follows_the_replies_and_ends_with_a_compaction() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let path = paths.projects.join("p/s.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let prompt = |sec| json!({"type":"user","timestamp":at(sec),"message":{"content":"go on"}});
+        let csr = json!({"type":"attachment","timestamp":at(3),"attachment":{"type":"hook_success",
+            "hookName":"UserPromptSubmit","command":"/usr/local/bin/csr-engine hook prompt-submit",
+            "content":"c".repeat(1100)}});
+        let result = json!({"type":"user","timestamp":at(4),"message":{"content":[
+            {"type":"tool_result","tool_use_id":"t","content":"r".repeat(6000)}]}});
+        let side = json!({"type":"user","isSidechain":true,"timestamp":at(5),"message":{"content":[
+            {"type":"tool_result","tool_use_id":"u","content":"s".repeat(90000)}]}});
+        std::fs::write(
+            &path,
+            jsonl(&[
+                prompt(1),
+                reply("a", 2, 30_000),
+                prompt(2),
+                csr,
+                result,
+                side,
+                reply("b", 6, 39_000),
+            ]),
+        )
+        .unwrap();
+        let mut session = Session::new("s");
+        let data = session.load(&paths, None).clone();
+        let b = &data["breakdown"];
+        assert_eq!(b["total"], json!(39_000.));
+        assert_eq!(b["turn"]["from"], json!(30_000.));
+        // Only the main thread counts: the side thread's 90k characters are nowhere.
+        assert_eq!(b["chars"]["tool"], json!(6000));
+        assert_eq!(b["chars"]["csr"], json!(1100));
+        assert_eq!(b["turn"]["chars"]["csr"], json!(1100));
+        assert!(b["floor"].as_f64().unwrap() > 20_000.);
+        // A compaction ends the old context; the next reply starts a new floor.
+        use std::io::Write;
+        let boundary = json!({"type":"system","subtype":"compact_boundary","timestamp":at(7),
+            "compactMetadata":{"preTokens":39000,"postTokens":5000,"durationMs":9}});
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(jsonl(&[boundary]).as_bytes())
+            .unwrap();
+        assert_eq!(session.load(&paths, None)["breakdown"], Value::Null);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(jsonl(&[reply("c", 8, 12_000)]).as_bytes())
+            .unwrap();
+        let data = session.load(&paths, None).clone();
+        assert_eq!(data["breakdown"]["total"], json!(12_000.));
+        assert_eq!(data["breakdown"]["turn"], Value::Null);
     }
     #[test]
     fn load_borrows_histories_and_partial_lines_cross_chunk_boundaries() {

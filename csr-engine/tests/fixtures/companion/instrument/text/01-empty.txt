@@ -45,7 +45,6 @@
 
 
 
-
 ☾ The dreamer looks as you work.
 dreamer 0 of 40k
 It asks a what-if from your past sessions.
@@ -62,6 +61,7 @@ preferences.
 Show the history of this function. Find prior edits and their context.
 What changed in the last session? Review the session's evidenced work.
 Which approach did we reject? Retrieve alternatives and their reasons.
-7D 52%» · CSR 0 pts · 5H 3% · Codex 7D 41%
+7D 52%» · out ~Wed 06:40 · CSR 0 pts · 5H 3% · → ~10% at reset
+Codex 7D 41%
 $0 this week
  l changes  t threads  i figure  b theme  q close

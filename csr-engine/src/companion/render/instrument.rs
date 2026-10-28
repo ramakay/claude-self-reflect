@@ -8,7 +8,7 @@ use super::{
     theme::{self, Theme, Tokens, ICON_GAP, S1, S2, S3, S4, S5},
 };
 use crate::companion::{
-    agents, array, dreams, masthead, num, pyfmt::short, string, value::InstrumentCost,
+    agents, array, dreams, masthead, num, pyfmt::short, string, truthy, value::InstrumentCost,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -58,6 +58,9 @@ pub struct RiverRow {
     /// The glyph the plain-text pane leads the row with. The picture draws the kind's icon instead.
     pub lead: &'static str,
     pub line: String,
+    /// The mood word. Fixed at build time: a thread's word depends on its state, which the kind
+    /// and lead do not carry.
+    pub mood: &'static str,
 }
 impl RiverRow {
     /// The picture's text: the kind's icon replaces the lead glyph, except a shift at risk.
@@ -74,7 +77,7 @@ impl RiverRow {
     }
     /// The row's past-tense mood word, from a fixed table.
     pub fn mood(&self) -> &'static str {
-        mood(self.kind, self.lead)
+        self.mood
     }
 }
 fn river_row(at: f64, kind: RiverKind, lead: &'static str, line: String) -> RiverRow {
@@ -84,6 +87,18 @@ fn river_row(at: f64, kind: RiverKind, lead: &'static str, line: String) -> Rive
         kind,
         lead,
         line,
+        mood: mood(kind, lead),
+    }
+}
+/// A thread row's mood. "asked" only when the thread waits on the user; open or lost threads are
+/// "left open"; everything else (faded, carried, answered, handed) is "noted".
+pub fn thread_mood(thread: &Value) -> &'static str {
+    if truthy(&thread["waiting"]) {
+        "asked"
+    } else if matches!(string(&thread["state"]), "open" | "lost") {
+        "left open"
+    } else {
+        "noted"
     }
 }
 /// The one word a timeline row says before its line. Fixed table, no model.
@@ -212,11 +227,39 @@ pub struct Composition {
     pub clocks: Clocks,
     pub now: f64,
 }
+/// The layout width in pt that the pictures' x positions are measured in.
+pub const LAYOUT_WIDTH: f32 = W;
+/// One of the circles of the quota row. A tap on a circle opens the `i` page cut to its facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gauge {
+    FiveHour,
+    Week,
+    Cache,
+    Codex,
+}
+impl Gauge {
+    /// The code the circle carries in `Metrics.quota_gauges` and in a pane action.
+    pub fn code(self) -> &'static str {
+        match self {
+            Gauge::FiveHour => "5H",
+            Gauge::Week => "7D",
+            Gauge::Cache => "cache",
+            Gauge::Codex => "Codex 7D",
+        }
+    }
+    pub fn from_code(code: &str) -> Option<Gauge> {
+        [Gauge::FiveHour, Gauge::Week, Gauge::Cache, Gauge::Codex]
+            .into_iter()
+            .find(|g| g.code() == code)
+    }
+}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Open {
     pub scroll: usize,
     pub agents: bool,
     pub figure: bool,
+    /// With `figure`: the one circle whose facts the page shows. `None` lists every fact.
+    pub gauge: Option<Gauge>,
     pub changes: bool,
     pub threads: bool,
     pub dreams: bool,
@@ -410,18 +453,27 @@ impl Composition {
                 ));
             }
         }
-        river.extend(array(&data["threads"]).iter().map(|thread| {
-            river_row(
-                num(&thread["last_seen"]),
-                RiverKind::Prompt,
-                "↳ ",
-                format!(
-                    "{} · {}",
-                    string(&thread["text"]),
-                    crate::companion::threads::thread_group(thread)
-                ),
-            )
-        }));
+        river.extend(
+            array(&data["threads"])
+                .iter()
+                .filter(|thread| {
+                    !crate::companion::lost::is_summary_footer(string(&thread["text"]))
+                })
+                .map(|thread| {
+                    let mut row = river_row(
+                        num(&thread["last_seen"]),
+                        RiverKind::Prompt,
+                        "↳ ",
+                        format!(
+                            "{} · {}",
+                            string(&thread["text"]),
+                            crate::companion::threads::thread_group(thread)
+                        ),
+                    );
+                    row.mood = thread_mood(thread);
+                    row
+                }),
+        );
         river.sort_by(|a, b| b.at.total_cmp(&a.at));
         let mut stamps: Vec<_> = array(&s["main"])
             .iter()
@@ -547,14 +599,20 @@ impl Composition {
             story,
             story_age: age,
             shifts,
-            figure: masthead::gauges_compacting(
-                &data["claude_fields"],
-                data["claude_at"].as_f64(),
-                s,
-                now,
-                &data["limits"],
-                &data["sts"],
-                &drawn_compaction(&data["compacting"]),
+            figure: with_layout(
+                with_forecast(
+                    masthead::gauges_compacting(
+                        &data["claude_fields"],
+                        data["claude_at"].as_f64(),
+                        s,
+                        now,
+                        &data["limits"],
+                        &data["sts"],
+                        &drawn_compaction(&data["compacting"]),
+                    ),
+                    &data["forecast"],
+                ),
+                &data["rings"],
             ),
             tally: if notice
                 .as_deref()
@@ -702,6 +760,13 @@ impl Composition {
             if let Some(left) = cache["left"].as_f64().filter(|n| *n > 0.) {
                 due.push(now + left - 60. * (left / 60.).floor());
             }
+        }
+        // The outlook's lines count minutes: they move on the minute.
+        if self.figure["outlook"]["windows"]
+            .as_array()
+            .is_some_and(|w| !w.is_empty())
+        {
+            due.push((now / 60.).floor() * 60. + 60.);
         }
         let quotas = array(&self.figure["quotas"]);
         for q in quotas {
@@ -956,7 +1021,30 @@ fn observation_fold_h() -> f32 {
 const DRILL_LINE: f32 = 17.;
 /// The figure card's height for the expanded chart (95 + 40), its labels and payback (72) and the
 /// gauge offset (84).
-const FIGURE_EXPANDED_H: f32 = 291.;
+const FIGURE_EXPANDED_BASE: f32 = 291.;
+/// The expanded figure's height: the history chart keeps its room when the notes line is drawn.
+fn figure_expanded_h(g: &Value) -> f32 {
+    FIGURE_EXPANDED_BASE + notes_h(g)
+}
+/// The history plot's height at the expanded figure's full height, and the least it is shrunk to
+/// so the notes line stays: its title row, a few bars and the gap under them.
+const EXPANDED_PLOT_FULL: f32 = 73.;
+const EXPANDED_PLOT_MIN: f32 = 48.;
+/// The least height the expanded figure draws in: the chart gives back what the notes line needs.
+/// A shorter card drops the chart and draws the collapsed ring.
+fn figure_expanded_min_h(g: &Value) -> f32 {
+    figure_expanded_h(g) - (EXPANDED_PLOT_FULL - EXPANDED_PLOT_MIN)
+}
+/// Float noise in a card's height that never makes it the strip: a closed pane's card is laid
+/// out at `mid_min_h` to within rounding.
+const MID_MIN_SLOP: f32 = 0.5;
+/// The least height of a Context card in the mid layout: the title, the small circles with their
+/// captions and the notes line, and the bottom clearance. A card shorter than this is the strip.
+fn mid_min_h(g: &Value) -> f32 {
+    const MIN_GAUGE_R: f32 = 16.;
+    const LABEL_BELOW: f32 = MIN_GAUGE_R + 12.;
+    P + theme::TITLE_LINE + S2 + MIN_GAUGE_R + LABEL_BELOW + theme::CAPTION_LINE + notes_h(g) + S4
+}
 /// Fewest lines a clipped section keeps, its "+N more" line included.
 const DRILL_MIN_LINES: usize = 4;
 /// Most thread bands an open `t` draws at once.
@@ -1155,9 +1243,14 @@ fn changes_note(c: &Composition) -> String {
 }
 const NO_THREADS: &str = "No threads yet: the session has said nothing out loud.";
 /// The figure's text rows: the closed pane's facts, or with `i` open one fact to a row.
-pub fn figure_text_rows(c: &Composition, cols: usize, open_figure: bool) -> Vec<String> {
+pub fn figure_text_rows(
+    c: &Composition,
+    cols: usize,
+    open_figure: bool,
+    gauge: Option<Gauge>,
+) -> Vec<String> {
     if open_figure {
-        figure_detail_lines(c)
+        figure_detail_lines(c, gauge)
             .iter()
             .flat_map(|line| {
                 // A fact whose pieces do not fit a row wraps; fact_rows would drop them.
@@ -1316,7 +1409,7 @@ fn assemble(
         }
     }
     // `i` opens the figure: one fact to a row, then the history in words.
-    let fig_lines = figure_text_rows(c, cols, open.figure);
+    let fig_lines = figure_text_rows(c, cols, open.figure, open.gauge);
     if open.changes || open.threads || open.dreams || open.agents {
         let details = out.drain(details_start..).collect::<Vec<_>>();
         let figure_rows = if show_figure { fig_lines.len() } else { 4 };
@@ -1534,6 +1627,72 @@ fn history_mark(outcome: &str) -> Option<&'static str> {
 fn earlier_intent(intent: &str) -> &str {
     intent.strip_prefix("you asked: ").unwrap_or(intent)
 }
+/// A figure that asks for the older ring layouts when `rings` is true.
+fn with_layout(mut figure: Value, rings: &Value) -> Value {
+    if *rings == true {
+        figure["layout"] = json!("rings");
+    }
+    figure
+}
+/// A figure carrying the outlook of its windows (`forecast::outlook`'s shape): the dashboard's
+/// headline and window lines, and for the circles of the older layouts a short caption each.
+fn with_forecast(mut figure: Value, forecast: &Value) -> Value {
+    if let Some(quotas) = figure["quotas"].as_array_mut() {
+        for q in quotas {
+            let window = forecast["quota"][string(&q["code"])].clone();
+            if q["used"].is_number() && window["text"].is_string() {
+                q["forecast"] = window;
+            }
+        }
+    }
+    if forecast["windows"].is_array() {
+        figure["outlook"] = json!({
+            "headline": forecast["headline"],
+            "windows": forecast["windows"],
+        });
+    }
+    figure
+}
+/// One window's line in the facts: its words, then where it is headed when that is known.
+fn quota_fact(q: &Value) -> String {
+    let line = text::paced(q);
+    match q["forecast"]["text"].as_str() {
+        Some(forecast) => format!("{line} · {forecast}"),
+        None => line,
+    }
+}
+/// The name an agent shows under, when it has one.
+fn agent_name(a: &agents::Agent) -> Option<&str> {
+    Some(a.description.trim()).filter(|n| !n.is_empty())
+}
+/// The agents bar's words, and whether they warn. Nothing stalled: how many agents run and the
+/// name of the newest, in plain ink. One or more stalled: the count and the name of a stalled
+/// agent (the one stuck longest), in the warning. An agent with no description has no name to
+/// show, and then no dot is drawn either.
+fn agents_bar(agents: &[agents::Agent], now: f64) -> (String, bool) {
+    let active = || agents.iter().filter(|a| agents::is_active(a));
+    let stalled: Vec<_> = active().filter(|a| agents::stalled(a, now)).collect();
+    let (count, word, shown) = if stalled.is_empty() {
+        let newest = active()
+            .filter(|a| agent_name(a).is_some())
+            .max_by(|a, b| a.first_seen.total_cmp(&b.first_seen));
+        (
+            active().count(),
+            "running",
+            newest.and_then(|a| agent_name(a)),
+        )
+    } else {
+        let mut by_age = stalled.clone();
+        by_age.sort_by(|a, b| a.last_at.total_cmp(&b.last_at));
+        let longest = by_age.iter().find_map(|a| agent_name(a));
+        (stalled.len(), "stalled", longest)
+    };
+    let text = match shown {
+        Some(name) => format!("{count} {word} · {name}"),
+        None => format!("{count} {word}"),
+    };
+    (text, !stalled.is_empty())
+}
 fn agent_lines(c: &Composition) -> Vec<String> {
     c.agents
         .agents
@@ -1591,7 +1750,7 @@ fn figure_facts(c: &Composition) -> (Vec<String>, Vec<String>) {
         .iter()
         .filter(|q| q["used"].is_number())
         .map(|q| {
-            let line = text::paced(q);
+            let line = quota_fact(q);
             if q["code"] == "7D" {
                 format!("{line} · CSR {} pts", c.csr_cost.share_label())
             } else {
@@ -1614,6 +1773,44 @@ fn figure_facts(c: &Composition) -> (Vec<String>, Vec<String>) {
     (top, quotas)
 }
 
+/// The facts of one circle of the quota row, a line each. Empty when that circle is not drawn.
+fn gauge_facts(c: &Composition, gauge: Gauge) -> Vec<String> {
+    let g = &c.figure;
+    let quota = |code: &str| {
+        array(&g["quotas"])
+            .iter()
+            .find(|q| q["code"] == code && q["used"].is_number())
+    };
+    match gauge {
+        Gauge::FiveHour => quota("5H").map(|q| vec![quota_fact(q)]).unwrap_or_default(),
+        Gauge::Week => quota("7D")
+            .map(|q| {
+                let mut out = vec![format!(
+                    "{} · CSR {} pts",
+                    quota_fact(q),
+                    c.csr_cost.share_label()
+                )];
+                let money = money_fact(c);
+                if !money.is_empty() {
+                    out.push(money);
+                }
+                out
+            })
+            .unwrap_or_default(),
+        Gauge::Cache => {
+            if g["cache"]["left"].is_number() || g["cache"]["cold"] == true {
+                vec![string(&g["cache"]["text"]).replace("CACHE ", "◷ ")]
+            } else {
+                vec![]
+            }
+        }
+        Gauge::Codex => c.codex_week["percent"]
+            .as_f64()
+            .map(|n| vec![format!("Codex 7D {n:.0}%")])
+            .unwrap_or_default(),
+    }
+}
+
 fn money_fact(c: &Composition) -> String {
     if has_week(c) && c.csr_cost.usd.is_some() {
         c.csr_cost.money_line()
@@ -1632,7 +1829,11 @@ fn figure_lines(c: &Composition) -> Vec<String> {
 
 /// What `i` opens: every fact of the figure on a line of its own, then the per-turn history in
 /// words. Says so when there is nothing to show.
-fn figure_detail_lines(c: &Composition) -> Vec<String> {
+fn figure_detail_lines(c: &Composition, gauge: Option<Gauge>) -> Vec<String> {
+    // A tapped circle shows its own facts; a circle with nothing to say falls back to the list.
+    if let Some(own) = gauge.map(|g| gauge_facts(c, g)).filter(|f| !f.is_empty()) {
+        return own;
+    }
     let (top, quotas) = figure_facts(c);
     let g = &c.figure;
     // The cost line alone is not a measurement: with only that, the pane still says nothing was measured.
@@ -1644,7 +1845,14 @@ fn figure_detail_lines(c: &Composition) -> Vec<String> {
     if !measured {
         out.push("No figures yet: nothing has been measured in this session.".into());
     }
-    out.extend(top.into_iter().chain(quotas));
+    out.extend(top);
+    // The words about the last turn, where the text pane has a row to spare for them.
+    out.extend(
+        breakdown_of(g)
+            .and_then(|b| b["caption"].as_str())
+            .map(str::to_owned),
+    );
+    out.extend(quotas);
     let money = money_fact(c);
     if !money.is_empty() {
         out.push(money);
@@ -1659,6 +1867,75 @@ fn figure_detail_lines(c: &Composition) -> Vec<String> {
         ));
     }
     out
+}
+
+/// The breakdown of what fills the context, when the figure has one.
+fn breakdown_of(g: &Value) -> Option<&Value> {
+    g["breakdown"].is_object().then(|| &g["breakdown"])
+}
+/// The Context card's line about the change per turn: the last turn's parts when they are known,
+/// else the median change.
+fn turn_line(g: &Value) -> Option<String> {
+    if let Some(caption) = breakdown_of(g).and_then(|b| b["caption"].as_str()) {
+        return Some(caption.to_owned());
+    }
+    g["trend"].as_f64().map(|trend| {
+        format!(
+            "{}{}/turn",
+            if trend >= 0. { "+" } else { "−" },
+            short(trend.abs())
+        )
+    })
+}
+/// Height of the breakdown bar in the mid layout, and the room it takes under the lines.
+const BREAKDOWN_BAR_H: f32 = 8.;
+const BREAKDOWN_ROOM: f32 = 12.;
+/// What fills the context as one bar over the whole window: the floor under the conversation
+/// (system prompt, tools, memory), the messages, the tool results, CSR's injections, and what is
+/// free. A part that exists is never thinner than a hairline, so CSR's share stays visible.
+fn breakdown_bar(c: &mut Canvas, g: &Value, x: f32, y: f32, w: f32, t: &Tokens) {
+    let Some(b) = breakdown_of(g) else {
+        return;
+    };
+    let size = num(&b["size"]);
+    if size <= 0. || w <= 0. {
+        return;
+    }
+    c.rrect(x, y, w, BREAKDOWN_BAR_H, 2., t.track);
+    let wide = |key: &str| {
+        let n = num(&b[key]);
+        if n > 0. {
+            ((n / size) as f32 * w).max(1.5)
+        } else {
+            0.
+        }
+    };
+    let (text, tool, csr) = (wide("text"), wide("tool"), wide("csr"));
+    let used = ((num(&b["total"]) / size) as f32 * w).max(text + tool + csr);
+    let floor = (used - text - tool - csr).max(0.);
+    c.rrect(x, y, floor + 2., BREAKDOWN_BAR_H, 2., t.faint);
+    let mut at = x + floor;
+    for (part, ink) in [(text, t.sky), (tool, t.mint), (csr, t.csr_share)] {
+        if part > 0. {
+            c.rect(at, y, part, BREAKDOWN_BAR_H, ink);
+            at += part;
+        }
+    }
+    c.breakdown_bars.push((x, y, w, BREAKDOWN_BAR_H));
+}
+
+/// Whether a line of notes sits under the quota captions: a window with a forecast has one.
+fn has_notes(g: &Value) -> bool {
+    array(&g["quotas"])
+        .iter()
+        .any(|q| q["used"].is_number() && q["forecast"]["text"].is_string())
+}
+fn notes_h(g: &Value) -> f32 {
+    if has_notes(g) {
+        NOTES_H
+    } else {
+        0.
+    }
 }
 
 fn has_week(data: &Composition) -> bool {
@@ -1696,16 +1973,17 @@ fn quota_ring(c: &mut Canvas, data: &Composition, q: &Value, x: f32, y: f32, r: 
     if let Some((rest_end, from, to)) = csr {
         // Butt caps preserve the one-output-pixel notch without round-cap overlap.
         c.arc(x, y, r, 0., 1., t.ring, t.track, false);
-        c.arc(x, y, r, 0., rest_end, t.ring, t.sky, false);
+        c.arc(x, y, r, 0., rest_end, t.ring, t.claude, false);
         c.arc(x, y, r, from, to, t.ring, t.csr_share, false);
     } else {
-        c.ring(x, y, r, t.ring, t.track, &[(0., used, t.sky)]);
+        c.ring(x, y, r, t.ring, t.track, &[(0., used, t.claude)]);
     }
     c.quota_gauges.push(QuotaGauge {
         code: string(&q["code"]).into(),
         center: (x, y),
         radius: r,
         csr_segment: csr,
+        tap: None,
     });
 }
 
@@ -1737,7 +2015,8 @@ fn fitted_caption_ink(
     c.text(f, line, x, y, sans(size, t.medium), ink, A::M);
 }
 
-/// Weekly identity and CSR attribution keep separate inks on the same measured line.
+/// Weekly identity and CSR attribution keep separate inks on the same measured line, led by the
+/// swatch of the ring they belong to.
 fn weekly_caption(
     c: &mut Canvas,
     f: &Fonts,
@@ -1751,12 +2030,15 @@ fn weekly_caption(
 ) {
     let line = quota_caption(data, q);
     let st = sans(size, t.medium);
+    let room = width - SWATCH_LEAD;
     let st = sans(
-        (size * width / f.width(&line, st).max(width)).min(size),
+        (size * room / f.width(&line, st).max(room)).min(size),
         t.medium,
     );
     let prefix = "7D · ";
-    let left = x - f.width(&line, st) / 2.;
+    let w = f.width(&line, st);
+    let x = caption_swatch(c, x, w, y, f.cap(st), Swatch::Disc(t.claude));
+    let left = x - w / 2.;
     let prefix_w = c.text(f, prefix, left, y, st, t.quiet, A::L);
     c.text(
         f,
@@ -1777,7 +2059,8 @@ fn quota_money_caption(f: &Fonts, line: &str, width: f32, size: f32, t: &Tokens)
     }
 }
 
-/// Caption fitting never affects the equal-width gauge slots.
+/// Caption fitting never affects the equal-width gauge slots. A swatch leads the first line, and
+/// the two are centred together.
 fn quota_label(
     c: &mut Canvas,
     f: &Fonts,
@@ -1787,20 +2070,39 @@ fn quota_label(
     width: f32,
     size: f32,
     ink: Rgba,
+    swatch: Option<Swatch>,
     t: &Tokens,
 ) {
     let st = sans(size, t.medium);
-    for (i, line) in f.wrap(line, st, width).iter().take(2).enumerate() {
-        c.text(
-            f,
-            line,
-            x,
-            y + i as f32 * theme::CAPTION_LINE,
-            st,
-            ink,
-            A::M,
-        );
+    let room = width - if swatch.is_some() { SWATCH_LEAD } else { 0. };
+    for (i, line) in f.wrap(line, st, room).iter().take(2).enumerate() {
+        let base = y + i as f32 * theme::CAPTION_LINE;
+        let x = match swatch.filter(|_| i == 0) {
+            Some(swatch) => caption_swatch(c, x, f.width(line, st), base, f.cap(st), swatch),
+            None => x,
+        };
+        c.text(f, line, x, base, st, ink, A::M);
     }
+}
+
+/// `fitted_caption`, led by a swatch.
+fn swatch_caption(
+    c: &mut Canvas,
+    f: &Fonts,
+    line: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    size: f32,
+    swatch: Swatch,
+    t: &Tokens,
+) {
+    let st = sans(size, t.medium);
+    let room = width - SWATCH_LEAD;
+    let size = (size * room / f.width(line, st).max(room)).min(size);
+    let st = sans(size, t.medium);
+    let x = caption_swatch(c, x, f.width(line, st), y, f.cap(st), swatch);
+    c.text(f, line, x, y, st, t.quiet, A::M);
 }
 
 /// Quota row shared by full, mid-height and narrow text-mode strips.
@@ -1814,9 +2116,12 @@ fn quota_row(
     r: f32,
     label_y: f32,
     caption_size: f32,
+    notes: bool,
     t: &Tokens,
 ) -> (f32, f32) {
     let g = &data.figure;
+    // The tap reaches down over the line of notes when one is drawn.
+    let tap_to = label_y + if notes { theme::CAPTION_LINE } else { 0. };
     let mut quotas = array(&g["quotas"])
         .iter()
         .filter(|q| q["used"].is_number())
@@ -1837,6 +2142,9 @@ fn quota_row(
         bounds.0 = bounds.0.min(x - r);
         bounds.1 = bounds.1.max(x + r);
         quota_ring(c, data, q, x, cy, r, t);
+        if let Some(gauge) = c.quota_gauges.last_mut() {
+            gauge.tap = Some(tap_box(x, unit, cy, r, tap_to));
+        }
         c.text(
             f,
             &format!("{:.0}%", num(&q["used"])),
@@ -1858,8 +2166,23 @@ fn quota_row(
                 slot - S2,
                 caption_size,
                 t.quiet,
+                Some(Swatch::Disc(t.claude)),
                 t,
             );
+        }
+        if notes {
+            if let Some(text) = q["forecast"]["text"].as_str() {
+                let at = label_y + 2. * theme::CAPTION_LINE;
+                let ink = if q["forecast"]["out"] == true {
+                    t.amber
+                } else {
+                    t.quiet
+                };
+                fitted_caption_ink(c, f, text, x, at, slot - S2, caption_size, ink, t);
+                if c.note_rows.last() != Some(&at) {
+                    c.note_rows.push(at);
+                }
+            }
         }
         if weekly && data.csr_cost.usd.is_some() {
             let money =
@@ -1886,6 +2209,7 @@ fn quota_row(
             center: (x, cy),
             radius: r,
             csr_segment: None,
+            tap: Some(tap_box(x, unit, cy, r, tap_to)),
         });
         // The minute shown is the one drawn: a seconds sweep repaints the whole picture.
         let left = (num(&g["cache"]["left"]) / 60.).floor() * 60.;
@@ -1933,6 +2257,7 @@ fn quota_row(
             unit - S2,
             caption_size,
             t.quiet,
+            Some(Swatch::Disc(if cold { t.amber } else { t.mint })),
             t,
         );
     }
@@ -1946,14 +2271,16 @@ fn quota_row(
             center: (x, cy),
             radius: r,
             csr_segment: None,
+            tap: Some(tap_box(x, unit, cy, r, tap_to)),
         });
+        // Black on a light pane, white on a dark one: Codex is the one provider drawn in ink.
         c.ring(
             x,
             cy,
             r,
             t.ring,
             t.track,
-            &[(0., (used / 100.).clamp(0., 1.) as f32, t.asked)],
+            &[(0., (used / 100.).clamp(0., 1.) as f32, t.ink)],
         );
         c.text(
             f,
@@ -1964,7 +2291,7 @@ fn quota_row(
             t.ink,
             A::M,
         );
-        fitted_caption(
+        swatch_caption(
             c,
             f,
             "\u{e181} Codex 7D",
@@ -1972,6 +2299,7 @@ fn quota_row(
             label_y,
             unit - S2,
             caption_size,
+            Swatch::Half(t.ink, t.track),
             t,
         );
     }
@@ -1983,6 +2311,7 @@ fn quota_row(
             center: (x, cy),
             radius: 0.,
             csr_segment: None,
+            tap: None,
         });
         let card_w = (slot - S2).min(180.);
         let top = cy - r;
@@ -2025,6 +2354,7 @@ fn quota_row(
                 card_w - S2,
                 caption_size,
                 t.quiet,
+                None,
                 t,
             );
         } else {
@@ -2035,6 +2365,56 @@ fn quota_row(
         bounds.1 = bounds.1.max(x + card_w / 2.);
     }
     bounds
+}
+
+/// Height a layout gives the line of notes under the quota captions.
+pub(super) const NOTES_H: f32 = theme::CAPTION_LINE + S2;
+/// A circle's tap: its whole slot, from the top of the ring to below its second caption line.
+fn tap_box(x: f32, slot: f32, cy: f32, r: f32, label_y: f32) -> (f32, f32, f32, f32) {
+    (
+        x - slot / 2.,
+        cy - r,
+        x + slot / 2.,
+        label_y + theme::CAPTION_LINE + S1,
+    )
+}
+
+/// One swatch beside a caption: a filled shape in the colour its circle is drawn in.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Swatch {
+    Disc(Rgba),
+    /// Codex: half ink, half track, as the ring is black or white on its track.
+    Half(Rgba, Rgba),
+}
+/// A swatch's width, and the gap between it and its caption.
+const SWATCH: f32 = 8.;
+const SWATCH_GAP: f32 = S1 + 1.;
+/// What a swatch adds to the width of the caption it leads.
+const SWATCH_LEAD: f32 = SWATCH + SWATCH_GAP;
+/// Draw `swatch` at the left of a caption of width `w` that is centred on `x`, level with the
+/// middle of its capital letters. Returns the x the caption is now centred on: the swatch and the
+/// words are centred as one.
+fn caption_swatch(c: &mut Canvas, x: f32, w: f32, baseline: f32, cap: f32, swatch: Swatch) -> f32 {
+    let left = x - (w + SWATCH_LEAD) / 2.;
+    let mid = baseline - cap / 2.;
+    match swatch {
+        Swatch::Disc(col) => c.circle(left + SWATCH / 2., mid, SWATCH / 2., col),
+        Swatch::Half(a, b) => {
+            c.circle(left + SWATCH / 2., mid, SWATCH / 2., a);
+            // The right half-disc: a stroke as wide as the disc's radius, around its middle.
+            c.arc(
+                left + SWATCH / 2.,
+                mid,
+                SWATCH / 4.,
+                0.,
+                0.5,
+                SWATCH / 2.,
+                b,
+                false,
+            );
+        }
+    }
+    x + SWATCH_LEAD / 2.
 }
 
 // The geometry and primitives below are the approved B prototype's glass, serif and ring design.
@@ -2268,6 +2648,14 @@ fn recent_request_compactions(s: &Value) -> Vec<usize> {
 pub struct Metrics {
     pub csr_cost: InstrumentCost,
     pub quota_gauges: Vec<QuotaGauge>,
+    /// Baseline of the line of notes drawn under the quota circles, in layout pt.
+    pub note_rows: Vec<f32>,
+    /// Left, top, width and height of each context breakdown bar drawn, in layout pt.
+    pub breakdown_bars: Vec<(f32, f32, f32, f32)>,
+    /// The Context card's dashboard: its lines, bars and legend, when it is the layout.
+    pub dash: Option<Dash>,
+    /// Top and bottom of each "N by CSR" caption drawn, in layout pt.
+    pub by_csr: Vec<(f32, f32)>,
     pub fresh_plots: Vec<FreshPlot>,
     pub question_size: f32,
     pub question_line_height: f32,
@@ -2530,23 +2918,38 @@ pub fn draw(
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
     // The figure card's smallest height: its one-row gauge strip (or the quotas row).
     let figure_floor: f32 = if quotas_only { 154. } else { 110. };
+    // A closed pane keeps the Context card tall enough for the small circles, their notes line and
+    // the caption; a card an open section squeezed below that is the strip.
+    let dash = dash_plan(f, c, t);
+    let figure_closed_floor: f32 = if let Some(plan) = &dash {
+        figure_floor.max(dash_compact_h(plan))
+    } else if quotas_only || narrow {
+        figure_floor
+    } else {
+        figure_floor.max(mid_min_h(&c.figure))
+    };
     // `i` adds a card of the figure's facts, one to a line, under the figure.
-    let fig_detail_all: Vec<String> = if open.figure {
-        figure_detail_lines(c)
+    let fig_detail_all: Vec<String> = if open.figure && dash.is_none() {
+        figure_detail_lines(c, open.gauge)
             .iter()
             .flat_map(|line| f.wrap(line, sans(11.5, t.regular), IW))
             .collect()
     } else {
         vec![]
     };
-    let (detail_want, detail_least) = if fig_detail_all.is_empty() {
-        (0., 0.)
-    } else {
-        (
-            line_card(fig_detail_all.len()),
-            line_card(fig_detail_all.len().min(DRILL_MIN_LINES)),
-        )
-    };
+    let (detail_want, detail_least) =
+        if dash.is_some() && open.figure && fresh_bar_heights(&c.requests).is_some() {
+            // The dashboard draws no card of its own under the figure, but `i` asks the figure for
+            // the room of its chart: the cards above fold to make it.
+            (DASH_CHART_WANT, DASH_CHART_WANT)
+        } else if fig_detail_all.is_empty() {
+            (0., 0.)
+        } else {
+            (
+                line_card(fig_detail_all.len()),
+                line_card(fig_detail_all.len().min(DRILL_MIN_LINES)),
+            )
+        };
     let observed = [
         (CONFUSED_TITLE, &c.confusing, false),
         (SHOULD_BE_TITLE, &c.should_be, true),
@@ -2583,7 +2986,7 @@ pub fn draw(
     // The canvas is the closed pane's: an open section never makes it taller. Layout points may
     // scale to fit a narrow/wide terminal; reserve S3 in final pixels.
     let maxh = maxh.max(
-        (top_for(observed_full_h, story_h) + tail_base + figure_floor)
+        (top_for(observed_full_h, story_h) + tail_base + figure_closed_floor)
             / (1. - S3 / available_height as f32),
     );
     let key_gap = S3 * maxh / available_height as f32;
@@ -2599,8 +3002,15 @@ pub fn draw(
     };
     let figure_target = if quotas_only {
         empty_quota_height(c)
+    } else if let Some(plan) = &dash {
+        dash_full_h(plan)
+            + if open.figure && fresh_bar_heights(&c.requests).is_some() {
+                DASH_CHART_WANT
+            } else {
+                0.
+            }
     } else if open.figure && fresh_bar_heights(&c.requests).is_some() {
-        FIGURE_EXPANDED_H
+        figure_expanded_h(&c.figure)
     } else {
         collapsed_context_layout(&c.figure, 0.).2
     };
@@ -3277,7 +3687,7 @@ pub fn draw(
         y,
         figure_layout_h,
         t,
-        open.figure && figure_h >= FIGURE_EXPANDED_H,
+        open.figure && figure_h >= FIGURE_EXPANDED_BASE,
         narrow,
     );
     if let Some((cy, ring, group, avail, mid)) = fig_info {
@@ -3311,7 +3721,6 @@ pub fn draw(
         let agents_draw_h = agents_h;
         panel(&mut canvas, y, agents_draw_h, t);
         let mut x = IX;
-        let mut stalled = 0;
         canvas.cut_title = "Agent in flight";
         for a in c
             .agents
@@ -3321,7 +3730,6 @@ pub fn draw(
             .take(10)
         {
             let is_stalled = agents::stalled(a, c.now);
-            stalled += usize::from(is_stalled);
             canvas.icon(
                 f,
                 Icon::Bot,
@@ -3333,22 +3741,21 @@ pub fn draw(
             );
             x += S5;
         }
-        let live = c
-            .agents
-            .agents
-            .iter()
-            .find(|a| agents::is_active(a) && !agents::stalled(a, c.now))
-            .map(|a| a.description.as_str())
-            .unwrap_or("");
+        let (words, warns) = agents_bar(&c.agents.agents, c.now);
+        let (words, ink) = if warns {
+            (format!("{} {words}", Icon::TriangleAlert.glyph()), t.amber)
+        } else {
+            (words, t.quiet)
+        };
         single(
             &mut canvas,
             f,
-            &format!("{stalled} stalled · {live}"),
+            &words,
             x + S2,
             y + P + f.cap(body),
             W - x - 40.,
             11.5,
-            t.amber,
+            ink,
             t,
         );
         canvas.cut_title = recording;
@@ -3580,6 +3987,10 @@ pub fn draw(
         Metrics {
             csr_cost: c.csr_cost.clone(),
             quota_gauges: canvas.quota_gauges.clone(),
+            note_rows: canvas.note_rows.clone(),
+            breakdown_bars: canvas.breakdown_bars.clone(),
+            dash: canvas.dash.clone(),
+            by_csr: canvas.by_csr.clone(),
             fresh_plots: canvas.fresh_plots.clone(),
             question_size: qs.size,
             question_line_height,
@@ -3663,13 +4074,19 @@ fn empty_quota_radius(c: &Composition) -> f32 {
     ((IW / count.max(1) as f32 - S3) / 2.).clamp(30., 64.)
 }
 fn empty_quota_height(c: &Composition) -> f32 {
-    P + theme::TITLE_LINE + S2 + 2. * empty_quota_radius(c) + 46. + theme::CAPTION_LINE + P
+    P + theme::TITLE_LINE
+        + S2
+        + 2. * empty_quota_radius(c)
+        + 46.
+        + theme::CAPTION_LINE
+        + notes_h(&c.figure)
+        + P
 }
 
 fn context_title_height(g: &Value) -> f32 {
     P + theme::TITLE_LINE
         + S2
-        + if g["trend"].as_f64().is_some() {
+        + if turn_line(g).is_some() {
             theme::CAPTION_LINE + S3
         } else {
             0.
@@ -3756,6 +4173,15 @@ fn history_plot(c: &mut Canvas, f: &Fonts, data: &Composition, y: f32, h: f32, t
     });
 }
 
+/// "N by CSR" at the top right of the card that starts at `y`: CSR's own work this session.
+fn by_csr_mark(c: &mut Canvas, f: &Fonts, t: &Tokens, n: u64, y: f32) {
+    let st = serif(24., t.medium);
+    let base = y + P + f.cap(st);
+    c.by_csr.push((y + P, base));
+    c.text(f, &format!("{n}"), W - 100., base, st, t.ink, A::M);
+    label(c, f, "by CSR", W - 84., base, 10., t.quiet, t.regular);
+}
+
 /// Draw the figure card. Returns (ceiling_y, ring_bounds) for layout metrics.
 fn figure(
     c: &mut Canvas,
@@ -3767,14 +4193,25 @@ fn figure(
     expanded: bool,
     narrow: bool,
 ) -> Option<FigureInfo> {
-    let expanded = expanded && fresh_bar_heights(&data.requests).is_some();
     let g = &data.figure;
+    if let Some(plan) = dash_plan(f, data, t) {
+        if h + 0.5 >= dash_compact_h(&plan) {
+            panel(c, y, h, t);
+            draw_dashboard(c, f, data, &plan, y, h, expanded, t);
+            return Some((None, None, None, None, None));
+        }
+    }
+    let expanded =
+        expanded && fresh_bar_heights(&data.requests).is_some() && h >= figure_expanded_min_h(g);
     let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
     let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.);
     let collapsed_scaled_fits = collapsed_context_fits(g, h);
     // Strip only for narrow panes or truly strip-height cards. Mid-height cards get their own layout.
     const STRIP_H: f32 = 110.;
-    let use_strip = tokens.is_some() && (narrow || h <= STRIP_H);
+    let use_strip = tokens.is_some()
+        && (narrow
+            || h <= STRIP_H
+            || (!expanded && !collapsed_scaled_fits && h < mid_min_h(g) - MID_MIN_SLOP));
     let use_mid = tokens.is_some() && !expanded && !use_strip && !collapsed_scaled_fits;
     panel(c, y, h, t);
     if use_strip {
@@ -3790,6 +4227,10 @@ fn figure(
     let mut collapsed_pay_y = None;
     let mut collapsed_sat_cy = None;
     let mut context_quota_radius = 30.;
+    // Whether the quota row's notes line has room. The expanded chart shrinks to make it; the
+    // collapsed ring may have none to spare: then the notes line is not drawn.
+    let mut notes_drawn = true;
+    let notes_gap = if notes_drawn { notes_h(g) } else { 0. };
     label(
         c,
         f,
@@ -3804,45 +4245,23 @@ fn figure(
         t.ink,
         t.bold,
     );
-    if let Some(trend) = g["trend"]
-        .as_f64()
-        .filter(|_| tokens.is_some() && !expanded)
-    {
-        label(
+    if let Some(line) = turn_line(g).filter(|_| tokens.is_some() && !expanded) {
+        let caption_y = y + P + theme::TITLE_LINE + S2;
+        single(
             c,
             f,
-            &format!(
-                "{}{}/turn",
-                if trend >= 0. { "+" } else { "−" },
-                short(trend.abs())
-            ),
+            &line,
             IX,
-            y + P + theme::TITLE_LINE + S2 + f.cap(sans(theme::CAPTION_SIZE, t.regular)),
+            caption_y + f.cap(sans(theme::CAPTION_SIZE, t.regular)),
+            IW,
             11.5,
             t.quiet,
-            t.regular,
+            t,
         );
+        breakdown_bar(c, g, IX, caption_y + theme::CAPTION_LINE + S1, IW, t);
     }
     if let Some(n) = data.tally["by_csr"].as_u64().filter(|n| *n > 0) {
-        c.text(
-            f,
-            &format!("{n}"),
-            W - 100.,
-            y + P + f.cap(serif(24., t.medium)),
-            serif(24., t.medium),
-            t.ink,
-            A::M,
-        );
-        label(
-            c,
-            f,
-            "by CSR",
-            W - 84.,
-            y + P + f.cap(serif(24., t.medium)),
-            10.,
-            t.quiet,
-            t.regular,
-        );
+        by_csr_mark(c, f, t, n, y);
     }
     if let Some((line, sev)) = csr_status(g) {
         let col = if sev == "red" { t.risk } else { t.amber };
@@ -3871,26 +4290,14 @@ fn figure(
     if let (Some(n), Some(size)) = (tokens, size) {
         if expanded {
             // Fresh input has its own scale. A context-window ceiling/band would be a different unit.
-            let gauge_cy = y + h - 84.;
-            let chart_bottom = (gauge_cy - 72.).max(y + 135.);
+            let gauge_cy = y + h - 84. - notes_gap;
+            let chart_bottom = (gauge_cy - 72.).max(y + 70. - S2 + EXPANDED_PLOT_MIN);
             expanded_chart_bottom = chart_bottom;
             history_plot(c, f, data, y + 70., chart_bottom - (y + 70.) + S2, t);
-            if let Some(trend) = g["trend"].as_f64() {
-                label(
-                    c,
-                    f,
-                    &format!(
-                        "{}{}/turn",
-                        if trend >= 0. { "+" } else { "−" },
-                        short(trend.abs())
-                    ),
-                    IX,
-                    chart_bottom + 15.,
-                    11.5,
-                    t.quiet,
-                    t.regular,
-                );
+            if let Some(line) = turn_line(g) {
+                single(c, f, &line, IX, chart_bottom + 15., IW, 11.5, t.quiet, t);
             }
+            breakdown_bar(c, g, IX + 130., y + 49., IW - 130., t);
             c.text(f, &short(n), IX, y + 60., serif(25., t.medium), t.ink, A::L);
             label(
                 c,
@@ -3914,20 +4321,54 @@ fn figure(
             let ring_extent = r + S3;
             let needed = collapsed_context_layout(g, h).2;
             let slack = (h - needed).max(0.);
-            let history_h = if fresh_bar_heights(&data.requests).is_some() && slack >= 50. {
+            // The closed pane's height is the least the ring needs, so the notes line takes only
+            // room that is spare: from the history plot's, which keeps its own minimum, or from
+            // the slack around the group. The notes line matters more than the plot: a plot that
+            // would fall under its minimum is dropped, and the slack goes to the notes line.
+            let spare = notes_h(g);
+            let notes_floor = spare + S2;
+            let mut history_h = if fresh_bar_heights(&data.requests).is_some() && slack >= 50. {
                 slack
             } else {
                 0.
             };
-            if history_h == 0. {
-                context_quota_radius = (30. + slack / 4.).min(54.).min(empty_quota_radius(data));
+            if history_h > 0. && history_h - spare >= 50. {
+                history_h -= spare;
+            } else if history_h > 0. {
+                history_h = 0.;
             }
-            let gauge_growth = 2. * (context_quota_radius - 30.);
+            let quota_radius_in = |room: f32| {
+                (30. + room / 4.)
+                    .min(54.)
+                    .min(empty_quota_radius(data))
+                    .max(30.)
+            };
+            if history_h == 0. {
+                context_quota_radius = quota_radius_in(slack);
+            }
+            let mut gauge_growth = 2. * (context_quota_radius - 30.);
+            let mut loose = if history_h > 0. {
+                0.
+            } else {
+                slack - gauge_growth
+            };
+            if history_h == 0. && spare > 0. && slack >= notes_floor && loose < notes_floor {
+                // The circles grew into the notes line's room: they grow from what is left of it.
+                context_quota_radius = quota_radius_in(slack - notes_floor);
+                gauge_growth = 2. * (context_quota_radius - 30.);
+                loose = slack - gauge_growth;
+            }
+            let notes_room = if history_h > 0. {
+                notes_drawn
+            } else {
+                loose >= spare + S2
+            };
+            notes_drawn = notes_drawn && notes_room;
             let group_top = title_bottom
                 + if history_h > 0. {
                     0.
                 } else {
-                    (slack - gauge_growth) / 2.
+                    (loose - if notes_drawn { spare } else { 0. }) / 2.
                 };
             let cy = group_top + ring_extent;
             let cx = W / 2.;
@@ -3988,7 +4429,7 @@ fn figure(
     let pay = payback(g);
     // Gauge labels stay >= 24pt above the card bottom; collapsed uses the exact group geometry.
     let quota_radius = if tokens.is_none() {
-        ((h - (P + theme::TITLE_LINE + S2 + 46. + theme::CAPTION_LINE + P)) / 2.)
+        ((h - (P + theme::TITLE_LINE + S2 + 46. + theme::CAPTION_LINE + notes_h(g) + P)) / 2.)
             .clamp(30., empty_quota_radius(data))
     } else {
         context_quota_radius
@@ -3999,7 +4440,7 @@ fn figure(
             y + P + theme::TITLE_LINE,
         )
     } else if expanded {
-        let sat = y + h - 84.;
+        let sat = y + h - 84. - notes_gap;
         let below_chart = expanded_chart_bottom + 33.;
         let above_gauges = sat - 36.;
         (
@@ -4011,7 +4452,7 @@ fn figure(
     } else if let (Some(pay), Some(sat)) = (collapsed_pay_y, collapsed_sat_cy) {
         (sat, pay)
     } else {
-        (y + h - 84., y + h - 120.)
+        (y + h - 84. - notes_gap, y + h - 120. - notes_gap)
     };
     if g["compacting"].is_object() {
         if let Some(high) = g["compacting"]["usual"]["high"]
@@ -4055,9 +4496,559 @@ fn figure(
         quota_radius,
         sat_cy + quota_radius + S4,
         theme::CAPTION_SIZE,
+        has_notes(g) && notes_drawn,
         t,
     );
     Some((ceiling_y, ring_bounds, ring_group, ring_formula_avail, None))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Context card as a dashboard that reads in words, top to bottom: one headline sentence for
+// where the limits are headed, the 5 Hour and Weekly bars with a tick at their forecast, the
+// context with a labelled bar and a row per part, what CSR did this session, then the fresh
+// tokens per turn. The older ring layouts stay for a card too short to hold it.
+// ---------------------------------------------------------------------------------------------
+const DASH_HEAD_LINE: f32 = 17.;
+const DASH_LABEL_W: f32 = 62.;
+const DASH_PCT_W: f32 = 40.;
+const DASH_LIMIT_PITCH: f32 = 36.;
+const DASH_BAR_H: f32 = 8.;
+const DASH_ROW: f32 = 14.;
+const DASH_CHART_MIN: f32 = 64.;
+/// The height the fresh-tokens chart is given when the card is expanded and has room.
+const DASH_CHART_WANT: f32 = 92.;
+/// The width of the name column of a part's row in the full layout.
+const DASH_PART_COL: f32 = 150.;
+
+/// The words and numbers the dashboard draws, from the composition alone.
+struct DashPlan {
+    head: Vec<String>,
+    head_sev: String,
+    /// (code, name, used percent, state, tick percent, line) of each window.
+    limits: Vec<(String, String, f64, String, Option<f64>, String)>,
+    codex: Option<(f64, String)>,
+    ctx: Option<(f64, f64, &'static str)>,
+    parts: Vec<(&'static str, f64, Rgba)>,
+    estimated: bool,
+    turn: Option<String>,
+    cache: Option<(String, bool)>,
+    csr: Vec<String>,
+    status: Option<(String, bool)>,
+}
+
+fn dash_sev_ink(sev: &str, t: &Tokens) -> Rgba {
+    match sev {
+        "red" => t.risk,
+        "amber" => t.amber,
+        "quiet" => t.quiet,
+        _ => t.mint,
+    }
+}
+
+fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
+    let g = &c.figure;
+    // A figure can ask for the older ring layouts, which the checks of their geometry draw.
+    if g["layout"] == "rings" {
+        return None;
+    }
+    let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.)?;
+    let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.)?;
+    let (head, head_sev) = match g["outlook"]["headline"]["text"].as_str() {
+        Some(text) => (
+            f.wrap(text, sans(12.5, t.bold), IW)
+                .into_iter()
+                .take(2)
+                .collect(),
+            string(&g["outlook"]["headline"]["sev"]).to_owned(),
+        ),
+        None => (vec![], String::new()),
+    };
+    let mut limits = vec![];
+    if let Some(windows) = g["outlook"]["windows"].as_array() {
+        for w in windows {
+            limits.push((
+                string(&w["code"]).to_owned(),
+                string(&w["name"]).to_owned(),
+                num(&w["used"]),
+                string(&w["sev"]).to_owned(),
+                w["tick"].as_f64(),
+                string(&w["line"]).to_owned(),
+            ));
+        }
+    } else {
+        // A figure with no outlook still shows its windows, with no pace.
+        let mut quotas: Vec<_> = array(&g["quotas"])
+            .iter()
+            .filter(|q| q["used"].is_number())
+            .collect();
+        quotas.sort_by_key(|q| if q["code"] == "5H" { 0 } else { 1 });
+        for q in quotas {
+            let used = num(&q["used"]);
+            let left = q["resets"]
+                .as_f64()
+                .map(|at| {
+                    format!(
+                        " · resets in {}",
+                        crate::companion::forecast::until(at - c.now)
+                    )
+                })
+                .unwrap_or_default();
+            limits.push((
+                string(&q["code"]).to_owned(),
+                if q["code"] == "5H" {
+                    "5 Hour"
+                } else {
+                    "Weekly"
+                }
+                .to_owned(),
+                used,
+                if used >= 90. {
+                    "red"
+                } else if used >= 75. {
+                    "amber"
+                } else {
+                    "ok"
+                }
+                .to_owned(),
+                None,
+                format!("{}% used{left}", used.round() as i64),
+            ));
+        }
+    }
+    let codex = c.codex_week["percent"].as_f64().map(|n| {
+        let left = c.codex_week["resets_at"]
+            .as_f64()
+            .filter(|at| *at > c.now)
+            .map(|at| {
+                format!(
+                    " · resets in {}",
+                    crate::companion::forecast::until(at - c.now)
+                )
+            })
+            .unwrap_or_default();
+        (n, format!("Codex weekly limit{left}"))
+    });
+    let ctx_state = match string(&g["ctx"]["sev"]) {
+        "red" => "red",
+        "amber" => "amber",
+        _ => "ok",
+    };
+    let (parts, estimated) = match breakdown_of(g) {
+        Some(b) => {
+            let messages = num(&b["text"]) + num(&b["you"]);
+            (
+                [
+                    ("System + tools", num(&b["floor"]), t.faint),
+                    ("Messages", messages, t.sky),
+                    ("Tool results", num(&b["tool"]), t.asked),
+                    ("CSR injected", num(&b["csr"]), t.csr_share),
+                ]
+                .into_iter()
+                .filter(|p| p.1 > 0.)
+                .collect(),
+                true,
+            )
+        }
+        None => (vec![("In use", tokens, t.mint)], false),
+    };
+    let turn = breakdown_of(g)
+        .and_then(|b| b["caption"].as_str())
+        .map(str::to_owned);
+    // The prompt cache as the status line measured it: warm with its time left, or cold with what
+    // re-reading would cost. No claim that CSR kept it warm: no feed says so.
+    let cache = g["cache"]["long"]
+        .as_str()
+        .filter(|l| *l != "--" && !l.is_empty())
+        .map(|l| {
+            let words = l.replacen("WARM", "warm", 1).replacen("COLD", "cold", 1);
+            (format!("Cache {words}"), g["cache"]["cold"] == true)
+        });
+    let mut csr = vec![];
+    if let Some(n) = c.tally["by_csr"].as_u64().filter(|n| *n > 0) {
+        csr.push(format!("{n} compaction{}", if n == 1 { "" } else { "s" }));
+    }
+    if let Some(n) = c.tally["payback"].as_f64().filter(|n| *n > 0.) {
+        csr.push(format!("~{} tokens saved", short(n)));
+    }
+    if let Some(n) = g["asks"].as_u64().filter(|n| *n > 0) {
+        csr.push(format!("{n} recall{} used", if n == 1 { "" } else { "s" }));
+    }
+    if c.csr_cost.share.is_some_and(|s| s > 0.) {
+        csr.push(format!(
+            "{} pts of the weekly limit",
+            c.csr_cost.share_label()
+        ));
+    }
+    let status = csr_status(g).map(|(line, sev)| (line, sev == "red"));
+    Some(DashPlan {
+        head,
+        head_sev,
+        limits,
+        codex,
+        ctx: Some((tokens, size, ctx_state)),
+        parts,
+        estimated,
+        turn,
+        cache,
+        csr,
+        status,
+    })
+}
+
+/// The heights of the dashboard's sections: (headline, limits, context, CSR) and their sum with
+/// the card's padding. `full` lists the parts one to a row; the compact layout sets two to a row.
+fn dash_heights(p: &DashPlan, full: bool) -> (f32, f32, f32, f32, f32) {
+    let head = if p.head.is_empty() {
+        0.
+    } else {
+        p.head.len() as f32 * DASH_HEAD_LINE + S2
+    };
+    let limits = (p.limits.len() + usize::from(p.codex.is_some())) as f32 * DASH_LIMIT_PITCH;
+    let rows = if full {
+        p.parts.len()
+    } else {
+        p.parts.len().div_ceil(2)
+    } as f32;
+    let note = p.turn.is_some() || (p.estimated && p.turn.is_none());
+    let ctx = if p.ctx.is_some() {
+        16. + S2
+            + DASH_BAR_H
+            + S2
+            + rows * DASH_ROW
+            + if note { DASH_ROW } else { 0. }
+            + if p.cache.is_some() { DASH_ROW } else { 0. }
+            + S2
+    } else {
+        0.
+    };
+    let csr = if p.csr.is_empty() { 0. } else { 20. }
+        + if p.status.is_some() {
+            DASH_ROW + S1
+        } else {
+            0.
+        };
+    (head, limits, ctx, csr, P + head + limits + ctx + csr + P)
+}
+
+fn dash_full_h(p: &DashPlan) -> f32 {
+    dash_heights(p, true).4
+}
+fn dash_compact_h(p: &DashPlan) -> f32 {
+    dash_heights(p, false).4
+}
+
+/// Draw the dashboard in the card at `y` of height `h`. `chart` asks for the fresh-tokens chart
+/// in what room is left under the rows.
+fn draw_dashboard(
+    c: &mut Canvas,
+    f: &Fonts,
+    data: &Composition,
+    p: &DashPlan,
+    y: f32,
+    h: f32,
+    chart: bool,
+    t: &Tokens,
+) {
+    let full = h + 0.5 >= dash_full_h(p);
+    let (head_h, limits_h, ctx_h, csr_h, total) = dash_heights(p, full);
+    let slack = (h - total).max(0.);
+    // The spare room goes between the sections, never into one section's rows.
+    let chart_room = if chart && fresh_bar_heights(&data.requests).is_some() {
+        DASH_CHART_WANT
+    } else {
+        0.
+    };
+    let gap = ((slack - chart_room) / 3.).clamp(0., S4);
+    let mut dash = Dash {
+        full,
+        ..Dash::default()
+    };
+    let mut at = y + P;
+    // A. the headline
+    if !p.head.is_empty() {
+        let st = sans(12.5, t.bold);
+        let ink = dash_sev_ink(&p.head_sev, t);
+        for (i, line) in p.head.iter().enumerate() {
+            let shown = if i + 1 == p.head.len() && p.head.len() == 2 {
+                f.fit(line, st, IW)
+            } else {
+                line.clone()
+            };
+            c.text(
+                f,
+                &shown,
+                IX,
+                at + f.cap(st) + i as f32 * DASH_HEAD_LINE,
+                st,
+                ink,
+                A::L,
+            );
+        }
+        dash.headline = Some((p.head.join(" "), p.head_sev.clone()));
+        at += head_h + gap;
+    }
+    // B. the limits
+    let label = sans(11.5, t.medium);
+    let caption = sans(theme::CAPTION_SIZE, t.regular);
+    let bar_x = IX + DASH_LABEL_W;
+    let bar_w = IW - DASH_LABEL_W - DASH_PCT_W;
+    let mut bars: Vec<(String, String, f64, String, Option<f64>, String)> = p.limits.clone();
+    if let Some((n, line)) = &p.codex {
+        bars.push((
+            "CX".into(),
+            "Codex 7D".into(),
+            *n,
+            if *n >= 90. {
+                "red"
+            } else if *n >= 75. {
+                "amber"
+            } else {
+                "ok"
+            }
+            .into(),
+            None,
+            line.clone(),
+        ));
+    }
+    for (code, name, used, sev, tick, line) in &bars {
+        let ink = dash_sev_ink(sev, t);
+        let base = at + f.cap(label);
+        c.text(f, name, IX, base, label, t.ink, A::L);
+        let bar_y = at + f.cap(label) / 2. - DASH_BAR_H / 2.;
+        c.rrect(bar_x, bar_y, bar_w, DASH_BAR_H, 3., t.track);
+        let fill = (used / 100.).clamp(0., 1.) as f32;
+        if *used > 0. {
+            c.rrect(bar_x, bar_y, (bar_w * fill).max(4.), DASH_BAR_H, 3., ink);
+        }
+        let tick_frac = tick.map(|n| (n / 100.).clamp(0., 1.) as f32);
+        if let Some(frac) = tick_frac {
+            let tx = (bar_x + bar_w * frac).min(bar_x + bar_w - 1.);
+            c.rect(tx - 1., bar_y - 3., 2., DASH_BAR_H + 6., t.quiet);
+        }
+        c.text(
+            f,
+            &format!("{}%", used.round() as i64),
+            IX + IW,
+            base,
+            sans(11.5, t.bold),
+            ink,
+            A::R,
+        );
+        let line_ink = if sev == "red" && line.starts_with("On pace to run out") {
+            t.risk
+        } else {
+            t.quiet
+        };
+        single(
+            c,
+            f,
+            line,
+            IX,
+            at + 17. + f.cap(caption),
+            IW,
+            theme::CAPTION_SIZE,
+            line_ink,
+            t,
+        );
+        dash.limits.push(DashLimit {
+            code: code.clone(),
+            name: name.clone(),
+            bar: (bar_x, bar_y, bar_w, DASH_BAR_H),
+            fill,
+            tick: tick_frac,
+            line: line.clone(),
+        });
+        at += DASH_LIMIT_PITCH;
+    }
+    at += gap;
+    // C. the context
+    if let Some((tokens, size, state)) = p.ctx {
+        at += S2;
+        let base = at + f.cap(label);
+        c.text(f, "Context", IX, base, label, t.ink, A::L);
+        let used = format!("{:.0}% used", (tokens / size * 100.).round());
+        let name_w = f.width("Context", label);
+        c.text(
+            f,
+            &used,
+            IX + name_w + S2,
+            base,
+            sans(11.5, t.bold),
+            dash_sev_ink(state, t),
+            A::L,
+        );
+        let free = format!("{} free of {}", short(size - tokens), short(size));
+        c.text(f, &free, IX + IW, base, caption, t.quiet, A::R);
+        dash.context_head = Some(format!("{used} · {free}"));
+        at += 16.;
+        let bar_y = at + S1;
+        c.rrect(IX, bar_y, IW, DASH_BAR_H, 3., t.track);
+        let mut x = IX;
+        let mut segs = vec![];
+        for (name, n, ink) in &p.parts {
+            let w = ((*n / size) as f32 * IW).max(1.5);
+            c.rect(x, bar_y, w, DASH_BAR_H, *ink);
+            segs.push(DashSegment {
+                name: (*name).into(),
+                tokens: *n,
+                x,
+                w,
+                legend: None,
+            });
+            x += w;
+        }
+        dash.context_bar = Some((IX, bar_y, IW, DASH_BAR_H));
+        at = bar_y + DASH_BAR_H + S2;
+        let sized = |n: f64| {
+            if p.estimated {
+                format!("~{}", short(n))
+            } else {
+                short(n)
+            }
+        };
+        let col_w = if full { DASH_PART_COL } else { IW / 2. };
+        for (i, (name, n, ink)) in p.parts.iter().enumerate() {
+            let (cx, row) = if full {
+                (IX, i)
+            } else {
+                (IX + (i % 2) as f32 * col_w, i / 2)
+            };
+            let ry = at + row as f32 * DASH_ROW;
+            let base = ry + f.cap(caption) + 1.;
+            c.rrect(cx, ry + 2.5, 8., 8., 2., *ink);
+            c.text(f, name, cx + 14., base, caption, t.quiet, A::L);
+            let right = cx + DASH_PART_COL - if full { 0. } else { S2 };
+            c.text(
+                f,
+                &sized(*n),
+                right,
+                base,
+                sans(theme::CAPTION_SIZE, t.medium),
+                t.ink,
+                A::R,
+            );
+            segs[i].legend = Some(format!("{name} {}", sized(*n)));
+        }
+        dash.segments = segs;
+        at += (if full {
+            p.parts.len()
+        } else {
+            p.parts.len().div_ceil(2)
+        }) as f32
+            * DASH_ROW;
+        match (&p.turn, p.estimated) {
+            (Some(line), _) => {
+                single(
+                    c,
+                    f,
+                    line,
+                    IX,
+                    at + 1. + f.cap(caption),
+                    IW,
+                    theme::CAPTION_SIZE,
+                    t.quiet,
+                    t,
+                );
+                dash.est_marks += line.matches("est.").count();
+                dash.turn = Some(line.clone());
+                at += DASH_ROW;
+            }
+            (None, true) => {
+                let line = "Part sizes est., scaled to the real total.";
+                single(
+                    c,
+                    f,
+                    line,
+                    IX,
+                    at + 1. + f.cap(caption),
+                    IW,
+                    theme::CAPTION_SIZE,
+                    t.quiet,
+                    t,
+                );
+                dash.est_marks += 1;
+                at += DASH_ROW;
+            }
+            _ => {}
+        }
+        if let Some((line, cold)) = &p.cache {
+            single(
+                c,
+                f,
+                line,
+                IX,
+                at + 1. + f.cap(caption),
+                IW,
+                theme::CAPTION_SIZE,
+                if *cold { t.amber } else { t.quiet },
+                t,
+            );
+            dash.cache_row = Some(line.clone());
+            at += DASH_ROW;
+        }
+        at += S2 + gap;
+        let _ = ctx_h;
+    }
+    // D. what CSR did this session
+    if !p.csr.is_empty() {
+        let st = sans(11., t.medium);
+        let lead = "CSR this session: ";
+        let lead_w = f.width(lead, sans(11., t.bold));
+        let mut parts = p.csr.clone();
+        while parts.len() > 1 && lead_w + f.width(&parts.join(" · "), st) > IW - 10. {
+            parts.pop();
+        }
+        let base = at + 2. + f.cap(st);
+        c.rrect(IX, at, 3., 15., 1.5, t.csr_share);
+        c.text(
+            f,
+            lead,
+            IX + 10.,
+            base,
+            sans(11., t.bold),
+            t.csr_share,
+            A::L,
+        );
+        let rest = f.fit(&parts.join(" · "), st, IW - 10. - lead_w);
+        c.text(f, &rest, IX + 10. + lead_w, base, st, t.ink, A::L);
+        dash.csr_row = Some(format!("{lead}{rest}"));
+        at += 20.;
+    }
+    if let Some((line, red)) = &p.status {
+        c.icon(
+            f,
+            Icon::CircleAlert,
+            IX,
+            at + f.cap(caption) + 1.,
+            12.,
+            10.,
+            if *red { t.risk } else { t.amber },
+        );
+        single(
+            c,
+            f,
+            line,
+            IX + 18.,
+            at + f.cap(caption) + 1.,
+            IW - 18.,
+            theme::CAPTION_SIZE,
+            t.quiet,
+            t,
+        );
+        at += DASH_ROW + S1;
+    }
+    let _ = (head_h, limits_h, csr_h);
+    // E. the fresh tokens per turn, under it all
+    if chart && fresh_bar_heights(&data.requests).is_some() {
+        let top = at;
+        let room = y + h - top - S2;
+        if room >= DASH_CHART_MIN {
+            let given = room.min(DASH_CHART_WANT + S5 * 3.);
+            history_plot(c, f, data, top, given, t);
+            dash.chart = true;
+        }
+    }
+    c.dash = Some(dash);
 }
 
 /// Compact side-ring strip for narrow panes or cards ≤ ~110 pt.
@@ -4112,6 +5103,7 @@ fn draw_context_strip(
         16.,
         y + h - 28.,
         10.,
+        false,
         t,
     );
     (None, None, None, None, None)
@@ -4164,6 +5156,9 @@ fn draw_context_mid(
             t,
         );
     }
+    if let Some(n) = data.tally["by_csr"].as_u64().filter(|n| *n > 0) {
+        by_csr_mark(c, f, t, n, y);
+    }
     let (Some(n), Some(size)) = (tokens, size) else {
         return (None, None, None, None, None);
     };
@@ -4178,9 +5173,63 @@ fn draw_context_mid(
     let gauge_r = (r * 0.32).clamp(16., if variable_history { 20. } else { 30. });
 
     let label_below = gauge_r + 12.;
-    let details_gap = S3;
+    // Under a forecast line the lines are already apart: the gap shrinks so the bar keeps its room.
+    let details_gap = if has_notes(g) { S1 } else { S3 };
     let details_h = 6.;
-    let right_h = gauge_r + label_below + theme::CAPTION_LINE + details_gap + details_h;
+    // The trend and payback line, under the notes line. "N by CSR" sits in the title row instead.
+    // The breakdown's words take a line of their own; the median change and the payback share one.
+    let pay = payback(g);
+    let broken = breakdown_of(g).is_some_and(|b| b["caption"].is_string());
+    let details: Vec<String> = if broken {
+        turn_line(g)
+            .into_iter()
+            .chain((!pay.is_empty()).then_some(pay))
+            .collect()
+    } else {
+        let line: Vec<_> = turn_line(g)
+            .into_iter()
+            .chain((!pay.is_empty()).then_some(pay))
+            .collect();
+        if line.is_empty() {
+            vec![]
+        } else {
+            vec![line.join(" · ")]
+        }
+    };
+    let compacting = g["compacting"].is_object();
+    let bar_wanted = breakdown_of(g).is_some() && !compacting;
+    let right_bare = gauge_r + label_below + theme::CAPTION_LINE + notes_h(g);
+    let right_for = |lines: usize, bar: bool| {
+        right_bare
+            + details_gap
+            + details_h
+            + lines.saturating_sub(1) as f32 * theme::CAPTION_LINE
+            + if bar { BREAKDOWN_ROOM } else { 0. }
+    };
+    let right_full = right_for(1, false);
+    // The lines take their room from the card or are not drawn: they never hang below the card.
+    // The richest set that fits wins: the lines and the bar, the lines, the first line and the
+    // bar, the first line. The compaction bar sits where the line would, so it keeps the room too.
+    let wants_row = !details.is_empty() || compacting || bar_wanted;
+    let first = details.len().min(1);
+    let (shown_lines, shown_bar) = [
+        (details.len(), bar_wanted),
+        (details.len(), false),
+        (first, bar_wanted),
+        (first, false),
+    ]
+    .into_iter()
+    .find(|(n, bar)| (2. * r).max(right_for((*n).max(1), *bar)) <= slot + 0.5)
+    .unwrap_or((0, false));
+    let show_details =
+        wants_row && (2. * r).max(right_for(shown_lines.max(1), shown_bar)) <= slot + 0.5;
+    let right_h = if show_details {
+        right_for(shown_lines.max(1), shown_bar)
+    } else if wants_row && details.is_empty() && !bar_wanted {
+        right_full
+    } else {
+        right_bare
+    };
     let core_h = (2. * r).max(right_h);
     let history_h = if fresh_bar_heights(&data.requests).is_some() && slot - core_h - S3 >= 50. {
         slot - core_h - S3
@@ -4198,7 +5247,11 @@ fn draw_context_mid(
     let right_top = group_top + (core_h - right_h).max(0.) / 2.;
     let gauges_cy = right_top + gauge_r;
     let gauge_label_y = gauges_cy + label_below;
-    let details_y = gauge_label_y + theme::CAPTION_LINE + details_gap + 2.;
+    let details_y = if right_h == right_bare {
+        group_bottom
+    } else {
+        gauge_label_y + theme::CAPTION_LINE + notes_h(g) + details_gap + 2.
+    };
 
     let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
     if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64()) {
@@ -4246,34 +5299,30 @@ fn draw_context_mid(
         gauge_r,
         gauge_label_y,
         theme::CAPTION_SIZE,
+        has_notes(g),
         t,
     );
 
-    let mut details = Vec::new();
-    if let Some(trend) = g["trend"].as_f64() {
-        details.push(format!(
-            "{}{}/turn",
-            if trend >= 0. { "+" } else { "−" },
-            short(trend.abs())
-        ));
-    }
-    let pay = payback(g);
-    if !pay.is_empty() {
-        details.push(pay);
-    }
-    if let Some(n) = data.tally["by_csr"].as_u64().filter(|n| *n > 0) {
-        details.push(format!("{n} by CSR"));
-    }
-    if !details.is_empty() {
-        let line = details.join(" · ");
-        let col = if g["payback"]["sev"] == "amber" {
-            t.amber
-        } else if g["compacting"].is_object() {
-            t.mint
-        } else {
-            t.quiet
-        };
-        single(c, f, &line, right_x0, details_y, right_w, 10.5, col, t);
+    if show_details {
+        for (i, line) in details.iter().take(shown_lines).enumerate() {
+            // The payback keeps its warning ink; the words about the turn stay quiet.
+            let is_payback = !broken || i + 1 == details.len() && details.len() > 1;
+            let col = if is_payback && g["payback"]["sev"] == "amber" {
+                t.amber
+            } else if is_payback && compacting {
+                t.mint
+            } else {
+                t.quiet
+            };
+            let at = details_y + i as f32 * theme::CAPTION_LINE;
+            single(c, f, line, right_x0, at, right_w, 10.5, col, t);
+        }
+        if shown_bar {
+            let top = details_y
+                + shown_lines.saturating_sub(1) as f32 * theme::CAPTION_LINE
+                + if shown_lines > 0 { 4. } else { -6. };
+            breakdown_bar(c, g, right_x0, top, right_w.min(240.), t);
+        }
     }
     if g["compacting"].is_object() {
         if let Some(high) = g["compacting"]["usual"]["high"]
@@ -4441,7 +5490,7 @@ pub fn strip(
         let st = sans(10., t.medium);
         c.text(f, &f.fit(&pay, st, w - 86.), 76., 37., st, t.mint, A::L);
     }
-    quota_row(&mut c, f, data, 76., w - 86., 65., 16., 93., 8., t);
+    quota_row(&mut c, f, data, 76., w - 86., 65., 16., 93., 8., false, t);
     Some(c.pm)
 }
 
@@ -4670,6 +5719,943 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_row_says_asked_only_when_it_waits_on_the_user() {
+        let now = 1_800_000_000.;
+        let (mut data, s) = timeline_data();
+        let thread = |text: &str, state: &str, waiting: bool| json!({"text": text, "last_seen": now - 9000., "state": state, "waiting": waiting});
+        let mut footer = thread("Compaction footer", "open", false);
+        footer["text"] = json!(
+            "If you need specific details from before compaction (like exact code \
+             snippets), read the full transcript at: /x/y.jsonl"
+        );
+        data["threads"] = json!([
+            thread("Waits on the user", "lost", true),
+            thread("Open and quiet", "open", false),
+            thread("Lost and quiet", "lost", false),
+            thread("Faded away", "faded", false),
+            thread("Carried over", "carried", false),
+            footer,
+        ]);
+        let c = Composition::build(&data, &s, now);
+        let moods: Vec<_> = c
+            .river
+            .iter()
+            .filter(|r| r.kind == RiverKind::Prompt)
+            .map(|r| {
+                (
+                    r.mood(),
+                    r.line.split(" · ").next().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            moods,
+            vec![
+                ("asked", "Waits on the user".to_owned()),
+                ("left open", "Open and quiet".to_owned()),
+                ("left open", "Lost and quiet".to_owned()),
+                ("noted", "Faded away".to_owned()),
+                ("noted", "Carried over".to_owned()),
+            ],
+            "the compaction footer row is dropped, the rest keep their order"
+        );
+    }
+
+    /// CIEDE2000 between two sRGB colours (Sharma, Wu, Dalal 2005).
+    fn ciede2000(a: [u8; 4], b: [u8; 4]) -> f64 {
+        fn lab(c: [u8; 4]) -> (f64, f64, f64) {
+            let lin = |v: u8| {
+                let v = f64::from(v) / 255.;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let (r, g, bl) = (lin(c[0]), lin(c[1]), lin(c[2]));
+            let x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * bl;
+            let y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * bl;
+            let z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * bl;
+            let f = |t: f64| {
+                if t > 216. / 24389. {
+                    t.cbrt()
+                } else {
+                    (24389. / 27. * t + 16.) / 116.
+                }
+            };
+            let (fx, fy, fz) = (f(x / 0.95047), f(y), f(z / 1.08883));
+            (116. * fy - 16., 500. * (fx - fy), 200. * (fy - fz))
+        }
+        let ((l1, a1, b1), (l2, a2, b2)) = (lab(a), lab(b));
+        let (c1, c2) = (a1.hypot(b1), a2.hypot(b2));
+        let cb = (c1 + c2) / 2.;
+        let g = 0.5 * (1. - (cb.powi(7) / (cb.powi(7) + 25f64.powi(7))).sqrt());
+        let (a1p, a2p) = ((1. + g) * a1, (1. + g) * a2);
+        let (c1p, c2p) = (a1p.hypot(b1), a2p.hypot(b2));
+        let hue = |b: f64, a: f64| b.atan2(a).to_degrees().rem_euclid(360.);
+        let (h1, h2) = (hue(b1, a1p), hue(b2, a2p));
+        let (dl, dc) = (l2 - l1, c2p - c1p);
+        let mut dh = h2 - h1;
+        if c1p * c2p == 0. {
+            dh = 0.;
+        } else if dh > 180. {
+            dh -= 360.;
+        } else if dh < -180. {
+            dh += 360.;
+        }
+        let dhh = 2. * (c1p * c2p).sqrt() * (dh.to_radians() / 2.).sin();
+        let (lb, cbp) = ((l1 + l2) / 2., (c1p + c2p) / 2.);
+        let hb = if c1p * c2p == 0. {
+            h1 + h2
+        } else if (h1 - h2).abs() <= 180. {
+            (h1 + h2) / 2.
+        } else if h1 + h2 < 360. {
+            (h1 + h2 + 360.) / 2.
+        } else {
+            (h1 + h2 - 360.) / 2.
+        };
+        let t = 1. - 0.17 * (hb - 30.).to_radians().cos()
+            + 0.24 * (2. * hb).to_radians().cos()
+            + 0.32 * (3. * hb + 6.).to_radians().cos()
+            - 0.20 * (4. * hb - 63.).to_radians().cos();
+        let dth = 30. * (-((hb - 275.) / 25.).powi(2)).exp();
+        let rc = 2. * (cbp.powi(7) / (cbp.powi(7) + 25f64.powi(7))).sqrt();
+        let sl = 1. + 0.015 * (lb - 50.).powi(2) / (20. + (lb - 50.).powi(2)).sqrt();
+        let (sc, sh) = (1. + 0.045 * cbp, 1. + 0.015 * cbp * t);
+        let rt = -(2. * dth).to_radians().sin() * rc;
+        ((dl / sl).powi(2) + (dc / sc).powi(2) + (dhh / sh).powi(2) + rt * (dc / sc) * (dhh / sh))
+            .sqrt()
+    }
+
+    #[test]
+    fn claude_orange_stays_visibly_apart_from_the_warning_amber_in_both_themes() {
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let claude = t.claude;
+            assert!(ciede2000(claude, t.amber) >= 20., "{theme:?} vs amber");
+            assert!(ciede2000(claude, t.warn) >= 20., "{theme:?} vs warn");
+            assert!(
+                ciede2000(claude, t.csr_share) >= 20.,
+                "{theme:?} vs CSR pink"
+            );
+        }
+    }
+
+    fn agent_at(description: &str, status: &str, last_at_ms: i64) -> agents::Agent {
+        serde_json::from_value(json!({
+            "id": description, "parent": null, "description": description, "type": "Explore",
+            "model": null, "status": status, "started": 1_799_999_000_000_i64,
+            "first_seen": 1_799_999_000_000_i64, "last_at": last_at_ms, "tools": 3, "tokens": 10,
+            "edits": [], "edits_omitted": 0, "overlaps": [], "overlaps_omitted": 0,
+            "last": "", "last_tool": null, "current_turn": null, "completion": null,
+            "listed": true,
+        }))
+        .expect("an agent row")
+    }
+
+    #[test]
+    fn the_agents_bar_warns_only_of_stalled_agents_and_names_one_of_them() {
+        let now = 1_800_000_000.;
+        let stalled_at = 1_799_999_000_000_i64;
+        let live_at = 1_799_999_990_000_i64;
+        let said = |a: &[agents::Agent]| agents_bar(a, now).0;
+        // Nothing stalled: running agents, plainly. No warning word, no "stalled" at all.
+        let one = [agent_at("Fresh scan", "running", live_at)];
+        assert_eq!(said(&one), "1 running · Fresh scan");
+        let mut two = vec![
+            agent_at("Early scan", "running", live_at),
+            agent_at("Late scan", "running", live_at - 5000),
+        ];
+        two[0].first_seen -= 100_000.;
+        assert_eq!(
+            said(&two),
+            "2 running · Late scan",
+            "the newest agent is named"
+        );
+        let waiting = [agent_at("  ", "waiting", live_at)];
+        assert_eq!(said(&waiting), "1 running");
+        // One stalled agent: the warning, naming that agent even when a live one is newer.
+        let only = [agent_at("Scan the repo", "running", stalled_at)];
+        assert_eq!(said(&only), "1 stalled · Scan the repo");
+        let mixed = [
+            agent_at("Old build", "running", stalled_at),
+            agent_at("Fresh scan", "running", live_at),
+        ];
+        assert_eq!(said(&mixed), "1 stalled · Old build");
+        // Several stalled: the one stuck longest is named.
+        let many = [
+            agent_at("Stuck a while", "running", stalled_at + 300_000),
+            agent_at("Stuck longest", "running", stalled_at),
+            agent_at("Fresh scan", "running", live_at),
+        ];
+        assert_eq!(said(&many), "2 stalled · Stuck longest");
+        // A stalled agent with no name leaves no dot, and another stalled name is used if any.
+        let nameless = [agent_at("  ", "running", stalled_at)];
+        assert_eq!(said(&nameless), "1 stalled");
+        let some = [
+            agent_at("  ", "running", stalled_at),
+            agent_at("Named", "running", stalled_at + 1000),
+        ];
+        assert_eq!(said(&some), "2 stalled · Named");
+        // A finished agent is neither counted nor named.
+        let done = [
+            agent_at("Old build", "completed", stalled_at),
+            agent_at("Stuck", "running", stalled_at),
+        ];
+        assert_eq!(said(&done), "1 stalled · Stuck");
+    }
+
+    #[test]
+    fn the_agents_bar_is_amber_only_when_an_agent_is_stalled() {
+        let stalled_at = 1_799_999_000_000_i64;
+        let live_at = 1_799_999_990_000_i64;
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let amber_in_bar = |rows: Vec<agents::Agent>| {
+                let mut c = quota_composition();
+                c.now = 1_800_000_000.;
+                c.agents.agents = rows;
+                let (width, avail) = (1210_u32, 2000_u32);
+                let (pm, m) = draw(&c, width, avail, theme, Open::default(), false).expect("draws");
+                let scale = (width as f32 / W).min(avail as f32 / m.height);
+                let left = ((width as f32 - (W * scale).round().min(width as f32)) / 2.) as u32;
+                let (y, h) = m.agents_region.expect("an agents bar");
+                ink_px(&pm, (y, y + h), scale, left, (W * scale) as u32, t.amber)
+            };
+            assert_eq!(
+                amber_in_bar(vec![agent_at("Fresh scan", "running", live_at)]),
+                0,
+                "{theme:?}: a bar with nothing stalled has no warning ink"
+            );
+            assert!(
+                amber_in_bar(vec![agent_at("Old build", "running", stalled_at)]) > 40,
+                "{theme:?}: a stalled agent is drawn in the warning ink"
+            );
+        }
+    }
+
+    fn quota_composition() -> Composition {
+        let mut c = drill_composition(0, 0, true);
+        c.figure["quotas"] = json!([
+            {"code":"5H","used":18.,"pace":0.1,"text":"5H 18% · 3h left ↻ 11:20"},
+            {"code":"7D","used":45.,"pace":0.4,"text":"7D 45% · 4d left ↻ Sun 07:00"},
+        ]);
+        c.figure["cache"] = json!({"left": 1800., "ttl": 3600., "text": "CACHE 30m left"});
+        c.codex_week = json!({"percent": 41.});
+        c.csr_cost.share = Some(4.7);
+        // The checks that use this draw the circles; the dashboard has its own.
+        c.figure["layout"] = json!("rings");
+        c
+    }
+
+    #[test]
+    fn a_tapped_circle_lists_only_its_own_facts() {
+        let c = quota_composition();
+        let all = figure_text_rows(&c, 100, true, None).join("\n");
+        for code in ["5H 18%", "7D 45%", "30m left", "Codex 7D 41%"] {
+            assert!(all.contains(code), "{code}: {all}");
+        }
+        for (gauge, has, lacks) in [
+            (Gauge::FiveHour, "5H 18%", "7D 45%"),
+            (Gauge::Week, "7D 45%", "5H 18%"),
+            (Gauge::Cache, "30m left", "5H 18%"),
+            (Gauge::Codex, "Codex 7D 41%", "7D 45%"),
+        ] {
+            let own = figure_text_rows(&c, 100, true, Some(gauge)).join("\n");
+            assert!(own.contains(has), "{gauge:?}: {own}");
+            assert!(!own.contains(lacks), "{gauge:?}: {own}");
+            assert!(!own.contains("CTX"), "{gauge:?}: {own}");
+        }
+        // A circle that is not drawn falls back to the whole list.
+        let mut bare = quota_composition();
+        bare.codex_week = json!({});
+        assert_eq!(
+            figure_text_rows(&bare, 100, true, Some(Gauge::Codex)),
+            figure_text_rows(&bare, 100, true, None)
+        );
+    }
+
+    /// Pixels within `tol` of `ink` in a band of rows (layout pt) across the card.
+    fn ink_px(
+        pm: &tiny_skia::Pixmap,
+        rows: (f32, f32),
+        scale: f32,
+        left: u32,
+        w: u32,
+        ink: Rgba,
+    ) -> usize {
+        let near =
+            |p: &[u8], c: [u8; 4]| (0..3).all(|i| (i32::from(p[i]) - i32::from(c[i])).abs() <= 6);
+        let mut n = 0;
+        for y in (rows.0 * scale) as u32..(rows.1 * scale) as u32 {
+            for x in left..(left + w).min(pm.width()) {
+                let px = pm.pixel(x, y).expect("in the picture");
+                n += usize::from(near(&[px.red(), px.green(), px.blue()], ink));
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn every_drawn_circle_has_its_own_tap_and_its_swatch_sits_in_its_caption() {
+        let c = quota_composition();
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let (width, avail) = (1210_u32, 1800_u32);
+            let (pm, m) = draw(&c, width, avail, theme, Open::default(), false).expect("draws");
+            let codes: Vec<_> = m.quota_gauges.iter().map(|g| g.code.as_str()).collect();
+            assert_eq!(codes, vec!["5H", "7D", "cache", "Codex 7D"], "{theme:?}");
+            let taps: Vec<_> = m.quota_gauges.iter().map(|g| g.tap.expect("tap")).collect();
+            for (g, tap) in m.quota_gauges.iter().zip(&taps) {
+                assert!(tap.0 < g.center.0 && g.center.0 < tap.2, "{}", g.code);
+                assert!(tap.1 <= g.center.1 - g.radius + 0.01, "{}", g.code);
+                assert!(tap.3 > g.center.1 + g.radius, "{}", g.code);
+                assert_eq!(
+                    Gauge::from_code(&g.code).map(Gauge::code),
+                    Some(g.code.as_str())
+                );
+            }
+            for pair in taps.windows(2) {
+                assert!(pair[0].2 <= pair[1].0 + 0.01, "taps overlap: {pair:?}");
+            }
+            // The swatch is in the caption, not in a row of its own: each slot's caption band
+            // (the two caption lines under its ring) holds the colour its ring is drawn in.
+            let scale = (width as f32 / W).min(avail as f32 / m.height);
+            let left = (width as f32 - (W * scale).round().min(width as f32)) / 2.;
+            for (i, (code, ink)) in [("5H", t.claude), ("7D", t.claude), ("cache", t.mint)]
+                .into_iter()
+                .enumerate()
+            {
+                let tap = taps[i];
+                let band = (tap.3 - 2. * theme::CAPTION_LINE - S1, tap.3);
+                let slot = ((tap.2 - tap.0) * scale) as u32;
+                let found = ink_px(
+                    &pm,
+                    band,
+                    scale,
+                    (tap.0 * scale).max(left) as u32,
+                    slot,
+                    ink,
+                );
+                assert!(
+                    found >= 15,
+                    "{theme:?}: {found} {code}-coloured px in its caption"
+                );
+                let amber = ink_px(
+                    &pm,
+                    band,
+                    scale,
+                    (tap.0 * scale).max(left) as u32,
+                    slot,
+                    t.amber,
+                );
+                assert_eq!(amber, 0, "{theme:?}: {code} caption has warning amber");
+            }
+            // Nothing under the captions: the old legend row's band is empty of swatch colour.
+            let below = (taps[0].3 + 1., taps[0].3 + NOTES_H);
+            let width_px = (W * scale) as u32;
+            assert_eq!(
+                ink_px(&pm, below, scale, left as u32, width_px, t.claude),
+                0,
+                "{theme:?}: a legend row is still drawn under the captions"
+            );
+        }
+    }
+
+    fn forecast_composition(text: &str, out: bool) -> Composition {
+        let mut c = quota_composition();
+        for q in c.figure["quotas"].as_array_mut().unwrap() {
+            q["forecast"] = json!({"text": text, "out": out});
+        }
+        c
+    }
+
+    #[test]
+    fn a_forecast_is_a_line_under_the_circles_and_no_forecast_is_no_line() {
+        let with = forecast_composition("→ ~74% at reset", false);
+        let hot = forecast_composition("out ~15:40", true);
+        let bare = quota_composition();
+        assert!(mid_min_h(&with.figure) > mid_min_h(&bare.figure));
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let (width, avail) = (1210_u32, 2000_u32);
+            let band_of = |c: &Composition| {
+                let (pm, m) = draw(c, width, avail, theme, Open::default(), false).expect("draws");
+                let scale = (width as f32 / W).min(avail as f32 / m.height);
+                let left = (width as f32 - (W * scale).round().min(width as f32)) / 2.;
+                (pm, m, scale, left as u32, (W * scale) as u32)
+            };
+            let (pm, m, scale, left, w) = band_of(&with);
+            assert_eq!(m.note_rows.len(), 1, "{theme:?}");
+            let row = m.note_rows[0];
+            let band = (row - theme::CAPTION_LINE + S1, row + S1);
+            assert!(
+                ink_px(&pm, band, scale, left, w, t.quiet) >= 8,
+                "{theme:?}: no forecast text in the notes line"
+            );
+            // The tap of each circle reaches over the line.
+            for g in &m.quota_gauges {
+                if matches!(g.code.as_str(), "5H" | "7D") {
+                    assert!(
+                        g.tap.unwrap().3 >= row,
+                        "{}: tap ends above the notes line",
+                        g.code
+                    );
+                }
+            }
+            // A forecast of a window that fills early is drawn in the warning ink.
+            let (pm, m, scale, left, w) = band_of(&hot);
+            let row = m.note_rows[0];
+            let band = (row - theme::CAPTION_LINE + S1, row + S1);
+            assert!(
+                ink_px(&pm, band, scale, left, w, t.amber) >= 8,
+                "{theme:?}: out is not amber"
+            );
+            // With nothing to say there is no line at all.
+            let (pm, m, scale, left, w) = band_of(&bare);
+            assert!(m.note_rows.is_empty(), "{theme:?}");
+            let below = (
+                m.quota_gauges[0].tap.unwrap().3 + 1.,
+                m.quota_gauges[0].tap.unwrap().3 + NOTES_H,
+            );
+            assert_eq!(ink_px(&pm, below, scale, left, w, t.amber), 0);
+        }
+        // The facts say it in words, for the text pane and a tapped circle.
+        let rows = figure_text_rows(&with, 100, true, None).join("\n");
+        assert!(
+            rows.lines()
+                .any(|l| l.starts_with("5H 18%") && l.ends_with("· → ~74% at reset")),
+            "{rows}"
+        );
+        let own = figure_text_rows(&with, 100, true, Some(Gauge::FiveHour)).join("\n");
+        assert!(own.contains("→ ~74% at reset"), "{own}");
+        assert!(!figure_text_rows(&bare, 100, true, None)
+            .join("\n")
+            .contains("at reset"));
+    }
+
+    /// Every pane height a terminal can give, as frames whose figure card is a full card (tall
+    /// enough for the mid layout; a shorter one is the strip, which has no notes line and no caption):
+    /// the figure's top and height, and the frame's metrics.
+    fn figure_sweep(c: &Composition, open: Open) -> Vec<(f32, f32, Metrics)> {
+        let closed = !open.figure;
+        let mut out = vec![];
+        for width in [560_u32, 704] {
+            for avail in (600..=1400).step_by(12) {
+                let Some((_, m)) = draw(c, width, avail, Theme::Dark, open, false) else {
+                    continue;
+                };
+                let (top, h) = m.figure_region;
+                if h >= mid_min_h(&c.figure) - MID_MIN_SLOP {
+                    out.push((top, h, m));
+                } else {
+                    // Only an open section squeezes the card to a strip; a closed pane never.
+                    assert!(!closed, "closed pane {width}x{avail}: figure card {h:.1}pt");
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_forecast_line_stays_under_the_circles_when_the_figure_is_short() {
+        let c = forecast_composition("→ ~74% at reset", false);
+        for open in [
+            Open::default(),
+            Open {
+                figure: true,
+                ..Open::default()
+            },
+        ] {
+            let frames = figure_sweep(&c, open);
+            assert!(frames.len() > 30, "{} frames drawn", frames.len());
+            for (top, h, m) in &frames {
+                // A full ring on a card with no spare room keeps the ring: the line takes only
+                // room that is spare there (see `figure`). Every other card shows it.
+                let spare = h - collapsed_context_layout(&c.figure, *h).2;
+                if m.ring_bounds.is_some()
+                    && m.fresh_plots.is_empty()
+                    && spare < notes_h(&c.figure) + S2
+                {
+                    continue;
+                }
+                assert_eq!(
+                    m.note_rows.len(),
+                    1,
+                    "figure={}: figure card {h:.1}pt has no notes line",
+                    open.figure
+                );
+                let row = m.note_rows[0];
+                assert!(
+                    *top < row && row < top + h,
+                    "figure={}: notes line {row:.1} outside the card {top:.1}..{:.1}",
+                    open.figure,
+                    top + h
+                );
+            }
+        }
+    }
+
+    /// A figure the dashboard draws: windows with their outlook, a breakdown, CSR's tallies.
+    fn dash_composition(sev: &str) -> Composition {
+        let mut c = quota_composition();
+        c.figure.as_object_mut().unwrap().remove("layout");
+        c.figure["outlook"] = json!({
+            "headline": {"text": "On track. You should reach Thursday's reset with room to spare.", "sev": sev},
+            "windows": [
+                {"code":"5H","name":"5 Hour","used":18.,"sev":"ok","tick":46.,"early":false,
+                 "blended":false,"line":"On pace for about 46% by reset · resets in 4h 35m"},
+                {"code":"7D","name":"Weekly","used":45.,"sev":"ok","tick":71.,"early":true,
+                 "blended":true,"line":"On pace for about 71% by reset · resets in 2d 20h (early)"},
+            ],
+        });
+        c.figure["breakdown"] = json!({
+            "caption": "this turn +1.6k · Claude 1.3k · you 0.3k (est.)",
+            "floor": 28000., "text": 20000., "you": 4000., "tool": 60000., "csr": 8000.,
+            "free": 880000., "total": 120000., "size": 1000000.,
+            "turn": null, "estimated": true,
+        });
+        c.figure["asks"] = json!(4);
+        c.tally = json!({"by_csr": 2, "by_you": 0, "payback": 851_000.});
+        c
+    }
+
+    /// The dashboard's sizes: (width px, available height px) of a 35x30, the owner's 44x30 and a
+    /// 60x40 pane, at 16x34 px a cell.
+    const DASH_SIZES: [(u32, u32); 3] = [(560, 1020), (704, 1020), (960, 1360)];
+
+    #[test]
+    fn the_dashboard_reads_top_to_bottom_in_words_at_every_size_and_theme() {
+        let c = dash_composition("ok");
+        for theme in [Theme::Dark, Theme::Light] {
+            for (w, h) in DASH_SIZES {
+                for open in [
+                    Open::default(),
+                    Open {
+                        figure: true,
+                        ..Open::default()
+                    },
+                ] {
+                    let at = format!("{theme:?} {w}x{h} figure={}", open.figure);
+                    let (_, m) = draw(&c, w, h, theme, open, false).expect("draws");
+                    let d = m
+                        .dash
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{at}: no dashboard"));
+                    // A. one headline sentence, then B. the limits, C. the context, D. CSR.
+                    let (head, _) = d.headline.as_ref().expect("a headline");
+                    assert!(head.starts_with("On track."), "{at}: {head}");
+                    let codes: Vec<_> = d.limits.iter().map(|l| l.code.as_str()).collect();
+                    assert_eq!(codes, vec!["5H", "7D", "CX"], "{at}");
+                    assert!(d.limits[0].line.contains("On pace for about 46% by reset"));
+                    assert!(d.limits[1].line.ends_with("(early)"), "{at}");
+                    for l in &d.limits {
+                        let (bx, by, bw, bh) = l.bar;
+                        assert!(bw > 200. && bh >= 6., "{at}: {l:?}");
+                        assert!(bx >= IX && bx + bw <= IX + IW + 0.01, "{at}: {l:?}");
+                        assert!((0. ..=1.).contains(&l.fill), "{at}: {l:?}");
+                        assert!(
+                            by > m.figure_region.0 && by < m.figure_region.0 + m.figure_region.1
+                        );
+                    }
+                    // The forecast tick sits where the outlook said, on the bar.
+                    assert_eq!(d.limits[0].tick, Some(0.46));
+                    assert_eq!(d.limits[1].tick, Some(0.71));
+                    assert_eq!(d.limits[2].tick, None, "Codex has no forecast");
+                    assert!(
+                        d.context_head.as_deref().unwrap().contains("12% used"),
+                        "{at}"
+                    );
+                    assert!(d
+                        .context_head
+                        .as_deref()
+                        .unwrap()
+                        .contains("880k free of 1M"));
+                    let row = d.csr_row.as_deref().expect("a CSR row");
+                    assert!(
+                        row.starts_with("CSR this session: 2 compactions · ~851k tokens saved"),
+                        "{at}: {row}"
+                    );
+                    assert!(row.contains("4 recalls used"), "{at}: {row}");
+                    // E. the chart comes with `i`, never without it.
+                    if !open.figure {
+                        assert!(!d.chart, "{at}");
+                    }
+                    // The card holds all of it: the figure card is inside the picture.
+                    let (top, ch) = m.figure_region;
+                    assert!(top + ch <= m.height, "{at}");
+                    // The facts card that repeated the circles is gone, and so are the circles.
+                    assert!(m.figure_detail_region.is_none(), "{at}");
+                    assert!(m.quota_gauges.is_empty(), "{at}");
+                }
+            }
+        }
+        // The owner's size, expanded: the chart is under the rows.
+        let open = Open {
+            figure: true,
+            ..Open::default()
+        };
+        let (_, m) = draw(&c, 704, 1020, Theme::Dark, open, false).expect("draws");
+        assert!(m.dash.unwrap().chart);
+        assert_eq!(m.fresh_plots.len(), 1);
+    }
+
+    #[test]
+    fn every_bar_segment_has_a_labelled_swatch_row_and_est_is_said_once() {
+        let c = dash_composition("ok");
+        for theme in [Theme::Dark, Theme::Light] {
+            for (w, h) in DASH_SIZES {
+                for open in [
+                    Open::default(),
+                    Open {
+                        figure: true,
+                        ..Open::default()
+                    },
+                ] {
+                    let at = format!("{theme:?} {w}x{h} figure={}", open.figure);
+                    let (_, m) = draw(&c, w, h, theme, open, false).expect("draws");
+                    let d = m.dash.expect("dashboard");
+                    let names: Vec<_> = d.segments.iter().map(|s| s.name.as_str()).collect();
+                    assert_eq!(
+                        names,
+                        vec!["System + tools", "Messages", "Tool results", "CSR injected"],
+                        "{at}"
+                    );
+                    let (bx, _, bw, _) = d.context_bar.expect("the context bar");
+                    let mut end = bx;
+                    for s in &d.segments {
+                        let legend = s.legend.as_deref().unwrap_or_else(|| panic!("{at}: {s:?}"));
+                        assert!(
+                            legend.starts_with(&s.name) && legend.contains('~'),
+                            "{at}: {legend}"
+                        );
+                        assert!(s.w >= 1.5 && s.x >= end - 0.01 && s.x + s.w <= bx + bw + 0.01);
+                        end = s.x + s.w;
+                    }
+                    // Messages are the person's and Claude's text together: 24k of 120k.
+                    assert_eq!(d.segments[1].legend.as_deref(), Some("Messages ~24k"));
+                    assert_eq!(d.est_marks, 1, "{at}");
+                }
+            }
+        }
+        // With no turn caption the card still says est. once, and with none of the parts it
+        // draws one segment and says nothing of estimates.
+        let mut quiet = dash_composition("ok");
+        quiet.figure["breakdown"]["caption"] = Value::Null;
+        let (_, m) = draw(&quiet, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        let d = m.dash.unwrap();
+        assert!(d.turn.is_none() && d.est_marks == 1);
+        quiet.figure["breakdown"] = Value::Null;
+        let (_, m) = draw(&quiet, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        let d = m.dash.unwrap();
+        assert_eq!(d.segments.len(), 1);
+        assert_eq!(d.segments[0].name, "In use");
+        assert_eq!(d.est_marks, 0);
+    }
+
+    #[test]
+    fn the_headline_is_in_the_colour_of_its_state() {
+        type Pick = fn(&Tokens) -> Rgba;
+        let states: [(&str, Pick); 3] = [
+            ("ok", |t| t.mint),
+            ("amber", |t| t.amber),
+            ("red", |t| t.risk),
+        ];
+        for (sev, pick) in states {
+            for theme in [Theme::Dark, Theme::Light] {
+                let t = theme.tokens();
+                let c = dash_composition(sev);
+                let (w, h) = (704_u32, 1020_u32);
+                let (pm, m) = draw(&c, w, h, theme, Open::default(), false).expect("draws");
+                let scale = (w as f32 / W).min(h as f32 / m.height);
+                let left = ((w as f32 - (W * scale).round().min(w as f32)) / 2.) as u32;
+                let top = m.figure_region.0 + P;
+                let own = ink_px(
+                    &pm,
+                    (top, top + DASH_HEAD_LINE),
+                    scale,
+                    left,
+                    (W * scale) as u32,
+                    pick(t),
+                );
+                assert!(own >= 40, "{theme:?} {sev}: {own} px of its own ink");
+                // And the other states' inks are not in the headline.
+                for other in ["ok", "amber", "red"].into_iter().filter(|o| *o != sev) {
+                    let ink = match other {
+                        "ok" => t.mint,
+                        "amber" => t.amber,
+                        _ => t.risk,
+                    };
+                    let n = ink_px(
+                        &pm,
+                        (top, top + DASH_HEAD_LINE),
+                        scale,
+                        left,
+                        (W * scale) as u32,
+                        ink,
+                    );
+                    assert!(n < own / 4, "{theme:?} {sev}: {n} px of {other}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_csr_row_drops_each_part_that_has_no_data() {
+        let row = |edit: &dyn Fn(&mut Composition)| {
+            let mut c = dash_composition("ok");
+            c.csr_cost.share = Some(0.4);
+            edit(&mut c);
+            let (_, m) = draw(&c, 960, 1280, Theme::Dark, Open::default(), false).unwrap();
+            m.dash.unwrap().csr_row
+        };
+        let all = row(&|_| {}).expect("a row");
+        for part in [
+            "2 compactions",
+            "~851k tokens saved",
+            "4 recalls used",
+            "0.4 pts of the weekly limit",
+        ] {
+            assert!(all.contains(part), "{all}");
+        }
+        let no_tally = row(&|c| c.tally = Value::Null).unwrap();
+        assert!(
+            !no_tally.contains("compaction") && !no_tally.contains("saved"),
+            "{no_tally}"
+        );
+        assert!(no_tally.contains("4 recalls used"));
+        let no_asks = row(&|c| c.figure["asks"] = json!(0)).unwrap();
+        assert!(
+            !no_asks.contains("recall") && no_asks.contains("2 compactions"),
+            "{no_asks}"
+        );
+        let none = row(&|c| {
+            c.tally = Value::Null;
+            c.figure["asks"] = json!(0);
+            c.csr_cost.share = None;
+        });
+        assert_eq!(none, None, "no data, no row and no empty label");
+        // One compaction and one recall are singular.
+        let one = row(&|c| {
+            c.tally = json!({"by_csr": 1});
+            c.figure["asks"] = json!(1);
+        })
+        .unwrap();
+        assert!(
+            one.contains("1 compaction ·") && one.contains("1 recall used"),
+            "{one}"
+        );
+    }
+
+    #[test]
+    fn the_cache_row_says_warm_with_its_time_left_and_cold_with_its_cost() {
+        let row = |cache: Value| {
+            let mut c = dash_composition("ok");
+            c.figure["cache"] = cache;
+            let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+            m.dash.unwrap().cache_row
+        };
+        let warm = row(json!({"long": "WARM · 59m left", "cold": false, "left": 3540.}));
+        assert_eq!(warm.as_deref(), Some("Cache warm · 59m left"));
+        let cold = row(json!({"long": "COLD · re-reads ~92k", "cold": true}));
+        assert_eq!(cold.as_deref(), Some("Cache cold · re-reads ~92k"));
+        // No reading, no row, and the CSR row never claims the cache was kept warm.
+        assert_eq!(row(json!({"long": "--", "cold": false})), None);
+        let mut c = dash_composition("ok");
+        c.figure["cache"] = json!({"long": "WARM · 59m left", "cold": false});
+        let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        assert!(!m.dash.unwrap().csr_row.unwrap().contains("warm"));
+    }
+
+    #[test]
+    fn the_codex_bar_shows_only_when_codex_data_exists() {
+        let mut c = dash_composition("ok");
+        c.codex_week = json!({});
+        let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        let codes: Vec<_> = m
+            .dash
+            .unwrap()
+            .limits
+            .iter()
+            .map(|l| l.code.clone())
+            .collect();
+        assert_eq!(codes, vec!["5H", "7D"]);
+    }
+
+    #[test]
+    fn a_figure_without_an_outlook_still_shows_its_windows_and_no_headline() {
+        let mut c = dash_composition("ok");
+        c.figure.as_object_mut().unwrap().remove("outlook");
+        let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        let d = m.dash.unwrap();
+        assert!(d.headline.is_none());
+        assert_eq!(d.limits.len(), 3);
+        assert!(
+            d.limits[0].line.starts_with("18% used"),
+            "{}",
+            d.limits[0].line
+        );
+        assert_eq!(d.limits[0].tick, None);
+    }
+
+    #[test]
+    fn the_dashboard_fills_the_closed_card_at_the_live_44_column_size_without_a_blank_gap() {
+        // The closed card at 44x30 is the dashboard in its compact form: the rows two to a row.
+        let c = dash_composition("amber");
+        let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
+        let d = m.dash.unwrap();
+        assert!(!d.chart && !d.full);
+        let (top, h) = m.figure_region;
+        let plan = dash_plan(&fonts().unwrap(), &c, Theme::Dark.tokens()).unwrap();
+        assert!(
+            h + 0.5 >= dash_compact_h(&plan),
+            "{h} < compact {}",
+            dash_compact_h(&plan)
+        );
+        assert!(top > 0. && top + h <= m.height);
+    }
+
+    fn breakdown_composition() -> Composition {
+        let mut c = quota_composition();
+        c.figure["breakdown"] = json!({
+            "caption": "this turn +9k · tool results 6k · CSR 1.1k (est.)",
+            "floor": 28000., "text": 20000., "tool": 60000., "csr": 12000.,
+            "free": 880000., "total": 120000., "size": 1000000.,
+            "turn": null, "estimated": true,
+        });
+        c
+    }
+
+    #[test]
+    fn a_forecast_never_takes_the_breakdown_bars_row_in_the_mid_card() {
+        let mut c = breakdown_composition();
+        for q in c.figure["quotas"].as_array_mut().unwrap() {
+            q["forecast"] = json!({"text": "→ ~15% at reset", "out": false});
+        }
+        let mut no_forecast = breakdown_composition();
+        no_forecast.figure["quotas"] = c.figure["quotas"].clone();
+        for q in no_forecast.figure["quotas"].as_array_mut().unwrap() {
+            q.as_object_mut().unwrap().remove("forecast");
+        }
+        // The live 44x30 pane's closed card is 163pt tall: the mid layout, a forecast under the
+        // circles, the caption and the bar all in it.
+        let mut checked = 0;
+        for (comp, forecast) in [(&c, true), (&no_forecast, false)] {
+            for (top, h, m) in figure_sweep(comp, Open::default()) {
+                if m.mid_layout.is_none() || h < 160. {
+                    continue;
+                }
+                checked += 1;
+                assert_eq!(m.note_rows.len(), usize::from(forecast), "card {h:.1}pt");
+                assert_eq!(
+                    m.breakdown_bars.len(),
+                    1,
+                    "card {h:.1}pt at {top:.1}: forecast={forecast}: no breakdown bar"
+                );
+            }
+        }
+        assert!(
+            checked >= 4,
+            "{checked} mid cards of 160pt or more were swept"
+        );
+    }
+
+    #[test]
+    fn the_context_card_draws_what_fills_the_context_and_what_the_last_turn_added() {
+        let with = breakdown_composition();
+        let bare = quota_composition();
+        for open in [
+            Open::default(),
+            Open {
+                figure: true,
+                ..Open::default()
+            },
+        ] {
+            let frames = figure_sweep(&with, open);
+            assert!(frames.len() > 30, "{} frames drawn", frames.len());
+            let mut drawn = 0;
+            for (top, h, m) in &frames {
+                assert!(m.breakdown_bars.len() <= 1, "figure={}", open.figure);
+                for (_, y, w, bh) in &m.breakdown_bars {
+                    drawn += 1;
+                    assert!(*w > 60., "bar {w}pt wide");
+                    assert!(
+                        *y >= *top && y + bh <= top + h,
+                        "figure={}: bar {y:.1}..{:.1} outside the card {top:.1}..{:.1}",
+                        open.figure,
+                        y + bh,
+                        top + h
+                    );
+                }
+            }
+            // Most card heights have room for it; the rest keep the words and drop the bar.
+            assert!(
+                drawn * 2 > frames.len(),
+                "figure={}: {drawn}/{}",
+                open.figure,
+                frames.len()
+            );
+            for (_, _, m) in figure_sweep(&bare, open) {
+                assert!(m.breakdown_bars.is_empty(), "no breakdown, no bar");
+            }
+        }
+        // The bar shows CSR's share in CSR's ink, and the words are in the facts.
+        for theme in [Theme::Dark, Theme::Light] {
+            let t = theme.tokens();
+            let (width, avail) = (1210_u32, 2000_u32);
+            let (pm, m) = draw(&with, width, avail, theme, Open::default(), false).expect("draws");
+            let scale = (width as f32 / W).min(avail as f32 / m.height);
+            let left = ((width as f32 - (W * scale).round().min(width as f32)) / 2.) as u32;
+            let (x, y, w, bh) = *m.breakdown_bars.first().expect("a bar");
+            let band = (y, y + bh);
+            let wide = (W * scale) as u32;
+            assert!(
+                ink_px(&pm, band, scale, left, wide, t.csr_share) >= 4,
+                "{theme:?}: no CSR share"
+            );
+            assert!(
+                ink_px(&pm, band, scale, left, wide, t.mint) >= 4,
+                "{theme:?}: no tool results"
+            );
+            assert!(x >= 0. && x + w <= W);
+        }
+        let rows = figure_text_rows(&with, 100, true, None).join("\n");
+        assert!(
+            rows.contains("this turn +9k · tool results 6k · CSR 1.1k (est.)"),
+            "{rows}"
+        );
+        assert!(!figure_text_rows(&bare, 100, true, None)
+            .join("\n")
+            .contains("this turn"));
+    }
+
+    #[test]
+    fn the_by_csr_caption_stays_inside_the_context_card() {
+        let mut c = quota_composition();
+        c.tally = json!({"by_csr": 3});
+        let mut mid = 0;
+        for open in [
+            Open::default(),
+            Open {
+                figure: true,
+                ..Open::default()
+            },
+        ] {
+            for (top, h, m) in figure_sweep(&c, open) {
+                mid += usize::from(m.mid_layout.is_some());
+                assert_eq!(m.by_csr.len(), 1, "figure card {h:.1}pt: caption count");
+                let (cap_top, cap_bottom) = m.by_csr[0];
+                assert!(
+                    cap_top >= top && cap_bottom <= top + h,
+                    "figure card {top:.1}..{:.1}: caption at {cap_top:.1}..{cap_bottom:.1}",
+                    top + h
+                );
+            }
+        }
+        assert!(mid > 0, "the sweep never reached the mid layout");
+    }
+
+    #[test]
     fn the_text_pane_reads_monologue_verb_and_time() {
         let now = 1_800_000_000.;
         let (data, mut s) = timeline_data();
@@ -4692,7 +6678,10 @@ mod tests {
         );
         assert!(all.contains("10 min ago · ☾"), "{all}");
         assert!(all.contains("♻ made room · Compacted"), "{all}");
-        assert!(all.contains("↳ asked · Decide the release name"), "{all}");
+        assert!(
+            all.contains("↳ left open · Decide the release name"),
+            "{all}"
+        );
         assert!(
             all.contains("20 min ago · ~ tinkered · summarizer.rs"),
             "{all}"
@@ -5289,6 +7278,10 @@ mod tests {
                     let (shown, m) = draw(&c, w, h, Theme::Dark, open, false).expect("draws");
                     assert_ne!(shown.data(), closed.data(), "{at}: the picture must change");
                     match key {
+                        "i" if m.dash.is_some() => {
+                            // The dashboard is its own facts: no second card repeats it.
+                            assert!(m.figure_detail_region.is_none(), "{at}");
+                        }
                         "i" => {
                             let (_, card) = m
                                 .figure_detail_region
@@ -5375,11 +7368,14 @@ mod tests {
                                 + (bands as f32 * ROW_PITCH - ROW_GAP).max(40.);
                             assert!(card >= least, "{at}: {card} < {least}");
                         }
+                        _ if m.dash.is_some() => {
+                            assert!(m.figure_detail_region.is_none(), "{at}");
+                        }
                         _ => {
                             let (_, card) = m
                                 .figure_detail_region
                                 .unwrap_or_else(|| panic!("{at}: no facts card"));
-                            let lines = figure_detail_lines(&c).len().min(3);
+                            let lines = figure_detail_lines(&c, None).len().min(3);
                             assert!(card >= P * 2. + lines as f32 * DRILL_LINE, "{at}: {card}");
                         }
                     }

@@ -426,12 +426,18 @@ pub fn gauges(
     } else {
         median_of(&diffs[diffs.len().saturating_sub(5)..])
     };
+    let breakdown = match (tokens, size) {
+        (Some(n), Some(size)) => super::breakdown::figure(&s["breakdown"], n, size),
+        _ => Value::Null,
+    };
     json!({
         "ctx": {
             "tokens": tokens,
             "size": size,
             "sev": sev,
         },
+        "breakdown": breakdown,
+        "asks": array(&s["asked"]).len(),
         "band": {"low": super::app::state::BAND_LOW, "high": super::app::state::BAND_HIGH},
         "floor": {
             "tokens": floor,
@@ -1245,6 +1251,39 @@ mod usage_tests {
     }
     fn rows(g: &Value) -> Vec<String> {
         cockpit(g, 49).iter().map(|r| plain(r)).collect()
+    }
+
+    #[test]
+    fn test_the_gauges_carry_the_breakdown_only_for_the_context_it_describes() {
+        let mut t = super::super::breakdown::Tally::default();
+        t.text(3600);
+        t.reply(30_000.);
+        t.prompt();
+        t.tool_result(36_000);
+        let kept = t.reply(40_000.);
+        let fields = json!({"context_window": {"context_window_size": 1000000}});
+        let s = json!({"main": [[T0 + 60., 40000]], "breakdown": kept});
+        let g = gauges(&fields, Some(T0), &s, T0 + 70., &Value::Null, &Value::Null);
+        assert_eq!(g["breakdown"]["total"], json!(40_000.));
+        assert_eq!(g["breakdown"]["size"], json!(1_000_000.));
+        assert!(g["breakdown"]["caption"]
+            .as_str()
+            .unwrap()
+            .starts_with("this turn +10k"));
+        // A context that no longer matches the kept reply (after a compaction) has no breakdown.
+        let s = json!({"main": [[T0 + 60., 9000]], "breakdown": s["breakdown"]});
+        let g = gauges(&fields, Some(T0), &s, T0 + 70., &Value::Null, &Value::Null);
+        assert_eq!(g["breakdown"], Value::Null);
+        // And none without a window size.
+        let g = gauges(
+            &Value::Null,
+            None,
+            &Value::Null,
+            T0,
+            &Value::Null,
+            &Value::Null,
+        );
+        assert_eq!(g["breakdown"], Value::Null);
     }
 
     #[test]
