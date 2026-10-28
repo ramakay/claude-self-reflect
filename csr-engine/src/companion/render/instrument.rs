@@ -3152,19 +3152,21 @@ pub fn draw(
     let has_answers = c.dream.state == Batch::Ready || c.offer;
     // The hero keeps to 30% of the pane-derived height: a long question or status loses its
     // last lines ("…") instead of growing the canvas, which would shrink every font (rule 2).
-    let hero_rest = P * 2.
-        + theme::TITLE_LINE
-        + S2
-        + if meta_rows.is_empty() {
-            0.
-        } else {
-            (if compact_hero { 0. } else { S3 }) + meta_rows.len() as f32 * theme::CAPTION_LINE
-        }
-        + if has_answers {
-            S1 + theme::CAPTION_LINE
-        } else {
-            0.
-        };
+    let hero_rest = |meta: usize| {
+        P * 2.
+            + theme::TITLE_LINE
+            + S2
+            + if meta == 0 {
+                0.
+            } else {
+                (if compact_hero { 0. } else { S3 }) + meta as f32 * theme::CAPTION_LINE
+            }
+            + if has_answers {
+                S1 + theme::CAPTION_LINE
+            } else {
+                0.
+            }
+    };
     let hero_budget = (maxh * 0.30).floor();
     let hero_text_h = |q: usize, s: usize| {
         q as f32 * question_line_height
@@ -3174,14 +3176,23 @@ pub fn draw(
                 S2 + s as f32 * theme::CAPTION_LINE
             }
     };
-    let (full_q, full_s) = (question.len(), status_lines.len());
-    while hero_rest + hero_text_h(question.len(), status_lines.len()) > hero_budget {
+    let (full_q, full_s, full_m) = (question.len(), status_lines.len(), meta_rows.len());
+    while hero_rest(meta_rows.len()) + hero_text_h(question.len(), status_lines.len()) > hero_budget
+    {
         if status_lines.len() > 1 {
             status_lines.pop();
         } else if question.len() > 1 {
             question.pop();
+        } else if meta_rows.len() > 1 {
+            meta_rows.pop();
         } else {
             break;
+        }
+    }
+    // Meta rows cut: the last kept part says so.
+    if meta_rows.len() < full_m {
+        if let Some(last) = meta_rows.last_mut().and_then(|row| row.last_mut()) {
+            *last = "…".into();
         }
     }
     let ellipsize = |lines: &mut Vec<String>, full: usize, st: St| {
