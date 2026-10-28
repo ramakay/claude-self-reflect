@@ -2954,16 +2954,12 @@ pub fn draw(
         0.
     };
     let notice_gap = if c.notice.is_some() { S3 } else { 0. };
-    // The CSR performance card sits right above the Context card.
-    let soak = c.soak.as_ref().map(|card| soak_plan(f, card, t));
-    let soak_h = soak.as_ref().map_or(0., |p| p.h);
-    let soak_gap = if soak_h > 0. { S3 } else { 0. };
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
     // The figure card's smallest height: its one-row gauge strip (or the quotas row).
     let figure_floor: f32 = if quotas_only { 154. } else { 110. };
     // A closed pane keeps the Context card tall enough for the small circles, their notes line and
     // the caption; a card an open section squeezed below that is the strip.
-    let dash = dash_plan(f, c, t);
+    let mut dash = dash_plan(f, c, t);
     let figure_closed_floor: f32 = if let Some(plan) = &dash {
         figure_floor.max(dash_compact_h(plan))
     } else if quotas_only || narrow {
@@ -2997,11 +2993,6 @@ pub fn draw(
         (CONFUSED_TITLE, &c.confusing, false),
         (SHOULD_BE_TITLE, &c.should_be, true),
     ];
-    let observed_full_h: f32 = observed
-        .iter()
-        .filter(|(_, items, _)| !items.is_empty())
-        .map(|(_, items, _)| observation_card_h(items.len()) + S3)
-        .sum();
     let observed_fold_h: f32 = observed
         .iter()
         .filter(|(_, items, _)| !items.is_empty())
@@ -3016,8 +3007,22 @@ pub fn draw(
         + if active { S3 } else { 0. }
         + empty_help
         + if empty_help > 0. { S3 } else { 0. };
-    // Everything above the figure for one choice of observation cards and story card.
-    let top_for = |observed_h: f32, story_h: f32| {
+    // Text keeps one size: the width fit, `limit` pt of layout for this pane, or what the pane held
+    // before the performance card, the credit row and the rings existed (lists and story whole),
+    // if that was more. Content that does not fit is dropped, never scaled, in this order:
+    //   1. the CSR performance card's check rows (a failing check stays),
+    //   2. its clock and progress bar (the heading and the headline stay),
+    //   3. the lists' rows, down to 3,
+    //   4. the API credit row,
+    //   5. the lists' rows, down to 1,
+    //   6. "CSR this session" from rings to one line of words,
+    //   7. each list folded to its title row,
+    //   8. the story folded to its title row.
+    // The hero, the story, the limits and the context keep their size. Only when all of that still
+    // overflows does the layout grow, and the picture with it shrink. A list or the story is folded
+    // only for the performance card, which stays in the pane in some form.
+    let limit = maxh;
+    let top_with = |observed_h: f32, story_h: f32, soak_h: f32| {
         M + hero_h
             + S3
             + observed_h
@@ -3026,8 +3031,83 @@ pub fn draw(
             + notice_h
             + notice_gap
             + soak_h
-            + soak_gap
+            + if soak_h > 0. { S3 } else { 0. }
     };
+    let observed_with = |cap: usize| -> f32 {
+        observed
+            .iter()
+            .filter(|(_, items, _)| !items.is_empty())
+            .map(|(_, items, _)| {
+                if cap == 0 {
+                    observation_fold_h() + S3
+                } else {
+                    observation_card_h(items.len().min(cap)) + S3
+                }
+            })
+            .sum()
+    };
+    let (soak_level, obs_cap, keep_credit, rings_compact, story_fold) = {
+        // (soak level, list row cap, keep the credit row, rings as one line, story folded), most
+        // content first.
+        const STEPS: [(u8, usize, bool, bool, bool); 9] = [
+            (2, usize::MAX, true, false, false),
+            (1, usize::MAX, true, false, false),
+            (0, usize::MAX, true, false, false),
+            (0, 3, true, false, false),
+            (0, 3, false, false, false),
+            (0, 1, false, false, false),
+            (0, 1, false, true, false),
+            (0, 0, false, true, false),
+            (0, 0, false, true, true),
+        ];
+        let need = |&(level, cap, credit, compact, fold): &(u8, usize, bool, bool, bool),
+                    with_soak: bool| {
+            let soak_h = c
+                .soak
+                .as_ref()
+                .filter(|_| with_soak)
+                .map_or(0., |card| soak_plan(f, card, t, level).h);
+            let floor = match &dash {
+                Some(plan) => figure_floor.max(dash_heights_with(plan, false, credit, compact).4),
+                None => figure_closed_floor,
+            };
+            let story_h = if fold { story_fold_h } else { story_h };
+            (top_with(observed_with(cap), story_h, soak_h) + tail_base + floor)
+                / (1. - S3 / available_height as f32)
+        };
+        let limit = limit.max(need(&(0, usize::MAX, false, true, false), false));
+        // Without a performance card there is nothing to make room for: no list or story folds.
+        let steps = if c.soak.is_some() {
+            &STEPS[..]
+        } else {
+            &STEPS[..7]
+        };
+        *steps
+            .iter()
+            .find(|step| need(step, true) <= limit)
+            // Short of a fit the text shrinks anyway, and no card is folded for it.
+            .unwrap_or(&STEPS[6])
+    };
+    if let Some(plan) = dash.as_mut() {
+        plan.fit(DashFit {
+            credit: keep_credit,
+            compact_rings: rings_compact,
+        });
+    }
+    let figure_closed_floor = match &dash {
+        Some(plan) => figure_floor.max(dash_compact_h(plan)),
+        None => figure_closed_floor,
+    };
+    // The CSR performance card sits right above the Context card.
+    let soak = c
+        .soak
+        .as_ref()
+        .map(|card| soak_plan(f, card, t, soak_level));
+    let soak_h = soak.as_ref().map_or(0., |p| p.h);
+    let observed_full_h = observed_with(obs_cap);
+    let story_h = if story_fold { story_fold_h } else { story_h };
+    // Everything above the figure for one choice of observation cards and story card.
+    let top_for = |observed_h: f32, story_h: f32| top_with(observed_h, story_h, soak_h);
     // The canvas is the closed pane's: an open section never makes it taller. Layout points may
     // scale to fit a narrow/wide terminal; reserve S3 in final pixels.
     let maxh = maxh.max(
@@ -3067,8 +3147,8 @@ pub fn draw(
     let mut room = maxh - key_gap - top_for(observed_full_h, story_h) - tail_base - figure_pref;
     let mut observed_h = observed_full_h;
     let mut story_card_h = story_h;
-    let mut folded = false;
-    let mut story_folded = false;
+    let mut folded = obs_cap == 0;
+    let mut story_folded = story_fold;
     // Float noise in `room` never folds a card for a section that is not open.
     let needs = |room: f32| want > 0. && want > room;
     if needs(room) && observed_fold_h < observed_full_h {
@@ -3397,7 +3477,8 @@ pub fn draw(
             y += h + card_gap;
             continue;
         }
-        let h = observation_card_h(items.len());
+        let shown = items.len().min(obs_cap);
+        let h = observation_card_h(shown);
         panel(&mut canvas, y, h, t);
         label(
             &mut canvas,
@@ -3409,6 +3490,17 @@ pub fn draw(
             t.ink,
             t.bold,
         );
+        if shown < items.len() {
+            canvas.text(
+                f,
+                &format!("{shown} of {} · o opens", items.len()),
+                IX + IW,
+                y + P + f.cap(caption),
+                caption,
+                t.quiet,
+                A::R,
+            );
+        }
         observation_titles.push((
             if should {
                 ObsCard::ShouldBe
@@ -3419,7 +3511,7 @@ pub fn draw(
             y + P + theme::TITLE_LINE,
         ));
         let mut row_y = y + P + theme::TITLE_LINE + S2;
-        for (index, item) in items.iter().enumerate() {
+        for (index, item) in items.iter().take(shown).enumerate() {
             observation_rows.push((
                 if should {
                     ObsCard::ShouldBe
@@ -3740,6 +3832,10 @@ pub fn draw(
         t,
         open.figure && figure_h >= FIGURE_EXPANDED_BASE,
         narrow,
+        DashFit {
+            credit: keep_credit,
+            compact_rings: rings_compact,
+        },
     );
     if let Some((cy, ring, group, avail, mid)) = fig_info {
         ceiling_y = cy;
@@ -4244,9 +4340,11 @@ fn figure(
     t: &Tokens,
     expanded: bool,
     narrow: bool,
+    dash_fit: DashFit,
 ) -> Option<FigureInfo> {
     let g = &data.figure;
-    if let Some(plan) = dash_plan(f, data, t) {
+    if let Some(mut plan) = dash_plan(f, data, t) {
+        plan.fit(dash_fit);
         if h + 0.5 >= dash_compact_h(&plan) {
             panel(c, y, h, t);
             draw_dashboard(c, f, data, &plan, y, h, expanded, t);
@@ -4577,30 +4675,54 @@ const DASH_PART_COL: f32 = 150.;
 struct SoakPlan {
     head: Vec<String>,
     h: f32,
+    /// Whether the clock line and its progress bar are drawn.
+    clock: bool,
+    /// 2: every check row. 1 and 0: only a failing check; 0 also drops the clock and bar.
+    level: u8,
 }
 /// The height of the progress bar under the card's clock line.
 const SOAK_BAR_H: f32 = 6.;
 
-fn soak_plan(f: &Fonts, card: &crate::companion::live_eval::Card, t: &Tokens) -> SoakPlan {
+fn soak_plan(
+    f: &Fonts,
+    card: &crate::companion::live_eval::Card,
+    t: &Tokens,
+    level: u8,
+) -> SoakPlan {
     let head: Vec<String> = f
         .wrap(&card.line1, heading(t), IW)
         .into_iter()
         .take(2)
         .collect();
-    let rows = card.rows.len() + usize::from(card.warning.is_some());
+    let clock = level >= 1 && !card.line2.is_empty();
+    let rows = soak_rows(card, level).count() + usize::from(card.warning.is_some());
     let h = P
         + theme::TITLE_LINE
         + S2
         + head.len() as f32 * DASH_HEAD_LINE
-        + if card.line2.is_empty() {
-            0.
-        } else {
+        + if clock {
             S1 + theme::CAPTION_LINE + S1 + SOAK_BAR_H
+        } else {
+            0.
         }
         + if rows > 0 { S2 } else { 0. }
         + rows as f32 * DASH_ROW
         + P;
-    SoakPlan { head, h }
+    SoakPlan {
+        head,
+        h,
+        clock,
+        level,
+    }
+}
+/// The check rows a card shows at `level`: all of them at 2, only the failing ones below.
+fn soak_rows(
+    card: &crate::companion::live_eval::Card,
+    level: u8,
+) -> impl Iterator<Item = &crate::companion::live_eval::Row> {
+    card.rows
+        .iter()
+        .filter(move |row| level >= 2 || row.sev == "red")
 }
 
 /// The CSR performance card at `y`: its heading, the big number and headline, the clock with its
@@ -4648,7 +4770,7 @@ fn draw_soak(
         c.text(f, &shown, IX, at + f.cap(st), st, ink, A::L);
         at += DASH_HEAD_LINE;
     }
-    if !card.line2.is_empty() {
+    if plan.clock {
         at += S1;
         single(
             c,
@@ -4669,11 +4791,11 @@ fn draw_soak(
         }
         at += SOAK_BAR_H;
     }
-    if !card.rows.is_empty() || card.warning.is_some() {
+    if soak_rows(card, plan.level).next().is_some() || card.warning.is_some() {
         at += S2;
     }
     let row_st = sans(11., t.regular);
-    for row in &card.rows {
+    for row in soak_rows(card, plan.level) {
         let mark = match row.sev.as_str() {
             "ok" => t.mint,
             "red" => t.risk,
@@ -4735,7 +4857,24 @@ struct DashPlan {
     csr: Vec<CsrRing>,
     /// The most lines any ring's label wraps to.
     csr_label_lines: usize,
+    /// "CSR this session" as one line of words, for a pane too short for its rings.
+    csr_compact: bool,
     status: Option<(String, bool)>,
+}
+
+/// What the layout dropped from the dashboard to keep the text size.
+#[derive(Clone, Copy)]
+struct DashFit {
+    credit: bool,
+    compact_rings: bool,
+}
+impl DashPlan {
+    fn fit(&mut self, fit: DashFit) {
+        if !fit.credit {
+            self.credit.clear();
+        }
+        self.csr_compact = fit.compact_rings;
+    }
 }
 
 /// One ring of "CSR this session": the number in it, the words under it, and the fraction of the
@@ -4957,6 +5096,7 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
         cache,
         csr,
         csr_label_lines,
+        csr_compact: false,
         status,
     })
 }
@@ -4964,13 +5104,22 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
 /// The heights of the dashboard's sections: (headline, limits, context, CSR) and their sum with
 /// the card's padding. `full` lists the parts one to a row; the compact layout sets two to a row.
 fn dash_heights(p: &DashPlan, full: bool) -> (f32, f32, f32, f32, f32) {
+    dash_heights_with(p, full, true, p.csr_compact)
+}
+/// `dash_heights` with the API credit row and the rings of "CSR this session" kept or dropped.
+fn dash_heights_with(
+    p: &DashPlan,
+    full: bool,
+    credit: bool,
+    compact: bool,
+) -> (f32, f32, f32, f32, f32) {
     let head = if p.head.is_empty() {
         0.
     } else {
         p.head.len() as f32 * DASH_HEAD_LINE + S2
     };
     let limits = (p.limits.len() + usize::from(p.codex.is_some())) as f32 * DASH_LIMIT_PITCH
-        + if p.credit.is_empty() {
+        + if p.credit.is_empty() || !credit {
             0.
         } else {
             p.credit.len() as f32 * DASH_ROW + S1
@@ -4994,6 +5143,8 @@ fn dash_heights(p: &DashPlan, full: bool) -> (f32, f32, f32, f32, f32) {
     };
     let csr = if p.csr.is_empty() {
         0.
+    } else if compact {
+        20.
     } else {
         theme::TITLE_LINE
             + S2
@@ -5286,7 +5437,30 @@ fn draw_dashboard(
         let _ = ctx_h;
     }
     // D. what CSR did this session: a ring to each measured value, its words under it
-    if !p.csr.is_empty() {
+    if !p.csr.is_empty() && p.csr_compact {
+        let st = sans(11., t.medium);
+        let lead = "CSR this session: ";
+        let lead_w = f.width(lead, sans(11., t.bold));
+        let mut parts: Vec<&str> = p.csr.iter().map(|r| r.label.as_str()).collect();
+        while parts.len() > 1 && lead_w + f.width(&parts.join(" · "), st) > IW - 10. {
+            parts.pop();
+        }
+        let base = at + 2. + f.cap(st);
+        c.rrect(IX, at, 3., 15., 1.5, t.csr_share);
+        c.text(
+            f,
+            lead,
+            IX + 10.,
+            base,
+            sans(11., t.bold),
+            t.csr_share,
+            A::L,
+        );
+        let rest = f.fit(&parts.join(" · "), st, IW - 10. - lead_w);
+        c.text(f, &rest, IX + 10. + lead_w, base, st, t.ink, A::L);
+        dash.csr_row = Some(format!("{lead}{rest}"));
+        at += 20.;
+    } else if !p.csr.is_empty() {
         label(
             c,
             f,
@@ -6560,9 +6734,10 @@ mod tests {
         c
     }
 
-    /// The dashboard's sizes: (width px, available height px) of a 35x30, the owner's 44x30 and a
-    /// 60x40 pane, at 16x34 px a cell.
-    const DASH_SIZES: [(u32, u32); 3] = [(560, 1020), (704, 1020), (960, 1360)];
+    /// The dashboard's sizes: (width px, available height px) of panes the dashboard fits whole,
+    /// with its credit row, its rings and the chart `i` asks for, at the width-fit text size.
+    /// Shorter panes drop those first; the fit tests below cover them.
+    const DASH_SIZES: [(u32, u32); 3] = [(560, 1060), (704, 1500), (960, 2000)];
 
     #[test]
     fn the_dashboard_reads_top_to_bottom_in_words_at_every_size_and_theme() {
@@ -6630,12 +6805,20 @@ mod tests {
                 }
             }
         }
-        // The owner's size, expanded: the chart is under the rows.
+        // A 44-column pane tall enough for it, expanded: the chart is under the rows.
         let open = Open {
             figure: true,
             ..Open::default()
         };
-        let (_, m) = draw(&c, 704, 1020, Theme::Dark, open, false).expect("draws");
+        let (_, m) = draw(
+            &c,
+            DASH_SIZES[1].0,
+            DASH_SIZES[1].1,
+            Theme::Dark,
+            open,
+            false,
+        )
+        .expect("draws");
         assert!(m.dash.unwrap().chart);
         assert_eq!(m.fresh_plots.len(), 1);
     }
@@ -7056,9 +7239,45 @@ mod tests {
                     m.dash.is_some(),
                     "the Context card still draws its dashboard"
                 );
-                assert!(h > 100., "a big number, a clock and five checks: {h}pt");
+                // At least its heading and its headline; the checks come with room.
+                assert!(h >= 80., "{theme:?} {size:?}: {h}pt");
             }
         }
+        let (_, m) = draw(&c, 704, 1800, Theme::Dark, Open::default(), false).unwrap();
+        let (_, h) = m.soak_region.expect("the card is drawn");
+        assert!(
+            h > 150.,
+            "with room: a big number, a clock and five checks: {h}pt"
+        );
+    }
+
+    #[test]
+    fn a_short_pane_drops_the_card_rows_then_its_clock_and_keeps_the_headline() {
+        let card_h = |card: crate::companion::live_eval::Card, h: u32| {
+            let mut c = dash_composition("ok");
+            c.soak = Some(card);
+            let (_, m) = draw(&c, 704, h, Theme::Dark, Open::default(), false).unwrap();
+            m.soak_region.expect("the card stays").1
+        };
+        // The taller the pane, the more of the card: rows, then clock and bar, then the headline.
+        let heights: Vec<f32> = [900, 1100, 1250, 1400, 1500, 1600, 1800]
+            .into_iter()
+            .map(|h| card_h(soak_card(5), h))
+            .collect();
+        assert!(heights.windows(2).all(|w| w[0] <= w[1]), "{heights:?}");
+        let (short, tall) = (heights[0], heights[heights.len() - 1]);
+        assert!(
+            heights.iter().any(|h| *h > short && *h < tall),
+            "{heights:?}"
+        );
+        assert!(short >= 80., "the heading and the headline stay: {short}");
+        // A failing check stays when the rows go.
+        let mut failing = soak_card(5);
+        failing.rows[1].sev = "red".into();
+        assert!(
+            card_h(failing, 900) > short,
+            "a failing check keeps its row"
+        );
     }
 
     #[test]
@@ -7168,9 +7387,15 @@ mod tests {
         let c = dash_composition("amber");
         let (_, m) = draw(&c, 704, 1020, Theme::Dark, Open::default(), false).unwrap();
         let d = m.dash.unwrap();
-        assert!(!d.chart && !d.full);
+        assert!(!d.chart);
         let (top, h) = m.figure_region;
-        let plan = dash_plan(&fonts().unwrap(), &c, Theme::Dark.tokens()).unwrap();
+        // Whatever the pane dropped, the card holds the dashboard it kept: at the least, the
+        // one without the credit row and with the rings as a line.
+        let mut plan = dash_plan(&fonts().unwrap(), &c, Theme::Dark.tokens()).unwrap();
+        plan.fit(DashFit {
+            credit: false,
+            compact_rings: true,
+        });
         assert!(
             h + 0.5 >= dash_compact_h(&plan),
             "{h} < compact {}",

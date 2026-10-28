@@ -676,6 +676,150 @@ fn all_nine_states_and_both_themes_have_honest_top_frame_goldens() {
         }
     }
 }
+/// The pane's text scale: the width fit, or the height fit when the layout is taller than the
+/// pane. 605 is the layout width in pt. This is what `instrument::draw` resizes the picture by.
+fn text_scale(cols: usize, rows: usize, cell: (u32, u32), layout_height: f32) -> f32 {
+    let width = (cols as u32 * cell.0) as f32;
+    let available = (rows.saturating_sub(1) as u32 * cell.1) as f32;
+    (width / 605.).min(available / layout_height)
+}
+/// One state through the real top frame at `cols`x`rows` of `cell` pixels a cell:
+/// (layout height in pt, the performance card's (top, height) when drawn, whether the Context
+/// card drew its dashboard).
+fn frame_layout(
+    state: &str,
+    theme: Theme,
+    cols: usize,
+    rows: usize,
+    cell: (u32, u32),
+) -> (f32, Option<(f32, f32)>, bool) {
+    csr_engine::companion::render::kitty::set_cell_override(Some(cell));
+    let (_home, paths) = state_home(state);
+    let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+    pane.theme = theme;
+    pane.pixels = true;
+    pane.enable_cards();
+    if state == "03-agents" {
+        pane.key("i");
+    }
+    pane.frame(cols, rows, NOW);
+    let m = pane
+        .instrument_metrics
+        .as_ref()
+        .expect("the instrument drew");
+    let out = (m.height, m.soak_region, m.dash.is_some());
+    csr_engine::companion::render::kitty::set_cell_override(None);
+    out
+}
+/// The layout height (pt) d6a4787f drew each state at, per pane size, read from its goldens. That
+/// build had no performance card, no API credit row and no CSR rings; its text scale is the one
+/// the owner is used to. Sizes are (cols, rows, cell px). The owner's real pane is 35x30 at 26x58
+/// (herdr reports 455x870 px for it).
+const D6_SIZES: [(usize, usize, (u32, u32)); 5] = [
+    (35, 30, (16, 34)),
+    (38, 30, (16, 34)),
+    (44, 30, (16, 34)),
+    (60, 40, (16, 34)),
+    (35, 30, (26, 58)),
+];
+const D6_HEIGHTS: [(&str, [f32; 5]); 14] = [
+    ("01-empty", [1065.232, 981.135, 847.344, 835.656, 1118.253]),
+    (
+        "02-running",
+        [1065.232, 981.135, 867.559, 889.046, 1118.253],
+    ),
+    ("03-agents", [1065.232, 981.135, 930.322, 951.612, 1118.253]),
+    ("04-band", [1065.232, 981.135, 867.559, 889.046, 1118.253]),
+    (
+        "05-compacting",
+        [1065.232, 981.135, 867.559, 889.046, 1118.253],
+    ),
+    ("06-after", [1065.232, 981.135, 930.322, 951.612, 1118.253]),
+    ("07-away", [1065.232, 981.135, 930.322, 951.612, 1118.253]),
+    ("08-offer", [1065.232, 981.135, 847.344, 838.589, 1118.253]),
+    (
+        "08b-nothing",
+        [1065.232, 981.135, 847.344, 835.656, 1118.253],
+    ),
+    (
+        "09-api-cost",
+        [1065.232, 981.135, 847.344, 852.717, 1118.253],
+    ),
+    (
+        "10-unknown-cost",
+        [1065.232, 981.135, 867.559, 889.046, 1118.253],
+    ),
+    (
+        "11-last-time",
+        [1065.232, 981.135, 847.344, 835.656, 1118.253],
+    ),
+    ("12-fresh", [1065.232, 981.135, 867.559, 889.046, 1118.253]),
+    ("13-flat", [1065.232, 981.135, 867.559, 889.046, 1118.253]),
+];
+/// 13a4a6c4 made card titles 17 pt on a 23 pt line (13 on 18 before): 5 pt a titled card, four
+/// cards on a running session, plus the 6 pt margin the measured 44x30 case shows.
+const TITLE_GROWTH_ALLOWANCE: f32 = 27.;
+#[test]
+fn no_pane_size_draws_text_smaller_than_d6a4787f_did() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (state, d6) in D6_HEIGHTS {
+            // The performance card adds to a running session; its d6 reference is that session.
+            let mut names = vec![state];
+            if state == "02-running" {
+                names.push("14-soak");
+            }
+            for (i, (cols, rows, cell)) in D6_SIZES.into_iter().enumerate() {
+                // d6a4787f's layout, plus the title enlargement of 13a4a6c4.
+                let allowance = TITLE_GROWTH_ALLOWANCE;
+                let want = text_scale(cols, rows, cell, d6[i] + allowance);
+                for name in &names {
+                    let (height, _, _) = frame_layout(name, theme, cols, rows, cell);
+                    let got = text_scale(cols, rows, cell, height);
+                    assert!(
+                        got >= want - 1e-4,
+                        "{theme:?} {name} {cols}x{rows}@{cell:?}: text scale {got:.4} is below \
+                         d6a4787f's {want:.4} (layout {height:.1}pt vs {:.1}pt)",
+                        d6[i]
+                    );
+                }
+            }
+        }
+    }
+}
+/// The owner's pane: 35 columns by 30 rows, 13x29 px a cell as herdr reports it (455x870 px), which
+/// the pane doubles. d6a4787f drew every state of it at the full width scale, 1.504 px per pt.
+#[test]
+fn the_owners_pane_keeps_the_full_width_text_scale_with_the_performance_card_on() {
+    let want = 910. / 605.;
+    for theme in [Theme::Dark, Theme::Light] {
+        for state in ["02-running", "14-soak"] {
+            let (height, soak, _) = frame_layout(state, theme, 35, 30, (26, 58));
+            let got = text_scale(35, 30, (26, 58), height);
+            assert!(
+                (got - want).abs() < 1e-4,
+                "{theme:?} {state}: text scale {got:.4} px/pt, not the width fit {want:.4} \
+                 (layout {height:.1}pt in a pane that holds {:.1}pt)",
+                1682. * 605. / 910.
+            );
+            assert_eq!(soak.is_some(), state == "14-soak");
+        }
+    }
+}
+#[test]
+fn the_performance_card_stays_while_a_trial_exists_at_every_pane_size() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for (cols, rows, cell) in D6_SIZES {
+            let (_, soak, dash) = frame_layout("14-soak", theme, cols, rows, cell);
+            assert!(
+                dash,
+                "{cols}x{rows}@{cell:?}: the Context card lost its dashboard"
+            );
+            let (_, h) = soak.unwrap_or_else(|| panic!("{cols}x{rows}@{cell:?}: no card"));
+            // At least its heading and its headline.
+            assert!(h >= 80., "{cols}x{rows}@{cell:?}: card {h}pt");
+        }
+    }
+}
 #[test]
 fn live_keys_keep_one_surface_and_switch_theme_without_restart() {
     let (_home, paths) = state_home("02-running");
@@ -2700,7 +2844,7 @@ fn which_item(copy: &str) -> Option<usize> {
 fn every_row_of_the_three_cards_opens_its_own_item_by_click_or_by_a_step() {
     use csr_engine::companion::render::{kitty, theme::BODY_LINE};
     let mut table = vec![];
-    for (cols, rows) in [(46, 30), (40, 50)] {
+    for (cols, rows) in [(46, 36), (40, 50)] {
         let (_home, paths) = observed_home();
         let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
         pane.pixels = true;

@@ -10,7 +10,18 @@ pub fn pixels_enabled() -> bool {
 pub fn pixels_for(program: &str, override_value: Option<&str>) -> bool {
     override_value != Some("0") && matches!(program, "herdr" | "kitty" | "ghostty" | "WezTerm")
 }
+thread_local! {
+    static CELL_OVERRIDE: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+}
+/// Make this thread see terminal cells of `cell` pixels (None: ask the terminal). A headless run
+/// has no tty to ask, so a test or a screenshot run uses it to draw at a real pane's pixel size.
+pub fn set_cell_override(cell: Option<(u32, u32)>) {
+    CELL_OVERRIDE.with(|c| c.set(cell));
+}
 pub fn cell_size() -> (u32, u32) {
+    if let Some(cell) = CELL_OVERRIDE.with(std::cell::Cell::get) {
+        return cell;
+    }
     cell_from_window(crossterm::terminal::window_size().ok().as_ref())
 }
 fn cell_from_window(size: Option<&crossterm::terminal::WindowSize>) -> (u32, u32) {
