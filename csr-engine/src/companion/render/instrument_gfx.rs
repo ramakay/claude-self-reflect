@@ -614,6 +614,8 @@ pub struct Canvas {
     pub cuts: Vec<Cut>,
     /// What the next cut rows are called in their popup. Empty: do not record them.
     pub cut_title: &'static str,
+    /// Every run of text drawn: left, top, right, bottom in pt, and the words.
+    pub runs: Vec<(f32, f32, f32, f32, String)>,
 }
 
 /// One limit bar of the dashboard: a window used so far, with a tick where it is headed.
@@ -673,7 +675,21 @@ pub struct Dash {
     pub chart: bool,
     /// How many times the word "est." is on the card.
     pub est_marks: usize,
+    /// Where the rows drawn end, with the card's bottom padding, and where the card ends, in
+    /// layout pt: rows past the card are drawn over what lies under it.
+    pub rows_bottom: f32,
+    pub card_bottom: f32,
+    /// The session-mix donut: its verdict, the Tools/Context/Other shares, and (cx, cy, outer r).
+    pub mix: Option<SessionMix>,
+    /// The window the parts bar spans when Claude Code's auto-compact window is known, and
+    /// the auto-compact buffer segment (x, width) at its end.
+    pub window: Option<f64>,
+    pub buffer: Option<(f32, f32)>,
 }
+
+/// The session-mix donut as drawn: its verdict, the Tools/Context/Other shares, and
+/// (cx, cy, outer radius) in layout pt.
+pub type SessionMix = (String, [f32; 3], (f32, f32, f32));
 
 /// One row the picture drew shortened, so a click on it can show the whole text.
 #[derive(Clone, Debug, PartialEq)]
@@ -948,6 +964,7 @@ impl Canvas {
             fresh_plots: Vec::new(),
             cuts: Vec::new(),
             cut_title: "In full",
+            runs: Vec::new(),
         }
     }
     pub fn dry() -> Canvas {
@@ -963,6 +980,7 @@ impl Canvas {
             fresh_plots: Vec::new(),
             cuts: Vec::new(),
             cut_title: "In full",
+            runs: Vec::new(),
         }
     }
     pub fn fill(&mut self, p: &Path, col: Rgba) {
@@ -1240,6 +1258,16 @@ impl Canvas {
             }
         };
         let by = (base * S).round();
+        if !s.trim().is_empty() {
+            let left = ox / S;
+            self.runs.push((
+                left,
+                base - st.size * 0.72,
+                left + adv_pt,
+                base + st.size * 0.2,
+                s.to_owned(),
+            ));
+        }
         let (w, h) = (self.pm.width() as i32, self.pm.height() as i32);
         let data = self.pm.data_mut();
         for p in &glyphs {
@@ -1363,6 +1391,7 @@ pub fn contact(f: &Fonts, tiles: &[(String, Pixmap, String)], path: &str, bg: Rg
         fresh_plots: Vec::new(),
         cuts: Vec::new(),
         cut_title: "",
+        runs: Vec::new(),
     };
     c.pm.fill(color(bg));
     let mut y = gap;

@@ -269,6 +269,8 @@ pub struct Open {
     pub dreams: bool,
     /// An observation item shown in full over the pane.
     pub popup: Option<PopupAt>,
+    /// The stacked card open under the stack row, as a `STACKABLE` index.
+    pub stack: Option<usize>,
 }
 /// The threads timeline's heading and its subtitle.
 const MONOLOGUE: &str = "Monologue";
@@ -617,6 +619,7 @@ impl Composition {
                     &data["forecast"],
                 ),
                 &data["rings"],
+                &data["native_window"],
             ),
             tally: if notice
                 .as_deref()
@@ -1015,6 +1018,226 @@ fn meta(c: &Composition) -> String {
         bits.push("carried".into());
     }
     bits.join(" · ")
+}
+/// A card's tier (PANE_RULES.md #3): 0 is never folded, 1 never folds and stays small, 2 folds
+/// into the stack row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CardSpec {
+    /// The titles a `CardRegion` of this card carries.
+    pub titles: &'static [&'static str],
+    pub tier: u8,
+    /// Its `STACKABLE` index when it folds into the stack.
+    pub stack: Option<usize>,
+}
+/// Every card the picture draws. A card not listed here fails the pane contract suite.
+pub const CARD_REGISTRY: &[CardSpec] = &[
+    CardSpec {
+        titles: &["hero"],
+        tier: 0,
+        stack: None,
+    },
+    CardSpec {
+        titles: &["stack"],
+        tier: 0,
+        stack: None,
+    },
+    CardSpec {
+        titles: &["Context"],
+        tier: 0,
+        stack: None,
+    },
+    CardSpec {
+        titles: &["Agents", "Dreams"],
+        tier: 0,
+        stack: None,
+    },
+    CardSpec {
+        titles: &[MONOLOGUE],
+        tier: 0,
+        stack: None,
+    },
+    CardSpec {
+        titles: &[CHANGES],
+        tier: 0,
+        stack: None,
+    },
+    CardSpec {
+        titles: &["figure facts"],
+        tier: 0,
+        stack: None,
+    },
+    CardSpec {
+        titles: &["notice"],
+        tier: 1,
+        stack: None,
+    },
+    CardSpec {
+        titles: &["agents"],
+        tier: 1,
+        stack: None,
+    },
+    CardSpec {
+        titles: &["help"],
+        tier: 1,
+        stack: None,
+    },
+    CardSpec {
+        titles: &[CONFUSED_TITLE],
+        tier: 2,
+        stack: Some(0),
+    },
+    CardSpec {
+        titles: &[SHOULD_BE_TITLE],
+        tier: 2,
+        stack: Some(1),
+    },
+    CardSpec {
+        titles: &["Where the work stands", "This session"],
+        tier: 2,
+        stack: Some(2),
+    },
+    CardSpec {
+        titles: &["CSR performance"],
+        tier: 2,
+        stack: Some(3),
+    },
+];
+/// The stack row as drawn: where it is, the stackable cards it holds (`STACKABLE` indexes), the
+/// span of each title drawn (left, right, kind) for taps, and the card open under it.
+#[derive(Clone, Debug, Default)]
+pub struct StackRow {
+    pub top: f32,
+    pub height: f32,
+    pub kinds: Vec<usize>,
+    pub titles: Vec<&'static str>,
+    pub spans: Vec<(f32, f32, usize)>,
+    pub open: Option<usize>,
+}
+/// Draw the stack row at `y`: a slim card with two sheet edges under it, "N more" and each folded
+/// card's title, the open one in ink, and the key that opens it at the right.
+fn draw_stack_row(
+    c: &mut Canvas,
+    f: &Fonts,
+    kinds: &[usize],
+    open: Option<usize>,
+    y: f32,
+    t: &Tokens,
+) -> StackRow {
+    let body_h = STACK_H - 8.;
+    // The sheets of the folded cards peek out under the row.
+    for (inset, drop) in [(20., 8.), (10., 4.)] {
+        c.rrect(
+            M + inset,
+            y + drop,
+            CW - 2. * inset,
+            body_h,
+            14.,
+            al(t.glass[1], 0.9),
+        );
+        c.rrect_line(
+            M + inset,
+            y + drop,
+            CW - 2. * inset,
+            body_h,
+            14.,
+            t.hair,
+            t.hair_width,
+        );
+    }
+    c.shadow(M, y, CW, body_h, 14., t.contact_shadow);
+    c.glass(
+        M,
+        y,
+        CW,
+        body_h,
+        14.,
+        lin(
+            0.,
+            y,
+            0.,
+            y + body_h,
+            &[(t.linear_at[0], t.glass[0]), (t.linear_at[1], t.glass[1])],
+        ),
+    );
+    c.rrect_line(M, y, CW, body_h, 14., t.hair, t.hair_width);
+    let medium = sans(theme::CAPTION_SIZE, t.medium);
+    let regular = sans(theme::CAPTION_SIZE, t.regular);
+    let base = y + body_h / 2. + f.cap(medium) / 2.;
+    let key = if open.is_some() { "e close" } else { "e open" };
+    let key_w = f.width(key, medium);
+    c.rrect(
+        IX + IW - key_w - S1,
+        base - f.cap(medium) - S1 / 2. - 1.,
+        key_w + S2,
+        theme::CHIP_LINE,
+        S1,
+        t.chip,
+    );
+    c.text(f, key, IX + IW + S1 - S1, base, medium, t.dream, A::R);
+    let right = IX + IW - key_w - S3;
+    let mut x = IX;
+    x += c.text(
+        f,
+        &format!("{} more", kinds.len()),
+        x,
+        base,
+        medium,
+        t.ink,
+        A::L,
+    );
+    let mut row = StackRow {
+        top: y,
+        height: STACK_H,
+        kinds: kinds.to_vec(),
+        titles: kinds.iter().map(|k| STACKABLE[*k].1).collect(),
+        spans: vec![],
+        open,
+    };
+    for &kind in kinds {
+        let name = STACKABLE[kind].1;
+        let sep = " · ";
+        let w = f.width(sep, regular) + f.width(name, medium);
+        if x + w > right {
+            c.text(f, " …", x, base, regular, t.quiet, A::L);
+            break;
+        }
+        x += c.text(f, sep, x, base, regular, t.quiet, A::L);
+        let is_open = open == Some(kind);
+        let st = if is_open {
+            sans(theme::CAPTION_SIZE, t.bold)
+        } else {
+            medium
+        };
+        let w = c.text(
+            f,
+            name,
+            x,
+            base,
+            st,
+            if is_open { t.dream } else { t.quiet },
+            A::L,
+        );
+        if is_open {
+            c.rect(x, base + 2.5, w, 1.5, t.dream);
+        }
+        row.spans.push((x, x + w, kind));
+        x += w;
+    }
+    row
+}
+/// The radius of the dreamer's token ring on its meta row, in layout pt.
+const BUDGET_RING_R: f32 = 5.;
+/// The width one part of the dreamer card's meta row takes: the token ring takes room before the
+/// budget's words, which drop their "dreamer" (the card says it).
+fn meta_part_width(f: &Fonts, part: &str, t: &Tokens) -> f32 {
+    if let Some(rest) = part.strip_prefix("dreamer ") {
+        2. * BUDGET_RING_R + ICON_GAP + f.width(rest, sans(theme::CAPTION_SIZE, t.regular))
+    } else if part.starts_with('⌗') {
+        f.width(part, mono(theme::CHIP_SIZE, t.regular))
+    } else {
+        f.width(part, sans(theme::CAPTION_SIZE, t.regular))
+    }
+    .min(IW)
 }
 /// A card of `rows` one-line observations under its title.
 fn observation_card_h(rows: usize) -> f32 {
@@ -1670,9 +1893,13 @@ fn earlier_intent(intent: &str) -> &str {
     intent.strip_prefix("you asked: ").unwrap_or(intent)
 }
 /// A figure that asks for the older ring layouts when `rings` is true.
-fn with_layout(mut figure: Value, rings: &Value) -> Value {
+fn with_layout(mut figure: Value, rings: &Value, native_window: &Value) -> Value {
     if *rings == true {
         figure["layout"] = json!("rings");
+    }
+    // The window Claude Code's own auto-compact works to, when settings or its env var set one.
+    if figure["ctx"].is_object() && native_window.as_f64().is_some_and(|w| w > 0.) {
+        figure["ctx"]["window"] = native_window.clone();
     }
     figure
 }
@@ -2723,6 +2950,18 @@ impl CardRegion {
 pub struct Metrics {
     /// Every card drawn, top to bottom.
     pub cards: Vec<CardRegion>,
+    /// Each card whose content was drawn past its own bottom: (title, where the content ends,
+    /// where the card ends), in layout pt.
+    pub overdrawn: Vec<(&'static str, f32, f32)>,
+    /// The pane's height in layout pt: the canvas is never taller.
+    pub limit: f32,
+    /// What the fit needed past its last step, when that was more than `limit`: the picture is
+    /// cut at the pane's bottom.
+    pub clipped: Option<f32>,
+    /// The stack row, when cards are folded into one.
+    pub stack: Option<StackRow>,
+    /// Every run of text drawn: left, top, right, bottom in layout pt, and the words.
+    pub text_runs: Vec<(f32, f32, f32, f32, String)>,
     pub csr_cost: InstrumentCost,
     pub quota_gauges: Vec<QuotaGauge>,
     /// Baseline of the line of notes drawn under the quota circles, in layout pt.
@@ -2837,9 +3076,13 @@ pub fn draw(
     let has_story = !page && (!c.story.is_empty() || !c.shifts.is_empty() || !c.learnt.is_empty());
     let story_age =
         has_story && !c.story_age.is_empty() && (!c.story.is_empty() || !c.shifts.is_empty());
-    let story_h = if !has_story {
-        0.
-    } else {
+    // The story card's height with at most `lines` story rows and `shifts` change rows.
+    let story_shift_rows = c.shifts.len().min(3);
+    let story_h_with = |lines: usize, shifts: usize| -> f32 {
+        if !has_story {
+            return 0.;
+        }
+        let shifts = shifts.min(story_shift_rows);
         P * 2.
             + theme::TITLE_LINE
             + S2
@@ -2848,32 +3091,39 @@ pub fn draw(
             } else {
                 0.
             }
-            + (story_line_rows + usize::from(!c.learnt.is_empty())) as f32 * theme::BODY_LINE
-            + if c.shifts.is_empty() {
+            + (lines.min(story_line_rows) + usize::from(!c.learnt.is_empty())) as f32
+                * theme::BODY_LINE
+            + if shifts == 0 {
                 0.
             } else {
-                S3 + c.shifts.len().min(3) as f32 * theme::CAPTION_LINE
+                S3 + shifts as f32 * theme::CAPTION_LINE
             }
     };
-    let metadata = meta(c);
-    let mut meta_rows: Vec<Vec<&str>> = vec![];
-    let mut row = vec![];
-    let mut row_width = 0.;
-    for part in metadata
+    // The dreamer card. A question takes the big serif; every other state is two rows: the title
+    // with the state in words, and one meta row of the token ring, the budget and the status.
+    let compact_hero = !c.offer && c.dream.state != Batch::Ready;
+    let status = status_line(c);
+    let mut parts: Vec<String> = meta(c)
         .split(" · ")
         .filter(|p| !p.is_empty() && *p != "carried")
-    {
-        let st = if part.starts_with('⌗') {
-            mono(theme::CHIP_SIZE, t.regular)
-        } else {
-            caption
-        };
-        let part_width = f.width(part, st)
-            + if part.starts_with("dreamer ") {
-                S5 + ICON_GAP
-            } else {
-                0.
-            };
+        .map(str::to_owned)
+        .collect();
+    if compact_hero {
+        parts.extend(
+            status
+                .split(" · ")
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned),
+        );
+        if parts.is_empty() {
+            parts.push("It asks a what-if from your past sessions.".into());
+        }
+    }
+    let mut meta_rows: Vec<Vec<String>> = vec![];
+    let mut row: Vec<String> = vec![];
+    let mut row_width = 0.;
+    for part in parts {
+        let part_width = meta_part_width(f, &part, t);
         if !row.is_empty() && row_width + S3 + part_width > IW {
             meta_rows.push(std::mem::take(&mut row));
             row_width = 0.;
@@ -2881,15 +3131,19 @@ pub fn draw(
         if !row.is_empty() {
             row_width += S3;
         }
-        row.push(part);
         row_width += part_width;
+        row.push(part);
     }
     if !row.is_empty() {
         meta_rows.push(row);
     }
-    let status = status_line(c);
-    let status_lines = f.wrap(&status, caption, IW);
+    let status_lines = if compact_hero {
+        vec![]
+    } else {
+        f.wrap(&status, caption, IW)
+    };
     let (qs, question) = question_layout(f, &c.question(), width, t);
+    let question = if compact_hero { vec![] } else { question };
     let question_line_height = (qs.size * 1.25).round();
     let qh = question.len() as f32 * question_line_height;
     let has_answers = c.dream.state == Batch::Ready || c.offer;
@@ -2900,14 +3154,14 @@ pub fn draw(
         + if meta_rows.is_empty() {
             0.
         } else {
-            S3 + meta_rows.len() as f32 * theme::CAPTION_LINE
+            (if compact_hero { 0. } else { S3 }) + meta_rows.len() as f32 * theme::CAPTION_LINE
         }
         + if has_answers {
             S1 + theme::CAPTION_LINE
         } else {
             0.
         }
-        + if status.is_empty() {
+        + if status_lines.is_empty() {
             0.
         } else {
             S2 + status_lines.len() as f32 * theme::CAPTION_LINE
@@ -3045,28 +3299,51 @@ pub fn draw(
         + if active { S3 } else { 0. }
         + empty_help
         + if empty_help > 0. { S3 } else { 0. };
-    // Text keeps one size: the width fit, `limit` pt of layout for this pane. Content that does not
-    // fit is dropped, never scaled, and then whole cards are hidden, before any text gets smaller
-    // than the width fit. The final priority, the first to go first:
+    // Text keeps one size: the width fit, `limit` pt of layout for this pane (PANE_RULES.md).
+    // Content that does not fit gives way in a fixed order, the first to go first:
     //   1. the CSR performance card's check rows (a failing check stays),
     //   2. its clock and progress bar (the heading and the headline stay),
     //   3. the lists' rows, down to 3,
     //   4. the lists' rows, down to 1,
-    //   5. the API credit row (one line: it outranks the lists' second and third rows),
+    //   5. the API credit row,
     //   6. "CSR this session" from rings to one line of words,
-    //   7. both lists (Confused Claude, Should be a skill / memory / tool), whole,
-    //   8. the story ("Where the work stands"), whole,
-    //   9. with a section open: the Context card to its floor,
-    //  10. with a section open: the section to its least rows.
-    // The hero, the performance card's headline and the Context card are never hidden. A card is
-    // drawn with a body or not at all: no list, story or section is ever folded to its title.
-    // Cards that stay take the room a hidden card frees: they are drawn at the richest step that
-    // fits, so rows come back before the text grows, and the text never exceeds the width fit.
-    // Only when all of that still overflows does the layout grow, and the picture with it shrink.
+    //   7. both lists fold into the stack row,
+    //   8. the story ("Where the work stands") folds into the stack row,
+    //   9. the CSR performance card folds into the stack row,
+    //  10. with a section open: the Context card to its floor,
+    //  11. with a section open: the section to its least rows.
+    // The hero, the Context card, an open section and the stack row are never folded. A folded
+    // card is one title in the stack row, and `e` (or a tap on its title) opens it in place as
+    // an accordion, over the room of the cards below it. Nothing makes the canvas taller than
+    // the pane: past the last step, the picture is cut at the pane's bottom (`clipped`).
     let limit = maxh;
-    let top_with = |observed_h: f32, story_h: f32, soak_h: f32| {
+    let has_soak = !page && c.soak.is_some();
+    let has_obs = [!observed[0].1.is_empty(), !observed[1].1.is_empty()];
+    // What a fold puts into the stack: the stackable cards with something to show.
+    let stack_kinds = |fold: u8| -> Vec<usize> {
+        STACKABLE
+            .iter()
+            .enumerate()
+            .filter(|(_, (bit, _))| fold & bit != 0)
+            .filter(|(i, _)| match i {
+                0 | 1 => has_obs[*i],
+                2 => has_story,
+                _ => has_soak,
+            })
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let stack_with = |fold: u8| -> f32 {
+        if stack_kinds(fold).is_empty() {
+            0.
+        } else {
+            STACK_H + S3
+        }
+    };
+    let top_with = |observed_h: f32, story_h: f32, soak_h: f32, stack_h: f32| {
         M + hero_h
             + S3
+            + stack_h
             + observed_h
             + story_h
             + if story_h > 0. { S3 } else { 0. }
@@ -3075,11 +3352,14 @@ pub fn draw(
             + soak_h
             + if soak_h > 0. { S3 } else { 0. }
     };
-    let observed_with = |cap: usize| -> f32 {
+    let observed_with = |cap: usize, fold: u8| -> f32 {
         observed
             .iter()
-            .filter(|(_, items, _)| !items.is_empty() && cap > 0)
-            .map(|(_, items, _)| observation_card_h(items.len().min(cap)) + S3)
+            .enumerate()
+            .filter(|(i, (_, items, _))| {
+                !items.is_empty() && cap > 0 && fold & STACKABLE[*i].0 == 0
+            })
+            .map(|(_, (_, items, _))| observation_card_h(items.len().min(cap)) + S3)
             .sum()
     };
     let gaps = if drill_want > 0. { S3 } else { 0. } + if detail_want > 0. { S3 } else { 0. };
@@ -3108,37 +3388,60 @@ pub fn draw(
             None => figure_closed_floor,
         }
     };
-    let fit = if page {
+    let step_soak_h = |step: &FitStep| -> f32 {
+        if step.fold & FOLD_PERF != 0 {
+            0.
+        } else {
+            c.soak
+                .as_ref()
+                .filter(|_| !page)
+                .map_or(0., |card| soak_plan(f, card, t, step.soak).h)
+        }
+    };
+    let step_story_h = |step: &FitStep| -> f32 {
+        if step.fold & FOLD_STORY != 0 {
+            0.
+        } else {
+            story_h_with(step.story_lines, step.story_shifts)
+        }
+    };
+    // `open_bit` is the open accordion card's fold bit (0 with none): the stack row stays drawn
+    // while it is open, listing it, so its close control never disappears.
+    let need = |step: &FitStep, open_bit: u8| {
+        let accordion = open_bit != 0;
+        let section = if step.least {
+            drill_least + detail_least + gaps
+        } else {
+            want
+        };
+        let figure = if section_open && !accordion {
+            if step.squeeze {
+                figure_floor
+            } else {
+                figure_floor_with(step.credit, step.compact)
+                    .max(figure_target_with(step.credit, step.compact))
+            }
+        } else {
+            figure_floor_with(step.credit, step.compact)
+        };
+        (top_with(
+            observed_with(step.cap, step.fold),
+            step_story_h(step),
+            step_soak_h(step),
+            stack_with(step.fold | open_bit),
+        ) + tail_base
+            + figure
+            + if section_open && !accordion {
+                section
+            } else {
+                0.
+            })
+            / (1. - S3 / available_height as f32)
+    };
+    let closed_fit = if page {
         // A page is one card; nothing is traded for it.
         FIT_STEPS[FIT_STEPS.len() - 1]
     } else {
-        let need = |step: &FitStep| {
-            let soak_h = c
-                .soak
-                .as_ref()
-                .map_or(0., |card| soak_plan(f, card, t, step.soak).h);
-            let story_h = if step.story_hidden { 0. } else { story_h };
-            let section = if step.least {
-                drill_least + detail_least + gaps
-            } else {
-                want
-            };
-            let figure = if section_open {
-                if step.squeeze {
-                    figure_floor
-                } else {
-                    figure_floor_with(step.credit, step.compact)
-                        .max(figure_target_with(step.credit, step.compact))
-                }
-            } else {
-                figure_floor_with(step.credit, step.compact)
-            };
-            (top_with(observed_with(step.cap), story_h, soak_h)
-                + tail_base
-                + figure
-                + if section_open { section } else { 0. })
-                / (1. - S3 / available_height as f32)
-        };
         // A closed pane keeps the Context card at its closed floor; only an open section may
         // squeeze it, so the last steps repeat the one before them without one.
         let steps = if section_open {
@@ -3148,49 +3451,114 @@ pub fn draw(
         };
         *steps
             .iter()
-            .find(|step| need(step) <= limit)
-            // Short of a fit everything that can go has gone, and the text shrinks.
+            .find(|step| need(step, 0) <= limit)
             .unwrap_or(&steps[steps.len() - 1])
     };
+    // The accordion: one stacked card open under the stack row. Every other stackable card
+    // folds, the Context card goes to its floor, and the open card takes its richest form that
+    // fits the room left.
+    let accordion_kind = open
+        .stack
+        .filter(|_| !page && !section_open)
+        .filter(|k| !stack_kinds(closed_fit.fold).is_empty() && stack_kinds(FOLD_ALL).contains(k));
+    let fit = if let Some(kind) = accordion_kind {
+        let bit = STACKABLE[kind].0;
+        let base = step(0, usize::MAX, false, true, FOLD_ALL & !bit, false, false);
+        let mut choices: Vec<FitStep> = vec![];
+        match kind {
+            0 | 1 => {
+                for cap in (1..=observed[kind].1.len()).rev() {
+                    choices.push(FitStep { cap, ..base });
+                }
+            }
+            2 => {
+                for shifts in (0..=story_shift_rows).rev() {
+                    choices.push(FitStep {
+                        story_shifts: shifts,
+                        ..base
+                    });
+                }
+                for lines in (1..story_line_rows).rev() {
+                    choices.push(FitStep {
+                        story_shifts: 0,
+                        story_lines: lines,
+                        ..base
+                    });
+                }
+            }
+            _ => {
+                for level in (0..=2).rev() {
+                    choices.push(FitStep {
+                        soak: level,
+                        ..base
+                    });
+                }
+            }
+        }
+        // A story of only changes keeps one change row: a card is never its title alone.
+        if kind == 2 && story_line_rows == 0 && c.learnt.is_empty() {
+            choices.retain(|s| s.story_shifts > 0);
+        }
+        let last = *choices.last().unwrap_or(&base);
+        *choices
+            .iter()
+            .find(|s| need(s, bit) <= limit)
+            .unwrap_or(&last)
+    } else {
+        closed_fit
+    };
+    let accordion = accordion_kind.is_some();
+    let open_bit = accordion_kind.map_or(0, |k| STACKABLE[k].0);
+    let fit_need = need(&fit, open_bit);
+    let clipped = !page && fit_need > limit + 0.5;
     let FitStep {
         soak: soak_level,
         cap: obs_cap,
         credit: keep_credit,
         compact: rings_compact,
-        story_hidden,
+        fold,
+        story_lines: story_line_cap,
+        story_shifts: story_shift_cap,
         squeeze,
         least: section_least,
     } = fit;
-    let figure_target = figure_target_with(keep_credit, rings_compact);
+    let story_hidden = fold & FOLD_STORY != 0;
+    let stack_list = if page {
+        vec![]
+    } else {
+        stack_kinds(fold | open_bit)
+    };
+    let stack_h = if stack_list.is_empty() {
+        0.
+    } else {
+        STACK_H + S3
+    };
+    let figure_target = if accordion {
+        figure_floor_with(keep_credit, rings_compact)
+    } else {
+        figure_target_with(keep_credit, rings_compact)
+    };
     if let Some(plan) = dash.as_mut() {
         plan.fit(DashFit {
             credit: keep_credit,
             compact_rings: rings_compact,
         });
     }
-    let figure_closed_floor = match &dash {
-        Some(plan) if !squeeze => figure_floor.max(dash_compact_h(plan)),
-        Some(_) => figure_floor,
-        None if squeeze => figure_floor,
-        None => figure_closed_floor,
-    };
     // The CSR performance card sits right above the Context card.
     let soak = c
         .soak
         .as_ref()
-        .filter(|_| !page)
+        .filter(|_| !page && fold & FOLD_PERF == 0)
         .map(|card| soak_plan(f, card, t, soak_level));
     let soak_h = soak.as_ref().map_or(0., |p| p.h);
-    let observed_full_h = observed_with(obs_cap);
-    let story_h = if story_hidden { 0. } else { story_h };
+    let observed_full_h = observed_with(obs_cap, fold);
+    let story_h = if story_hidden {
+        0.
+    } else {
+        story_h_with(story_line_cap, story_shift_cap)
+    };
     // Everything above the figure for one choice of observation cards and story card.
-    let top_for = |observed_h: f32, story_h: f32| top_with(observed_h, story_h, soak_h);
-    // The canvas is the closed pane's: an open section never makes it taller. Layout points may
-    // scale to fit a narrow/wide terminal; reserve S3 in final pixels.
-    let maxh = maxh.max(
-        (top_for(observed_full_h, story_h) + tail_base + figure_closed_floor)
-            / (1. - S3 / available_height as f32),
-    );
+    let top_for = |observed_h: f32, story_h: f32| top_with(observed_h, story_h, soak_h, stack_h);
     // A page keeps at least the rows its heading promises, whatever the pane.
     let maxh = if page {
         maxh.max(
@@ -3341,33 +3709,64 @@ pub fn draw(
     canvas.background(t);
     let mut y = M;
     let mut cards: Vec<CardRegion> = vec![];
+    let mut overdrawn: Vec<(&'static str, f32, f32)> = vec![];
     let mut answer_spans = vec![];
     let mut offer_hit = None;
     let mut answer_y = None;
     if !page {
-        cards.push(CardRegion::new("hero", y, hero_h, question.len()));
+        cards.push(CardRegion::new(
+            "hero",
+            y,
+            hero_h,
+            if compact_hero {
+                meta_rows.len()
+            } else {
+                question.len()
+            },
+        ));
         panel(&mut canvas, y, hero_h, t);
         let title_y = y + P + f.cap(title);
+        let title_text = if c.offer {
+            "Dreams are off"
+        } else if c.dream.state == Batch::Ready {
+            if c.asked_away {
+                "The dreamer asks · asked while you were away"
+            } else {
+                "The dreamer asks"
+            }
+        } else {
+            "CSR's dreamer"
+        };
         label(
             &mut canvas,
             f,
-            if c.offer {
-                "Dreams are off"
-            } else if c.dream.state == Batch::Ready {
-                if c.asked_away {
-                    "The dreamer asks · asked while you were away"
-                } else {
-                    "The dreamer asks"
-                }
-            } else {
-                "CSR's dreamer"
-            },
+            title_text,
             IX,
             title_y,
             theme::TITLE_SIZE,
             t.ink,
             t.bold,
         );
+        if compact_hero {
+            // The state in words, on the title row, in the dreamer's colour.
+            let said = if c.dream.state == Batch::Dreaming {
+                " · Dreaming"
+            } else {
+                " · Looks as you work"
+            };
+            let x = IX + f.width(title_text, title);
+            single(
+                &mut canvas,
+                f,
+                said,
+                x,
+                title_y,
+                W - M - P - 18. - S2 - x,
+                theme::BODY_SIZE,
+                t.dream,
+                t,
+            );
+        }
         if c.dream.carried {
             label(
                 &mut canvas,
@@ -3394,34 +3793,39 @@ pub fn draw(
             canvas.text(f, line, IX, cursor + f.cap(qs), qs, t.ink, A::L);
             cursor += question_line_height;
         }
-        if !meta_rows.is_empty() {
+        if !meta_rows.is_empty() && !compact_hero {
             cursor += S3;
         }
         for parts in &meta_rows {
             let b = cursor + f.cap(caption);
             let mut x = IX;
             for part in parts {
-                if part.starts_with("dreamer ") {
+                let mut shown: &str = part;
+                if let Some(rest) = part.strip_prefix("dreamer ") {
+                    // The dreamer's share of its token budget as a small ring.
                     let spent = num(&c.dream.budget["spent"]);
                     let cap = num(&c.dream.budget["cap"]).max(1.);
-                    canvas.rrect(x, b - f.cap(caption) / 2., S5, 3., 1.5, t.track);
-                    canvas.rrect(
-                        x,
-                        b - f.cap(caption) / 2.,
-                        S5 * (spent / cap).clamp(0., 1.) as f32,
-                        3.,
-                        1.5,
-                        t.dream,
+                    let frac = (spent / cap).clamp(0., 1.) as f32;
+                    let cy = b - f.cap(caption) / 2.;
+                    canvas.ring(
+                        x + BUDGET_RING_R,
+                        cy,
+                        BUDGET_RING_R,
+                        2.,
+                        t.track,
+                        &[(0., frac.max(4. / 360.), t.dream)],
                     );
-                    x += S5 + ICON_GAP;
+                    x += 2. * BUDGET_RING_R + ICON_GAP;
+                    shown = rest;
                 }
-                let st = if part.starts_with('⌗') {
+                let st = if shown.starts_with('⌗') {
                     mono(theme::CHIP_SIZE, t.regular)
                 } else {
                     caption
                 };
-                let w = f.width(part, st);
-                if part.starts_with('⌗') {
+                let room = IX + IW - x;
+                let w = f.width(shown, st).min(room);
+                if shown.starts_with('⌗') {
                     canvas.rrect(
                         x - S1,
                         b - f.cap(st) - S1 / 2.,
@@ -3430,20 +3834,20 @@ pub fn draw(
                         S1,
                         t.chip,
                     );
+                    canvas.text(f, shown, x, b, st, t.dream, A::L);
+                } else {
+                    single(
+                        &mut canvas,
+                        f,
+                        shown,
+                        x,
+                        b,
+                        room,
+                        theme::CAPTION_SIZE,
+                        t.quiet,
+                        t,
+                    );
                 }
-                canvas.text(
-                    f,
-                    part,
-                    x,
-                    b,
-                    st,
-                    if part.starts_with('⌗') {
-                        t.dream
-                    } else {
-                        t.quiet
-                    },
-                    A::L,
-                );
                 x += w + S3;
             }
             cursor += theme::CAPTION_LINE;
@@ -3505,7 +3909,7 @@ pub fn draw(
             offer_hit = Some((b, IX, x));
             cursor += theme::CAPTION_LINE;
         }
-        if !status.is_empty() {
+        if !status_lines.is_empty() {
             cursor += S2;
             for line in &status_lines {
                 label(
@@ -3521,17 +3925,29 @@ pub fn draw(
                 cursor += theme::CAPTION_LINE;
             }
         }
+        if cursor + P > y + hero_h + 0.5 {
+            overdrawn.push(("hero", cursor + P, y + hero_h));
+        }
     }
     if !page {
         y += hero_h + card_gap;
+    }
+    // The stack row: every folded card as one title, under the hero. A tap on a title, or `e`,
+    // opens that card under it.
+    let mut stack_row = None;
+    if !stack_list.is_empty() {
+        let open_kind = if accordion { accordion_kind } else { None };
+        cards.push(CardRegion::new("stack", y, STACK_H, stack_list.len()));
+        stack_row = Some(draw_stack_row(&mut canvas, f, &stack_list, open_kind, y, t));
+        y += STACK_H + card_gap;
     }
     let mut observation_rows = vec![];
     let mut observation_titles = vec![];
     // The observation rows have their own popup: their cut rows are not recorded as shortened rows.
     let recording = std::mem::take(&mut canvas.cut_title);
-    for (title_text, items, should) in observed {
-        // A list with nothing to show, or hidden for room, is not drawn at all.
-        if items.is_empty() || obs_cap == 0 {
+    for (which, (title_text, items, should)) in observed.into_iter().enumerate() {
+        // A list with nothing to show, or folded into the stack, is not drawn here.
+        if items.is_empty() || obs_cap == 0 || fold & STACKABLE[which].0 != 0 {
             continue;
         }
         let shown = items.len().min(obs_cap);
@@ -3638,7 +4054,9 @@ pub fn draw(
             story_title,
             y,
             story_h,
-            story_lines_fit.len() + usize::from(!c.learnt.is_empty()) + c.shifts.len().min(3),
+            story_line_cap.min(story_line_rows)
+                + usize::from(!c.learnt.is_empty())
+                + story_shift_cap.min(story_shift_rows),
         ));
         panel(&mut canvas, y, story_h, t);
         label(
@@ -3666,10 +4084,24 @@ pub fn draw(
             );
             cursor += theme::CAPTION_LINE + S3;
         }
-        story_line_count = story_lines_fit.len();
+        // The accordion may cut the story to fewer rows: its last row then ends in "…".
+        let mut story_shown: Vec<String> = story_lines_fit
+            .iter()
+            .take(story_line_cap)
+            .cloned()
+            .collect();
+        if story_shown.len() < story_lines_fit.len() {
+            if let Some(last) = story_shown.last_mut() {
+                *last = f.fit(&format!("{} …", last.trim_end_matches('…')), body, IW);
+                if !last.ends_with('…') {
+                    last.push('…');
+                }
+            }
+        }
+        story_line_count = story_shown.len();
         // A story cut at a clause is drawn with its "…": every row of it opens the whole story.
-        let story_cut = story_lines_fit.last().is_some_and(|l| l.ends_with('…'));
-        for line in &story_lines_fit {
+        let story_cut = story_shown.last().is_some_and(|l| l.ends_with('…'));
+        for line in &story_shown {
             if story_cut && !canvas.dry {
                 canvas.cuts.push(Cut {
                     y: cursor + f.cap(body),
@@ -3696,10 +4128,11 @@ pub fn draw(
             );
             cursor += theme::BODY_LINE;
         }
-        if !c.shifts.is_empty() {
+        let shifts_shown = story_shift_cap.min(story_shift_rows);
+        if shifts_shown > 0 {
             cursor += S3;
         }
-        for v in c.shifts.iter().take(3) {
+        for v in c.shifts.iter().take(shifts_shown) {
             let b = cursor + f.cap(caption);
             shift_hits.push(b - f.cap(caption) / 2.);
             canvas.cut_title = "A change";
@@ -3916,7 +4349,9 @@ pub fn draw(
             y,
             figure_layout_h,
             t,
-            open.figure && figure_h >= FIGURE_EXPANDED_BASE,
+            // The dashboard draws its chart in whatever room it gets (DASH_CHART_MIN at least);
+            // the ring layouts need FIGURE_EXPANDED_BASE.
+            figure_wants_chart || (open.figure && figure_h >= FIGURE_EXPANDED_BASE),
             narrow,
             DashFit {
                 credit: keep_credit,
@@ -3924,6 +4359,11 @@ pub fn draw(
             },
         )
     };
+    if let Some(d) = canvas.dash.as_ref().filter(|_| !page) {
+        if d.rows_bottom > d.card_bottom + 0.5 {
+            overdrawn.push(("Context", d.rows_bottom, d.card_bottom));
+        }
+    }
     if let Some((cy, ring, group, avail, mid)) = fig_info {
         ceiling_y = cy;
         ring_bounds = ring;
@@ -4228,6 +4668,11 @@ pub fn draw(
         pm,
         Metrics {
             cards,
+            overdrawn,
+            limit,
+            clipped: clipped.then_some(fit_need),
+            stack: stack_row,
+            text_runs: std::mem::take(&mut canvas.runs),
             csr_cost: c.csr_cost.clone(),
             quota_gauges: canvas.quota_gauges.clone(),
             note_rows: canvas.note_rows.clone(),
@@ -4763,8 +5208,81 @@ const DASH_ROW: f32 = 14.;
 const DASH_CHART_MIN: f32 = 64.;
 /// The height the fresh-tokens chart is given when the card is expanded and has room.
 const DASH_CHART_WANT: f32 = 92.;
-/// The width of the name column of a part's row in the full layout.
-const DASH_PART_COL: f32 = 150.;
+/// The context parts' segmented bar: its height and the gap between two segments.
+const PARTS_BAR_H: f32 = 8.;
+const PARTS_GAP: f32 = 2.;
+/// The radius of a legend's filled circle.
+const LEGEND_DOT_R: f32 = 3.5;
+/// A context part's name in the one-line legend.
+fn part_short_name(name: &str) -> &str {
+    match name {
+        "System + tools" => "System",
+        "Tool results" => "Tools",
+        "CSR injected" => "CSR",
+        other => other,
+    }
+}
+/// The session mix the Context card's donut shows, from the breakdown's parts alone (no new
+/// read): Tools = tool results; Context = messages and system text (`breakdown.rs` counts tool
+/// calls' input into the message text, so they land here); Other = the rest (CSR injected).
+/// Shares are of the three together. The verdict names a slice holding at least
+/// `MIX_HEAVY` (half) of it, else "mixed".
+pub fn session_mix(parts: &[(&'static str, f64, Rgba)]) -> Option<([f64; 3], &'static str)> {
+    let mut mix = [0f64; 3];
+    for (name, n, _) in parts {
+        let slot = match *name {
+            "Tool results" => 0,
+            "System + tools" | "Messages" => 1,
+            "In use" => return None,
+            _ => 2,
+        };
+        mix[slot] += n.max(0.);
+    }
+    let total: f64 = mix.iter().sum();
+    if total <= 0. {
+        return None;
+    }
+    let shares = mix.map(|n| n / total);
+    let verdict = if shares[0] >= MIX_HEAVY {
+        "tool-heavy"
+    } else if shares[1] >= MIX_HEAVY {
+        "context-heavy"
+    } else {
+        "mixed"
+    };
+    Some((shares, verdict))
+}
+/// A slice is "heavy" at half the session or more.
+const MIX_HEAVY: f64 = 0.5;
+/// The session-mix donut on the parts bar's line: its radius and stroke, in pt. Its outer edge
+/// (radius + half the stroke = 7 pt) stays inside the S1 gap above the bar and the S2 gap below.
+const MIX_R: f32 = 5.25;
+const MIX_W: f32 = 3.5;
+/// The parts on each line of the legend: one line, two only when one cannot hold them.
+fn legend_lines(f: &Fonts, parts: &[(&'static str, f64, Rgba)], t: &Tokens) -> Vec<Vec<usize>> {
+    let caption = sans(theme::CAPTION_SIZE, t.regular);
+    let number = sans(theme::CAPTION_SIZE, t.medium);
+    let mut lines: Vec<Vec<usize>> = vec![];
+    let mut width = 0.;
+    for (i, (name, n, _)) in parts.iter().enumerate() {
+        let w = 2. * LEGEND_DOT_R
+            + S1
+            + f.width(part_short_name(name), caption)
+            + S1
+            + f.width(&short(*n), number);
+        match lines.last_mut() {
+            Some(line) if width + S3 + w <= IW => {
+                line.push(i);
+                width += S3 + w;
+            }
+            _ => {
+                lines.push(vec![i]);
+                width = w;
+            }
+        }
+    }
+    lines
+}
 
 /// The words and numbers the dashboard draws, from the composition alone.
 /// The CSR performance card's lines, fitted, and its height.
@@ -4946,7 +5464,11 @@ struct DashPlan {
     limits: Vec<(String, String, f64, String, Option<f64>, String)>,
     codex: Option<(f64, String)>,
     ctx: Option<(f64, f64, &'static str)>,
+    /// Claude Code's auto-compact buffer at the window's end, when its window is known.
+    buffer: Option<f64>,
     parts: Vec<(&'static str, f64, Rgba)>,
+    /// The parts' one-line legend: the parts on each line, one line unless it cannot fit.
+    legend: Vec<Vec<usize>>,
     estimated: bool,
     turn: Option<String>,
     cache: Option<(String, bool)>,
@@ -4963,14 +5485,17 @@ struct DashPlan {
 struct FitStep {
     /// The performance card's level: 2 every check row, 1 only a failing one, 0 no clock or bar.
     soak: u8,
-    /// Most rows a list keeps; 0 hides both lists.
+    /// Most rows a list keeps.
     cap: usize,
     /// Keep the API credit row.
     credit: bool,
     /// "CSR this session" as one line of words instead of rings.
     compact: bool,
-    /// The story card is hidden.
-    story_hidden: bool,
+    /// The stackable cards folded into the stack row (`FOLD_*` bits).
+    fold: u8,
+    /// Most story rows and change rows the story card keeps (the accordion cuts them).
+    story_lines: usize,
+    story_shifts: usize,
     /// An open section squeezes the Context card to its floor.
     squeeze: bool,
     /// An open section is cut to its least rows.
@@ -4981,7 +5506,7 @@ const fn step(
     cap: usize,
     credit: bool,
     compact: bool,
-    story_hidden: bool,
+    fold: u8,
     squeeze: bool,
     least: bool,
 ) -> FitStep {
@@ -4990,25 +5515,44 @@ const fn step(
         cap,
         credit,
         compact,
-        story_hidden,
+        fold,
+        story_lines: usize::MAX,
+        story_shifts: usize::MAX,
         squeeze,
         least,
     }
 }
-/// What the dashboard keeps, most first: the order content goes as the pane gets shorter. The
+/// The cards a stack row can hold, in the order it lists them: the bit that folds each, and its
+/// name in the row.
+pub const STACKABLE: [(u8, &str); 4] = [
+    (FOLD_CONFUSED, "Confused Claude"),
+    (FOLD_SHOULD, "Should be"),
+    (FOLD_STORY, "Story"),
+    (FOLD_PERF, "Performance"),
+];
+const FOLD_CONFUSED: u8 = 1;
+const FOLD_SHOULD: u8 = 2;
+const FOLD_LISTS: u8 = FOLD_CONFUSED | FOLD_SHOULD;
+const FOLD_STORY: u8 = 4;
+const FOLD_PERF: u8 = 8;
+const FOLD_ALL: u8 = FOLD_LISTS | FOLD_STORY | FOLD_PERF;
+/// The stack row's height, its two sheet edges included, in layout pt.
+pub const STACK_H: f32 = 38.;
+/// What a dashboard keeps, most first: the order content goes as the pane gets shorter. The
 /// doc of the fit in `draw` names each step.
-const FIT_STEPS: [FitStep; 11] = [
-    step(2, usize::MAX, true, false, false, false, false),
-    step(1, usize::MAX, true, false, false, false, false),
-    step(0, usize::MAX, true, false, false, false, false),
-    step(0, 3, true, false, false, false, false),
-    step(0, 1, true, false, false, false, false),
-    step(0, 1, false, false, false, false, false),
-    step(0, 1, false, true, false, false, false),
-    step(0, 0, false, true, false, false, false),
-    step(0, 0, false, true, true, false, false),
-    step(0, 0, false, true, true, true, false),
-    step(0, 0, false, true, true, true, true),
+const FIT_STEPS: [FitStep; 12] = [
+    step(2, usize::MAX, true, false, 0, false, false),
+    step(1, usize::MAX, true, false, 0, false, false),
+    step(0, usize::MAX, true, false, 0, false, false),
+    step(0, 3, true, false, 0, false, false),
+    step(0, 1, true, false, 0, false, false),
+    step(0, 1, false, false, 0, false, false),
+    step(0, 1, false, true, 0, false, false),
+    step(0, 1, false, true, FOLD_LISTS, false, false),
+    step(0, 1, false, true, FOLD_LISTS | FOLD_STORY, false, false),
+    step(0, 1, false, true, FOLD_ALL, false, false),
+    step(0, 1, false, true, FOLD_ALL, true, false),
+    step(0, 1, false, true, FOLD_ALL, true, true),
 ];
 
 /// What the layout dropped from the dashboard to keep the text size.
@@ -5053,7 +5597,15 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
         return None;
     }
     let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.)?;
-    let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.)?;
+    let model_size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.)?;
+    // The bar spans the window Claude Code compacts to (`autoCompactWindow` or its env var, as
+    // the compactor reads it), as /context does; its last NATIVE_UNDER is the auto-compact
+    // buffer. With none set, the model's own window and no buffer.
+    let native = g["ctx"]["window"]
+        .as_f64()
+        .filter(|w| *w > crate::companion::app::compactor::rules::NATIVE_UNDER);
+    let size = native.unwrap_or(model_size);
+    let buffer = native.map(|_| crate::companion::app::compactor::rules::NATIVE_UNDER);
     let (head, head_sev) = match g["outlook"]["headline"]["text"].as_str() {
         Some(text) => (
             f.wrap(text, heading(t), IW).into_iter().take(2).collect(),
@@ -5231,6 +5783,7 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
         .max()
         .unwrap_or(0);
     let status = csr_status(g).map(|(line, sev)| (line, sev == "red"));
+    let legend = legend_lines(f, &parts, t);
     Some(DashPlan {
         head,
         head_sev,
@@ -5239,7 +5792,9 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
         limits,
         codex,
         ctx: Some((tokens, size, ctx_state)),
+        buffer,
         parts,
+        legend,
         estimated,
         turn,
         cache,
@@ -5273,15 +5828,14 @@ fn dash_heights_with(
         } else {
             p.credit.len() as f32 * DASH_ROW + S1
         };
-    let rows = if full {
-        p.parts.len()
-    } else {
-        p.parts.len().div_ceil(2)
-    } as f32;
+    let _ = full;
+    let rows = p.legend.len() as f32;
     let note = p.turn.is_some() || (p.estimated && p.turn.is_none());
+    // As `draw_dashboard` draws it: the gap, the heading, the bar, the legend lines, the notes.
     let ctx = if p.ctx.is_some() {
-        16. + S2
-            + DASH_BAR_H
+        S2 + 16.
+            + S1
+            + PARTS_BAR_H
             + S2
             + rows * DASH_ROW
             + if note { DASH_ROW } else { 0. }
@@ -5462,7 +6016,14 @@ fn draw_dashboard(
         at += S2;
         let base = at + f.cap(name_st);
         c.text(f, "Context", IX, base, name_st, t.ink, A::L);
-        let used = format!("{:.0}% used", (tokens / size * 100.).round());
+        // As /context says it: what is used of the window, and what is free short of the
+        // auto-compact buffer.
+        let used = format!(
+            "{} of {} ({:.0}%)",
+            short(tokens),
+            short(size),
+            (tokens / size * 100.).round()
+        );
         let name_w = f.width("Context", name_st);
         c.text(
             f,
@@ -5473,17 +6034,106 @@ fn draw_dashboard(
             dash_sev_ink(state, t),
             A::L,
         );
-        let free = format!("{} free of {}", short(size - tokens), short(size));
+        let buffer = p.buffer.unwrap_or(0.);
+        let free = match p.buffer {
+            Some(b) => format!(
+                "{} free · {} buffer",
+                short((size - tokens - b).max(0.)),
+                short(b)
+            ),
+            None => format!("{} free", short((size - tokens).max(0.))),
+        };
         c.text(f, &free, IX + IW, base, caption, t.quiet, A::R);
         dash.context_head = Some(format!("{used} · {free}"));
         at += 16.;
+        // One bar of the window cut into the parts, each its own segment with a gap between: no
+        // pace tick and square ends, unlike the rounded limit bars above it.
         let bar_y = at + S1;
-        c.rrect(IX, bar_y, IW, DASH_BAR_H, 3., t.track);
+        // The session mix: a small donut and its one-word verdict at the bar's right end, on
+        // the bar's own line (no row of its own).
+        let mix = if p.estimated {
+            session_mix(&p.parts)
+        } else {
+            None
+        };
+        let bar_w = match mix {
+            Some((shares, verdict)) => {
+                let vw = f.width(verdict, caption);
+                let cx = IX + IW - vw - S1 - MIX_R - MIX_W / 2.;
+                let cy = bar_y + PARTS_BAR_H / 2.;
+                c.arc(cx, cy, MIX_R, 0., 1., MIX_W, t.track, false);
+                let inks = [t.asked, t.sky, t.csr_share];
+                let mut from = 0f32;
+                for (share, ink) in shares.iter().zip(inks) {
+                    let to = from + *share as f32;
+                    // A hairline gap between slices, as between the bar's segments.
+                    c.arc(
+                        cx,
+                        cy,
+                        MIX_R,
+                        from,
+                        (to - 0.012).max(from),
+                        MIX_W,
+                        ink,
+                        false,
+                    );
+                    from = to;
+                }
+                c.text(
+                    f,
+                    verdict,
+                    IX + IW,
+                    cy + f.cap(caption) / 2.,
+                    caption,
+                    t.quiet,
+                    A::R,
+                );
+                dash.mix = Some((
+                    verdict.to_owned(),
+                    shares.map(|s| s as f32),
+                    (cx, cy, MIX_R + MIX_W / 2.),
+                ));
+                (cx - MIX_R - MIX_W / 2. - S3 - IX).max(IW / 2.)
+            }
+            None => IW,
+        };
+        // Claude Code's auto-compact buffer: the window's last part, dimmed and hatched, drawn
+        // first so the parts lie over it once the context reaches it.
+        let buffer_x = IX + ((size - buffer) / size) as f32 * bar_w;
+        if buffer > 0. {
+            c.rrect(
+                buffer_x,
+                bar_y,
+                IX + bar_w - buffer_x,
+                PARTS_BAR_H,
+                1.5,
+                t.track,
+            );
+            let mut hx = buffer_x - PARTS_BAR_H;
+            while hx < IX + bar_w {
+                // One diagonal per 3 pt, cut to the segment.
+                let (x0, x1) = (hx.max(buffer_x), (hx + PARTS_BAR_H).min(IX + bar_w));
+                if x1 > x0 {
+                    c.line(
+                        x0,
+                        bar_y + PARTS_BAR_H - (x0 - hx),
+                        x1,
+                        bar_y + PARTS_BAR_H - (x1 - hx),
+                        0.75,
+                        t.faint,
+                    );
+                }
+                hx += 3.;
+            }
+            dash.buffer = Some((buffer_x, IX + bar_w - buffer_x));
+        }
         let mut x = IX;
         let mut segs = vec![];
         for (name, n, ink) in &p.parts {
-            let w = ((*n / size) as f32 * IW).max(1.5);
-            c.rect(x, bar_y, w, DASH_BAR_H, *ink);
+            let w = ((*n / size) as f32 * bar_w)
+                .min(IX + bar_w - x)
+                .max(PARTS_GAP + 1.5);
+            c.rrect(x, bar_y, w - PARTS_GAP, PARTS_BAR_H, 1.5, *ink);
             segs.push(DashSegment {
                 name: (*name).into(),
                 tokens: *n,
@@ -5493,45 +6143,58 @@ fn draw_dashboard(
             });
             x += w;
         }
-        dash.context_bar = Some((IX, bar_y, IW, DASH_BAR_H));
-        at = bar_y + DASH_BAR_H + S2;
-        let sized = |n: f64| {
-            if p.estimated {
-                format!("~{}", short(n))
-            } else {
-                short(n)
-            }
+        let track_end = if buffer > 0. {
+            buffer_x - PARTS_GAP
+        } else {
+            IX + bar_w
         };
-        let col_w = if full { DASH_PART_COL } else { IW / 2. };
-        for (i, (name, n, ink)) in p.parts.iter().enumerate() {
-            let (cx, row) = if full {
-                (IX, i)
-            } else {
-                (IX + (i % 2) as f32 * col_w, i / 2)
-            };
-            let ry = at + row as f32 * DASH_ROW;
-            let base = ry + f.cap(caption) + 1.;
-            c.rrect(cx, ry + 2.5, 8., 8., 2., *ink);
-            c.text(f, name, cx + 14., base, caption, t.quiet, A::L);
-            let right = cx + DASH_PART_COL - if full { 0. } else { S2 };
-            c.text(
-                f,
-                &sized(*n),
-                right,
-                base,
-                sans(theme::CAPTION_SIZE, t.medium),
-                t.ink,
-                A::R,
+        if x < track_end - 1. {
+            c.rrect(x, bar_y, track_end - x, PARTS_BAR_H, 1.5, t.track);
+        }
+        // Where Claude Code compacts on its own: a tick at the buffer's start, in the gaps above
+        // and below the bar (CSR's own band ends before it).
+        if buffer > 0. {
+            c.line(
+                buffer_x,
+                bar_y - 3.,
+                buffer_x,
+                bar_y + PARTS_BAR_H + 3.,
+                1.25,
+                t.quiet,
             );
-            segs[i].legend = Some(format!("{name} {}", sized(*n)));
+            dash.window = Some(size);
+        }
+        dash.context_bar = Some((IX, bar_y, bar_w, PARTS_BAR_H));
+        at = bar_y + PARTS_BAR_H + S2;
+        // The legend: a small filled circle and the part's short name and size, on one line.
+        for (line, items) in p.legend.iter().enumerate() {
+            let base = at + line as f32 * DASH_ROW + f.cap(caption) + 1.;
+            let mut lx = IX;
+            for &i in items {
+                let (name, n, ink) = &p.parts[i];
+                c.circle(
+                    lx + LEGEND_DOT_R,
+                    base - f.cap(caption) / 2.,
+                    LEGEND_DOT_R,
+                    *ink,
+                );
+                lx += 2. * LEGEND_DOT_R + S1;
+                let short_name = part_short_name(name);
+                lx += c.text(f, short_name, lx, base, caption, t.quiet, A::L) + S1;
+                lx += c.text(
+                    f,
+                    &short(*n),
+                    lx,
+                    base,
+                    sans(theme::CAPTION_SIZE, t.medium),
+                    t.ink,
+                    A::L,
+                ) + S3;
+                segs[i].legend = Some(format!("{short_name} {}", short(*n)));
+            }
         }
         dash.segments = segs;
-        at += (if full {
-            p.parts.len()
-        } else {
-            p.parts.len().div_ceil(2)
-        }) as f32
-            * DASH_ROW;
+        at += p.legend.len() as f32 * DASH_ROW;
         match (&p.turn, p.estimated) {
             (Some(line), _) => {
                 single(
@@ -5701,6 +6364,8 @@ fn draw_dashboard(
         at += DASH_ROW + S1;
     }
     let _ = (head_h, limits_h, csr_h);
+    dash.rows_bottom = at + P;
+    dash.card_bottom = y + h;
     // E. the fresh tokens per turn, under it all
     if chart && fresh_bar_heights(&data.requests).is_some() {
         let top = at;
@@ -6927,14 +7592,13 @@ mod tests {
                     assert_eq!(d.limits[1].tick, Some(0.71));
                     assert_eq!(d.limits[2].tick, None, "Codex has no forecast");
                     assert!(
-                        d.context_head.as_deref().unwrap().contains("12% used"),
+                        d.context_head
+                            .as_deref()
+                            .unwrap()
+                            .contains("120k of 1M (12%)"),
                         "{at}"
                     );
-                    assert!(d
-                        .context_head
-                        .as_deref()
-                        .unwrap()
-                        .contains("880k free of 1M"));
+                    assert!(d.context_head.as_deref().unwrap().contains("880k free"));
                     let row = d.csr_row.as_deref().expect("a CSR row");
                     assert!(
                         row.starts_with("CSR this session: 2 compactions · ~851k tokens saved"),
@@ -6997,15 +7661,16 @@ mod tests {
                     let mut end = bx;
                     for s in &d.segments {
                         let legend = s.legend.as_deref().unwrap_or_else(|| panic!("{at}: {s:?}"));
+                        // One inline legend line: a dot, the short name, the number.
                         assert!(
-                            legend.starts_with(&s.name) && legend.contains('~'),
+                            legend.starts_with(part_short_name(&s.name)) && !legend.contains('\n'),
                             "{at}: {legend}"
                         );
                         assert!(s.w >= 1.5 && s.x >= end - 0.01 && s.x + s.w <= bx + bw + 0.01);
                         end = s.x + s.w;
                     }
                     // Messages are the person's and Claude's text together: 24k of 120k.
-                    assert_eq!(d.segments[1].legend.as_deref(), Some("Messages ~24k"));
+                    assert_eq!(d.segments[1].legend.as_deref(), Some("Messages 24k"));
                     assert_eq!(d.est_marks, 1, "{at}");
                 }
             }
@@ -7583,23 +8248,25 @@ mod tests {
 
     #[test]
     fn the_fit_drops_the_credit_row_after_the_lists_are_down_to_one_row_and_before_the_rings() {
-        // perf rows, perf clock, lists to 3, lists to 1, credit, rings, lists hidden, story.
+        // perf rows, perf clock, lists to 3, lists to 1, credit, rings, lists fold, story folds,
+        // performance folds.
         let order: Vec<_> = FIT_STEPS
             .iter()
-            .map(|s| (s.soak, s.cap, s.credit, s.compact, s.story_hidden))
+            .map(|s| (s.soak, s.cap, s.credit, s.compact, s.fold))
             .collect();
         assert_eq!(
-            order[..9],
+            order[..10],
             [
-                (2, usize::MAX, true, false, false),
-                (1, usize::MAX, true, false, false),
-                (0, usize::MAX, true, false, false),
-                (0, 3, true, false, false),
-                (0, 1, true, false, false),
-                (0, 1, false, false, false),
-                (0, 1, false, true, false),
-                (0, 0, false, true, false),
-                (0, 0, false, true, true),
+                (2, usize::MAX, true, false, 0),
+                (1, usize::MAX, true, false, 0),
+                (0, usize::MAX, true, false, 0),
+                (0, 3, true, false, 0),
+                (0, 1, true, false, 0),
+                (0, 1, false, false, 0),
+                (0, 1, false, true, 0),
+                (0, 1, false, true, FOLD_LISTS),
+                (0, 1, false, true, FOLD_LISTS | FOLD_STORY),
+                (0, 1, false, true, FOLD_ALL),
             ]
         );
     }

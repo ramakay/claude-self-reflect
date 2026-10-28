@@ -185,7 +185,10 @@ pub fn last_look(records: &[Value], root: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 pub fn dreams_on(paths: &Paths) -> bool {
-    let settings = read_json(&paths.home.join(".claude/settings.json"));
+    dreams_on_in(&read_json(&paths.home.join(".claude/settings.json")))
+}
+/// [`dreams_on`] from settings.json already read.
+pub fn dreams_on_in(settings: &Value) -> bool {
     !settings["pluginConfigs"]
         .as_object()
         .into_iter()

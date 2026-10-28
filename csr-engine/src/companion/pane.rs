@@ -609,7 +609,18 @@ impl Pane {
             .as_ref()
             .map(|db| pages::session_story(db, &self.paths, &self.sid))
             .unwrap_or(Value::Null);
+        // settings.json, read once per frame: whether dreams are on, and the window Claude Code's
+        // own auto-compact works to (as the compactor reads it), which the Context bar spans.
+        let settings = super::paths::read_json(&self.paths.home.join(".claude/settings.json"));
+        let native_window = super::app::compactor::rules::native_window_of(
+            &settings,
+            std::env::var("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                .ok()
+                .as_deref(),
+            std::env::var_os("DISABLE_AUTO_COMPACT").is_some(),
+        );
         let mut data = json!({
+            "native_window": native_window,
             "story_map": self.map.shown,
             "story_map_from": self.map.from,
             "story_map_messages": self.map.messages,
@@ -623,7 +634,7 @@ impl Pane {
             "chapter": dreams::last_chapter(records, &root, &self.sid),
             "look": dreams::last_look(records, &root),
             "dream_records": records,
-            "dreams_on": dreams::dreams_on(&self.paths),
+            "dreams_on": dreams::dreams_on_in(&settings),
             "story": story,
             "claude_fields": kept["fields"],
             "claude_at": kept["at"],
@@ -1311,6 +1322,30 @@ impl Pane {
                             self.acts.insert(row, json!({"key":"instrument:agents"}));
                         }
                     }
+                    if let Some(stack) = &metrics.stack {
+                        let to_col = |x: f32| {
+                            (metrics.content_left
+                                + x / instrument::LAYOUT_WIDTH * metrics.content_width)
+                                * cols as f32
+                        };
+                        let spans: Vec<Value> = stack
+                            .spans
+                            .iter()
+                            .map(|(x0, x1, kind)| {
+                                json!([
+                                    to_col(*x0).floor().max(0.) as usize,
+                                    (to_col(*x1).ceil().max(0.) as usize).min(cols),
+                                    kind
+                                ])
+                            })
+                            .collect();
+                        for row in to_row(stack.top)..=to_row(stack.top + stack.height - 8.) {
+                            self.acts.insert(
+                                row,
+                                json!({"key":"instrument:stack","stack":spans.clone()}),
+                            );
+                        }
+                    }
                     for y in &metrics.shift_hits {
                         self.acts
                             .insert(to_row(*y), json!({"key":"instrument:changes"}));
@@ -1532,6 +1567,22 @@ impl Pane {
                 keys.push(("t", "threads"));
             }
             keys.push(("i", "figure"));
+            // The stack's key shows only when a stack is drawn.
+            let stack_open = self.instrument_open.stack.is_some();
+            if self
+                .instrument_metrics
+                .as_ref()
+                .is_some_and(|m| m.stack.is_some())
+                && self.pixels
+                && !self.placed.is_empty()
+            {
+                if stack_open {
+                    keys.push(("e", "close"));
+                    keys.push(("n", "next"));
+                } else {
+                    keys.push(("e", "more"));
+                }
+            }
             if !composition.confusing.is_empty() || !composition.should_be.is_empty() {
                 keys.push(("o", "details"));
             }
@@ -2124,6 +2175,14 @@ impl Pane {
         }
         true
     }
+    /// The cards the last picture folded into its stack row, as `STACKABLE` indexes.
+    fn stack_kinds(&self) -> Vec<usize> {
+        self.instrument_metrics
+            .as_ref()
+            .and_then(|m| m.stack.as_ref())
+            .map(|s| s.kinds.clone())
+            .unwrap_or_default()
+    }
     pub fn key(&mut self, key: &str) -> bool {
         if self.popup_key(key) {
             return true;
@@ -2135,7 +2194,44 @@ impl Pane {
                 }
                 return true;
             }
+            // e: open the stack's first folded card under it, or close the one open.
+            "e" if self.view == "main" => {
+                let kinds = self.stack_kinds();
+                if self.instrument_open.stack.is_some() {
+                    self.instrument_open.stack = None;
+                } else if let Some(first) = kinds.first() {
+                    self.instrument_open = super::render::instrument::Open {
+                        stack: Some(*first),
+                        ..Default::default()
+                    };
+                }
+                return true;
+            }
+            // n: the next folded card, while one is open.
+            "n" if self.view == "main" && self.instrument_open.stack.is_some() => {
+                let kinds = self.stack_kinds();
+                let here = self.instrument_open.stack;
+                let at = kinds.iter().position(|k| Some(*k) == here);
+                self.instrument_open.stack = at.map_or(kinds.first().copied(), |i| {
+                    kinds.get((i + 1) % kinds.len()).copied()
+                });
+                return true;
+            }
+            _ if key.starts_with("stack:") => {
+                let kind = key["stack:".len()..].parse::<usize>().ok();
+                if self.instrument_open.stack == kind {
+                    self.instrument_open.stack = None;
+                } else if kind.is_some_and(|k| self.stack_kinds().contains(&k)) {
+                    self.instrument_open = super::render::instrument::Open {
+                        stack: kind,
+                        ..Default::default()
+                    };
+                }
+                self.view = "main".into();
+                return true;
+            }
             "a" if self.view == "main" => {
+                self.instrument_open.stack = None;
                 self.instrument_open.agents = !self.instrument_open.agents;
                 self.instrument_open.changes = false;
                 self.instrument_open.threads = false;
@@ -2148,6 +2244,7 @@ impl Pane {
                 return true;
             }
             "i" => {
+                self.instrument_open.stack = None;
                 self.instrument_open.figure = !self.instrument_open.figure;
                 self.instrument_open.gauge = None;
                 // The figure is the dashboard's: it leaves a page.
@@ -2178,6 +2275,7 @@ impl Pane {
                 return true;
             }
             "l" | "m" => {
+                self.instrument_open.stack = None;
                 self.instrument_open.changes = !self.instrument_open.changes;
                 self.instrument_open.threads = false;
                 self.instrument_open.dreams = false;
@@ -2187,6 +2285,7 @@ impl Pane {
                 return true;
             }
             "t" | "f" => {
+                self.instrument_open.stack = None;
                 self.instrument_open.threads = !self.instrument_open.threads;
                 self.instrument_open.changes = false;
                 self.instrument_open.dreams = false;
@@ -2196,6 +2295,7 @@ impl Pane {
                 return true;
             }
             "d" => {
+                self.instrument_open.stack = None;
                 self.instrument_open.dreams = !self.instrument_open.dreams;
                 self.instrument_open.changes = false;
                 self.instrument_open.threads = false;
@@ -2466,6 +2566,16 @@ impl Pane {
                     return self.key(&format!("gauge:{}", string(&span[2])));
                 }
             }
+            // A tap on a title in the stack row opens that card; elsewhere on the row, the first.
+            if key == "stack" {
+                if let Some(span) = array(&act["stack"])
+                    .iter()
+                    .find(|s| num(&s[0]) <= col as f64 && (col as f64) < num(&s[1]))
+                {
+                    return self.key(&format!("stack:{}", num(&span[2]) as usize));
+                }
+                return self.key("e");
+            }
             return self.key(match key {
                 "dreams" => "d",
                 "threads" => "t",
@@ -2486,7 +2596,7 @@ impl Pane {
                 }
                 if matches!(
                     string(&span[2]),
-                    "d" | "l" | "r" | "s" | "f" | "t" | "i" | "b" | "q" | "z"
+                    "d" | "l" | "r" | "s" | "f" | "t" | "i" | "b" | "q" | "z" | "e" | "n"
                 ) {
                     return self.key(string(&span[2]));
                 }
