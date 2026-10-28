@@ -48,6 +48,8 @@ fn utc() {
         std::env::set_var("TZ", "UTC");
         // The API credit row reads this folder when it is set; the goldens read the private HOME's.
         std::env::remove_var("API_LANES_HOME");
+        // No keychain read and no network from a test: the goldens show the ledger row.
+        std::env::set_var("CSR_ADMIN_COST", "off");
     });
 }
 fn rich_home() -> (tempfile::TempDir, Paths) {
