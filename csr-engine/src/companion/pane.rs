@@ -274,6 +274,11 @@ pub struct Pane {
     compacting: bool,
     /// Visible notice when the dreams-off offer could not write settings.
     offer_notice: Option<String>,
+    /// The trial on show and when its files were read: they are re-read every 15 s, and the card
+    /// is worked out afresh each frame.
+    soak: Option<(f64, super::live_eval::Loaded)>,
+    /// The API credit and when the ledger was read.
+    credit: Option<(f64, Option<super::api_credit::Credit>)>,
     popup: Option<Popup>,
     /// The lines of each observation card at the last frame, `[confusing, should_be]`.
     obs_lines: [Vec<String>; 3],
@@ -390,6 +395,8 @@ impl Pane {
             carry_gate: None,
             compacting: false,
             offer_notice: None,
+            soak: None,
+            credit: None,
             popup: None,
             obs_lines: Default::default(),
             more: vec![],
@@ -735,6 +742,29 @@ impl Pane {
             if let Some(notice) = &self.offer_notice {
                 data["offer_notice"] = json!(notice);
             }
+            // The live eval of a running trial, and the API credit: both read off the draw path's
+            // hot loop, and neither can stop a frame: what cannot be read is a line saying so.
+            if self
+                .soak
+                .as_ref()
+                .is_none_or(|(at, _)| now - at >= 15. || now < *at)
+            {
+                let dir = self.paths.home.join(".claude-self-reflect/trials");
+                self.soak = Some((now, super::live_eval::load(&dir, now)));
+            }
+            if let Some((_, loaded)) = &self.soak {
+                data["soak"] = json!(super::live_eval::card_at(loaded, now));
+            }
+            if self
+                .credit
+                .as_ref()
+                .is_none_or(|(at, _)| now - at >= 30. || now < *at)
+            {
+                let dir =
+                    super::api_credit::dir(&self.paths.home, std::env::var_os("API_LANES_HOME"));
+                self.credit = Some((now, super::api_credit::read(&dir, now)));
+            }
+            data["api_credit"] = json!(self.credit.as_ref().and_then(|c| c.1.clone()));
             if array(&s["main"]).is_empty()
                 && array(&s["prompts"]).is_empty()
                 && masthead::ctx_now(&data["claude_fields"], data["claude_at"].as_f64(), s)

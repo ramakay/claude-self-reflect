@@ -44,7 +44,11 @@ fn fill(text: &str, home: &str) -> String {
 /// The goldens carry local times (10:37), so the clock is UTC for every test in this file.
 fn utc() {
     static ONCE: Once = Once::new();
-    ONCE.call_once(|| std::env::set_var("TZ", "UTC"));
+    ONCE.call_once(|| {
+        std::env::set_var("TZ", "UTC");
+        // The API credit row reads this folder when it is set; the goldens read the private HOME's.
+        std::env::remove_var("API_LANES_HOME");
+    });
 }
 fn rich_home() -> (tempfile::TempDir, Paths) {
     utc();
@@ -123,7 +127,7 @@ use csr_engine::companion::render::{text, theme::Theme};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 const NOW: f64 = 1792320000.;
-const STATES: [&str; 14] = [
+const STATES: [&str; 15] = [
     "01-empty",
     "02-running",
     "03-agents",
@@ -138,6 +142,7 @@ const STATES: [&str; 14] = [
     "11-last-time",
     "12-fresh",
     "13-flat",
+    "14-soak",
 ];
 const QUESTION:&str="What if one of Fable's three prototypes made the what-if question the star of the pane, as you wanted on 10-09?";
 fn write_json(path: &Path, value: &Value) {
@@ -449,7 +454,70 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
     if state == "10-unknown-cost" {
         con.execute("DROP TABLE narrative_usage", []).unwrap();
     }
+    if state == "14-soak" {
+        soak_files(&paths);
+    }
     (home, paths)
+}
+/// A soak two hours in, ten minutes between samples, and API credit with about a day left.
+fn soak_files(paths: &Paths) {
+    let at = |secs: f64| {
+        chrono::DateTime::from_timestamp(secs as i64, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    };
+    let check = |id: &str,
+                 label: &str,
+                 metric: &str,
+                 op: &str,
+                 threshold: Value,
+                 kind: &str,
+                 unit: &str,
+                 warmup: f64| {
+        json!({"id":id,"label":label,"metric":metric,"op":op,"threshold":threshold,"kind":kind,
+            "unit":unit,"warmup_hours":warmup})
+    };
+    let trials = paths.home.join(".claude-self-reflect/trials");
+    write_json(
+        &trials.join("combo-soak.json"),
+        &json!({"name":"Combo soak","started_at":at(NOW - 7200.),"planned_end":at(NOW + 6. * 3600.),
+        "candidate":{"label":"combo","sha":"ac9c24c3f0a1"},"source":"combo-soak.ndjson",
+        "checks":[
+            check("daemon_errors","Daemon errors","daemon_errors","==",json!(0),"latest","",0.),
+            check("rss","Memory trend","rss_mb","<=",json!(150),"slope_per_hour","MB/h",0.5),
+            check("prompt","Prompt hook p95, worst","per_hook_p50_p95_max.prompt-submit.1","<=",json!(800),"max","ms",0.),
+            check("post","Post-tool hook p95, worst","per_hook_p50_p95_max.post-tool-use.1","<=",json!(100),"max","ms",0.),
+            check("replay","Replay finished","replay_finished","==",json!(true),"at_least_by_end","",0.),
+            check("dreams","Dream cycles","dream_cycles",">=",json!(1),"at_least_by_end","",0.),
+        ]}),
+    );
+    let rows: Vec<String> = (0..11)
+        .map(|i| {
+            json!({"t":at(NOW - 6600. + i as f64 * 600.),"daemon_errors":0,
+                "rss_mb":4400. - i as f64 * 20.,"dream_cycles":0,"replay_finished":false,
+                "per_hook_p50_p95_max":{"prompt-submit":[16.4, 481.1, 491.5],
+                    "post-tool-use":[10.2, 21.7 - i as f64 * 0.1, 128.8]}})
+            .to_string()
+        })
+        .collect();
+    fs::write(trials.join("combo-soak.ndjson"), rows.join("\n") + "\n").unwrap();
+    // Credit 200 from 10-01; $76.14 spent ten days ago, $94.63 within the week: $29.23 left,
+    // $13.5 a day, about two days.
+    let lanes = paths.home.join(".agents/api-lanes");
+    write_json(
+        &lanes.join("credit.json"),
+        &json!({"amount":200.0,"since":"2026-10-01"}),
+    );
+    fs::write(
+        lanes.join("ledger.jsonl"),
+        format!(
+            "{}\n{}\n",
+            json!({"ts":NOW - 10. * 86400.,"run":"r","id":"a","cost":76.14}),
+            json!({"ts":NOW - 3. * 86400.,"run":"r","id":"b","cost":94.63})
+        ),
+    )
+    .unwrap();
 }
 fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<u8>) {
     let (_home, paths) = state_home(state);

@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod api_credit;
 pub mod app;
 pub mod breakdown;
 pub mod brief;
@@ -22,6 +23,7 @@ pub mod infinite;
 pub mod info;
 pub mod layout;
 pub mod lease;
+pub mod live_eval;
 pub mod lost;
 pub mod lostmain;
 pub mod masthead;
