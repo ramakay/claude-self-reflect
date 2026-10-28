@@ -3771,3 +3771,28 @@ fn owner_review_pictures() {
         }
     }
 }
+
+/// The owner's pane (35x30 at the 26x58 cell) shows the API credit row in the closed view. The
+/// fixture has credit on record ($29.23 left by ledger), so a missing row is the fit dropping it,
+/// not an absent credit. (The figure view asks for a chart besides: its credit row needs
+/// 1220.7pt of the 1118.3pt the pane has, so the fit drops it there, after the lists and the
+/// performance card have given what they can.)
+#[test]
+fn the_api_credit_row_is_drawn_in_the_closed_owner_pane_at_35x30() {
+    let size = FIT_SIZES[0];
+    for theme in [Theme::Dark, Theme::Light] {
+        let shot = owner_shot(size, theme, &[]);
+        let row = shot
+            .metrics
+            .dash
+            .as_ref()
+            .and_then(|d| d.credit_row.clone());
+        assert!(
+            row.as_deref()
+                .is_some_and(|r| r.starts_with("API credit $29.23 left by ledger")),
+            "35x30 {theme:?}: credit row {row:?}; cards {:?}; scale {}",
+            title_rows(&shot),
+            shot.scale
+        );
+    }
+}

@@ -3051,8 +3051,8 @@ pub fn draw(
     //   1. the CSR performance card's check rows (a failing check stays),
     //   2. its clock and progress bar (the heading and the headline stay),
     //   3. the lists' rows, down to 3,
-    //   4. the API credit row,
-    //   5. the lists' rows, down to 1,
+    //   4. the lists' rows, down to 1,
+    //   5. the API credit row (one line: it outranks the lists' second and third rows),
     //   6. "CSR this session" from rings to one line of words,
     //   7. both lists (Confused Claude, Should be a skill / memory / tool), whole,
     //   8. the story ("Where the work stands"), whole,
@@ -5002,7 +5002,7 @@ const FIT_STEPS: [FitStep; 11] = [
     step(1, usize::MAX, true, false, false, false, false),
     step(0, usize::MAX, true, false, false, false, false),
     step(0, 3, true, false, false, false, false),
-    step(0, 3, false, false, false, false, false),
+    step(0, 1, true, false, false, false, false),
     step(0, 1, false, false, false, false, false),
     step(0, 1, false, true, false, false, false),
     step(0, 0, false, true, false, false, false),
@@ -7579,6 +7579,29 @@ mod tests {
             d.limits[0].line
         );
         assert_eq!(d.limits[0].tick, None);
+    }
+
+    #[test]
+    fn the_fit_drops_the_credit_row_after_the_lists_are_down_to_one_row_and_before_the_rings() {
+        // perf rows, perf clock, lists to 3, lists to 1, credit, rings, lists hidden, story.
+        let order: Vec<_> = FIT_STEPS
+            .iter()
+            .map(|s| (s.soak, s.cap, s.credit, s.compact, s.story_hidden))
+            .collect();
+        assert_eq!(
+            order[..9],
+            [
+                (2, usize::MAX, true, false, false),
+                (1, usize::MAX, true, false, false),
+                (0, usize::MAX, true, false, false),
+                (0, 3, true, false, false),
+                (0, 1, true, false, false),
+                (0, 1, false, false, false),
+                (0, 1, false, true, false),
+                (0, 0, false, true, false),
+                (0, 0, false, true, true),
+            ]
+        );
     }
 
     #[test]
