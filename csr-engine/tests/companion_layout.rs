@@ -204,7 +204,8 @@ fn a_scrolled_drilldown_keeps_the_instrument_and_legend() {
     assert_eq!(pane.instrument_open.scroll, 6);
     let after = pane.frame(100, 40, NOW);
     assert_eq!(before.len(), after.len());
-    assert!(after.iter().any(|l| plain(l).contains("CTX")));
+    // The Monologue is a page: its heading stays while the rows scroll, and the key bar stays.
+    assert!(after.iter().any(|l| plain(l).contains("Monologue")));
     assert_eq!(act_key(&pane, 39), "legend");
     pane.key("escape");
     assert_eq!(pane.instrument_open.scroll, 0);

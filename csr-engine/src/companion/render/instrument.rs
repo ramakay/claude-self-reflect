@@ -1020,10 +1020,7 @@ fn meta(c: &Composition) -> String {
 fn observation_card_h(rows: usize) -> f32 {
     P * 2. + theme::TITLE_LINE + S2 + rows as f32 * theme::BODY_LINE
 }
-/// An observation card folded to its title row, while an open section needs the room.
-fn observation_fold_h() -> f32 {
-    P * 2. + theme::TITLE_LINE
-}
+
 /// Line pitch of an open section's text card.
 const DRILL_LINE: f32 = 17.;
 /// The figure card's height for the expanded chart (95 + 40), its labels and payback (72) and the
@@ -1054,8 +1051,18 @@ fn mid_min_h(g: &Value) -> f32 {
 }
 /// Fewest lines a clipped section keeps, its "+N more" line included.
 const DRILL_MIN_LINES: usize = 4;
-/// Most thread bands an open `t` draws at once.
-const THREAD_BANDS: usize = 8;
+/// Fewest Monologue rows a page keeps on screen, however short the pane.
+const PAGE_MIN_ROWS: usize = 3;
+/// The Changes page's heading.
+const CHANGES: &str = "Changes";
+/// The footer of a page that holds more rows than fit: which rows are shown, and how to scroll.
+fn scroll_footer(from: usize, shown: usize, total: usize) -> String {
+    format!(
+        "{}\u{2013}{} of {total} \u{b7} j/k scroll",
+        from + 1,
+        from + shown
+    )
+}
 /// The line that ends a section clipped to the room it was given.
 fn more_line(hidden: usize) -> String {
     format!("+{hidden} more")
@@ -1233,19 +1240,14 @@ pub fn story_full(c: &Composition) -> String {
         c.story.clone()
     }
 }
-/// The row a folded observation card leaves: its title and how many items it holds.
-pub fn fold_row(title: &str, items: usize) -> String {
-    format!("{title} · {items} · o opens")
-}
-/// The note an open `l` leads with: how many changes there are and how many the story card shows.
+/// What the Changes page says it holds: how many changes there are, each with what it replaced.
 fn changes_note(c: &Composition) -> String {
     match c.shifts.len() {
         0 => "No changes yet in this session.".into(),
-        n @ 1..=3 => format!(
-            "{n} change{}, all shown above; each with what it replaced.",
+        n => format!(
+            "{n} change{}, each with what it replaced.",
             if n == 1 { "" } else { "s" }
         ),
-        n => format!("{n} changes, the first 3 shown above; each with what it replaced."),
     }
 }
 const NO_THREADS: &str = "No threads yet: the session has said nothing out loud.";
@@ -1275,6 +1277,51 @@ pub fn figure_text_rows(
             .collect()
     }
 }
+/// The text pane's page: the Changes or the Monologue and nothing of the dashboard, scrolled by
+/// `open.scroll`, with a footer when it holds more rows than fit.
+fn page_text_rows(c: &Composition, cols: usize, rows: usize, open: Open) -> Vec<String> {
+    let wrap = |s: &str| text::wrap(s, cols.max(1), 1000);
+    let (mut out, body) = if open.threads {
+        let mut body: Vec<String> = vec![];
+        if c.river.is_empty() {
+            body.extend(wrap(NO_THREADS));
+        }
+        for row in &c.river {
+            let when = row.time_label(c.now);
+            body.extend(wrap(&format!(
+                "{}{}{}{} · {}",
+                when,
+                if when.is_empty() { "" } else { " · " },
+                row.lead,
+                row.mood(),
+                row.line
+            )));
+        }
+        (wrap(&format!("{MONOLOGUE} · {MONOLOGUE_SUB}")), body)
+    } else {
+        let mut body: Vec<String> = vec![];
+        for v in &c.shifts {
+            body.extend(wrap(&shift_row(v, true)));
+            if !string(&v["was"]).is_empty() {
+                body.extend(wrap(&format!("Was: {}", string(&v["was"]))));
+            }
+        }
+        let mut head = wrap(CHANGES);
+        head.extend(wrap(&changes_note(c)));
+        (head, body)
+    };
+    // The key row keeps the last line of the pane.
+    let room = rows.saturating_sub(1 + out.len()).max(1);
+    if body.len() <= room {
+        out.extend(body);
+    } else {
+        let shown = (room - 1).max(1);
+        let from = open.scroll.min(body.len() - shown);
+        out.extend(body.iter().skip(from).take(shown).cloned());
+        out.extend(wrap(&scroll_footer(from, shown, body.len())));
+    }
+    out
+}
 /// The text rows, and whether an open section was cut for want of room.
 fn assemble(
     c: &Composition,
@@ -1290,6 +1337,9 @@ fn assemble(
     let mut pitch_insert = None;
     let cap = rows * 3 / 10;
     let wrap = |s: &str| text::wrap(s, cols.max(1), 1000);
+    if open.threads || open.changes {
+        return (page_text_rows(c, cols, rows, open), false);
+    }
     let mut collapsed_hero = false;
     let mut hero = wrap(&format!("☾ {}", c.question()));
     if hero.len() > cap.saturating_sub(2) {
@@ -1322,8 +1372,8 @@ fn assemble(
         if items.is_empty() {
             continue;
         }
+        // A list squeezed for room is left out, never folded to a title row.
         if fold {
-            out.extend(wrap(&fold_row(title, items.len())));
             continue;
         }
         out.extend(wrap(title));
@@ -1366,41 +1416,10 @@ fn assemble(
     }
     out.extend(text_story_rows(c, cols));
     let story_end = out.len();
-    let mut details_start = out.len();
-    if open.changes {
-        out.extend(wrap(&changes_note(c)));
+    for v in c.shifts.iter().take(3) {
+        out.extend(wrap(&shift_row(v, false)));
     }
-    for v in c
-        .shifts
-        .iter()
-        .take(if open.changes { usize::MAX } else { 3 })
-    {
-        out.extend(wrap(&shift_row(v, open.changes)));
-        if open.changes && !string(&v["was"]).is_empty() {
-            out.extend(wrap(&format!("Was: {}", string(&v["was"]))));
-        }
-    }
-    if !open.changes {
-        details_start = out.len();
-    }
-    if open.threads {
-        out.extend(wrap(&format!("{MONOLOGUE} · {MONOLOGUE_SUB}")));
-        details_start = out.len();
-        if c.river.is_empty() {
-            out.extend(wrap(NO_THREADS));
-        }
-        for row in &c.river {
-            let when = row.time_label(c.now);
-            out.extend(wrap(&format!(
-                "{}{}{}{} · {}",
-                when,
-                if when.is_empty() { "" } else { " · " },
-                row.lead,
-                row.mood(),
-                row.line
-            )));
-        }
-    }
+    let details_start = out.len();
     if open.dreams {
         if collapsed_hero {
             out.extend(wrap(&c.question()));
@@ -1417,7 +1436,7 @@ fn assemble(
     }
     // `i` opens the figure: one fact to a row, then the history in words.
     let fig_lines = figure_text_rows(c, cols, open.figure, open.gauge);
-    if open.changes || open.threads || open.dreams || open.agents {
+    if open.dreams || open.agents {
         let details = out.drain(details_start..).collect::<Vec<_>>();
         let figure_rows = if show_figure { fig_lines.len() } else { 4 };
         let reserved = figure_rows
@@ -1490,7 +1509,7 @@ fn assemble(
     // Past the pane's last row the tail is cut. An open section must not be what goes: fold the
     // observation cards (a second pass), then give up the rows between them and the open section.
     let over = (out.len() + usize::from(!active.is_empty())).saturating_sub(rows.saturating_sub(1));
-    if over > 0 && (open.changes || open.threads || open.dreams || open.agents || open.figure) {
+    if over > 0 && (open.dreams || open.agents || open.figure) {
         if fold {
             let cut = over.min(story_end.saturating_sub(obs_end));
             out.drain(obs_end..obs_end + cut);
@@ -2681,8 +2700,29 @@ fn recent_request_compactions(s: &Value) -> Vec<usize> {
     indices
 }
 
+/// A card the picture drew: its title, top and height in layout pt, and how many rows of body it
+/// holds under the title. A card with no body is never drawn.
+#[derive(Clone, Debug)]
+pub struct CardRegion {
+    pub title: &'static str,
+    pub top: f32,
+    pub height: f32,
+    pub body_rows: usize,
+}
+impl CardRegion {
+    fn new(title: &'static str, top: f32, height: f32, body_rows: usize) -> Self {
+        Self {
+            title,
+            top,
+            height,
+            body_rows,
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Metrics {
+    /// Every card drawn, top to bottom.
+    pub cards: Vec<CardRegion>,
     pub csr_cost: InstrumentCost,
     pub quota_gauges: Vec<QuotaGauge>,
     /// Baseline of the line of notes drawn under the quota circles, in layout pt.
@@ -2719,8 +2759,9 @@ pub struct Metrics {
     pub story_open: Option<(f32, f32, String, String)>,
     /// Where the popup's footer keys sit in layout pt, when a popup is drawn.
     pub popup_keys: Vec<observation::KeyBox>,
-    /// The two observation cards were folded to a title row each, for an open section's room.
-    pub observations_folded: bool,
+    /// With a page open: the most the first row shown may be, so a scroll never runs past the
+    /// last row.
+    pub page_scroll_max: Option<usize>,
     /// Every row drawn with a trailing "…", with its words in full: the click targets that open
     /// the popup.
     pub cuts: Vec<Cut>,
@@ -2778,6 +2819,9 @@ pub fn draw(
     let f = &*fonts;
     f.used.borrow_mut().clear();
     let t = theme.tokens();
+    // `l` and `t` open a page: one card, the Changes or the Monologue, over the whole pane, and
+    // none of the dashboard's cards.
+    let page = open.threads || open.changes;
     let ratio = width as f32 / (W * S);
     let mut maxh = (available_height as f32 / (S * ratio)).max(800.);
     let caption = sans(theme::CAPTION_SIZE, t.regular);
@@ -2790,7 +2834,7 @@ pub fn draw(
         wrap_clauses(f, first_sentence(&c.story), story_st, IW, 4)
     };
     let story_line_rows = story_lines_fit.len();
-    let has_story = !c.story.is_empty() || !c.shifts.is_empty() || !c.learnt.is_empty();
+    let has_story = !page && (!c.story.is_empty() || !c.shifts.is_empty() || !c.learnt.is_empty());
     let story_age =
         has_story && !c.story_age.is_empty() && (!c.story.is_empty() || !c.shifts.is_empty());
     let story_h = if !has_story {
@@ -2868,9 +2912,11 @@ pub fn draw(
         } else {
             S2 + status_lines.len() as f32 * theme::CAPTION_LINE
         };
+    let hero_full_h = hero_h;
+    let hero_h = if page { 0. } else { hero_full_h };
     // Keep the full specified headline size and the hero's 30% budget together in short panes.
     maxh = maxh.max((hero_h / 0.30).ceil());
-    let active = c.agents.agents.iter().any(agents::is_active);
+    let active = !page && c.agents.agents.iter().any(agents::is_active);
     let agents_h = if active {
         P * 2. + theme::BODY_LINE
     } else {
@@ -2899,10 +2945,9 @@ pub fn draw(
     } else {
         0.
     };
-    let empty_help = sell_h;
+    let empty_help = if page { 0. } else { sell_h };
     let mut drill_lines = vec![];
     if open.changes {
-        drill_lines.extend(f.wrap(&changes_note(c), sans(11.5, t.regular), IW));
         for v in &c.shifts {
             drill_lines.extend(f.wrap(&shift_row(v, true), sans(11.5, t.regular), IW));
             if !string(&v["was"]).is_empty() {
@@ -2923,24 +2968,11 @@ pub fn draw(
             drill_lines.extend(f.wrap(string(&d["line"]), sans(11.5, t.regular), IW));
         }
     }
-    // The room an open section asks for, and the least it is given. Threads draw bands, every
-    // other section draws lines.
+    // The room an open section asks for, and the least it is given. A page takes the pane and
+    // asks for nothing: the dashboard's sections are the agents and the dreams.
     let drill_total = drill_lines.len().saturating_sub(open.scroll);
-    let bands_left = c.river.len().saturating_sub(open.scroll);
-    let thread_card = |bands: usize, more: bool| {
-        // A heading, then the bands with a gap between each, or the one line saying there are none.
-        P * 2.
-            + MONOLOGUE_H
-            + (bands as f32 * ROW_PITCH - ROW_GAP).max(40.)
-            + if more { DRILL_LINE } else { 0. }
-    };
     let line_card = |lines: usize| lines as f32 * DRILL_LINE + P * 2.;
-    let (drill_want, drill_least) = if open.threads {
-        (
-            thread_card(bands_left.min(THREAD_BANDS), bands_left > THREAD_BANDS),
-            thread_card(bands_left.min(2), bands_left > 2),
-        )
-    } else if drill_lines.is_empty() {
+    let (drill_want, drill_least) = if page || drill_lines.is_empty() {
         (0., 0.)
     } else {
         (
@@ -2948,19 +2980,28 @@ pub fn draw(
             line_card(drill_total.clamp(1, DRILL_MIN_LINES)),
         )
     };
-    let notice_h = if c.notice.is_some() {
+    let notice = c.notice.as_ref().filter(|_| !page);
+    let notice_h = if notice.is_some() {
         P * 2. + theme::BODY_LINE
     } else {
         0.
     };
-    let notice_gap = if c.notice.is_some() { S3 } else { 0. };
+    let notice_gap = if notice.is_some() { S3 } else { 0. };
     let quotas_only = c.figure["ctx"]["tokens"].as_f64().is_none_or(|n| n <= 0.);
     // The figure card's smallest height: its one-row gauge strip (or the quotas row).
-    let figure_floor: f32 = if quotas_only { 154. } else { 110. };
+    let figure_floor: f32 = if page {
+        0.
+    } else if quotas_only {
+        154.
+    } else {
+        110.
+    };
     // A closed pane keeps the Context card tall enough for the small circles, their notes line and
     // the caption; a card an open section squeezed below that is the strip.
-    let mut dash = dash_plan(f, c, t);
-    let figure_closed_floor: f32 = if let Some(plan) = &dash {
+    let mut dash = if page { None } else { dash_plan(f, c, t) };
+    let figure_closed_floor: f32 = if page {
+        0.
+    } else if let Some(plan) = &dash {
         figure_floor.max(dash_compact_h(plan))
     } else if quotas_only || narrow {
         figure_floor
@@ -2968,7 +3009,7 @@ pub fn draw(
         figure_floor.max(mid_min_h(&c.figure))
     };
     // `i` adds a card of the figure's facts, one to a line, under the figure.
-    let fig_detail_all: Vec<String> = if open.figure && dash.is_none() {
+    let fig_detail_all: Vec<String> = if open.figure && !page && dash.is_none() {
         figure_detail_lines(c, open.gauge)
             .iter()
             .flat_map(|line| f.wrap(line, sans(11.5, t.regular), IW))
@@ -2976,51 +3017,52 @@ pub fn draw(
     } else {
         vec![]
     };
-    let (detail_want, detail_least) =
-        if dash.is_some() && open.figure && fresh_bar_heights(&c.requests).is_some() {
-            // The dashboard draws no card of its own under the figure, but `i` asks the figure for
-            // the room of its chart: the cards above fold to make it.
-            (DASH_CHART_WANT, DASH_CHART_WANT)
-        } else if fig_detail_all.is_empty() {
-            (0., 0.)
-        } else {
-            (
-                line_card(fig_detail_all.len()),
-                line_card(fig_detail_all.len().min(DRILL_MIN_LINES)),
-            )
-        };
-    let observed = [
-        (CONFUSED_TITLE, &c.confusing, false),
-        (SHOULD_BE_TITLE, &c.should_be, true),
-    ];
-    let observed_fold_h: f32 = observed
-        .iter()
-        .filter(|(_, items, _)| !items.is_empty())
-        .map(|_| observation_fold_h() + S3)
-        .sum();
-    let story_fold_h = if story_h > 0. {
-        observation_fold_h()
+    // The dashboard draws no card of its own under the figure, but `i` asks the figure for the room
+    // of its chart: the cards above give way for it.
+    let figure_wants_chart =
+        dash.is_some() && open.figure && fresh_bar_heights(&c.requests).is_some();
+    let (detail_want, detail_least) = if fig_detail_all.is_empty() {
+        (0., 0.)
     } else {
-        0.
+        (
+            line_card(fig_detail_all.len()),
+            line_card(fig_detail_all.len().min(DRILL_MIN_LINES)),
+        )
+    };
+    let no_items: [Value; 0] = [];
+    let observed: [(&'static str, &[Value], bool); 2] = if page {
+        [
+            (CONFUSED_TITLE, &no_items[..], false),
+            (SHOULD_BE_TITLE, &no_items[..], true),
+        ]
+    } else {
+        [
+            (CONFUSED_TITLE, &c.confusing[..], false),
+            (SHOULD_BE_TITLE, &c.should_be[..], true),
+        ]
     };
     let tail_base = agents_h
         + if active { S3 } else { 0. }
         + empty_help
         + if empty_help > 0. { S3 } else { 0. };
-    // Text keeps one size: the width fit, `limit` pt of layout for this pane, or what the pane held
-    // before the performance card, the credit row and the rings existed (lists and story whole),
-    // if that was more. Content that does not fit is dropped, never scaled, in this order:
+    // Text keeps one size: the width fit, `limit` pt of layout for this pane. Content that does not
+    // fit is dropped, never scaled, and then whole cards are hidden, before any text gets smaller
+    // than the width fit. The final priority, the first to go first:
     //   1. the CSR performance card's check rows (a failing check stays),
     //   2. its clock and progress bar (the heading and the headline stay),
     //   3. the lists' rows, down to 3,
     //   4. the API credit row,
     //   5. the lists' rows, down to 1,
     //   6. "CSR this session" from rings to one line of words,
-    //   7. each list folded to its title row,
-    //   8. the story folded to its title row.
-    // The hero, the story, the limits and the context keep their size. Only when all of that still
-    // overflows does the layout grow, and the picture with it shrink. A list or the story is folded
-    // only for the performance card, which stays in the pane in some form.
+    //   7. both lists (Confused Claude, Should be a skill / memory / tool), whole,
+    //   8. the story ("Where the work stands"), whole,
+    //   9. with a section open: the Context card to its floor,
+    //  10. with a section open: the section to its least rows.
+    // The hero, the performance card's headline and the Context card are never hidden. A card is
+    // drawn with a body or not at all: no list, story or section is ever folded to its title.
+    // Cards that stay take the room a hidden card frees: they are drawn at the richest step that
+    // fits, so rows come back before the text grows, and the text never exceeds the width fit.
+    // Only when all of that still overflows does the layout grow, and the picture with it shrink.
     let limit = maxh;
     let top_with = |observed_h: f32, story_h: f32, soak_h: f32| {
         M + hero_h
@@ -3036,58 +3078,90 @@ pub fn draw(
     let observed_with = |cap: usize| -> f32 {
         observed
             .iter()
-            .filter(|(_, items, _)| !items.is_empty())
-            .map(|(_, items, _)| {
-                if cap == 0 {
-                    observation_fold_h() + S3
-                } else {
-                    observation_card_h(items.len().min(cap)) + S3
-                }
-            })
+            .filter(|(_, items, _)| !items.is_empty() && cap > 0)
+            .map(|(_, items, _)| observation_card_h(items.len().min(cap)) + S3)
             .sum()
     };
-    let (soak_level, obs_cap, keep_credit, rings_compact, story_fold) = {
-        // (soak level, list row cap, keep the credit row, rings as one line, story folded), most
-        // content first.
-        const STEPS: [(u8, usize, bool, bool, bool); 9] = [
-            (2, usize::MAX, true, false, false),
-            (1, usize::MAX, true, false, false),
-            (0, usize::MAX, true, false, false),
-            (0, 3, true, false, false),
-            (0, 3, false, false, false),
-            (0, 1, false, false, false),
-            (0, 1, false, true, false),
-            (0, 0, false, true, false),
-            (0, 0, false, true, true),
-        ];
-        let need = |&(level, cap, credit, compact, fold): &(u8, usize, bool, bool, bool),
-                    with_soak: bool| {
+    let gaps = if drill_want > 0. { S3 } else { 0. } + if detail_want > 0. { S3 } else { 0. };
+    let want = drill_want + detail_want + gaps;
+    let section_open = want > 0. || figure_wants_chart;
+    // The figure card: the height it is laid out at for each choice of dashboard parts.
+    let figure_target_with = |credit: bool, compact: bool| -> f32 {
+        if quotas_only {
+            empty_quota_height(c)
+        } else if let Some(plan) = &dash {
+            dash_heights_with(plan, true, credit, compact).4
+                + if figure_wants_chart {
+                    DASH_CHART_WANT
+                } else {
+                    0.
+                }
+        } else if open.figure && fresh_bar_heights(&c.requests).is_some() {
+            figure_expanded_h(&c.figure)
+        } else {
+            collapsed_context_layout(&c.figure, 0.).2
+        }
+    };
+    let figure_floor_with = |credit: bool, compact: bool| -> f32 {
+        match &dash {
+            Some(plan) => figure_floor.max(dash_heights_with(plan, false, credit, compact).4),
+            None => figure_closed_floor,
+        }
+    };
+    let fit = if page {
+        // A page is one card; nothing is traded for it.
+        FIT_STEPS[FIT_STEPS.len() - 1]
+    } else {
+        let need = |step: &FitStep| {
             let soak_h = c
                 .soak
                 .as_ref()
-                .filter(|_| with_soak)
-                .map_or(0., |card| soak_plan(f, card, t, level).h);
-            let floor = match &dash {
-                Some(plan) => figure_floor.max(dash_heights_with(plan, false, credit, compact).4),
-                None => figure_closed_floor,
+                .map_or(0., |card| soak_plan(f, card, t, step.soak).h);
+            let story_h = if step.story_hidden { 0. } else { story_h };
+            let section = if step.least {
+                drill_least + detail_least + gaps
+            } else {
+                want
             };
-            let story_h = if fold { story_fold_h } else { story_h };
-            (top_with(observed_with(cap), story_h, soak_h) + tail_base + floor)
+            let figure = if section_open {
+                if step.squeeze {
+                    figure_floor
+                } else {
+                    figure_floor_with(step.credit, step.compact)
+                        .max(figure_target_with(step.credit, step.compact))
+                }
+            } else {
+                figure_floor_with(step.credit, step.compact)
+            };
+            (top_with(observed_with(step.cap), story_h, soak_h)
+                + tail_base
+                + figure
+                + if section_open { section } else { 0. })
                 / (1. - S3 / available_height as f32)
         };
-        let limit = limit.max(need(&(0, usize::MAX, false, true, false), false));
-        // Without a performance card there is nothing to make room for: no list or story folds.
-        let steps = if c.soak.is_some() {
-            &STEPS[..]
+        // A closed pane keeps the Context card at its closed floor; only an open section may
+        // squeeze it, so the last steps repeat the one before them without one.
+        let steps = if section_open {
+            &FIT_STEPS[..]
         } else {
-            &STEPS[..7]
+            &FIT_STEPS[..FIT_STEPS.len() - 2]
         };
         *steps
             .iter()
-            .find(|step| need(step, true) <= limit)
-            // Short of a fit the text shrinks anyway, and no card is folded for it.
-            .unwrap_or(&STEPS[6])
+            .find(|step| need(step) <= limit)
+            // Short of a fit everything that can go has gone, and the text shrinks.
+            .unwrap_or(&steps[steps.len() - 1])
     };
+    let FitStep {
+        soak: soak_level,
+        cap: obs_cap,
+        credit: keep_credit,
+        compact: rings_compact,
+        story_hidden,
+        squeeze,
+        least: section_least,
+    } = fit;
+    let figure_target = figure_target_with(keep_credit, rings_compact);
     if let Some(plan) = dash.as_mut() {
         plan.fit(DashFit {
             credit: keep_credit,
@@ -3095,17 +3169,20 @@ pub fn draw(
         });
     }
     let figure_closed_floor = match &dash {
-        Some(plan) => figure_floor.max(dash_compact_h(plan)),
+        Some(plan) if !squeeze => figure_floor.max(dash_compact_h(plan)),
+        Some(_) => figure_floor,
+        None if squeeze => figure_floor,
         None => figure_closed_floor,
     };
     // The CSR performance card sits right above the Context card.
     let soak = c
         .soak
         .as_ref()
+        .filter(|_| !page)
         .map(|card| soak_plan(f, card, t, soak_level));
     let soak_h = soak.as_ref().map_or(0., |p| p.h);
     let observed_full_h = observed_with(obs_cap);
-    let story_h = if story_fold { story_fold_h } else { story_h };
+    let story_h = if story_hidden { 0. } else { story_h };
     // Everything above the figure for one choice of observation cards and story card.
     let top_for = |observed_h: f32, story_h: f32| top_with(observed_h, story_h, soak_h);
     // The canvas is the closed pane's: an open section never makes it taller. Layout points may
@@ -3114,9 +3191,22 @@ pub fn draw(
         (top_for(observed_full_h, story_h) + tail_base + figure_closed_floor)
             / (1. - S3 / available_height as f32),
     );
+    // A page keeps at least the rows its heading promises, whatever the pane.
+    let maxh = if page {
+        maxh.max(
+            (M + if open.threads {
+                P * 2. + MONOLOGUE_H + (PAGE_MIN_ROWS as f32 * ROW_PITCH - ROW_GAP) + DRILL_LINE
+            } else {
+                P * 2. + MONOLOGUE_H + DRILL_MIN_LINES as f32 * DRILL_LINE
+            }) / (1. - S3 / available_height as f32),
+        )
+    } else {
+        maxh
+    };
     let key_gap = S3 * maxh / available_height as f32;
-    // The height the figure keeps while cards can still fold: the closed pane's, or the least its
-    // layout needs (the expanded chart for `i`, the full ring, the quotas row), whichever is less.
+    // The height the figure keeps while cards can still give way: the closed pane's, or the least
+    // its layout needs (the expanded chart for `i`, the full ring, the quotas row), whichever is
+    // less.
     let closed_figure_h = {
         let available = maxh - top_for(observed_full_h, story_h) - tail_base - key_gap;
         if quotas_only && empty_help > 0. {
@@ -3125,54 +3215,30 @@ pub fn draw(
             available
         }
     };
-    let figure_target = if quotas_only {
-        empty_quota_height(c)
-    } else if let Some(plan) = &dash {
-        dash_full_h(plan)
-            + if open.figure && fresh_bar_heights(&c.requests).is_some() {
-                DASH_CHART_WANT
-            } else {
-                0.
-            }
-    } else if open.figure && fresh_bar_heights(&c.requests).is_some() {
-        figure_expanded_h(&c.figure)
-    } else {
-        collapsed_context_layout(&c.figure, 0.).2
-    };
     let figure_pref = closed_figure_h.min(figure_target).max(figure_floor);
-    // An open section makes its room by folding the two observation cards to a row each, then the
-    // story card, then shrinking the figure to its floor; only then is the section itself clipped.
-    let gaps = if drill_want > 0. { S3 } else { 0. } + if detail_want > 0. { S3 } else { 0. };
-    let want = drill_want + detail_want + gaps;
     let mut room = maxh - key_gap - top_for(observed_full_h, story_h) - tail_base - figure_pref;
-    let mut observed_h = observed_full_h;
-    let mut story_card_h = story_h;
-    let mut folded = obs_cap == 0;
-    let mut story_folded = story_fold;
-    // Float noise in `room` never folds a card for a section that is not open.
-    let needs = |room: f32| want > 0. && want > room;
-    if needs(room) && observed_fold_h < observed_full_h {
-        folded = true;
-        observed_h = observed_fold_h;
-        room += observed_full_h - observed_fold_h;
-    }
-    if needs(room) && story_fold_h < story_h {
-        story_folded = true;
-        story_card_h = story_fold_h;
-        room += story_h - story_fold_h;
-    }
-    if needs(room) {
+    if squeeze {
         room += figure_pref - figure_floor;
     }
+    let observed_h = observed_full_h;
+    let story_card_h = story_h;
     // The drill card is placed first; the facts card takes what it leaves.
     let space = room - gaps;
     let drill_given = if drill_want > 0. {
-        drill_want.min(drill_least.max(space - detail_least))
+        if section_least {
+            drill_least
+        } else {
+            drill_want.min(drill_least.max(space - detail_least))
+        }
     } else {
         0.
     };
     let detail_given = if detail_want > 0. {
-        detail_want.min(detail_least.max(space - drill_given))
+        if section_least {
+            detail_least
+        } else {
+            detail_want.min(detail_least.max(space - drill_given))
+        }
     } else {
         0.
     };
@@ -3189,34 +3255,59 @@ pub fn draw(
         out.push(more_line(rest.len() - shown));
         out
     };
-    let drill_rows = if open.threads || drill_lines.is_empty() {
+    // A page is one card to the bottom of the pane. It shows the rows that fit and scrolls through
+    // the rest with j and k: (the first row shown, the most the first row may be, a footer).
+    let page_h = if page { maxh - M - key_gap } else { 0. };
+    let (page_rows, page_from, page_scroll_max, page_footer) = if open.threads {
+        let spine = page_h - P * 2. - MONOLOGUE_H;
+        let total = c.river.len();
+        let all = ((spine + ROW_GAP) / ROW_PITCH + 0.001).max(0.) as usize;
+        if total <= all {
+            (total, 0, 0, String::new())
+        } else {
+            let fit = (((spine - DRILL_LINE + ROW_GAP) / ROW_PITCH + 0.001).max(0.) as usize)
+                .max(PAGE_MIN_ROWS)
+                .min(total);
+            let max = total - fit;
+            let from = open.scroll.min(max);
+            (fit, from, max, scroll_footer(from, fit, total))
+        }
+    } else if open.changes {
+        let total = drill_lines.len();
+        let all = lines_in(page_h - MONOLOGUE_H);
+        if total <= all {
+            (total, 0, 0, String::new())
+        } else {
+            let fit = all.saturating_sub(1).max(DRILL_MIN_LINES - 1).min(total);
+            let max = total - fit;
+            let from = open.scroll.min(max);
+            (fit, from, max, scroll_footer(from, fit, total))
+        }
+    } else {
+        (0, 0, 0, String::new())
+    };
+    let drill_rows: Vec<String> = if open.changes {
+        drill_lines
+            .iter()
+            .skip(page_from)
+            .take(page_rows)
+            .cloned()
+            .chain((!page_footer.is_empty()).then(|| page_footer.clone()))
+            .collect()
+    } else if drill_lines.is_empty() {
         vec![]
     } else {
         clip(&drill_lines, open.scroll, drill_given, drill_want)
     };
-    // The bands an open `t` draws, and how many it leaves out.
-    let (thread_bands, thread_hidden) = if open.threads {
-        let spine = drill_given - P * 2. - MONOLOGUE_H;
-        let all = ((spine + ROW_GAP) / ROW_PITCH + 0.001).max(0.) as usize;
-        if bands_left <= THREAD_BANDS && (all >= bands_left || drill_given >= drill_want) {
-            (bands_left, 0)
-        } else {
-            let fit = (((spine - DRILL_LINE + ROW_GAP) / ROW_PITCH + 0.001).max(0.) as usize)
-                .min(THREAD_BANDS)
-                .max(bands_left.min(2));
-            (fit.min(bands_left), bands_left.saturating_sub(fit))
-        }
-    } else {
-        (0, 0)
-    };
-    let extra_h = if open.threads {
-        thread_card(thread_bands, thread_hidden > 0)
+    let thread_bands = if open.threads { page_rows } else { 0 };
+    let extra_h = if page {
+        page_h
     } else if drill_rows.is_empty() {
         0.
     } else {
         line_card(drill_rows.len())
     };
-    let fig_detail_lines = if open.figure {
+    let fig_detail_lines = if open.figure && !page {
         clip(&fig_detail_all, 0, detail_given, detail_want)
     } else {
         vec![]
@@ -3234,7 +3325,9 @@ pub fn draw(
         };
     let top_core = top_for(observed_h, story_card_h) + extra_h + if extra_h > 0. { S3 } else { 0. };
     let card_gap = S3;
-    let (figure_h, help_h) = if quotas_only && empty_help > 0. {
+    let (figure_h, help_h) = if page {
+        (0., 0.)
+    } else if quotas_only && empty_help > 0. {
         let available = maxh - top_core - tail_core - key_gap;
         let figure_h = available.min(empty_quota_height(c)).max(figure_floor);
         // Cards always stack from the top. The final card owns surplus height.
@@ -3247,238 +3340,203 @@ pub fn draw(
     canvas.output_scale = (width as f32 / W).min(available_height as f32 / height);
     canvas.background(t);
     let mut y = M;
-    panel(&mut canvas, y, hero_h, t);
-    let title_y = y + P + f.cap(title);
-    label(
-        &mut canvas,
-        f,
-        if c.offer {
-            "Dreams are off"
-        } else if c.dream.state == Batch::Ready {
-            if c.asked_away {
-                "The dreamer asks · asked while you were away"
-            } else {
-                "The dreamer asks"
-            }
-        } else {
-            "CSR's dreamer"
-        },
-        IX,
-        title_y,
-        theme::TITLE_SIZE,
-        t.ink,
-        t.bold,
-    );
-    if c.dream.carried {
-        label(
-            &mut canvas,
-            f,
-            "CARRIED",
-            IX + f.width("The dreamer asks", title) + S3,
-            title_y,
-            theme::CAPTION_SIZE,
-            t.dream,
-            t.medium,
-        );
-    }
-    canvas.icon(
-        f,
-        if c.offer { Icon::Moon } else { Icon::MoonStar },
-        W - M - P - 18.,
-        title_y,
-        18.,
-        theme::TITLE_SIZE,
-        t.dream,
-    );
-    let mut cursor = y + P + theme::TITLE_LINE + S2;
-    for line in &question {
-        canvas.text(f, line, IX, cursor + f.cap(qs), qs, t.ink, A::L);
-        cursor += question_line_height;
-    }
-    if !meta_rows.is_empty() {
-        cursor += S3;
-    }
-    for parts in &meta_rows {
-        let b = cursor + f.cap(caption);
-        let mut x = IX;
-        for part in parts {
-            if part.starts_with("dreamer ") {
-                let spent = num(&c.dream.budget["spent"]);
-                let cap = num(&c.dream.budget["cap"]).max(1.);
-                canvas.rrect(x, b - f.cap(caption) / 2., S5, 3., 1.5, t.track);
-                canvas.rrect(
-                    x,
-                    b - f.cap(caption) / 2.,
-                    S5 * (spent / cap).clamp(0., 1.) as f32,
-                    3.,
-                    1.5,
-                    t.dream,
-                );
-                x += S5 + ICON_GAP;
-            }
-            let st = if part.starts_with('⌗') {
-                mono(theme::CHIP_SIZE, t.regular)
-            } else {
-                caption
-            };
-            let w = f.width(part, st);
-            if part.starts_with('⌗') {
-                canvas.rrect(
-                    x - S1,
-                    b - f.cap(st) - S1 / 2.,
-                    w + S2,
-                    theme::CHIP_LINE,
-                    S1,
-                    t.chip,
-                );
-            }
-            canvas.text(
-                f,
-                part,
-                x,
-                b,
-                st,
-                if part.starts_with('⌗') {
-                    t.dream
-                } else {
-                    t.quiet
-                },
-                A::L,
-            );
-            x += w + S3;
-        }
-        cursor += theme::CAPTION_LINE;
-    }
+    let mut cards: Vec<CardRegion> = vec![];
     let mut answer_spans = vec![];
     let mut offer_hit = None;
     let mut answer_y = None;
-    if has_answers {
-        cursor += S1;
-    }
-    if c.dream.state == Batch::Ready {
-        let b = cursor + f.cap(caption);
-        answer_y = Some(b);
-        let mut x = IX;
-        for (label, answer) in [
-            ("1 ✓ helpful", "helpful"),
-            ("2 \u{e1c2} thought of it", "thought_of_it"),
-            ("3 ✗ not relevant", "not_relevant"),
-            ("4 → ask Claude", "ask_claude"),
-        ] {
-            let w = canvas.text(
-                f,
-                label,
-                x,
-                b,
-                sans(theme::CAPTION_SIZE, t.medium),
-                if answer == "ask_claude" {
-                    t.asked
-                } else {
-                    t.quiet
-                },
-                A::L,
-            );
-            answer_spans.push((x, x + w, answer.into()));
-            x += w + S3;
-        }
-        cursor += theme::CAPTION_LINE;
-    } else if c.offer {
-        let b = cursor + f.cap(caption);
-        let mut x = IX;
-        x += canvas.text(f, "Press", x, b, caption, t.quiet, A::L) + ICON_GAP;
-        let key_w = f.width("1", caption);
-        canvas.rrect(
-            x - S1,
-            b - f.cap(caption) - S1 / 2.,
-            key_w + S2,
-            theme::CAPTION_LINE,
-            S1,
-            t.chip,
-        );
-        canvas.text(f, "1", x, b, caption, t.dream, A::L);
-        x += key_w + ICON_GAP;
-        x += canvas.text(
+    if !page {
+        cards.push(CardRegion::new("hero", y, hero_h, question.len()));
+        panel(&mut canvas, y, hero_h, t);
+        let title_y = y + P + f.cap(title);
+        label(
+            &mut canvas,
             f,
-            "to turn dreams on in all your sessions.",
-            x,
-            b,
-            caption,
-            t.quiet,
-            A::L,
+            if c.offer {
+                "Dreams are off"
+            } else if c.dream.state == Batch::Ready {
+                if c.asked_away {
+                    "The dreamer asks · asked while you were away"
+                } else {
+                    "The dreamer asks"
+                }
+            } else {
+                "CSR's dreamer"
+            },
+            IX,
+            title_y,
+            theme::TITLE_SIZE,
+            t.ink,
+            t.bold,
         );
-        offer_hit = Some((b, IX, x));
-        cursor += theme::CAPTION_LINE;
-    }
-    if !status.is_empty() {
-        cursor += S2;
-        for line in &status_lines {
+        if c.dream.carried {
             label(
                 &mut canvas,
                 f,
-                line,
-                IX,
-                cursor + f.cap(caption),
+                "CARRIED",
+                IX + f.width("The dreamer asks", title) + S3,
+                title_y,
                 theme::CAPTION_SIZE,
-                t.quiet,
-                t.regular,
+                t.dream,
+                t.medium,
             );
+        }
+        canvas.icon(
+            f,
+            if c.offer { Icon::Moon } else { Icon::MoonStar },
+            W - M - P - 18.,
+            title_y,
+            18.,
+            theme::TITLE_SIZE,
+            t.dream,
+        );
+        let mut cursor = y + P + theme::TITLE_LINE + S2;
+        for line in &question {
+            canvas.text(f, line, IX, cursor + f.cap(qs), qs, t.ink, A::L);
+            cursor += question_line_height;
+        }
+        if !meta_rows.is_empty() {
+            cursor += S3;
+        }
+        for parts in &meta_rows {
+            let b = cursor + f.cap(caption);
+            let mut x = IX;
+            for part in parts {
+                if part.starts_with("dreamer ") {
+                    let spent = num(&c.dream.budget["spent"]);
+                    let cap = num(&c.dream.budget["cap"]).max(1.);
+                    canvas.rrect(x, b - f.cap(caption) / 2., S5, 3., 1.5, t.track);
+                    canvas.rrect(
+                        x,
+                        b - f.cap(caption) / 2.,
+                        S5 * (spent / cap).clamp(0., 1.) as f32,
+                        3.,
+                        1.5,
+                        t.dream,
+                    );
+                    x += S5 + ICON_GAP;
+                }
+                let st = if part.starts_with('⌗') {
+                    mono(theme::CHIP_SIZE, t.regular)
+                } else {
+                    caption
+                };
+                let w = f.width(part, st);
+                if part.starts_with('⌗') {
+                    canvas.rrect(
+                        x - S1,
+                        b - f.cap(st) - S1 / 2.,
+                        w + S2,
+                        theme::CHIP_LINE,
+                        S1,
+                        t.chip,
+                    );
+                }
+                canvas.text(
+                    f,
+                    part,
+                    x,
+                    b,
+                    st,
+                    if part.starts_with('⌗') {
+                        t.dream
+                    } else {
+                        t.quiet
+                    },
+                    A::L,
+                );
+                x += w + S3;
+            }
             cursor += theme::CAPTION_LINE;
         }
+        if has_answers {
+            cursor += S1;
+        }
+        if c.dream.state == Batch::Ready {
+            let b = cursor + f.cap(caption);
+            answer_y = Some(b);
+            let mut x = IX;
+            for (label, answer) in [
+                ("1 ✓ helpful", "helpful"),
+                ("2 \u{e1c2} thought of it", "thought_of_it"),
+                ("3 ✗ not relevant", "not_relevant"),
+                ("4 → ask Claude", "ask_claude"),
+            ] {
+                let w = canvas.text(
+                    f,
+                    label,
+                    x,
+                    b,
+                    sans(theme::CAPTION_SIZE, t.medium),
+                    if answer == "ask_claude" {
+                        t.asked
+                    } else {
+                        t.quiet
+                    },
+                    A::L,
+                );
+                answer_spans.push((x, x + w, answer.into()));
+                x += w + S3;
+            }
+            cursor += theme::CAPTION_LINE;
+        } else if c.offer {
+            let b = cursor + f.cap(caption);
+            let mut x = IX;
+            x += canvas.text(f, "Press", x, b, caption, t.quiet, A::L) + ICON_GAP;
+            let key_w = f.width("1", caption);
+            canvas.rrect(
+                x - S1,
+                b - f.cap(caption) - S1 / 2.,
+                key_w + S2,
+                theme::CAPTION_LINE,
+                S1,
+                t.chip,
+            );
+            canvas.text(f, "1", x, b, caption, t.dream, A::L);
+            x += key_w + ICON_GAP;
+            x += canvas.text(
+                f,
+                "to turn dreams on in all your sessions.",
+                x,
+                b,
+                caption,
+                t.quiet,
+                A::L,
+            );
+            offer_hit = Some((b, IX, x));
+            cursor += theme::CAPTION_LINE;
+        }
+        if !status.is_empty() {
+            cursor += S2;
+            for line in &status_lines {
+                label(
+                    &mut canvas,
+                    f,
+                    line,
+                    IX,
+                    cursor + f.cap(caption),
+                    theme::CAPTION_SIZE,
+                    t.quiet,
+                    t.regular,
+                );
+                cursor += theme::CAPTION_LINE;
+            }
+        }
     }
-    y += hero_h + card_gap;
+    if !page {
+        y += hero_h + card_gap;
+    }
     let mut observation_rows = vec![];
     let mut observation_titles = vec![];
     // The observation rows have their own popup: their cut rows are not recorded as shortened rows.
     let recording = std::mem::take(&mut canvas.cut_title);
     for (title_text, items, should) in observed {
-        if items.is_empty() {
-            continue;
-        }
-        if folded {
-            let h = observation_fold_h();
-            panel(&mut canvas, y, h, t);
-            label(
-                &mut canvas,
-                f,
-                title_text,
-                IX,
-                y + P + f.cap(title),
-                theme::TITLE_SIZE,
-                t.ink,
-                t.bold,
-            );
-            canvas.text(
-                f,
-                &format!("{} · o opens", items.len()),
-                IX + IW,
-                y + P + f.cap(caption),
-                caption,
-                t.quiet,
-                A::R,
-            );
-            observation_rows.push((
-                if should {
-                    ObsCard::ShouldBe
-                } else {
-                    ObsCard::Confusing
-                },
-                0,
-                y + h / 2.,
-            ));
-            observation_titles.push((
-                if should {
-                    ObsCard::ShouldBe
-                } else {
-                    ObsCard::Confusing
-                },
-                y,
-                y + h,
-            ));
-            y += h + card_gap;
+        // A list with nothing to show, or hidden for room, is not drawn at all.
+        if items.is_empty() || obs_cap == 0 {
             continue;
         }
         let shown = items.len().min(obs_cap);
         let h = observation_card_h(shown);
+        cards.push(CardRegion::new(title_text, y, h, shown));
         panel(&mut canvas, y, h, t);
         label(
             &mut canvas,
@@ -3554,7 +3612,8 @@ pub fn draw(
         y += h + card_gap;
     }
     canvas.cut_title = recording;
-    if let Some(notice) = &c.notice {
+    if let Some(notice) = notice {
+        cards.push(CardRegion::new("notice", y, notice_h, 1));
         panel(&mut canvas, y, notice_h, t);
         single(
             &mut canvas,
@@ -3574,30 +3633,13 @@ pub fn draw(
     let story_region = (story_h > 0.).then_some((y, story_card_h));
     let mut story_open = None;
     let story_title = story_title(c);
-    if story_folded {
-        // Folded to its title row, the card still opens its words in full on a click.
-        panel(&mut canvas, y, story_card_h, t);
-        label(
-            &mut canvas,
-            f,
+    if story_h > 0. {
+        cards.push(CardRegion::new(
             story_title,
-            IX,
-            y + P + f.cap(title),
-            theme::TITLE_SIZE,
-            t.ink,
-            t.bold,
-        );
-        story_open = Some((y, y + story_card_h, story_title.into(), story_full(c)));
-        if !canvas.dry {
-            canvas.cuts.push(Cut {
-                y: y + P + f.cap(title),
-                size: theme::TITLE_SIZE,
-                title: story_title,
-                full: story_full(c),
-            });
-        }
-        y += story_card_h + card_gap;
-    } else if story_h > 0. {
+            y,
+            story_h,
+            story_lines_fit.len() + usize::from(!c.learnt.is_empty()) + c.shifts.len().min(3),
+        ));
         panel(&mut canvas, y, story_h, t);
         label(
             &mut canvas,
@@ -3680,8 +3722,45 @@ pub fn draw(
     }
     let drill_region = (extra_h > 0.).then_some((y, extra_h));
     if extra_h > 0. {
+        cards.push(CardRegion::new(
+            if open.threads {
+                MONOLOGUE
+            } else if open.changes {
+                CHANGES
+            } else if open.agents {
+                "Agents"
+            } else {
+                "Dreams"
+            },
+            y,
+            extra_h,
+            if open.threads {
+                thread_bands
+            } else {
+                drill_rows.len()
+            },
+        ));
         panel(&mut canvas, y, extra_h, t);
         let mut b = y + P;
+        if open.changes {
+            // The page: a heading and what the page holds, then each change with what it
+            // replaced.
+            let title_st = serif(20., t.bold);
+            let head = y + P + f.cap(title_st);
+            canvas.text(f, CHANGES, IX, head, title_st, t.ink, A::L);
+            single(
+                &mut canvas,
+                f,
+                &changes_note(c),
+                IX,
+                head + 16.,
+                IW,
+                theme::CAPTION_SIZE,
+                t.quiet,
+                t,
+            );
+            b += MONOLOGUE_H;
+        }
         if open.changes || open.dreams || open.agents {
             for line in &drill_rows {
                 b += 12.;
@@ -3718,12 +3797,7 @@ pub fn draw(
                 );
             }
             let spine_x = IX + 72.;
-            let rows: Vec<_> = c
-                .river
-                .iter()
-                .skip(open.scroll)
-                .take(thread_bands)
-                .collect();
+            let rows: Vec<_> = c.river.iter().skip(page_from).take(thread_bands).collect();
             // The first baseline sits half a band plus a cap-height below the first band's top.
             let b = top + ROW_BAND / 2. + 4.;
             // The spine runs between the icons, never through them, and ends at the last one.
@@ -3788,12 +3862,12 @@ pub fn draw(
                 canvas.cut_title = recording;
                 b += ROW_PITCH;
             }
-            if thread_hidden > 0 {
+            if !page_footer.is_empty() {
                 let line_top = y + extra_h - P - DRILL_LINE;
                 label(
                     &mut canvas,
                     f,
-                    &more_line(thread_hidden),
+                    &page_footer,
                     IX,
                     line_top + 12.,
                     11.5,
@@ -3816,27 +3890,40 @@ pub fn draw(
     let mut mid_layout = None;
     let mut soak_region = None;
     if let (Some(card), Some(plan)) = (&c.soak, &soak) {
+        cards.push(CardRegion::new(
+            "CSR performance",
+            y,
+            plan.h,
+            plan.head.len() + soak_rows(card, plan.level).count(),
+        ));
         draw_soak(&mut canvas, f, card, plan, y, t);
         soak_region = Some((y, plan.h));
         y += plan.h + card_gap;
     }
     let figure_draw_h = figure_h;
     let figure_layout_h = figure_h;
+    if !page {
+        cards.push(CardRegion::new("Context", y, figure_h, 1));
+    }
     let figure_region = (y, figure_draw_h);
-    let fig_info = figure(
-        &mut canvas,
-        f,
-        c,
-        y,
-        figure_layout_h,
-        t,
-        open.figure && figure_h >= FIGURE_EXPANDED_BASE,
-        narrow,
-        DashFit {
-            credit: keep_credit,
-            compact_rings: rings_compact,
-        },
-    );
+    let fig_info = if page {
+        None
+    } else {
+        figure(
+            &mut canvas,
+            f,
+            c,
+            y,
+            figure_layout_h,
+            t,
+            open.figure && figure_h >= FIGURE_EXPANDED_BASE,
+            narrow,
+            DashFit {
+                credit: keep_credit,
+                compact_rings: rings_compact,
+            },
+        )
+    };
     if let Some((cy, ring, group, avail, mid)) = fig_info {
         ceiling_y = cy;
         ring_bounds = ring;
@@ -3845,10 +3932,16 @@ pub fn draw(
         mid_layout = mid;
     }
     y += figure_draw_h;
-    let mut figure_bottom = y;
+    let mut figure_bottom = if page { y - card_gap } else { y };
     let figure_detail_region = (fig_detail_h > 0.).then_some((y + card_gap, fig_detail_h));
     if fig_detail_h > 0. {
         y += card_gap;
+        cards.push(CardRegion::new(
+            "figure facts",
+            y,
+            fig_detail_h,
+            fig_detail_lines.len(),
+        ));
         panel(&mut canvas, y, fig_detail_h, t);
         let mut b = y + P;
         for line in &fig_detail_lines {
@@ -3866,6 +3959,7 @@ pub fn draw(
     let agents_region = active.then_some((y, agents_h));
     if active {
         let agents_draw_h = agents_h;
+        cards.push(CardRegion::new("agents", y, agents_draw_h, 1));
         panel(&mut canvas, y, agents_draw_h, t);
         let mut x = IX;
         canvas.cut_title = "Agent in flight";
@@ -3915,6 +4009,7 @@ pub fn draw(
     let mut history_bottom = None;
     let help_region = (help_h > 0.).then_some((y, help_h));
     if let Some((help_y, help_draw_h)) = help_region {
+        cards.push(CardRegion::new("help", help_y, help_draw_h, 1));
         panel(&mut canvas, help_y, help_draw_h, t);
         if let Some(recap) = &c.repo_recap {
             let mut cursor = help_y + P;
@@ -4132,6 +4227,7 @@ pub fn draw(
     Some((
         pm,
         Metrics {
+            cards,
             csr_cost: c.csr_cost.clone(),
             quota_gauges: canvas.quota_gauges.clone(),
             note_rows: canvas.note_rows.clone(),
@@ -4155,7 +4251,7 @@ pub fn draw(
             observation_titles,
             story_open,
             popup_keys,
-            observations_folded: folded,
+            page_scroll_max: page.then_some(page_scroll_max),
             cuts: canvas.cuts.clone(),
             agents_region,
             drill_region,
@@ -4861,6 +4957,59 @@ struct DashPlan {
     csr_compact: bool,
     status: Option<(String, bool)>,
 }
+
+/// One choice of what the dashboard keeps, richest first in `FIT_STEPS`.
+#[derive(Clone, Copy)]
+struct FitStep {
+    /// The performance card's level: 2 every check row, 1 only a failing one, 0 no clock or bar.
+    soak: u8,
+    /// Most rows a list keeps; 0 hides both lists.
+    cap: usize,
+    /// Keep the API credit row.
+    credit: bool,
+    /// "CSR this session" as one line of words instead of rings.
+    compact: bool,
+    /// The story card is hidden.
+    story_hidden: bool,
+    /// An open section squeezes the Context card to its floor.
+    squeeze: bool,
+    /// An open section is cut to its least rows.
+    least: bool,
+}
+const fn step(
+    soak: u8,
+    cap: usize,
+    credit: bool,
+    compact: bool,
+    story_hidden: bool,
+    squeeze: bool,
+    least: bool,
+) -> FitStep {
+    FitStep {
+        soak,
+        cap,
+        credit,
+        compact,
+        story_hidden,
+        squeeze,
+        least,
+    }
+}
+/// What the dashboard keeps, most first: the order content goes as the pane gets shorter. The
+/// doc of the fit in `draw` names each step.
+const FIT_STEPS: [FitStep; 11] = [
+    step(2, usize::MAX, true, false, false, false, false),
+    step(1, usize::MAX, true, false, false, false, false),
+    step(0, usize::MAX, true, false, false, false, false),
+    step(0, 3, true, false, false, false, false),
+    step(0, 3, false, false, false, false, false),
+    step(0, 1, false, false, false, false, false),
+    step(0, 1, false, true, false, false, false),
+    step(0, 0, false, true, false, false, false),
+    step(0, 0, false, true, true, false, false),
+    step(0, 0, false, true, true, true, false),
+    step(0, 0, false, true, true, true, true),
+];
 
 /// What the layout dropped from the dashboard to keep the text size.
 #[derive(Clone, Copy)]
@@ -8192,11 +8341,10 @@ mod tests {
     }
 
     #[test]
-    fn an_open_section_folds_the_observation_cards_before_it_is_squeezed_out() {
+    fn the_changes_page_replaces_the_dashboard_and_keeps_every_change() {
         let c = drill_composition(7, 4, true);
-        // Room for the closed pane and nothing more.
         let (_, closed) = draw(&c, 704, 700, Theme::Dark, Open::default(), false).expect("draws");
-        assert!(!closed.observations_folded);
+        assert!(closed.cards.len() > 1, "{:?}", closed.cards);
         let (_, open) = draw(
             &c,
             704,
@@ -8209,14 +8357,37 @@ mod tests {
             false,
         )
         .expect("draws");
-        let (_, card) = open.drill_region.expect("the changes card");
-        // Every change with its Was line fits, or at least the room it was asked for within the
-        // fold-and-shrink budget; never a stub.
+        let (_, card) = open.drill_region.expect("the changes page");
+        // The page is the whole pane bar the key row; never a stub.
         assert!(card > 6. * DRILL_LINE, "{card}");
-        assert!(open.observations_folded, "folded");
-        // Folded cards are still click targets: one per card.
-        assert_eq!(open.observation_rows.len(), 2);
-        assert!(open.observation_rows.iter().all(|r| r.1 == 0));
+        // Nothing of the dashboard is drawn or clickable on it.
+        assert!(open.observation_rows.is_empty());
+        assert!(open.story_region.is_none());
+        let titles: Vec<_> = open.cards.iter().map(|c| c.title).collect();
+        assert_eq!(titles, vec![CHANGES], "{titles:?}");
+    }
+
+    #[test]
+    fn a_page_too_long_for_the_pane_scrolls_to_its_last_row_and_no_further() {
+        // More rows than any pane holds: the river runs to about a hundred.
+        let c = drill_composition(60, 40, false);
+        let page = |scroll: usize| Open {
+            threads: true,
+            scroll,
+            ..Open::default()
+        };
+        let (w, h) = (40 * 16, 40 * 34);
+        let (top, m) = draw(&c, w, h, Theme::Dark, page(0), false).expect("draws");
+        let most = m
+            .page_scroll_max
+            .expect("a page too long for the pane scrolls");
+        assert!(most > 0, "{most}");
+        let (down, _) = draw(&c, w, h, Theme::Dark, page(1), false).expect("draws");
+        assert_ne!(top.data(), down.data(), "one row down moves the page");
+        // Past the end is the end.
+        let (last, _) = draw(&c, w, h, Theme::Dark, page(most), false).expect("draws");
+        let (beyond, _) = draw(&c, w, h, Theme::Dark, page(most + 5), false).expect("draws");
+        assert_eq!(last.data(), beyond.data());
     }
 
     #[test]
@@ -8245,14 +8416,16 @@ mod tests {
                         "l" => {
                             let (_, card) =
                                 m.drill_region.unwrap_or_else(|| panic!("{at}: no card"));
-                            // The note and the first change, or all of them when there are fewer.
-                            let lines = c.shifts.len().min(1) + 1;
-                            assert!(card >= P * 2. + lines as f32 * DRILL_LINE, "{at}: {card}");
+                            // The heading and the least of the first change.
+                            assert!(
+                                card >= P * 2. + MONOLOGUE_H + DRILL_MIN_LINES as f32 * DRILL_LINE,
+                                "{at}: {card}"
+                            );
                         }
                         "t" => {
                             let (_, card) =
                                 m.drill_region.unwrap_or_else(|| panic!("{at}: no card"));
-                            let bands = c.river.len().min(2);
+                            let bands = c.river.len().clamp(1, PAGE_MIN_ROWS);
                             let least = P * 2.
                                 + MONOLOGUE_H
                                 + (bands as f32 * ROW_PITCH - ROW_GAP).max(40.);
@@ -8269,16 +8442,18 @@ mod tests {
                             assert!(card >= P * 2. + lines as f32 * DRILL_LINE, "{at}: {card}");
                         }
                     }
-                    // Whatever the section took came from the cards, not from the canvas.
-                    let (fig_top, fig_h) = m.figure_region;
-                    assert!(fig_h > 0. && fig_top + fig_h <= m.height, "{at}: {fig_h}");
+                    // A page is the whole pane; the `i` figure took its room from the cards.
+                    if key != "l" && key != "t" {
+                        let (fig_top, fig_h) = m.figure_region;
+                        assert!(fig_h > 0. && fig_top + fig_h <= m.height, "{at}: {fig_h}");
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn a_closed_pane_never_folds_a_card_whatever_its_size() {
+    fn a_closed_pane_never_draws_a_stub_card_whatever_its_size() {
         for (name, shifts, dreams, figure) in [
             ("rich", 7, 4, true),
             ("thin", 2, 0, false),
@@ -8292,9 +8467,10 @@ mod tests {
                     let (_, m) =
                         draw(&c, w, h, Theme::Dark, Open::default(), false).expect("draws");
                     let at = format!("{name} {w}x{h}");
-                    assert!(!m.observations_folded, "{at}");
-                    let (_, story) = m.story_region.expect("a story card");
-                    assert!(story > P * 2. + theme::TITLE_LINE + 1., "{at}: {story}");
+                    // A story card is drawn whole or not at all, never as a stub.
+                    if let Some((_, story)) = m.story_region {
+                        assert!(story > P * 2. + theme::TITLE_LINE + 1., "{at}: {story}");
+                    }
                     assert!(
                         m.drill_region.is_none() && m.figure_detail_region.is_none(),
                         "{at}"
@@ -8302,34 +8478,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn a_folded_story_card_opens_its_words_on_a_click() {
-        let c = drill_composition(7, 4, true);
-        let open = Open {
-            changes: true,
-            ..Open::default()
-        };
-        let mut folded = false;
-        for (cols, rows) in [(46, 30), (40, 50)] {
-            let (_, m) =
-                draw(&c, cols * 16, (rows - 1) * 34, Theme::Dark, open, false).expect("draws");
-            if let Some((top, h)) = m
-                .story_region
-                .filter(|(_, h)| *h < P * 2. + theme::TITLE_LINE + 1.)
-            {
-                folded = true;
-                let cut = m
-                    .cuts
-                    .iter()
-                    .find(|cut| cut.title == "Where the work stands")
-                    .expect("the folded card carries its words");
-                assert_eq!(cut.full, LONG_STORY);
-                assert!(cut.y > top && cut.y < top + h);
-            }
-        }
-        assert!(folded, "no size folded the story card");
     }
 
     #[test]
@@ -8353,12 +8501,10 @@ mod tests {
                             flat.contains("No changes yet in this session."),
                             "{at}\n{all}"
                         ),
-                        ("l", 1..=3) => assert!(flat.contains("all shown above"), "{at}\n{all}"),
                         ("l", _) => {
-                            assert!(
-                                flat.contains("7 changes, the first 3 shown above"),
-                                "{at}\n{all}"
-                            )
+                            assert!(flat.starts_with("Changes"), "{at}\n{all}");
+                            assert!(flat.contains("each with what it replaced"), "{at}\n{all}");
+                            assert!(flat.contains("Was: "), "{at}\n{all}");
                         }
                         ("t", _) if dreams == 0 && shifts == 0 => {
                             assert!(flat.contains("No threads yet"), "{at}\n{all}")
@@ -8380,7 +8526,8 @@ mod tests {
     #[test]
     fn a_cut_story_and_every_cut_row_carry_their_words_in_full() {
         let c = drill_composition(7, 4, true);
-        for (w, h) in [(1210, 1700), (704, 900)] {
+        // Tall enough that the story card is kept: a short pane hides it, it never cuts it.
+        for (w, h) in [(1210, 2600), (704, 1500)] {
             let open = Open {
                 changes: true,
                 ..Open::default()
@@ -8395,10 +8542,15 @@ mod tests {
             ] {
                 let (_, m) = draw(&c, w, h, Theme::Dark, open, false).expect("draws");
                 let titles: Vec<_> = m.cuts.iter().map(|c| c.title).collect();
-                assert!(
-                    titles.contains(&"Where the work stands"),
-                    "{w}x{h} {titles:?}"
-                );
+                // The story is on the dashboard; a page holds only its own rows.
+                if !open.changes && !open.threads {
+                    assert!(
+                        titles.contains(&"Where the work stands"),
+                        "{w}x{h} {:?} {titles:?} story {:?}",
+                        (open.changes, open.threads),
+                        (m.story_region, m.height, &m.cards)
+                    );
+                }
                 for cut in &m.cuts {
                     assert!(!cut.full.ends_with('…'), "{cut:?}");
                     assert!(!cut.full.is_empty());

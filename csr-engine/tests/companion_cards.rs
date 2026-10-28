@@ -163,10 +163,11 @@ fn the_single_surface_draws_one_complete_instrument_and_scrolls_details() {
     assert!(picture.row + picture.rows <= rows.len());
     let metrics = full.instrument_metrics.as_ref().unwrap();
     assert!(metrics.dream / metrics.height <= 0.3);
+    // The Monologue is a page: a short pane holds a part of it, and j/k move through the rest.
     full.key("t");
-    full.frame(46, 40, NOW);
+    full.frame(46, 24, NOW);
     full.scroll(3);
-    full.frame(46, 40, NOW);
+    full.frame(46, 24, NOW);
     assert_eq!(full.instrument_open.scroll, 3);
     assert_eq!(full.view, "main");
 }

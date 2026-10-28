@@ -2279,10 +2279,16 @@ fn narrow_footer_keeps_every_key_labeled() {
         let shown = pane.frame(38, 30, NOW);
         let foot = text::plain(&shown[29]);
         assert!(foot.contains("i fig"), "{state}: {foot}");
-        assert!(
-            foot.contains("l chg") && foot.contains("t thr"),
-            "{state}: {foot}"
-        );
+        // `l` and `t` are on the bar only when their page has content; when they are, they
+        // are labelled.
+        for (key, label) in [("l", "chg"), ("t", "thr")] {
+            let bare = foot.split_whitespace().any(|w| w == key);
+            assert_eq!(
+                bare,
+                foot.contains(&format!("{key} {label}")),
+                "{state}: {foot}"
+            );
+        }
         assert!(
             foot.contains("b th") && foot.contains("q close"),
             "{state}: {foot}"
@@ -2724,7 +2730,6 @@ fn a_row_the_picture_cut_opens_its_words_in_full_on_click() {
     let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
     pane.pixels = true;
     pane.enable_cards();
-    pane.key("l");
     pane.frame(cols, rows, NOW);
     let cuts = pane.instrument_metrics.as_ref().unwrap().cuts.clone();
     assert!(!cuts.is_empty(), "a 36-column pane cuts some row");
@@ -3007,10 +3012,10 @@ fn a_click_on_row_n_of_five_opens_n_of_five_in_the_text_and_the_picture() {
         );
         pane.key("escape");
     }
-    // Picture at 46x30: a click opens the item the oracle names, never its neighbour; the rows
+    // Picture at 46x60 (tall enough to keep both lists; a short pane hides them): a click opens the item the oracle names, never its neighbour; the rows
     // the cell grid cannot single out are a step away, and each step lands on the next number.
     let (_home, paths) = five_and_five_home();
-    let (cols, rows) = (46, 30);
+    let (cols, rows) = (46, 60);
     let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
     pane.pixels = true;
     pane.enable_cards();
@@ -3352,4 +3357,415 @@ fn the_popups_footer_keys_answer_a_click_in_the_text_pane_and_in_the_picture() {
 }
 fn string(v: &Value) -> &str {
     v.as_str().unwrap_or("")
+}
+
+/// The owner's session at 21:47: a performance trial, five items on each observation card, a long
+/// story and a monologue of many rows.
+fn owner_home() -> (tempfile::TempDir, Paths) {
+    let (home, paths) = state_home("14-soak");
+    let log = paths.keep.join("dreams.jsonl");
+    let mut text = fs::read_to_string(&log).unwrap();
+    let confusing: Vec<Value> = (0..5)
+        .map(|i| {
+            json!({"line":format!("Claude misread which pane the owner meant, case {i}."),
+                "evidence":format!("Turn {}: 'the companion pane'", i + 3)})
+        })
+        .collect();
+    let should_be: Vec<Value> = ["skill", "hook", "memory", "tool", "skill"]
+        .iter()
+        .enumerate()
+        .map(|(i, kind)| {
+            json!({"kind":kind,"line":format!("Check the card height after each layout edit, rule {i}."),
+                "evidence":format!("Turns {} and {}: 'at most 30%'", i + 4, i + 9)})
+        })
+        .collect();
+    text.push_str(
+        &json!({"kind":"look","session":"sess-now","at":NOW - 20.,"outcome":"none",
+            "confusing_claude":confusing,"should_be":should_be})
+        .to_string(),
+    );
+    text.push('\n');
+    fs::write(&log, text).unwrap();
+    (home, paths)
+}
+/// A frame of the owner's session at `cols`x`rows` cells of `cell` px after pressing `keys`.
+struct OwnerShot {
+    metrics: csr_engine::companion::render::instrument::Metrics,
+    scale: f32,
+    png: Vec<u8>,
+}
+fn owner_shot(
+    (cols, rows, cell): (usize, usize, (u32, u32)),
+    theme: Theme,
+    keys: &[&str],
+) -> OwnerShot {
+    csr_engine::companion::render::kitty::set_cell_override(Some(cell));
+    let (_home, paths) = owner_home();
+    let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+    pane.theme = theme;
+    pane.pixels = true;
+    pane.enable_cards();
+    for key in keys {
+        pane.key(key);
+    }
+    pane.frame(cols, rows, NOW);
+    let metrics = pane
+        .instrument_metrics
+        .clone()
+        .expect("the instrument drew");
+    let scale = text_scale(cols, rows, cell, metrics.height);
+    let png = pane.placed[0].png.to_vec();
+    csr_engine::companion::render::kitty::set_cell_override(None);
+    OwnerShot {
+        metrics,
+        scale,
+        png,
+    }
+}
+/// The sizes the owner's pane takes: 35x30 at the real 26x58 cell, then 44x30 and 60x40.
+const FIT_SIZES: [(usize, usize, (u32, u32)); 3] =
+    [(35, 30, (26, 58)), (44, 30, (16, 34)), (60, 40, (16, 34))];
+/// The two dashboard views: closed, and the figure `i` opens.
+const FIT_VIEWS: [&[&str]; 2] = [&[], &["i"]];
+
+/// What a4f80651 drew of the owner's session at each size and view, read off the frames: the text
+/// scale, and each card with the rows of body it kept (0: a title and nothing under it).
+type Before = (f32, &'static [(&'static str, usize)]);
+const BEFORE_CLOSED_35: Before = (
+    1.5041,
+    &[
+        ("hero", 3),
+        ("Confused Claude", 1),
+        ("Should be a skill / memory / tool", 1),
+        ("Where the work stands", 5),
+        ("CSR performance", 1),
+        ("Context", 1),
+    ],
+);
+const BEFORE_FOLDED_35: Before = (
+    1.5041,
+    &[
+        ("hero", 3),
+        ("Confused Claude", 0),
+        ("Should be a skill / memory / tool", 0),
+        ("Where the work stands", 0),
+        ("CSR performance", 1),
+        ("Context", 1),
+    ],
+);
+/// (scale, cards) before, per `FIT_SIZES` and `FIT_VIEWS`.
+fn before(size: usize, view: usize) -> Before {
+    const SCALES: [[f32; 2]; 3] = [[1.5041, 1.5041], [0.9929, 0.9929], [1.3075, 1.3075]];
+    let (_, cards) = if view == 0 {
+        BEFORE_CLOSED_35
+    } else {
+        BEFORE_FOLDED_35
+    };
+    (SCALES[size][view], cards)
+}
+fn title_rows(shot: &OwnerShot) -> Vec<(&'static str, usize)> {
+    shot.metrics
+        .cards
+        .iter()
+        .map(|c| (c.title, c.body_rows))
+        .collect()
+}
+
+/// A card with nothing under its title says nothing: it is not drawn. That covers a card with no
+/// data and a card folded to its title row, in the closed pane and with the figure open.
+#[test]
+fn no_card_is_drawn_with_an_empty_body_at_any_size_in_either_view() {
+    for size in FIT_SIZES {
+        for keys in FIT_VIEWS {
+            for theme in [Theme::Dark, Theme::Light] {
+                let shot = owner_shot(size, theme, keys);
+                for card in &shot.metrics.cards {
+                    assert!(
+                        card.body_rows > 0,
+                        "{}x{} {keys:?} {theme:?}: {} is drawn with no body ({:?})",
+                        size.0,
+                        size.1,
+                        card.title,
+                        title_rows(&shot)
+                    );
+                }
+                assert!(
+                    shot.metrics
+                        .cards
+                        .iter()
+                        .any(|c| c.title == "CSR performance"),
+                    "{}x{} {keys:?}: the performance card lost its headline",
+                    size.0,
+                    size.1
+                );
+            }
+        }
+    }
+}
+/// The text-only pane folds nothing to a title row either: no "N · o opens" stub.
+#[test]
+fn the_text_pane_draws_no_stub_row_for_a_hidden_list() {
+    for (cols, rows) in [(35, 14), (44, 30), (60, 40)] {
+        for keys in FIT_VIEWS {
+            let (_home, paths) = owner_home();
+            let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+            pane.pixels = false;
+            for key in keys {
+                pane.key(key);
+            }
+            let all = plain_rows(&mut pane, cols, rows).join("\n");
+            assert!(!all.contains("o opens"), "{cols}x{rows} {keys:?}\n{all}");
+        }
+    }
+}
+/// Text drops content, then whole cards, before it gets smaller than the width fit; and the room a
+/// hidden card frees goes to the cards that stay.
+#[test]
+fn text_stays_at_the_width_fit_until_nothing_else_can_go_and_freed_room_is_used() {
+    for (s, size) in FIT_SIZES.into_iter().enumerate() {
+        let width_fit = (size.0 as u32 * size.2 .0) as f32 / 605.;
+        for (v, keys) in FIT_VIEWS.into_iter().enumerate() {
+            let at = format!("{}x{} {keys:?}", size.0, size.1);
+            let shot = owner_shot(size, Theme::Dark, keys);
+            let (was_scale, was_cards) = before(s, v);
+            // Never drawn larger than the width fit, never smaller than a4f80651 drew it.
+            assert!(shot.scale <= width_fit + 1e-4, "{at}: {}", shot.scale);
+            assert!(shot.scale >= was_scale - 1e-3, "{at}: {}", shot.scale);
+            let titles: Vec<_> = shot.metrics.cards.iter().map(|c| c.title).collect();
+            let hideable = ["Confused Claude", "Should be a skill / memory / tool"];
+            let hidden_any = was_cards
+                .iter()
+                .any(|(t, _)| *t != "hero" && !titles.contains(t));
+            // Smaller than the width fit only when every list and the story are already gone.
+            if shot.scale < width_fit - 1e-3 {
+                assert!(
+                    hideable.iter().all(|t| !titles.contains(t))
+                        && !titles.contains(&"Where the work stands"),
+                    "{at}: text at {:.4} of {width_fit:.4} with cards left to hide: {titles:?}",
+                    shot.scale
+                );
+            }
+            // A hidden card leaves the rest with more rows or bigger text than before.
+            if hidden_any {
+                let rows_now = title_rows(&shot);
+                let more_rows = rows_now
+                    .iter()
+                    .any(|(t, n)| was_cards.iter().any(|(w, m)| w == t && *m > 0 && n > m));
+                let more_text = shot.scale > was_scale + 1e-3;
+                assert!(
+                    more_rows || more_text,
+                    "{at}: a card was hidden and nothing gained its room: {rows_now:?}"
+                );
+            }
+        }
+    }
+}
+
+fn card_titles(shot: &OwnerShot) -> Vec<&'static str> {
+    shot.metrics.cards.iter().map(|c| c.title).collect()
+}
+/// The keys the key bar offers, left to right.
+fn legend_keys(pane: &Pane, rows: usize) -> Vec<String> {
+    pane.acts[&(rows - 1)]["keys"]
+        .as_array()
+        .expect("the key bar's keys")
+        .iter()
+        .map(|k| k[2].as_str().unwrap().to_owned())
+        .collect()
+}
+const DASHBOARD_ONLY: [&str; 6] = [
+    "Confused Claude",
+    "Should be a skill",
+    "CSR performance",
+    "Where the work stands",
+    "CTX ",
+    "1 helpful",
+];
+
+/// `l` is a Changes page and `t` a Monologue page: each fills the pane with its own rows and
+/// nothing of the dashboard, in the closed pane and with the figure open.
+#[test]
+fn l_and_t_open_pages_that_differ_from_each_other_and_from_the_dashboard() {
+    for size in FIT_SIZES {
+        for theme in [Theme::Dark, Theme::Light] {
+            let at = format!("{}x{} {theme:?}", size.0, size.1);
+            let dash = owner_shot(size, theme, &[]);
+            let changes = owner_shot(size, theme, &["l"]);
+            let monologue = owner_shot(size, theme, &["t"]);
+            assert_ne!(changes.png, dash.png, "{at}: l is the dashboard");
+            assert_ne!(monologue.png, dash.png, "{at}: t is the dashboard");
+            assert_ne!(changes.png, monologue.png, "{at}: l and t are one page");
+            assert_eq!(card_titles(&changes), ["Changes"], "{at}");
+            assert_eq!(card_titles(&monologue), ["Monologue"], "{at}");
+            for page in [&changes, &monologue] {
+                let card = &page.metrics.cards[0];
+                assert!(card.body_rows >= 3, "{at}: {} rows", card.body_rows);
+                // The page fills the pane down to the key row's gap.
+                assert!(
+                    card.top + card.height >= page.metrics.height * 0.97,
+                    "{at}: {} ends at {} of {}",
+                    card.title,
+                    card.top + card.height,
+                    page.metrics.height
+                );
+            }
+            // The figure view behaves the same: the page does not care whether `i` is open.
+            for (key, page) in [("l", &changes), ("t", &monologue)] {
+                let in_figure = owner_shot(size, theme, &["i", key]);
+                assert_eq!(in_figure.png, page.png, "{at}: {key} differs with `i` open");
+            }
+        }
+    }
+}
+/// The text pane's pages hold only their own rows.
+#[test]
+fn each_page_holds_only_its_own_content() {
+    for (cols, rows) in [(35, 30), (44, 30), (60, 40)] {
+        for (key, must) in [
+            (
+                "l",
+                vec![
+                    "Was: The budget had no label.",
+                    "render/instrument.rs",
+                    "\u{2317}7625eed7",
+                ],
+            ),
+            ("t", vec!["Monologue \u{b7} the session thinking out loud"]),
+        ] {
+            let (_home, paths) = owner_home();
+            let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+            pane.pixels = false;
+            pane.key(key);
+            let all = plain_rows(&mut pane, cols, rows);
+            let flat = all.join(" ");
+            let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+            for word in must {
+                assert!(
+                    flat.contains(word),
+                    "{cols}x{rows} {key}: no {word:?}\n{all:#?}"
+                );
+            }
+            for word in DASHBOARD_ONLY {
+                assert!(
+                    !flat.contains(word),
+                    "{cols}x{rows} {key}: dashboard text {word:?}\n{all:#?}"
+                );
+            }
+            // The key bar says how to leave and how to scroll.
+            let bar = all.last().unwrap();
+            assert!(bar.contains("j/k"), "{bar:?}");
+            // The key or Esc returns to the dashboard.
+            pane.key(key);
+            let back = plain_rows(&mut pane, cols, rows).join(" ");
+            assert!(
+                back.contains("Confused Claude") || back.contains("CTX"),
+                "{back}"
+            );
+            pane.key(key);
+            pane.key("escape");
+            let back = plain_rows(&mut pane, cols, rows).join(" ");
+            assert!(
+                back.contains("Confused Claude") || back.contains("CTX"),
+                "{back}"
+            );
+        }
+    }
+}
+/// j and k scroll a page through all its rows.
+#[test]
+fn j_and_k_scroll_the_monologue_page_through_every_row() {
+    let (_home, paths) = owner_home();
+    let (cols, rows) = (44, 9);
+    let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+    pane.pixels = false;
+    pane.key("t");
+    let top = plain_rows(&mut pane, cols, rows);
+    pane.key("j");
+    let lower = plain_rows(&mut pane, cols, rows);
+    assert_ne!(top, lower, "j did not scroll");
+    pane.key("k");
+    assert_eq!(
+        plain_rows(&mut pane, cols, rows),
+        top,
+        "k did not come back"
+    );
+    for _ in 0..40 {
+        pane.key("j");
+    }
+    let end = plain_rows(&mut pane, cols, rows);
+    assert!(
+        end.iter().any(|l| !l.is_empty() && !l.contains("j/k")),
+        "scrolled past the last row into a blank page: {end:#?}"
+    );
+}
+/// A key is on the bar only when its page has something to show.
+#[test]
+fn l_and_t_are_on_the_key_bar_only_when_their_page_has_content() {
+    let (cols, rows) = (44, 30);
+    let keys_of = |state: &str, strip: bool, press: bool| {
+        let (_home, paths) = state_home(state);
+        if strip {
+            // Shifts gone, the monologue (dreams, compactions) stays.
+            let con = rusqlite::Connection::open(&paths.db).unwrap();
+            con.execute("DELETE FROM meta WHERE key LIKE 'story_map:%'", [])
+                .unwrap();
+        }
+        let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+        pane.pixels = true;
+        pane.enable_cards();
+        // Pressing a key with no page behind it opens nothing.
+        if press {
+            pane.key("l");
+            pane.key("t");
+        }
+        pane.frame(cols, rows, NOW);
+        let titles: Vec<_> = pane
+            .instrument_metrics
+            .as_ref()
+            .unwrap()
+            .cards
+            .iter()
+            .map(|c| c.title)
+            .collect();
+        (legend_keys(&pane, rows), titles)
+    };
+    let (full, _) = keys_of("02-running", false, false);
+    assert!(
+        full.contains(&"l".into()) && full.contains(&"t".into()),
+        "{full:?}"
+    );
+    let (empty, titles) = keys_of("01-empty", false, true);
+    assert!(!empty.contains(&"l".into()), "{empty:?}");
+    assert!(!empty.contains(&"t".into()), "{empty:?}");
+    assert!(titles.contains(&"hero"), "an empty page opened: {titles:?}");
+    let (noshifts, _) = keys_of("02-running", true, false);
+    assert!(!noshifts.contains(&"l".into()), "{noshifts:?}");
+    assert!(noshifts.contains(&"t".into()), "{noshifts:?}");
+}
+
+/// Review pictures of the owner's session: `CSR_FIX_SHOTS=<dir> CSR_FIX_TAG=before|after`.
+#[test]
+fn owner_review_pictures() {
+    let Some(dir) = std::env::var_os("CSR_FIX_SHOTS") else {
+        return;
+    };
+    let tag = std::env::var("CSR_FIX_TAG").unwrap_or_else(|_| "shot".into());
+    let dir = std::path::PathBuf::from(dir);
+    fs::create_dir_all(&dir).unwrap();
+    let sizes: [(usize, usize, (u32, u32)); 2] = [(35, 30, (26, 58)), (44, 30, (16, 34))];
+    let views: [(&str, &[&str]); 4] = [
+        ("closed", &[]),
+        ("figure", &["i"]),
+        ("l-page", &["l"]),
+        ("t-page", &["t"]),
+    ];
+    for size in sizes {
+        for (theme_name, theme) in [("dark", Theme::Dark), ("light", Theme::Light)] {
+            for (view, keys) in views {
+                let shot = owner_shot(size, theme, keys);
+                let name = format!("{tag}-{}x{}-{theme_name}-{view}.png", size.0, size.1);
+                fs::write(dir.join(name), &shot.png).unwrap();
+            }
+        }
+    }
 }

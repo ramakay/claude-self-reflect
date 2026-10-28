@@ -64,4 +64,4 @@ Where did we fix this bug before? Find earlier attempts and the final fix.
 7D 52%» · out ~Wed 06:40 · CSR 0 pts · 5H 3% · → ~10% at reset
 Codex 7D 41%
 $0 this week
- l changes  t threads  i figure  b theme  q close
+ i figure  b theme  q close

@@ -1,24 +1,19 @@
 {
   "entry-100x40": {
-    "23": "instrument:dreams",
-    "24": "dream:newest",
-    "25": "instrument:threads",
-    "28": "instrument:changes",
-    "31": "instrument:changes",
-    "34": "instrument:changes",
-    "35": "instrument:changes",
-    "37": "instrument:figure"
+    "28": "instrument:dreams",
+    "29": "dream:newest",
+    "30": "instrument:changes",
+    "33": "instrument:changes",
+    "36": "instrument:changes",
+    "37": "instrument:changes"
   },
   "entry-46x30": {
-    "13": "instrument:changes",
+    "15": "instrument:dreams",
+    "16": "instrument:dreams",
     "17": "instrument:changes",
-    "22": "instrument:changes",
-    "23": "instrument:changes",
-    "25": "instrument:figure",
-    "5": "instrument:dreams",
-    "6": "instrument:dreams",
-    "7": "dream:newest",
-    "9": "instrument:threads"
+    "21": "instrument:changes",
+    "26": "instrument:changes",
+    "27": "instrument:changes"
   },
   "folded-100x40": {
     "30": "instrument:dreams",
@@ -40,25 +35,20 @@
     "25": "instrument:figure"
   },
   "inherited-100x40": {
-    "23": "instrument:dreams",
-    "24": "dream:newest",
-    "25": "instrument:threads",
-    "28": "instrument:changes",
-    "31": "instrument:changes",
-    "34": "instrument:changes",
-    "35": "instrument:changes",
-    "37": "instrument:figure"
+    "28": "instrument:dreams",
+    "29": "dream:newest",
+    "30": "instrument:changes",
+    "33": "instrument:changes",
+    "36": "instrument:changes",
+    "37": "instrument:changes"
   },
   "inherited-46x30": {
-    "13": "instrument:changes",
+    "15": "instrument:dreams",
+    "16": "instrument:dreams",
     "17": "instrument:changes",
-    "22": "instrument:changes",
-    "23": "instrument:changes",
-    "25": "instrument:figure",
-    "5": "instrument:dreams",
-    "6": "instrument:dreams",
-    "7": "dream:newest",
-    "9": "instrument:threads"
+    "21": "instrument:changes",
+    "26": "instrument:changes",
+    "27": "instrument:changes"
   },
   "landed-100x40": {
     "30": "instrument:dreams",
@@ -143,25 +133,20 @@
     "9": "shifts"
   },
   "open-100x40": {
-    "23": "instrument:dreams",
-    "24": "dream:newest",
-    "25": "instrument:threads",
-    "28": "instrument:changes",
-    "31": "instrument:changes",
-    "34": "instrument:changes",
-    "35": "instrument:changes",
-    "37": "instrument:figure"
+    "28": "instrument:dreams",
+    "29": "dream:newest",
+    "30": "instrument:changes",
+    "33": "instrument:changes",
+    "36": "instrument:changes",
+    "37": "instrument:changes"
   },
   "open-46x30": {
-    "13": "instrument:changes",
+    "15": "instrument:dreams",
+    "16": "instrument:dreams",
     "17": "instrument:changes",
-    "22": "instrument:changes",
-    "23": "instrument:changes",
-    "25": "instrument:figure",
-    "5": "instrument:dreams",
-    "6": "instrument:dreams",
-    "7": "dream:newest",
-    "9": "instrument:threads"
+    "21": "instrument:changes",
+    "26": "instrument:changes",
+    "27": "instrument:changes"
   },
   "refreshing-100x40": {
     "0": "view:info",
