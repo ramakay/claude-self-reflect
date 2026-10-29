@@ -2408,6 +2408,7 @@ fn a_pane_outside_herdrs_default_focus_still_draws_when_woken() {
         .env("HOME", &paths.home)
         .env("TERM_PROGRAM", "kitty")
         .env("CSR_PANE_FRAME_LOG", &frame_log)
+        .env_remove("CSR_PANE_HERDR_EVENTS")
         .env("HERDR_SOCKET_PATH", &socket)
         .env("HERDR_PANE_ID", "w1:p3")
         .args([
@@ -2615,6 +2616,7 @@ fn the_pane_ends_when_herdr_says_the_agent_pane_closed() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
         .env("HOME", &paths.home)
         .env("TERM_PROGRAM", "kitty")
+        .env_remove("CSR_PANE_HERDR_EVENTS")
         .env("HERDR_SOCKET_PATH", &socket)
         .env("HERDR_PANE_ID", "w1:p3")
         .args([

@@ -21,7 +21,7 @@
 use super::send;
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader, ErrorKind, Read, Write},
+    io::{BufRead, BufReader, ErrorKind, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::{
@@ -64,26 +64,47 @@ pub struct Watcher {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
 }
+/// A second opinion on "the agent pane is not in herdr's snapshot": true when the pane is still
+/// there. herdr can change a pane's id (a move to another workspace) and keeps the old one as an
+/// alias, so absence from the snapshot alone does not say the pane ended.
+type StillThere = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 impl Watcher {
     /// A watcher of herdr's events, when herdr is there and it is not switched off. `agent` is the pane given on the
     /// command line; without one it is the left neighbour, found in the thread.
     pub fn from_env(agent: Option<String>) -> Option<Self> {
         let socket = config(|name| std::env::var(name).ok())?;
-        Some(Self::start(socket, move || {
-            send::agent_pane(agent.as_deref())
-        }))
+        let still_there: StillThere = Arc::new(|pane| {
+            (send::herdr(&["pane", "get", pane]))
+                .and_then(|said| serde_json::from_str::<Value>(&said).ok())
+                .is_some_and(|said| said["result"]["pane"].is_object())
+        });
+        Some(Self::start_with(
+            socket,
+            move || send::agent_pane(agent.as_deref()),
+            still_there,
+        ))
     }
 
     pub fn start(socket: PathBuf, agent: impl FnOnce() -> Option<String> + Send + 'static) -> Self {
+        Self::start_with(socket, agent, Arc::new(|_| false))
+    }
+
+    fn start_with(
+        socket: PathBuf,
+        agent: impl FnOnce() -> Option<String> + Send + 'static,
+        still_there: StillThere,
+    ) -> Self {
         let shared = Arc::new(Shared::default());
+        // A thread that cannot be made leaves a watcher that sees nothing: the pane polls.
         let thread = {
             let shared = shared.clone();
-            thread::spawn(move || run(&shared, &socket, agent().as_deref()))
+            thread::Builder::new()
+                .name("herdr-events".into())
+                .spawn(move || run(&shared, &socket, agent().as_deref(), &*still_there))
+                .ok()
         };
-        Self {
-            shared,
-            thread: Some(thread),
-        }
+        Self { shared, thread }
     }
 
     /// The agent pane is closed or exited.
@@ -119,10 +140,10 @@ fn subscription(agent: Option<&str>) -> String {
     .to_string()
 }
 
-fn run(shared: &Shared, socket: &Path, agent: Option<&str>) {
+fn run(shared: &Shared, socket: &Path, agent: Option<&str>, still_there: &dyn Fn(&str) -> bool) {
     let mut wait = RETRY;
     while !shared.stop.load(Ordering::Relaxed) && !shared.gone.load(Ordering::Relaxed) {
-        let started = session(shared, socket, agent);
+        let started = session(shared, socket, agent, still_there);
         wait = if matches!(started, Ok(true)) {
             RETRY
         } else {
@@ -135,8 +156,46 @@ fn run(shared: &Shared, socket: &Path, agent: Option<&str>) {
     }
 }
 
+/// What one read from the stream brought.
+enum Got {
+    /// A whole line is in the buffer.
+    Line,
+    /// Some of one.
+    Part,
+    /// The stream ended.
+    End,
+}
+
+/// One read from `reader` into `line`, up to the end of a line. It never reads twice, so the
+/// caller looks at its stop flag between reads however slowly or quickly bytes arrive, and it
+/// refuses a line past `LINE_LIMIT`.
+fn read_some(reader: &mut BufReader<UnixStream>, line: &mut Vec<u8>) -> std::io::Result<Got> {
+    let buffered = reader.fill_buf()?;
+    if buffered.is_empty() {
+        return Ok(Got::End);
+    }
+    let (taken, whole) = match buffered.iter().position(|b| *b == b'\n') {
+        Some(end) => (end + 1, true),
+        None => (buffered.len(), false),
+    };
+    line.extend_from_slice(&buffered[..taken]);
+    reader.consume(taken);
+    if line.len() as u64 > LINE_LIMIT {
+        return Err(ErrorKind::InvalidData.into());
+    }
+    Ok(if whole { Got::Line } else { Got::Part })
+}
+
+/// After this many lines in a row that are not JSON the stream is not herdr.
+const GARBAGE: usize = 64;
+
 /// One subscription, until it ends. Ok(true): it was acknowledged before it ended.
-fn session(shared: &Shared, socket: &Path, agent: Option<&str>) -> std::io::Result<bool> {
+fn session(
+    shared: &Shared,
+    socket: &Path,
+    agent: Option<&str>,
+    still_there: &dyn Fn(&str) -> bool,
+) -> std::io::Result<bool> {
     let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(TICK))?;
     stream.set_write_timeout(Some(IO_LIMIT))?;
@@ -144,17 +203,19 @@ fn session(shared: &Shared, socket: &Path, agent: Option<&str>) -> std::io::Resu
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
     let mut started = false;
+    let mut garbage = 0;
     while !shared.stop.load(Ordering::Relaxed) {
-        // A line is read a bounded amount at a time: bytes without a newline are not herdr.
-        let room = LINE_LIMIT.saturating_sub(line.len() as u64);
-        if room == 0 {
-            return Ok(false);
-        }
-        match (&mut reader).take(room).read_until(b'\n', &mut line) {
-            Ok(0) => return Ok(started),
-            Ok(_) if line.ends_with(b"\n") => {
-                let value: Value = serde_json::from_slice(&line).unwrap_or(Value::Null);
+        match read_some(&mut reader, &mut line) {
+            Ok(Got::End) => return Ok(started),
+            Ok(Got::Part) => (),
+            Ok(Got::Line) => {
+                let parsed = serde_json::from_slice::<Value>(&line);
                 line.clear();
+                garbage = if parsed.is_ok() { 0 } else { garbage + 1 };
+                if garbage >= GARBAGE {
+                    return Ok(false);
+                }
+                let value = parsed.unwrap_or(Value::Null);
                 if !started {
                     if value["result"]["type"] != "subscription_started" {
                         return Ok(false);
@@ -162,7 +223,7 @@ fn session(shared: &Shared, socket: &Path, agent: Option<&str>) -> std::io::Resu
                     started = true;
                     // The stream does not replay what happened while there was none: read the
                     // layout once now, after the subscription so nothing falls between.
-                    if agent_pane_missing(socket, agent) {
+                    if agent_pane_missing(shared, socket, agent, still_there) {
                         shared.gone.store(true, Ordering::Relaxed);
                         return Ok(started);
                     }
@@ -176,41 +237,64 @@ fn session(shared: &Shared, socket: &Path, agent: Option<&str>) -> std::io::Resu
                     return Ok(started);
                 }
             }
-            Ok(_) => (),
             Err(e)
                 if matches!(
                     e.kind(),
                     ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
                 ) => {}
+            // A line too long, or the socket broke.
+            Err(e) if e.kind() == ErrorKind::InvalidData => return Ok(false),
             Err(e) => return Err(e),
         }
     }
     Ok(started)
 }
 
-/// True when herdr's snapshot is readable and the agent pane is not in it: closed or exited
-/// (herdr drops a pane that ends) while no event reached us. Unreadable, or no agent to look for,
-/// is not missing.
-fn agent_pane_missing(socket: &Path, agent: Option<&str>) -> bool {
+/// How long the snapshot is waited for, all told.
+const SNAPSHOT_LIMIT: Duration = Duration::from_secs(4);
+
+/// True when herdr's snapshot is readable, the agent pane is not in it, and herdr does not know
+/// the pane under another id either: closed or exited (herdr drops a pane that ends) while no
+/// event reached us. Unreadable, or no agent to look for, is not missing.
+fn agent_pane_missing(
+    shared: &Shared,
+    socket: &Path,
+    agent: Option<&str>,
+    still_there: &dyn Fn(&str) -> bool,
+) -> bool {
     let Some(agent) = agent else {
         return false;
     };
     let read = || -> Option<bool> {
         let stream = UnixStream::connect(socket).ok()?;
-        stream.set_read_timeout(Some(IO_LIMIT)).ok()?;
+        stream.set_read_timeout(Some(TICK)).ok()?;
         stream.set_write_timeout(Some(IO_LIMIT)).ok()?;
         (&stream)
             .write_all(b"{\"id\":\"csr-snapshot\",\"method\":\"session.snapshot\",\"params\":{}}\n")
             .ok()?;
-        let mut line = String::new();
-        BufReader::new(stream.take(LINE_LIMIT))
-            .read_line(&mut line)
-            .ok()?;
-        let value: Value = serde_json::from_str(&line).ok()?;
+        let mut reader = BufReader::new(stream);
+        let mut line = Vec::new();
+        let until = Instant::now() + SNAPSHOT_LIMIT;
+        loop {
+            if shared.stop.load(Ordering::Relaxed) || Instant::now() >= until {
+                return None;
+            }
+            match read_some(&mut reader, &mut line) {
+                Ok(Got::Line) => break,
+                Ok(Got::Part) => (),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) => {}
+                Ok(Got::End) | Err(_) => return None,
+            }
+        }
+        let value: Value = serde_json::from_slice(&line).ok()?;
         let panes = value["result"]["snapshot"]["panes"].as_array()?;
         Some(!panes.iter().any(|pane| pane["pane_id"] == agent))
     };
-    read().unwrap_or(false)
+    read().unwrap_or(false) && !still_there(agent)
 }
 
 /// True when the agent pane is gone.
@@ -661,11 +745,16 @@ mod tests {
             read_request(&conn);
             ack(&conn);
             let _ = (&conn).write_all(deep.as_bytes());
+            let _ = writeln!(
+                &conn,
+                "{}",
+                json!({ "event": "pane.agent_status_changed", "data": { "pane_id": "w1:p2" } })
+            );
             thread::sleep(Duration::from_secs(2));
         });
         let watch = Watcher::start(path, || Some("w1:p2".into()));
-        thread::sleep(Duration::from_millis(600));
-        quiet(&watch);
+        assert!(until(|| watch.take_status()), "alive after the deep line");
+        assert!(!watch.agent_gone());
     }
 
     #[test]
@@ -687,7 +776,7 @@ mod tests {
         // not acknowledged would.
         let shared = Shared::default();
         let started = Instant::now();
-        let ended = session(&shared, &path, Some("w1:p2"));
+        let ended = session(&shared, &path, Some("w1:p2"), &|_| false);
         assert!(matches!(ended, Ok(false)), "{ended:?}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -701,10 +790,14 @@ mod tests {
     #[test]
     fn a_herdr_that_never_answers_costs_the_pane_nothing_and_leaving_does_not_wait() {
         let d = tempfile::tempdir().unwrap();
-        let (path, count) = listener(d.path(), "mute.sock", |conn| {
+        let hung_up = Arc::new(AtomicBool::new(false));
+        let seen = hung_up.clone();
+        let (path, count) = listener(d.path(), "mute.sock", move |conn| {
             read_request(&conn);
-            thread::sleep(Duration::from_secs(30));
-            drop(conn);
+            // Silent until the client lets go.
+            let mut sink = [0u8; 64];
+            while !matches!((&conn).read(&mut sink), Ok(0) | Err(_)) {}
+            seen.store(true, Ordering::SeqCst);
         });
         let started = Instant::now();
         let watch = Watcher::start(path, || {
@@ -728,12 +821,93 @@ mod tests {
             until(|| count.load(Ordering::SeqCst) == 1),
             "it is waiting on herdr"
         );
+        assert!(!hung_up.load(Ordering::SeqCst));
         let leaving = Instant::now();
         drop(watch);
         assert!(
             leaving.elapsed() < Duration::from_millis(200),
             "drop does not wait"
         );
+        assert!(
+            until(|| hung_up.load(Ordering::SeqCst)),
+            "the socket is let go"
+        );
+    }
+
+    #[test]
+    fn a_herdr_that_trickles_a_line_is_let_go_when_the_pane_leaves() {
+        let d = tempfile::tempdir().unwrap();
+        let hung_up = Arc::new(AtomicBool::new(false));
+        let seen = hung_up.clone();
+        // A byte every 20 ms, never a newline: no read ever times out.
+        let (path, _) = listener(d.path(), "trickle.sock", move |conn| {
+            read_request(&conn);
+            ack(&conn);
+            while (&conn).write_all(b" ").is_ok() {
+                thread::sleep(Duration::from_millis(20));
+            }
+            seen.store(true, Ordering::SeqCst);
+        });
+        let watch = Watcher::start(path, || Some("w1:p2".into()));
+        thread::sleep(Duration::from_millis(600));
+        quiet(&watch);
+        drop(watch);
+        assert!(
+            until(|| hung_up.load(Ordering::SeqCst)),
+            "the socket is let go"
+        );
+    }
+
+    #[test]
+    fn endless_short_garbage_ends_the_subscription_and_waits_before_the_next() {
+        let d = tempfile::tempdir().unwrap();
+        let subscriptions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = subscriptions.clone();
+        let (path, _) = listener(d.path(), "spam.sock", move |conn| {
+            let mut request = String::new();
+            let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut request);
+            if !request.contains("events.subscribe") {
+                return;
+            }
+            counted.fetch_add(1, Ordering::SeqCst);
+            ack(&conn);
+            let line = b"not json\n".repeat(1000);
+            while (&conn).write_all(&line).is_ok() {}
+        });
+        let watch = Watcher::start(path, || Some("w1:p2".into()));
+        assert!(until(|| subscriptions.load(Ordering::SeqCst) >= 1));
+        thread::sleep(Duration::from_millis(1500));
+        quiet(&watch);
+        let tries = subscriptions.load(Ordering::SeqCst);
+        assert!(tries <= 2, "{tries} subscriptions in 1.5 s");
+    }
+
+    #[test]
+    fn an_agent_pane_herdr_still_knows_under_another_id_does_not_end_the_pane() {
+        // Not in the snapshot, but herdr answers for it (a move gives a pane a new id and keeps
+        // the old one as an alias): the second opinion says it is there.
+        let fake = Fake::new();
+        *fake.panes.lock().unwrap() = Some(vec!["w1:p3"]);
+        let asked = Arc::new(Mutex::new(vec![]));
+        let record = asked.clone();
+        let watch = Watcher::start_with(
+            fake.socket(),
+            || Some("w1:p2".into()),
+            Arc::new(move |pane| {
+                record.lock().unwrap().push(pane.to_string());
+                true
+            }),
+        );
+        assert!(until(|| !asked.lock().unwrap().is_empty()), "asked");
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(*asked.lock().unwrap(), ["w1:p2"]);
+        assert!(!watch.agent_gone());
+        // And when herdr does not know it either, the pane ends.
+        let fake = Fake::new();
+        *fake.panes.lock().unwrap() = Some(vec!["w1:p3"]);
+        let watch =
+            Watcher::start_with(fake.socket(), || Some("w1:p2".into()), Arc::new(|_| false));
+        assert!(until(|| watch.agent_gone()));
     }
 
     #[test]
