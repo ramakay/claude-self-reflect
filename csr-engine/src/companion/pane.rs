@@ -2468,11 +2468,15 @@ impl Pane {
     pub fn map_wait(&self, now: f64) -> (f64, bool) {
         self.map.wait(now)
     }
-    /// What one `j` moves: on a pictured Monologue or Changes page one step, a row or a cell of
-    /// lines laid on whole cells, so the picture moves by whole bands; elsewhere three rows.
+    /// What one `j` moves: on a pictured page laid on whole cells one step, a row or a cell of
+    /// lines, so the picture moves by whole bands; elsewhere three rows.
     fn line_step(&self) -> isize {
         let page = self.instrument_open.threads || self.instrument_open.changes;
-        if self.view == "main" && page && self.pixels && self.cards {
+        let aligned = self
+            .instrument_metrics
+            .as_ref()
+            .is_some_and(|m| m.page_aligned);
+        if self.view == "main" && page && self.pixels && self.cards && aligned {
             1
         } else {
             3

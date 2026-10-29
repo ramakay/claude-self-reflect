@@ -3029,6 +3029,9 @@ pub struct Metrics {
     /// With a page open: the most the first row shown may be, so a scroll never runs past the
     /// last row.
     pub page_scroll_max: Option<usize>,
+    /// With a page open: its rows lie on whole cells, so the scroll counts steps (a row, or a
+    /// cell of lines) and a `j` moves one; otherwise it counts rows and a `j` moves three.
+    pub page_aligned: bool,
     /// Every row drawn with a trailing "…", with its words in full: the click targets that open
     /// the popup.
     pub cuts: Vec<Cut>,
@@ -4007,15 +4010,22 @@ fn draw_pass(
     // A page on a pane of known cells lays its rows on whole cells: the body starts on a cell
     // boundary and a row (or a cell of Changes lines) is one cell tall, so a `j` moves whole bands
     // and every band but the new one is the same picture as before.
+    // Only where one cell holds a whole row (or a whole line) at its own type size: a row of two
+    // cells would send two bands a step, and a line cut by its cell would clip. Elsewhere the page
+    // keeps its free layout.
     let aligned = (page && cell_h > 0).then(|| {
         let scale = (width as f32 / W).min(available_height as f32 / maxh);
         let cell = cell_h as f32 / scale;
+        let fits = if open.threads {
+            (ALIGNED_ROW_MIN..=ROW_PITCH * 2.).contains(&cell)
+        } else {
+            cell >= ALIGNED_LINE_MIN
+        };
+        fits.then_some((scale, cell))
+    });
+    let aligned = aligned.flatten().map(|(scale, cell)| {
         let (pitch, lines) = if open.threads {
-            let mut cells = (ROW_PITCH / cell).round().max(1.);
-            while cells * cell < ALIGNED_ROW_MIN {
-                cells += 1.;
-            }
-            (cells * cell, 1)
+            (cell, 1)
         } else {
             let lines = (cell / DRILL_LINE)
                 .round()
@@ -4098,7 +4108,7 @@ fn draw_pass(
     // Aligned: rows below the body's top down to the card's padding, less a cell for the footer
     // when not all of them fit. A `j` is one step: a row of the Monologue, a cell of Changes lines.
     // The last step may show blank lines under the last one, so no step moves less than a cell.
-    let aligned_rows = aligned.map(|al| {
+    let aligned_rows = aligned.and_then(|al| {
         let room = M + page_h - P - al.body_top;
         let total = if open.threads {
             c.river.len()
@@ -4107,20 +4117,26 @@ fn draw_pass(
         };
         let all = (room / al.pitch + 0.001).max(0.) as usize;
         if total <= all {
-            return (total, 0, 0, String::new(), total);
+            return Some((total, 0, 0, String::new(), total));
         }
+        // The rows that fit over a footer cell, in whole steps. None fit: the free layout.
+        let fit = ((room - al.cell) / al.pitch + 0.001).max(0.) as usize;
+        let fit = (fit / al.lines * al.lines).min(total);
+        // Fewer than the heading promises (or none): the free layout, which keeps the promise.
         let least = if open.threads {
             PAGE_MIN_ROWS
         } else {
             DRILL_MIN_LINES - 1
         };
-        let fit = (((room - al.cell) / al.pitch + 0.001).max(0.) as usize).max(least);
-        let fit = (fit / al.lines * al.lines).max(al.lines).min(total);
+        if fit == 0 || fit < least.min(total) {
+            return None;
+        }
         let steps = (total - fit).div_ceil(al.lines);
         let from = open.scroll.min(steps) * al.lines;
         let shown = fit.min(total - from);
-        (shown, from, steps, scroll_footer(from, shown, total), fit)
+        Some((shown, from, steps, scroll_footer(from, shown, total), fit))
     });
+    let aligned = aligned.filter(|_| aligned_rows.is_some());
     // Where an aligned page's footer goes: under the most rows a step shows, so it never moves.
     let page_fit = aligned_rows.as_ref().map_or(0, |r| r.4);
     let (page_rows, page_from, page_scroll_max, page_footer) = if let Some(rows) = aligned_rows {
@@ -5408,6 +5424,7 @@ fn draw_pass(
             story_open,
             popup_keys,
             page_scroll_max: page.then_some(page_scroll_max),
+            page_aligned: aligned.is_some(),
             cuts: canvas.cuts.clone(),
             agents_region,
             drill_region,

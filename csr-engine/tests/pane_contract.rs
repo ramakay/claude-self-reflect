@@ -1465,3 +1465,70 @@ fn a_page_scroll_step_uploads_at_most_two_bands() {
         set_cell_override(None);
     }
 }
+/// At every contract size, and at the sizes where a row would span two cells, one cell would
+/// clip a line, or the pane holds almost nothing: a page laid on cells sends at most two bands a
+/// `j`, and `j` reaches the end of the scroll. A page that cannot be laid on cells keeps its free layout.
+#[test]
+fn every_size_scrolls_to_the_end_and_aligned_pages_send_two_bands() {
+    let mut aligned_seen = 0;
+    for (page, home) in [
+        ("t", long_monologue as fn() -> (tempfile::TempDir, Paths)),
+        ("l", long_changes),
+    ] {
+        for (cols, rows, cell) in SIZES.into_iter().chain([
+            (60, 40, (16, 34)),
+            (200, 100, (16, 34)),
+            (35, 6, (26, 58)),
+            (35, 4, (26, 58)),
+        ]) {
+            let (_dir, mut pane) = live(home, &[page], (cols, rows, cell));
+            set_cell_override(Some(cell));
+            let mut drawn = None;
+            send(&mut pane, cols, rows, &mut drawn);
+            let Some(m) = pane.instrument_metrics.clone() else {
+                set_cell_override(None);
+                continue;
+            };
+            let max = m.page_scroll_max.unwrap_or(0);
+            if m.page_aligned {
+                aligned_seen += 1;
+            }
+            let mut presses = 0;
+            while pane.instrument_metrics.as_ref().is_some_and(|m| {
+                m.page_scroll_max
+                    .is_some_and(|max| pane_scroll(&pane) < max)
+            }) && presses < 400
+            {
+                pane.key("j");
+                presses += 1;
+                let s = send(&mut pane, cols, rows, &mut drawn);
+                if m.page_aligned && presses <= 3 {
+                    assert!(
+                        s.sent <= 2,
+                        "{page} at {cols}x{rows} {cell:?}: j#{presses} sent {} bands",
+                        s.sent
+                    );
+                }
+            }
+            assert!(
+                presses < 400,
+                "{page} at {cols}x{rows}: j never reaches the end (max {max})"
+            );
+            pane.frame(cols, rows, NOW);
+            assert!(
+                pane.instrument_metrics
+                    .as_ref()
+                    .is_some_and(|m| m.page_scroll_max.is_some()),
+                "{page} at {cols}x{rows}: the page closed while scrolling"
+            );
+            set_cell_override(None);
+        }
+    }
+    assert!(
+        aligned_seen >= 4,
+        "only {aligned_seen} aligned pages: the check proves little"
+    );
+}
+fn pane_scroll(pane: &Pane) -> usize {
+    pane.instrument_open.scroll
+}
