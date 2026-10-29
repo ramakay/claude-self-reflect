@@ -1275,6 +1275,27 @@ fn send(pane: &mut Pane, cols: usize, rows: usize, drawn: &mut Option<Drawn>) ->
         })
         .filter(|id| on_screen.contains(id))
         .count();
+    // The terminal keeps no pixels for an image with no placement: an `a=p` may name only an
+    // image placed in the last frame (and cleared by nothing since) or sent earlier in this one.
+    let mut live = if out.contains("a=d,d=A") {
+        vec![]
+    } else {
+        on_screen.clone()
+    };
+    for t in out.split("\x1b_G").skip(1) {
+        let id = t
+            .split("i=")
+            .nth(1)
+            .and_then(|r| r.split(',').next()?.parse::<usize>().ok());
+        if t.starts_with("a=T") {
+            live.extend(id);
+        } else if t.starts_with("a=p") {
+            assert!(
+                id.is_some_and(|id| live.contains(&id)),
+                "a=p names an image with no placement on screen: {t:.70}"
+            );
+        }
+    }
     let last_place = out.rfind("\x1b_Ga=T").max(out.rfind("\x1b_Ga=p"));
     let first_delete = out.find("\x1b_Ga=d");
     Step {
@@ -1409,7 +1430,8 @@ fn a_page_scroll_places_new_bands_before_it_deletes_the_old() {
 }
 /// The cost of a scroll step: on the owner's pane a `j` on the Monologue (`t`) and Changes (`l`)
 /// pages moves the picture by whole bands, so it sends at most two (the row that comes into view
-/// and the footer) and places the rest again from images already up. A `k` back sends none.
+/// and the footer) and places the rest again from images still on screen. A `k` back sends the
+/// same two: the terminal keeps no image once its last placement is gone.
 /// Run with `--nocapture` for the per-step receipt.
 #[test]
 fn a_page_scroll_step_uploads_at_most_two_bands() {
@@ -1447,7 +1469,7 @@ fn a_page_scroll_step_uploads_at_most_two_bands() {
                 "pin {page} {key}#{}: {} bytes, {} bands, {} sent, {} placed only, {} deleted, frame {:.1} ms, step {:.1} ms",
                 step + 1, s.bytes, s.bands, s.sent, s.placed_only, s.deleted, s.ms, s.step_ms
             );
-            let most = if key == "k" { 0 } else { 2 };
+            let most = 2;
             assert!(
                 s.sent <= most,
                 "{page} {key}#{}: {} bands uploaded, at most {most} allowed",

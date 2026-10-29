@@ -44,7 +44,7 @@ pub struct Placement {
     pub png: Arc<Png>,
 }
 /// A picture's PNG. One made from pixels is encoded only when its bytes are asked for: a band
-/// already up in the terminal is placed again by its id and never encoded. Two pictures are equal
+/// still on screen is placed again by its id and never encoded. Two pictures are equal
 /// when their content hashes are, so the same pixels are the same picture.
 pub struct Png {
     pixels: Option<tiny_skia::Pixmap>,
@@ -222,12 +222,12 @@ pub struct Drawn {
     pub placed: Vec<Placement>,
     /// The image id each placed picture is on screen under; slot `i` is placement `i + 1` of it.
     pub ids: Vec<usize>,
-    /// Images the terminal holds, by id and content hash, the longest unseen first. A band whose
-    /// pixels come back (a page scrolled by one row) is placed again from these and not sent.
+    /// The images that have a placement on screen after this frame, by id and content hash. Only
+    /// these may be placed again without their pixels (`a=p`): the terminal chain (herdr, then
+    /// the outer terminal) does not keep the pixels of an image once its last placement is
+    /// gone, so a picture that comes back after that is sent again.
     pub held: Vec<(usize, u64)>,
 }
-/// Images kept in the terminal beyond those on screen, so a scroll back is placement-only too.
-const HELD_SPARE: usize = 64;
 /// Image ids run from 1 to 2^31 - 1: a picture's id comes from its content hash, the next free
 /// one on a clash.
 const ID_SPAN: u64 = 0x7fff_fffe;
@@ -265,8 +265,11 @@ pub fn repaint_pictures(
 }
 /// What to write for this frame after `drawn`, and what is on screen once it is written.
 ///
-/// A picture's image id comes from its pixels, so a band that only moved (a page scrolled by a
-/// row) is placed again from the image the terminal holds (`a=p`), and only new pixels are sent.
+/// A picture's image id comes from its pixels. A band that only moved (a page scrolled by a
+/// row) is on screen already, so it is placed again by id (`a=p`) and only new pixels are sent.
+/// An image with no placement on screen is not kept by the terminal chain: it is freed (`d=I`)
+/// as soon as its last placement goes, and a picture that comes back later is sent in full
+/// (`a=T`), never named by an id the terminal no longer knows (the band would stay black).
 /// herdr keys its own copy for the outer terminal by content too, so that hop sends nothing either.
 /// Every new placement goes up before any old one is deleted, all inside one synchronized update:
 /// herdr shows the gap between a delete and the next picture as a blank band.
@@ -284,7 +287,10 @@ pub fn repaint_frame(
         out.push_str(DELETE_ALL);
         out.push_str("\x1b[H\x1b[2J");
     }
-    let mut held: Vec<(usize, u64)> = same.map(|d| d.held.clone()).unwrap_or_default();
+    // Images with a placement on screen right now. The old placements are deleted only after
+    // every new one is placed, so during the placing loop all of these are still live.
+    let prior: Vec<(usize, u64)> = same.map(|d| d.held.clone()).unwrap_or_default();
+    let mut live = prior.clone();
     for (i, line) in written.iter().enumerate() {
         if same.and_then(|d| d.written.get(i)) != Some(line) {
             out.push_str(&format!("\x1b[{};1H\x1b[0m\x1b[2K{line}", i + 1));
@@ -293,7 +299,7 @@ pub fn repaint_frame(
     let mut ids: Vec<usize> = Vec::with_capacity(placed.len());
     for (i, p) in placed.iter().enumerate() {
         let hash = p.png.hash();
-        let id = held
+        let id = live
             .iter()
             .find(|e| e.1 == hash)
             .map(|e| e.0)
@@ -306,7 +312,7 @@ pub fn repaint_frame(
             })
             .unwrap_or_else(|| {
                 id_for(hash, |id| {
-                    held.iter().any(|e| e.0 == id) || ids.contains(&id)
+                    live.iter().any(|e| e.0 == id) || ids.contains(&id)
                 })
             });
         ids.push(id);
@@ -315,18 +321,19 @@ pub fn repaint_frame(
     let shown_id = |i: usize| same.and_then(|d| d.ids.get(i).copied());
     let changed = |row: usize| same.and_then(|d| d.written.get(row)) != written.get(row);
     let under = |p: &Placement| (p.row..p.row + p.rows).any(changed);
-    // New and moved pictures first: placed again when the terminal holds them, sent when not.
+    // New and moved pictures first: placed again when the image has a live placement (on
+    // screen in the last frame, or placed earlier in this one), sent in full when not.
     for (i, p) in placed.iter().enumerate() {
         let old = shown.get(i);
         if shown_id(i) == Some(ids[i]) && old == Some(p) && !under(p) && !old.is_some_and(under) {
             continue;
         }
         let at = (ids[i], Some(i + 1));
-        if held.iter().any(|e| e.0 == ids[i]) {
+        if live.iter().any(|e| e.0 == ids[i]) {
             out.push_str(&place(p, at));
         } else {
             out.push_str(&transmit(&p.png, p.row, p.col, p.cols, p.rows, Some(at)));
-            held.push((ids[i], p.png.hash()));
+            live.push((ids[i], p.png.hash()));
         }
     }
     // Then the old placements go: a slot now showing another image, or no longer drawn. A slot
@@ -339,12 +346,11 @@ pub fn repaint_frame(
             out.push_str(&format!("\x1b_Ga=d,d=i,i={old},p={},q=2;\x1b\\", i + 1));
         }
     }
-    // Images on screen are the most recently seen; past the spare, the longest unseen are freed.
-    held.sort_by_key(|e| ids.contains(&e.0));
-    let unseen = held.iter().filter(|e| !ids.contains(&e.0)).count();
-    for (id, _) in held.drain(..unseen.saturating_sub(HELD_SPARE)) {
+    // An image left with no placement is freed now: the terminal does not keep it.
+    for (id, _) in prior.iter().filter(|e| !ids.contains(&e.0)) {
         out.push_str(&format!("\x1b_Ga=d,d=I,i={id},q=2;\x1b\\"));
     }
+    let held: Vec<(usize, u64)> = live.into_iter().filter(|e| ids.contains(&e.0)).collect();
     let next = Drawn {
         cols,
         rows,
@@ -543,11 +549,15 @@ mod picture_tests {
         let last_place = out.rfind("a=T").max(out.rfind("a=p")).unwrap();
         assert!(last_place < out.find("a=d").unwrap());
         assert_eq!(out.matches("a=d,d=i,").count(), 4);
-        assert!(!out.contains(DELETE_ALL) && !out.contains("\x1b[2J") && !out.contains("d=I"));
-        // Back up: every band is still held, so nothing is sent at all.
+        assert!(!out.contains(DELETE_ALL) && !out.contains("\x1b[2J"));
+        // The band that scrolled off has no placement left: freed, after every place.
+        assert_eq!(out.matches("a=d,d=I,").count(), 1);
+        assert!(last_place < out.find("a=d,d=I,").unwrap());
+        // Back up: the band that left the screen is gone from the terminal, so it is sent again;
+        // the three still on screen are only placed.
         let (back, _) = repaint_frame(Some(&next), 4, 5, &written, &page(&[1u8, 2, 3, 4]));
-        assert_eq!(back.matches("a=T").count(), 0);
-        assert_eq!(back.matches("a=p").count(), 4);
+        assert_eq!(back.matches("a=T").count(), 1);
+        assert_eq!(back.matches("a=p").count(), 3);
         // The same frame again writes nothing.
         let (_, again) = repaint_frame(Some(&next), 4, 5, &written, &page(&[2u8, 3, 4, 5]));
         assert_eq!(
@@ -559,25 +569,87 @@ mod picture_tests {
         assert_eq!(twins.matches("a=T").count(), 2);
         assert_eq!(twins.matches("a=p").count(), 1);
     }
+    /// Every `a=p` in `out` names an image the terminal has: one with a placement on screen in
+    /// `before`, or sent (`a=T`) earlier in `out`.
+    fn assert_places_only_live_images(out: &str, before: Option<&Drawn>) {
+        let mut live: Vec<usize> = before.map(|d| d.ids.clone()).unwrap_or_default();
+        for t in out.split("\x1b_G").skip(1) {
+            let id = t
+                .split("i=")
+                .nth(1)
+                .and_then(|r| r.split(',').next()?.parse::<usize>().ok());
+            if t.starts_with("a=T") {
+                live.extend(id);
+            } else if t.starts_with("a=p") {
+                assert!(
+                    live.contains(&id.unwrap()),
+                    "a=p names a dead image: {t:.60}"
+                );
+            }
+        }
+    }
     #[test]
-    fn images_off_screen_are_freed_past_the_spare_longest_unseen_first() {
+    fn a_band_that_leaves_the_screen_and_comes_back_is_sent_again() {
         let written = vec![String::new(); 3];
+        let (_, f1) = repaint_frame(None, 4, 3, &written, &page(&[1u8, 2]));
+        let id_one = f1.ids[0];
+        // Frame 2: band 1 is gone, replaced by 3. Its image is freed, not kept.
+        let (f2_out, f2) = repaint_frame(Some(&f1), 4, 3, &written, &page(&[3u8, 2]));
+        assert!(f2_out.contains(&format!("a=d,d=I,i={id_one},q=2;")));
+        assert!(!f2.held.iter().any(|e| e.0 == id_one));
+        // Frame 3: band 1 comes back two frames after it left. It is not live, so it is sent.
+        let (f3_out, f3) = repaint_frame(Some(&f2), 4, 3, &written, &page(&[1u8, 2]));
+        assert!(
+            sent_ids(&f3_out, "a=T").contains(&f3.ids[0]),
+            "the returning band must be transmitted: {f3_out:?}"
+        );
+        assert!(!sent_ids(&f3_out, "a=p").contains(&f3.ids[0]));
+        assert_places_only_live_images(&f3_out, Some(&f2));
+    }
+    #[test]
+    fn an_animated_card_cycling_a_b_a_sends_pixels_each_time() {
+        let written = vec![String::new(); 3];
+        let card = |level: u8| {
+            super::bands(&[Placement {
+                row: 0,
+                col: 0,
+                cols: 4,
+                rows: 1,
+                png: Png::from_pixmap(levels(8, 2, &[level])),
+            }])
+        };
         let mut drawn: Option<Drawn> = None;
-        let mut freed = vec![];
-        for level in 0..(HELD_SPARE as u8 + 10) {
-            let (out, next) =
-                repaint_frame(drawn.as_ref(), 4, 3, &written, &page(&[level, level / 2]));
-            freed.extend(sent_ids(&out, "a=d,d=I"));
+        for (n, level) in [10u8, 20, 10, 20, 10].into_iter().enumerate() {
+            let (out, next) = repaint_frame(drawn.as_ref(), 4, 3, &written, &card(level));
+            assert_eq!(out.matches("a=T").count(), 1, "frame {n}: {out:?}");
+            assert_eq!(out.matches("a=p").count(), 0, "frame {n}: {out:?}");
+            assert_places_only_live_images(&out, drawn.as_ref());
             drawn = Some(next);
         }
-        let drawn = drawn.unwrap();
-        assert!(!freed.is_empty());
-        assert!(drawn.held.len() <= HELD_SPARE + 2);
-        assert!(drawn
-            .ids
-            .iter()
-            .all(|id| drawn.held.iter().any(|e| e.0 == *id)));
-        assert!(freed.iter().all(|id| !drawn.ids.contains(id)));
+        // What is held is what is on screen, nothing more.
+        assert_eq!(drawn.unwrap().held.len(), 1);
+    }
+    #[test]
+    fn an_image_with_a_placement_left_is_not_freed_and_one_with_none_is() {
+        let written = vec![String::new(); 4];
+        // Two slots share one image; one slot changes: the image still has a placement.
+        let (_, f1) = repaint_frame(None, 4, 4, &written, &page(&[7u8, 7, 8]));
+        let (out, f2) = repaint_frame(Some(&f1), 4, 4, &written, &page(&[7u8, 9, 8]));
+        assert!(!out.contains("d=I"), "{out:?}");
+        assert!(f2.held.len() == 3);
+        // Drawing nothing frees every image.
+        let (gone, f3) = repaint_frame(Some(&f2), 4, 4, &written, &[]);
+        assert_eq!(gone.matches("d=I").count(), 3);
+        assert!(f3.held.is_empty());
+        // And a long walk never holds more than what is on screen.
+        let mut drawn: Option<Drawn> = None;
+        for level in 0..80u8 {
+            let (out, next) =
+                repaint_frame(drawn.as_ref(), 4, 3, &written, &page(&[level, level / 2]));
+            assert_places_only_live_images(&out, drawn.as_ref());
+            assert!(next.held.len() <= 2);
+            drawn = Some(next);
+        }
         // A clash takes the next free id.
         assert_eq!(id_for(4, |id| id == 5), 6);
         assert_eq!(id_for(ID_SPAN - 1, |id| id == ID_SPAN as usize), 1);
