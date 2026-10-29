@@ -1047,7 +1047,7 @@ impl Pane {
         cols: usize,
         rows: usize,
     ) -> Vec<String> {
-        use super::render::{instrument, raster, text};
+        use super::render::{instrument, text};
         self.instrument_metrics = None;
         self.obs_lines = [ObsCard::Confusing, ObsCard::ShouldBe, ObsCard::More].map(|card| {
             if card == ObsCard::More {
@@ -1263,8 +1263,9 @@ impl Pane {
         let mut out = semantic;
         if let Some(strip) = strip {
             self.encodes += 1;
-            if let Ok(png) = raster::png(&strip) {
+            {
                 let count = strip.height().div_ceil(cell.1) as usize;
+                let png = super::render::kitty::Png::from_pixmap(strip);
                 let row = out.len().min(rows.saturating_sub(1 + count));
                 out.truncate(row);
                 self.placed = vec![super::render::kitty::Placement {
@@ -1272,7 +1273,7 @@ impl Pane {
                     col: 0,
                     cols,
                     rows: count,
-                    png: png.into(),
+                    png,
                 }];
                 hits.retain(|r, _| *r < row);
                 for r in row..row + count {
@@ -1281,17 +1282,21 @@ impl Pane {
             }
         } else if self.pixels && self.cards && cols >= 32 {
             let cell = super::render::kitty::cell_size();
-            if let Some((pm, metrics)) = instrument::draw(
+            if let Some((pm, metrics)) = instrument::draw_cells(
                 composition,
                 cols as u32 * cell.0,
                 rows.saturating_sub(1) as u32 * cell.1,
                 self.theme,
                 open,
                 false,
+                cell.1,
             ) {
                 self.rasters += 1;
                 self.encodes += 1;
-                if let Ok(png) = raster::png(&pm) {
+                // The picture is kept as pixels: bands are cut from them, and a band is encoded
+                // only when it has to be sent.
+                let picture = super::render::kitty::Png::from_pixmap(pm);
+                if let Some(pm) = picture.pixmap() {
                     self.instrument_metrics = Some(metrics.clone());
                     let picture_rows = pm.height().div_ceil(cell.1) as usize;
                     self.placed = vec![super::render::kitty::Placement {
@@ -1299,7 +1304,7 @@ impl Pane {
                         col: 0,
                         cols,
                         rows: picture_rows,
-                        png: png.into(),
+                        png: picture.clone(),
                     }];
                     out = vec![String::new(); picture_rows];
                     let to_row = |y: f32| {
@@ -2436,8 +2441,8 @@ impl Pane {
             "z" => {
                 self.phone.zoom_key(self.herdr.as_ref());
             }
-            "j" | "down" => self.scroll(3),
-            "k" | "up" => self.scroll(-3),
+            "j" | "down" => self.scroll(self.line_step()),
+            "k" | "up" => self.scroll(-self.line_step()),
             " " => self.scroll(12),
             _ => (),
         }
@@ -2462,6 +2467,16 @@ impl Pane {
     /// Map's hold is up and it folds.
     pub fn map_wait(&self, now: f64) -> (f64, bool) {
         self.map.wait(now)
+    }
+    /// What one `j` moves: on a pictured Monologue or Changes page one step, a row or a cell of
+    /// lines laid on whole cells, so the picture moves by whole bands; elsewhere three rows.
+    fn line_step(&self) -> isize {
+        let page = self.instrument_open.threads || self.instrument_open.changes;
+        if self.view == "main" && page && self.pixels && self.cards {
+            1
+        } else {
+            3
+        }
     }
     pub fn scroll(&mut self, step: isize) {
         if self.view == "main"

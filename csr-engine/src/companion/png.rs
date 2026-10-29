@@ -64,7 +64,7 @@ fn cards_png(
             let Ok(img) = image::load_from_memory(&p.png) else {
                 continue;
             };
-            std::fs::write(dir.join(format!("{name}-{i}.png")), &p.png)?;
+            std::fs::write(dir.join(format!("{name}-{i}.png")), &p.png[..])?;
             stack.push((p.row as u32 * cell.1, img.to_rgba8()));
         }
         let width = stack.iter().map(|(_, i)| i.width()).max().unwrap_or(0);

@@ -54,3 +54,10 @@ is checked by `tests/pane_contract.rs` for every fixture, pane size and theme. A
     last 33k (`NATIVE_UNDER`; all of a smaller window) a hatched buffer with a tick at its start.
     The heading reads "85k of 300k (28%)" and "182k free · 33k buffer". No setting: the model's
     window, no buffer. No segment runs past the bar's end, even with the context past the window.
+14. **A page scrolls by whole bands.** On a pane of known cells the Monologue (`t`) and Changes
+    (`l`) pages lay their rows on whole cells (a Monologue row is one cell, a cell holds two
+    Changes lines at the same type sizes), with a flat ground down the page, so a `j` moves the
+    picture by whole bands and every band but the new row and the footer is the same pixels. The
+    transport names an image by a hash of its pixels and places one already up again (`a=p`): a
+    `j` sends at most two bands (`tests/pane_contract.rs`,
+    `a_page_scroll_step_uploads_at_most_two_bands`). Fonts are never shrunk to fit the cell.

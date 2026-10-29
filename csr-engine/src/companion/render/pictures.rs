@@ -197,7 +197,7 @@ impl Hash for Request {
         self.backs.hash(h);
     }
 }
-type CacheEntry = (u64, Request, Option<Arc<[u8]>>);
+type CacheEntry = (u64, Request, Option<Arc<super::kitty::Png>>);
 pub struct Cache {
     fonts: &'static raster::Fonts,
     entries: VecDeque<CacheEntry>,
@@ -218,7 +218,7 @@ impl Cache {
             bytes: 0,
         }
     }
-    pub fn get(&mut self, request: Request) -> Option<Arc<[u8]>> {
+    pub fn get(&mut self, request: Request) -> Option<Arc<super::kitty::Png>> {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         request.hash(&mut hash);
         let hash = hash.finish();
@@ -232,7 +232,7 @@ impl Cache {
             self.entries.push_back(entry);
             return png;
         }
-        let png: Option<Arc<[u8]>> = request
+        let png: Option<Arc<super::kitty::Png>> = request
             .picture
             .draw(
                 request.cols,
@@ -242,7 +242,7 @@ impl Cache {
                 self.fonts,
             )
             .and_then(|p| raster::png(&p).ok())
-            .map(Into::into);
+            .map(super::kitty::Png::from_bytes);
         self.bytes += png.as_ref().map_or(0, |p| p.len());
         self.entries.push_back((hash, request, png.clone()));
         while self.entries.len() > 64 || self.bytes > 8 * 1024 * 1024 {
