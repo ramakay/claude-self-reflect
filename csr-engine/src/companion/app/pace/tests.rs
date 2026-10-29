@@ -710,7 +710,22 @@ async fn a_look_s_spend_and_claude_s_steps_both_land_when_they_interleave_pace_c
     // The look itself: it starts at its due step and waits on its fork.
     let r = dream_rig(vec![]);
     let (cx, gate) = r.gated();
-    r.steps(&cx, 12, None, None).await;
+    // The first look is due at step 6, and it is a task of its own: it reads Claude's spend when
+    // it runs, not when it was started, and while it runs no other look starts. Claude's steps go
+    // on counting while it waits for a core, so on a loaded host it reads the spend of step 9, or
+    // is still running at step 12, and the look this test waits for is put off to a different
+    // step than at a quiet host. In a session Claude's next step takes seconds; here the test
+    // says so by letting the look finish before the next step.
+    r.steps(&cx, 6, None, None).await;
+    assert!(
+        until(|| {
+            !r.of_kind("look").is_empty()
+                && !cx.kept(|f: &mut crate::companion::app::fleet::Fleet| f.dreaming)
+        })
+        .await,
+        "the first look ran to its end"
+    );
+    r.steps(&cx, 6, None, None).await;
     assert!(until(|| gate.arrived() >= 1).await);
     gate.open();
     r.steps(&cx, 3, None, None).await; // Claude's next steps count theirs

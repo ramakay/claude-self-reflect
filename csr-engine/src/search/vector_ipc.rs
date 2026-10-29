@@ -2012,7 +2012,7 @@ mod tests {
             serve_timeout,
             slots.clone(),
         );
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while !socket_path(tmp.path()).exists() {
                 assert!(!server.is_finished(), "vector socket bind failed");
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2045,27 +2045,46 @@ mod tests {
             })
             .unwrap(),
         );
-        let stuck: Vec<_> = (0..SERVER_SLOTS)
-            .map(|_| {
-                let (dir, bytes) = (dir.clone(), search_frame.clone());
-                // A loaded machine may admit a client late; one that gave up
-                // first would never hold a slot, so these wait long.
-                std::thread::spawn(move || {
-                    raw_within(&dir, &bytes, false, Duration::from_secs(120))
-                })
-            })
-            .collect();
-        // All eight admitted (and blocked on the lock)...
+        // The server reads a request within `serve_timeout` of admitting it and drops a
+        // connection that is late, which frees its slot. A client a loaded host schedules late
+        // is such a connection, so clients keep arriving until eight jobs hold a slot, however
+        // many attempts that takes: a request that is read blocks on the lock and keeps its
+        // slot for good, one that is not read gives its slot back and is replaced.
+        let mut attempts: Vec<std::thread::JoinHandle<Option<Vec<u8>>>> = Vec::new();
         tokio::time::timeout(Duration::from_secs(90), async {
-            while slots.available_permits() > 0 {
-                tokio::time::sleep(Duration::from_millis(2)).await;
+            loop {
+                while slots.available_permits() > 0 {
+                    let live = attempts.iter().filter(|a| !a.is_finished()).count();
+                    for _ in live..slots.available_permits() {
+                        let (dir, bytes) = (dir.clone(), search_frame.clone());
+                        attempts.push(std::thread::spawn(move || {
+                            raw_within(&dir, &bytes, false, Duration::from_secs(120))
+                        }));
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                // The server has now given up on every connection (each client saw it close;
+                // none was answered, the index lock is still held). A slot that is still out
+                // belongs to a blocked job: the old code freed every slot at this point. A slot
+                // that a late client's read timeout has just given back means another round.
+                for attempt in attempts.drain(..) {
+                    let answer = tokio::task::spawn_blocking(move || attempt.join().unwrap())
+                        .await
+                        .unwrap();
+                    assert!(
+                        answer.is_none(),
+                        "no search is answered while the lock is held"
+                    );
+                }
+                if slots.available_permits() == 0 {
+                    break;
+                }
             }
         })
         .await
-        .expect("eight searches admitted");
-        // ...then well past the server's give-up time for each of them (the
-        // old code freed every slot then), none has come back.
-        tokio::time::sleep(serve_timeout * 3).await;
+        .expect(
+            "eight blocked jobs hold every slot once the server has given up on each connection",
+        );
         assert_eq!(
             slots.available_permits(),
             0,
@@ -2080,14 +2099,33 @@ mod tests {
             "no slot while eight jobs are still blocked"
         );
         drop(held);
-        for thread in stuck {
-            let _ = thread.join();
-        }
-        let (d, p) = (dir.clone(), ping.clone());
-        let answered = tokio::task::spawn_blocking(move || raw(&d, &p, false))
-            .await
-            .unwrap();
-        assert!(answered.is_some(), "slots come back once the work finishes");
+        // The blocked work finishes on its own threads; the slots come back as it does.
+        tokio::time::timeout(Duration::from_secs(90), async {
+            while slots.available_permits() < SERVER_SLOTS {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("slots come back once the work finishes");
+        // A ping that reaches the server late is dropped like any late request; ask again.
+        let answered = tokio::time::timeout(Duration::from_secs(90), async {
+            loop {
+                let (d, p) = (dir.clone(), ping.clone());
+                if tokio::task::spawn_blocking(move || raw(&d, &p, false))
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            answered.is_ok(),
+            "the server answers once the slots are back"
+        );
         shutdown.store(true, Ordering::SeqCst);
         server.await.unwrap();
     }
@@ -2493,10 +2531,12 @@ mod tests {
             &db,
             shutdown.clone(),
             Arc::new(Notify::new()),
-            Duration::from_secs(5),
+            // Long enough that the waiting connections are still waiting when the last one
+            // arrives, whatever the host is doing; nothing here depends on it running out.
+            Duration::from_secs(60),
             slots,
         );
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while !socket_path(dir.path()).exists() {
                 assert!(!server.is_finished(), "vector socket bind failed");
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2504,21 +2544,33 @@ mod tests {
         })
         .await
         .unwrap();
+        // The socket file appears at bind(2), before listen(2), so the first connect can still be
+        // refused when the file is there.
+        let connect = || async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                match tokio::net::UnixStream::connect(socket_path(dir.path())).await {
+                    Ok(stream) => return stream,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ConnectionRefused
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(e) => panic!("vector socket connect failed: {e}"),
+                }
+            }
+        };
         let mut waiting = Vec::new();
         for _ in 0..WAITING_CONNECTIONS {
-            waiting.push(
-                tokio::net::UnixStream::connect(socket_path(dir.path()))
-                    .await
-                    .unwrap(),
-            );
+            waiting.push(connect().await);
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut extra = tokio::net::UnixStream::connect(socket_path(dir.path()))
+        // The server accepts in the order connections arrived, so by the time it reaches this
+        // one all of the above hold a waiting place; no pause is needed to let that happen.
+        let mut extra = connect().await;
+        let size = tokio::time::timeout(Duration::from_secs(60), extra.read_u32())
             .await
-            .unwrap();
-        let size = tokio::time::timeout(Duration::from_secs(1), extra.read_u32())
-            .await
-            .unwrap()
+            .expect("the busy reply arrives")
             .unwrap();
         let mut bytes = vec![0; size as usize];
         extra.read_exact(&mut bytes).await.unwrap();

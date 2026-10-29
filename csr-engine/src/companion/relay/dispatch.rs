@@ -842,9 +842,12 @@ pub mod testing {
         chain_event(key, shape, table.entries(key), cx.clone(), e).await
     }
 
-    /// Let tasks the runtime holds run until `done` holds, or give up after a second.
+    /// Let tasks the runtime holds run until `done` holds. It returns the moment it does, so the
+    /// bound is a hang guard and not a speed check: a host with every core busy can take longer
+    /// than a second to schedule a task, which is not a defect in what the test is about.
     pub async fn until(mut done: impl FnMut() -> bool) -> bool {
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if done() {
                 return true;
             }

@@ -366,7 +366,7 @@ pub fn refresh(h: &dyn Host, home: &Path, from: &str, now: f64) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
-    let Ok(lock) = std::fs::OpenOptions::new()
+    let Ok(file) = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
@@ -374,17 +374,28 @@ pub fn refresh(h: &dyn Host, home: &Path, from: &str, now: f64) -> bool {
     else {
         return false;
     };
-    if lock.try_lock_exclusive().is_err() {
+    if file.try_lock_exclusive().is_err() {
         return false;
     }
+    let _lock = PaneLock(file);
     let prev = load(&path);
     if prev.as_ref().is_some_and(|c| fresh(c, from, now)) {
         return false;
     }
     let c = fetch(h, from, now, prev.as_ref());
-    let wrote = write(&path, &c).is_ok();
-    let _ = FileExt::unlock(&lock);
-    wrote
+    write(&path, &c).is_ok()
+}
+
+/// The fetch lock, held until this goes out of scope by any path (the fresh-cache return
+/// included). It unlocks the flock itself instead of leaning on the close: a flock belongs to
+/// the open file description, so closing our descriptor frees it only if no other process holds
+/// a copy, and a child being spawned beside us holds one until its exec.
+struct PaneLock(std::fs::File);
+
+impl Drop for PaneLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
 }
 
 /// Off in this crate's own unit tests, and with `CSR_ADMIN_COST=off`.
@@ -796,10 +807,38 @@ mod tests {
         lock.lock_exclusive().unwrap();
         assert!(!refresh(&h, home.path(), "2026-10-27", n + 5000.));
         assert_eq!(h.urls.borrow().len(), 2);
+        // Unlocked, not just closed: a process a concurrent test is spawning holds a copy of the
+        // descriptor until its exec, and the lock outlives the close for that long.
+        FileExt::unlock(&lock).unwrap();
         drop(lock);
         // An earlier base date than the cache covers is a new question.
         assert!(refresh(&h, home.path(), "2026-10-01", n + 602.));
         assert_eq!(h.urls.borrow().len(), 3);
+    }
+
+    #[test]
+    fn the_fetch_lock_frees_when_its_holder_is_done_with_a_copy_of_the_descriptor_open() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("admin_cost.lock");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap()
+        };
+        let file = open();
+        file.try_lock_exclusive().unwrap();
+        // What a child between fork and exec holds: the same open file description.
+        let inherited = file.try_clone().unwrap();
+        assert!(open().try_lock_exclusive().is_err(), "held");
+        drop(PaneLock(file));
+        assert!(
+            open().try_lock_exclusive().is_ok(),
+            "free although a copy of the descriptor is still open"
+        );
+        drop(inherited);
     }
 
     #[test]

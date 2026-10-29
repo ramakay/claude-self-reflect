@@ -609,7 +609,17 @@ fn settle(conn: &Connection, files: &[&(String, String, i64)], skipped: usize) -
 }
 
 struct DrainLock {
-    _file: std::fs::File,
+    file: std::fs::File,
+}
+
+impl Drop for DrainLock {
+    /// Release the flock itself rather than leaning on the close. A flock belongs to the open
+    /// file description, so closing this descriptor frees the lock only if no other process
+    /// holds a copy of it. A child the daemon is spawning has one until its exec closes it,
+    /// and a pass that has finished must not look held for that long.
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
 }
 
 impl DrainLock {
@@ -628,7 +638,7 @@ impl DrainLock {
                 anyhow::anyhow!("graph drain lock {} cannot be opened: {e}", path.display())
             })?;
         match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => Ok(Some(Self { file })),
             Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(None),
             Err(e) => Err(anyhow::anyhow!(
                 "graph drain lock {} cannot be taken: {e}",
@@ -825,6 +835,21 @@ mod tests {
         assert_eq!(pending(&storage).len(), 1, "left for the lock holder");
         drop(held);
         assert!(drain_if_pending(&storage, &db).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_finished_pass_frees_the_lock_with_a_copy_of_the_descriptor_still_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let held = DrainLock::try_acquire(dir.path()).unwrap().unwrap();
+        // What a child between fork and exec holds: the same open file description.
+        let inherited = held.file.try_clone().unwrap();
+        assert!(DrainLock::try_acquire(dir.path()).unwrap().is_none());
+        drop(held);
+        assert!(
+            DrainLock::try_acquire(dir.path()).unwrap().is_some(),
+            "closing our descriptor must not be what frees the lock"
+        );
+        drop(inherited);
     }
 
     #[test]
