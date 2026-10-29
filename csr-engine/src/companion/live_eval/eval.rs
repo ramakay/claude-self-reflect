@@ -28,6 +28,8 @@ pub struct CheckResult {
     pub value: Option<Val>,
     /// Where the metric itself went over the last three samples.
     pub trend: Option<Trend>,
+    /// A slope check still short of its span: (hours of samples held, hours needed).
+    pub short_span: Option<(f64, f64)>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Headline {
@@ -138,6 +140,7 @@ fn check(spec: &CheckSpec, trial: &Trial, samples: &[&Sample], now: f64) -> Chec
             .collect()
     };
     let latest = samples.iter().rev().find_map(|s| val(&s.row, &spec.metric));
+    let mut short_span = None;
     let (mut status, value) = match spec.kind {
         Kind::Latest => (None, latest),
         Kind::Max => {
@@ -150,11 +153,24 @@ fn check(spec: &CheckSpec, trial: &Trial, samples: &[&Sample], now: f64) -> Chec
         }
         Kind::SlopePerHour => {
             let from = trial.start + spec.warmup_hours * 3600.;
-            let points: Vec<(f64, f64)> = numbers(from)
-                .into_iter()
-                .map(|(at, v)| ((at - from) / 3600., v))
+            let raw = numbers(from);
+            let points: Vec<(f64, f64)> = raw
+                .iter()
+                .map(|(at, v)| ((at - from) / 3600., *v))
                 .collect();
-            (None, slope(&points).map(Val::Num))
+            // Subtract the times in seconds, then convert: two offsets in hours differ by a
+            // rounding error, and an exact span of 6 h must count as 6 h.
+            let held = match (raw.first(), raw.last()) {
+                (Some(a), Some(b)) => (b.0 - a.0) / 3600.,
+                _ => 0.,
+            };
+            if held < spec.min_span_hours {
+                // Too few hours to tell a trend from noise: neither pass nor fail.
+                short_span = Some((held.max(0.), spec.min_span_hours));
+                (Some(Status::Pending), None)
+            } else {
+                (None, slope(&points).map(Val::Num))
+            }
         }
         Kind::AtLeastByEnd => {
             let met = samples.iter().find_map(|s| {
@@ -188,6 +204,7 @@ fn check(spec: &CheckSpec, trial: &Trial, samples: &[&Sample], now: f64) -> Chec
         status,
         value,
         trend: trend(samples, &spec.metric),
+        short_span,
     }
 }
 

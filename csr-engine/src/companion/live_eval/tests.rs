@@ -142,6 +142,7 @@ fn slope_check(limit: f64) -> Value {
         "slope_per_hour",
     );
     c["warmup_hours"] = json!(1.0);
+    c["min_span_hours"] = json!(0.0);
     c["unit"] = json!("MB/h");
     c
 }
@@ -177,6 +178,151 @@ fn slope_waits_for_three_samples_after_the_warm_up() {
     ];
     let r = one(slope_check(150.), &rows, "2026-10-28T00:21:00Z");
     assert_eq!((r.status, r.value), (Status::Pending, None));
+}
+
+/// The live card's check: warm-up 1 h, limit +150 MB/h, and the default span of 6 h.
+fn card_slope_check() -> Value {
+    let mut c = slope_check(150.);
+    c.as_object_mut().unwrap().remove("min_span_hours");
+    c
+}
+/// One sample every `step` minutes from `from_min` for `count` samples, from the soak's start.
+fn rss_run(
+    from_min: i64,
+    step: i64,
+    count: i64,
+    value: impl Fn(f64) -> f64,
+) -> Vec<(String, Value)> {
+    let start = at(START);
+    (0..count)
+        .map(|i| {
+            let t = start + (from_min + i * step) as f64 * 60.;
+            let hours = (t - start) / 3600.;
+            let when = chrono::DateTime::from_timestamp(t as i64, 0)
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string();
+            (when, json!({"rss": value(hours)}))
+        })
+        .collect()
+}
+fn borrowed(rows: &[(String, Value)]) -> Vec<(&str, Value)> {
+    rows.iter().map(|(t, v)| (t.as_str(), v.clone())).collect()
+}
+
+#[test]
+fn slope_waits_until_its_samples_span_the_minimum() {
+    // The 10-29 card: 5 samples over 40 minutes after the warm-up, climbing steeply.
+    let all = rss_run(60, 10, 5, |h| 1800. + 1200. * h);
+    let r = one(card_slope_check(), &borrowed(&all), "2026-10-28T00:45:00Z");
+    assert_eq!((r.status, r.value), (Status::Pending, None));
+    let (have, need) = r.short_span.unwrap();
+    assert!(
+        (have - 40. / 60.).abs() < 1e-6 && need == 6.,
+        "{have} {need}"
+    );
+}
+
+#[test]
+fn slope_passes_flat_or_noisy_samples_once_the_span_is_held() {
+    let flat = rss_run(60, 20, 22, |_| 2700.);
+    let r = one(card_slope_check(), &borrowed(&flat), "2026-10-28T07:00:00Z");
+    assert_eq!(r.status, Status::Pass);
+    // RSS swings 213-6766 MB as caches load and drop: no trend, so no fail.
+    let noisy = rss_run(60, 20, 22, |h| {
+        if (h * 3.) as i64 % 2 == 0 {
+            6000.
+        } else {
+            400.
+        }
+    });
+    let r = one(
+        card_slope_check(),
+        &borrowed(&noisy),
+        "2026-10-28T07:00:00Z",
+    );
+    assert_eq!(r.status, Status::Pass, "{r:?}");
+    assert!(r.short_span.is_none());
+}
+
+#[test]
+fn slope_fails_a_steady_rise_over_the_limit_once_the_span_is_held() {
+    let rise = rss_run(60, 20, 22, |h| 2000. + 300. * h);
+    let r = one(card_slope_check(), &borrowed(&rise), "2026-10-28T07:00:00Z");
+    assert_eq!(r.status, Status::Fail);
+    let Some(Val::Num(slope)) = r.value else {
+        panic!("{r:?}")
+    };
+    assert!((slope - 300.).abs() < 1e-6, "{slope}");
+    // Just under the span it still waits, however steep.
+    let short = rss_run(60, 20, 17, |h| 2000. + 300. * h);
+    let r = one(
+        card_slope_check(),
+        &borrowed(&short),
+        "2026-10-28T06:00:00Z",
+    );
+    assert_eq!(r.status, Status::Pending);
+}
+
+#[test]
+fn slope_counts_an_exact_span_and_never_says_it_holds_what_it_lacks() {
+    // Samples 1 h 59 m and 7 h 59 m in: exactly 6 h apart, though offset from the warm-up.
+    let rows = [
+        ("2026-10-28T00:59:00Z", json!({"rss":2000})),
+        ("2026-10-28T04:00:00Z", json!({"rss":2000})),
+        ("2026-10-28T06:59:00Z", json!({"rss":2000})),
+    ];
+    let mut c = card_slope_check();
+    c["warmup_hours"] = json!(0.0);
+    let r = one(c.clone(), &rows, "2026-10-28T06:59:30Z");
+    assert!(r.short_span.is_none(), "{r:?}");
+    assert_eq!(r.status, Status::Pass);
+    // 5 h 59 m 30 s still waits, and the line does not round itself up to "have 6 h".
+    let rows = [
+        ("2026-10-28T01:00:00Z", json!({"rss":2000})),
+        ("2026-10-28T04:00:00Z", json!({"rss":2000})),
+        ("2026-10-28T06:59:30Z", json!({"rss":2000})),
+    ];
+    let report = evaluate(
+        &trial_with(vec![c]),
+        &samples(&rows),
+        at("2026-10-28T06:59:40Z"),
+    );
+    assert_eq!(report.checks[0].status, Status::Pending);
+    assert_eq!(
+        card(&report, &Utc).rows[0].text,
+        "Memory trend: waiting for 6 h of samples (have 5.9 h)"
+    );
+}
+
+#[test]
+fn the_waiting_line_says_why_in_words() {
+    let rows = rss_run(60, 20, 3, |h| 1800. + 1200. * h);
+    let report = evaluate(
+        &trial_with(vec![card_slope_check()]),
+        &samples(&borrowed(&rows)),
+        at("2026-10-28T00:45:00Z"),
+    );
+    let card = card(&report, &Utc);
+    assert_eq!(card.rows[0].mark, "…");
+    assert_eq!(
+        card.rows[0].text,
+        "Memory trend: waiting for 6 h of samples (have 0.7 h)"
+    );
+    assert_eq!(
+        card.line1,
+        "0 of 1 checks passing · 1 waiting · Waiting for data"
+    );
+    // A trial that ends short of the span says so rather than "had no data".
+    let ended = evaluate(
+        &trial_with(vec![card_slope_check()]),
+        &samples(&borrowed(&rows)),
+        at(END),
+    );
+    assert_eq!(
+        super::card(&ended, &Utc).rows[0].text,
+        "Memory trend: only 0.7 h of samples, needed 6 h"
+    );
 }
 
 #[test]
@@ -394,6 +540,7 @@ fn soak_trial() -> Trial {
                 "slope_per_hour",
             );
             c["warmup_hours"] = json!(1.0);
+            c["min_span_hours"] = json!(0.0);
             c["unit"] = json!("MB/h");
             c
         },

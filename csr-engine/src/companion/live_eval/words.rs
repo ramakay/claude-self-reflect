@@ -112,6 +112,10 @@ fn number(n: f64, signed: bool) -> String {
     }
     s
 }
+/// "6 h", "0.7 h": hours as a person says them.
+fn hours(h: f64) -> String {
+    format!("{} h", number((h * 10.).round() / 10., false))
+}
 fn value_text(v: Val, signed: bool) -> String {
     match v {
         Val::Num(n) => number(n, signed),
@@ -162,6 +166,27 @@ fn row(c: &CheckResult) -> Row {
                 Status::Pending => format!("{label}{sep}{shown}, need {limit} by end"),
                 Status::Fail => format!("{label}{sep}{shown}, needed {limit}"),
                 Status::Pass => format!("{label}{sep}{shown} (need {limit})"),
+            }
+        }
+        (_, status, None) if c.short_span.is_some() => {
+            let (have, need) = c.short_span.unwrap_or_default();
+            if status == Status::Fail {
+                format!(
+                    "{label}: only {} of samples, needed {}",
+                    hours(have),
+                    hours(need)
+                )
+            } else {
+                format!(
+                    "{label}: waiting for {} of samples (have {})",
+                    hours(need),
+                    // Nearest tenth, but never "have 6 h" of a window still short of 6.
+                    hours(if (have * 10.).round() / 10. >= need {
+                        need - 0.1
+                    } else {
+                        have
+                    })
+                )
             }
         }
         (_, Status::Fail, None) => format!("{label} had no data"),
