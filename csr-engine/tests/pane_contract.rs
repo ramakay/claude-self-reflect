@@ -7,8 +7,8 @@ use csr_engine::companion::{
     pane::Pane,
     paths::Paths,
     render::{
-        instrument::{Metrics, CARD_REGISTRY, LAYOUT_WIDTH, STACKABLE},
-        kitty::{set_cell_override, Placement},
+        instrument::{Metrics, CARD_REGISTRY, LAYOUT_WIDTH, SHOULD_BE_KINDS, STACKABLE},
+        kitty::{bands, picture_ids, repaint_pictures, set_cell_override, Drawn, Placement},
         theme::Theme,
     },
 };
@@ -187,6 +187,28 @@ fn window_20k() -> (tempfile::TempDir, Paths) {
     fs::write(&path, settings.to_string()).unwrap();
     (home, paths)
 }
+/// A running session whose newest look suggests one should-be item of each `kinds`, with a long
+/// line, so the row's text runs to its kind label.
+fn should_be_home(kinds: &[&str]) -> (tempfile::TempDir, Paths) {
+    let (home, paths) = few();
+    let should_be: Vec<Value> = kinds
+        .iter()
+        .map(|kind| {
+            json!({"kind":kind,"line":"Briefs for long workers repeat the same gate, resolver and flags.",
+                "evidence":"Turns 2, 3"})
+        })
+        .collect();
+    append_dream_log(
+        &paths,
+        json!({"kind":"look","session":"sess-now","at":NOW - 20.,"outcome":"none",
+            "confusing_claude":[],"should_be":should_be}),
+    );
+    (home, paths)
+}
+/// Every label a should-be row can carry, the longest first.
+fn every_kind() -> (tempfile::TempDir, Paths) {
+    should_be_home(&["CLAUDE.md", "memory", "skill", "hook", "tool"])
+}
 fn after() -> (tempfile::TempDir, Paths) {
     state_home("06-after")
 }
@@ -194,7 +216,7 @@ fn away() -> (tempfile::TempDir, Paths) {
     state_home("07-away")
 }
 
-const FIXTURES: [Fixture; 26] = [
+const FIXTURES: [Fixture; 27] = [
     Fixture {
         name: "few",
         home: few,
@@ -321,6 +343,11 @@ const FIXTURES: [Fixture; 26] = [
         keys: &["a", "e"],
     },
     Fixture {
+        name: "every-kind",
+        home: every_kind,
+        keys: &[],
+    },
+    Fixture {
         name: "stack-esc",
         home: dreaming,
         keys: &["e", "escape"],
@@ -403,6 +430,31 @@ fn registered(title: &str) -> Option<&'static csr_engine::companion::render::ins
     CARD_REGISTRY.iter().find(|c| c.titles.contains(&title))
 }
 
+/// Rule 9: no two text runs share any area. A run's extent is the drawn advance of its text, from
+/// where the canvas placed it, so a label longer than its column overlaps the text after it.
+fn overlaps(runs: &[(f32, f32, f32, f32, String)], what: &str) -> Vec<String> {
+    let mut bad = vec![];
+    for i in 0..runs.len() {
+        for j in i + 1..runs.len() {
+            let (a, b) = (&runs[i], &runs[j]);
+            let w = a.2.min(b.2) - a.0.max(b.0);
+            let h = a.3.min(b.3) - a.1.max(b.1);
+            if w > 0.5 && h > 0.5 {
+                bad.push(redo(
+                    9,
+                    what,
+                    h,
+                    0.,
+                    &format!(
+                        "{:?} at {:.1},{:.1} overlaps {:?} at {:.1},{:.1}",
+                        a.4, a.0, a.1, b.4, b.0, b.1
+                    ),
+                ));
+            }
+        }
+    }
+    bad
+}
 /// Every rule a single frame can break, as redo messages.
 fn violations(
     fixture: &Fixture,
@@ -552,26 +604,7 @@ fn violations(
         }
     }
     // #9 no overlapping text runs.
-    let runs = &m.text_runs;
-    for i in 0..runs.len() {
-        for j in i + 1..runs.len() {
-            let (a, b) = (&runs[i], &runs[j]);
-            let w = a.2.min(b.2) - a.0.max(b.0);
-            let h = a.3.min(b.3) - a.1.max(b.1);
-            if w > 0.5 && h > 0.5 {
-                bad.push(redo(
-                    9,
-                    &what,
-                    h,
-                    0.,
-                    &format!(
-                        "{:?} at {:.1},{:.1} overlaps {:?} at {:.1},{:.1}",
-                        a.4, a.0, a.1, b.4, b.0, b.1
-                    ),
-                ));
-            }
-        }
-    }
+    bad.extend(overlaps(&m.text_runs, &what));
     // #10 every panel drawn is a registered card region.
     for (y, h) in &m.panels {
         let owned = m.cards.iter().any(|c| {
@@ -1033,4 +1066,273 @@ fn frame_time_receipt() {
         at(0.5),
         at(0.95)
     );
+}
+
+/// Rule 9 for every kind the dreamer can write: each should-be label is drawn, whole, at every
+/// size in both themes (from the stack when its card folds there), and runs into nothing. The kinds
+/// come from the producer's own table, so a new kind is covered the day it is added.
+#[test]
+fn every_should_be_kind_is_drawn_whole_and_overlaps_nothing() {
+    let mut bad = vec![];
+    let mut checked = 0;
+    let mut skipped = vec![];
+    let mut kinds: Vec<&str> = SHOULD_BE_KINDS.iter().map(|(raw, _)| *raw).collect();
+    kinds.push("an-unknown-kind");
+    for raw in kinds {
+        let label = SHOULD_BE_KINDS
+            .iter()
+            .find(|(r, _)| *r == raw)
+            .map_or("tool", |(_, l)| *l);
+        for (cols, rows, cell) in SIZES {
+            for theme in THEMES {
+                set_cell_override(Some(cell));
+                let (_home, paths) = should_be_home(&[raw]);
+                let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+                pane.theme = theme;
+                pane.pixels = true;
+                pane.enable_cards();
+                let what = format!("kind {raw:?} {cols}x{rows} {theme:?}");
+                let drawn = |pane: &Pane| {
+                    pane.instrument_metrics
+                        .as_ref()
+                        .map(|m| m.text_runs.clone())
+                        .unwrap_or_default()
+                };
+                pane.frame(cols, rows, NOW);
+                if pane.placed.is_empty() {
+                    // A text-only size: the row is plain text, `kind: line`.
+                    set_cell_override(None);
+                    skipped.push(what);
+                    continue;
+                }
+                let mut runs = drawn(&pane);
+                bad.extend(overlaps(&runs, &what));
+                // Folded into the stack: open its cards in turn until the label shows.
+                let mut keys = ["e"].into_iter().chain(std::iter::repeat_n("n", 8));
+                while !runs.iter().any(|r| r.4 == label) {
+                    let Some(key) = keys.next() else { break };
+                    pane.key(key);
+                    pane.frame(cols, rows, NOW);
+                    runs = drawn(&pane);
+                    bad.extend(overlaps(&runs, &what));
+                }
+                set_cell_override(None);
+                // A size with no room for the card at all, open or folded, has no row to check.
+                if !runs.iter().any(|r| r.4.contains("Should be a skill")) {
+                    skipped.push(what);
+                    continue;
+                }
+                checked += 1;
+                if !runs.iter().any(|r| r.4 == label) {
+                    bad.push(format!(
+                        "PANE_RULES #9: {what}: the label {label:?} is never drawn whole"
+                    ));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "should-be kinds: {checked} frames checked, {} with no room for the card, {} violations",
+        skipped.len(),
+        bad.len()
+    );
+    // Only the two sizes that draw no should-be card in the picture may go unchecked (26 columns
+    // is the text pane; 30x16 the smallest), and every kind is checked at every other size in both
+    // themes: (kinds) x (sizes but two) x (themes) frames.
+    assert!(
+        skipped
+            .iter()
+            .all(|w| w.contains(" 26x58 ") || w.contains(" 30x16 ")),
+        "{skipped:?}"
+    );
+    assert!(
+        checked >= (SHOULD_BE_KINDS.len() + 1) * (SIZES.len() - 2) * THEMES.len(),
+        "only {checked} frames checked"
+    );
+    assert!(
+        bad.is_empty(),
+        "{} violations:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}
+
+/// What one scroll step sends to the terminal: the bytes, the pictures sent and deleted, and
+/// whether any picture is deleted before the last one is sent.
+struct Step {
+    bytes: usize,
+    bands: usize,
+    sent: usize,
+    deleted: usize,
+    /// Pictures sent under an id already on screen: herdr replaces those by deleting first.
+    replaced: usize,
+    delete_before_place: bool,
+    clears: bool,
+    ms: f64,
+}
+/// One frame of `pane` through the transport the watch loop uses, after `drawn`.
+fn send(pane: &mut Pane, cols: usize, rows: usize, drawn: &mut Option<Drawn>) -> Step {
+    let on_screen: Vec<usize> = drawn
+        .as_ref()
+        .map(|d| {
+            (0..d.placed.len())
+                .map(|i| d.ids.get(i).copied().unwrap_or(2 * i + 1))
+                .collect()
+        })
+        .unwrap_or_default();
+    let start = std::time::Instant::now();
+    let written = pane.frame(cols, rows, NOW);
+    let ms = start.elapsed().as_secs_f64() * 1000.;
+    let cut = bands(&pane.placed);
+    let out = repaint_pictures(drawn.as_ref(), cols, rows, &written, &cut);
+    let ids = picture_ids(drawn.as_ref(), cols, rows, &written, &cut);
+    *drawn = Some(Drawn {
+        cols,
+        rows,
+        written,
+        placed: cut.clone(),
+        ids,
+    });
+    let replaced = out
+        .split("\x1b_Ga=T,")
+        .skip(1)
+        .filter_map(|t| {
+            t.split("i=")
+                .nth(1)?
+                .split(',')
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .filter(|id| on_screen.contains(id))
+        .count();
+    let last_place = out.rfind("\x1b_Ga=T");
+    let first_delete = out.find("\x1b_Ga=d");
+    Step {
+        bytes: out.len(),
+        bands: cut.len(),
+        sent: out.matches("\x1b_Ga=T").count(),
+        deleted: out.matches("\x1b_Ga=d").count(),
+        replaced,
+        delete_before_place: matches!((first_delete, last_place), (Some(d), Some(p)) if d < p),
+        clears: out.contains("\x1b[2J") || out.contains("a=d,d=A"),
+        ms,
+    }
+}
+/// The owner's session with a Monologue longer than any pane: thirty dreams in this session.
+fn long_monologue() -> (tempfile::TempDir, Paths) {
+    let (home, paths) = dreaming();
+    let dreams: Vec<Value> = (0..30)
+        .map(|i| {
+            json!({"id":format!("long-{i}"),"session":"sess-now","line":format!("What if row {i} of the monologue said more?"),
+                "confidence":0.6})
+        })
+        .collect();
+    append_dream_log(
+        &paths,
+        json!({"kind":"batch","session":"sess-now","at":NOW - 60.,"dreams":dreams}),
+    );
+    (home, paths)
+}
+/// The owner's session with more Changes than any pane holds: the map keeps four entries, so
+/// each says a lot.
+fn long_changes() -> (tempfile::TempDir, Paths) {
+    let (home, paths) = dreaming();
+    let con = rusqlite::Connection::open(&paths.db).unwrap();
+    let raw: String = con
+        .query_row(
+            "SELECT value FROM meta WHERE key='story_map:sess-now'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut map: Value = serde_json::from_str(&raw).unwrap();
+    let long = "the reader streams each chunk as it lands and keeps the rows it already drew, so a long transcript never waits for its tail";
+    map["current"]["entries"] = (0..4)
+        .map(|i| {
+            json!({"kind":"added","claim":format!("Change {i}"),"before":[],
+                "now":format!("Change {i}: {}.", [long; 8].join("; ")),
+                "was":format!("Before change {i}: {}.", [long; 6].join("; ")),
+                "after":[{"scope":format!("src/part_{i}.rs"),"sym":"run","mark":"+"}],
+                "receipts":[format!("oid:{:08x}", 0x5100_0000 + i)]})
+        })
+        .collect();
+    con.execute(
+        "UPDATE meta SET value=? WHERE key='story_map:sess-now'",
+        [map.to_string()],
+    )
+    .unwrap();
+    (home, paths)
+}
+/// The flash on scroll: a `j` on the Monologue (`t`) and Changes (`l`) pages sends each band that
+/// moved under a fresh id and deletes the old ids only after every new one is placed, with no
+/// clear, inside one synchronized update. Run with `--nocapture` for the per-step receipt.
+#[test]
+fn a_page_scroll_places_new_bands_before_it_deletes_the_old() {
+    for (page, home) in [
+        ("t", long_monologue as fn() -> (tempfile::TempDir, Paths)),
+        ("l", long_changes),
+    ] {
+        // The owner's pane at its shorter height first, then every contract size and two shorter
+        // ones: the first one
+        // where the page runs past the pane, so `j` scrolls.
+        let scrolls = [(35, 20, (26, 58))]
+            .into_iter()
+            .chain(SIZES)
+            .chain([(35, 12, (26, 58)), (35, 10, (26, 58))])
+            .find_map(|size| {
+                let (dir, mut pane) = live(home, &[page], size);
+                let mut drawn = None;
+                let first = send(&mut pane, size.0, size.1, &mut drawn);
+                let max = pane
+                    .instrument_metrics
+                    .as_ref()
+                    .and_then(|m| m.page_scroll_max);
+                set_cell_override(None);
+                (max.is_some_and(|m| m > 0) && first.bands > 1).then_some((dir, pane, drawn, size))
+            });
+        let Some((_dir, mut pane, mut drawn, (cols, rows, cell))) = scrolls else {
+            panic!("{page}: no size scrolls the page; the probe proves nothing");
+        };
+        set_cell_override(Some(cell));
+        eprintln!(
+            "scroll {page} at {cols}x{rows}: key row {:?}",
+            drawn
+                .as_ref()
+                .and_then(|d| d.written.last())
+                .map(|l| csr_engine::companion::render::text::plain(l))
+        );
+        let mut moved = 0;
+        for step in 1..=3 {
+            pane.key("j");
+            let s = send(&mut pane, cols, rows, &mut drawn);
+            eprintln!(
+                "scroll {page} j#{step}: {} bytes, {} bands, {} sent, {} replaced in place, {} deleted, delete before place: {}, clear: {}, frame {:.1} ms",
+                s.bytes, s.bands, s.sent, s.replaced, s.deleted, s.delete_before_place, s.clears, s.ms
+            );
+            assert!(
+                !s.delete_before_place,
+                "{page} j#{step}: a picture is deleted before the last new one is placed"
+            );
+            assert!(!s.clears, "{page} j#{step}: a scroll clears the pane");
+            assert_eq!(
+                s.replaced, 0,
+                "{page} j#{step}: a band is replaced under its own id"
+            );
+            assert_eq!(
+                s.deleted, s.sent,
+                "{page} j#{step}: each old band goes once its new one is up"
+            );
+            assert!(
+                s.sent <= s.bands,
+                "{page} j#{step}: more pictures than bands"
+            );
+            moved += s.sent;
+        }
+        assert!(
+            moved > 0,
+            "{page}: three j presses moved nothing; the probe proves nothing"
+        );
+        set_cell_override(None);
+    }
 }

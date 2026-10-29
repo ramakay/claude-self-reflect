@@ -31,7 +31,10 @@ is checked by `tests/pane_contract.rs` for every fixture, pane size and theme. A
 8. **The accordion never grows the picture.** The open card takes the room of the stackable
    cards (they fold) and of the Context card down to its floor. Rows that still do not fit are
    cut, the last one ending in "…" or a "+N more" row (the performance card's failing checks).
-9. **No overlapping text.** No two text runs share any area.
+9. **No overlapping text.** No two text runs share any area, measured by the advance each run
+   is drawn with. A column of labels is as wide as its widest label. Every label a producer can
+   emit is drawn by the suite: the should-be kinds come from `instrument::SHOULD_BE_KINDS`, the
+   table the row reads, so a new kind is checked the day it is added.
 10. **A new card registers.** Add it to `instrument::CARD_REGISTRY` with its tier and stack
     index, size it in the fit's `need`, and add a fixture that draws it to `tests/pane_contract.rs`.
     A card drawn but not registered, or registered but drawn by no fixture, fails the suite, as

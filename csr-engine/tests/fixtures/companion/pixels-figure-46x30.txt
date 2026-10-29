@@ -27,4 +27,4 @@
 [48;2;18;20;23m[38;2;242;244;246m● CSR: daemon down                            [0m
 [48;2;18;20;23m[38;2;242;244;246mFresh tokens per turn: last 2 turns, newest   [0m
 [48;2;18;20;23m[38;2;242;244;246m70k, max 95k                                  [0m
-[48;2;18;20;23m[38;2;184;193;203m l changes t threads i figure b theme q close [0m
+[48;2;18;20;23m[38;2;184;193;203m l changes t monologue i fig b theme q close  [0m

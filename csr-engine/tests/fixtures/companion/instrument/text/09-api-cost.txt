@@ -64,4 +64,4 @@ Text parity is ready for review.
 CTX 192k/1M · +6k/turn · ♻ >15 prompts · 1 by CSR
 5H 2% · → ~7% at reset · CSR cost: $1.20 this week · 37 calls · ◷ 59m
 Codex 7D 41%
- d queue  l changes  t threads  i figure  o details  b theme  q close
+ d queue  l changes  t monologue  i figure  o details  b theme  q close

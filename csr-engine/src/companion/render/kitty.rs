@@ -120,6 +120,60 @@ pub struct Drawn {
     pub rows: usize,
     pub written: Vec<String>,
     pub placed: Vec<Placement>,
+    /// The image id each placed picture is on screen under (`picture_ids`); empty: `first_id`.
+    pub ids: Vec<usize>,
+}
+/// Slot `i` owns two image ids, `2i + 1` and `2i + 2`, and no other slot shares either: a slot
+/// whose picture changes moves to its other one, however many slots there are.
+fn first_id(i: usize) -> usize {
+    2 * i + 1
+}
+fn other_id(i: usize, id: usize) -> usize {
+    if id == first_id(i) {
+        first_id(i) + 1
+    } else {
+        first_id(i)
+    }
+}
+/// Whether slot `i` is sent again this frame: a new, moved or changed picture, or one whose text
+/// row was rewritten over it.
+fn resent(same: Option<&Drawn>, written: &[String], placed: &[Placement], i: usize) -> bool {
+    let shown = same.map(|d| d.placed.as_slice()).unwrap_or_default();
+    let changed = |row: usize| same.and_then(|d| d.written.get(row)) != written.get(row);
+    let under = |p: &Placement| (p.row..p.row + p.rows).any(changed);
+    let Some(p) = placed.get(i) else {
+        return false;
+    };
+    let old = shown.get(i);
+    old != Some(p) || under(p) || old.is_some_and(under)
+}
+fn same_size(drawn: Option<&Drawn>, cols: usize, rows: usize) -> Option<&Drawn> {
+    drawn.filter(|d| d.cols == cols && d.rows == rows)
+}
+/// The image id of each picture after this frame. A picture sent again takes the other bank's id
+/// for its slot, so the new one is placed before the old one is deleted: herdr shows the gap
+/// between a delete and the pixels that follow as a blank band, and a page scroll changes every
+/// band at once.
+pub fn picture_ids(
+    drawn: Option<&Drawn>,
+    cols: usize,
+    rows: usize,
+    written: &[String],
+    placed: &[Placement],
+) -> Vec<usize> {
+    let same = same_size(drawn, cols, rows);
+    // The id a slot is on screen under, when it is on screen at all.
+    let old_id = |i: usize| {
+        same.filter(|d| i < d.placed.len())
+            .map(|d| d.ids.get(i).copied().unwrap_or(first_id(i)))
+    };
+    (0..placed.len())
+        .map(|i| match old_id(i) {
+            Some(id) if resent(same, written, placed, i) => other_id(i, id),
+            Some(id) => id,
+            None => first_id(i),
+        })
+        .collect()
 }
 pub fn repaint(drawn: Option<&Drawn>, cols: usize, rows: usize, written: &[String]) -> String {
     repaint_pictures(drawn, cols, rows, written, &[])
@@ -131,7 +185,7 @@ pub fn repaint_pictures(
     written: &[String],
     placed: &[Placement],
 ) -> String {
-    let same = drawn.filter(|d| d.cols == cols && d.rows == rows);
+    let same = same_size(drawn, cols, rows);
     let mut out = SYNC_ON.to_owned();
     let start = out.len();
     if same.is_none() {
@@ -139,29 +193,33 @@ pub fn repaint_pictures(
         out.push_str("\x1b[H\x1b[2J");
     }
     let shown = same.map(|d| d.placed.as_slice()).unwrap_or_default();
-    let changed: Vec<_> = written
-        .iter()
-        .enumerate()
-        .filter(|(i, l)| same.and_then(|d| d.written.get(*i)) != Some(*l))
-        .map(|(i, _)| i)
-        .collect();
-    let under = |p: &Placement| changed.iter().any(|i| *i >= p.row && *i < p.row + p.rows);
-    // Picture `i` keeps image id `i + 1`. A slot that moved, or is no longer drawn, is deleted.
-    let place = |p: &Placement| (p.row, p.col, p.cols, p.rows);
-    for (i, old) in shown.iter().enumerate() {
-        if placed.get(i).is_none_or(|p| place(p) != place(old)) {
-            out.push_str(&format!("\x1b_Ga=d,d=I,i={},q=2;\x1b\\", i + 1));
-        }
-    }
+    let shown_id = |i: usize| {
+        same.and_then(|d| d.ids.get(i).copied())
+            .unwrap_or(first_id(i))
+    };
+    let ids = picture_ids(drawn, cols, rows, written, placed);
     for (i, line) in written.iter().enumerate() {
         if same.and_then(|d| d.written.get(i)) != Some(line) {
             out.push_str(&format!("\x1b[{};1H\x1b[0m\x1b[2K{line}", i + 1));
         }
     }
+    // New pictures first, each under its slot's other-bank id, placed over the old one.
     for (i, p) in placed.iter().enumerate() {
-        let old = shown.get(i);
-        if old != Some(p) || under(p) || old.is_some_and(under) {
-            out.push_str(&transmit(&p.png, p.row, p.col, p.cols, p.rows, Some(i + 1)));
+        if resent(same, written, placed, i) {
+            out.push_str(&transmit(
+                &p.png,
+                p.row,
+                p.col,
+                p.cols,
+                p.rows,
+                Some(ids[i]),
+            ));
+        }
+    }
+    // Then the old ones go: a slot now under another id, or no longer drawn.
+    for i in 0..shown.len() {
+        if ids.get(i) != Some(&shown_id(i)) {
+            out.push_str(&format!("\x1b_Ga=d,d=I,i={},q=2;\x1b\\", shown_id(i)));
         }
     }
     if out.len() == start {
@@ -184,6 +242,7 @@ mod tests {
             rows: 2,
             written,
             placed: vec![],
+            ids: vec![],
         };
         let b = repaint(Some(&d), 46, 2, &["a".into(), "c".into()]);
         assert_eq!(
@@ -206,6 +265,7 @@ mod picture_tests {
             rows: 4,
             written,
             placed: vec![],
+            ids: vec![],
         };
         assert_eq!(repaint(Some(&drawn), 10, 4, &drawn.written), "");
         let mut next = drawn.written.clone();
@@ -232,6 +292,7 @@ mod picture_tests {
             rows: 4,
             written,
             placed: vec![picture.clone()],
+            ids: vec![],
         };
         let mut next = drawn.written.clone();
         next[0] = "A".into();
@@ -242,7 +303,12 @@ mod picture_tests {
         next = drawn.written.clone();
         next[2] = "C".into();
         let under = repaint_pictures(Some(&drawn), 10, 4, &next, std::slice::from_ref(&picture));
-        assert!(!under.contains("a=d") && under.contains("a=T,f=100,q=2,C=1,i=1,"));
+        // Sent again under the other bank's id, and the old id deleted only after it.
+        let (placed_at, deleted_at) = (
+            under.find("a=T,f=100,q=2,C=1,i=2,").unwrap(),
+            under.find("a=d,d=I,i=1,q=2;").unwrap(),
+        );
+        assert!(placed_at < deleted_at);
         let gone = repaint_pictures(Some(&drawn), 10, 4, &drawn.written, &[]);
         assert!(gone.contains("a=d,d=I,i=1,q=2;") && !gone.contains("a=T"));
         let mut changed = picture;
@@ -289,7 +355,7 @@ mod picture_tests {
         assert!(transmit(&png, 0, 0, 1, 1, Some(7)).contains(",i=7,c=1,r=1,z=-1,"));
     }
     #[test]
-    fn only_the_band_that_changed_is_sent_again_and_nothing_is_deleted_first() {
+    fn only_the_band_that_changed_is_sent_again_and_its_old_id_goes_only_after_it() {
         let before = bands(&[Placement {
             row: 0,
             col: 0,
@@ -310,15 +376,38 @@ mod picture_tests {
             rows: 4,
             written: written.clone(),
             placed: before.clone(),
+            ids: vec![],
         };
         let out = repaint_pictures(Some(&drawn), 4, 4, &written, &after);
-        // herdr draws the gap between a delete and the next upload as a blank pane.
-        assert!(!out.contains("a=d"));
+        // herdr draws the gap between a delete and the next upload as a blank band: the new
+        // picture is placed under a fresh id first, and only then is the old id deleted.
         assert_eq!(out.matches("a=T").count(), 1);
-        assert!(out.contains("a=T,f=100,q=2,C=1,i=2,"));
+        assert_eq!(out.matches("a=d").count(), 1);
+        assert!(
+            out.find("a=T,f=100,q=2,C=1,i=4,").unwrap() < out.find("a=d,d=I,i=3,q=2;").unwrap()
+        );
+        assert!(!out.contains(DELETE_ALL) && !out.contains("\x1b[2J"));
+        // The next change moves the slot back to the first bank.
+        let ids = picture_ids(Some(&drawn), 4, 4, &written, &after);
+        assert_eq!(ids, [first_id(0), first_id(1) + 1, first_id(2)]);
+        assert_eq!(ids[1], 4);
+        // A thousand-band pane: no slot's new id is one another slot is still shown under.
+        let many: Vec<usize> = (0..1200).map(first_id).collect();
+        let moved: Vec<usize> = (0..1200).map(|i| other_id(i, first_id(i))).collect();
+        assert!(moved.iter().all(|id| !many.contains(id)));
+        assert!((0..1200).all(|i| other_id(i, moved[i]) == first_id(i)));
+        let again = Drawn {
+            placed: after.clone(),
+            ids,
+            ..drawn.clone()
+        };
+        let back = repaint_pictures(Some(&again), 4, 4, &written, &before);
+        assert!(
+            back.find("a=T,f=100,q=2,C=1,i=3,").unwrap() < back.find("a=d,d=I,i=4,q=2;").unwrap()
+        );
         assert_eq!(repaint_pictures(Some(&drawn), 4, 4, &written, &before), "");
         let gone = repaint_pictures(Some(&drawn), 4, 4, &written, &after[..1]);
-        assert!(gone.contains("a=d,d=I,i=2,q=2;") && gone.contains("a=d,d=I,i=3,q=2;"));
+        assert!(gone.contains("a=d,d=I,i=3,q=2;") && gone.contains("a=d,d=I,i=5,q=2;"));
         assert!(!gone.contains(DELETE_ALL));
     }
     #[test]

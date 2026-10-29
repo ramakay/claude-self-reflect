@@ -9,4 +9,4 @@
 36	{"key":"instrument:figure"}
 37	{"key":"instrument:figure"}
 38	{"key":"instrument:figure"}
-39	{"key":"legend","keys":[[1,10,"l"],[12,21,"t"],[23,31,"i"],[33,40,"b"],[42,49,"q"]]}
+39	{"key":"legend","keys":[[1,10,"l"],[12,23,"t"],[25,33,"i"],[35,42,"b"],[44,51,"q"]]}

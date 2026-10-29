@@ -1076,7 +1076,7 @@ fn footer_abbreviates_only_what_must_fit_and_keeps_q_close() {
     let footer = text::plain(&pane.frame(44, 30, NOW)[29]);
     assert!(footer.contains("q close"), "{footer}");
     assert!(
-        footer.contains("l changes") && footer.contains("t threads"),
+        footer.contains("l changes") && footer.contains("t monologue"),
         "{footer}"
     );
     assert!(!footer.contains("q quit"), "{footer}");
@@ -1097,7 +1097,7 @@ fn footer_abbreviates_only_what_must_fit_and_keeps_q_close() {
     for cols in [48, 60] {
         let wide = text::plain(&pane.frame(cols, 30, NOW)[29]);
         assert!(
-            wide.contains("l changes") && wide.contains("t threads") && wide.contains("q close"),
+            wide.contains("l changes") && wide.contains("t monologue") && wide.contains("q close"),
             "{wide}"
         );
         if cols == 60 {
@@ -1788,7 +1788,7 @@ fn narrow_footer_keeps_every_key_labeled() {
         assert!(foot.contains("i fig"), "{state}: {foot}");
         // `l` and `t` are on the bar only when their page has content; when they are, they
         // are labelled.
-        for (key, label) in [("l", "chg"), ("t", "thr")] {
+        for (key, label) in [("l", "chg"), ("t", "mono")] {
             let bare = foot.split_whitespace().any(|w| w == key);
             assert_eq!(
                 bare,
@@ -2096,6 +2096,7 @@ fn the_popup_repaints_once_on_open_and_once_on_close() {
         rows,
         written: written.clone(),
         placed: closed.clone(),
+        ids: vec![],
     };
     // Every observation row is a click target in the picture.
     let places = pane
@@ -2129,6 +2130,7 @@ fn the_popup_repaints_once_on_open_and_once_on_close() {
         rows,
         written: written.clone(),
         placed: open.clone(),
+        ids: vec![],
     };
     let (written2, open2) = shot(&mut pane);
     assert_eq!(
