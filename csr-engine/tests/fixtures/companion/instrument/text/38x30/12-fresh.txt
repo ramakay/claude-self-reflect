@@ -27,4 +27,4 @@ CTX 190k/1M · +0/turn · ♻ >15 prompts
 5H 2% · → ~7% at reset · ◷ 59m
 Codex 7D 41%
 5¢ this week
- d q l chg t thr i fig b thm q close
+ d q l chg t mono i fig b thm q close

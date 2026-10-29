@@ -64,4 +64,4 @@ CTX 192k/1M · +6k/turn · ♻ >15 prompts · 1 by CSR
 7D 54%» · out ~Wed 01:25 · CSR 1.2 pts · 5H 0% · → ~0% at reset
 ◷ COLD ~192k · Codex 7D 41%
 5¢ this week
- d queue  l changes  t threads  i figure  o details  b theme  q close
+ d queue  l changes  t monologue  i figure  o details  b theme  q close

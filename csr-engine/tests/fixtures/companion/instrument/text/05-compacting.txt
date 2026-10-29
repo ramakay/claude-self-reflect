@@ -64,4 +64,4 @@ CTX 189k/1M · +6k/turn · ◷ Compacting · 10s of ~45s · 1 by CSR
 7D 52%» · out ~Wed 06:40 · CSR 2.6 pts · 5H 2% · → ~7% at reset · ◷ 59m
 Codex 7D 41%
 5¢ this week
- d queue  l changes  t threads  i figure  o details  b theme  q close
+ d queue  l changes  t monologue  i figure  o details  b theme  q close

@@ -1303,15 +1303,26 @@ fn more_line(hidden: usize) -> String {
 }
 pub(super) const CONFUSED_TITLE: &str = "Confused Claude";
 pub(super) const SHOULD_BE_TITLE: &str = "Should be a skill / memory / tool";
+/// Every `kind` the dreamer may write on a should-be item, and the label its row carries. Any
+/// other kind reads "tool". The pane contract draws every row of this table.
+pub const SHOULD_BE_KINDS: [(&str, &str); 9] = [
+    ("skill", "skill"),
+    ("memory", "memory"),
+    ("hook", "hook"),
+    ("CLAUDE.md", "CLAUDE.md rule"),
+    ("CLAUDE.md rule", "CLAUDE.md rule"),
+    ("claude_md", "CLAUDE.md rule"),
+    ("rule", "CLAUDE.md rule"),
+    ("tool", "tool"),
+    ("", "tool"),
+];
 /// The short label a should-be item carries on its row.
 pub(super) fn should_be_kind(item: &Value) -> &'static str {
-    match string(&item["kind"]) {
-        "skill" => "skill",
-        "memory" => "memory",
-        "hook" => "hook",
-        "CLAUDE.md" | "CLAUDE.md rule" | "claude_md" | "rule" => "CLAUDE.md rule",
-        _ => "tool",
-    }
+    let kind = string(&item["kind"]);
+    SHOULD_BE_KINDS
+        .iter()
+        .find(|(raw, _)| *raw == kind)
+        .map_or("tool", |(_, label)| label)
 }
 /// One observation row as the plain-text pane writes it.
 pub fn observation_text(item: &Value, should: bool) -> String {
@@ -4110,6 +4121,19 @@ pub fn draw(
             y + P + theme::TITLE_LINE,
         ));
         let mut row_y = y + P + theme::TITLE_LINE + S2;
+        // The kind column is as wide as the widest label it holds, measured in the face it is
+        // drawn in, so "CLAUDE.md rule" never runs into its row's text.
+        let kind_w = if should {
+            let widest = items
+                .iter()
+                .take(shown)
+                .map(|item| f.width(should_be_kind(item), sans(theme::CAPTION_SIZE, t.medium)))
+                .fold(0., f32::max);
+            // Never narrower than the column the short labels always had.
+            (widest + S3).max(78.)
+        } else {
+            0.
+        };
         for (index, item) in items.iter().take(shown).enumerate() {
             observation_rows.push((
                 if should {
@@ -4123,7 +4147,6 @@ pub fn draw(
             let base = row_y + f.cap(body);
             let receipt = evidence_receipt(item);
             let receipt_w = f.width(&receipt, caption);
-            let kind_w = if should { 78. } else { 0. };
             if should {
                 label(
                     &mut canvas,

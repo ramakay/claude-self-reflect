@@ -27,4 +27,4 @@ CTX 189k/1M · +18k/turn · ♻ ~1 prompt
 5H 2% · → ~7% at reset · ◷ 59m
 Codex 7D 41%
 5¢ this week
- d l changes t threads i fig b thm q close
+ d l changes t monologue i b thm q close

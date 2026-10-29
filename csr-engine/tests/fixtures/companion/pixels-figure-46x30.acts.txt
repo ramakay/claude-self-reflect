@@ -11,4 +11,4 @@
 26	{"key":"instrument:figure"}
 27	{"key":"instrument:figure"}
 28	{"key":"instrument:figure"}
-29	{"key":"legend","keys":[[1,10,"l"],[11,20,"t"],[21,29,"i"],[30,37,"b"],[38,45,"q"]]}
+29	{"key":"legend","keys":[[1,10,"l"],[11,22,"t"],[23,28,"i"],[29,36,"b"],[37,44,"q"]]}

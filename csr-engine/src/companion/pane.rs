@@ -1591,7 +1591,8 @@ impl Pane {
                 keys.push(("l", "changes"));
             }
             if !composition.river.is_empty() {
-                keys.push(("t", "threads"));
+                // `t` opens the Monologue page, so its key says so.
+                keys.push(("t", "monologue"));
             }
             keys.push(("i", "figure"));
             // The stack's key shows only when a stack is drawn.
@@ -1664,7 +1665,7 @@ impl Pane {
         let shorten = if cols < 44 {
             [
                 ("changes", "chg"),
-                ("threads", "thr"),
+                ("monologue", "mono"),
                 ("figure", "fig"),
                 ("theme", "thm"),
                 ("queue", "q"),
@@ -1679,7 +1680,7 @@ impl Pane {
                 ("queue", ""),
                 ("fig", ""),
                 ("changes", "chg"),
-                ("threads", "thr"),
+                ("monologue", "mono"),
                 ("scroll", ""),
                 ("back", ""),
             ]

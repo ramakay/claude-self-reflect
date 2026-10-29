@@ -27,4 +27,4 @@ Combo soak · ends 4:40 PM · 6h 0m left
 API credit $29.23 left by ledger
 CTX 192k/1M · +6k/turn · ♻ >15 prompts
 1 by CSR
- d q l chg t thr i fig b thm q close
+ d q l chg t mono i fig b thm q close
