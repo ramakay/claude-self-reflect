@@ -80,6 +80,7 @@ impl Pane {
             .env("TERM_PROGRAM", "kitty")
             .env_remove("CSR_COMPANION_PIXELS")
             .env_remove("CSR_PANE_HERDR_EVENTS")
+            .env_remove("HERDR_SOCKET_PATH")
             .env_remove("CSR_PANE_HOME_ENGINE")
             .args([
                 "companion",

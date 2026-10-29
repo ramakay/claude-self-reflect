@@ -2408,7 +2408,6 @@ fn a_pane_outside_herdrs_default_focus_still_draws_when_woken() {
         .env("HOME", &paths.home)
         .env("TERM_PROGRAM", "kitty")
         .env("CSR_PANE_FRAME_LOG", &frame_log)
-        .env("CSR_PANE_HERDR_EVENTS", "1")
         .env("HERDR_SOCKET_PATH", &socket)
         .env("HERDR_PANE_ID", "w1:p3")
         .args([
@@ -2468,6 +2467,7 @@ fn two_panes_of_one_session_both_draw_when_woken_and_one_ending_leaves_the_other
             .env("HOME", &paths.home)
             .env("TERM_PROGRAM", "kitty")
             .env("CSR_PANE_FRAME_LOG", log)
+            .env_remove("HERDR_SOCKET_PATH")
             .args([
                 "companion",
                 "pane",
@@ -2552,8 +2552,9 @@ fn two_panes_of_one_session_both_draw_when_woken_and_one_ending_leaves_the_other
     );
 }
 
-/// herdr's events, opt-in: with a fake herdr on a socket, the watching pane subscribes, and when
-/// herdr says the agent pane closed the pane ends by itself, cleanly, and removes its pid file.
+/// herdr's events, on by default: with a fake herdr on a socket and nothing else set, the watching
+/// pane subscribes, and when herdr says the agent pane closed the pane ends by itself, cleanly, and
+/// removes its pid file.
 #[cfg(unix)]
 #[test]
 fn the_pane_ends_when_herdr_says_the_agent_pane_closed() {
@@ -2614,7 +2615,6 @@ fn the_pane_ends_when_herdr_says_the_agent_pane_closed() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
         .env("HOME", &paths.home)
         .env("TERM_PROGRAM", "kitty")
-        .env("CSR_PANE_HERDR_EVENTS", "1")
         .env("HERDR_SOCKET_PATH", &socket)
         .env("HERDR_PANE_ID", "w1:p3")
         .args([
@@ -2655,4 +2655,157 @@ fn the_pane_ends_when_herdr_says_the_agent_pane_closed() {
     };
     assert!(status.success(), "{status:?}");
     assert!(!pid.exists(), "its pid file is gone");
+}
+
+/// A watching pane in a herdr whose socket is `socket`, with `events` as the kill switch's value
+/// (None: not set). It writes one line per frame to `log`.
+#[cfg(unix)]
+fn pane_in_herdr(
+    paths: &Paths,
+    socket: &std::path::Path,
+    events: Option<&str>,
+    log: &std::path::Path,
+) -> std::process::Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+    command
+        .env("HOME", &paths.home)
+        .env("TERM_PROGRAM", "kitty")
+        .env("CSR_PANE_FRAME_LOG", log)
+        .env("HERDR_SOCKET_PATH", socket)
+        .env("HERDR_PANE_ID", "w1:p3")
+        .env_remove("CSR_PANE_HERDR_EVENTS");
+    if let Some(events) = events {
+        command.env("CSR_PANE_HERDR_EVENTS", events);
+    }
+    command
+        .args([
+            "companion",
+            "pane",
+            "--repo",
+            env!("CARGO_MANIFEST_DIR"),
+            "--watch",
+            "--sid",
+            "sess-now",
+            "--agent",
+            "w1:p2",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// With `CSR_PANE_HERDR_EVENTS=0` the pane never subscribes to herdr's events, and still draws.
+/// (herdr's CLI, which the pane asks about its agent's session id, may still reach the socket: only
+/// the watcher's own requests are counted.) With the switch unset the same fake sees the
+/// subscription, so the count means something.
+#[cfg(unix)]
+#[test]
+fn the_kill_switch_keeps_the_pane_off_herdrs_event_stream() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    for (switch, subscriptions) in [(Some("0"), false), (None, true)] {
+        let (_home, paths) = home();
+        let socket = paths.home.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let watched = Arc::new(AtomicUsize::new(0));
+        let counted = watched.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let counted = counted.clone();
+                std::thread::spawn(move || {
+                    let mut request = String::new();
+                    let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut request);
+                    if request.contains("events.subscribe") || request.contains("session.snapshot")
+                    {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = writeln!(&conn, r#"{{"id":"x","error":{{"code":"no"}}}}"#);
+                });
+            }
+        });
+        let log = paths.home.join("frames.log");
+        let mut child = pane_in_herdr(&paths, &socket, switch, &log);
+        let frames = || fs::read_to_string(&log).map_or(0, |t| t.lines().count());
+        let start = Instant::now();
+        while frames() == 0 && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(2500));
+        let running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(frames() >= 1, "{switch:?}: the first frame");
+        assert!(running, "{switch:?}: the pane runs");
+        assert_eq!(
+            watched.load(Ordering::SeqCst) > 0,
+            subscriptions,
+            "{switch:?}: watcher requests"
+        );
+    }
+}
+
+/// A herdr socket that is missing, refuses, or hangs up after the acknowledgement leaves the pane
+/// as it is with no watcher: it draws its first frame, draws again when woken, and does not end.
+#[cfg(unix)]
+#[test]
+fn a_herdr_socket_that_is_gone_refuses_or_hangs_up_leaves_the_pane_drawing() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+    let (_home, paths) = home();
+    let missing = paths.home.join("missing.sock");
+    let stale = paths.home.join("stale.sock");
+    drop(UnixListener::bind(&stale).unwrap());
+    let hangs_up = paths.home.join("hangs-up.sock");
+    let listener = UnixListener::bind(&hangs_up).unwrap();
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let mut request = String::new();
+            let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut request);
+            let _ = writeln!(
+                &conn,
+                r#"{{"id":"csr","result":{{"type":"subscription_started"}}}}"#
+            );
+        }
+    });
+    for (name, socket) in [
+        ("missing", missing),
+        ("refusing", stale),
+        ("hanging up", hangs_up),
+    ] {
+        let log = paths.home.join(format!("{name}.log"));
+        let mut child = pane_in_herdr(&paths, &socket, None, &log);
+        let frames = || fs::read_to_string(&log).map_or(0, |t| t.lines().count());
+        let wakes = paths
+            .keep
+            .join(format!("panes/sess-now.{}.wake", child.id()));
+        let start = Instant::now();
+        while (frames() == 0 || !wakes.exists()) && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let first = frames();
+        // Long enough for the watcher to have failed and waited at least once.
+        std::thread::sleep(Duration::from_millis(2500));
+        let before = frames();
+        assert!(csr_engine::companion::wake::notify(
+            &paths.keep,
+            "sess-now",
+            csr_engine::companion::wake::Kind::Now
+        ));
+        let start = Instant::now();
+        while frames() == before && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(first >= 1, "{name}: the first frame");
+        assert!(running, "{name}: the pane ended");
+        assert!(frames() > before, "{name}: a woken pane drew nothing");
+    }
 }

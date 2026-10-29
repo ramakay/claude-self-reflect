@@ -680,7 +680,8 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let mut wake = Debounce::default();
     // For tests that count what the loop draws: one line per frame drawn and written out, and why.
     let frame_log = std::env::var_os("CSR_PANE_FRAME_LOG").map(PathBuf::from);
-    // Opt-in (`CSR_PANE_HERDR_EVENTS=1`): herdr says when the tab is out of sight.
+    // On inside herdr (`CSR_PANE_HERDR_EVENTS=0` turns it off): herdr says when the agent's status
+    // changes and when its pane ends. Without herdr, or when it cannot be reached, nothing changes.
     let events = HerdrEvents::from_env(args.agent.clone());
     // For tests of the watchdog: make the loop stick, at once (`busy`) or where it would end
     // (`ending`: the terminal is gone or an end was asked for), as a hang inside a call would.

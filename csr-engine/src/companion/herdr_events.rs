@@ -1,7 +1,8 @@
 //! herdr's event stream: the pane ends with its agent's pane, and draws when its status moves.
 //!
-//! Opt-in: only with `CSR_PANE_HERDR_EVENTS=1` and herdr's `HERDR_SOCKET_PATH` set. A thread subscribes over herdr's socket (newline JSON), and keeps two
-//! facts for the watch loop:
+//! On by default whenever herdr's `HERDR_SOCKET_PATH` is set; `CSR_PANE_HERDR_EVENTS=0` turns it
+//! off (any other value, or none, leaves it on). A thread subscribes over herdr's socket (newline
+//! JSON), and keeps two facts for the watch loop:
 //!
 //! - wake: the agent's status changed (draw soon).
 //! - gone: the agent pane closed or exited, and so does this pane. An event says so; and since a
@@ -13,12 +14,14 @@
 //! may be in front of someone. A pane that cannot know draws as it would without events; its own
 //! gates keep a quiet one cheap.
 //!
-//! It fails open. Any socket error, an error answer to the subscription, `events_lost`, or an
-//! EOF drops the thread back to plain polling, and it reconnects with a growing wait.
+//! It fails open. A socket that is missing or refuses, an error or garbage answer to the
+//! subscription, `events_lost`, an EOF, or a line too long to be herdr's drops the thread back to
+//! plain polling, and it reconnects with a growing wait. Nothing it does can block or panic the
+//! pane: the work is on its own thread, and leaving does not wait for it.
 use super::send;
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader, ErrorKind, Write},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::{
@@ -36,13 +39,18 @@ const RETRY_MAX: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_millis(250);
 const IO_LIMIT: Duration = Duration::from_secs(2);
 
-/// The socket, when the person asked for events and herdr is there.
+/// The longest line read from herdr. A snapshot of a big session is far below it; a stream that
+/// goes past it without a newline is not herdr.
+const LINE_LIMIT: u64 = 4 << 20;
+
+/// The socket, when herdr is there and the kill switch (`CSR_PANE_HERDR_EVENTS=0`) is not set.
 pub fn config(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let nonempty = |name| var(name).filter(|v| !v.is_empty());
-    if nonempty("CSR_PANE_HERDR_EVENTS")? != "1" {
+    if var("CSR_PANE_HERDR_EVENTS").as_deref() == Some("0") {
         return None;
     }
-    Some(nonempty("HERDR_SOCKET_PATH")?.into())
+    var("HERDR_SOCKET_PATH")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 #[derive(Default)]
@@ -57,7 +65,7 @@ pub struct Watcher {
     thread: Option<JoinHandle<()>>,
 }
 impl Watcher {
-    /// A watcher of herdr's events, when asked for and possible. `agent` is the pane given on the
+    /// A watcher of herdr's events, when herdr is there and it is not switched off. `agent` is the pane given on the
     /// command line; without one it is the left neighbour, found in the thread.
     pub fn from_env(agent: Option<String>) -> Option<Self> {
         let socket = config(|name| std::env::var(name).ok())?;
@@ -137,7 +145,12 @@ fn session(shared: &Shared, socket: &Path, agent: Option<&str>) -> std::io::Resu
     let mut line = Vec::new();
     let mut started = false;
     while !shared.stop.load(Ordering::Relaxed) {
-        match reader.read_until(b'\n', &mut line) {
+        // A line is read a bounded amount at a time: bytes without a newline are not herdr.
+        let room = LINE_LIMIT.saturating_sub(line.len() as u64);
+        if room == 0 {
+            return Ok(false);
+        }
+        match (&mut reader).take(room).read_until(b'\n', &mut line) {
             Ok(0) => return Ok(started),
             Ok(_) if line.ends_with(b"\n") => {
                 let value: Value = serde_json::from_slice(&line).unwrap_or(Value::Null);
@@ -190,7 +203,9 @@ fn agent_pane_missing(socket: &Path, agent: Option<&str>) -> bool {
             .write_all(b"{\"id\":\"csr-snapshot\",\"method\":\"session.snapshot\",\"params\":{}}\n")
             .ok()?;
         let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).ok()?;
+        BufReader::new(stream.take(LINE_LIMIT))
+            .read_line(&mut line)
+            .ok()?;
         let value: Value = serde_json::from_str(&line).ok()?;
         let panes = value["result"]["snapshot"]["panes"].as_array()?;
         Some(!panes.iter().any(|pane| pane["pane_id"] == agent))
@@ -350,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn it_is_asked_for_by_the_environment_and_by_nothing_else() {
+    fn it_is_on_whenever_herdr_is_there_and_off_only_by_the_kill_switch() {
         fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
             move |name| {
                 pairs
@@ -359,15 +374,29 @@ mod tests {
                     .map(|(_, v)| v.to_string())
             }
         }
-        let all = [
-            ("CSR_PANE_HERDR_EVENTS", "1"),
-            ("HERDR_SOCKET_PATH", "/s/herdr.sock"),
-        ];
-        assert_eq!(config(env(&all)), Some("/s/herdr.sock".into()));
-        assert_eq!(config(env(&all[1..])), None, "not asked for");
-        let off = [("CSR_PANE_HERDR_EVENTS", "0"), all[1]];
-        assert_eq!(config(env(&off)), None);
-        assert_eq!(config(env(&all[..1])), None, "no socket");
+        let socket = ("HERDR_SOCKET_PATH", "/s/herdr.sock");
+        assert_eq!(
+            config(env(&[socket])),
+            Some("/s/herdr.sock".into()),
+            "unset"
+        );
+        for value in ["1", "", "true", "off", "00", " 0", "2"] {
+            let on = [("CSR_PANE_HERDR_EVENTS", value), socket];
+            assert_eq!(config(env(&on)), Some("/s/herdr.sock".into()), "{value:?}");
+        }
+        let off = [("CSR_PANE_HERDR_EVENTS", "0"), socket];
+        assert_eq!(config(env(&off)), None, "the kill switch");
+        assert_eq!(config(env(&[])), None, "not in herdr");
+        assert_eq!(
+            config(env(&[("CSR_PANE_HERDR_EVENTS", "1")])),
+            None,
+            "no socket"
+        );
+        assert_eq!(
+            config(env(&[("HERDR_SOCKET_PATH", "")])),
+            None,
+            "empty socket"
+        );
     }
 
     #[test]
@@ -494,6 +523,246 @@ mod tests {
         for watch in [&none, &bad] {
             assert!(!watch.agent_gone());
             assert!(!watch.take_status());
+        }
+    }
+
+    /// A listener that does what `serve` is told with each connection, and counts them.
+    fn listener(
+        dir: &Path,
+        name: &str,
+        serve: impl Fn(UnixStream) + Send + Sync + 'static,
+    ) -> (PathBuf, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::AtomicUsize;
+        let path = dir.join(name);
+        let listener = UnixListener::bind(&path).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counted = count.clone();
+        let serve = Arc::new(serve);
+        thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let serve = serve.clone();
+                thread::spawn(move || serve(conn));
+            }
+        });
+        (path, count)
+    }
+    fn read_request(conn: &UnixStream) {
+        let mut request = String::new();
+        let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut request);
+    }
+    fn ack(conn: &UnixStream) {
+        let _ = writeln!(
+            &*conn,
+            "{}",
+            json!({ "id": "csr", "result": { "type": "subscription_started" } })
+        );
+    }
+    /// The pane as it is with no watcher: nothing gone, nothing to draw for.
+    fn quiet(watch: &Watcher) {
+        assert!(!watch.agent_gone());
+        assert!(!watch.take_status());
+    }
+
+    #[test]
+    fn a_socket_that_is_stale_or_not_a_socket_leaves_the_pane_as_it_was() {
+        let d = tempfile::tempdir().unwrap();
+        // A socket file left behind by a herdr that is gone: bound, then nobody listens.
+        let path = d.path().join("stale.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+        let started = Instant::now();
+        let watch = Watcher::start(path, || Some("w1:p2".into()));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "start does not wait"
+        );
+        thread::sleep(Duration::from_millis(400));
+        quiet(&watch);
+        // And a path that is a plain file, not a socket.
+        let file = d.path().join("plain");
+        std::fs::write(&file, b"not a socket").unwrap();
+        let watch = Watcher::start(file, || Some("w1:p2".into()));
+        thread::sleep(Duration::from_millis(400));
+        quiet(&watch);
+    }
+
+    #[test]
+    fn a_refusing_socket_is_not_hammered() {
+        let d = tempfile::tempdir().unwrap();
+        // Every connection is closed at once, before a word: the retry waits 1 s, then 2 s.
+        let (path, count) = listener(d.path(), "shut.sock", drop);
+        let watch = Watcher::start(path, || Some("w1:p2".into()));
+        thread::sleep(Duration::from_millis(2500));
+        quiet(&watch);
+        let tries = count.load(Ordering::SeqCst);
+        assert!((1..=3).contains(&tries), "{tries} connections in 2.5 s");
+    }
+
+    #[test]
+    fn a_herdr_that_closes_mid_stream_is_found_again_and_the_pane_goes_on() {
+        let d = tempfile::tempdir().unwrap();
+        // Acknowledges, then hangs up. Only the subscriptions are counted.
+        let subscriptions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = subscriptions.clone();
+        let (path, _) = listener(d.path(), "half.sock", move |conn| {
+            let mut request = String::new();
+            let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut request);
+            if request.contains("events.subscribe") {
+                counted.fetch_add(1, Ordering::SeqCst);
+                ack(&conn);
+            }
+        });
+        let watch = Watcher::start(path, || Some("w1:p2".into()));
+        assert!(until(|| subscriptions.load(Ordering::SeqCst) >= 1));
+        quiet(&watch);
+        // It subscribes again after the wait, not at once and not never.
+        assert!(
+            until(|| subscriptions.load(Ordering::SeqCst) >= 2),
+            "no second subscription"
+        );
+        thread::sleep(Duration::from_millis(500));
+        let tries = subscriptions.load(Ordering::SeqCst);
+        assert!(tries <= 4, "{tries} subscriptions in about 2 s");
+        quiet(&watch);
+    }
+
+    #[test]
+    fn garbage_leaves_the_pane_as_it_was_and_a_good_event_after_it_still_counts() {
+        let d = tempfile::tempdir().unwrap();
+        // Not JSON at all, instead of the acknowledgement.
+        let (path, _) = listener(d.path(), "junk.sock", |conn| {
+            read_request(&conn);
+            let _ = (&conn).write_all(b"\xff\xfe not json {{{\n[1,2,3]\n");
+            thread::sleep(Duration::from_millis(300));
+        });
+        let watch = Watcher::start(path, || Some("w1:p2".into()));
+        thread::sleep(Duration::from_millis(500));
+        quiet(&watch);
+        // Garbage after a good acknowledgement is skipped line by line.
+        let (path, _) = listener(d.path(), "mixed.sock", |conn| {
+            read_request(&conn);
+            ack(&conn);
+            let mut out = &conn;
+            let _ = out.write_all(b"\xff\xfe\n\n{\"event\": 5}\n[[[[[[\n\"str\"\n{\"error\": 7}\n");
+            let _ = writeln!(
+                out,
+                "{}",
+                json!({ "event": "pane.agent_status_changed", "data": { "pane_id": "w1:p2" } })
+            );
+            thread::sleep(Duration::from_secs(5));
+        });
+        let watch = Watcher::start(path, || Some("w1:p2".into()));
+        assert!(until(|| watch.take_status()), "the event after the garbage");
+        assert!(!watch.agent_gone());
+        // The same nesting that overflows a recursive parser is only an error line.
+        let deep = format!("{}{}\n", "[".repeat(100_000), "]".repeat(100_000));
+        let (path, _) = listener(d.path(), "deep.sock", move |conn| {
+            read_request(&conn);
+            ack(&conn);
+            let _ = (&conn).write_all(deep.as_bytes());
+            thread::sleep(Duration::from_secs(2));
+        });
+        let watch = Watcher::start(path, || Some("w1:p2".into()));
+        thread::sleep(Duration::from_millis(600));
+        quiet(&watch);
+    }
+
+    #[test]
+    fn a_stream_that_never_ends_a_line_is_dropped_and_not_kept_in_memory() {
+        let d = tempfile::tempdir().unwrap();
+        let (path, _) = listener(d.path(), "flood.sock", |conn| {
+            read_request(&conn);
+            ack(&conn);
+            let chunk = vec![b'x'; 1 << 20];
+            let mut out = &conn;
+            for _ in 0..(LINE_LIMIT >> 20) + 4 {
+                if out.write_all(&chunk).is_err() {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_secs(3));
+        });
+        // The subscription ends at the limit, well before the stream's own end, as one that was
+        // not acknowledged would.
+        let shared = Shared::default();
+        let started = Instant::now();
+        let ended = session(&shared, &path, Some("w1:p2"));
+        assert!(matches!(ended, Ok(false)), "{ended:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!shared.gone.load(Ordering::Relaxed));
+        assert!(!shared.status.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_herdr_that_never_answers_costs_the_pane_nothing_and_leaving_does_not_wait() {
+        let d = tempfile::tempdir().unwrap();
+        let (path, count) = listener(d.path(), "mute.sock", |conn| {
+            read_request(&conn);
+            thread::sleep(Duration::from_secs(30));
+            drop(conn);
+        });
+        let started = Instant::now();
+        let watch = Watcher::start(path, || {
+            // The lookup of the agent pane is itself slow.
+            thread::sleep(Duration::from_millis(1200));
+            Some("w1:p2".into())
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "start does not wait"
+        );
+        let polled = Instant::now();
+        for _ in 0..1000 {
+            quiet(&watch);
+        }
+        assert!(
+            polled.elapsed() < Duration::from_millis(200),
+            "polling is a load"
+        );
+        assert!(
+            until(|| count.load(Ordering::SeqCst) == 1),
+            "it is waiting on herdr"
+        );
+        let leaving = Instant::now();
+        drop(watch);
+        assert!(
+            leaving.elapsed() < Duration::from_millis(200),
+            "drop does not wait"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_that_is_garbage_or_has_no_panes_does_not_end_the_pane() {
+        let d = tempfile::tempdir().unwrap();
+        for answer in [
+            b"\xff\xfe not json\n".to_vec(),
+            b"{\"result\":{\"snapshot\":{\"panes\":\"no\"}}}\n".to_vec(),
+            b"{\"result\":{\"snapshot\":{}}}\n".to_vec(),
+            b"\n".to_vec(),
+        ] {
+            let name = format!("snap{}.sock", answer.len());
+            let (path, count) = listener(d.path(), &name, move |conn| {
+                let mut request = String::new();
+                let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut request);
+                if request.contains("events.subscribe") {
+                    ack(&conn);
+                    thread::sleep(Duration::from_secs(3));
+                } else {
+                    let _ = (&conn).write_all(&answer);
+                }
+            });
+            let watch = Watcher::start(path, || Some("w1:p2".into()));
+            assert!(
+                until(|| count.load(Ordering::SeqCst) >= 2),
+                "snapshot asked for"
+            );
+            thread::sleep(Duration::from_millis(300));
+            assert!(!watch.agent_gone(), "{name}");
         }
     }
 }
