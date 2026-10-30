@@ -940,6 +940,94 @@ fn sink_out_of_family_under_explicit_scope(
     enriched.extend(sink);
 }
 
+/// The Claude Code session this MCP server was spawned for, from the
+/// `CLAUDE_CODE_SESSION_ID` its environment carries (Claude Code starts one
+/// server process per session). Read once; empty or unset is `None` and every
+/// sink below becomes a no-op.
+///
+/// Known gap, not fixed here: after `/clear` Claude Code gives the chat a new
+/// session id, but this process keeps the environment it was spawned with, so
+/// the cleared chat's new turns are not covered by the sink.
+fn live_session_id() -> Option<String> {
+    #[cfg(test)]
+    {
+        LIVE_SESSION_OVERRIDE.with(|cell| cell.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        static LIVE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        LIVE.get_or_init(|| parse_live_session(std::env::var("CLAUDE_CODE_SESSION_ID").ok()))
+            .clone()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only stand-in for the environment variable: parallel tests must
+    /// not race on the process environment.
+    static LIVE_SESSION_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The session id in a raw environment value: trimmed, `None` when blank.
+fn parse_live_session(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// True when the query names the live session on purpose (the bare id or the
+/// `conv_<id>` form), so the caller is asking for that chat.
+fn query_names_session(query: &str, live: &str) -> bool {
+    query.to_lowercase().contains(&live.to_lowercase())
+}
+
+/// Sink every hit that belongs to the live session below every other hit,
+/// never dropping one: a search that only matches the caller's own chat still
+/// returns it. The session of a hit is [`session_key_of`], so a sidechain
+/// (subagent) chunk or a plan chunk that came from the live session sinks with
+/// it. Stable: the order inside the other hits, and inside the live-session
+/// hits, is unchanged. No-op without a live session, and when the query names
+/// that session.
+fn sink_session_hits(
+    enriched: &mut [EnrichedResult],
+    storage: &Storage,
+    live: Option<&str>,
+    query: &str,
+) {
+    let Some(live) = live.filter(|live| !query_names_session(query, live)) else {
+        return;
+    };
+    // `sort_by_key` is stable, so each group keeps the order it came in.
+    enriched.sort_by_cached_key(|e| is_session_hit(storage, &e.chunk, live));
+}
+
+/// True when `chunk` belongs to the live session: its conversation id is the
+/// session id (the transcript's file stem; the `conv_` form counts too), or
+/// provenance ties it to that conversation ([`session_key_of`]).
+fn is_session_hit(storage: &Storage, chunk: &crate::import::ConversationChunk, live: &str) -> bool {
+    let key = session_key_of(storage, chunk);
+    key == live || key.strip_prefix("conv_") == Some(live)
+}
+
+/// [`sink_session_hits`] for bare chunks (the file search holds no scores).
+fn sink_session_chunks(
+    chunks: &mut [crate::import::ConversationChunk],
+    storage: &Storage,
+    live: Option<&str>,
+    query: &str,
+) {
+    let Some(live) = live.filter(|live| !query_names_session(query, live)) else {
+        return;
+    };
+    chunks.sort_by_cached_key(|chunk| is_session_hit(storage, chunk, live));
+}
+
+/// [`sink_session_hits`] for the session this server runs in.
+fn sink_live_session(enriched: &mut [EnrichedResult], storage: &Storage, query: &str) {
+    let live = live_session_id();
+    sink_session_hits(enriched, storage, live.as_deref(), query);
+}
+
 /// Sink the rows that cannot answer a question below the rows that can, never
 /// dropping one: first the rows that only restate a question
 /// ([`crate::search::echo::is_question_echo`]), then CSR's own search-result
@@ -1746,7 +1834,8 @@ async fn reflect_final_page(
 
     // TAD: log each RETURNED memory as an MCP-search retrieval event — after the
     // limit cut, so telemetry agrees with what the caller actually saw.
-    // session_id="mcp" is a sentinel (MCP has no session id). Non-fatal.
+    // session_id="mcp" is a fixed label for the retrieval log, not the Claude Code
+    // session (that one is `live_session_id`, used by the sink). Non-fatal.
     if record_retrievals {
         for e in &enriched {
             let _ = storage.log_retrieval_event(&e.chunk.id, "chunk", "mcp_search", "mcp");
@@ -1858,6 +1947,8 @@ async fn settled_pool(
     // cut so stale results do not occupy slots that should go to
     // unresolved/non-demoted chunks ranked below them.
     settle_window(&mut enriched, storage, &pass.validity, active_forgetting);
+    // Last ordering step: the caller's own live chat answers no past question.
+    sink_live_session(&mut enriched, storage, query);
     Ok(SettledPool {
         enriched,
         display_rank_scores: pass.display_rank_scores,
@@ -4324,13 +4415,17 @@ async fn quick_check_with_vec(
     project: Option<&str>,
 ) -> Result<String> {
     let (effective_project, _) = cross_project::normalize_project_scope(storage, project)?;
+    // With a live session the window is wider than the two rows shown, so
+    // its sunk hits can give their places to others; without one it is 2.
+    let live = live_session_id();
+    let window = if live.is_some() { overfetch(2) } else { 2 };
     let results = if let Some(ref project) = effective_project {
         let ids = family_chunk_ids(storage, project)?;
         let idx = search.read().await;
-        idx.search_chunks_filtered(query_vec, 2, min_score, &ids)
+        idx.search_chunks_filtered(query_vec, window, min_score, &ids)
     } else {
         let idx = search.read().await;
-        idx.search_chunks(query_vec, 2, min_score)
+        idx.search_chunks(query_vec, window, min_score)
     };
 
     let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
@@ -4355,6 +4450,8 @@ async fn quick_check_with_vec(
     let labeled_chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
     let validity = csr_text_labels_only(storage, &labeled_chunks);
     apply_validity_partition(&mut enriched, &validity, false);
+    sink_session_hits(&mut enriched, storage, live.as_deref(), query);
+    enriched.truncate(2);
 
     Ok(format::format_quick_check(&enriched, query))
 }
@@ -4474,6 +4571,7 @@ pub async fn search_by_recency(
         fetch_enrich_partition_adaptive(
             storage,
             |n| idx.search_chunks_filtered(&query_vec, n, min_score, &time_ids),
+            query,
             limit,
             consumption_mode_for_partition(validity_partition_enabled()),
         )?
@@ -4676,8 +4774,16 @@ pub(super) async fn search_by_file_with_map(
     // The path is matched as one phrase of its tokens (`csr engine src storage
     // mod rs`), not as free-text words: those fold a path into a single token
     // no chunk holds.
+    // With a live session the window is wider than the page, so its sunk hits
+    // can give their places to others; without one it is exactly `limit`.
+    let live = live_session_id();
+    let window = if live.is_some() {
+        overfetch(limit)
+    } else {
+        limit
+    };
     let hits = match crate::storage::queries::fts5_path_expr(file_path) {
-        Some(expr) => storage.fts5_search_expr(&expr, limit, project)?,
+        Some(expr) => storage.fts5_search_expr(&expr, window, project)?,
         None => Vec::new(),
     };
     let chunks: Vec<_> = hits.into_iter().map(|(chunk, _, _)| chunk).collect();
@@ -4686,7 +4792,9 @@ pub(super) async fn search_by_file_with_map(
     let (clean, csr): (Vec<_>, Vec<_>) = chunks
         .into_iter()
         .partition(|chunk| !notes.contains_key(&chunk.id));
-    let chunks: Vec<_> = clean.into_iter().chain(csr).collect();
+    let mut chunks: Vec<_> = clean.into_iter().chain(csr).collect();
+    sink_session_chunks(&mut chunks, storage, live.as_deref(), file_path);
+    chunks.truncate(limit);
     let Some((section, views)) = map else {
         return Ok(format::format_file_results(
             &chunks,
@@ -5064,8 +5172,8 @@ pub async fn why(
     let ranking = apply_why_recency_tiebreak(reinstatement.items, &anchors);
 
     // TAD: log each returned chunk as an MCP-search retrieval event. session_id="mcp" is
-    // the sentinel (MCP has no session id) — same pattern as reflect_on_past. Non-fatal:
-    // a logging failure must never fail the search.
+    // a fixed label for the log (not the Claude Code session) — same pattern as
+    // reflect_on_past. Non-fatal: a logging failure must never fail the search.
     for item in &ranking.items {
         let _ = storage.log_retrieval_event(&item.chunk_id, "chunk", "mcp_search", "mcp");
     }
@@ -5348,6 +5456,7 @@ async fn search_by_concept_at_root(
         fetch_enrich_partition_adaptive(
             storage,
             |n| idx.search_chunks_filtered(&query_vec, n, 0.3, &ids),
+            concept,
             limit,
             consumption_mode_for_partition(validity_partition_enabled()),
         )?
@@ -5356,6 +5465,7 @@ async fn search_by_concept_at_root(
         fetch_enrich_partition_adaptive(
             storage,
             |n| idx.search_chunks(&query_vec, n, 0.3),
+            concept,
             limit,
             consumption_mode_for_partition(validity_partition_enabled()),
         )?
@@ -6097,6 +6207,7 @@ fn enrich_results_with_active_forgetting(
 fn fetch_enrich_partition_adaptive(
     storage: &Arc<Storage>,
     fetch_fn: impl Fn(usize) -> Vec<crate::search::SearchResult>,
+    query: &str,
     limit: usize,
     consumption_mode: ConsumptionMode,
 ) -> Result<Vec<EnrichedResult>> {
@@ -6112,6 +6223,8 @@ fn fetch_enrich_partition_adaptive(
             enriched = enrich_results_with(storage, &results, consumption_mode)?;
         }
     }
+    // Before the cut, so the live chat's hits do not hold slots the page needs.
+    sink_live_session(&mut enriched, storage, query);
     enriched.truncate(limit);
     Ok(enriched)
 }
@@ -9497,6 +9610,272 @@ mod tests {
         .await
         .unwrap();
         assert!(without_parent.contains("<id>child-chunk</id>"));
+    }
+
+    // --- live-session sink: the caller's own chat never tops its own search ---
+
+    const LIVE: &str = "6ca2a4d5-5785-4952-90ed-a5c245cbdfee";
+
+    fn row_ids(rows: &[EnrichedResult]) -> Vec<&str> {
+        rows.iter().map(|e| e.chunk.id.as_str()).collect()
+    }
+
+    /// Runs `body` with `LIVE` as this thread's live session id.
+    fn with_live_session<T>(live: Option<&str>, body: impl FnOnce() -> T) -> T {
+        LIVE_SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = live.map(str::to_string));
+        let out = body();
+        LIVE_SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        out
+    }
+
+    fn live_mix() -> Vec<EnrichedResult> {
+        vec![
+            enriched_result_conv("self-1", LIVE, 0.95, 0),
+            enriched_result_conv("other-1", "conv-other-1", 0.90, 1),
+            enriched_result_conv("self-2", LIVE, 0.85, 2),
+            enriched_result_conv("other-2", "conv-other-2", 0.80, 3),
+        ]
+    }
+
+    #[test]
+    fn live_session_hits_sink_below_others_and_keep_each_groups_order() {
+        let storage = Storage::open_memory().unwrap();
+        let mut rows = live_mix();
+        sink_session_hits(&mut rows, &storage, Some(LIVE), "how did we fix it");
+        assert_eq!(row_ids(&rows), ["other-1", "other-2", "self-1", "self-2"]);
+    }
+
+    #[test]
+    fn live_session_only_results_still_return_in_order() {
+        let storage = Storage::open_memory().unwrap();
+        let mut rows = vec![
+            enriched_result_conv("self-1", LIVE, 0.95, 0),
+            enriched_result_conv("self-2", LIVE, 0.85, 1),
+        ];
+        sink_session_hits(&mut rows, &storage, Some(LIVE), "how did we fix it");
+        assert_eq!(row_ids(&rows), ["self-1", "self-2"]);
+    }
+
+    #[test]
+    fn a_query_naming_the_session_leaves_the_order_alone() {
+        let storage = Storage::open_memory().unwrap();
+        for query in [
+            format!("what happened in {LIVE}"),
+            format!("conv_{LIVE} summary"),
+            format!("WHAT HAPPENED IN {}", LIVE.to_uppercase()),
+        ] {
+            let mut rows = live_mix();
+            sink_session_hits(&mut rows, &storage, Some(LIVE), &query);
+            assert_eq!(
+                row_ids(&rows),
+                ["self-1", "other-1", "self-2", "other-2"],
+                "{query}"
+            );
+        }
+        // A different session id in the query is not the live one.
+        let mut rows = live_mix();
+        sink_session_hits(&mut rows, &storage, Some(LIVE), "in 11111111-2222-3333");
+        assert_eq!(row_ids(&rows), ["other-1", "other-2", "self-1", "self-2"]);
+    }
+
+    #[test]
+    fn without_a_live_session_the_rows_are_byte_identical() {
+        let storage = Storage::open_memory().unwrap();
+        let before = live_mix();
+        let mut rows = live_mix();
+        sink_session_hits(&mut rows, &storage, None, "how did we fix it");
+        assert_eq!(row_ids(&rows), row_ids(&before));
+        assert!(rows
+            .iter()
+            .zip(&before)
+            .all(|(a, b)| a.score.to_bits() == b.score.to_bits()
+                && a.chunk.content == b.chunk.content));
+        // A blank or unset variable reads as no session.
+        assert_eq!(parse_live_session(None), None);
+        assert_eq!(parse_live_session(Some(String::new())), None);
+        assert_eq!(parse_live_session(Some("  \n".into())), None);
+        assert_eq!(
+            parse_live_session(Some(format!(" {LIVE}\n"))).as_deref(),
+            Some(LIVE)
+        );
+        with_live_session(None, || assert_eq!(live_session_id(), None));
+        // The `conv_` form of the id is the same session.
+        let mut prefixed = vec![
+            enriched_result_conv("self-p", &format!("conv_{LIVE}"), 0.9, 0),
+            enriched_result_conv("other-p", "conv-other", 0.8, 1),
+        ];
+        sink_session_hits(&mut prefixed, &storage, Some(LIVE), "q");
+        assert_eq!(row_ids(&prefixed), ["other-p", "self-p"]);
+    }
+
+    #[test]
+    fn a_sidechain_chunk_whose_parent_is_the_live_session_sinks() {
+        let storage = Storage::open_memory().unwrap();
+        let mut child = enriched_result_conv("child", "agent-a0c1", 0.97, 0);
+        child.chunk.is_sidechain = true;
+        let mut orphan = enriched_result_conv("orphan", "agent-zzzz", 0.96, 1);
+        orphan.chunk.is_sidechain = true;
+        storage
+            .insert_chunk(&child.chunk, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        storage
+            .insert_chunk_provenance(
+                "child",
+                &crate::provenance::ChunkProvenance {
+                    author: crate::provenance::Speaker::Assistant,
+                    source_conv_id: LIVE.into(),
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+        let mut rows = vec![
+            child,
+            orphan,
+            enriched_result_conv("other", "conv-other", 0.5, 2),
+        ];
+        sink_session_hits(&mut rows, &storage, Some(LIVE), "q");
+        // The orphan sidechain has no parent on record: it is not the live chat.
+        assert_eq!(row_ids(&rows), ["orphan", "other", "child"]);
+    }
+
+    #[test]
+    fn file_search_chunks_of_the_live_session_sink() {
+        let storage = Storage::open_memory().unwrap();
+        let mut chunks: Vec<_> = live_mix().into_iter().map(|e| e.chunk).collect();
+        sink_session_chunks(&mut chunks, &storage, Some(LIVE), "src/mcp/tools.rs");
+        let ids: Vec<&str> = chunks.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["other-1", "other-2", "self-1", "self-2"]);
+    }
+
+    /// The cut comes after the sink: with a page of one, the best other hit
+    /// takes the slot, and with no live session the best hit overall does.
+    #[test]
+    fn simple_search_sink_runs_before_the_page_cut() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        for (id, conv, vector) in [
+            ("self-1", LIVE, [1.0, 0.0, 0.0, 0.0]),
+            ("other-1", "conv-other-1", [0.9, 0.1, 0.0, 0.0]),
+        ] {
+            let chunk = enriched_result_conv(id, conv, 1.0, 0).chunk;
+            storage.insert_chunk(&chunk, &vector).unwrap();
+        }
+        let fetch = |_: usize| {
+            vec![
+                crate::search::SearchResult {
+                    id: "self-1".into(),
+                    score: 0.99,
+                },
+                crate::search::SearchResult {
+                    id: "other-1".into(),
+                    score: 0.90,
+                },
+            ]
+        };
+        let page = |live: Option<&str>, query: &str| {
+            with_live_session(live, || {
+                fetch_enrich_partition_adaptive(&storage, fetch, query, 1, ConsumptionMode::Off)
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.chunk.id.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(page(Some(LIVE), "q"), ["other-1"]);
+        assert_eq!(page(None, "q"), ["self-1"]);
+        assert_eq!(page(Some(LIVE), &format!("in {LIVE}")), ["self-1"]);
+    }
+
+    fn live_pipeline_fixture() -> (Arc<Storage>, Arc<RwLock<SearchEngine>>) {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut search = SearchEngine::new(8);
+        for (id, conv, vector) in [
+            ("self-chunk", LIVE, [1.0f32, 0.0, 0.0, 0.0]),
+            ("other-chunk", "conv-other", [0.9, 0.1, 0.0, 0.0]),
+        ] {
+            let mut chunk = enriched_result_conv(id, conv, 1.0, 0).chunk;
+            chunk.content = format!("live session sink probe {id}");
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            search.insert_chunk(chunk.id, vector.to_vec());
+        }
+        (storage, Arc::new(RwLock::new(search)))
+    }
+
+    async fn live_pipeline_page(live: Option<&str>, query: &str, limit: usize) -> String {
+        let (storage, search) = live_pipeline_fixture();
+        LIVE_SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = live.map(str::to_string));
+        let out = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            query,
+            limit,
+            0.1,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        LIVE_SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        out
+    }
+
+    #[tokio::test]
+    async fn recall_pipeline_sinks_the_live_chat_but_still_returns_it() {
+        let before = live_pipeline_page(None, "sink probe unset", 1).await;
+        assert!(before.contains("<id>self-chunk</id>"), "{before}");
+
+        let after = live_pipeline_page(Some(LIVE), "sink probe set", 1).await;
+        assert!(after.contains("<id>other-chunk</id>"), "{after}");
+        assert!(!after.contains("<id>self-chunk</id>"), "{after}");
+
+        // Both fit: the live chat is still there, below the other hit.
+        let both = live_pipeline_page(Some(LIVE), "sink probe both", 5).await;
+        let other_at = pos_of(&both, "<id>other-chunk</id>");
+        let self_at = pos_of(&both, "<id>self-chunk</id>");
+        assert!(other_at < self_at, "{both}");
+
+        // Naming the session on purpose lifts the sink.
+        let named = live_pipeline_page(Some(LIVE), &format!("probe {LIVE}"), 1).await;
+        assert!(named.contains("<id>self-chunk</id>"), "{named}");
+    }
+
+    #[tokio::test]
+    async fn quick_check_skips_past_the_live_chat() {
+        let rows = [
+            ("top", "project-a", "top candidate", [1.0, 0.0, 0.0, 0.0]),
+            (
+                "runner-up",
+                "project-b",
+                "runner-up candidate",
+                [0.8, 0.6, 0.0, 0.0],
+            ),
+        ];
+        let run = |live: Option<&'static str>| {
+            let (storage, search) = quick_check_fixture(&rows);
+            async move {
+                LIVE_SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = live.map(str::to_string));
+                let xml = quick_check_with_vec(
+                    &storage,
+                    &search,
+                    &[1.0, 0.0, 0.0, 0.0],
+                    "probe",
+                    0.3,
+                    Some("all"),
+                )
+                .await
+                .unwrap();
+                LIVE_SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+                xml
+            }
+        };
+        let unset = run(None).await;
+        assert!(unset.contains("top candidate"), "{unset}");
+        let set = run(Some("conv-top")).await;
+        assert!(set.contains("runner-up candidate"), "{set}");
+        assert!(!set.contains("top candidate"), "{set}");
     }
 
     /// The pipeline, not just the map: with the dream switches unset (annotate
