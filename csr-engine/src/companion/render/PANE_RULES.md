@@ -58,8 +58,6 @@ is checked by `tests/pane_contract.rs` for every fixture, pane size and theme. A
     (`l`) pages lay their rows on whole cells (a Monologue row is one cell, a cell holds two
     Changes lines at the same type sizes), with a flat ground down the page, so a `j` moves the
     picture by whole bands and every band but the new row and the footer is the same pixels. The
-    transport names an image by a hash of its pixels and places one that is still on screen again
-    (`a=p`); an image with no placement left is freed (`d=I`) and sent in full if it returns,
-    because the terminal chain does not keep unplaced pixels: a
+    transport names an image by a hash of its pixels and places one already up again (`a=p`): a
     `j` sends at most two bands (`tests/pane_contract.rs`,
     `a_page_scroll_step_uploads_at_most_two_bands`). Fonts are never shrunk to fit the cell.
