@@ -34,7 +34,8 @@ pub enum Kind {
     Latest,
     /// The worst sample of the run: the highest against a `<` limit, the lowest against a `>` one.
     Max,
-    /// The least-squares slope per hour over the samples after a warm-up.
+    /// The least-squares slope per hour over the samples after a warm-up, once they span
+    /// `min_span_hours`; waiting until then.
     SlopePerHour,
     /// Pending until some sample meets it; fails only at the planned end.
     AtLeastByEnd,
@@ -52,6 +53,10 @@ pub struct CheckSpec {
     /// For `slope_per_hour`: hours from the start whose samples are left out.
     #[serde(default)]
     pub warmup_hours: f64,
+    /// For `slope_per_hour`: the check waits, and neither passes nor fails, until the samples
+    /// after the warm-up cover this many hours. A few noisy samples make a wild slope.
+    #[serde(default = "min_span_hours")]
+    pub min_span_hours: f64,
     /// Said after a value: "ms", "MB/h".
     #[serde(default)]
     pub unit: String,
@@ -77,6 +82,9 @@ pub struct Trial {
     pub start: f64,
     #[serde(skip)]
     pub end: f64,
+}
+fn min_span_hours() -> f64 {
+    6.
 }
 fn time_field() -> String {
     "t".into()

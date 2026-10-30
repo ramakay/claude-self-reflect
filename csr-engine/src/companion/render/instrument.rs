@@ -8862,6 +8862,34 @@ mod tests {
     }
 
     #[test]
+    fn the_waiting_memory_trend_line_fits_the_card_whole() {
+        let text = "Memory trend: waiting for 6 h of samples (have 0.7 h)";
+        {
+            // `draw` takes the same font lock: let go of it before drawing.
+            let fonts = fonts().unwrap();
+            let t = Theme::Dark.tokens();
+            let w = fonts.width(text, sans(11., t.regular));
+            assert!(w <= IW - 16., "{w}pt of {}pt", IW - 16.);
+        }
+        let mut card = soak_card(5);
+        card.rows[1] = crate::companion::live_eval::Row {
+            mark: "\u{2026}".into(),
+            sev: "quiet".into(),
+            text: text.into(),
+        };
+        let mut c = dash_composition("ok");
+        c.soak = Some(card);
+        let (pm, m) = draw(&c, 704, 1800, Theme::Dark, Open::default(), false).expect("draws");
+        assert!(m.soak_region.is_some());
+        if let Some(dir) = std::env::var_os("CSR_MEMTREND_PNG") {
+            save(
+                &format!("{}/memtrend-waiting.png", dir.to_string_lossy()),
+                &pm,
+            );
+        }
+    }
+
+    #[test]
     fn the_performance_card_sits_right_above_the_context_card_at_every_size_and_theme() {
         let mut c = dash_composition("ok");
         for theme in [Theme::Dark, Theme::Light] {

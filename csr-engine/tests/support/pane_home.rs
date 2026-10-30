@@ -459,7 +459,7 @@ pub fn soak_files(paths: &Paths) {
                  unit: &str,
                  warmup: f64| {
         json!({"id":id,"label":label,"metric":metric,"op":op,"threshold":threshold,"kind":kind,
-            "unit":unit,"warmup_hours":warmup})
+            "unit":unit,"warmup_hours":warmup,"min_span_hours":0.})
     };
     let trials = paths.home.join(".claude-self-reflect/trials");
     write_json(
