@@ -2748,23 +2748,23 @@ fn heading(t: &Tokens) -> St {
     serif(theme::TITLE_SIZE, t.bold)
 }
 fn panel(c: &mut Canvas, y: f32, h: f32, t: &Tokens) {
-    panel_with(c, y, h, t, false);
-}
-/// `panel`; `flat`: its glass one colour all the way down (the mean of its two stops), so a page
-/// row looks the same at any height.
-fn panel_with(c: &mut Canvas, y: f32, h: f32, t: &Tokens, flat: bool) {
-    let glass = if flat {
-        let mean: [u8; 4] = std::array::from_fn(|k| {
-            ((u16::from(t.glass[0][k]) + u16::from(t.glass[1][k])) / 2) as u8
-        });
-        [(t.linear_at[0], mean), (t.linear_at[1], mean)]
-    } else {
-        [(t.linear_at[0], t.glass[0]), (t.linear_at[1], t.glass[1])]
-    };
     c.panels.push((y, h));
     c.shadow(M, y, CW, h, 24., t.ambient_shadow);
     c.shadow(M, y, CW, h, 24., t.contact_shadow);
-    c.glass(M, y, CW, h, 24., lin(0., y, 0., y + h, &glass));
+    c.glass(
+        M,
+        y,
+        CW,
+        h,
+        24.,
+        lin(
+            0.,
+            y,
+            0.,
+            y + h,
+            &[(t.linear_at[0], t.glass[0]), (t.linear_at[1], t.glass[1])],
+        ),
+    );
     c.rrect_line(M, y, CW, h, 24., t.hair, t.hair_width);
     c.line(
         M + 24.,
@@ -2804,7 +2804,7 @@ fn single_as(
     let st = sans(size, t.regular);
     let line = icons::line(s);
     let shown = f.fit(&line, st, width);
-    if shown != line && c.records() && !c.cut_title.is_empty() {
+    if shown != line && !c.dry && !c.cut_title.is_empty() {
         c.cuts.push(Cut {
             y,
             size,
@@ -3079,303 +3079,6 @@ pub fn draw(
     open: Open,
     narrow: bool,
 ) -> Option<(tiny_skia::Pixmap, Metrics)> {
-    draw_cells(c, width, available_height, theme, open, narrow, 0)
-}
-/// What one `draw_pass` paints.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Pass {
-    /// Everything, into one picture.
-    Full,
-    /// Nothing: the layout and its metrics, and a page's rows as cached slabs.
-    Measure,
-    /// A page without its rows and footer: the part a scroll never changes.
-    Chrome,
-}
-/// A page laid out on whole terminal cells (`draw_cells`).
-#[derive(Clone, Copy)]
-struct Aligned {
-    /// One cell, in layout pt.
-    cell: f32,
-    /// One cell, in output px.
-    cell_px: u32,
-    /// Distance from one Monologue row (or Changes line) to the next, in layout pt.
-    pitch: f32,
-    /// A Monologue row's band height.
-    band: f32,
-    /// Changes lines per cell: a `j` moves this many, one cell.
-    lines: usize,
-    /// Top of the first row, on a cell boundary, in layout pt and in output px.
-    body_top: f32,
-    body_top_px: u32,
-    /// Output px per layout pt, the picture's width and its left inset.
-    scale: f32,
-    fitted_width: u32,
-    left: u32,
-}
-/// The least pitch of a Monologue row (its icon is 18 pt) and of a Changes line (11.5 pt type).
-const ALIGNED_ROW_MIN: f32 = 24.;
-const ALIGNED_LINE_MIN: f32 = 14.;
-/// One row (or one cell of lines, or the footer) of a page, painted alone on a transparent ground
-/// and scaled to the output: premultiplied RGBA, `w` by `h` px.
-struct Slab {
-    w: u32,
-    h: u32,
-    data: Vec<u8>,
-}
-/// A page's pieces: the cached chrome and the slabs that go over it, by output px top.
-struct PagePlan {
-    chrome_key: u64,
-    slabs: Vec<(u32, std::sync::Arc<Slab>)>,
-    /// The output row whose pixels lie under every slab: the page's ground at its first row.
-    ground_y: u32,
-    left: u32,
-}
-#[derive(Default)]
-struct PageCache {
-    chromes: std::collections::VecDeque<(u64, std::sync::Arc<tiny_skia::Pixmap>)>,
-    slabs: std::collections::VecDeque<(u64, std::sync::Arc<Slab>)>,
-    slab_bytes: usize,
-}
-/// Chromes kept (one per page, size and theme), and the bytes of slabs kept.
-const CHROMES_KEPT: usize = 4;
-const SLAB_BYTES_KEPT: usize = 24 << 20;
-static PAGE_CACHE: std::sync::LazyLock<std::sync::Mutex<PageCache>> =
-    std::sync::LazyLock::new(Default::default);
-fn page_cache() -> std::sync::MutexGuard<'static, PageCache> {
-    PAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner())
-}
-fn key_of(parts: impl std::hash::Hash) -> u64 {
-    use std::hash::Hasher;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    parts.hash(&mut h);
-    h.finish()
-}
-/// The slab `key` names: from the cache, or painted by `paint` on an `h_pt`-tall canvas and
-/// scaled to `w` by `h` px. A slab depends on nothing but its key, so the same row is the same
-/// pixels wherever it scrolls to.
-fn slab(
-    key: u64,
-    w: u32,
-    h: u32,
-    h_pt: f32,
-    paint: impl FnOnce(&mut Canvas),
-) -> std::sync::Arc<Slab> {
-    if let Some(hit) = page_cache()
-        .slabs
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, s)| s.clone())
-    {
-        return hit;
-    }
-    let mut canvas = Canvas::new(W, h_pt);
-    paint(&mut canvas);
-    let data = image::RgbaImage::from_raw(
-        canvas.pm.width(),
-        canvas.pm.height(),
-        canvas.pm.data().to_vec(),
-    )
-    .map(|raw| {
-        image::imageops::resize(&raw, w, h, image::imageops::FilterType::Lanczos3).into_raw()
-    })
-    .unwrap_or_else(|| vec![0; (w * h * 4) as usize]);
-    let made = std::sync::Arc::new(Slab { w, h, data });
-    let mut cache = page_cache();
-    cache.slab_bytes += made.data.len();
-    cache.slabs.push_back((key, made.clone()));
-    while cache.slab_bytes > SLAB_BYTES_KEPT {
-        let Some((_, old)) = cache.slabs.pop_front() else {
-            break;
-        };
-        cache.slab_bytes -= old.data.len();
-    }
-    made
-}
-/// `draw` for a pane of `cell_h`-px rows (0: rows not known). A `t` or `l` page then lays its
-/// rows on whole cells, so a `j` moves whole bands, and is put together from a cached chrome and
-/// cached row slabs: a scroll paints only the row that comes into view.
-pub fn draw_cells(
-    c: &Composition,
-    width: u32,
-    available_height: u32,
-    theme: Theme,
-    open: Open,
-    narrow: bool,
-    cell_h: u32,
-) -> Option<(tiny_skia::Pixmap, Metrics)> {
-    let full = |cell_h| {
-        draw_pass(
-            c,
-            width,
-            available_height,
-            theme,
-            open,
-            narrow,
-            cell_h,
-            Pass::Full,
-        )
-        .and_then(|(pm, m, _)| Some((pm?, m)))
-    };
-    if !(open.threads || open.changes) || cell_h == 0 || open.popup.is_some() {
-        return full(cell_h);
-    }
-    let Some((_, metrics, Some(plan))) = draw_pass(
-        c,
-        width,
-        available_height,
-        theme,
-        open,
-        narrow,
-        cell_h,
-        Pass::Measure,
-    ) else {
-        return full(cell_h);
-    };
-    let kept = page_cache()
-        .chromes
-        .iter()
-        .find(|(k, _)| *k == plan.chrome_key)
-        .map(|(_, pm)| pm.clone());
-    let chrome = match kept {
-        Some(pm) => pm,
-        None => {
-            let (pm, _, _) = draw_pass(
-                c,
-                width,
-                available_height,
-                theme,
-                open,
-                narrow,
-                cell_h,
-                Pass::Chrome,
-            )?;
-            let pm = std::sync::Arc::new(pm?);
-            let mut cache = page_cache();
-            cache.chromes.push_back((plan.chrome_key, pm.clone()));
-            while cache.chromes.len() > CHROMES_KEPT {
-                cache.chromes.pop_front();
-            }
-            pm
-        }
-    };
-    let mut pm = (*chrome).clone();
-    let (pw, ph) = (pm.width() as usize, pm.height() as usize);
-    let stride = pw * 4;
-    if (plan.ground_y as usize) >= ph {
-        return full(cell_h);
-    }
-    let ground = pm.data()[plan.ground_y as usize * stride..][..stride].to_vec();
-    let data = pm.data_mut();
-    for (top, slab) in &plan.slabs {
-        for y in 0..slab.h as usize {
-            let row = *top as usize + y;
-            if row >= ph {
-                break;
-            }
-            let dst = &mut data[row * stride..][..stride];
-            dst.copy_from_slice(&ground);
-            let src = &slab.data[y * slab.w as usize * 4..][..slab.w as usize * 4];
-            for x in 0..(slab.w as usize).min(pw.saturating_sub(plan.left as usize)) {
-                let o = &src[x * 4..x * 4 + 4];
-                if o.iter().all(|&v| v == 0) {
-                    continue;
-                }
-                let d = &mut dst[(plan.left as usize + x) * 4..][..4];
-                let keep = 255 - u16::from(o[3]);
-                for k in 0..4 {
-                    d[k] = (u16::from(o[k]) + (u16::from(d[k]) * keep + 127) / 255).min(255) as u8;
-                }
-            }
-        }
-    }
-    Some((pm, metrics))
-}
-/// One Monologue row: its tinted band, the kind bar, icon, time, mood and words, the band
-/// centred on baseline `b` - 4. `spine` draws the hairline from its top down to the icon (`.0`)
-/// and from the icon to its bottom (`.1`), between `.2` and `.3`.
-fn monologue_row(
-    canvas: &mut Canvas,
-    f: &Fonts,
-    now: f64,
-    row: &RiverRow,
-    b: f32,
-    band: f32,
-    spine_x: f32,
-    spine: Option<(bool, bool, f32, f32)>,
-    t: &Tokens,
-) {
-    let recording = canvas.cut_title;
-    let kind_col = river_color(row.kind, t);
-    let band_y = b - 4. - band / 2.;
-    if let Some((above, below, top, bottom)) = spine {
-        let mid = b - 4.;
-        if above {
-            canvas.vhair(spine_x, top, (mid - 9. - top).max(0.), t.band);
-        }
-        if below {
-            canvas.vhair(spine_x, mid + 9., (bottom - mid - 9.).max(0.), t.band);
-        }
-    }
-    canvas.rrect(
-        IX - 8.,
-        band_y,
-        IW + 16.,
-        band,
-        5.,
-        al(kind_col, BAND_ALPHA),
-    );
-    canvas.rect(IX - 8., band_y + 3., 1., band - 6., kind_col);
-    river_icon(canvas, f, row.kind, spine_x, b - 4., t);
-    let when = row.time_label(now);
-    if !when.is_empty() {
-        single(canvas, f, &when, IX, b, 62., 9.5, t.quiet, t);
-    }
-    let mut x = IX + 88.;
-    let mood = row.mood();
-    if !mood.is_empty() {
-        let st = sans(10., t.regular);
-        let w = canvas.text_slanted(f, mood, x, b, st, t.quiet, A::L, ITALIC_SLANT);
-        x += w + 6.;
-    }
-    canvas.cut_title = "Monologue";
-    let full = format!(
-        "{}{}{}",
-        if when.is_empty() {
-            String::new()
-        } else {
-            format!("{when} · ")
-        },
-        if mood.is_empty() {
-            String::new()
-        } else {
-            format!("{mood} · ")
-        },
-        row.picture_text()
-    );
-    single_as(
-        canvas,
-        f,
-        &row.picture_text(),
-        &full,
-        x,
-        b,
-        IX + IW - x,
-        11.5,
-        t.ink,
-        t,
-    );
-    canvas.cut_title = recording;
-}
-fn draw_pass(
-    c: &Composition,
-    width: u32,
-    available_height: u32,
-    theme: Theme,
-    open: Open,
-    narrow: bool,
-    cell_h: u32,
-    pass: Pass,
-) -> Option<(Option<tiny_skia::Pixmap>, Metrics, Option<PagePlan>)> {
     if width < 160 || available_height < 120 {
         return None;
     }
@@ -4004,43 +3707,6 @@ fn draw_pass(
         maxh
     };
     let key_gap = S3 * maxh / available_height as f32;
-    // A page on a pane of known cells lays its rows on whole cells: the body starts on a cell
-    // boundary and a row (or a cell of Changes lines) is one cell tall, so a `j` moves whole bands
-    // and every band but the new one is the same picture as before.
-    let aligned = (page && cell_h > 0).then(|| {
-        let scale = (width as f32 / W).min(available_height as f32 / maxh);
-        let cell = cell_h as f32 / scale;
-        let (pitch, lines) = if open.threads {
-            let mut cells = (ROW_PITCH / cell).round().max(1.);
-            while cells * cell < ALIGNED_ROW_MIN {
-                cells += 1.;
-            }
-            (cells * cell, 1)
-        } else {
-            let lines = (cell / DRILL_LINE)
-                .round()
-                .min((cell / ALIGNED_LINE_MIN).floor())
-                .max(1.);
-            (cell / lines, lines as usize)
-        };
-        let body_top_px = (((M + P + MONOLOGUE_H) * scale / cell_h as f32) - 0.001)
-            .ceil()
-            .max(0.) as u32
-            * cell_h;
-        let fitted_width = (W * scale).round().min(width as f32) as u32;
-        Aligned {
-            cell,
-            cell_px: cell_h,
-            pitch,
-            band: ROW_BAND.min(pitch - ROW_GAP),
-            lines,
-            body_top: body_top_px as f32 / scale,
-            body_top_px,
-            scale,
-            fitted_width,
-            left: (width - fitted_width) / 2,
-        }
-    });
     // The height the figure keeps while cards can still give way: the closed pane's, or the least
     // its layout needs (the expanded chart for `i`, the full ring, the quotas row), whichever is
     // less.
@@ -4095,37 +3761,7 @@ fn draw_pass(
     // A page is one card to the bottom of the pane. It shows the rows that fit and scrolls through
     // the rest with j and k: (the first row shown, the most the first row may be, a footer).
     let page_h = if page { maxh - M - key_gap } else { 0. };
-    // Aligned: rows below the body's top down to the card's padding, less a cell for the footer
-    // when not all of them fit. A `j` is one step: a row of the Monologue, a cell of Changes lines.
-    // The last step may show blank lines under the last one, so no step moves less than a cell.
-    let aligned_rows = aligned.map(|al| {
-        let room = M + page_h - P - al.body_top;
-        let total = if open.threads {
-            c.river.len()
-        } else {
-            drill_lines.len()
-        };
-        let all = (room / al.pitch + 0.001).max(0.) as usize;
-        if total <= all {
-            return (total, 0, 0, String::new(), total);
-        }
-        let least = if open.threads {
-            PAGE_MIN_ROWS
-        } else {
-            DRILL_MIN_LINES - 1
-        };
-        let fit = (((room - al.cell) / al.pitch + 0.001).max(0.) as usize).max(least);
-        let fit = (fit / al.lines * al.lines).max(al.lines).min(total);
-        let steps = (total - fit).div_ceil(al.lines);
-        let from = open.scroll.min(steps) * al.lines;
-        let shown = fit.min(total - from);
-        (shown, from, steps, scroll_footer(from, shown, total), fit)
-    });
-    // Where an aligned page's footer goes: under the most rows a step shows, so it never moves.
-    let page_fit = aligned_rows.as_ref().map_or(0, |r| r.4);
-    let (page_rows, page_from, page_scroll_max, page_footer) = if let Some(rows) = aligned_rows {
-        (rows.0, rows.1, rows.2, rows.3)
-    } else if open.threads {
+    let (page_rows, page_from, page_scroll_max, page_footer) = if open.threads {
         let spine = page_h - P * 2. - MONOLOGUE_H;
         let total = c.river.len();
         let all = ((spine + ROW_GAP) / ROW_PITCH + 0.001).max(0.) as usize;
@@ -4159,7 +3795,7 @@ fn draw_pass(
             .skip(page_from)
             .take(page_rows)
             .cloned()
-            .chain((!page_footer.is_empty() && aligned.is_none()).then(|| page_footer.clone()))
+            .chain((!page_footer.is_empty()).then(|| page_footer.clone()))
             .collect()
     } else if drill_lines.is_empty() {
         vec![]
@@ -4204,29 +3840,9 @@ fn draw_pass(
         ((maxh - top_core - tail_core - key_gap).max(0.), empty_help)
     };
     let height = maxh;
-    let mut canvas = if pass == Pass::Measure {
-        let mut dry = Canvas::dry();
-        dry.record = true;
-        dry
-    } else {
-        Canvas::new(W, height)
-    };
+    let mut canvas = Canvas::new(W, height);
     canvas.output_scale = (width as f32 / W).min(available_height as f32 / height);
     canvas.background(t);
-    if aligned.is_some() && !canvas.dry {
-        // The page's ground is the same all the way down (its middle row, repeated), so a row
-        // looks the same wherever it scrolls to.
-        let stride = canvas.pm.width() as usize * 4;
-        let rows = canvas.pm.height() as usize;
-        let data = canvas.pm.data_mut();
-        let mid = data[rows / 2 * stride..][..stride].to_vec();
-        for row in data.chunks_mut(stride) {
-            row.copy_from_slice(&mid);
-        }
-    }
-    // A page's slabs. Only a full pass paints its rows into the picture.
-    let mut slabs: Vec<(u32, std::sync::Arc<Slab>)> = vec![];
-    let rows_painted = pass == Pass::Full;
     let mut y = M;
     let mut cards: Vec<CardRegion> = vec![];
     let mut overdrawn: Vec<(&'static str, f32, f32)> = vec![];
@@ -4707,7 +4323,7 @@ fn draw_pass(
                 drill_rows.len()
             },
         ));
-        panel_with(&mut canvas, y, extra_h, t, aligned.is_some());
+        panel(&mut canvas, y, extra_h, t);
         let mut b = y + P;
         if open.changes {
             // The page: a heading and what the page holds, then each change with what it
@@ -4728,40 +4344,7 @@ fn draw_pass(
             );
             b += MONOLOGUE_H;
         }
-        let theme_name = format!("{theme:?}");
-        if let (Some(al), true) = (aligned, open.changes) {
-            // Each line centred in its pitch; a cell holds `al.lines` of them.
-            let base = (al.pitch - DRILL_LINE) / 2. + 12.;
-            let was = (canvas.dry, canvas.record);
-            if !rows_painted {
-                (canvas.dry, canvas.record) = (true, true);
-            }
-            for (j, line) in drill_rows.iter().enumerate() {
-                let at = al.body_top + j as f32 * al.pitch + base;
-                label(&mut canvas, f, line, IX, at, 11.5, t.ink, t.regular);
-            }
-            (canvas.dry, canvas.record) = was;
-            if pass == Pass::Measure {
-                for (cell, lines) in drill_rows.chunks(al.lines).enumerate() {
-                    let key = key_of((
-                        "changes",
-                        lines,
-                        &theme_name,
-                        al.fitted_width,
-                        al.cell_px,
-                        al.pitch.to_bits(),
-                        al.scale.to_bits(),
-                    ));
-                    let made = slab(key, al.fitted_width, al.cell_px, al.cell, |cv| {
-                        for (i, line) in lines.iter().enumerate() {
-                            let at = i as f32 * al.pitch + base;
-                            label(cv, f, line, IX, at, 11.5, t.ink, t.regular);
-                        }
-                    });
-                    slabs.push((al.body_top_px + cell as u32 * al.cell_px, made));
-                }
-            }
-        } else if open.changes || open.dreams || open.agents {
+        if open.changes || open.dreams || open.agents {
             for line in &drill_rows {
                 b += 12.;
                 label(&mut canvas, f, line, IX, b, 11.5, t.ink, t.regular);
@@ -4797,68 +4380,7 @@ fn draw_pass(
                 );
             }
             let spine_x = IX + 72.;
-            if let Some(al) = aligned {
-                // The spine runs into each row from the one above and on to the one below, so a
-                // row is the same picture at the top of the page as anywhere else.
-                let total = c.river.len();
-                let was = (canvas.dry, canvas.record);
-                if !rows_painted {
-                    (canvas.dry, canvas.record) = (true, true);
-                }
-                let cells = (al.pitch / al.cell).round() as u32;
-                let shown = c
-                    .river
-                    .iter()
-                    .enumerate()
-                    .skip(page_from)
-                    .take(thread_bands);
-                for (j, (ri, row)) in shown.enumerate() {
-                    let top = al.body_top + j as f32 * al.pitch;
-                    let ends = (ri > 0, ri + 1 < total);
-                    monologue_row(
-                        &mut canvas,
-                        f,
-                        c.now,
-                        row,
-                        top + al.pitch / 2. + 4.,
-                        al.band,
-                        spine_x,
-                        Some((ends.0, ends.1, top, top + al.pitch)),
-                        t,
-                    );
-                    if pass == Pass::Measure {
-                        let key = key_of((
-                            "monologue",
-                            (row.time_label(c.now), row.mood(), row.picture_text()),
-                            (format!("{:?}", row.kind), ends),
-                            &theme_name,
-                            (al.fitted_width, al.cell_px, cells),
-                            (al.pitch.to_bits(), al.band.to_bits(), al.scale.to_bits()),
-                        ));
-                        let made = slab(key, al.fitted_width, cells * al.cell_px, al.pitch, |cv| {
-                            monologue_row(
-                                cv,
-                                f,
-                                c.now,
-                                row,
-                                al.pitch / 2. + 4.,
-                                al.band,
-                                spine_x,
-                                Some((ends.0, ends.1, 0., al.pitch)),
-                                t,
-                            )
-                        });
-                        slabs.push((al.body_top_px + j as u32 * cells * al.cell_px, made));
-                    }
-                }
-                (canvas.dry, canvas.record) = was;
-            }
-            let rows: Vec<_> = c
-                .river
-                .iter()
-                .skip(page_from)
-                .take(if aligned.is_some() { 0 } else { thread_bands })
-                .collect();
+            let rows: Vec<_> = c.river.iter().skip(page_from).take(thread_bands).collect();
             // The first baseline sits half a band plus a cap-height below the first band's top.
             let b = top + ROW_BAND / 2. + 4.;
             // The spine runs between the icons, never through them, and ends at the last one.
@@ -4923,7 +4445,7 @@ fn draw_pass(
                 canvas.cut_title = recording;
                 b += ROW_PITCH;
             }
-            if !page_footer.is_empty() && aligned.is_none() {
+            if !page_footer.is_empty() {
                 let line_top = y + extra_h - P - DRILL_LINE;
                 label(
                     &mut canvas,
@@ -4940,41 +4462,6 @@ fn draw_pass(
             for d in c.dream.queue.iter().take(4) {
                 single(&mut canvas, f, string(&d["line"]), IX, b, IW, 12., t.ink, t);
                 b += 38.;
-            }
-        }
-        // An aligned page's footer: one cell of its own under the rows.
-        if let Some(al) = aligned.filter(|_| !page_footer.is_empty()) {
-            let base = (al.cell - DRILL_LINE) / 2. + 12.;
-            let top = al.body_top + page_fit as f32 * al.pitch;
-            let was = (canvas.dry, canvas.record);
-            if !rows_painted {
-                (canvas.dry, canvas.record) = (true, true);
-            }
-            label(
-                &mut canvas,
-                f,
-                &page_footer,
-                IX,
-                top + base,
-                11.5,
-                t.quiet,
-                t.regular,
-            );
-            (canvas.dry, canvas.record) = was;
-            if pass == Pass::Measure {
-                let key = key_of((
-                    "footer",
-                    &page_footer,
-                    &theme_name,
-                    al.fitted_width,
-                    al.cell_px,
-                    al.scale.to_bits(),
-                ));
-                let made = slab(key, al.fitted_width, al.cell_px, al.cell, |cv| {
-                    label(cv, f, &page_footer, IX, base, 11.5, t.quiet, t.regular)
-                });
-                let cells = (page_fit as f32 * al.pitch / al.cell).round() as u32;
-                slabs.push((al.body_top_px + cells * al.cell_px, made));
             }
         }
         y += extra_h + card_gap;
@@ -5303,76 +4790,30 @@ fn draw_pass(
             t,
         );
     }
+    let raw = image::RgbaImage::from_raw(
+        canvas.pm.width(),
+        canvas.pm.height(),
+        canvas.pm.data().to_vec(),
+    )?;
     let scale = (width as f32 / W).min(available_height as f32 / height);
     let fitted_width = (W * scale).round().min(width as f32) as u32;
     let fitted_height = available_height;
     let content_h = (height * scale).round().min(available_height as f32) as u32;
+    let fitted = image::imageops::resize(
+        &raw,
+        fitted_width,
+        content_h.max(1),
+        image::imageops::FilterType::Lanczos3,
+    );
     let left = (width - fitted_width) / 2;
-    let pm = if pass == Pass::Measure {
-        None
-    } else {
-        let raw = image::RgbaImage::from_raw(
-            canvas.pm.width(),
-            canvas.pm.height(),
-            canvas.pm.data().to_vec(),
-        )?;
-        let fitted = image::imageops::resize(
-            &raw,
-            fitted_width,
-            content_h.max(1),
-            image::imageops::FilterType::Lanczos3,
-        );
-        let mut backdrop = Canvas::new(width as f32 / S, fitted_height as f32 / S);
-        backdrop.background(t);
-        if aligned.is_some() {
-            // Flat all the way down, as the page's own ground is.
-            let stride = backdrop.pm.width() as usize * 4;
-            let rows = backdrop.pm.height() as usize;
-            let data = backdrop.pm.data_mut();
-            let mid = data[rows / 2 * stride..][..stride].to_vec();
-            for row in data.chunks_mut(stride) {
-                row.copy_from_slice(&mid);
-            }
-        }
-        let mut output =
-            image::RgbaImage::from_raw(width, fitted_height, backdrop.pm.data().to_vec())?;
-        image::imageops::overlay(&mut output, &fitted, i64::from(left), 0);
-        Some(tiny_skia::Pixmap::from_vec(
-            output.into_raw(),
-            tiny_skia::IntSize::from_wh(width, fitted_height)?,
-        )?)
-    };
-    let plan = aligned
-        .filter(|_| pass == Pass::Measure)
-        .map(|al| PagePlan {
-            chrome_key: key_of((
-                "chrome",
-                (width, available_height, cell_h, format!("{theme:?}")),
-                (open.threads, open.changes, c.river.is_empty()),
-                if open.changes {
-                    changes_note(c)
-                } else {
-                    String::new()
-                },
-                (maxh.to_bits(), page_h.to_bits()),
-                // Whatever else the chrome shows, by its words and where they sit: a heading or a
-                // card above the rows that changes makes a new chrome.
-                canvas
-                    .runs
-                    .iter()
-                    .filter(|r| r.1 < al.body_top)
-                    .map(|r| (r.0.to_bits(), r.1.to_bits(), &r.4))
-                    .collect::<Vec<_>>(),
-                canvas
-                    .panels
-                    .iter()
-                    .map(|p| (p.0.to_bits(), p.1.to_bits()))
-                    .collect::<Vec<_>>(),
-            )),
-            slabs,
-            ground_y: al.body_top_px,
-            left: al.left,
-        });
+    let mut backdrop = Canvas::new(width as f32 / S, fitted_height as f32 / S);
+    backdrop.background(t);
+    let mut output = image::RgbaImage::from_raw(width, fitted_height, backdrop.pm.data().to_vec())?;
+    image::imageops::overlay(&mut output, &fitted, i64::from(left), 0);
+    let pm = tiny_skia::Pixmap::from_vec(
+        output.into_raw(),
+        tiny_skia::IntSize::from_wh(width, fitted_height)?,
+    )?;
     let font_fallbacks = f.used.borrow().clone();
     Some((
         pm,
@@ -5428,7 +4869,6 @@ fn draw_pass(
             height,
             question_lines: question,
         },
-        plan,
     ))
 }
 

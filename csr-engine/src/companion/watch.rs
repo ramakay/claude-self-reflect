@@ -833,15 +833,30 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                     if cut.0 != pane.placed {
                         cut = (pane.placed.clone(), kitty::bands(&pane.placed));
                     }
-                    let (out, next) = kitty::repaint_frame(
+                    print!(
+                        "{}",
+                        kitty::repaint_pictures(
+                            drawn.as_ref(),
+                            cols as usize,
+                            rows as usize,
+                            &written,
+                            &cut.1
+                        )
+                    );
+                    let ids = kitty::picture_ids(
                         drawn.as_ref(),
                         cols as usize,
                         rows as usize,
                         &written,
                         &cut.1,
                     );
-                    print!("{out}");
-                    drawn = Some(next);
+                    drawn = Some(Drawn {
+                        cols: cols as usize,
+                        rows: rows as usize,
+                        written,
+                        placed: cut.1.clone(),
+                        ids,
+                    });
                 } else {
                     drawn = None;
                     print!("{}", boundary.card(cols as usize, now));
@@ -1267,7 +1282,8 @@ mod reload_regressions {
             cols: 1,
             rows: 1,
             written: vec!["old".into()],
-            ..Default::default()
+            placed: vec![],
+            ids: vec![],
         });
         let mut resumed = false;
         let recovered = recover_terminal(&epoch, &mut seen, &mut drawn, || {

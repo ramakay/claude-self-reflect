@@ -598,9 +598,6 @@ pub struct FreshPlot {
 pub struct Canvas {
     pub pm: Pixmap,
     pub dry: bool,
-    /// With `dry`: still record the text runs and cut rows, paint nothing. A page's rows are
-    /// measured this way in the frame and painted on their own.
-    pub record: bool,
     /// Final output pixels per logical point (before supersampling/downsampling).
     pub output_scale: f32,
     pub quota_gauges: Vec<QuotaGauge>,
@@ -960,7 +957,6 @@ impl Canvas {
         Canvas {
             pm: Pixmap::new((w_pt * S).round() as u32, (h_pt * S).round() as u32).unwrap(),
             dry: false,
-            record: false,
             output_scale: S,
             quota_gauges: Vec::new(),
             note_rows: Vec::new(),
@@ -974,15 +970,10 @@ impl Canvas {
             panels: Vec::new(),
         }
     }
-    /// Whether text runs and cut rows are being recorded.
-    pub fn records(&self) -> bool {
-        !self.dry || self.record
-    }
     pub fn dry() -> Canvas {
         Canvas {
             pm: Pixmap::new(1, 1).unwrap(),
             dry: true,
-            record: false,
             output_scale: S,
             quota_gauges: Vec::new(),
             note_rows: Vec::new(),
@@ -1259,7 +1250,7 @@ impl Canvas {
     ) -> f32 {
         let (glyphs, adv) = f.place(s, st, 1.);
         let adv_pt = if s.is_empty() { 0. } else { adv / S - st.track };
-        if self.dry && !self.record {
+        if self.dry {
             return adv_pt;
         }
         let ox = match anchor {
@@ -1280,9 +1271,6 @@ impl Canvas {
                 base + st.size * 0.2,
                 s.to_owned(),
             ));
-        }
-        if self.dry {
-            return adv_pt;
         }
         let (w, h) = (self.pm.width() as i32, self.pm.height() as i32);
         let data = self.pm.data_mut();
@@ -1398,7 +1386,6 @@ pub fn contact(f: &Fonts, tiles: &[(String, Pixmap, String)], path: &str, bg: Rg
     let mut c = Canvas {
         pm: Pixmap::new(width, height).unwrap(),
         dry: false,
-        record: false,
         output_scale: S,
         quota_gauges: Vec::new(),
         note_rows: Vec::new(),

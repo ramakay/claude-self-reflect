@@ -2091,7 +2091,13 @@ fn the_popup_repaints_once_on_open_and_once_on_close() {
     };
     let (written, closed) = shot(&mut pane);
     let written_closed = written.clone();
-    let drawn = kitty::repaint_frame(None, cols, rows, &written, &closed).1;
+    let drawn = kitty::Drawn {
+        cols,
+        rows,
+        written: written.clone(),
+        placed: closed.clone(),
+        ids: vec![],
+    };
     // Every observation row is a click target in the picture.
     let places = pane
         .instrument_metrics
@@ -2119,7 +2125,13 @@ fn the_popup_repaints_once_on_open_and_once_on_close() {
     let opened = kitty::repaint_pictures(Some(&drawn), cols, rows, &written, &open);
     assert!(!opened.contains("\x1b[2J"), "no full clear on open");
     assert!(opened.contains("\x1b_G"), "the picture is sent");
-    let drawn_open = kitty::repaint_frame(Some(&drawn), cols, rows, &written, &open).1;
+    let drawn_open = kitty::Drawn {
+        cols,
+        rows,
+        written: written.clone(),
+        placed: open.clone(),
+        ids: vec![],
+    };
     let (written2, open2) = shot(&mut pane);
     assert_eq!(
         kitty::repaint_pictures(Some(&drawn_open), cols, rows, &written2, &open2),

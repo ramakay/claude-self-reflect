@@ -8,7 +8,7 @@ use csr_engine::companion::{
     paths::Paths,
     render::{
         instrument::{Metrics, CARD_REGISTRY, LAYOUT_WIDTH, SHOULD_BE_KINDS, STACKABLE},
-        kitty::{bands, repaint_frame, set_cell_override, Drawn, Placement},
+        kitty::{bands, picture_ids, repaint_pictures, set_cell_override, Drawn, Placement},
         theme::Theme,
     },
 };
@@ -505,15 +505,10 @@ fn violations(
                 "picture rows over the key row",
             ));
         }
-        let height = p
-            .png
-            .pixmap()
-            .map(|pm| pm.height())
-            .or_else(|| image::load_from_memory(&p.png).ok().map(|img| img.height()));
-        if let Some(height) = height {
+        if let Ok(img) = image::load_from_memory(&p.png) {
             let limit = (rows.saturating_sub(1) as u32 * cell.1) as f32;
-            if p.rows > 1 && height as f32 > limit {
-                bad.push(redo(1, &what, height as f32, limit, "picture px"));
+            if p.rows > 1 && img.height() as f32 > limit {
+                bad.push(redo(1, &what, img.height() as f32, limit, "picture px"));
             }
         }
     }
@@ -870,7 +865,7 @@ fn pane_contract_pictures() {
                             "light"
                         }
                     );
-                    fs::write(dir.join(name), &p.png[..]).unwrap();
+                    fs::write(dir.join(name), &p.png).unwrap();
                 }
             }
         }
@@ -1240,10 +1235,6 @@ struct Step {
     delete_before_place: bool,
     clears: bool,
     ms: f64,
-    /// The whole step: the frame, the bands cut from it and the repaint string.
-    step_ms: f64,
-    /// Pictures placed again from an image already up, with no pixels sent (`a=p`).
-    placed_only: usize,
 }
 /// One frame of `pane` through the transport the watch loop uses, after `drawn`.
 fn send(pane: &mut Pane, cols: usize, rows: usize, drawn: &mut Option<Drawn>) -> Step {
@@ -1259,9 +1250,15 @@ fn send(pane: &mut Pane, cols: usize, rows: usize, drawn: &mut Option<Drawn>) ->
     let written = pane.frame(cols, rows, NOW);
     let ms = start.elapsed().as_secs_f64() * 1000.;
     let cut = bands(&pane.placed);
-    let (out, next) = repaint_frame(drawn.as_ref(), cols, rows, &written, &cut);
-    let step_ms = start.elapsed().as_secs_f64() * 1000.;
-    *drawn = Some(next);
+    let out = repaint_pictures(drawn.as_ref(), cols, rows, &written, &cut);
+    let ids = picture_ids(drawn.as_ref(), cols, rows, &written, &cut);
+    *drawn = Some(Drawn {
+        cols,
+        rows,
+        written,
+        placed: cut.clone(),
+        ids,
+    });
     let replaced = out
         .split("\x1b_Ga=T,")
         .skip(1)
@@ -1275,7 +1272,7 @@ fn send(pane: &mut Pane, cols: usize, rows: usize, drawn: &mut Option<Drawn>) ->
         })
         .filter(|id| on_screen.contains(id))
         .count();
-    let last_place = out.rfind("\x1b_Ga=T").max(out.rfind("\x1b_Ga=p"));
+    let last_place = out.rfind("\x1b_Ga=T");
     let first_delete = out.find("\x1b_Ga=d");
     Step {
         bytes: out.len(),
@@ -1286,8 +1283,6 @@ fn send(pane: &mut Pane, cols: usize, rows: usize, drawn: &mut Option<Drawn>) ->
         delete_before_place: matches!((first_delete, last_place), (Some(d), Some(p)) if d < p),
         clears: out.contains("\x1b[2J") || out.contains("a=d,d=A"),
         ms,
-        step_ms,
-        placed_only: out.matches("\x1b_Ga=p,").count(),
     }
 }
 /// The owner's session with a Monologue longer than any pane: thirty dreams in this session.
@@ -1378,8 +1373,8 @@ fn a_page_scroll_places_new_bands_before_it_deletes_the_old() {
             pane.key("j");
             let s = send(&mut pane, cols, rows, &mut drawn);
             eprintln!(
-                "scroll {page} j#{step}: {} bytes, {} bands, {} sent, {} placed only, {} replaced in place, {} deleted, delete before place: {}, clear: {}, frame {:.1} ms, step {:.1} ms",
-                s.bytes, s.bands, s.sent, s.placed_only, s.replaced, s.deleted, s.delete_before_place, s.clears, s.ms, s.step_ms
+                "scroll {page} j#{step}: {} bytes, {} bands, {} sent, {} replaced in place, {} deleted, delete before place: {}, clear: {}, frame {:.1} ms",
+                s.bytes, s.bands, s.sent, s.replaced, s.deleted, s.delete_before_place, s.clears, s.ms
             );
             assert!(
                 !s.delete_before_place,
@@ -1390,78 +1385,20 @@ fn a_page_scroll_places_new_bands_before_it_deletes_the_old() {
                 s.replaced, 0,
                 "{page} j#{step}: a band is replaced under its own id"
             );
+            assert_eq!(
+                s.deleted, s.sent,
+                "{page} j#{step}: each old band goes once its new one is up"
+            );
             assert!(
-                s.sent + s.placed_only <= s.bands,
+                s.sent <= s.bands,
                 "{page} j#{step}: more pictures than bands"
             );
-            assert!(
-                s.deleted <= s.sent + s.placed_only + 64,
-                "{page} j#{step}: more deletes than placements and frees"
-            );
-            moved += s.sent + s.placed_only;
+            moved += s.sent;
         }
         assert!(
             moved > 0,
             "{page}: three j presses moved nothing; the probe proves nothing"
         );
-        set_cell_override(None);
-    }
-}
-/// The cost of a scroll step: on the owner's pane a `j` on the Monologue (`t`) and Changes (`l`)
-/// pages moves the picture by whole bands, so it sends at most two (the row that comes into view
-/// and the footer) and places the rest again from images already up. A `k` back sends none.
-/// Run with `--nocapture` for the per-step receipt.
-#[test]
-fn a_page_scroll_step_uploads_at_most_two_bands() {
-    for (page, home) in [
-        ("t", long_monologue as fn() -> (tempfile::TempDir, Paths)),
-        ("l", long_changes),
-    ] {
-        let (cols, rows, cell) = (35, 20, (26, 58));
-        let (_dir, mut pane) = live(home, &[page], (cols, rows, cell));
-        set_cell_override(Some(cell));
-        let mut drawn = None;
-        let first = send(&mut pane, cols, rows, &mut drawn);
-        let max = pane
-            .instrument_metrics
-            .as_ref()
-            .and_then(|m| m.page_scroll_max)
-            .unwrap_or(0);
-        assert!(
-            max >= 3 && first.bands > 4,
-            "{page}: the page must scroll three steps at {cols}x{rows}; the pin proves nothing"
-        );
-        let shots = std::env::var_os("CSR_PIN_SHOTS").map(std::path::PathBuf::from);
-        let shoot = |pane: &Pane, n: usize| {
-            if let (Some(dir), Some(p)) = (&shots, pane.placed.first()) {
-                std::fs::create_dir_all(dir).unwrap();
-                std::fs::write(dir.join(format!("{page}-{n}.png")), &p.png[..]).unwrap();
-            }
-        };
-        shoot(&pane, 0);
-        for (step, key) in ["j", "j", "j", "k"].into_iter().enumerate() {
-            pane.key(key);
-            let s = send(&mut pane, cols, rows, &mut drawn);
-            shoot(&pane, step + 1);
-            eprintln!(
-                "pin {page} {key}#{}: {} bytes, {} bands, {} sent, {} placed only, {} deleted, frame {:.1} ms, step {:.1} ms",
-                step + 1, s.bytes, s.bands, s.sent, s.placed_only, s.deleted, s.ms, s.step_ms
-            );
-            let most = if key == "k" { 0 } else { 2 };
-            assert!(
-                s.sent <= most,
-                "{page} {key}#{}: {} bands uploaded, at most {most} allowed",
-                step + 1,
-                s.sent
-            );
-            assert!(
-                s.placed_only >= 2,
-                "{page} {key}#{}: the step moved nothing ({} placed again)",
-                step + 1,
-                s.placed_only
-            );
-            assert!(!s.delete_before_place && !s.clears && s.replaced == 0);
-        }
         set_cell_override(None);
     }
 }
