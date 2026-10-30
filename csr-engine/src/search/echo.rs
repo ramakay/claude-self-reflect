@@ -270,6 +270,18 @@ pub fn is_logged_query_copy(
     LOGGED_ARG_TAIL.is_match(&content[start..offset])
 }
 
+/// Whether `content` holds the whole `query`, as words (case and punctuation
+/// aside), whoever wrote the row. A query under [`MIN_COPY_QUERY_CHARS`]
+/// characters or [`MIN_COPY_QUERY_WORDS`] words abstains. The caller decides
+/// whether a copy matters: in a session that ran the eval rig, a row that
+/// quotes the audit question is the rig's own copy of it.
+pub fn quotes_query(content: &str, query: &str) -> bool {
+    let (needle, _) = fold(query);
+    needle.chars().count() >= MIN_COPY_QUERY_CHARS
+        && needle.split(' ').count() >= MIN_COPY_QUERY_WORDS
+        && find_folded(content, &needle).is_some()
+}
+
 /// The reason a transcript row is left out of recall, or `None` to keep it.
 /// `author` is the row's provenance author (`None`: no provenance row, a legacy
 /// chunk). A CSR emission is looked for only in what a person or Claude wrote:

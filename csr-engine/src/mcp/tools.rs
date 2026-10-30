@@ -2893,6 +2893,39 @@ fn drop_synthetic_rows(
     dropped
 }
 
+/// Sink below every other row the transcript rows that are eval-rig material
+/// by provenance ([`super::synthetic::rig_sunk_ids`]): a marked row of a
+/// session that ran the bench/eval rig, or a row of such a session that
+/// quotes the query. Stable, never dropping: a sunk row still answers when
+/// nothing else matches. Stored reflections are never judged here.
+fn sink_rig_rows(
+    storage: &Storage,
+    enriched: &mut [EnrichedResult],
+    reflection_tags: &HashMap<String, Vec<String>>,
+    query: &str,
+) {
+    if !super::synthetic::filter_enabled() {
+        return;
+    }
+    let sink_start = Instant::now();
+    let sunk = {
+        let candidates: Vec<super::synthetic::SinkRef<'_>> = enriched
+            .iter()
+            .filter(|e| !reflection_tags.contains_key(&e.chunk.id))
+            .map(|e| super::synthetic::SinkRef {
+                id: &e.chunk.id,
+                conversation_id: &e.chunk.conversation_id,
+                content: &e.chunk.content,
+            })
+            .collect();
+        super::synthetic::rig_sunk_ids(storage, &candidates, query)
+    };
+    super::stage_timing::stage("synthetic_sink", sink_start);
+    if !sunk.is_empty() {
+        enriched.sort_by_key(|e| sunk.contains(&e.chunk.id));
+    }
+}
+
 /// The cross-encoder stage of hybrid recall: score the pool (first
 /// [`CE_POOL`] fused chunks plus the S1 top sessions' representatives) and
 /// return the new session order with its score summary. Fails open: with no
@@ -4080,6 +4113,7 @@ async fn reflect_gather_pass(
     // out-of-family sink so that sink, which is the stronger statement about
     // where a row belongs, keeps the last word on order.
     sink_non_answers(&mut enriched, query);
+    sink_rig_rows(storage, &mut enriched, &reflection_tags, query);
     // Under an explicit project filter, chunk search is already restricted to
     // the project family, but reflections and stories are not: RRF places them
     // by rank, so a cosine-0.12 story from another project could sit above
@@ -17172,5 +17206,94 @@ mod representative_tests {
         assert!(final_ce_summary(&[], &scores).is_none());
         let nan: HashMap<String, f32> = [("a".to_string(), f32::NAN)].into_iter().collect();
         assert!(final_ce_summary(&["a"], &nan).is_none());
+    }
+
+    fn rig_row(conversation: &str, seq: usize, text: &str) -> EnrichedResult {
+        EnrichedResult {
+            score: 1.0,
+            chunk: crate::import::ConversationChunk {
+                id: format!("{conversation}-{seq}"),
+                conversation_id: conversation.into(),
+                project_name: "p".into(),
+                timestamp: "2026-10-01T00:00:00Z".into(),
+                content: text.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::ToolResult,
+                seq,
+                is_sidechain: false,
+            },
+            resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
+            validity_demoted: false,
+        }
+    }
+
+    /// An assistant chunk holding one Bash call.
+    fn rig_call(seq: usize, text: &str) -> EnrichedResult {
+        let mut row = rig_row("rig", seq, text);
+        row.chunk.author = crate::provenance::Speaker::Assistant;
+        row
+    }
+
+    fn rig_store(rows: &[&EnrichedResult]) -> Storage {
+        let storage = Storage::open_memory().unwrap();
+        for row in rows {
+            storage
+                .insert_chunk_with_source(&row.chunk, &vec![0.1; 384], "conversation")
+                .unwrap();
+            storage
+                .insert_chunk_provenance(
+                    &row.chunk.id,
+                    &crate::provenance::ChunkProvenance {
+                        author: row.chunk.author,
+                        source_conv_id: row.chunk.conversation_id.clone(),
+                        supersedes: None,
+                    },
+                )
+                .unwrap();
+        }
+        storage
+    }
+
+    fn rig_ids(rows: &[EnrichedResult]) -> Vec<&str> {
+        rows.iter().map(|row| row.chunk.id.as_str()).collect()
+    }
+
+    #[test]
+    fn synth_sink_rig_rows_demotes_in_place_and_leaves_other_queries_alone() {
+        let query = "why do hooks use catch-all wrappers";
+        let planted = "why do hooks use catch-all wrappers so they never block claude code? \
+            [synthetic re-ask cycle 3] Synthetic E3 test answer.";
+        // A session that ran the rig twice among forty Bash calls.
+        let mut rig: Vec<EnrichedResult> = vec![
+            rig_call(0, "[Bash: csr-engine bench --probe --db-path /x/db]"),
+            rig_call(1, "[Bash: python3 s3/probe_ab.py compare a b]"),
+        ];
+        rig.extend((2..42).map(|seq| rig_call(seq, "[Bash: ls]")));
+        let candidate = rig_row("rig", 50, planted);
+        let real = rig_row("real", 0, planted);
+        let answer = rig_row("answer", 0, "hooks wrap their bodies so a bug never blocks");
+        let mut all: Vec<&EnrichedResult> = rig.iter().collect();
+        all.extend([&candidate, &real, &answer]);
+        let storage = rig_store(&all);
+        let tags = HashMap::new();
+
+        // Page order from the ranker: the planted row first.
+        let mut page = vec![candidate.clone(), real.clone(), answer.clone()];
+        sink_rig_rows(&storage, &mut page, &tags, query);
+        assert_eq!(rig_ids(&page), ["real-0", "answer-0", "rig-50"]);
+
+        // A query the rows do not hold: the page is untouched.
+        let mut page = vec![candidate.clone(), real.clone(), answer.clone()];
+        sink_rig_rows(&storage, &mut page, &tags, "how do I sort a vec");
+        assert_eq!(rig_ids(&page), ["rig-50", "real-0", "answer-0"]);
+
+        // A stored reflection with the same text is never judged.
+        let mut tagged = HashMap::new();
+        tagged.insert("rig-50".to_string(), vec!["reflection".to_string()]);
+        let mut page = vec![candidate.clone(), real.clone(), answer.clone()];
+        sink_rig_rows(&storage, &mut page, &tagged, query);
+        assert_eq!(rig_ids(&page), ["rig-50", "real-0", "answer-0"]);
     }
 }

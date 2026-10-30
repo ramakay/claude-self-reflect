@@ -1038,6 +1038,10 @@ pub struct EvalScanRow {
     /// The chunk's text when an assistant chunk holds a Bash tool call; the
     /// classifier reads the commands out of it. `None` for every other chunk.
     pub bash_text: Option<String>,
+    /// The session this chunk was sourced from (`chunk_provenance.source_conv_id`):
+    /// a sub-agent's chunks name the session that spawned it. `None` without a
+    /// provenance row.
+    pub source_conv: Option<String>,
 }
 
 /// Every chunk of `conversation_id`, as an [`EvalScanRow`]. `like_patterns`
@@ -1066,7 +1070,8 @@ pub fn conversation_eval_scan(
                 CASE WHEN p.author = 'assistant'
                       AND (c.content LIKE '%[Bash:%'
                            OR c.content LIKE '%external_agent_tool_call: Bash%')
-                     THEN c.content END
+                     THEN c.content END,
+                p.source_conv_id
          FROM chunks c LEFT JOIN chunk_provenance p ON p.chunk_id = c.id
          WHERE c.conversation_id = ?1"
     );
@@ -1082,6 +1087,7 @@ pub fn conversation_eval_scan(
             marked: row.get::<_, i64>(3)? != 0,
             output_marked: row.get::<_, i64>(4)? != 0,
             bash_text: row.get(5)?,
+            source_conv: row.get(6)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1120,7 +1126,8 @@ pub fn conversation_eval_scan_many(
                     CASE WHEN p.author = 'assistant'
                           AND (c.content LIKE '%[Bash:%'
                                OR c.content LIKE '%external_agent_tool_call: Bash%')
-                         THEN c.content END
+                         THEN c.content END,
+                    p.source_conv_id
              FROM chunks c LEFT JOIN chunk_provenance p ON p.chunk_id = c.id
              WHERE c.conversation_id IN ({marks})"
         );
@@ -1139,6 +1146,7 @@ pub fn conversation_eval_scan_many(
                     marked: row.get::<_, i64>(4)? != 0,
                     output_marked: row.get::<_, i64>(5)? != 0,
                     bash_text: row.get(6)?,
+                    source_conv: row.get(7)?,
                 },
             ))
         })?;

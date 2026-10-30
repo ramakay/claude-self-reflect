@@ -103,6 +103,13 @@ pub(crate) struct SessionVerdict {
     /// the output of a bench/eval/probe/measure call (normal sessions only)
     /// and runs that print CSR's own recall output.
     pub output_ids: HashSet<String>,
+    /// The session ran the rig (eval Bash calls reach [`MIN_EVAL_CALLS`]) even
+    /// when those calls are a small share of a long working session.
+    pub ran_rig: bool,
+    /// Chunks marked as rig material (a rig marker or a printed CSR response).
+    pub rig_ids: HashSet<String>,
+    /// The session that spawned this one, when its chunks name another.
+    pub parent: Option<String>,
 }
 
 fn call_pattern() -> &'static regex::Regex {
@@ -164,6 +171,12 @@ pub(crate) fn judge_session(rows: &[EvalScanRow]) -> SessionVerdict {
     let share_rule = marked >= MIN_MARKED_CHUNKS && marked * MARKED_SHARE_DENOM >= rows.len();
     let call_rule = eval_calls >= MIN_EVAL_CALLS && eval_calls * EVAL_CALL_SHARE_DENOM >= calls;
     let eval_session = share_rule || call_rule;
+    let ran_rig = eval_calls >= MIN_EVAL_CALLS;
+    let rig_ids: HashSet<String> = rows
+        .iter()
+        .filter(|row| row.marked || row.output_marked)
+        .map(|row| row.id.clone())
+        .collect();
     let mut output_ids = printed_output_ids(rows);
     if !eval_session {
         for row in rows {
@@ -179,7 +192,19 @@ pub(crate) fn judge_session(rows: &[EvalScanRow]) -> SessionVerdict {
     SessionVerdict {
         eval_session,
         output_ids,
+        ran_rig,
+        rig_ids,
+        parent: None,
     }
+}
+
+/// The session that spawned `conversation`: the other conversation its chunks
+/// were sourced from. `None` for a session that is its own source.
+fn parent_of(rows: &[EvalScanRow], conversation: &str) -> Option<String> {
+    rows.iter()
+        .filter_map(|row| row.source_conv.as_deref())
+        .find(|source| *source != conversation)
+        .map(str::to_string)
 }
 
 /// Ids of tool-result runs (consecutive chunk numbers) that print CSR
@@ -304,7 +329,9 @@ fn session_verdicts<'a>(
             continue;
         }
         let rows = scanned.remove(conversation).unwrap_or_default();
-        let verdict = Arc::new(judge_session(&rows));
+        let mut judged = judge_session(&rows);
+        judged.parent = parent_of(&rows, conversation);
+        let verdict = Arc::new(judged);
         held.insert(
             conversation.to_string(),
             (Instant::now(), Arc::clone(&verdict)),
@@ -312,6 +339,91 @@ fn session_verdicts<'a>(
         verdicts.insert(conversation, verdict);
     }
     verdicts
+}
+
+/// One candidate row for [`rig_sunk_ids`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SinkRef<'a> {
+    pub id: &'a str,
+    pub conversation_id: &'a str,
+    pub content: &'a str,
+}
+
+/// Ids among `candidates` that rank below every other row, because the session
+/// they belong to ran the eval rig and they are the rig's own material. Demote
+/// only: the caller keeps them, so they still answer when nothing else does.
+///
+/// A session is read once (cached with [`session_verdicts`]); a sub-agent also
+/// takes the standing of the session that spawned it, one level up. Two tiers:
+///
+/// - **Eval session** (the share or call rule of [`judge_session`]), or a
+///   sub-agent of one: a row marked as rig material (a `.testbed/` path, a
+///   `bench --probe` line, a printed CSR response) sinks. Its prose already left
+///   the pool; its file reads are not marked and stay.
+/// - **Ran the rig** (two or more eval calls, however small a share), or a
+///   sub-agent of such a session: a row that quotes the whole `query` sinks. In
+///   a session that measured recall, a row holding the audit question is the
+///   rig's copy of it (a probe prompt, a query list, an interview).
+///
+/// The text of the candidate is read only for the second tier, and only after
+/// the session earned it from its other chunks. The same text in a session that
+/// never ran the rig is untouched. `CSR_NO_SYNTHETIC_FILTER=1` turns it off.
+pub(crate) fn rig_sunk_ids(
+    storage: &Storage,
+    candidates: &[SinkRef<'_>],
+    query: &str,
+) -> HashSet<String> {
+    rig_sunk_ids_if(filter_enabled(), storage, candidates, query)
+}
+
+fn rig_sunk_ids_if(
+    enabled: bool,
+    storage: &Storage,
+    candidates: &[SinkRef<'_>],
+    query: &str,
+) -> HashSet<String> {
+    let mut sunk = HashSet::new();
+    if !enabled || candidates.is_empty() {
+        return sunk;
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let conversations: Vec<&str> = candidates
+        .iter()
+        .map(|chunk| chunk.conversation_id)
+        .filter(|conversation| seen.insert(*conversation))
+        .collect();
+    let verdicts = session_verdicts(storage, &conversations);
+    // Sub-agents whose own session earned no standing: read their parents.
+    let mut parents: Vec<&str> = Vec::new();
+    for verdict in verdicts.values() {
+        if verdict.eval_session || verdict.ran_rig {
+            continue;
+        }
+        if let Some(parent) = verdict.parent.as_deref() {
+            if !verdicts.contains_key(parent) && !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
+    }
+    crate::mcp::stage_timing::count("synthetic_lineage_parents", parents.len() as u64);
+    let parent_verdicts = session_verdicts(storage, &parents);
+    for chunk in candidates {
+        let Some(verdict) = verdicts.get(chunk.conversation_id) else {
+            continue;
+        };
+        let parent = verdict
+            .parent
+            .as_deref()
+            .and_then(|parent| parent_verdicts.get(parent).or_else(|| verdicts.get(parent)));
+        let strong = verdict.eval_session || parent.is_some_and(|p| p.eval_session);
+        let weak = strong || verdict.ran_rig || parent.is_some_and(|p| p.ran_rig);
+        if (strong && verdict.rig_ids.contains(chunk.id))
+            || (weak && crate::search::echo::quotes_query(chunk.content, query))
+        {
+            sunk.insert(chunk.id.to_string());
+        }
+    }
+    sunk
 }
 
 #[cfg(test)]
@@ -328,6 +440,7 @@ mod tests {
             marked,
             output_marked: false,
             bash_text: bash.map(str::to_string),
+            source_conv: None,
         }
     }
 
@@ -599,6 +712,7 @@ mod tests {
             marked: false,
             output_marked: printed,
             bash_text: None,
+            source_conv: None,
         }
     }
 
@@ -639,6 +753,7 @@ mod tests {
         let verdict = SessionVerdict {
             eval_session: true,
             output_ids: HashSet::from(["c45".to_string()]),
+            ..SessionVerdict::default()
         };
         let chunk = |seq: i64, author| ChunkRef {
             id: format!("c{seq}"),
@@ -671,5 +786,217 @@ mod tests {
         let dropped = synthetic_ids(&storage, &candidates);
         let expected: HashSet<String> = (0..6).map(|seq| format!("sess-print-{seq}")).collect();
         assert_eq!(dropped, expected);
+    }
+    // ---- rig_sunk_ids: demote by the session's provenance, never by prefix ----
+
+    const QUERY: &str = "why do hooks use catch-all wrappers";
+    const PLANTED: &str = "why do hooks use catch-all wrappers so they never block claude code? \
+        [synthetic re-ask cycle 3] Because hooks are a side channel. Synthetic E3 test answer.";
+
+    fn put_child(storage: &Storage, conv: &str, parent: &str, seq: usize, text: &str) -> String {
+        let chunk = ConversationChunk {
+            id: format!("{conv}-{seq}"),
+            conversation_id: conv.into(),
+            project_name: "p".into(),
+            timestamp: "2026-10-01T00:00:00Z".into(),
+            content: text.into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::ToolResult,
+            seq,
+            is_sidechain: true,
+        };
+        storage
+            .insert_chunk_with_source(&chunk, &vec![0.1; 384], "sidechain")
+            .unwrap();
+        storage
+            .insert_chunk_provenance(
+                &chunk.id,
+                &ChunkProvenance {
+                    author: Speaker::ToolResult,
+                    source_conv_id: parent.into(),
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+        chunk.id
+    }
+
+    /// A working session that ran the rig twice among forty Bash calls: not an
+    /// eval session by share, but it ran the rig.
+    fn ran_rig_session(storage: &Storage, conv: &str) {
+        put(
+            storage,
+            conv,
+            0,
+            Speaker::Assistant,
+            "[Bash: csr-engine bench --probe --db-path /x/db]",
+        );
+        put(
+            storage,
+            conv,
+            1,
+            Speaker::Assistant,
+            "[Bash: python3 s3/probe_ab.py compare a b]",
+        );
+        for seq in 2..42 {
+            put(storage, conv, seq, Speaker::Assistant, "[Bash: ls]");
+        }
+    }
+
+    fn sink_refs<'a>(rows: &'a [(String, String, String)]) -> Vec<SinkRef<'a>> {
+        rows.iter()
+            .map(|(id, conv, content)| SinkRef {
+                id,
+                conversation_id: conv,
+                content,
+            })
+            .collect()
+    }
+
+    fn row(storage: &Storage, conv: &str, seq: usize, text: &str) -> (String, String, String) {
+        let id = format!("{conv}-{seq}");
+        let _ = storage;
+        (id, conv.to_string(), text.to_string())
+    }
+
+    #[test]
+    fn synth_a_planted_reask_row_of_a_session_that_ran_the_rig_sinks() {
+        let storage = Storage::open_memory().unwrap();
+        ran_rig_session(&storage, "sess-rig");
+        let planted = put(&storage, "sess-rig", 50, Speaker::ToolResult, PLANTED);
+        let rows = vec![row(&storage, "sess-rig", 50, PLANTED)];
+        assert_eq!(rows[0].0, planted);
+        let sunk = rig_sunk_ids_if(true, &storage, &sink_refs(&rows), QUERY);
+        assert_eq!(sunk, HashSet::from([planted]));
+    }
+
+    #[test]
+    fn synth_the_same_text_in_a_real_session_is_not_sunk() {
+        let storage = Storage::open_memory().unwrap();
+        // A real session: the user asked the question; no rig call anywhere.
+        put(&storage, "sess-real", 0, Speaker::User, PLANTED);
+        for seq in 1..20 {
+            put(&storage, "sess-real", seq, Speaker::Assistant, "[Bash: ls]");
+        }
+        let rows = vec![row(&storage, "sess-real", 0, PLANTED)];
+        let sunk = rig_sunk_ids_if(true, &storage, &sink_refs(&rows), QUERY);
+        assert!(sunk.is_empty(), "{sunk:?}");
+    }
+
+    #[test]
+    fn synth_a_bench_log_row_of_an_eval_session_sinks_and_its_file_reads_stay() {
+        let storage = Storage::open_memory().unwrap();
+        // 12 chunks, 6 of them rig material: an eval session by share.
+        for seq in 0..6 {
+            put(
+                &storage,
+                "agent-eval",
+                seq,
+                Speaker::ToolResult,
+                "ran in /Users/x/.testbed/core-rewrite/wt",
+            );
+        }
+        for seq in 6..12 {
+            put(
+                &storage,
+                "agent-eval",
+                seq,
+                Speaker::ToolResult,
+                "fn catch_all(hook: Hook) { /* source read */ }",
+            );
+        }
+        let rows: Vec<_> = (0..12)
+            .map(|seq| {
+                let text = if seq < 6 {
+                    "ran in /Users/x/.testbed/core-rewrite/wt"
+                } else {
+                    "fn catch_all(hook: Hook) { /* source read */ }"
+                };
+                row(&storage, "agent-eval", seq, text)
+            })
+            .collect();
+        let sunk = rig_sunk_ids_if(
+            true,
+            &storage,
+            &sink_refs(&rows),
+            "unrelated question about sorting",
+        );
+        let expected: HashSet<String> = (0..6).map(|seq| format!("agent-eval-{seq}")).collect();
+        assert_eq!(sunk, expected);
+    }
+
+    #[test]
+    fn synth_a_sub_agent_takes_the_standing_of_the_session_that_spawned_it() {
+        let storage = Storage::open_memory().unwrap();
+        ran_rig_session(&storage, "sess-parent");
+        // The child has no rig evidence of its own; its parent ran the rig.
+        let quoted = put_child(&storage, "agent-child", "sess-parent", 0, PLANTED);
+        let plain = put_child(
+            &storage,
+            "agent-child",
+            "sess-parent",
+            1,
+            "a plain file read",
+        );
+        // Same text under a child of a session that never ran the rig.
+        for seq in 0..10 {
+            put(
+                &storage,
+                "sess-clean",
+                seq,
+                Speaker::Assistant,
+                "[Bash: ls]",
+            );
+        }
+        let other = put_child(&storage, "agent-other", "sess-clean", 0, PLANTED);
+        let rows = vec![
+            (
+                quoted.clone(),
+                "agent-child".to_string(),
+                PLANTED.to_string(),
+            ),
+            (
+                plain,
+                "agent-child".to_string(),
+                "a plain file read".to_string(),
+            ),
+            (other, "agent-other".to_string(), PLANTED.to_string()),
+        ];
+        let sunk = rig_sunk_ids_if(true, &storage, &sink_refs(&rows), QUERY);
+        assert_eq!(sunk, HashSet::from([quoted]));
+    }
+
+    #[test]
+    fn synth_the_rig_tier_needs_the_query_and_the_kill_switch_keeps_all() {
+        let storage = Storage::open_memory().unwrap();
+        ran_rig_session(&storage, "sess-rig2");
+        let unrelated = put(
+            &storage,
+            "sess-rig2",
+            50,
+            Speaker::ToolResult,
+            "hooks wrap their bodies",
+        );
+        let planted = put(&storage, "sess-rig2", 51, Speaker::ToolResult, PLANTED);
+        let rows = vec![
+            (
+                unrelated,
+                "sess-rig2".to_string(),
+                "hooks wrap their bodies".to_string(),
+            ),
+            (
+                planted.clone(),
+                "sess-rig2".to_string(),
+                PLANTED.to_string(),
+            ),
+        ];
+        let sunk = rig_sunk_ids_if(true, &storage, &sink_refs(&rows), QUERY);
+        assert_eq!(sunk, HashSet::from([planted]));
+        // A query that is not in the row: nothing sinks.
+        let sunk = rig_sunk_ids_if(true, &storage, &sink_refs(&rows), "how do I sort a vec");
+        assert!(sunk.is_empty());
+        // Kill switch.
+        assert!(rig_sunk_ids_if(false, &storage, &sink_refs(&rows), QUERY).is_empty());
     }
 }
