@@ -190,12 +190,34 @@ impl CeBands {
         }
     }
 
-    /// Bands for the reranker this process loads (`CSR_CE_MODEL_DIR` or the
-    /// cache dir), decided once per process.
+    /// Bands for the reranker this process loads, decided once per process.
+    /// Keyed on the sha256 of the ONNX bytes the scorer is built from: the
+    /// compiled-in graph, or the `model_qint8_arm64.onnx` in `CSR_CE_MODEL_DIR`.
     pub fn active() -> &'static Self {
         static ACTIVE: std::sync::OnceLock<CeBands> = std::sync::OnceLock::new();
-        ACTIVE.get_or_init(|| Self::for_model_dir(&crate::search::cross_encoder::model_dir()))
+        ACTIVE.get_or_init(|| {
+            Self::for_source(&crate::search::cross_encoder::ModelSource::from_env())
+        })
     }
+
+    /// Bands for the model `source` loads, read from [`CE_TUNED_BANDS`]. The
+    /// key is the hash of the model bytes, never of a path.
+    pub(crate) fn for_source(source: &crate::search::cross_encoder::ModelSource) -> Self {
+        use crate::search::cross_encoder::{embedded_onnx, ModelSource};
+        match source {
+            ModelSource::Embedded => Self::lookup(&sha256_hex(embedded_onnx()), CE_TUNED_BANDS),
+            ModelSource::Dir(dir) => Self::for_model_dir(dir),
+        }
+    }
+}
+
+/// Lower-case hex sha256 of `bytes`.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Lower-case hex sha256 of a file, streamed; `None` when it cannot be read.
@@ -3088,6 +3110,28 @@ mod tests {
     }
 
     #[test]
+    fn ce_embedded_model_reads_the_tuned_bands_and_a_dir_reads_its_own_hash() {
+        use crate::search::cross_encoder::ModelSource;
+        let tuned = CeBands::lookup(TUNED_RUN2_SHA, CE_TUNED_BANDS);
+        assert_ne!(tuned, CeBands::SHIPPED);
+        assert_eq!(CeBands::for_source(&ModelSource::Embedded), tuned);
+        // An override directory is judged by the bytes in it, not by its path.
+        let dir = tempfile::tempdir().unwrap();
+        let source = ModelSource::Dir(dir.path().to_path_buf());
+        assert_eq!(CeBands::for_source(&source), CeBands::SHIPPED);
+        std::fs::write(
+            dir.path().join(CE_ONNX_FILE),
+            crate::search::cross_encoder::embedded_onnx(),
+        )
+        .unwrap();
+        assert_eq!(CeBands::for_source(&source), tuned);
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn ce_file_sha256_is_the_sha256_of_the_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f");
@@ -3180,14 +3224,16 @@ mod tests {
 
     #[test]
     fn formatter_with_ce_uses_the_ce_label_and_keeps_every_row() {
-        // Cosine says weak (0.50); the CE margins say high.
+        // Cosine says weak (0.50); the CE margins say high. The margins clear
+        // both band sets (shipped and tuned-run2), so the test holds whichever
+        // model the process loads.
         let results = vec![
             quick_result(0.50, "first row"),
             quick_result(0.40, "second row"),
         ];
         let ce = CeSummary {
-            top: 6.0,
-            runner_up: Some(3.0),
+            top: 20.0,
+            runner_up: Some(10.0),
             median: 1.0,
         };
         let xml = format_search_results_with_ce(&results, "q", "all", 5, 3, &[], Some(&ce));
@@ -3196,7 +3242,7 @@ mod tests {
             "got: {xml}"
         );
         assert!(
-            xml.contains("ce-top=\"6.00\" ce-margin=\"3.00\" ce-median=\"1.00\">"),
+            xml.contains("ce-top=\"20.00\" ce-margin=\"10.00\" ce-median=\"1.00\">"),
             "got: {xml}"
         );
         assert!(

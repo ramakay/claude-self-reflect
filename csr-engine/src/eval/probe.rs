@@ -449,6 +449,21 @@ fn build_scorecard(i: &CardInputs) -> Value {
     })
 }
 
+/// Which label bands this process reads, and why: `tuned` when the loaded
+/// ONNX bytes hash to a [`crate::format::CE_TUNED_BANDS`] entry.
+fn ce_bands_json() -> Value {
+    let bands = crate::format::CeBands::active();
+    json!({
+        "set": if *bands == crate::format::CeBands::SHIPPED { "shipped" } else { "tuned" },
+        "gap_high": bands.gap_high,
+        "gap_good": bands.gap_good,
+        "gap_tie": bands.gap_tie,
+        "spread_high": bands.spread_high,
+        "spread_good": bands.spread_good,
+        "spread_partial": bands.spread_partial,
+    })
+}
+
 /// The `cross_encoder` block of the run JSON: the retrieval policy in force
 /// and the process-wide cross-encoder counters at the time the card is built.
 fn cross_encoder_json(
@@ -462,6 +477,8 @@ fn cross_encoder_json(
     json!({
         "policy": policy,
         "loaded": stats.loaded,
+        "model_source": crate::search::cross_encoder::ModelSource::from_env().label(),
+        "bands": ce_bands_json(),
         "calls": stats.calls,
         "pairs": stats.pairs,
         "total_ms": stats.total_ms,

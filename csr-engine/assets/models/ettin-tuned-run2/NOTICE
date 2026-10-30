@@ -1,0 +1,21 @@
+ettin-tuned-run2: reranker weights compiled into csr-engine
+
+Base model: cross-encoder/ettin-reranker-32m-v1 (revision b33e5ceb), Apache License 2.0
+  https://huggingface.co/cross-encoder/ettin-reranker-32m-v1
+  Built on jhu-clsp/ettin-encoder-32m (MIT).
+  The licence text is in LICENSE-Apache-2.0.txt beside this file.
+
+Changes: fine-tuned by the csr-engine maintainers on public coding-agent
+transcripts (BinaryCrossEntropyLoss, 2 epochs) and quantised to INT8 ONNX.
+The sentence-transformers head (2_Dense, 3_LayerNorm, 4_Dense) is retrained too.
+
+Fine-tuning data, public sources only (licence per source):
+  SALT-NLP/SWE-chat                      ODC-BY 1.0
+  trace-commons/agent-traces             CC-BY-4.0
+  MaxDevv/real-pi-coding-agent-traces-sessions
+                                         only the sub-sources carrying MIT or
+                                         CC-BY-4.0 cards (incl. julien-c/pi-sessions)
+  armand0e/claude-fable-5-claude-code    MIT
+  crispwisp/wisp-claude-code-sessions    MIT
+
+No private or local conversation entered training.

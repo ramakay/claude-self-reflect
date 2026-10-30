@@ -3,9 +3,14 @@
 //!
 //! The ONNX graph stops at `last_hidden_state`. The sentence-transformers head
 //! (CLS pooling, Dense+GELU, LayerNorm, Dense -> logit) is applied here in Rust
-//! from the small safetensors files shipped beside the model. Nothing in this
-//! module downloads anything; `global()` returns `None` when files are absent.
+//! from the small safetensors files that ship with the model.
+//!
+//! The tuned model (`assets/models/ettin-tuned-run2`) is compiled into the
+//! binary and loaded from memory: nothing is downloaded or written to disk.
+//! `CSR_CE_MODEL_DIR`, when set to a non-empty path, loads that directory
+//! instead; `global()` then returns `None` if its files are absent.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -55,20 +60,95 @@ impl RetrievalPolicy {
     }
 }
 
-/// Directory holding the reranker files.
-pub fn model_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("CSR_CE_MODEL_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
+/// The tuned model, compiled in. Directory layout is the sentence-transformers
+/// one, so the same files also load through `CSR_CE_MODEL_DIR`.
+mod embedded {
+    pub static ONNX: &[u8] =
+        include_bytes!("../../assets/models/ettin-tuned-run2/model_qint8_arm64.onnx");
+    pub static TOKENIZER: &[u8] =
+        include_bytes!("../../assets/models/ettin-tuned-run2/tokenizer.json");
+    pub static DENSE1: &[u8] =
+        include_bytes!("../../assets/models/ettin-tuned-run2/2_Dense/model.safetensors");
+    pub static LAYER_NORM: &[u8] =
+        include_bytes!("../../assets/models/ettin-tuned-run2/3_LayerNorm/model.safetensors");
+    pub static DENSE2: &[u8] =
+        include_bytes!("../../assets/models/ettin-tuned-run2/4_Dense/model.safetensors");
+}
+
+/// The ONNX graph compiled into the binary (what the label bands are keyed on
+/// when no override directory is set).
+pub fn embedded_onnx() -> &'static [u8] {
+    embedded::ONNX
+}
+
+/// Where the reranker files come from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelSource {
+    /// Compiled into the binary.
+    Embedded,
+    /// `CSR_CE_MODEL_DIR`.
+    Dir(PathBuf),
+}
+
+impl ModelSource {
+    /// `CSR_CE_MODEL_DIR` when set and non-empty, else the compiled-in model.
+    pub fn from_env() -> Self {
+        match std::env::var_os("CSR_CE_MODEL_DIR") {
+            Some(dir) if !dir.is_empty() => Self::Dir(PathBuf::from(dir)),
+            _ => Self::Embedded,
         }
     }
-    let cache = crate::embeddings::cache::cache_dir();
-    cache
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or(cache)
-        .join("rerankers")
-        .join("ettin-reranker-32m-v1")
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Embedded => "embedded".to_string(),
+            Self::Dir(dir) => format!("dir:{}", dir.display()),
+        }
+    }
+}
+
+/// The five files a scorer needs, as bytes.
+struct ModelBytes {
+    onnx: Cow<'static, [u8]>,
+    tokenizer: Cow<'static, [u8]>,
+    dense1: Cow<'static, [u8]>,
+    layer_norm: Cow<'static, [u8]>,
+    dense2: Cow<'static, [u8]>,
+}
+
+impl ModelBytes {
+    fn embedded() -> Self {
+        Self {
+            onnx: Cow::Borrowed(embedded::ONNX),
+            tokenizer: Cow::Borrowed(embedded::TOKENIZER),
+            dense1: Cow::Borrowed(embedded::DENSE1),
+            layer_norm: Cow::Borrowed(embedded::LAYER_NORM),
+            dense2: Cow::Borrowed(embedded::DENSE2),
+        }
+    }
+
+    fn from_dir(dir: &Path) -> Result<Self> {
+        let read = |rel: &str| -> Result<Cow<'static, [u8]>> {
+            let path = dir.join(rel);
+            std::fs::read(&path)
+                .map(Cow::Owned)
+                .with_context(|| format!("read {}", path.display()))
+        };
+        Ok(Self {
+            onnx: read("model_qint8_arm64.onnx")?,
+            tokenizer: read("tokenizer.json")?,
+            dense1: read("2_Dense/model.safetensors")?,
+            layer_norm: read("3_LayerNorm/model.safetensors")?,
+            dense2: read("4_Dense/model.safetensors")?,
+        })
+    }
+
+    fn load(source: &ModelSource) -> Result<Self> {
+        match source {
+            ModelSource::Embedded => Ok(Self::embedded()),
+            ModelSource::Dir(dir) => Self::from_dir(dir),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- stats
@@ -241,9 +321,8 @@ fn take(
     Ok(t.data)
 }
 
-fn read_st(path: &Path) -> Result<HashMap<String, Tensor32>> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    parse_safetensors(&bytes).with_context(|| format!("parse {}", path.display()))
+fn read_st(bytes: &[u8], file: &str) -> Result<HashMap<String, Tensor32>> {
+    parse_safetensors(bytes).with_context(|| format!("parse {file}"))
 }
 
 struct Head {
@@ -255,10 +334,10 @@ struct Head {
 }
 
 impl Head {
-    fn load(dir: &Path) -> Result<Self> {
-        let mut d1 = read_st(&dir.join("2_Dense/model.safetensors"))?;
-        let mut ln = read_st(&dir.join("3_LayerNorm/model.safetensors"))?;
-        let mut d2 = read_st(&dir.join("4_Dense/model.safetensors"))?;
+    fn load(files: &ModelBytes) -> Result<Self> {
+        let mut d1 = read_st(&files.dense1, "2_Dense/model.safetensors")?;
+        let mut ln = read_st(&files.layer_norm, "3_LayerNorm/model.safetensors")?;
+        let mut d2 = read_st(&files.dense2, "4_Dense/model.safetensors")?;
         Ok(Self {
             dense1_w: take(&mut d1, "linear.weight", &[HIDDEN, HIDDEN], "2_Dense")?,
             ln_w: take(&mut ln, "norm.weight", &[HIDDEN], "3_LayerNorm")?,
@@ -294,8 +373,18 @@ pub struct CrossEncoder {
 }
 
 impl CrossEncoder {
+    /// Load from a directory laid out like `assets/models/ettin-tuned-run2`.
     pub fn load(dir: &Path) -> Result<Self> {
-        let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+        Self::from_bytes(&ModelBytes::from_dir(dir)?)
+    }
+
+    /// Load the model compiled into the binary.
+    pub fn load_embedded() -> Result<Self> {
+        Self::from_bytes(&ModelBytes::embedded())
+    }
+
+    fn from_bytes(files: &ModelBytes) -> Result<Self> {
+        let mut tokenizer = Tokenizer::from_bytes(&files.tokenizer[..])
             .map_err(|e| anyhow!("tokenizer load: {e}"))?;
         tokenizer
             .with_truncation(Some(TruncationParams {
@@ -311,14 +400,22 @@ impl CrossEncoder {
             .token_to_id("[PAD]")
             .or_else(|| tokenizer.token_to_id("<pad>"))
             .unwrap_or(0) as i64;
-        let head = Head::load(dir)?;
+        let head = Head::load(files)?;
         let builder = Session::builder().map_err(ort_err)?;
         let mut builder = builder
             .with_auto_device(AutoDevicePolicy::PreferCPU)
             .map_err(ort_err)?;
-        let session = builder
-            .commit_from_file(dir.join("model_qint8_arm64.onnx"))
-            .map_err(ort_err)?;
+        // Memory pattern off. Every distinct (batch, sequence) shape plants its
+        // own planned buffer in ORT's CPU arena and keeps it for the life of
+        // the process; recall batches change shape on every query. Measured on
+        // 12 varied 24-pair batches: 1294 MB footprint with it, 665 MB without,
+        // bit-identical scores. Shrinking the arena after each run
+        // (`memory.enable_memory_arena_shrinkage`), turning the arena off and
+        // `malloc_zone_pressure_relief` were all measured on top of this and
+        // freed nothing on macOS: the pages sit in malloc's large-block cache
+        // and still count in the footprint.
+        builder = builder.with_memory_pattern(false).map_err(ort_err)?;
+        let session = builder.commit_from_memory(&files.onnx).map_err(ort_err)?;
         Ok(Self {
             session: Mutex::new(session),
             tokenizer,
@@ -394,21 +491,23 @@ impl CrossEncoder {
     }
 }
 
-/// Lazily loaded process-wide scorer. `None` when the model files are missing
-/// or fail to load (one warning, never a panic, never a download).
+/// Lazily loaded process-wide scorer: the compiled-in model, or the
+/// `CSR_CE_MODEL_DIR` directory when set. `None` when an override directory is
+/// missing files or the model fails to load (one warning, never a panic,
+/// never a download).
 pub fn global() -> Option<&'static CrossEncoder> {
     static CE: OnceLock<Option<CrossEncoder>> = OnceLock::new();
     CE.get_or_init(|| {
-        let dir = model_dir();
-        match CrossEncoder::load(&dir) {
+        let source = ModelSource::from_env();
+        match ModelBytes::load(&source).and_then(|files| CrossEncoder::from_bytes(&files)) {
             Ok(ce) => {
                 LOADED.store(true, Ordering::Relaxed);
                 Some(ce)
             }
             Err(e) => {
                 tracing::warn!(
-                    "cross-encoder {CE_MODEL_ID} unavailable at {}: {e:#}",
-                    dir.display()
+                    "cross-encoder {CE_MODEL_ID} unavailable ({}): {e:#}",
+                    source.label()
                 );
                 None
             }
@@ -499,9 +598,54 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs the Ettin reranker files in model_dir()"]
+    fn model_source_reads_the_override_dir_only_when_non_empty() {
+        // Parse-level check without touching the process environment.
+        assert_eq!(ModelSource::Embedded.label(), "embedded");
+        assert_eq!(ModelSource::Dir(PathBuf::from("/x/y")).label(), "dir:/x/y");
+    }
+
+    #[test]
+    fn embedded_files_are_the_tuned_run2_model() {
+        // The bands table is keyed on this hash: the compiled-in bytes must be
+        // the model the bands were fit on.
+        assert_eq!(
+            crate::format::sha256_hex(embedded_onnx()),
+            "73b9d13ac00020e657dc43319a9717fbf0fc10d7243ad5710d48837c6137abab"
+        );
+        let files = ModelBytes::embedded();
+        assert!(files.tokenizer.len() > 1_000_000);
+        Head::load(&files).expect("embedded head parses");
+    }
+
+    #[test]
+    fn embedded_model_loads_from_memory_and_ranks_the_answer_first() {
+        let ce = CrossEncoder::load_embedded().expect("load embedded model");
+        let query = "Which planet is known as the Red Planet?";
+        let passages = [
+            "Venus is often called Earth's twin because of its similar size and proximity.",
+            "Mars, known for its reddish appearance, is often referred to as the Red Planet.",
+            "Jupiter, the largest planet in our solar system, has a prominent red spot.",
+            "Saturn, famous for its rings, is sometimes mistaken for the Red Planet.",
+        ];
+        let scores = ce.score(query, &passages).expect("score");
+        assert_eq!(scores.len(), 4);
+        assert!(scores.iter().all(|s| s.is_finite()), "{scores:?}");
+        let best = (0..4)
+            .max_by(|a, b| scores[*a].partial_cmp(&scores[*b]).unwrap())
+            .unwrap();
+        assert_eq!(best, 1, "Mars must rank first: {scores:?}");
+        // Same bytes, same batch: bit-identical scores.
+        assert_eq!(scores, ce.score(query, &passages).unwrap());
+        assert!(ce.score(query, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs the shipped (untuned) Ettin reranker files in CSR_CE_MODEL_DIR"]
     fn ettin_red_planet_parity() {
-        let dir = model_dir();
+        let dir = match ModelSource::from_env() {
+            ModelSource::Dir(dir) => dir,
+            ModelSource::Embedded => panic!("set CSR_CE_MODEL_DIR to the shipped model"),
+        };
         let ce = CrossEncoder::load(&dir).expect("load model");
         let query = "Which planet is known as the Red Planet?";
         let passages = [
