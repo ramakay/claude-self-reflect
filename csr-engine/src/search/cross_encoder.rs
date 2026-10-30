@@ -107,9 +107,17 @@ impl ModelSource {
     }
 }
 
-/// The five files a scorer needs, as bytes.
+/// Where the ONNX graph comes from.
+enum OnnxSource {
+    /// Compiled in; handed to ORT from memory.
+    Embedded,
+    /// A file in an override directory.
+    File(PathBuf),
+}
+
+/// The files a scorer needs: the graph by source, the rest as bytes.
 struct ModelBytes {
-    onnx: Cow<'static, [u8]>,
+    onnx: OnnxSource,
     tokenizer: Cow<'static, [u8]>,
     dense1: Cow<'static, [u8]>,
     layer_norm: Cow<'static, [u8]>,
@@ -119,7 +127,7 @@ struct ModelBytes {
 impl ModelBytes {
     fn embedded() -> Self {
         Self {
-            onnx: Cow::Borrowed(embedded::ONNX),
+            onnx: OnnxSource::Embedded,
             tokenizer: Cow::Borrowed(embedded::TOKENIZER),
             dense1: Cow::Borrowed(embedded::DENSE1),
             layer_norm: Cow::Borrowed(embedded::LAYER_NORM),
@@ -135,7 +143,7 @@ impl ModelBytes {
                 .with_context(|| format!("read {}", path.display()))
         };
         Ok(Self {
-            onnx: read("model_qint8_arm64.onnx")?,
+            onnx: OnnxSource::File(dir.join("model_qint8_arm64.onnx")),
             tokenizer: read("tokenizer.json")?,
             dense1: read("2_Dense/model.safetensors")?,
             layer_norm: read("3_LayerNorm/model.safetensors")?,
@@ -365,6 +373,33 @@ fn ort_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
     anyhow!("ort: {e}")
 }
 
+/// Build the ORT session. The compiled-in graph goes in from memory; an
+/// override directory's graph goes in by path, because ORT resolves external
+/// initializer files (a sibling `weights.data`) relative to that path and a
+/// memory load gives it none.
+fn build_session(onnx: &OnnxSource) -> Result<Session> {
+    let builder = Session::builder().map_err(ort_err)?;
+    let mut builder = builder
+        .with_auto_device(AutoDevicePolicy::PreferCPU)
+        .map_err(ort_err)?;
+    // Memory pattern off. Every distinct (batch, sequence) shape plants its
+    // own planned buffer in ORT's CPU arena and keeps it for the life of
+    // the process; recall batches change shape on every query. Measured on
+    // 12 varied 24-pair batches: 1294 MB footprint with it, 665 MB without,
+    // bit-identical scores. Shrinking the arena after each run
+    // (`memory.enable_memory_arena_shrinkage`), turning the arena off and
+    // `malloc_zone_pressure_relief` were all measured on top of this and
+    // freed nothing on macOS: the pages sit in malloc's large-block cache
+    // and still count in the footprint.
+    builder = builder.with_memory_pattern(false).map_err(ort_err)?;
+    let session = match onnx {
+        OnnxSource::Embedded => builder.commit_from_memory(embedded::ONNX),
+        OnnxSource::File(path) => builder.commit_from_file(path),
+    }
+    .map_err(ort_err)?;
+    Ok(session)
+}
+
 pub struct CrossEncoder {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
@@ -401,21 +436,7 @@ impl CrossEncoder {
             .or_else(|| tokenizer.token_to_id("<pad>"))
             .unwrap_or(0) as i64;
         let head = Head::load(files)?;
-        let builder = Session::builder().map_err(ort_err)?;
-        let mut builder = builder
-            .with_auto_device(AutoDevicePolicy::PreferCPU)
-            .map_err(ort_err)?;
-        // Memory pattern off. Every distinct (batch, sequence) shape plants its
-        // own planned buffer in ORT's CPU arena and keeps it for the life of
-        // the process; recall batches change shape on every query. Measured on
-        // 12 varied 24-pair batches: 1294 MB footprint with it, 665 MB without,
-        // bit-identical scores. Shrinking the arena after each run
-        // (`memory.enable_memory_arena_shrinkage`), turning the arena off and
-        // `malloc_zone_pressure_relief` were all measured on top of this and
-        // freed nothing on macOS: the pages sit in malloc's large-block cache
-        // and still count in the footprint.
-        builder = builder.with_memory_pattern(false).map_err(ort_err)?;
-        let session = builder.commit_from_memory(&files.onnx).map_err(ort_err)?;
+        let session = build_session(&files.onnx)?;
         Ok(Self {
             session: Mutex::new(session),
             tokenizer,
@@ -595,6 +616,102 @@ mod tests {
     #[test]
     fn load_missing_dir_errors_without_panic() {
         assert!(CrossEncoder::load(Path::new("/nonexistent/csr-ce-test")).is_err());
+    }
+
+    // ---- hand-encoded ONNX protobuf: y = x + w, with w in an external file ----
+
+    fn pb_varint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return out;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    fn pb_bytes(field: u64, body: &[u8]) -> Vec<u8> {
+        let mut out = pb_varint(field << 3 | 2);
+        out.extend(pb_varint(body.len() as u64));
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn pb_int(field: u64, v: u64) -> Vec<u8> {
+        let mut out = pb_varint(field << 3);
+        out.extend(pb_varint(v));
+        out
+    }
+
+    fn pb_value_info(name: &str) -> Vec<u8> {
+        let dim = pb_bytes(1, &pb_int(1, 3));
+        let tensor = [pb_int(1, 1), pb_bytes(2, &dim)].concat();
+        let ty = pb_bytes(1, &tensor);
+        [pb_bytes(1, name.as_bytes()), pb_bytes(2, &ty)].concat()
+    }
+
+    /// `y = Add(x, w)` over f32[3]; `w` lives in `weights.data` beside the model.
+    fn external_data_add_model() -> Vec<u8> {
+        let entry = |k: &str, v: &str| {
+            pb_bytes(
+                13,
+                &[pb_bytes(1, k.as_bytes()), pb_bytes(2, v.as_bytes())].concat(),
+            )
+        };
+        let weights = [
+            pb_int(1, 3),
+            pb_int(2, 1),
+            pb_bytes(8, b"w"),
+            entry("location", "weights.data"),
+            entry("offset", "0"),
+            entry("length", "12"),
+            pb_int(14, 1),
+        ]
+        .concat();
+        let node = [
+            pb_bytes(1, b"x"),
+            pb_bytes(1, b"w"),
+            pb_bytes(2, b"y"),
+            pb_bytes(3, b"add"),
+            pb_bytes(4, b"Add"),
+        ]
+        .concat();
+        let graph = [
+            pb_bytes(1, &node),
+            pb_bytes(2, b"g"),
+            pb_bytes(5, &weights),
+            pb_bytes(11, &pb_value_info("x")),
+            pb_bytes(12, &pb_value_info("y")),
+        ]
+        .concat();
+        [
+            pb_int(1, 8),
+            pb_bytes(7, &graph),
+            pb_bytes(8, &pb_int(2, 13)),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn override_dir_onnx_loads_by_path_so_external_initializers_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let onnx = dir.path().join("model_qint8_arm64.onnx");
+        std::fs::write(&onnx, external_data_add_model()).unwrap();
+        let weights: Vec<u8> = [1.0f32, 2.0, 3.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        std::fs::write(dir.path().join("weights.data"), weights).unwrap();
+
+        let mut session = build_session(&OnnxSource::File(onnx)).expect("override graph loads");
+        let x =
+            Tensor::from_array(([3usize], vec![10.0f32, 20.0, 30.0].into_boxed_slice())).unwrap();
+        let outputs = session.run(ort::inputs!["x" => x]).unwrap();
+        let (_, y) = outputs["y"].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(y, &[11.0, 22.0, 33.0]);
     }
 
     #[test]
