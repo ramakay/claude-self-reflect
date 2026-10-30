@@ -814,6 +814,12 @@ pub(crate) async fn keyword_fallback(
             .as_ref()
             .map(|(start, end)| (start.as_str(), end.as_str())),
     )?;
+    // The live chat sinks on the fallback paths too, so a page served from here
+    // continues the order recall's own page was cut from. Evidence for csr_why
+    // and the insights summary are not a ranked page of chats.
+    if !matches!(tool, KeywordTool::Why | KeywordTool::Insights) {
+        sink_live_session(&mut results, storage, query);
+    }
     match tool {
         KeywordTool::Recall => unreachable!(),
         KeywordTool::Quick => Ok(format::format_keyword_quick_check(&results)),
@@ -1007,6 +1013,38 @@ fn sink_session_hits(
 fn is_session_hit(storage: &Storage, chunk: &crate::import::ConversationChunk, live: &str) -> bool {
     let key = session_key_of(storage, chunk);
     key == live || key.strip_prefix("conv_") == Some(live)
+}
+
+/// The (at most two) rows `format_quick_check` judges: the hit it may show and
+/// the runner-up its margin is read against.
+fn quick_check_hits(
+    mut enriched: Vec<EnrichedResult>,
+    storage: &Storage,
+    live: Option<&str>,
+    query: &str,
+) -> Vec<EnrichedResult> {
+    let Some(live) = live else {
+        enriched.truncate(2);
+        return enriched;
+    };
+    // `format_quick_check` judges only its first row against the floor, so the
+    // floor is applied here, before the row to show is picked: the best
+    // qualifying row outside the live session, else the qualifying live one.
+    // When nothing qualifies the order stays best-first, so the negative
+    // answer reports the best score it rejected.
+    let mut ordered = enriched.clone();
+    sink_session_hits(&mut ordered, storage, Some(live), query);
+    let Some(at) = ordered
+        .iter()
+        .position(|e| e.score >= format::QUICK_CHECK_FLOOR)
+    else {
+        enriched.truncate(2);
+        return enriched;
+    };
+    let shown = ordered.remove(at);
+    // The runner-up the margin reads against must not outscore the row shown.
+    let runner_up = ordered.into_iter().find(|e| e.score <= shown.score);
+    std::iter::once(shown).chain(runner_up).collect()
 }
 
 /// [`sink_session_hits`] for bare chunks (the file search holds no scores).
@@ -1943,17 +1981,20 @@ async fn settled_pool(
     }
 
     let mut enriched = pass.enriched;
+    let ids_before: Vec<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
     // Sink resolved chunks AND dream-verdict-demoted chunks BEFORE the limit
     // cut so stale results do not occupy slots that should go to
     // unresolved/non-demoted chunks ranked below them.
     settle_window(&mut enriched, storage, &pass.validity, active_forgetting);
     // Last ordering step: the caller's own live chat answers no past question.
     sink_live_session(&mut enriched, storage, query);
+    // The label reads the order the caller gets, not the one before the sinks.
+    let ce = refresh_ce(pass.ce, pass.ce_inputs.as_ref(), &ids_before, &enriched);
     Ok(SettledPool {
         enriched,
         display_rank_scores: pass.display_rank_scores,
         search_ms,
-        ce: pass.ce,
+        ce,
         exhausted: !pass.window_full,
         published: 0,
         cross_source_collapsed: pass.cross_source_collapsed,
@@ -2034,6 +2075,51 @@ struct GatherPass {
     ce: Option<format::CeSummary>,
     /// Codex rows dropped because a Claude session row has the same text.
     cross_source_collapsed: usize,
+    /// What `ce` was read from, kept so the summary can be read again from a
+    /// later order: the cross-encoder score of each session, and the session
+    /// of each candidate. `None` whenever `ce` is.
+    ce_inputs: Option<CeInputs>,
+}
+
+/// The cross-encoder scores behind a [`format::CeSummary`], see
+/// `GatherPass::ce_inputs`.
+#[derive(Clone)]
+struct CeInputs {
+    session_scores: HashMap<String, f32>,
+    session_of_chunk: HashMap<String, String>,
+}
+
+/// The cross-encoder summary for the order a pass finally returns. When the
+/// sinks after the pass moved rows, `ce` (read from the order before them)
+/// would label the new first row with the old first row's scores; this reads
+/// them again from `enriched`. With the order unchanged it is `ce` itself.
+fn refresh_ce(
+    ce: Option<format::CeSummary>,
+    inputs: Option<&CeInputs>,
+    ids_before: &[String],
+    enriched: &[EnrichedResult],
+) -> Option<format::CeSummary> {
+    let Some(inputs) = inputs else {
+        return ce;
+    };
+    if enriched.len() == ids_before.len()
+        && enriched
+            .iter()
+            .zip(ids_before)
+            .all(|(row, id)| row.chunk.id == *id)
+    {
+        return ce;
+    }
+    let final_sessions: Vec<&str> = enriched
+        .iter()
+        .map(|e| {
+            inputs
+                .session_of_chunk
+                .get(&e.chunk.id)
+                .map_or(e.chunk.id.as_str(), String::as_str)
+        })
+        .collect();
+    final_ce_summary(&final_sessions, &inputs.session_scores)
 }
 
 /// Compute the exact score used by recall reranking, including its conversation
@@ -4251,6 +4337,7 @@ async fn reflect_gather_pass(
     );
     // The label reads the cross-encoder scores of the list as it finally
     // stands: after the sinks, the dedupes and the exact-prefix promotion.
+    let mut ce_inputs = None;
     let ce = match collapsed_sessions.as_ref() {
         Some((_, session_keys)) if !ce_session_scores.is_empty() => {
             let final_sessions: Vec<&str> = enriched
@@ -4261,7 +4348,14 @@ async fn reflect_gather_pass(
                         .map_or(e.chunk.id.as_str(), String::as_str)
                 })
                 .collect();
-            final_ce_summary(&final_sessions, &ce_session_scores)
+            let summary = final_ce_summary(&final_sessions, &ce_session_scores);
+            if summary.is_some() {
+                ce_inputs = Some(CeInputs {
+                    session_scores: ce_session_scores.clone(),
+                    session_of_chunk: session_keys.clone(),
+                });
+            }
+            summary
         }
         _ => None,
     };
@@ -4274,6 +4368,7 @@ async fn reflect_gather_pass(
         search_ms,
         ce,
         cross_source_collapsed,
+        ce_inputs,
     })
 }
 
@@ -4450,8 +4545,7 @@ async fn quick_check_with_vec(
     let labeled_chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
     let validity = csr_text_labels_only(storage, &labeled_chunks);
     apply_validity_partition(&mut enriched, &validity, false);
-    sink_session_hits(&mut enriched, storage, live.as_deref(), query);
-    enriched.truncate(2);
+    let enriched = quick_check_hits(enriched, storage, live.as_deref(), query);
 
     Ok(format::format_quick_check(&enriched, query))
 }
@@ -9876,6 +9970,203 @@ mod tests {
         let set = run(Some("conv-top")).await;
         assert!(set.contains("runner-up candidate"), "{set}");
         assert!(!set.contains("top candidate"), "{set}");
+    }
+
+    /// Quick check on cosines against `[1, 0, 0, 0]`: the live chat 0.90 and one
+    /// other chat at `other_cosine`.
+    async fn quick_check_with_live_chat(other_cosine: f32, self_cosine: f32) -> String {
+        let other_y = (1.0 - other_cosine * other_cosine).sqrt();
+        let self_y = (1.0 - self_cosine * self_cosine).sqrt();
+        let (storage, search) = quick_check_fixture(&[
+            (
+                "self",
+                "project-a",
+                "self candidate",
+                [self_cosine, self_y, 0.0, 0.0],
+            ),
+            (
+                "other",
+                "project-b",
+                "other candidate",
+                [other_cosine, other_y, 0.0, 0.0],
+            ),
+        ]);
+        LIVE_SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = Some("conv-self".into()));
+        let xml = quick_check_with_vec(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "probe",
+            0.3,
+            Some("all"),
+        )
+        .await
+        .unwrap();
+        LIVE_SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        xml
+    }
+
+    /// The only hit above the floor is the live chat: it is shown, not a
+    /// below-floor other hit that the sink moved to the front.
+    #[tokio::test]
+    async fn quick_check_shows_the_qualifying_live_hit_when_no_other_qualifies() {
+        let xml = quick_check_with_live_chat(0.40, 0.90).await;
+        assert!(xml.contains("<found>true</found>"), "{xml}");
+        assert!(xml.contains("self candidate"), "{xml}");
+        assert!(!xml.contains("other candidate"), "{xml}");
+    }
+
+    /// A qualifying other hit is shown over the better-scoring live hit, and
+    /// its margin is not read against a runner-up that beats it.
+    #[tokio::test]
+    async fn quick_check_prefers_the_qualifying_other_hit_over_the_live_one() {
+        let xml = quick_check_with_live_chat(0.60, 0.90).await;
+        assert!(xml.contains("<found>true</found>"), "{xml}");
+        assert!(xml.contains("other candidate"), "{xml}");
+        assert!(!xml.contains("self candidate"), "{xml}");
+        assert!(!xml.contains("<margin>-"), "{xml}");
+    }
+
+    /// Nothing clears the floor: the answer is still the negative claim, with
+    /// the best score rejected.
+    #[tokio::test]
+    async fn quick_check_with_nothing_above_the_floor_stays_negative_with_a_live_chat() {
+        let xml = quick_check_with_live_chat(0.35, 0.40).await;
+        assert!(xml.contains("<found>false</found>"), "{xml}");
+        assert!(xml.contains("<best_rejected_score>0.400"), "{xml}");
+    }
+
+    /// With the daemon down every tool answers from the keyword fallback. The
+    /// live chat sinks there too, so recall(limit=1) followed by get_more(offset=1)
+    /// shows each of the two hits exactly once.
+    #[tokio::test]
+    async fn keyword_fallbacks_sink_the_live_chat_and_paginate_continuously() {
+        let v = [1.0, 0.0, 0.0, 0.0];
+        let (storage, search) = quick_check_fixture(&[
+            (
+                "self",
+                "alpha",
+                "SELFMARK fallbackword fallbackword fallbackword fallbackword",
+                v,
+            ),
+            (
+                "other",
+                "alpha",
+                "OTHERMARK fallbackword pad pad pad pad pad pad pad pad pad pad pad pad",
+                v,
+            ),
+        ]);
+        storage
+            .with_connection(|conn| {
+                conn.execute("UPDATE chunks SET timestamp='2026-10-02T00:00:00Z'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        // The raw keyword order has the live chat first.
+        let raw = keyword_candidates(&storage, "fallbackword", Some("alpha"), None).unwrap();
+        assert!(raw[0].chunk.content.contains("SELFMARK"), "premise");
+
+        LIVE_SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = Some("conv-self".into()));
+        let recall = keyword_fallback(
+            &storage,
+            &search,
+            "fallbackword",
+            1,
+            Some("alpha"),
+            KeywordTool::Recall,
+        )
+        .await
+        .unwrap();
+        let more = keyword_fallback(
+            &storage,
+            &search,
+            "fallbackword",
+            1,
+            Some("alpha"),
+            KeywordTool::More { offset: 1 },
+        )
+        .await
+        .unwrap();
+        // Page one holds `other` alone; page two holds `self` alone.
+        assert_eq!(recall.matches("<id>other</id>").count(), 1, "{recall}");
+        assert!(!recall.contains("SELFMARK"), "{recall}");
+        assert_eq!(more.matches("SELFMARK").count(), 1, "{more}");
+        assert!(!more.contains("OTHERMARK"), "{more}");
+
+        async fn one_page(
+            storage: &Arc<Storage>,
+            search: &Arc<RwLock<SearchEngine>>,
+            tool: KeywordTool<'_>,
+        ) -> String {
+            keyword_fallback(storage, search, "fallbackword", 1, Some("alpha"), tool)
+                .await
+                .unwrap()
+        }
+        let quick = one_page(&storage, &search, KeywordTool::Quick).await;
+        let concept = one_page(&storage, &search, KeywordTool::Concept).await;
+        let recency = one_page(
+            &storage,
+            &search,
+            KeywordTool::Recency {
+                time_range: None,
+                since: Some("2026-10-01"),
+                until: Some("2026-10-03"),
+            },
+        )
+        .await;
+        LIVE_SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        for (name, reply) in [("quick", quick), ("concept", concept), ("recency", recency)] {
+            assert!(reply.contains("OTHERMARK"), "{name}: {reply}");
+            assert!(!reply.contains("SELFMARK"), "{name}: {reply}");
+        }
+        // Without a live session the raw keyword order is what every tool shows.
+        let unset = one_page(&storage, &search, KeywordTool::Concept).await;
+        assert!(unset.contains("SELFMARK"), "{unset}");
+    }
+
+    /// CE order [live:9, other:1] with a page of one: the sink puts `other`
+    /// first, so the summary must be read from that order, not keep the "high"
+    /// label the live chat's scores earned.
+    #[test]
+    fn ce_summary_follows_the_order_the_sinks_leave() {
+        let scores: HashMap<String, f32> = [("conv-live".to_string(), 9.0), ("conv-o".into(), 1.0)]
+            .into_iter()
+            .collect();
+        let inputs = CeInputs {
+            session_scores: scores.clone(),
+            session_of_chunk: [
+                ("live".to_string(), "conv-live".to_string()),
+                ("o".into(), "conv-o".into()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let before = final_ce_summary(&["conv-live", "conv-o"], &scores);
+        assert_eq!(
+            before.unwrap().label_with(&format::CeBands::SHIPPED),
+            "high",
+            "premise: the live chat's scores earn high"
+        );
+        let ids_before = vec!["live".to_string(), "o".to_string()];
+        let unchanged = vec![
+            enriched_result_conv("live", "conv-live", 0.9, 0),
+            enriched_result_conv("o", "conv-o", 0.8, 1),
+        ];
+        assert_eq!(
+            refresh_ce(before, Some(&inputs), &ids_before, &unchanged),
+            before,
+            "no reorder: the summary is the pass's own"
+        );
+        let sunk = vec![
+            enriched_result_conv("o", "conv-o", 0.8, 1),
+            enriched_result_conv("live", "conv-live", 0.9, 0),
+        ];
+        let after = refresh_ce(before, Some(&inputs), &ids_before, &sunk).unwrap();
+        assert_eq!(after.top, 1.0);
+        assert_eq!(after.runner_up, Some(9.0));
+        assert_ne!(after.label_with(&format::CeBands::SHIPPED), "high");
+        // Nothing to read it from: the pass's summary stands.
+        assert_eq!(refresh_ce(before, None, &ids_before, &sunk), before);
     }
 
     /// The pipeline, not just the map: with the dream switches unset (annotate
