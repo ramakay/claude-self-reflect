@@ -1015,7 +1015,12 @@ fn sink_session_hits(
 /// provenance ties it to that conversation ([`session_key_of`]).
 fn is_session_hit(storage: &Storage, chunk: &crate::import::ConversationChunk, live: &str) -> bool {
     let key = session_key_of(storage, chunk);
-    key == live || key.strip_prefix("conv_") == Some(live)
+    // A row derived from the live chat (`conv_`, `v3_`, `extracted_v3_`,
+    // `story_`, ...) names it as the id's last `_` segment.
+    key == live
+        || key
+            .strip_suffix(live)
+            .is_some_and(|prefix| prefix.ends_with('_'))
 }
 
 /// The (at most two) rows `format_quick_check` judges: the hit it may show and
@@ -9837,6 +9842,31 @@ mod tests {
         ];
         sink_session_hits(&mut prefixed, &storage, Some(LIVE), "q");
         assert_eq!(row_ids(&prefixed), ["other-p", "self-p"]);
+    }
+
+    /// A summary derived from the live chat (its id ends in `_<sid>`) sinks
+    /// with it; another chat's summary and an id that only runs into the sid
+    /// do not.
+    #[test]
+    fn a_row_derived_from_the_live_chat_sinks_with_it() {
+        let storage = Storage::open_memory().unwrap();
+        let mut rows = vec![
+            enriched_result_conv("ext", &format!("extracted_v3_{LIVE}"), 0.99, 0),
+            enriched_result_conv("v3", &format!("v3_{LIVE}"), 0.98, 1),
+            enriched_result_conv("story", &format!("story_{LIVE}"), 0.97, 2),
+            enriched_result_conv(
+                "other-ext",
+                "extracted_v3_11111111-2222-3333-4444-555555555555",
+                0.96,
+                3,
+            ),
+            enriched_result_conv("run-in", &format!("x{LIVE}"), 0.95, 4),
+        ];
+        sink_session_hits(&mut rows, &storage, Some(LIVE), "q");
+        assert_eq!(
+            row_ids(&rows),
+            ["other-ext", "run-in", "ext", "v3", "story"]
+        );
     }
 
     #[test]
