@@ -8,7 +8,7 @@ use csr_engine::companion::{
     paths::Paths,
     render::{
         instrument::{Metrics, CARD_REGISTRY, LAYOUT_WIDTH, SHOULD_BE_KINDS, STACKABLE},
-        kitty::{bands, picture_ids, repaint_pictures, set_cell_override, Drawn, Placement},
+        kitty::{bands, repaint_pictures, set_cell_override, Drawn, Placement},
         theme::Theme,
     },
 };
@@ -1261,7 +1261,7 @@ fn send(pane: &mut Pane, cols: usize, rows: usize, drawn: &mut Option<Drawn>) ->
         .as_ref()
         .map(|d| {
             (0..d.placed.len())
-                .map(|i| d.ids.get(i).copied().unwrap_or(2 * i + 1))
+                .filter_map(|i| d.ids.get(i).copied())
                 .collect()
         })
         .unwrap_or_default();
@@ -1270,14 +1270,13 @@ fn send(pane: &mut Pane, cols: usize, rows: usize, drawn: &mut Option<Drawn>) ->
     let ms = start.elapsed().as_secs_f64() * 1000.;
     let cut = bands(&pane.placed);
     let out = repaint_pictures(drawn.as_ref(), cols, rows, &written, &cut);
-    let ids = picture_ids(drawn.as_ref(), cols, rows, &written, &cut);
-    *drawn = Some(Drawn {
+    *drawn = Some(Drawn::after(
+        drawn.as_ref(),
         cols,
         rows,
         written,
-        placed: cut.clone(),
-        ids,
-    });
+        cut.clone(),
+    ));
     let replaced = out
         .split("\x1b_Ga=T,")
         .skip(1)
