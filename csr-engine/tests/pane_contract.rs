@@ -173,6 +173,20 @@ fn perf_red() -> (tempfile::TempDir, Paths) {
     fs::write(&path, trial.to_string()).unwrap();
     (home, paths)
 }
+/// The owner's session with the live trial: a 94-character candidate label and its short sha,
+/// longer than the room right of the card's title.
+const LIVE_LABEL: &str =
+    "combo + pane + native-warn + herdr-events + flake-hunt + memtrend (bands rolled back)";
+fn perf_long_label() -> (tempfile::TempDir, Paths) {
+    let (home, paths) = owner_home();
+    let path = paths
+        .home
+        .join(".claude-self-reflect/trials/combo-soak.json");
+    let mut trial: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    trial["candidate"] = json!({"label": LIVE_LABEL, "sha": "a3744ba4c0de1f2a"});
+    fs::write(&path, trial.to_string()).unwrap();
+    (home, paths)
+}
 /// The owner's pane with a configured window under the 33k buffer: all of it is buffer.
 fn window_20k() -> (tempfile::TempDir, Paths) {
     let (home, paths) = owner_home();
@@ -231,7 +245,7 @@ fn away() -> (tempfile::TempDir, Paths) {
     state_home("07-away")
 }
 
-const FIXTURES: [Fixture; 28] = [
+const FIXTURES: [Fixture; 29] = [
     Fixture {
         name: "few",
         home: few,
@@ -351,6 +365,11 @@ const FIXTURES: [Fixture; 28] = [
         name: "perf-red-open",
         home: perf_red,
         keys: &["stack:3"],
+    },
+    Fixture {
+        name: "perf-long-label",
+        home: perf_long_label,
+        keys: &[],
     },
     Fixture {
         name: "window-20k",
@@ -1401,4 +1420,47 @@ fn a_page_scroll_places_new_bands_before_it_deletes_the_old() {
         );
         set_cell_override(None);
     }
+}
+
+/// The trial card's long candidate label gives way to the title: at the owner's pane the two
+/// text runs share no area, the label keeps its short sha, and a short label is drawn whole.
+#[test]
+fn a_long_trial_label_keeps_clear_of_the_card_title_and_keeps_its_sha() {
+    let size = (35, 30, (26, 58));
+    for theme in THEMES {
+        let s = shot(perf_long_label, &[], size, theme);
+        let runs = &s.metrics.as_ref().expect("metrics").text_runs;
+        let title = runs.iter().find(|r| r.4 == "CSR performance");
+        let label = runs.iter().find(|r| r.4.ends_with("a3744ba4"));
+        let (title, label) = (
+            title.unwrap_or_else(|| panic!("{theme:?}: no title run in {runs:?}")),
+            label.unwrap_or_else(|| panic!("{theme:?}: no label run ending in the sha")),
+        );
+        assert!(
+            label.0 >= title.2,
+            "{theme:?}: label starts at {:.1} pt, inside the title ending at {:.1} pt",
+            label.0,
+            title.2
+        );
+        assert!(label.4.len() < LIVE_LABEL.len(), "{theme:?}: label not cut");
+        assert!(
+            label.4.contains('\u{2026}'),
+            "{theme:?}: cut without an ellipsis"
+        );
+        let fixture = FIXTURES
+            .iter()
+            .find(|f| f.name == "perf-long-label")
+            .unwrap();
+        let bad = violations(fixture, size, theme, &s);
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+    let s = shot(owner_home, &[], size, Theme::Dark);
+    let runs = &s.metrics.as_ref().expect("metrics").text_runs;
+    assert!(
+        runs.iter().any(|r| r.4 == "combo ac9c24c3"),
+        "a short label is drawn whole; runs with the sha: {:?}",
+        runs.iter()
+            .filter(|r| r.4.contains("ac9c24c3"))
+            .collect::<Vec<_>>()
+    );
 }

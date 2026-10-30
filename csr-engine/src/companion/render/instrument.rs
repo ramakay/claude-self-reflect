@@ -5499,6 +5499,38 @@ fn soak_rows(
         .filter(move |row| level >= 2 || row.sev == "red")
 }
 
+/// The trial label `"<words> <sha>"` fitted to `room` pt: unchanged when it fits, else its words
+/// are cut with an ellipsis and the trailing short sha stays whole. `None` when not even the sha
+/// fits.
+fn fit_candidate(f: &Fonts, candidate: &str, st: St, room: f32) -> Option<String> {
+    if candidate.is_empty() || room <= 0. {
+        return None;
+    }
+    if f.width(candidate, st) <= room {
+        return Some(candidate.to_owned());
+    }
+    let Some((words, sha)) = candidate
+        .rsplit_once(' ')
+        .filter(|(_, s)| s.len() >= 7 && s.chars().all(|ch| ch.is_ascii_hexdigit()))
+    else {
+        // No sha to keep: cut the label itself.
+        let shown = f.fit(candidate, st, room);
+        return (shown != "\u{2026}").then_some(shown);
+    };
+    if f.width(sha, st) > room {
+        return None;
+    }
+    let tail = format!(" {sha}");
+    let cut = f.fit(words, st, room - f.width(&tail, st));
+    Some(
+        if cut == "\u{2026}" && f.width(&format!("\u{2026}{tail}"), st) > room {
+            sha.to_owned()
+        } else {
+            format!("{cut}{tail}")
+        },
+    )
+}
+
 /// The CSR performance card at `y`: its heading, the big number and headline, the clock with its
 /// progress bar, then a line to each check and the stale-data warning.
 fn draw_soak(
@@ -5522,10 +5554,13 @@ fn draw_soak(
         t.ink,
         t.bold,
     );
-    if !card.candidate.is_empty() {
+    // The trial label sits right of the title, in what room the title leaves. A long label loses
+    // words from its end, never its trailing short sha; with no room at all it is dropped.
+    let room = IW - f.width(&icons::line(&card.title), heading(t)) - S3;
+    if let Some(shown) = fit_candidate(f, &card.candidate, caption, room) {
         c.text(
             f,
-            &card.candidate,
+            &shown,
             IX + IW,
             y + P + f.cap(caption),
             caption,
