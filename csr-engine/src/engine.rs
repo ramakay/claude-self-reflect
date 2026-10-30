@@ -202,14 +202,18 @@ impl Engine {
         };
 
         // Clean stale numbered HNSW files from previous sessions (crash resilience).
-        // Acquire exclusive lock to avoid racing with concurrent dump_to_disk writers.
+        // Needs the exclusive lock to avoid racing concurrent dump_to_disk writers,
+        // but only TRY for it: any other process loading the cache holds the lock
+        // shared, and a blocking request here stalls this startup until all of them
+        // finish. Skipping is safe because every dump_to_disk runs the same cleanup
+        // under its own exclusive lock.
         if let Ok(lock_file) = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
             .open(index_dir.join("index.lock"))
         {
-            if fs2::FileExt::lock_exclusive(&lock_file).is_ok() {
+            if fs2::FileExt::try_lock_exclusive(&lock_file).is_ok() {
                 crate::search::cleanup_stale_index_files(&index_dir);
             }
             // lock released on drop
