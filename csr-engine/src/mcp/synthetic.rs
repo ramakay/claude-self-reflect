@@ -393,10 +393,12 @@ fn rig_sunk_ids_if(
         .filter(|conversation| seen.insert(*conversation))
         .collect();
     let verdicts = session_verdicts(storage, &conversations);
-    // Sub-agents whose own session earned no standing: read their parents.
+    // Sub-agents whose own session is not an eval session: read their parents.
+    // Ran-the-rig standing is weaker than a parent's eval verdict, so it does
+    // not stand in for it.
     let mut parents: Vec<&str> = Vec::new();
     for verdict in verdicts.values() {
-        if verdict.eval_session || verdict.ran_rig {
+        if verdict.eval_session {
             continue;
         }
         if let Some(parent) = verdict.parent.as_deref() {
@@ -965,6 +967,51 @@ mod tests {
         ];
         let sunk = rig_sunk_ids_if(true, &storage, &sink_refs(&rows), QUERY);
         assert_eq!(sunk, HashSet::from([quoted]));
+    }
+
+    #[test]
+    fn synth_a_sub_agent_that_ran_the_rig_still_takes_its_eval_parents_standing() {
+        let storage = Storage::open_memory().unwrap();
+        // The parent is an eval session by share and is not a candidate.
+        for seq in 0..6 {
+            put(
+                &storage,
+                "sess-evalp",
+                seq,
+                Speaker::ToolResult,
+                "ran in /Users/x/.testbed/core-rewrite/wt",
+            );
+        }
+        for seq in 6..12 {
+            put(
+                &storage,
+                "sess-evalp",
+                seq,
+                Speaker::Assistant,
+                "[Bash: ls]",
+            );
+        }
+        // The child ran the rig twice among forty calls: weak standing only.
+        ran_rig_session(&storage, "agent-weak");
+        let marked = put_child(
+            &storage,
+            "agent-weak",
+            "sess-evalp",
+            50,
+            "ran in /Users/x/.testbed/core-rewrite/wt",
+        );
+        let rows = vec![(
+            marked.clone(),
+            "agent-weak".to_string(),
+            "ran in /Users/x/.testbed/core-rewrite/wt".to_string(),
+        )];
+        let sunk = rig_sunk_ids_if(
+            true,
+            &storage,
+            &sink_refs(&rows),
+            "unrelated question about sorting",
+        );
+        assert_eq!(sunk, HashSet::from([marked]));
     }
 
     #[test]

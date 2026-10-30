@@ -817,7 +817,10 @@ pub(crate) async fn keyword_fallback(
     // The live chat sinks on the fallback paths too, so a page served from here
     // continues the order recall's own page was cut from. Evidence for csr_why
     // and the insights summary are not a ranked page of chats.
+    // The rig's own rows sink here as in keyword recall, so offset N continues
+    // that page. Keyword candidates are transcript rows, never reflections.
     if !matches!(tool, KeywordTool::Why | KeywordTool::Insights) {
+        sink_rig_rows(storage, &mut results, &HashMap::new(), query);
         sink_live_session(&mut results, storage, query);
     }
     match tool {
@@ -10156,6 +10159,70 @@ mod tests {
         // Without a live session the raw keyword order is what every tool shows.
         let unset = one_page(&storage, &search, KeywordTool::Concept).await;
         assert!(unset.contains("SELFMARK"), "{unset}");
+    }
+
+    /// Keyword recall sinks an eval session's rig row; get_more(offset=1) on the
+    /// fallback must continue that order, not re-serve the clean row.
+    #[tokio::test]
+    async fn keyword_get_more_continues_the_rig_sunk_order() {
+        let v = [1.0, 0.0, 0.0, 0.0];
+        let (storage, search) = quick_check_fixture(&[
+            (
+                "rig",
+                "alpha",
+                "RIGMARK fallbackword fallbackword fallbackword ran in /Users/x/.testbed/core-rewrite/wt",
+                v,
+            ),
+            (
+                "clean",
+                "alpha",
+                "CLEANMARK fallbackword pad pad pad pad pad pad pad pad pad pad pad pad",
+                v,
+            ),
+        ]);
+        // Five more rig rows make conv-rig an eval session by share.
+        for seq in 0..5 {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("rig-extra-{seq}"),
+                conversation_id: "conv-rig".into(),
+                project_name: "alpha".into(),
+                timestamp: "2099-01-01T00:00:00Z".into(),
+                content: "ran in /Users/x/.testbed/core-rewrite/wt".into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::ToolResult,
+                seq: 10 + seq,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &v).unwrap();
+        }
+        let raw = keyword_candidates(&storage, "fallbackword", Some("alpha"), None).unwrap();
+        assert!(raw[0].chunk.content.contains("RIGMARK"), "premise");
+
+        let recall = keyword_fallback(
+            &storage,
+            &search,
+            "fallbackword",
+            1,
+            Some("alpha"),
+            KeywordTool::Recall,
+        )
+        .await
+        .unwrap();
+        let more = keyword_fallback(
+            &storage,
+            &search,
+            "fallbackword",
+            1,
+            Some("alpha"),
+            KeywordTool::More { offset: 1 },
+        )
+        .await
+        .unwrap();
+        assert!(recall.contains("CLEANMARK"), "{recall}");
+        assert!(!recall.contains("RIGMARK"), "{recall}");
+        assert!(more.contains("RIGMARK"), "{more}");
+        assert!(!more.contains("CLEANMARK"), "{more}");
     }
 
     /// CE order [live:9, other:1] with a page of one: the sink puts `other`
