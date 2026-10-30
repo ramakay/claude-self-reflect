@@ -573,7 +573,7 @@ fn backfill_missing_chunks_batched(
     Ok(added)
 }
 
-fn backfill_missing_chunks(
+pub(crate) fn backfill_missing_chunks(
     storage: &Storage,
     search: &mut SearchEngine,
     missing_ids: &[String],

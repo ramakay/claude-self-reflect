@@ -232,6 +232,24 @@ impl FileWatcher {
             }
         }
 
+        // A hook process may have stored some of these chunks before this pass.
+        // Their rows are byte-identical, so the loop above skips them, but this
+        // index has never held them. Load their stored vectors, or every dump of
+        // this index omits them and every hook process re-inserts them at startup.
+        let backfilled = {
+            let mut idx = self.search.write().await;
+            let missing: Vec<String> = chunks
+                .iter()
+                .filter(|c| !idx.has_chunk(&c.id))
+                .map(|c| c.id.clone())
+                .collect();
+            if missing.is_empty() {
+                0
+            } else {
+                crate::engine::backfill_missing_chunks(&self.storage, &mut idx, &missing)?
+            }
+        };
+
         self.storage.mark_file_imported(file_path, chunk_count)?;
 
         // Layer 1: Heuristic enrichment (inline, instant, free)
@@ -268,6 +286,7 @@ impl FileWatcher {
             chunks = chunk_count,
             reindexed,
             unchanged,
+            backfilled,
             project = %project_name,
             "auto-imported conversation"
         );
@@ -349,5 +368,57 @@ mod tests {
         let mut parsed = chunk("a", "hello");
         parsed.is_sidechain = true;
         assert!(needs_reindex(&parsed, Some(&stored)));
+    }
+
+    const HOOK_FIRST_TRANSCRIPT: &str = r#"{"type":"user","message":{"content":[{"type":"text","text":"Fix the race condition in HNSW persistence that causes stale index on restart"}]},"timestamp":"2026-02-22T15:00:00Z"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"I see the issue. The dump_to_disk function doesn't acquire a lock."}]},"timestamp":"2026-02-22T15:00:01Z"}
+{"type":"user","message":{"content":[{"type":"text","text":"Good, now add fs2 advisory locking"}]},"timestamp":"2026-02-22T15:00:02Z"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Added fs2 lock_exclusive before file dump."}]},"timestamp":"2026-02-22T15:00:03Z"}
+"#;
+
+    /// A hook process can import a transcript before the daemon's watcher sees
+    /// it. The stored rows are then byte-identical to what the watcher parses,
+    /// so `needs_reindex` skips them, but the watcher's in-memory index has never
+    /// held them. They must still enter that index. Otherwise every daemon dump
+    /// omits them and every hook process re-inserts them at startup through the
+    /// additive backfill in `Engine::new` (3,480 chunks and 5.6 s per hook on
+    /// 2026-10-29, growing until the daemon restarts).
+    #[tokio::test]
+    async fn chunk_stored_by_another_process_still_enters_the_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("-Users-test-proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let transcript = project_dir.join("conv-hook-first.jsonl");
+        std::fs::write(&transcript, HOOK_FIRST_TRANSCRIPT).unwrap();
+
+        let project_name = import::normalize_project_name("-Users-test-proj");
+        let chunks = import::parse_jsonl_file(&transcript, &project_name).unwrap();
+        assert!(!chunks.is_empty(), "fixture must produce chunks");
+
+        // What the hook process left behind: rows and vectors in SQLite.
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        for c in &chunks {
+            storage.insert_chunk(c, &[0.1f32; 384]).unwrap();
+        }
+        // The daemon's own index, which never saw them.
+        let search = Arc::new(RwLock::new(SearchEngine::new(16)));
+        let watcher = FileWatcher::new(
+            tmp.path().to_path_buf(),
+            storage,
+            Arc::new(EmbeddingEngine::new().unwrap()),
+            search.clone(),
+            tmp.path().join("index"),
+        );
+
+        watcher.import_file(&transcript).await.unwrap();
+
+        let idx = search.read().await;
+        for c in &chunks {
+            assert!(
+                idx.has_chunk(&c.id),
+                "chunk {} is in SQLite but missing from the watcher's index",
+                c.id
+            );
+        }
     }
 }
