@@ -110,16 +110,18 @@ impl DreamHeadline {
     }
 
     /// [`DreamHeadline::label`] said with where it lives, so it can be found:
-    /// `send in pane/kitty.rs` for a symbol, the file's path alone when there
-    /// is no symbol. Never a bare one-word symbol.
+    /// `send in pane/kitty.rs` for a symbol, the file alone when there is no
+    /// symbol. The file is its last two path components: the stored path is
+    /// often absolute, and a recap line does not carry a home directory.
+    /// Never a bare one-word symbol.
     pub fn qualified_label(&self) -> String {
-        let file = self.file.trim();
+        let file = short_path(self.file.trim());
         match self.symbol.as_deref().map(str::trim) {
             Some(symbol) if !symbol.is_empty() && !file.is_empty() => {
                 format!("{symbol} in {file}")
             }
             Some(symbol) if !symbol.is_empty() => symbol.to_string(),
-            _ if !file.is_empty() => file.to_string(),
+            _ if !file.is_empty() => file,
             _ => self.label().to_string(),
         }
     }
@@ -133,6 +135,17 @@ impl DreamHeadline {
             "anchor_reinstated" => "was reinstated",
             other => other,
         }
+    }
+}
+
+/// The last two components of a path: `/a/b/src/pane/kitty.rs` is
+/// `pane/kitty.rs`, `kitty.rs` stays `kitty.rs`.
+fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    match parts.len() {
+        0 => String::new(),
+        1 => parts[0].to_string(),
+        n => format!("{}/{}", parts[n - 2], parts[n - 1]),
     }
 }
 
@@ -1083,13 +1096,15 @@ mod tests {
             "send",
             "the bare label is unchanged for other surfaces"
         );
+        assert_eq!(with_symbol.qualified_label(), "send in pane/kitty.rs");
         assert_eq!(
-            with_symbol.qualified_label(),
-            "send in csr-engine/src/pane/kitty.rs"
+            headline("/Users/me/projects/x/src/pane/kitty.rs", Some("send")).qualified_label(),
+            "send in pane/kitty.rs",
+            "an absolute stored path never reaches the line"
         );
         assert_eq!(
             headline("src/pane/kitty.rs", None).qualified_label(),
-            "src/pane/kitty.rs"
+            "pane/kitty.rs"
         );
         assert_eq!(
             headline("src/a.rs", Some("  ")).qualified_label(),
