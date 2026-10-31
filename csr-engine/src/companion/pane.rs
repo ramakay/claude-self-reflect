@@ -211,6 +211,21 @@ struct Wide<'a> {
     persist: bool,
 }
 
+/// Whether the maintainer's road trial shows on the CSR performance card. Off unless
+/// `CSR_PANE_ROAD=1`, or `"road": true` among the csr-companion plugin's options in
+/// `~/.claude/settings.json`: the pane reads that file each frame, and an env var set in a shell
+/// does not reach a pane the plugin starts.
+fn road_on(settings: &Value, env: Option<&str>) -> bool {
+    env == Some("1")
+        || settings["pluginConfigs"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .any(|(name, c)| {
+                name.split('@').next() == Some("csr-companion") && c["options"]["road"] == true
+            })
+}
+
 pub struct Pane {
     paths: Paths,
     persist: bool,
@@ -276,7 +291,7 @@ pub struct Pane {
     offer_notice: Option<String>,
     /// The trial on show and when its files were read: they are re-read every 15 s, and the card
     /// is worked out afresh each frame.
-    soak: Option<(f64, super::live_eval::Loaded)>,
+    soak: Option<(f64, super::live_eval::Shown)>,
     /// The API credit and when the ledger was read.
     credit: Option<(f64, Option<super::api_credit::Credit>)>,
     popup: Option<Popup>,
@@ -763,7 +778,8 @@ impl Pane {
                 .is_none_or(|(at, _)| now - at >= 15. || now < *at)
             {
                 let dir = self.paths.home.join(".claude-self-reflect/trials");
-                self.soak = Some((now, super::live_eval::load(&dir, now)));
+                let road = road_on(&settings, std::env::var("CSR_PANE_ROAD").ok().as_deref());
+                self.soak = Some((now, super::live_eval::load(&dir, now, road)));
             }
             if let Some((_, loaded)) = &self.soak {
                 data["soak"] = json!(super::live_eval::card_at(loaded, now));
@@ -2812,6 +2828,25 @@ impl Pane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_road_is_off_unless_the_env_or_the_plugin_option_turns_it_on() {
+        let none = json!({});
+        assert!(!road_on(&none, None));
+        assert!(!road_on(&none, Some("0")));
+        assert!(road_on(&none, Some("1")));
+        let option =
+            |name: &str, v: Value| json!({"pluginConfigs": {name: {"options": {"road": v}}}});
+        assert!(road_on(&option("csr-companion@csr", json!(true)), None));
+        assert!(road_on(&option("csr-companion", json!(true)), None));
+        assert!(!road_on(&option("csr-companion@csr", json!(false)), None));
+        assert!(!road_on(&option("csr-companion@csr", json!("yes")), None));
+        assert!(!road_on(&option("other@csr", json!(true)), None));
+        assert!(!road_on(
+            &json!({"pluginConfigs": {"csr-companion@csr": {"options": {"dreams": true}}}}),
+            None
+        ));
+    }
     #[test]
     fn test_the_legend_keeps_close_at_phone_width() {
         let (s, spans) = legend("main", 37, Some(42));

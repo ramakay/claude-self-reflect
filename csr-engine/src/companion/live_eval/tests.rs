@@ -739,9 +739,9 @@ fn good_source(dir: &std::path::Path) {
 fn no_trial_no_card() {
     let home = tempfile::tempdir().unwrap();
     let now = at("2026-10-28T01:00:00Z");
-    assert!(card_at(&load(&home.path().join("trials"), now), now).is_none());
+    assert!(card_at(&load(&home.path().join("trials"), now, false), now).is_none());
     fs::create_dir_all(home.path().join("trials")).unwrap();
-    assert!(card_at(&load(&home.path().join("trials"), now), now).is_none());
+    assert!(card_at(&load(&home.path().join("trials"), now, false), now).is_none());
 }
 
 #[test]
@@ -749,7 +749,7 @@ fn a_trial_shows_while_it_runs_and_for_twelve_hours_after() {
     let dir = tempfile::tempdir().unwrap();
     good_source(dir.path());
     write_trial(dir.path(), "a.json", START, END, "s.log");
-    let shown = |now: &str| card_at(&load(dir.path(), at(now)), at(now)).is_some();
+    let shown = |now: &str| card_at(&load(dir.path(), at(now), false), at(now)).is_some();
     assert!(!shown("2026-10-27T22:00:00Z"), "not started");
     assert!(shown("2026-10-28T01:00:00Z"));
     assert!(shown("2026-10-28T18:59:00Z"), "11h59m after the end");
@@ -769,7 +769,7 @@ fn the_newest_trial_that_covers_now_is_the_active_one() {
     );
     write_trial(dir.path(), "new.json", START, END, "s.log");
     let now = at("2026-10-28T01:00:00Z");
-    let card = card_at(&load(dir.path(), now), now).unwrap();
+    let card = card_at(&load(dir.path(), now, false), now).unwrap();
     assert!(card.line2.starts_with("new.json"), "{}", card.line2);
 }
 
@@ -778,7 +778,7 @@ fn a_missing_source_is_unreadable_not_a_crash() {
     let dir = tempfile::tempdir().unwrap();
     write_trial(dir.path(), "a.json", START, END, "gone.log");
     let now = at("2026-10-28T01:00:00Z");
-    let card = card_at(&load(dir.path(), now), now).unwrap();
+    let card = card_at(&load(dir.path(), now, false), now).unwrap();
     assert_eq!(card.line1, "Trial data unreadable: gone.log not found");
     assert!(card.line2.starts_with("a.json · ends"));
 }
@@ -793,7 +793,7 @@ fn a_corrupt_source_is_unreadable_and_an_empty_one_is_waiting() {
         "\u{0}\u{1}garbage\nmore garbage\n",
     )
     .unwrap();
-    let card = card_at(&load(dir.path(), now), now).unwrap();
+    let card = card_at(&load(dir.path(), now, false), now).unwrap();
     assert!(
         card.line1
             .starts_with("Trial data unreadable: none of the 2 lines"),
@@ -801,7 +801,7 @@ fn a_corrupt_source_is_unreadable_and_an_empty_one_is_waiting() {
         card.line1
     );
     fs::write(dir.path().join("s.log"), "").unwrap();
-    let card = card_at(&load(dir.path(), now), now).unwrap();
+    let card = card_at(&load(dir.path(), now, false), now).unwrap();
     assert!(card.line1.ends_with("Waiting for data"), "{}", card.line1);
 }
 
@@ -813,7 +813,7 @@ fn a_spec_that_will_not_parse_shows_why_while_it_is_fresh() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs_f64();
-    let card = card_at(&load(dir.path(), mtime), mtime).unwrap();
+    let card = card_at(&load(dir.path(), mtime, false), mtime).unwrap();
     assert!(
         card.line1.starts_with("Trial data unreadable: a.json: "),
         "{}",
@@ -821,7 +821,7 @@ fn a_spec_that_will_not_parse_shows_why_while_it_is_fresh() {
     );
     // Long forgotten, it is not the card's business.
     let later = mtime + 13. * 3600.;
-    assert!(card_at(&load(dir.path(), later), later).is_none());
+    assert!(card_at(&load(dir.path(), later, false), later).is_none());
 }
 
 #[test]
@@ -837,10 +837,209 @@ fn a_relative_source_is_read_from_the_specs_folder_and_an_absolute_one_as_given(
         other.path().join("s.log").to_str().unwrap(),
     );
     let now = at("2026-10-28T01:00:00Z");
-    let card = card_at(&load(dir.path(), now), now).unwrap();
+    let card = card_at(&load(dir.path(), now, false), now).unwrap();
     assert!(
         card.line1.contains("1 of 1 checks passing"),
         "{}",
         card.line1
     );
+}
+
+// ---- the road
+
+const ROAD_START: &str = "2026-10-27T20:00:00Z";
+const ROAD_END: &str = "2026-10-30T07:00:00Z";
+
+/// The seven-check road of the 4.5-star trial, with two checks passing.
+fn write_road(dir: &std::path::Path, file: &str, track: Option<&str>) {
+    let mut spec = json!({"name":"Road to blind 4.5 stars","started_at":ROAD_START,
+    "planned_end":ROAD_END,"source":"road.ndjson","candidate":{"label":"rc","sha":"046c4925"},
+    "checks":[
+        check("gate","Release gate failures","gate_failed","==",json!(0),"latest"),
+        check("recall","Recall p50","recall_p50_ms","<=",json!(800),"at_least_by_end"),
+        check("recap","Recap judge: recaps worse","recap_worse","==",json!(0),"at_least_by_end"),
+        check("stars","Blind Fable rating","blind_stars",">=",json!(4.5),"at_least_by_end"),
+    ]});
+    if let Some(track) = track {
+        spec["track"] = json!(track);
+    }
+    fs::write(dir.join(file), spec.to_string()).unwrap();
+    fs::write(
+        dir.join("road.ndjson"),
+        "{\"t\":\"2026-10-28T00:00:00Z\",\"gate_failed\":0,\"recall_p50_ms\":700,\"recap_worse\":5,\"blind_stars\":3}\n",
+    )
+    .unwrap();
+}
+fn run_and_road(dir: &std::path::Path) {
+    good_source(dir);
+    write_trial(dir, "run.json", START, END, "s.log");
+    write_road(dir, "road.json", Some("road"));
+}
+const ROAD_NOW: &str = "2026-10-28T00:30:00Z";
+
+#[test]
+fn a_spec_without_a_track_is_a_run_trial() {
+    assert_eq!(trial_with(vec![]).track, Track::Run);
+    let road = Trial::from_json(
+        &json!({"name":"r","track":"road","started_at":START,"planned_end":END,"source":"x","checks":[]})
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(road.track, Track::Road);
+    assert!(Trial::from_json(
+        &json!({"name":"r","track":"sprint","started_at":START,"planned_end":END,"source":"x","checks":[]})
+            .to_string()
+    )
+    .is_err());
+}
+
+#[test]
+fn a_road_is_never_shown_with_the_flag_off() {
+    let dir = tempfile::tempdir().unwrap();
+    run_and_road(dir.path());
+    let now = at(ROAD_NOW);
+    let card = card_at(&load(dir.path(), now, false), now).unwrap();
+    assert!(card.road.is_none());
+    assert!(card.line2.starts_with("run.json"), "{}", card.line2);
+    // Alone, it is no card at all.
+    fs::remove_file(dir.path().join("run.json")).unwrap();
+    assert!(card_at(&load(dir.path(), now, false), now).is_none());
+}
+
+#[test]
+fn a_broken_road_spec_is_not_reported_with_the_flag_off() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("road.json"),
+        json!({"name":"r","track":"road","started_at":"nope"}).to_string(),
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    assert!(card_at(&load(dir.path(), now, false), now).is_none());
+    let card = card_at(&load(dir.path(), now, true), now).unwrap();
+    assert!(
+        card.line1.starts_with("Trial data unreadable: road.json: "),
+        "{}",
+        card.line1
+    );
+}
+
+#[test]
+fn the_road_is_one_line_under_the_run_card_with_the_flag_on() {
+    let dir = tempfile::tempdir().unwrap();
+    run_and_road(dir.path());
+    let now = at(ROAD_NOW);
+    let card = card_at(&load(dir.path(), now, true), now).unwrap();
+    assert!(card.line2.starts_with("run.json"), "the run trial leads");
+    let road = card.road.expect("the road line");
+    assert_eq!(
+        road.text,
+        "Road to blind 4.5 stars · 2 of 4 · next: Recap judge: recaps worse"
+    );
+    assert_eq!((road.mark.as_str(), road.sev.as_str()), ("…", "quiet"));
+}
+
+#[test]
+fn the_road_alone_makes_the_card_and_names_what_is_next() {
+    let dir = tempfile::tempdir().unwrap();
+    write_road(dir.path(), "road.json", Some("road"));
+    let now = at(ROAD_NOW);
+    let card = card_at(&load(dir.path(), now, true), now).unwrap();
+    assert_eq!(card.title, "CSR performance");
+    assert_eq!(
+        card.line1,
+        "2 of 4 checks passing · next: Recap judge: recaps worse"
+    );
+    assert!(
+        card.line2.starts_with("Road to blind 4.5 stars · ends"),
+        "{}",
+        card.line2
+    );
+    assert_eq!(card.rows.len(), 4);
+    assert!(card.road.is_none());
+}
+
+#[test]
+fn next_is_the_first_check_not_passing_and_a_failure_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    write_road(dir.path(), "road.json", Some("road"));
+    // Gate and recall hold; the recap check is the first that does not.
+    fs::write(
+        dir.path().join("road.ndjson"),
+        "{\"t\":\"2026-10-28T00:00:00Z\",\"gate_failed\":0,\"recall_p50_ms\":700,\"recap_worse\":5,\"blind_stars\":3}\n",
+    )
+    .unwrap();
+    let now = at(ROAD_NOW);
+    let line = |dir: &std::path::Path| {
+        let shown = load(dir, now, true);
+        let report = match &shown.road {
+            Loaded::Trial {
+                trial,
+                samples: Ok(s),
+            } => evaluate(trial, s, now),
+            _ => panic!("no road"),
+        };
+        road_line(&report)
+    };
+    assert_eq!(
+        line(dir.path()).text,
+        "Road to blind 4.5 stars · 2 of 4 · next: Recap judge: recaps worse"
+    );
+    fs::write(
+        dir.path().join("road.ndjson"),
+        "{\"t\":\"2026-10-28T00:00:00Z\",\"gate_failed\":1,\"recall_p50_ms\":700,\"recap_worse\":5,\"blind_stars\":3}\n",
+    )
+    .unwrap();
+    let failing = line(dir.path());
+    assert_eq!(
+        failing.text,
+        "Road to blind 4.5 stars · 1 of 4 · next: Release gate failures"
+    );
+    assert_eq!((failing.mark.as_str(), failing.sev.as_str()), ("✗", "red"));
+    fs::write(
+        dir.path().join("road.ndjson"),
+        "{\"t\":\"2026-10-28T00:00:00Z\",\"gate_failed\":0,\"recall_p50_ms\":700,\"recap_worse\":0,\"blind_stars\":4.6}\n",
+    )
+    .unwrap();
+    let done = line(dir.path());
+    assert_eq!(done.text, "Road to blind 4.5 stars · 4 of 4 · all passing");
+    assert_eq!(done.mark, "✓");
+}
+
+#[test]
+fn an_unreadable_road_beside_a_run_card_is_a_line_that_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    good_source(dir.path());
+    write_trial(dir.path(), "run.json", START, END, "s.log");
+    write_road(dir.path(), "road.json", Some("road"));
+    fs::remove_file(dir.path().join("road.ndjson")).unwrap();
+    let now = at(ROAD_NOW);
+    let card = card_at(&load(dir.path(), now, true), now).unwrap();
+    assert_eq!(
+        card.road.unwrap().text,
+        "Road: Trial data unreadable: road.ndjson not found"
+    );
+}
+
+#[test]
+fn the_newest_road_wins_among_roads_and_does_not_displace_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    run_and_road(dir.path());
+    // An older road, and a run that started before the newer road: each track keeps its own.
+    let mut older: Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("road.json")).unwrap()).unwrap();
+    older["name"] = json!("Old road");
+    older["started_at"] = json!("2026-10-26T00:00:00Z");
+    fs::write(dir.path().join("old-road.json"), older.to_string()).unwrap();
+    let now = at(ROAD_NOW);
+    let card = card_at(&load(dir.path(), now, true), now).unwrap();
+    assert!(card.line2.starts_with("run.json"));
+    assert!(card
+        .road
+        .unwrap()
+        .text
+        .starts_with("Road to blind 4.5 stars"));
 }

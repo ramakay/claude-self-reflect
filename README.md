@@ -195,6 +195,7 @@ The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew instal
 - **autoCompact:** `off`, `suggest` (default) or `auto`.
 - **`/csr statusline`:** moves your status bar into the pane, and restores it when the pane closes.
 - **Phone layout:** the pane has a layout for a narrow terminal.
+- **Road trial line (maintainers):** a trial spec with `"track": "road"` adds one line to the CSR performance card; off by default, switch on with `CSR_PANE_ROAD=1` or `"road": true` under the `csr-companion` entry of `pluginConfigs` in `~/.claude/settings.json`.
 - **One dreamer per session, crash guard:** a lease stops two dreamers on one session, and a broken edit to the pane does not kill it.
 
 ### Quiet MCP niceties

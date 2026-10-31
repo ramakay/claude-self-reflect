@@ -29,6 +29,10 @@ pub struct Card {
     /// When the words next change with no new data, as a time: the clock line moves by the minute.
     #[serde(default)]
     pub next_change: Option<f64>,
+    /// The maintainer's long road, as one line under the card; only when the road is switched on
+    /// and a run trial makes the card.
+    #[serde(default)]
+    pub road: Option<Row>,
 }
 
 /// The next moment the clock line's minutes change.
@@ -255,7 +259,60 @@ where
             )
         }),
         next_change: Some(next_minute(&report.trial, report.now)),
+        road: None,
     }
+}
+
+/// The first check not yet passing, which the road names as what is next.
+fn next_label(report: &Report) -> Option<&str> {
+    report
+        .checks
+        .iter()
+        .find(|c| c.status != Status::Pass)
+        .map(|c| c.spec.label.as_str())
+}
+
+/// The road as one line: "Road to blind 4.5 stars · 3 of 7 · next: Recap judge: recaps worse".
+pub fn road_line(report: &Report) -> Row {
+    let total = report.checks.len();
+    let next = match next_label(report) {
+        Some(label) => format!("next: {label}"),
+        None => "all passing".to_owned(),
+    };
+    let (mark, sev) = if report.checks.iter().any(|c| c.status == Status::Fail) {
+        ("✗", "red")
+    } else if report.pending == 0 {
+        ("✓", "ok")
+    } else {
+        ("…", "quiet")
+    };
+    Row {
+        mark: mark.into(),
+        sev: sev.into(),
+        text: format!(
+            "{} · {} of {total} · {next}",
+            report.trial.name, report.passing
+        ),
+    }
+}
+
+/// The card for a road with no run trial beside it: the usual card, with "next: <check>" in
+/// place of the soak's headline, which says "Soak finished" after the end.
+pub fn road_card<Tz: TimeZone>(report: &Report, tz: &Tz) -> Card
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let mut card = card(report, tz);
+    let next = match next_label(report) {
+        Some(label) => format!("next: {label}"),
+        None => "all passing".to_owned(),
+    };
+    card.line1 = format!(
+        "{} of {} checks passing · {next}",
+        report.passing,
+        report.checks.len()
+    );
+    card
 }
 
 /// The card for a trial whose data could not be read: why, and the clock if the spec was.
@@ -275,5 +332,6 @@ where
         rows: vec![],
         warning: None,
         next_change: trial.map(|t| next_minute(t, now)),
+        road: None,
     }
 }

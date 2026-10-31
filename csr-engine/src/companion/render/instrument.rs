@@ -1704,6 +1704,9 @@ fn assemble(
         for row in card.rows.iter().filter(|r| r.mark == "✗") {
             out.extend(wrap(&format!("{} {}", row.mark, row.text)));
         }
+        if let Some(road) = &card.road {
+            out.extend(wrap(&format!("{} {}", road.mark, road.text)));
+        }
         if let Some(warning) = &card.warning {
             out.extend(wrap(warning));
         }
@@ -5448,6 +5451,8 @@ struct SoakPlan {
     /// The check rows drawn, and how many `level` has: fewer drawn ends in a "+N more" row.
     shown: usize,
     total: usize,
+    /// Whether the road line is drawn under the checks.
+    road: bool,
 }
 /// The height of the progress bar under the card's clock line.
 const SOAK_BAR_H: f32 = 6.;
@@ -5467,7 +5472,8 @@ fn soak_plan(
     let clock = level >= 1 && !card.line2.is_empty();
     let total = soak_rows(card, level).count();
     let shown = total.min(max_rows.max(1));
-    let rows = shown + usize::from(card.warning.is_some());
+    let road = level >= 1 && card.road.is_some();
+    let rows = shown + usize::from(card.warning.is_some()) + usize::from(road);
     let h = P
         + theme::TITLE_LINE
         + S2
@@ -5479,6 +5485,7 @@ fn soak_plan(
         }
         + if rows > 0 { S2 } else { 0. }
         + rows as f32 * DASH_ROW
+        + if road { S1 } else { 0. }
         + P;
     SoakPlan {
         head,
@@ -5487,6 +5494,7 @@ fn soak_plan(
         level,
         shown,
         total,
+        road,
     }
 }
 /// The check rows a card shows at `level`: all of them at 2, only the failing ones below.
@@ -5600,7 +5608,7 @@ fn draw_soak(
         }
         at += SOAK_BAR_H;
     }
-    if plan.shown > 0 || card.warning.is_some() {
+    if plan.shown > 0 || card.warning.is_some() || plan.road {
         at += S2;
     }
     let row_st = sans(11., t.regular);
@@ -5637,6 +5645,19 @@ fn draw_soak(
             t.quiet,
             A::L,
         );
+        at += DASH_ROW;
+    }
+    if let Some(road) = card.road.as_ref().filter(|_| plan.road) {
+        // A little air, so the road reads as its own line and not as one more check.
+        at += S1;
+        let mark = match road.sev.as_str() {
+            "ok" => t.mint,
+            "red" => t.risk,
+            _ => t.quiet,
+        };
+        let base = at + f.cap(row_st);
+        c.text(f, &road.mark, IX, base, sans(11., t.bold), mark, A::L);
+        single(c, f, &road.text, IX + 16., base, IW - 16., 11., t.ink, t);
         at += DASH_ROW;
     }
     if let Some(warning) = &card.warning {
@@ -8316,6 +8337,7 @@ mod tests {
                 .collect(),
             warning: None,
             next_change: None,
+            road: None,
         }
     }
 
@@ -8442,6 +8464,36 @@ mod tests {
             m.soak_region.is_some(),
             "unreadable data is a card that says so, never a hole"
         );
+    }
+
+    #[test]
+    fn the_road_line_adds_one_row_and_a_short_pane_keeps_the_card_without_it() {
+        let height = |card: crate::companion::live_eval::Card, h: u32| {
+            let mut c = dash_composition("ok");
+            c.soak = Some(card);
+            let (_, m) = draw(&c, 704, h, Theme::Dark, Open::default(), false).unwrap();
+            m.soak_region.expect("the card stays").1
+        };
+        let mut with = soak_card(5);
+        with.road = Some(crate::companion::live_eval::Row {
+            mark: "\u{2026}".into(),
+            sev: "quiet".into(),
+            text: "Road to blind 4.5 stars \u{b7} 3 of 7 \u{b7} next: Recap judge: recaps worse"
+                .into(),
+        });
+        let (plain, road) = (height(soak_card(5), 1800), height(with.clone(), 1800));
+        assert!(road > plain, "{road} vs {plain}");
+        assert!(height(with, 900) >= 80., "the card stays on a short pane");
+        let mut c = dash_composition("ok");
+        let mut card = soak_card(5);
+        card.road = Some(crate::companion::live_eval::Row {
+            mark: "\u{2026}".into(),
+            sev: "quiet".into(),
+            text: "Road to blind 4.5 stars \u{b7} 3 of 7 \u{b7} next: Recap judge".into(),
+        });
+        c.soak = Some(card);
+        let text = text_rows(&c, 80, 40, Open::default()).join("\n");
+        assert!(text.contains("next: Recap judge"), "{text}");
     }
 
     #[test]
