@@ -2856,7 +2856,7 @@ fn wait_for_daemon(
 // is an upsert that rewrites the whole entry: it drops `args`, `env`, `cwd`, timeouts and tool
 // filters from the entry it replaces, so an entry with any of those, or one the user disabled,
 // is left alone and the user is told why. It also drops comments in and above the
-// `[mcp_servers.*]` tables (codex-cli 0.163.0), so the file is copied aside before the add.
+// `[mcp_servers.*]` tables (codex-cli 0.163.0), so the file is copied to a new backup before the add.
 
 /// Hard stop for each `codex mcp` call. Only that child is killed.
 const CODEX_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2874,6 +2874,13 @@ enum CodexMcpOutcome {
     AlreadyCurrent,
     /// An entry exists that setup must not rewrite. `command` is the manual fix.
     LeftAlone { reason: String, command: String },
+    /// The add ran but the read-back did not confirm it. The config may already be
+    /// rewritten, so the backup is still reported.
+    Unverified {
+        reason: String,
+        backup: Option<std::path::PathBuf>,
+        command: String,
+    },
     /// A `codex` call failed. `command` is the manual fix.
     Failed { reason: String, command: String },
 }
@@ -2916,8 +2923,9 @@ fn codex_entry_is_bare(entry: &serde_json::Value) -> bool {
         && ["args", "env", "env_vars", "cwd"]
             .iter()
             .all(|k| empty(transport.get(*k)))
+        // An allowlist, even an empty one, is a restriction; the add would drop it.
+        && entry.get("enabled_tools").is_none_or(|v| v.is_null())
         && [
-            "enabled_tools",
             "disabled_tools",
             "startup_timeout_sec",
             "tool_timeout_sec",
@@ -2950,15 +2958,45 @@ fn codex_config_path() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Copy `config` to `config.toml.csr-backup` beside it. None when there is no file to copy.
+/// Copy `config` to a new `config.toml.csr-backup-<unix secs>[-n]` beside it, owner-only.
+/// The file is created exclusively, so an earlier backup is never overwritten and a link
+/// planted at the name is never followed. None when there is no file to copy.
 fn backup_codex_config(config: &Path) -> Result<Option<std::path::PathBuf>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
     if !config.is_file() {
         return Ok(None);
     }
-    let backup = config.with_file_name("config.toml.csr-backup");
-    std::fs::copy(config, &backup)
-        .map(|_| Some(backup.clone()))
-        .map_err(|e| format!("could not back up {}: {e}", config.display()))
+    let fail = |e: std::io::Error| format!("could not back up {}: {e}", config.display());
+    let mut source = std::fs::File::open(config).map_err(fail)?;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for n in 0..100 {
+        let name = match n {
+            0 => format!("config.toml.csr-backup-{secs}"),
+            n => format!("config.toml.csr-backup-{secs}-{n}"),
+        };
+        let backup = config.with_file_name(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backup)
+        {
+            Ok(mut out) => {
+                std::io::copy(&mut source, &mut out).map_err(fail)?;
+                out.sync_all().map_err(fail)?;
+                return Ok(Some(backup));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(fail(e)),
+        }
+    }
+    Err(format!(
+        "could not back up {}: no free backup name",
+        config.display()
+    ))
 }
 
 /// Register `binary` as the `claude-self-reflect` MCP server with the Codex CLI at `codex`.
@@ -3027,21 +3065,27 @@ fn register_codex_mcp(
         Err(reason) => return failed(reason),
     }
 
-    // Read it back: "Added" on stdout is not proof the entry names this binary.
+    // Read it back: "Added" on stdout is not proof the entry names this binary. From here
+    // on the config may already be rewritten, so a failure keeps the backup receipt.
+    let unverified = |reason: String| CodexMcpOutcome::Unverified {
+        reason,
+        backup: backup.clone(),
+        command: command.clone(),
+    };
     let check = match run_with_timeout(codex, &get_args, timeout) {
         Ok(run) if run.success => run,
         Ok(run) => {
-            return failed(format!(
+            return unverified(format!(
                 "`codex mcp get` after the add failed: {}",
                 codex_detail(&run)
             ))
         }
-        Err(reason) => return failed(reason),
+        Err(reason) => return unverified(reason),
     };
     let kept =
         first_json(&check.stdout, |v| v.is_object()).and_then(|entry| codex_entry_command(&entry));
     if kept.as_deref() != Some(binary) {
-        return failed(format!(
+        return unverified(format!(
             "Codex's config names {} after the add, not this binary",
             kept.unwrap_or_else(|| "no command".to_string())
         ));
@@ -3072,6 +3116,19 @@ fn codex_step_text(outcome: &CodexMcpOutcome) -> String {
         CodexMcpOutcome::AlreadyCurrent => "  Codex: already registered\n".to_string(),
         CodexMcpOutcome::LeftAlone { reason, command } => {
             format!("  Codex: existing entry left alone; {reason}. To repoint it:\n    {command}\n")
+        }
+        CodexMcpOutcome::Unverified {
+            reason,
+            backup,
+            command,
+        } => {
+            let kept = backup
+                .as_ref()
+                .map(|b| format!("\n  Codex: previous config saved to {}", b.display()))
+                .unwrap_or_default();
+            format!(
+                "  Codex: added, but not confirmed ({reason}). Check with `codex mcp get {MCP_SERVER_NAME}`, or run:\n    {command}{kept}\n"
+            )
         }
         CodexMcpOutcome::Failed { reason, command } => {
             format!("  Codex: not registered ({reason}). Run it yourself:\n    {command}\n")
@@ -3108,8 +3165,16 @@ fn codex_step_checked() -> (String, bool) {
     let Some(codex) = find_on_path("codex") else {
         return ("  Codex: not installed, skipped\n".to_string(), true);
     };
+    // The stable name (a symlink an upgrade repoints), as the daemon step stores it.
     let binary = match std::env::current_exe() {
-        Ok(path) => path.to_string_lossy().into_owned(),
+        Ok(exe) => stable_engine_path(
+            std::env::args_os().next().as_deref(),
+            &std::env::current_dir().unwrap_or_default(),
+            std::env::var_os("PATH").as_deref(),
+            &exe,
+        )
+        .to_string_lossy()
+        .into_owned(),
         Err(e) => {
             return (
                 format!("  Codex: not registered (cannot determine our own path: {e})\n"),
@@ -3142,6 +3207,7 @@ echo "$@" >> "$D/argv.log"
 case "$2" in
   get)
     if [ -f "$D/get_fails" ]; then echo "Error: config.toml: invalid TOML" >&2; exit 1; fi
+    if [ -f "$D/get_fails_after_add" ] && [ -f "$D/entry.json" ]; then echo "Error: config.toml: locked" >&2; exit 1; fi
     if [ -f "$D/entry.json" ]; then cat "$D/entry.json"; else echo "Error: No MCP server named '$3' found." >&2; exit 1; fi ;;
   add)
     if [ -f "$D/add_fails" ]; then echo "Error: permission denied" >&2; exit 1; fi
@@ -3195,6 +3261,7 @@ esac
 
     #[test]
     fn codex_config_is_copied_aside_before_the_add() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let codex = fake_codex(tmp.path());
         let config = tmp.path().join("config.toml");
@@ -3204,24 +3271,67 @@ esac
         )
         .unwrap();
         let outcome = register_codex_mcp(&codex, Some(&config), NEW_BIN, Duration::from_secs(10));
-        let backup = tmp.path().join("config.toml.csr-backup");
-        assert_eq!(
-            outcome,
-            CodexMcpOutcome::Registered {
-                repointed_from: None,
-                backup: Some(backup.clone())
-            }
-        );
-        assert!(std::fs::read_to_string(&backup)
+        let CodexMcpOutcome::Registered {
+            backup: Some(backup),
+            ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert!(std::fs::read_to_string(backup)
             .unwrap()
             .starts_with("# mine"));
+        assert_eq!(
+            std::fs::metadata(backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(codex_step_text(&outcome).contains("previous config saved to"));
 
+        let backups = || {
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("config.toml.csr-backup-")
+                })
+                .count()
+        };
         // Already current: nothing is written, so no new backup either.
-        std::fs::remove_file(&backup).unwrap();
         let again = register_codex_mcp(&codex, Some(&config), NEW_BIN, Duration::from_secs(10));
         assert_eq!(again, CodexMcpOutcome::AlreadyCurrent);
-        assert!(!backup.exists());
+        assert_eq!(backups(), 1);
+
+        // A second backup in the same second takes a new name; the first is kept as it was.
+        let first = std::fs::read(backup).unwrap();
+        let second = backup_codex_config(&config).unwrap().unwrap();
+        assert_ne!(&second, backup);
+        assert_eq!(std::fs::read(backup).unwrap(), first);
+        assert_eq!(backups(), 2);
+    }
+
+    #[test]
+    fn codex_failed_read_back_is_unverified_and_keeps_the_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = fake_codex(tmp.path());
+        let config = tmp.path().join("config.toml");
+        std::fs::write(&config, "[mcp_servers.other]\ncommand = \"/bin/echo\"\n").unwrap();
+        std::fs::write(tmp.path().join("get_fails_after_add"), "").unwrap();
+        let outcome = register_codex_mcp(&codex, Some(&config), NEW_BIN, Duration::from_secs(10));
+        let CodexMcpOutcome::Unverified {
+            backup: Some(_),
+            reason,
+            ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert!(reason.contains("after the add"), "{reason}");
+        let text = codex_step_text(&outcome);
+        assert!(text.contains("added, but not confirmed"), "{text}");
+        assert!(text.contains("previous config saved to"), "{text}");
     }
 
     #[test]
@@ -3308,7 +3418,7 @@ esac
     }
 
     #[test]
-    fn codex_add_failure_and_silent_add_are_failures() {
+    fn codex_add_failure_fails_and_silent_add_is_unverified() {
         let tmp = tempfile::tempdir().unwrap();
         let codex = fake_codex(tmp.path());
         std::fs::write(tmp.path().join("add_fails"), "").unwrap();
@@ -3323,7 +3433,7 @@ esac
         std::fs::write(tmp.path().join("add_ignored"), "").unwrap();
         let outcome = register_codex_mcp(&codex, None, NEW_BIN, Duration::from_secs(10));
         assert!(
-            matches!(&outcome, CodexMcpOutcome::Failed { .. }),
+            matches!(&outcome, CodexMcpOutcome::Unverified { .. }),
             "{outcome:?}"
         );
     }
@@ -3369,6 +3479,13 @@ esac
             e[field] = serde_json::from_str(value).unwrap();
             assert!(!codex_entry_is_bare(&e), "{field}");
         }
+        let mut allow_none = bare.clone();
+        allow_none["enabled_tools"] = serde_json::json!([]);
+        assert!(!codex_entry_is_bare(&allow_none), "empty allowlist");
+        let mut deny_none = bare.clone();
+        deny_none["disabled_tools"] = serde_json::json!([]);
+        assert!(codex_entry_is_bare(&deny_none), "empty denylist");
+
         let mut http = bare.clone();
         http["transport"]["type"] = "streamable_http".into();
         assert!(!codex_entry_is_bare(&http));

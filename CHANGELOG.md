@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Setup registers the MCP server with Codex** when the `codex` CLI is on `PATH`: `codex mcp add claude-self-reflect -- <this binary>`,
   read back with `codex mcp get --json`. An entry that already names this binary is not rewritten; a bare entry at an older path
   is repointed; an entry the user disabled or customized (args, env, cwd, timeouts, tool filters, which `codex mcp add` would drop)
-  is left alone with the command to run by hand. Never fails setup. `csr-engine setup --codex-only` runs this step alone;
+  is left alone with the command to run by hand. `codex mcp add` drops comments in and above `[mcp_servers.*]`, so the
+  config is first copied to a new owner-only `config.toml.csr-backup-<secs>`. The stored path is the stable symlink, not the
+  versioned binary. Never fails setup. `csr-engine setup --codex-only` runs this step alone;
   `CSR_NO_CODEX_MCP=1` skips it.
 
 **Already shipped in 9.5.1-9.5.8, carried here, not new:** 92acc3bd, cdd23033, c46702aa, f0cf3a83, 56dddc3a,
