@@ -5648,7 +5648,8 @@ fn draw_soak(
         at += DASH_ROW;
     }
     if let Some(road) = card.road.as_ref().filter(|_| plan.road) {
-        // A little air, so the road reads as its own line and not as one more check.
+        // A hairline in the air above, so the road reads as its own track and not as one more check.
+        c.rect(IX, at + S1 / 2., IW, t.hair_width, t.hair);
         at += S1;
         let mark = match road.sev.as_str() {
             "ok" => t.mint,

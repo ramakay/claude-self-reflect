@@ -928,6 +928,53 @@ fn a_broken_road_spec_is_not_reported_with_the_flag_off() {
 }
 
 #[test]
+fn a_half_written_road_spec_is_not_reported_with_the_flag_off() {
+    let dir = tempfile::tempdir().unwrap();
+    // Not JSON (a trailing comma), but it still names its track.
+    for text in [
+        r#"{"track":"road","name":"r",}"#,
+        "{\n  \"name\": \"r\",\n  \"track\" :\n \"road\",\n",
+    ] {
+        fs::write(dir.path().join("road.json"), text).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(
+            card_at(&load(dir.path(), now, false), now).is_none(),
+            "{text}"
+        );
+        assert!(
+            card_at(&load(dir.path(), now, true), now).is_some(),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_half_written_run_spec_is_still_reported_with_the_flag_off() {
+    let dir = tempfile::tempdir().unwrap();
+    // A legacy run spec, and a run spec that only mentions the road in another field.
+    for text in [
+        r#"{"name":"r",}"#,
+        r#"{"track":"run","name":"road",}"#,
+        r#"{"name":"track road","note":"track: road",}"#,
+    ] {
+        fs::write(dir.path().join("run.json"), text).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let card = card_at(&load(dir.path(), now, false), now).expect(text);
+        assert!(
+            card.line1.starts_with("Trial data unreadable: run.json: "),
+            "{text}: {}",
+            card.line1
+        );
+    }
+}
+
+#[test]
 fn the_road_is_one_line_under_the_run_card_with_the_flag_on() {
     let dir = tempfile::tempdir().unwrap();
     run_and_road(dir.path());
@@ -937,9 +984,9 @@ fn the_road_is_one_line_under_the_run_card_with_the_flag_on() {
     let road = card.road.expect("the road line");
     assert_eq!(
         road.text,
-        "Road to blind 4.5 stars · 2 of 4 · next: Recap judge: recaps worse"
+        "Long road · 2 of 4 · next: Recap judge: recaps worse"
     );
-    assert_eq!((road.mark.as_str(), road.sev.as_str()), ("…", "quiet"));
+    assert_eq!((road.mark.as_str(), road.sev.as_str()), ("→", "quiet"));
 }
 
 #[test]
@@ -986,7 +1033,7 @@ fn next_is_the_first_check_not_passing_and_a_failure_counts() {
     };
     assert_eq!(
         line(dir.path()).text,
-        "Road to blind 4.5 stars · 2 of 4 · next: Recap judge: recaps worse"
+        "Long road · 2 of 4 · next: Recap judge: recaps worse"
     );
     fs::write(
         dir.path().join("road.ndjson"),
@@ -996,7 +1043,7 @@ fn next_is_the_first_check_not_passing_and_a_failure_counts() {
     let failing = line(dir.path());
     assert_eq!(
         failing.text,
-        "Road to blind 4.5 stars · 1 of 4 · next: Release gate failures"
+        "Long road · 1 of 4 · next: Release gate failures"
     );
     assert_eq!((failing.mark.as_str(), failing.sev.as_str()), ("✗", "red"));
     fs::write(
@@ -1005,7 +1052,7 @@ fn next_is_the_first_check_not_passing_and_a_failure_counts() {
     )
     .unwrap();
     let done = line(dir.path());
-    assert_eq!(done.text, "Road to blind 4.5 stars · 4 of 4 · all passing");
+    assert_eq!(done.text, "Long road · 4 of 4 · all passing");
     assert_eq!(done.mark, "✓");
 }
 
@@ -1020,7 +1067,7 @@ fn an_unreadable_road_beside_a_run_card_is_a_line_that_says_so() {
     let card = card_at(&load(dir.path(), now, true), now).unwrap();
     assert_eq!(
         card.road.unwrap().text,
-        "Road: Trial data unreadable: road.ndjson not found"
+        "Long road: Trial data unreadable: road.ndjson not found"
     );
 }
 
@@ -1037,9 +1084,5 @@ fn the_newest_road_wins_among_roads_and_does_not_displace_the_run() {
     let now = at(ROAD_NOW);
     let card = card_at(&load(dir.path(), now, true), now).unwrap();
     assert!(card.line2.starts_with("run.json"));
-    assert!(card
-        .road
-        .unwrap()
-        .text
-        .starts_with("Road to blind 4.5 stars"));
+    assert!(card.road.unwrap().text.starts_with("Long road"));
 }

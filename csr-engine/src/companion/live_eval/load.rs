@@ -59,13 +59,27 @@ pub struct Shown {
     pub road: Loaded,
 }
 
-/// The track a spec's text names, for a spec that failed to load: the ones that parse as JSON
-/// can still say `"track": "road"`; anything else is a run spec.
+/// The track a spec's text names, for a spec that failed to load. A spec that parses as JSON
+/// says `"track": "road"` itself; one half-written still can, so a narrow text check finds the
+/// same key and value. Anything else is a run spec.
 fn track_of(text: &str) -> Track {
-    match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(v) if v["track"] == "road" => Track::Road,
-        _ => Track::Run,
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        return if v["track"] == "road" {
+            Track::Road
+        } else {
+            Track::Run
+        };
     }
+    const KEY: &str = "\"track\"";
+    let mut rest = text;
+    while let Some(at) = rest.find(KEY) {
+        rest = &rest[at + KEY.len()..];
+        let value = rest.trim_start().strip_prefix(':');
+        if value.is_some_and(|v| v.trim_start().starts_with("\"road\"")) {
+            return Track::Road;
+        }
+    }
+    Track::Run
 }
 
 fn settle(best: Option<Trial>, broken: Option<String>, dir: &Path) -> Loaded {
@@ -188,7 +202,7 @@ fn road_row(road: &Loaded, now: f64) -> Option<Row> {
         other => unreadable_card(other, now).map(|c| Row {
             mark: "!".into(),
             sev: "quiet".into(),
-            text: format!("Road: {}", c.line1),
+            text: format!("Long road: {}", c.line1),
         }),
     }
 }

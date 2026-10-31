@@ -7,7 +7,7 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Row {
-    /// "✓", "✗" or "…".
+    /// "✓", "✗" or "…" ("→" for a long road still pending).
     pub mark: String,
     /// "ok", "red" or "quiet": the colour of the mark.
     pub sev: String,
@@ -284,15 +284,12 @@ pub fn road_line(report: &Report) -> Row {
     } else if report.pending == 0 {
         ("✓", "ok")
     } else {
-        ("…", "quiet")
+        ("→", "quiet")
     };
     Row {
         mark: mark.into(),
         sev: sev.into(),
-        text: format!(
-            "{} · {} of {total} · {next}",
-            report.trial.name, report.passing
-        ),
+        text: format!("Long road · {} of {total} · {next}", report.passing),
     }
 }
 
