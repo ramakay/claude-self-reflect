@@ -299,8 +299,19 @@ mod tests {
         // Row times are what orders the Stop episode against the snapshot.
         let first = serde_json::json!({"type":"user","timestamp":"2026-10-21T10:00:00Z","message":{"content":FIRST}}).to_string();
         let done = serde_json::json!({"type":"assistant","timestamp":"2026-10-21T10:01:00Z","message":{"content":"Done.","stop_reason":"end_turn"}}).to_string();
-        let ep = crate::hooks::stop::extract_episode(&[&first, &done], "r8-compact", "fixture");
+        // A recap that names only the task abstains, and the fragment block does not
+        // follow the snapshot. The session landed one commit (in the transcript, so
+        // the snapshot sees it too): the recap keeps its head clause, the task this
+        // test reads, and adds `Settled:`.
+        let call = serde_json::json!({"type":"assistant","timestamp":"2026-10-21T10:00:20Z","message":{"content":[{"type":"tool_use","id":"toolu_c1","name":"Bash","input":{"command":"git commit -m x"}}]}}).to_string();
+        let result = serde_json::json!({"type":"user","timestamp":"2026-10-21T10:00:30Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_c1","content":"[main abc1234] fix(auth): keep form errors"}]}}).to_string();
+        let ep = crate::hooks::stop::extract_episode(
+            &[&first, &call, &result, &done],
+            "r8-compact",
+            "fixture",
+        );
         assert!(ep.watermark.is_some());
+        assert_eq!(ep.completions.len(), 1);
         storage
             .insert_reflection(
                 "r8-episode",
@@ -310,7 +321,7 @@ mod tests {
             )
             .unwrap();
         let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, "{first}\n{done}").unwrap();
+        writeln!(file, "{first}\n{call}\n{result}\n{done}").unwrap();
         let padding = serde_json::json!({"type":"progress","data":"x".repeat(65_000)}).to_string();
         for _ in 0..padding_rows {
             writeln!(file, "{padding}").unwrap();

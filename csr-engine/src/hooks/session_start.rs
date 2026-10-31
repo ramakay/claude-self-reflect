@@ -181,7 +181,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // On `resume` Claude Code starts a NEW session id; the transcript the user resumed
     // names itself in a `continued-in` row, and its episode leads the list so the
     // recap and the learnt line talk about it, not about a concurrent session.
-    let predecessor = resume_predecessor_for(input);
+    let predecessor = resume_predecessor_for(input).or_else(|| compact_own_session(input));
     let episodes = match resolve_project_from_cwd(&cwd.to_string_lossy()) {
         Some(p) => recent_project_episodes_resuming(
             engine.storage(),
@@ -895,6 +895,18 @@ fn resume_predecessor_for(input: &HookInput) -> Option<String> {
     let sid = input.session_id.as_deref()?;
     let dir = Path::new(input.transcript_path.as_deref()?).parent()?;
     super::resume_lineage::resume_predecessor(dir, sid)
+}
+
+/// The session a `source=compact` SessionStart belongs to. A compaction keeps the
+/// session id, so the episode that leads the list must be this session's own: the
+/// newest episode of the project may belong to a concurrent session, and the recap
+/// would then describe that one (and skip the compact overlay, which needs the
+/// target session's own episode). `None` for any other source or a subagent.
+fn compact_own_session(input: &HookInput) -> Option<String> {
+    if input.source.as_deref() != Some("compact") || input.subagent().is_some() {
+        return None;
+    }
+    input.session_id.clone()
 }
 
 /// Move the predecessor's episode to the front, keeping every other episode
@@ -3051,10 +3063,26 @@ mod tests {
         let lines: Vec<String> = rows.iter().map(serde_json::Value::to_string).collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         // Round-trip through the stored episode representation, as SessionStart does.
-        serde_json::from_str(
-            &serde_json::to_string(&crate::hooks::stop::extract_episode(&refs, "s", "p")).unwrap(),
+        with_session_commit(
+            serde_json::from_str(
+                &serde_json::to_string(&crate::hooks::stop::extract_episode(&refs, "s", "p"))
+                    .unwrap(),
+            )
+            .unwrap(),
         )
-        .unwrap()
+    }
+
+    /// These tests are about which task the recap names. A recap that names only
+    /// the task abstains (the fragment block runs instead), so the episode carries
+    /// one commit the session made outside every task: the recap then keeps its
+    /// head clause and adds `Settled:`, and the head is what the tests read.
+    fn with_session_commit(mut ep: Episode) -> Episode {
+        ep.completions = vec![crate::hooks::stop::CompletionReceipt {
+            claim: "fix(auth): keep form errors".into(),
+            receipt: "abc1234".into(),
+        }];
+        ep.completions_untied = true;
+        ep
     }
 
     fn compact_block(ep: &Episode, source: &str, session: Option<&str>) -> String {
@@ -3157,6 +3185,60 @@ mod tests {
     }
 
     #[test]
+    fn a_recap_with_only_the_prompt_falls_back_to_the_fragments() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let rows = [
+            serde_json::json!({"type": "user", "promptSource": "typed", "message": {"content": COMPACT_TASKS[0]}}).to_string(),
+            serde_json::json!({"type": "assistant", "message": {"content": "Work finished.", "stop_reason": "end_turn"}}).to_string(),
+        ];
+        let ep = crate::hooks::stop::extract_episode(
+            &rows.iter().map(String::as_str).collect::<Vec<_>>(),
+            "s",
+            "p",
+        );
+        assert!(ep.completions.is_empty() && ep.todos.is_empty() && ep.next_steps.is_none());
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        for source in ["compact", "resume", "startup"] {
+            let block = format_session_start_tier0_for_session(
+                &storage,
+                &ep.project,
+                &ep,
+                &[],
+                "1m ago",
+                Some("s"),
+                Some(source),
+            );
+            assert!(!block.contains("recap ["), "{source}: {block}");
+            assert!(
+                !block.contains(crate::extraction::provenance::RECAP_SENTINEL),
+                "{source}: {block}"
+            );
+            assert_eq!(
+                block.as_bytes(),
+                format_tier0_block(&ep, &[], "1m ago").as_bytes(),
+                "{source}"
+            );
+        }
+        // With one commit the same session gets its recap back.
+        let evidenced = with_session_commit(ep);
+        let block = format_session_start_tier0_for_session(
+            &storage,
+            &evidenced.project,
+            &evidenced,
+            &[],
+            "1m ago",
+            Some("s"),
+            Some("compact"),
+        );
+        assert!(block.starts_with("recap [1m ago]: "), "{block}");
+        assert!(
+            block.contains("Settled: fix(auth): keep form errors (abc1234)."),
+            "{block}"
+        );
+    }
+
+    #[test]
     fn compact_failed_feeds_preserve_fragment_bytes() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
         std::env::remove_var("CSR_NO_RECAP");
@@ -3202,11 +3284,11 @@ mod tests {
                 serde_json::json!({"type": "assistant", "message": {"content": "Done.", "stop_reason": "end_turn"}}).to_string(),
                 serde_json::json!({"type": "user", "message": {"content": later}}).to_string(),
             ];
-            let ep = crate::hooks::stop::extract_episode(
+            let ep = with_session_commit(crate::hooks::stop::extract_episode(
                 &rows.iter().map(String::as_str).collect::<Vec<_>>(),
                 "s",
                 "p",
-            );
+            ));
             assert!(ep.compact_anchor.is_none());
             assert!(compact_block(&ep, "compact", Some("s"))
                 .starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[0])));
@@ -3567,6 +3649,27 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
             "learnt [yesterday]: 17 memory notes: a, +16 more (6ca2a4d5, 2026-10-16). [[CSR:LEARNT]]"
         ));
         assert!(!is_session_framing_line("learning how to ship"));
+    }
+
+    #[test]
+    fn a_compaction_leads_with_its_own_session_not_a_concurrent_one() {
+        let list = lineage_episodes(&["concurrent", "me", "older"]);
+        let mut compact = learnt_input(Some("compact"), "me");
+        assert_eq!(compact_own_session(&compact).as_deref(), Some("me"));
+        let mut promoted = list.clone();
+        promote_predecessor(&mut promoted, compact_own_session(&compact).as_deref());
+        assert_eq!(session_ids(&promoted), ["me", "concurrent", "older"]);
+        // Only a compaction by the main session: not startup, resume, clear or a subagent.
+        for source in ["startup", "resume", "clear"] {
+            assert_eq!(
+                compact_own_session(&learnt_input(Some(source), "me")),
+                None,
+                "{source}"
+            );
+        }
+        assert_eq!(compact_own_session(&learnt_input(None, "me")), None);
+        compact.agent_id = Some("agent-1".into());
+        assert_eq!(compact_own_session(&compact), None);
     }
 
     #[test]

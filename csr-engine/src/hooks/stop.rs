@@ -264,6 +264,36 @@ fn shell_simple_commands(command: &str) -> Vec<Vec<String>> {
     commands
 }
 
+/// The command `ssh [options] host command...` runs on the other machine,
+/// joined back into one string; `None` when the words are not an ssh call that
+/// names a remote command. Only `ssh` itself is read: `bash -c`, `sh -c` and
+/// the like stay unread, so a miss costs a receipt and a false hit costs none.
+fn ssh_remote_command(words: &[String]) -> Option<String> {
+    // Options that take a value (`ssh -p 22 host`): the value is not the host.
+    const VALUE_OPTIONS: &[&str] = &[
+        "-p", "-i", "-l", "-o", "-F", "-J", "-b", "-c", "-D", "-E", "-e", "-I", "-L", "-m", "-O",
+        "-Q", "-R", "-S", "-W", "-w",
+    ];
+    // Leading `VAR=value` assignments are part of the simple command.
+    let mut rest = words
+        .iter()
+        .skip_while(|w| w.contains('=') && !w.starts_with('-'));
+    let program = rest.next()?;
+    if program != "ssh" && !program.ends_with("/ssh") {
+        return None;
+    }
+    while let Some(word) = rest.next() {
+        if VALUE_OPTIONS.contains(&word.as_str()) {
+            rest.next();
+        } else if !word.starts_with('-') {
+            // `word` is the host; whatever follows is the remote command.
+            let remote = rest.cloned().collect::<Vec<_>>().join(" ");
+            return (!remote.trim().is_empty()).then_some(remote);
+        }
+    }
+    None
+}
+
 /// Whether a Bash command runs a git subcommand that can print a commit
 /// success line: the first non-option word after `git` (global options
 /// `-c <k=v>`, `-C <path>`, `--no-pager` and other `--long` options skipped)
@@ -271,6 +301,12 @@ fn shell_simple_commands(command: &str) -> Vec<Vec<String>> {
 /// does not qualify.
 fn is_git_committing_command(command: &str) -> bool {
     shell_simple_commands(command).iter().any(|words| {
+        // `ssh host 'cd repo && git commit ...'` commits on the other machine and
+        // prints git's success line back; the quoted command is one word to the
+        // splitter, so read it as a command of its own.
+        if let Some(remote) = ssh_remote_command(words) {
+            return is_git_committing_command(&remote);
+        }
         // Leading `VAR=value` assignments are part of the simple command.
         let mut rest = words
             .iter()
@@ -5488,6 +5524,36 @@ mod tests {
             one
         );
         assert!(commit_receipts_for("echo git commit").is_empty());
+    }
+
+    #[test]
+    fn a_commit_made_over_ssh_yields_a_receipt_and_other_ssh_calls_do_not() {
+        let one = vec![CompletionReceipt {
+            claim: "fix(recap): subject".into(),
+            receipt: "1a2b3c4".into(),
+        }];
+        assert_eq!(
+            commit_receipts_for(
+                "ssh studio 'cd ~/build/rc && git add -A && git commit -F /tmp/m 2>&1 | tail -3'"
+            ),
+            one
+        );
+        assert_eq!(
+            commit_receipts_for("ssh -o BatchMode=yes -p 22 studio git commit -m y"),
+            one
+        );
+        assert_eq!(
+            commit_receipts_for("/usr/bin/ssh studio \"git -C ~/build/rc commit -F /tmp/m\""),
+            one
+        );
+        // The remote command is read like any other: a listing is no receipt.
+        assert!(commit_receipts_for("ssh studio 'git log --grep=commit'").is_empty());
+        assert!(commit_receipts_for("ssh studio 'echo git commit'").is_empty());
+        // No remote command, or a different program, is no commit.
+        assert!(commit_receipts_for("ssh studio").is_empty());
+        assert!(commit_receipts_for("scp m studio:git commit").is_empty());
+        // `bash -c` and friends stay unread.
+        assert!(commit_receipts_for("bash -c 'git commit -m y'").is_empty());
     }
 
     fn bash_receipts(command: &str, output: &str, failed: bool) -> Vec<CompletionReceipt> {

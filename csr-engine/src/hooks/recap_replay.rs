@@ -54,3 +54,77 @@ fn recap_replay_over_transcripts() {
         writeln!(sink, "{line}").unwrap();
     }
 }
+
+/// Before/after over real sessions. `CSR_REPLAY_PAIRS` holds `<session>.json` (the
+/// stored episode, as the installed build wrote it) and, optionally,
+/// `<session>.jsonl` (its transcript). For each session it writes the recap the
+/// old composer gave the stored episode, what SessionStart now prints for that
+/// same episode on a compaction, and what it prints once the episode is read
+/// again from the transcript by the current extractor.
+///
+/// `CSR_REPLAY_PAIRS=... CSR_REPLAY_OUT=... cargo test --release --lib recap_before_after -- --ignored`
+#[test]
+#[ignore = "reads real episodes and transcripts: CSR_REPLAY_PAIRS, CSR_REPLAY_OUT"]
+fn recap_before_after_over_stored_episodes() {
+    use crate::hooks::stop::Episode;
+    let dir = std::env::var("CSR_REPLAY_PAIRS").expect("CSR_REPLAY_PAIRS");
+    let out = std::env::var("CSR_REPLAY_OUT").expect("CSR_REPLAY_OUT");
+    let mut stored: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    stored.sort();
+    let storage = crate::storage::Storage::open_memory().unwrap();
+    let first_lines = |block: &str| -> String {
+        block
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .take(4)
+            .collect::<Vec<_>>()
+            .join("\n    ")
+    };
+    let mut sink = std::fs::File::create(out).unwrap();
+    for path in stored {
+        let ep: Episode = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let sid = ep.session_id.clone();
+        let before = compose_recap(&ep, &empty_feeds(), "1h ago");
+        let after_stored = crate::hooks::session_start::format_session_start_tier0_for_session(
+            &storage,
+            &ep.project,
+            &ep,
+            &[],
+            "1h ago",
+            Some(&sid),
+            Some("compact"),
+        );
+        let mut report = format!(
+            "== {} ({}, {} messages)\n  before (stored episode, old composer):\n    {}\n  after, same stored episode:\n    {}\n",
+            &sid[..8.min(sid.len())],
+            ep.project,
+            ep.message_count,
+            before.as_deref().map_or("(none)".to_string(), |t| t.replace('\n', "\n    ")),
+            first_lines(&after_stored),
+        );
+        let transcript = path.with_extension("jsonl");
+        if transcript.exists() {
+            let limit = std::fs::metadata(&transcript).unwrap().len();
+            let fresh = extract_episode_from_file(&transcript, limit, &sid, &ep.project).unwrap();
+            let after_fresh = crate::hooks::session_start::format_session_start_tier0_for_session(
+                &storage,
+                &ep.project,
+                &fresh,
+                &[],
+                "1h ago",
+                Some(&sid),
+                Some("compact"),
+            );
+            report.push_str(&format!(
+                "  after, episode re-read from the transcript (commits seen: {}):\n    {}\n",
+                fresh.completions.len(),
+                first_lines(&after_fresh)
+            ));
+        }
+        writeln!(sink, "{report}").unwrap();
+    }
+}

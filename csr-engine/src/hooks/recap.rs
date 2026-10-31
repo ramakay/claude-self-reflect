@@ -109,24 +109,40 @@ const MAX_CHARS: usize = 700;
 pub const THEN_CLAUSE_PREFIX: &str = "Then: ";
 
 /// Compose an evidence-backed recap without reading external state.
+///
+/// This form may return a paragraph whose only content is the session's intent:
+/// its callers label that themselves (the repo recap reads it as "you asked").
+/// SessionStart uses [`compose_recap_with_deliveries`], which abstains instead.
 pub fn compose_recap(
     ep: &crate::hooks::stop::Episode,
     feeds: &RecapFeeds,
     age: &str,
 ) -> Option<String> {
-    compose_recap_with_deliveries(ep, feeds, age).map(|composed| composed.text)
+    compose_with_then(ep, feeds, age, false).map(|composed| composed.text)
 }
 
+/// The SessionStart recap. A paragraph that would carry no evidenced clause (it
+/// would only echo the user's last prompt) is not composed: `None`, so the
+/// fragment fallback runs.
 pub fn compose_recap_with_deliveries(
     ep: &crate::hooks::stop::Episode,
     feeds: &RecapFeeds,
     age: &str,
 ) -> Option<ComposedRecap> {
-    let base = compose_recap_inner(ep, feeds, age, None)?;
+    compose_with_then(ep, feeds, age, true)
+}
+
+fn compose_with_then(
+    ep: &crate::hooks::stop::Episode,
+    feeds: &RecapFeeds,
+    age: &str,
+    abstain_intent_only: bool,
+) -> Option<ComposedRecap> {
+    let base = compose_recap_inner(ep, feeds, age, None, abstain_intent_only)?;
     // The `Then:` clause is a pure addition: it is kept only when every other
     // line of the recap comes out exactly as it would without it.
     if let Some(then) = then_clause(ep) {
-        if let Some(with) = compose_recap_inner(ep, feeds, age, Some(&then)) {
+        if let Some(with) = compose_recap_inner(ep, feeds, age, Some(&then), abstain_intent_only) {
             if with.text.chars().count() <= MAX_CHARS
                 && with
                     .text
@@ -147,6 +163,7 @@ fn compose_recap_inner(
     feeds: &RecapFeeds,
     age: &str,
     then: Option<&str>,
+    abstain_intent_only: bool,
 ) -> Option<ComposedRecap> {
     use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
     use crate::import::contamination::has_csr_text;
@@ -358,6 +375,19 @@ fn compose_recap_inner(
     while clauses[RETIRED].add_one_within(&mut remaining) {}
     while clauses[DREAMT].add_one_within(&mut remaining) {}
     while clauses[NOW].add_one_within(&mut remaining) {}
+
+    // The user's own prompt is not evidence of anything. With no completed
+    // clause, no `Next:` and no list clause that fit, the paragraph would only
+    // echo the last thing they typed (typos included): abstain, so the fragment
+    // fallback runs. `warn_line` is a notice about Claude Code, not about this
+    // session, so it does not count either.
+    if abstain_intent_only
+        && completed.is_none()
+        && next_line.is_none()
+        && clauses.iter().all(|clause| clause.selected == 0)
+    {
+        return None;
+    }
 
     let rendered_corrections = shown_corrections
         .iter()
@@ -1314,6 +1344,72 @@ mod tests {
         assert_eq!(text.lines().count(), 1, "{text}");
         for clause in ["Settled:", "Now:", "Next:"] {
             assert!(!text.contains(clause), "{clause}: {text}");
+        }
+    }
+
+    #[test]
+    fn session_start_abstains_when_the_recap_would_only_echo_the_prompt() {
+        let mut ep = bare_episode();
+        // A later typed ask adds a `Then:` clause, which is the user's words too.
+        ep.latest_ask = Some("Please fix the other composer bug".into());
+        assert!(compose_recap_with_deliveries(&ep, &bare_feeds(), "1h ago").is_none());
+        // The repo recap labels the bare intent itself and keeps getting it.
+        let text = compose_recap(&ep, &bare_feeds(), "1h ago").unwrap();
+        assert!(
+            text.starts_with("recap [1h ago]: Fix the recap composer"),
+            "{text}"
+        );
+        assert_eq!(text.lines().count(), 1, "{text}");
+    }
+
+    #[test]
+    fn any_evidenced_clause_keeps_the_recap_and_stays_a_recognised_emission() {
+        use crate::extraction::provenance::is_csr_emission;
+        let evidenced: Vec<(&str, Episode, RecapFeeds)> = {
+            let mut completed = bare_episode();
+            completed.completions = vec![receipt("fix(auth): keep form errors", "abc1234")];
+            completed.anchor_receipts = Some(vec![0]);
+            let mut settled = bare_episode();
+            settled.completions = vec![receipt("fix(auth): keep form errors", "abc1234")];
+            settled.completions_untied = true;
+            let mut now = bare_episode();
+            now.todos = vec![TodoItem {
+                content: "wire session start".into(),
+                status: "pending".into(),
+            }];
+            let mut next = bare_episode();
+            next.next_steps = Some("run the device tests".into());
+            let mut corrected = bare_feeds();
+            corrected.corrections = vec![CorrectionLine {
+                quote: "no, use the shared cache".into(),
+                session8: "761bf75c".into(),
+                turn: 12,
+                date: "2026-10-30".into(),
+            }];
+            vec![
+                ("completed", completed, bare_feeds()),
+                ("settled", settled, bare_feeds()),
+                ("now", now, bare_feeds()),
+                ("next", next, bare_feeds()),
+                ("corrected", bare_episode(), corrected),
+            ]
+        };
+        for (kind, ep, feeds) in evidenced {
+            let composed = compose_recap_with_deliveries(&ep, &feeds, "1h ago")
+                .unwrap_or_else(|| panic!("{kind}: abstained"));
+            assert!(composed.text.starts_with("recap [1h ago]: "), "{kind}");
+            assert!(is_csr_emission(&composed.text), "{kind}: {}", composed.text);
+            // The sentinel closes the first line, as the re-import guard expects.
+            assert!(
+                composed
+                    .text
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .ends_with("[[CSR:RECAP]]"),
+                "{kind}: {}",
+                composed.text
+            );
         }
     }
 
