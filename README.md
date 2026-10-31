@@ -142,6 +142,7 @@ Smaller features that ship in this release. Each line says what you get.
 - **Transcript mirror:** a scrubbed, zstd-compressed copy of every main and subagent transcript, kept after Claude Code deletes the original. Manage it with `csr-engine mirror sync|status|purge --yes`.
 - **Queued prompts:** what you type while Claude is still busy is indexed and searchable like any other prompt.
 - **Codex sessions:** if `~/.codex/sessions` exists, your Codex work is searchable next to Claude's. Nothing to set up.
+- **Codex can ask too:** when the `codex` CLI is installed, `csr-engine setup` registers the same MCP server with Codex (`codex mcp add`), so Codex can search the same history. An entry you customized or disabled is left alone. Already set up? Run `csr-engine setup --codex-only`. `CSR_NO_CODEX_MCP=1` skips it.
 - **Memory file catalogue:** CSR knows which Claude memory files exist (metadata only, never embedded).
 
 ### Privacy built in
@@ -215,7 +216,7 @@ The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew instal
 
 ### Dials
 
-- **Kill switches:** `CSR_NO_RECAP`, `CSR_NO_LEARNT`, `CSR_NO_DREAMING`, `CSR_NO_DREAM_INJECT`, `CSR_NO_DREAM_ON_COMPACT`, `CSR_NO_MIRROR`, `CSR_NO_SECRET_SCRUB`, `CSR_NO_STORY_MAP`, `CSR_NO_CODEX_IMPORT`, `CSR_NO_HEALTH`, `CSR_NO_JOURNAL_SERVER`, `CSR_NO_AI_NARRATIVES`. In herdr the pane also follows herdr's event socket; `CSR_PANE_HERDR_EVENTS=0` switches that off.
+- **Kill switches:** `CSR_NO_RECAP`, `CSR_NO_LEARNT`, `CSR_NO_DREAMING`, `CSR_NO_DREAM_INJECT`, `CSR_NO_DREAM_ON_COMPACT`, `CSR_NO_MIRROR`, `CSR_NO_SECRET_SCRUB`, `CSR_NO_STORY_MAP`, `CSR_NO_CODEX_IMPORT`, `CSR_NO_CODEX_MCP`, `CSR_NO_HEALTH`, `CSR_NO_JOURNAL_SERVER`, `CSR_NO_AI_NARRATIVES`. In herdr the pane also follows herdr's event socket; `CSR_PANE_HERDR_EVENTS=0` switches that off.
 - **Dream cost:** `CSR_DREAM_EFFORT=less|balanced|max` and `CSR_DREAM_BUDGET`.
 - **Dream timing:** `CSR_DREAM_INTERVAL_SECS`, `CSR_DREAM_IDLE_MINS` (default 30), `CSR_DREAM_FLOOR_HOUR` (default 3).
 - **Search path:** `CSR_SEARCH_MODE=hybrid|vector|fts`.

@@ -67,6 +67,9 @@ enum Commands {
         /// Do not install the csr-companion plugin this binary writes
         #[arg(long)]
         no_companion: bool,
+        /// Only register this binary as an MCP server with the Codex CLI, then exit
+        #[arg(long)]
+        codex_only: bool,
     },
     /// Show system status (JSON by default, --compact for statusline, --swiftbar for menu bar)
     Status {
@@ -1135,8 +1138,12 @@ async fn run(
     if let Some(Commands::Setup {
         anthropic_key,
         no_companion,
+        codex_only,
     }) = args.command
     {
+        if codex_only {
+            return csr_engine::setup::codex_only();
+        }
         return csr_engine::setup::handle(
             &args.db_path,
             &args.projects_dir,

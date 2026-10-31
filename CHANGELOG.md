@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 `[untraced]` marks a claim that no commit message supports.
 
+### Codex
+
+- **Setup registers the MCP server with Codex** when the `codex` CLI is on `PATH`: `codex mcp add claude-self-reflect -- <this binary>`,
+  read back with `codex mcp get --json`. An entry that already names this binary is not rewritten; a bare entry at an older path
+  is repointed; an entry the user disabled or customized (args, env, cwd, timeouts, tool filters, which `codex mcp add` would drop)
+  is left alone with the command to run by hand. Never fails setup. `csr-engine setup --codex-only` runs this step alone;
+  `CSR_NO_CODEX_MCP=1` skips it.
+
 **Already shipped in 9.5.1-9.5.8, carried here, not new:** 92acc3bd, cdd23033, c46702aa, f0cf3a83, 56dddc3a,
 71457f3c, 31d78e5b, d6b9c454, 46e14f16, 962f8e03, 6e3a08b1, aededb4a (replaced by 76e390d6), cecddb48, c7e4e285,
 c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
