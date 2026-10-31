@@ -592,6 +592,19 @@ async fn resolve_rerank_intent(
     }
 }
 
+/// Run the recall `run` and report the time of the whole tool call in its header:
+/// from `started` (request entry) to the built response. The formatter alone only
+/// knows the embed and search stages, which left the header at tens of
+/// milliseconds on calls that took seconds.
+pub(crate) async fn stamp_whole_call(
+    started: Instant,
+    run: impl std::future::Future<Output = Result<String>>,
+) -> Result<String> {
+    let page = run.await?;
+    let total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Ok(format::restamp_performance(page, total_ms))
+}
+
 /// Full semantic search with rich XML results.
 pub async fn reflect_on_past(
     storage: &Arc<Storage>,
@@ -18062,5 +18075,38 @@ mod representative_tests {
         let mut page = vec![candidate.clone(), real.clone(), answer.clone()];
         sink_rig_rows(&storage, &mut page, &tagged, query);
         assert_eq!(rig_ids(&page), ["rig-50", "real-0", "answer-0"]);
+    }
+
+    #[tokio::test]
+    async fn the_recall_header_reports_the_whole_call_not_only_the_search() {
+        // A formatter header that claims 31 ms for a call that spent 150 ms
+        // before the page was built, on top of its own stages.
+        let page = "🎯 RESULTS: 1 matches (high relevance, top score: 0.900)\n⚡ PERFORMANCE: 31ms (1 collection searched)\n\n<search>\n  <meta>\n    <perf>\n      <ttl>31</ttl>\n      <emb>3</emb>\n      <srch>28</srch>\n    </perf>\n  </meta>\n</search>\n";
+        let started = Instant::now();
+        let stamped = stamp_whole_call(started, async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            Ok(page.to_string())
+        })
+        .await
+        .unwrap();
+        let wall = started.elapsed().as_millis() as u64;
+        let shown: u64 = stamped
+            .split("PERFORMANCE: ")
+            .nth(1)
+            .and_then(|rest| rest.split("ms").next())
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("no PERFORMANCE header: {stamped}"));
+        assert!(
+            (150..=wall).contains(&shown),
+            "header says {shown} ms, the call took {wall} ms: {stamped}"
+        );
+        assert!(
+            stamped.contains(&format!("<ttl>{shown}</ttl>")),
+            "{stamped}"
+        );
+        assert!(stamped.contains("<emb>3</emb>") && stamped.contains("<srch>28</srch>"));
+        // An error passes through untouched.
+        let failed = stamp_whole_call(Instant::now(), async { anyhow::bail!("boom") }).await;
+        assert_eq!(failed.unwrap_err().to_string(), "boom");
     }
 }

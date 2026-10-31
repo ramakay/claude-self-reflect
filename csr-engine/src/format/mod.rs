@@ -656,6 +656,54 @@ pub(crate) fn format_search_results_with_rank_scores(
     )
 }
 
+/// Make the recall page's timing report `total_ms`: the time of the whole tool
+/// call. That is the header's `PERFORMANCE: Nms` and the `<ttl>` of its `<perf>`
+/// block. The formatter only knows the embed and search stages; a caller that
+/// timed the call from request entry restamps the page with this. A page that
+/// does not open with the results header (no results, an error note) is returned
+/// as it came; a keyword-only page has no `PERFORMANCE` line, only the `<ttl>`.
+pub(crate) fn restamp_performance(page: String, total_ms: u64) -> String {
+    const HEADER: &str = "\u{1F3AF} RESULTS: ";
+    const PERFORMANCE: &str = "\u{26A1} PERFORMANCE: ";
+    if !page.starts_with(HEADER) {
+        return page;
+    }
+    let Some((first, rest)) = page.split_once('\n') else {
+        return page;
+    };
+    let (line, tail) = match rest.split_once('\n') {
+        Some((second, tail)) => (second, tail),
+        None => (rest, ""),
+    };
+    let stamped_line = line.strip_prefix(PERFORMANCE).and_then(|after| {
+        let digits = after.chars().take_while(char::is_ascii_digit).count();
+        (digits > 0 && after[digits..].starts_with("ms"))
+            .then(|| format!("{PERFORMANCE}{total_ms}{}", &after[digits..]))
+    });
+    match stamped_line {
+        Some(line) => format!("{first}\n{line}\n{}", restamp_ttl(tail, total_ms)),
+        // No performance line: the `<ttl>` is somewhere in `rest`.
+        None => format!("{first}\n{}", restamp_ttl(rest, total_ms)),
+    }
+}
+
+/// The `<ttl>N</ttl>` of the page's `<perf>` block, set to `total_ms`. Only the
+/// part before `<results>` is read: a result's own text is never touched.
+fn restamp_ttl(tail: &str, total_ms: u64) -> String {
+    const OPEN: &str = "<ttl>";
+    const CLOSE: &str = "</ttl>";
+    let head_len = tail.find("<results>").unwrap_or(tail.len());
+    if let Some(start) = tail[..head_len].find(OPEN) {
+        let value = start + OPEN.len();
+        if let Some(len) = tail[value..].find(CLOSE) {
+            if tail[value..value + len].chars().all(|c| c.is_ascii_digit()) {
+                return format!("{}{}{}", &tail[..value], total_ms, &tail[value + len..]);
+            }
+        }
+    }
+    tail.to_string()
+}
+
 /// [`format_search_results_with_rank_scores`] plus the cross-encoder summary of
 /// the recall. With `ce` present the summary's `relevance` comes from the CE
 /// margins and gains `ce-top` / `ce-margin`; rows are never dropped by the
@@ -3263,5 +3311,66 @@ mod tests {
         assert!(xml.contains("ce-margin=\"n/a\""), "got: {xml}");
         assert!(xml.contains("<caveat>"), "got: {xml}");
         assert_eq!(xml.matches("<r rank=").count(), 2, "got: {xml}");
+    }
+
+    #[test]
+    fn restamp_performance_sets_the_header_and_ttl_and_leaves_the_stages() {
+        let results = vec![EnrichedResult {
+            score: 0.9,
+            chunk: make_chunk("c-1", "conv-1", "hello world"),
+            resolution: None,
+            trust: crate::provenance::TrustTier::Unknown,
+            validity_demoted: false,
+        }];
+        let page = format_search_results(&results, "q", "all", 5, 3);
+        assert!(
+            page.contains("PERFORMANCE: 8ms (1 collection searched)\n"),
+            "{page}"
+        );
+        let stamped = restamp_performance(page.clone(), 1840);
+        assert!(
+            stamped.contains("\u{26a1} PERFORMANCE: 1840ms (1 collection searched)\n"),
+            "{stamped}"
+        );
+        assert!(stamped.contains("<ttl>1840</ttl>"), "{stamped}");
+        // Embed and search keep their own stage times; nothing else moves.
+        assert!(stamped.contains("<emb>3</emb>") && stamped.contains("<srch>5</srch>"));
+        assert_eq!(
+            stamped.replace("1840", "8"),
+            page,
+            "only the two totals differ"
+        );
+    }
+
+    #[test]
+    fn restamp_performance_leaves_pages_without_the_header_alone() {
+        for page in [
+            "\u{274c} NO RESULTS: none\n\n<search>\n  <ttl>9</ttl>\n</search>".to_string(),
+            "no newline at all".to_string(),
+            String::new(),
+            "\u{1f3af} RESULTS: 1 matches\n\u{26a1} PERFORMANCE: soon (1 collection searched)\n"
+                .to_string(),
+            "\u{1f3af} RESULTS: 1 matches".to_string(),
+        ] {
+            assert_eq!(restamp_performance(page.clone(), 1234), page);
+        }
+    }
+
+    #[test]
+    fn restamp_performance_never_touches_result_text() {
+        let page = "\u{1f3af} RESULTS: 1 matches (high relevance, top score: 0.900)\n\u{26a1} PERFORMANCE: 8ms (1 collection searched)\n\n<search>\n  <results>\n    <r rank=\"1\"><excerpt><![CDATA[<ttl>8</ttl> and \u{26a1} PERFORMANCE: 8ms]]></excerpt></r>\n  </results>\n</search>\n".to_string();
+        let stamped = restamp_performance(page.clone(), 900);
+        assert_eq!(
+            stamped,
+            page.replacen("PERFORMANCE: 8ms (1", "PERFORMANCE: 900ms (1", 1)
+        );
+    }
+
+    #[test]
+    fn restamp_performance_fixes_the_ttl_of_a_keyword_only_page() {
+        let page = "\u{1f3af} RESULTS: 2 matches (keyword relevance; semantic confidence unavailable)\n\n<search>\n  <meta>\n    <perf>\n      <ttl>1</ttl>\n    </perf>\n  </meta>\n</search>\n".to_string();
+        let stamped = restamp_performance(page.clone(), 640);
+        assert_eq!(stamped, page.replace("<ttl>1</ttl>", "<ttl>640</ttl>"));
+        assert!(!stamped.contains("PERFORMANCE"));
     }
 }

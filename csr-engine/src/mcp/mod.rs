@@ -410,20 +410,25 @@ impl CsrServer {
         &self,
         params: Parameters<ReflectOnPastParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let started = std::time::Instant::now();
         let p = params.0;
         let limit = p.limit.unwrap_or(5);
         tools::validate_page(0, limit)
             .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
         let min_score = p.min_score.unwrap_or(0.3);
 
-        let run = tools::reflect_on_past(
-            &self.storage,
-            &self.embeddings,
-            &self.search,
-            &p.query,
-            limit,
-            min_score,
-            p.project.as_deref(),
+        // The header's PERFORMANCE is the whole call, from entry to the built page.
+        let run = tools::stamp_whole_call(
+            started,
+            tools::reflect_on_past(
+                &self.storage,
+                &self.embeddings,
+                &self.search,
+                &p.query,
+                limit,
+                min_score,
+                p.project.as_deref(),
+            ),
         );
         self.vector_backed(
             run,
