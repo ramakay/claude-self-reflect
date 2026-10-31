@@ -281,7 +281,7 @@ fn fixture_episode(overrides: serde_json::Value) -> crate::hooks::stop::Episode 
         "timestamp": "2026-10-13T00:00:00Z",
         "request": "Fix the importer span ownership",
         "investigated": [],
-        "completed": "Added provenance checks for chunk spans",
+        "completed": "Added span_matcher provenance checks to scrub.rs",
         "next_steps": null,
         "blockers": null,
         "outcome": "success",

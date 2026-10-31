@@ -5512,7 +5512,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         let mut ep = minimal_episode(
             "Review previous sesison - create a simple unwall for me where we are and how we get to 10.1.",
             "Fixed it",
-            Some("Deploy to staging"),
+            Some("Retest the send path in kitty.rs"),
         );
         ep.completions = vec![crate::hooks::stop::CompletionReceipt {
             claim: "fix(search): rig sink on the keyword get_more page".into(),
@@ -5520,8 +5520,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         }];
         ep.outcome_version = Some(crate::hooks::stop::OUTCOME_VERSION);
         ep.closing_ended = false;
-        // The dream is about a file the session edited, so SessionStart shows it.
-        ep.files_modified = vec!["/repo/src/pane/kitty.rs".into()];
+        // `Next:` names the dream's file, so SessionStart shows it.
         let feeds = RecapFeeds {
             settled: vec![SettledFact {
                 claim: "schema is stable".into(),

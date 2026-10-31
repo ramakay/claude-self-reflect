@@ -440,21 +440,46 @@ fn compose_recap_inner(
         now_parts.push(format!("last turn did not finish (conv {session8})"));
     }
 
-    let retired_entries: Vec<String> = feeds
+    // SessionStart shows a project-wide verdict (a dream, a retired note) only
+    // when the recap's own text names its file or symbol: the ask, `Latest:`,
+    // `Last:`, `Settled:`, `Now:` or `Next:`. Checked here against every
+    // candidate entry, and again below against the entries that fit.
+    let candidate_text = [
+        request_text.clone(),
+        completed.clone().unwrap_or_default(),
+        last_line.clone().unwrap_or_default(),
+        next.clone().unwrap_or_default(),
+        settled_entries.join(" "),
+        now_parts.join(" "),
+    ]
+    .join("\n");
+    let shown_ok =
+        |subject: &WitnessSubject, text: &str| !abstain_intent_only || subject.is_named_in(text);
+    let (retired_subjects, retired_entries): (Vec<WitnessSubject>, Vec<String>) = feeds
         .retired_while_away
         .iter()
         .filter(|line| !normalize_feed_text(&line.receipt_oid).is_empty())
         .filter(|line| !has_csr_text(&normalize_feed_text(&line.label)))
-        .take(2)
         .map(|line| {
-            format!(
-                "{} (superseded {}, {})",
-                normalize_feed_text(&line.label),
-                normalize_feed_text(&line.date),
-                normalize_feed_text(&line.receipt_oid)
+            (
+                WitnessSubject::from_label(&normalize_feed_text(&line.label)),
+                line,
             )
         })
-        .collect();
+        .filter(|(subject, _)| shown_ok(subject, &candidate_text))
+        .take(2)
+        .map(|(subject, line)| {
+            (
+                subject,
+                format!(
+                    "{} (superseded {}, {})",
+                    normalize_feed_text(&line.label),
+                    normalize_feed_text(&line.date),
+                    normalize_feed_text(&line.receipt_oid)
+                ),
+            )
+        })
+        .unzip();
     let next_line = next.map(|next| format!("Next: {next}."));
     let line_cost =
         |line: &Option<String>| line.as_ref().map_or(0, |line| line.chars().count() + 1);
@@ -499,26 +524,27 @@ fn compose_recap_inner(
     // Journal v4 P5 delivery channel (b): one clause naming the top dream and
     // its receipt. Same evidence gating as every other clause — no feed, no
     // clause; and the feed itself cannot carry a receiptless conclusion.
-    let dream_entries: Vec<String> = feeds
+    let (dream_subjects, dream_entries): (Vec<WitnessSubject>, Vec<String>) = feeds
         .top_dream
         .iter()
-        // SessionStart: a project-wide conclusion is shown only when it is about
-        // what this session touched or what the request names.
-        .filter(|dream| !abstain_intent_only || dream_is_relevant(ep, dream, &request_text))
+        .filter(|dream| shown_ok(&WitnessSubject::from_dream(dream), &candidate_text))
         .filter(|dream| !normalize_feed_text(&dream.receipt).is_empty())
         .filter(|dream| has_substance(&normalize_feed_text(&dream.label)))
         .filter(|dream| is_qualified_dream_label(&normalize_feed_text(&dream.label)))
         .filter(|dream| !has_csr_text(&normalize_feed_text(&dream.verdict)))
         .map(|dream| {
-            format!(
-                "{} {} ({}, {})",
-                normalize_feed_text(&dream.label),
-                normalize_feed_text(&dream.verdict),
-                normalize_feed_text(&dream.date),
-                ctx.mark_receipt(&normalize_feed_text(&dream.receipt))
+            (
+                WitnessSubject::from_dream(dream),
+                format!(
+                    "{} {} ({}, {})",
+                    normalize_feed_text(&dream.label),
+                    normalize_feed_text(&dream.verdict),
+                    normalize_feed_text(&dream.date),
+                    ctx.mark_receipt(&normalize_feed_text(&dream.receipt))
+                ),
             )
         })
-        .collect();
+        .unzip();
 
     let mut clauses = [
         ListClause::new("Settled: ", "; ", settled_entries),
@@ -552,6 +578,25 @@ fn compose_recap_inner(
     while clauses[RETIRED].add_one_within(&mut remaining) {}
     while clauses[DREAMT].add_one_within(&mut remaining) {}
     while clauses[NOW].add_one_within(&mut remaining) {}
+    // The candidate check above may have leaned on an entry the budget then
+    // dropped: keep a verdict only while the lines that are shown name it.
+    let shown_text = [
+        request_text.clone(),
+        completed.clone().unwrap_or_default(),
+        last_line.clone().unwrap_or_default(),
+        next_line.clone().unwrap_or_default(),
+        clauses[SETTLED].render().unwrap_or_default(),
+        clauses[NOW].render().unwrap_or_default(),
+    ]
+    .join("\n");
+    for (index, subjects) in [(RETIRED, &retired_subjects), (DREAMT, &dream_subjects)] {
+        let named = subjects
+            .iter()
+            .take(clauses[index].selected)
+            .take_while(|subject| shown_ok(subject, &shown_text))
+            .count();
+        clauses[index].selected = named;
+    }
 
     // The user's own prompt is not evidence of anything. With no completed
     // clause, no `Next:` and no list clause that fit, the paragraph would only
@@ -879,46 +924,69 @@ fn last_clause(ep: &crate::hooks::stop::Episode, head: &str) -> Option<String> {
     Some(format!("Last: {body} (conv {session8})."))
 }
 
-/// Whether a project-wide dream is about this session: its anchor file is one
-/// the session touched (edited, or holding an anchor it recorded), or the
-/// request names the file or the symbol. Files compare by their last two path
-/// components, so a worktree and the main checkout match.
-fn dream_is_relevant(ep: &crate::hooks::stop::Episode, dream: &DreamClause, request: &str) -> bool {
-    fn tail(path: &str, n: usize) -> Vec<&str> {
-        let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-        parts[parts.len().saturating_sub(n)..].to_vec()
-    }
-    let file = dream.file.trim();
-    if !file.is_empty() {
-        let depth = tail(file, 2).len();
-        let same = |touched: &str| {
-            let touched = tail(touched.trim(), depth);
-            touched.len() == depth && touched == tail(file, depth)
-        };
-        if ep.files_modified.iter().any(|path| same(path))
-            || ep.anchors.iter().any(|anchor| same(&anchor.file))
-        {
-            return true;
+/// What a project-wide verdict is about: a file, a symbol, or both. The
+/// SessionStart recap shows the verdict only when its own text names one of
+/// them ([`WitnessSubject::is_named_in`]).
+struct WitnessSubject {
+    file: String,
+    symbol: Option<String>,
+}
+
+impl WitnessSubject {
+    fn from_dream(dream: &DreamClause) -> Self {
+        Self {
+            file: dream.file.trim().to_string(),
+            symbol: dream
+                .symbol
+                .as_deref()
+                .map(str::trim)
+                .filter(|symbol| !symbol.is_empty())
+                .map(str::to_string),
         }
     }
-    let lower = request.to_lowercase();
-    let named = |word: &str, text: &str| {
-        text.match_indices(word).any(|(at, _)| {
-            let before = text[..at].chars().next_back();
-            let after = text[at + word.len()..].chars().next();
-            let is_word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-            !is_word(before) && !is_word(after)
-        })
-    };
-    let basename = tail(file, 1).first().copied().unwrap_or("").to_lowercase();
-    if basename.chars().count() >= 4 && named(&basename, &lower) {
-        return true;
+
+    /// A retired line carries one label: the witness symbol, else its file.
+    fn from_label(label: &str) -> Self {
+        let label = label.trim();
+        if label.contains(['/', '.']) {
+            Self {
+                file: label.to_string(),
+                symbol: None,
+            }
+        } else {
+            Self {
+                file: String::new(),
+                symbol: Some(label.to_string()),
+            }
+        }
     }
-    dream
-        .symbol
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|symbol| symbol.chars().count() >= 4 && named(symbol, request))
+
+    /// A narrow whitelist, nothing fuzzy: the file's basename (case-insensitive)
+    /// or the symbol (case-sensitive) appears in `text` as a whole word of at
+    /// least 4 characters. What the session merely touched does not count.
+    fn is_named_in(&self, text: &str) -> bool {
+        fn named(word: &str, text: &str) -> bool {
+            word.chars().count() >= 4
+                && text.match_indices(word).any(|(at, _)| {
+                    let before = text[..at].chars().next_back();
+                    let after = text[at + word.len()..].chars().next();
+                    let is_word =
+                        |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    !is_word(before) && !is_word(after)
+                })
+        }
+        let basename = self
+            .file
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .unwrap_or("")
+            .to_lowercase();
+        named(&basename, &text.to_lowercase())
+            || self
+                .symbol
+                .as_deref()
+                .is_some_and(|symbol| named(symbol, text))
+    }
 }
 
 /// The short handoff `/clear` receives in place of a recap: what the cleared session was doing,
@@ -3920,30 +3988,104 @@ mod tests {
 
     // (d) Project-wide evidence must be about the request.
     #[test]
-    fn a_dream_is_shown_only_when_it_is_about_the_session() {
+    fn a_dream_on_a_file_the_session_touched_is_dropped_when_the_recap_does_not_name_it() {
+        // Replay case 996285c6: the session edited work/page.tsx, but nothing the
+        // recap says mentions GATES or that file.
         let mut ep = episode();
-        let mut feeds = RecapFeeds::empty();
-        feeds.top_dream = Some(dream());
+        ep.anchor_request =
+            Some("Review the previous sessions where we focused on the homepage".into());
+        ep.files_modified = vec!["/Users/x/procsolve-website/src/app/work/page.tsx".into()];
+        let feeds = RecapFeeds {
+            top_dream: Some(witness_dream(
+                "GATES in work/page.tsx",
+                "src/app/work/page.tsx",
+                "GATES",
+            )),
+            ..RecapFeeds::empty()
+        };
         let got = session_start(&ep, &feeds).unwrap();
-        assert!(!got.contains("Dreamt:"), "unrelated dream: {got}");
-        // The session edited the anchor file (another checkout of it).
-        ep.files_modified = vec!["/Users/x/worktree/src/config.rs".into()];
+        assert!(!got.contains("Dreamt:"), "{got}");
+        assert!(!got.contains("GATES"), "{got}");
+        // The repo recap is unchanged.
+        let got = compose_recap(&ep, &feeds, "now").unwrap();
+        assert!(got.contains("Dreamt: GATES in work/page.tsx"), "{got}");
+    }
+
+    #[test]
+    fn a_dream_about_another_page_is_dropped_under_an_unrelated_ask() {
+        // Replay case d63802a8: a Chakar Rakho campaign ask, a dream about the
+        // Mahalakshmi Ashtakam page the session also edited.
+        let mut ep = episode();
+        ep.anchor_request = Some("a pair comes calling about a new campaign chakar rakh lo".into());
+        ep.files_modified =
+            vec!["/Users/x/anukriti-website/src/app/mahalakshmi-ashtakam-meaning/page.tsx".into()];
+        let feeds = RecapFeeds {
+            top_dream: Some(witness_dream(
+                "MahalakshmiAshtakamPage in mahalakshmi-ashtakam-meaning/page.tsx",
+                "src/app/mahalakshmi-ashtakam-meaning/page.tsx",
+                "MahalakshmiAshtakamPage",
+            )),
+            retired_while_away: vec![RetiredLine {
+                label: "MahalakshmiAshtakamPage".into(),
+                receipt_oid: "e72ad1b".into(),
+                date: "2026-10-27".into(),
+            }],
+            ..RecapFeeds::empty()
+        };
+        let got = session_start(&ep, &feeds).unwrap();
+        assert!(!got.contains("Dreamt:"), "{got}");
+        assert!(!got.contains("Learnt-then-retired"), "{got}");
+        assert!(!got.contains("Mahalakshmi"), "{got}");
+    }
+
+    #[test]
+    fn a_dream_or_retired_line_is_kept_when_the_recap_names_its_file_or_symbol() {
+        let mut ep = episode();
+        let feeds = RecapFeeds {
+            top_dream: Some(witness_dream(
+                "GATES in work/page.tsx",
+                "src/app/work/page.tsx",
+                "GATES",
+            )),
+            retired_while_away: vec![RetiredLine {
+                label: "src/app/work/page.tsx".into(),
+                receipt_oid: "41748ea".into(),
+                date: "2026-08-05".into(),
+            }],
+            ..RecapFeeds::empty()
+        };
+        // The ask names the file (its basename is enough).
+        ep.anchor_request = Some("Why does the work page.tsx hero still miss on mobile".into());
         let got = session_start(&ep, &feeds).unwrap();
         assert!(
-            got.contains("Dreamt: parse_config in src/config.rs went stale"),
+            got.contains("Dreamt: GATES in work/page.tsx went stale (2026-08-11, abc1234)."),
             "{got}"
         );
-        // A file with the same name elsewhere is not the anchor file.
-        ep.files_modified = vec!["/Users/x/repo/other/config.rs".into()];
-        assert!(!session_start(&ep, &feeds).unwrap().contains("Dreamt:"));
-        // The request names the symbol.
-        ep.files_modified.clear();
-        ep.anchor_request = Some("Why does parse_config drop the env override".into());
+        assert!(
+            got.contains("Learnt-then-retired while away: src/app/work/page.tsx (superseded 2026-08-05, 41748ea)."),
+            "{got}"
+        );
+        // The symbol named by a line the recap shows (here `Next:`), not the ask.
+        ep.anchor_request = Some("Fix the recap composer".into());
+        ep.next_steps = Some("Rename GATES to the new gate list".into());
         let got = session_start(&ep, &feeds).unwrap();
-        assert!(got.contains("Dreamt: parse_config"), "{got}");
-        // The repo recap is unchanged.
-        let got = compose_recap(&episode(), &feeds, "now").unwrap();
-        assert!(got.contains("Dreamt:"), "{got}");
+        assert!(got.contains("Dreamt: GATES in work/page.tsx"), "{got}");
+        // A word that merely contains the symbol does not name it.
+        ep.next_steps = Some("Run the GATESKEEPER suite".into());
+        let got = session_start(&ep, &feeds).unwrap();
+        assert!(!got.contains("Dreamt:"), "{got}");
+        assert!(!got.contains("Learnt-then-retired"), "{got}");
+    }
+
+    fn witness_dream(label: &str, file: &str, symbol: &str) -> DreamClause {
+        DreamClause {
+            label: label.into(),
+            verdict: "went stale".into(),
+            receipt: "abc1234".into(),
+            date: "2026-08-11".into(),
+            file: file.into(),
+            symbol: Some(symbol.into()),
+        }
     }
 
     #[test]
@@ -3977,8 +4119,8 @@ mod tests {
     #[test]
     fn off_branch_receipts_are_marked_with_the_head_branch_name() {
         let mut ep = episode();
-        // The dream's anchor file is one the session edited.
-        ep.files_modified = vec!["src/config.rs".into()];
+        // The ask names the dream's symbol, so SessionStart shows it.
+        ep.anchor_request = Some("Fix the recap composer and parse_config".into());
         ep.completions.push(receipt("Second change", "def5678"));
         ep.anchor_receipts = Some(vec![0, 1]);
         let mut feeds = RecapFeeds::empty();
