@@ -8,7 +8,7 @@
 
 **Claude forgets everything. This fixes that.**
 
-Single 94MB binary. Embedded SQLite, no database server. No containers. No API keys required.
+Single binary (about 135 MB). Embedded SQLite, no database server. No containers. No API keys required.
 
 [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [Paper](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
@@ -27,7 +27,7 @@ Single 94MB binary. Embedded SQLite, no database server. No containers. No API k
 ## Table of Contents
 
 - [The Problem](#the-forgetting-problem) — Why Claude needs memory
-- [The Architecture](#one-binary-78mb) — How CSR solves it
+- [The Architecture](#one-binary) — How CSR solves it
 - [The Pipeline](#the-pipeline) — Progressive enrichment (9.3x improvement)
 - [The Paper](#the-paper) — The research behind the retrieval design (preprint)
 - [btw, these too](#btw-these-too): Smaller features that ship with it
@@ -59,12 +59,12 @@ No special syntax. No commands. Install once, and past context appears automatic
 
 ---
 
-## One Binary. 94MB.
+## One Binary
 
 <a href="https://ramakay.github.io/claude-self-reflect/#/docs/architecture">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-02-arch-dark.png" />
-  <img align="right" src="docs-site/public/images/card-02-arch-light.png" alt="Architecture — One Binary, 94MB" width="420" />
+  <img align="right" src="docs-site/public/images/card-02-arch-light.png" alt="Architecture — One Binary" width="420" />
 </picture>
 </a>
 
@@ -292,7 +292,7 @@ No special syntax. No commands. CSR finds relevant past context and injects it a
 |--------|-------|
 | **Cached startup** | Loads the saved index; the time grows with index size |
 | **Vector index lookup (p95)** | Timed by `csr-engine eval` on your own index (target under 1 ms). It covers the lookup only, not a full recall call. |
-| **Binary size** | 94MB (aarch64-apple-darwin release build) |
+| **Binary size** | About 135 MB (aarch64-apple-darwin release build) |
 | **Embedding** | Local MiniLM model, 384 dimensions, no API call |
 
 </details>

@@ -203,10 +203,10 @@ function ImportBatchChart() {
 
 function BinaryDiagram() {
   return (
-    <svg className="binary-diagram" viewBox="0 0 150 150" role="img" aria-label="Single binary size is seventy eight megabytes">
+    <svg className="binary-diagram" viewBox="0 0 150 150" role="img" aria-label="Single binary size is about one hundred thirty five megabytes">
       <circle cx="75" cy="75" r="58" fill="rgba(246,230,169,0.20)" stroke="rgba(26,26,46,0.62)" strokeWidth="2.4" />
       <circle cx="75" cy="75" r="45" fill="none" stroke="rgba(26,26,46,0.13)" strokeDasharray="4 6" />
-      <text x="75" y="72" textAnchor="middle" className="binary-diagram__metric">94MB</text>
+      <text x="75" y="72" textAnchor="middle" className="binary-diagram__metric">~135MB</text>
       <text x="75" y="94" textAnchor="middle" className="binary-diagram__label">local</text>
     </svg>
   )
@@ -343,7 +343,7 @@ function OneBinaryCard() {
       <CardKicker number="05" />
       <h2 className="type-hl-sm">One Binary</h2>
       <PostIt className="binary-note" bg="var(--color-amber-paper)" rot="-2deg">
-        94MB CSR<br />(single binary)
+        ~135MB CSR<br />(single binary)
       </PostIt>
       <BinaryDiagram />
       <div className="competitor-box">
@@ -521,7 +521,7 @@ function InstallCard() {
           </div>
           <p className="type-caption mt-2">One command. Downloads binary, then asks before activating hooks + MCP. Restart Claude Code.</p>
           <div className="install-tabs-inline">
-            {['94MB binary', 'zero deps', '7 hooks', '16 MCP tools'].map((label, index) => (
+            {['~135MB binary', 'zero deps', '7 hooks', '16 MCP tools'].map((label, index) => (
               <span key={label} className="tear-tab" style={{ animationDelay: `${720 + index * 70}ms` }}>{label}</span>
             ))}
           </div>

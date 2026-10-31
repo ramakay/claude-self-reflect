@@ -37,10 +37,10 @@ protected and moves only through reviewed PRs merged by the maintainer.
 Single Rust binary (`csr-engine`). No Python, no Docker, no Qdrant.
 
 ```
-csr-engine (~94MB release build)
+csr-engine (about 135 MB release build)
   ├── MCP server (rmcp, 16 tools)
   ├── Embeddings (FastEmbed, 384-dim, local)
-  ├── Search (HNSW, <1ms p95)
+  ├── Search (HNSW vector index; `eval` times the index lookup only, not a recall call)
   ├── Storage (SQLite)
   ├── AST analysis (ast-grep, 6 languages)
   ├── 6 hook events (7 commands; SessionStart runs two)

@@ -4,7 +4,7 @@ title: Architecture
 
 ## Overview
 
-CSR is a single 94MB Rust binary. Everything — storage, search, embeddings, MCP server, hooks, and enrichment — runs in one process. No database servers, no containers, no network services. The one background process is `csr-engine daemon`, which does enrichment and dreaming. On macOS `csr-engine setup` installs it as a launchd agent and starts it (`CSR_NO_DAEMON=1` skips that; `scripts/launchd/` holds a template for doing it by hand). Hooks and the MCP server run without it.
+CSR is a single Rust binary of about 135 MB. Everything — storage, search, embeddings, MCP server, hooks, and enrichment — runs in one process. No database servers, no containers, no network services. The one background process is `csr-engine daemon`, which does enrichment and dreaming. On macOS `csr-engine setup` installs it as a launchd agent and starts it (`CSR_NO_DAEMON=1` skips that; `scripts/launchd/` holds a template for doing it by hand). Hooks and the MCP server run without it.
 
 ![CSR Architecture Diagram](/claude-self-reflect/images/arch-diagram.png)
 
@@ -120,7 +120,7 @@ score = raw_score * ((1 - 0.3) + 0.3 * 2^(-age_days / 90))
 
 ## Design Decisions
 
-**Why Rust?** — Single binary distribution, no runtime deps, predictable performance, memory safety, 94MB total including ONNX Runtime.
+**Why Rust?** — Single binary distribution, no runtime deps, predictable performance, memory safety, about 135 MB in total including ONNX Runtime.
 
 **Why SQLite over Qdrant?** — Eliminated Docker dependency entirely. Single-file database is easy to backup, move, inspect. Good enough for single-user workloads.
 

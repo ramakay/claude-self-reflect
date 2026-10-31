@@ -344,7 +344,7 @@ async fn test_performance(
         Ok(v) => v,
         Err(e) => {
             return EvalResult::fail(
-                "Performance Target",
+                "Embed + Index Lookup",
                 "performance",
                 t.elapsed().as_secs_f64() * 1000.0,
                 format!("Embed error: {e}"),
@@ -359,17 +359,19 @@ async fn test_performance(
 
     if total_ms < 500.0 {
         EvalResult::pass(
-            "Performance Target",
+            "Embed + Index Lookup",
             "performance",
             total_ms,
-            format!("embed+search: {total_ms:.1}ms (search: {search_ms:.1}ms)"),
+            format!(
+                "embed + vector index lookup: {total_ms:.1}ms (index lookup alone: {search_ms:.1}ms; not a recall call)"
+            ),
         )
     } else {
         EvalResult::fail(
-            "Performance Target",
+            "Embed + Index Lookup",
             "performance",
             total_ms,
-            format!("too slow: {total_ms:.1}ms (target <500ms)"),
+            format!("too slow: {total_ms:.1}ms for embed + vector index lookup (target <500ms)"),
         )
     }
 }
@@ -751,7 +753,9 @@ fn main() {
 
 /// Batch embedding target, ms per text. Over it the check warns, never fails.
 const BATCH_EMBED_TARGET_MS_PER_TEXT: f64 = 5.0;
-/// Search p95 target, ms. Over it the check warns, never fails.
+/// Vector index lookup p95 target, ms. Over it the check warns, never fails.
+/// It times the index lookup only: not embedding, full-text search, ranking or
+/// formatting, so it is not the latency of a recall call.
 const SEARCH_P95_TARGET_MS: f64 = 1.0;
 /// Timed passes over the query set, after one untimed warm-up pass.
 const SEARCH_TIMED_ROUNDS: usize = 5;
@@ -818,8 +822,8 @@ fn nearest_rank_p95(samples: &mut [f64]) -> Option<f64> {
     samples.get(rank.max(1) - 1).copied()
 }
 
-/// Grade the search latency. `p95` is `None` when nothing was timed. Over the
-/// target is AMBER and passes; zero timed searches (or a non-finite p95) is a
+/// Grade the vector index lookup latency. `p95` is `None` when nothing was timed. Over the
+/// target is AMBER and passes; zero timed lookups (or a non-finite p95) is a
 /// broken engine and fails.
 fn grade_search_latency(p95: Option<f64>, timed: usize, chunks: usize) -> (bool, String) {
     let p95 = match p95 {
@@ -827,20 +831,22 @@ fn grade_search_latency(p95: Option<f64>, timed: usize, chunks: usize) -> (bool,
         _ => {
             return (
                 false,
-                format!("no timed searches completed ({timed} timed, {chunks} chunks indexed)"),
+                format!(
+                    "no timed index lookups completed ({timed} timed, {chunks} chunks indexed)"
+                ),
             )
         }
     };
     if p95 < SEARCH_P95_TARGET_MS {
         (
             true,
-            format!("p95: {p95:.2}ms ({timed} timed searches, {chunks} chunks)"),
+            format!("index lookup p95: {p95:.2}ms ({timed} timed lookups, {chunks} chunks)"),
         )
     } else {
         (
             true,
             format!(
-                "AMBER (non-gating): p95 {p95:.2}ms, target <{SEARCH_P95_TARGET_MS:.0}ms ({timed} timed searches, {chunks} chunks indexed)"
+                "AMBER (non-gating): index lookup p95 {p95:.2}ms, target <{SEARCH_P95_TARGET_MS:.0}ms ({timed} timed lookups, {chunks} chunks indexed)"
             ),
         )
     }
@@ -892,9 +898,9 @@ async fn test_search_latency_p95(
 
     let (passed, detail) = grade_search_latency(p95, timed, chunks);
     if passed {
-        EvalResult::pass("Search Latency P95", "performance", ms, detail)
+        EvalResult::pass("Index Lookup P95", "performance", ms, detail)
     } else {
-        EvalResult::fail("Search Latency P95", "performance", ms, detail)
+        EvalResult::fail("Index Lookup P95", "performance", ms, detail)
     }
 }
 
@@ -948,7 +954,7 @@ mod tests {
             [
                 "DB Connectivity",
                 "Search Accuracy",
-                "Performance Target",
+                "Embed + Index Lookup",
                 "Cache Status",
                 "Tool Count",
                 "Trained Re-ranker Gate",
@@ -966,7 +972,7 @@ mod tests {
                 "AST Analysis",
                 "Quality Analysis",
                 "Batch Embed Speed",
-                "Search Latency P95",
+                "Index Lookup P95",
                 "Emitter Contamination Canary",
                 "Duplicate Rate (Report Only)",
                 "Known-Item Recall",
@@ -1007,7 +1013,10 @@ mod tests {
     fn search_latency_under_target_is_a_plain_pass() {
         let (passed, detail) = grade_search_latency(Some(0.42), 50, 760_078);
         assert!(passed);
-        assert_eq!(detail, "p95: 0.42ms (50 timed searches, 760078 chunks)");
+        assert_eq!(
+            detail,
+            "index lookup p95: 0.42ms (50 timed lookups, 760078 chunks)"
+        );
         assert!(!detail.contains("AMBER"));
     }
 
@@ -1020,7 +1029,7 @@ mod tests {
             assert!(detail.starts_with("AMBER (non-gating): "), "{detail}");
             assert!(detail.contains(&format!("{p95:.2}ms")), "{detail}");
             assert!(detail.contains("target <1ms"), "{detail}");
-            assert!(detail.contains("50 timed searches"), "{detail}");
+            assert!(detail.contains("50 timed lookups"), "{detail}");
             assert!(detail.contains("760078 chunks"), "{detail}");
         }
     }
@@ -1030,7 +1039,7 @@ mod tests {
         for (p95, timed) in [(None, 0), (Some(0.5), 0), (Some(f64::NAN), 10), (None, 10)] {
             let (passed, detail) = grade_search_latency(p95, timed, 12);
             assert!(!passed, "{detail}");
-            assert!(detail.starts_with("no timed searches"), "{detail}");
+            assert!(detail.starts_with("no timed index lookups"), "{detail}");
         }
     }
 
@@ -1090,7 +1099,7 @@ mod tests {
         };
         let amber = EvalReport {
             results: vec![
-                mk(p_ok, "Search Latency P95", p_detail),
+                mk(p_ok, "Index Lookup P95", p_detail),
                 mk(b_ok, "Batch Embed Speed", b_detail),
             ],
             total_ms: 0.0,
@@ -1100,7 +1109,7 @@ mod tests {
         // a broken engine still gates
         let (p_ok, p_detail) = grade_search_latency(None, 0, 0);
         let broken = EvalReport {
-            results: vec![mk(p_ok, "Search Latency P95", p_detail)],
+            results: vec![mk(p_ok, "Index Lookup P95", p_detail)],
             total_ms: 0.0,
         };
         assert!(broken.has_gating_failure());
