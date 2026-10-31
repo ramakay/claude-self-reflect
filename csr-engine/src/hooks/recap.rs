@@ -285,7 +285,9 @@ fn compose_recap_inner(
     // long to quote and nothing landed): the evidence lines below carry it, and
     // the check after them abstains when they are not primary evidence.
     let headless = intent.is_none() && completed.is_none();
-    if headless && !abstain_intent_only {
+    // Only for a prompt the word cap dropped: a session with no clean intent at
+    // all keeps the fragment block, whose LAST line says more than a bare head.
+    if headless && !(abstain_intent_only && recap_intent(ep).is_some()) {
         return None;
     }
 
@@ -3633,6 +3635,10 @@ mod tests {
                 .is_empty(),
             "the scrubber removes the whole head-less block: {got}"
         );
+        // No prompt at all (nothing was dropped): the fragment block runs.
+        let mut none = bare_episode();
+        none.anchor_request = None;
+        assert!(compose_recap_with_deliveries(&none, &feeds, "3d ago").is_none());
         // A dream alone is not what the session did: the fallback runs instead.
         let mut dream_only = RecapFeeds::empty();
         dream_only.top_dream = Some(dream());
