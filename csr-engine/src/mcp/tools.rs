@@ -3083,15 +3083,48 @@ fn keyword_legs(
     search_mode: SearchMode,
     family: Option<&[&str]>,
 ) -> KeywordLegs {
+    read_keyword_legs(storage, query, fetch, search_mode, family, false)
+        .expect("a fail-open read always answers")
+}
+
+/// [`keyword_legs`] on a lane connection: `None` when any read failed, so the
+/// caller reruns the legs on the main connection instead of taking a lane's
+/// transient error for "no keyword matches".
+fn keyword_legs_strict(
+    storage: &Storage,
+    query: &str,
+    fetch: usize,
+    search_mode: SearchMode,
+    family: Option<&[&str]>,
+) -> Option<KeywordLegs> {
+    read_keyword_legs(storage, query, fetch, search_mode, family, true)
+}
+
+/// One read of a leg: its rows, an empty result when a failure is tolerated, or
+/// `None` when it is not (`strict`).
+fn leg_rows<T: Default>(read: anyhow::Result<T>, strict: bool) -> Option<T> {
+    match read {
+        Ok(rows) => Some(rows),
+        Err(_) if !strict => Some(T::default()),
+        Err(_) => None,
+    }
+}
+
+fn read_keyword_legs(
+    storage: &Storage,
+    query: &str,
+    fetch: usize,
+    search_mode: SearchMode,
+    family: Option<&[&str]>,
+    strict: bool,
+) -> Option<KeywordLegs> {
     let mut postings_hits: Vec<(String, f64)> = Vec::new();
     let mut postings_weight = 0.0_f64;
     if search_mode == SearchMode::Hybrid {
         let idents = crate::search::identifiers::analyze_query(query);
         if !idents.is_empty() {
             let sub_start = Instant::now();
-            postings_hits = storage
-                .search_postings(&idents, fetch, family)
-                .unwrap_or_default();
+            postings_hits = leg_rows(storage.search_postings(&idents, fetch, family), strict)?;
             super::stage_timing::stage("f_postings", sub_start);
             if !postings_hits.is_empty() {
                 postings_weight = id_channel_weight(&idents, &postings_term_dfs(storage, &idents));
@@ -3099,37 +3132,53 @@ fn keyword_legs(
         }
     }
     let sub_start = Instant::now();
-    let keyword = keyword_chunk_hits(storage, query, fetch, family.map(<[&str]>::to_vec));
+    let family_vec = family.map(<[&str]>::to_vec);
+    let keyword = if strict {
+        crate::search::hybrid::keyword_chunk_hits_strict(storage, query, fetch, family_vec)?
+    } else {
+        keyword_chunk_hits(storage, query, fetch, family_vec)
+    };
     super::stage_timing::stage("f_chunks_fts", sub_start);
     let sub_start = Instant::now();
-    let reflection_fts_hits = storage
-        .fts5_search_reflections(query, fetch)
-        .unwrap_or_default();
+    let reflection_fts_hits = leg_rows(storage.fts5_search_reflections(query, fetch), strict)?;
     super::stage_timing::stage("f_refl_fts", sub_start);
     let sub_start = Instant::now();
-    let reflection_prefix_ids = storage
-        .fts5_reflection_prefix_matches(query, fetch)
-        .unwrap_or_default();
+    let reflection_prefix_ids =
+        leg_rows(storage.fts5_reflection_prefix_matches(query, fetch), strict)?;
     super::stage_timing::stage("f_refl_prefix", sub_start);
-    KeywordLegs {
+    Some(KeywordLegs {
         postings_hits,
         postings_weight,
         keyword,
         reflection_fts_hits,
         reflection_prefix_ids,
-    }
+    })
 }
 
 /// Start [`keyword_legs`] on the blocking pool over a lane connection of its
 /// own (a WAL reader, so it never waits on the main connection). `None` when
 /// the pass has no keyword channel, lanes are off, or the store has no file; the
-/// pass then runs the legs inline, which returns the same rows.
+/// pass then runs the legs inline, which returns the same rows. The task yields
+/// `None` when the lane would not open or any of its reads failed.
 fn spawn_keyword_lane(
     storage: &Arc<Storage>,
     query: &str,
     fetch: usize,
     scope: &SearchProjectScope,
     search_mode: SearchMode,
+) -> Option<tokio::task::JoinHandle<Option<KeywordLegs>>> {
+    spawn_keyword_lane_with(storage, query, fetch, scope, search_mode, |_| {})
+}
+
+/// [`spawn_keyword_lane`] with a hook run on the lane connection before its
+/// reads (the tests break the lane alone with it).
+fn spawn_keyword_lane_with(
+    storage: &Arc<Storage>,
+    query: &str,
+    fetch: usize,
+    scope: &SearchProjectScope,
+    search_mode: SearchMode,
+    prepare: impl FnOnce(&Storage) + Send + 'static,
 ) -> Option<tokio::task::JoinHandle<Option<KeywordLegs>>> {
     if search_mode == SearchMode::Vector || !recall_lanes_enabled() {
         return None;
@@ -3142,17 +3191,29 @@ fn spawn_keyword_lane(
         .then(|| scope.family_projects.iter().cloned().collect());
     Some(tokio::task::spawn_blocking(move || {
         let lane = storage.open_prompt_lane().ok().flatten()?;
+        prepare(&lane);
         let family: Option<Vec<&str>> = family
             .as_ref()
             .map(|projects| projects.iter().map(String::as_str).collect());
-        Some(keyword_legs(
-            &lane,
-            &query,
-            fetch,
-            search_mode,
-            family.as_deref(),
-        ))
+        keyword_legs_strict(&lane, &query, fetch, search_mode, family.as_deref())
     }))
+}
+
+/// The keyword legs of a pass: the lane's when it answered whole, otherwise the
+/// same reads inline on the main connection.
+async fn collect_keyword_legs(
+    lane: Option<tokio::task::JoinHandle<Option<KeywordLegs>>>,
+    storage: &Storage,
+    query: &str,
+    fetch: usize,
+    search_mode: SearchMode,
+    family: Option<&[&str]>,
+) -> KeywordLegs {
+    match lane {
+        Some(handle) => handle.await.ok().flatten(),
+        None => None,
+    }
+    .unwrap_or_else(|| keyword_legs(storage, query, fetch, search_mode, family))
 }
 
 /// Judge, on a lane connection of its own, the sessions of the semantic
@@ -3618,11 +3679,15 @@ async fn reflect_gather_pass(
         // semantic candidates were enriched; the same function runs inline when
         // no lane was available.
         let sub_start = Instant::now();
-        let legs = match keyword_lane.take() {
-            Some(handle) => handle.await.ok().flatten(),
-            None => None,
-        }
-        .unwrap_or_else(|| keyword_legs(storage, query, fetch, search_mode, family.as_deref()));
+        let legs = collect_keyword_legs(
+            keyword_lane.take(),
+            storage,
+            query,
+            fetch,
+            search_mode,
+            family.as_deref(),
+        )
+        .await;
         super::stage_timing::stage("f_keyword_wait", sub_start);
         postings_hits = legs.postings_hits;
         postings_weight = legs.postings_weight;
@@ -18368,6 +18433,43 @@ mod recall_lane_tests {
         );
         assert_eq!(inline.reflection_fts_hits, lane.reflection_fts_hits);
         assert_eq!(inline.reflection_prefix_ids, lane.reflection_prefix_ids);
+    }
+
+    #[tokio::test]
+    async fn a_failed_lane_read_reruns_the_legs_on_the_main_connection() {
+        let rows: Vec<(String, String, String)> = (0..6)
+            .map(|n| {
+                (
+                    format!("faultlane-id{n}"),
+                    format!("faultlane-conv{n}"),
+                    format!("zirconfault notes about retries {n}"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+            .collect();
+        let (_dir, storage) = file_store(&refs);
+        let scope = unscoped();
+        let query = "zirconfault retries notes";
+        let inline = keyword_legs(&storage, query, 30, SearchMode::Hybrid, None);
+        assert!(!inline.keyword.hits.is_empty());
+        // A temp table shadows `chunks_fts` on the lane connection only: its
+        // chunk read errors while the main connection stays healthy.
+        let lane =
+            spawn_keyword_lane_with(&storage, query, 30, &scope, SearchMode::Hybrid, |lane| {
+                lane.with_connection(|conn| {
+                    conn.execute_batch("CREATE TEMP TABLE chunks_fts (content TEXT);")?;
+                    Ok(())
+                })
+                .unwrap();
+            })
+            .expect("a file store has a lane");
+        let legs =
+            collect_keyword_legs(Some(lane), &storage, query, 30, SearchMode::Hybrid, None).await;
+        assert_eq!(rows_of(&inline), rows_of(&legs));
+        assert_eq!(inline.keyword.window_full, legs.keyword.window_full);
     }
 
     #[tokio::test]

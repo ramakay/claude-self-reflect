@@ -315,19 +315,21 @@ fn session_verdicts<'a>(
     if uncached.is_empty() {
         return verdicts;
     }
-    // A failed read is a pass: the filter never removes what it cannot judge.
-    let mut scanned = storage
-        .with_connection(|conn| {
-            crate::storage::queries::conversation_eval_scan_many(
-                conn,
-                &uncached,
-                MARKER_LIKE,
-                OUTPUT_LIKE,
-            )
-        })
-        .unwrap_or_default();
+    // A failed read is a pass for this call (the filter never removes what it
+    // cannot judge) but never a verdict: it is not cached, so the next ask
+    // scans again instead of keeping "clean" for the whole TTL.
+    let scan = storage.with_connection(|conn| {
+        crate::storage::queries::conversation_eval_scan_many(
+            conn,
+            &uncached,
+            MARKER_LIKE,
+            OUTPUT_LIKE,
+        )
+    });
+    let scan_ok = scan.is_ok();
+    let mut scanned = scan.unwrap_or_default();
     let mut held = cache().lock().unwrap_or_else(|e| e.into_inner());
-    if held.len() + uncached.len() >= CACHE_CAP {
+    if scan_ok && held.len() + uncached.len() >= CACHE_CAP {
         held.clear();
     }
     for &conversation in conversations {
@@ -338,10 +340,12 @@ fn session_verdicts<'a>(
         let mut judged = judge_session(&rows);
         judged.parent = parent_of(&rows, conversation);
         let verdict = Arc::new(judged);
-        held.insert(
-            conversation.to_string(),
-            (Instant::now(), Arc::clone(&verdict)),
-        );
+        if scan_ok {
+            held.insert(
+                conversation.to_string(),
+                (Instant::now(), Arc::clone(&verdict)),
+            );
+        }
         verdicts.insert(conversation, verdict);
     }
     verdicts
@@ -493,6 +497,30 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn a_failed_prefetch_scan_is_not_cached_as_a_clean_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("csr-engine.db")).unwrap();
+        let bench = "[Bash: csr-engine bench --probe --db-path /x/.testbed/failscan]";
+        for seq in 0..6 {
+            put(&storage, "failscan-rig", seq, Speaker::Assistant, bench);
+        }
+        // The prefetch lane cannot read `chunks` (a temp table shadows it on
+        // that connection alone), so its scan fails.
+        let lane = storage.open_prompt_lane().unwrap().expect("a file store");
+        lane.with_connection(|conn| {
+            conn.execute_batch("CREATE TEMP TABLE chunks (x TEXT);")?;
+            Ok(())
+        })
+        .unwrap();
+        prefetch_verdicts(&lane, &["failscan-rig"]);
+        // The consuming filter must scan again on its healthy connection and
+        // drop the rig's rows, not trust a cached "clean".
+        let candidates = refs(&storage, "failscan-rig", 6);
+        let dropped = synthetic_ids_if(true, &storage, &candidates);
+        assert_eq!(dropped.len(), 6, "{dropped:?}");
     }
 
     #[test]

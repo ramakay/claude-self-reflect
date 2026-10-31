@@ -255,7 +255,37 @@ pub fn keyword_chunk_hits(
     fetch: usize,
     family_projects: Option<Vec<&str>>,
 ) -> KeywordChunkHits {
-    let searches = match family_projects {
+    assemble_keyword_hits(
+        keyword_windows(storage, query, fetch, family_projects)
+            .into_iter()
+            .flatten()
+            .collect(),
+        fetch,
+    )
+}
+
+/// [`keyword_chunk_hits`] that reports a failed read instead of dropping it:
+/// `None` when any window errored, so the caller can ask a healthier connection.
+pub fn keyword_chunk_hits_strict(
+    storage: &Storage,
+    query: &str,
+    fetch: usize,
+    family_projects: Option<Vec<&str>>,
+) -> Option<KeywordChunkHits> {
+    let windows = keyword_windows(storage, query, fetch, family_projects)
+        .into_iter()
+        .collect::<anyhow::Result<Vec<_>>>()
+        .ok()?;
+    Some(assemble_keyword_hits(windows, fetch))
+}
+
+fn keyword_windows(
+    storage: &Storage,
+    query: &str,
+    fetch: usize,
+    family_projects: Option<Vec<&str>>,
+) -> Vec<anyhow::Result<Vec<(ConversationChunk, usize, f64)>>> {
+    match family_projects {
         Some(mut projects) => {
             projects.sort_unstable();
             projects.dedup();
@@ -271,10 +301,16 @@ pub fn keyword_chunk_hits(
             }
         }
         None => vec![storage.fts5_search(query, fetch, None)],
-    };
+    }
+}
+
+fn assemble_keyword_hits(
+    searches: Vec<Vec<(ConversationChunk, usize, f64)>>,
+    fetch: usize,
+) -> KeywordChunkHits {
     let mut hits = Vec::new();
     let mut window_full = false;
-    for window in searches.into_iter().flatten() {
+    for window in searches {
         window_full |= window.len() == fetch;
         hits.extend(window);
     }
