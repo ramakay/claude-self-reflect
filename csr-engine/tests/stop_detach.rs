@@ -534,6 +534,8 @@ fn three_quick_stops_never_cost_more_runs_than_stops_and_the_last_input_wins() {
                 .unwrap_or(false)
                 && !spool_dir(&w.db).join("sid-quick.json").exists()
                 && !spool_dir(&w.db).join("sid-quick.work").exists()
+                // The worker logs its run count as it exits, after the spool is cleared.
+                && w.worker_runs() >= 1
         },
     );
     let runs = world.worker_runs();
