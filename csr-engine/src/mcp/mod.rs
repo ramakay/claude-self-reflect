@@ -1,6 +1,8 @@
 pub mod completions;
 pub mod elicitation;
 pub mod opener_guard;
+#[cfg(test)]
+mod recall_bench;
 pub mod resources;
 pub mod stage_probe;
 pub mod stage_timing;

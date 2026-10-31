@@ -496,7 +496,10 @@ pub fn witness_verdict_for_chunks(
     let candidates: std::collections::HashSet<&str> =
         conversation_ids.iter().map(|s| s.as_str()).collect();
 
+    let w_start = std::time::Instant::now();
     let nodes: Vec<NodeRow> = codegraph::nodes_for_conversations(&tx, conversation_ids)?;
+    crate::mcp::stage_timing::stage("s_w_nodes", w_start);
+    crate::mcp::stage_timing::count("s_w_node_rows", nodes.len() as u64);
 
     // node -> the input conversation_ids it is attributed to (first and/or
     // last touch; almost always the same single id, but both are checked so
@@ -536,7 +539,10 @@ pub fn witness_verdict_for_chunks(
             }
         }
     }
+    let w_start = std::time::Instant::now();
     let (symbols_by_file, lineages) = witness_symbols_for_files(&tx, &file_keys)?;
+    crate::mcp::stage_timing::stage("s_w_symbols", w_start);
+    let w_start = std::time::Instant::now();
 
     let mut resolved = Vec::new();
     let mut state_anchors = Vec::new();
@@ -595,6 +601,7 @@ pub fn witness_verdict_for_chunks(
             }
         }
     }
+    crate::mcp::stage_timing::stage("s_w_states", w_start);
     let negative_witness_ids: Vec<i64> = states
         .values()
         .flat_map(|state| state.negative_witness_ids.iter().copied())

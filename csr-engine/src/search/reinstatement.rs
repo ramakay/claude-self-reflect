@@ -284,8 +284,10 @@ impl ProbeFilter {
         if unknown.is_empty() {
             return Ok(());
         }
-        let probes: HashSet<String> = storage
-            .first_chunk_prefixes(&unknown, PROBE_PREFIX_CHARS)?
+        let w_start = std::time::Instant::now();
+        let prefixes = storage.first_chunk_prefixes(&unknown, PROBE_PREFIX_CHARS)?;
+        crate::mcp::stage_timing::stage("w_probe_classify", w_start);
+        let probes: HashSet<String> = prefixes
             .into_iter()
             .filter(|(_, prefix)| is_experiment_probe_opening(prefix))
             .map(|(conv, _)| conv)
@@ -533,6 +535,18 @@ fn clean_excerpt(content: &str) -> String {
 /// conversation's own embeddings. `None` if the conversation has no chunks or no
 /// stored embeddings (never panics — old/unenriched conversations are common).
 fn best_chunk_for_conv(
+    storage: &Storage,
+    query_vec: &[f32],
+    conv: &str,
+    family_projects: &[String],
+) -> Result<Option<(String, f32)>> {
+    let w_start = std::time::Instant::now();
+    let out = best_chunk_for_conv_untimed(storage, query_vec, conv, family_projects);
+    crate::mcp::stage_timing::stage("w_best_chunk", w_start);
+    out
+}
+
+fn best_chunk_for_conv_untimed(
     storage: &Storage,
     query_vec: &[f32],
     conv: &str,
@@ -790,11 +804,14 @@ pub async fn reinstate(
         return Ok(ReinstateResult::default());
     }
 
+    let w_start = std::time::Instant::now();
     let query_vec: Vec<f32> = {
         let q = query.to_string();
         let emb = embeddings.clone();
         tokio::task::spawn_blocking(move || emb.embed_single(&q)).await??
     };
+    crate::mcp::stage_timing::stage("w_embed", w_start);
+    let w_start = std::time::Instant::now();
 
     // Resolve the family exactly once, then carry the same set through chunks,
     // code_evolution, nodes, edges, and episode target validation.
@@ -820,6 +837,8 @@ pub async fn reinstate(
         None
     };
 
+    crate::mcp::stage_timing::stage("w_family", w_start);
+    let w_start = std::time::Instant::now();
     // ---- hop 1: chunks (project-scoped if given) + reflections, merged ----
     // 2x over-fetch so seed selection can skip verbatim query echoes and still
     // find cfg.seeds real seeds — on a re-asked question the top hits are all
@@ -836,6 +855,8 @@ pub async fn reinstate(
         (chunks, reflections)
     };
 
+    crate::mcp::stage_timing::stage("w_hop1", w_start);
+    let w_start = std::time::Instant::now();
     let mut pool: HashMap<String, Candidate> = HashMap::new();
     let mut probes = ProbeFilter::default();
 
@@ -881,6 +902,8 @@ pub async fn reinstate(
         );
     }
 
+    crate::mcp::stage_timing::stage("w_meta", w_start);
+    let w_start = std::time::Instant::now();
     // seeds = top-N NON-ECHO chunk hits (hits are already score-sorted by
     // SearchEngine; echoes only fill in when nothing else matched)
     let query_lower = query.to_lowercase();
@@ -968,6 +991,8 @@ pub async fn reinstate(
         .take(MAX_STRUCTURAL_CONVERSATIONS)
         .collect();
 
+    crate::mcp::stage_timing::stage("w_symbols", w_start);
+    let w_start = std::time::Instant::now();
     let mut structural_launches = Vec::new();
     for conv in structural_conversations {
         trace.graph_walks += 1;
@@ -983,6 +1008,8 @@ pub async fn reinstate(
         }
     }
 
+    crate::mcp::stage_timing::stage("w_structural", w_start);
+    let w_start = std::time::Instant::now();
     let seed_ids: Vec<String> = semantic_seeds
         .iter()
         .map(|(seed, _)| seed.id.clone())
@@ -1049,9 +1076,11 @@ pub async fn reinstate(
             launches.push((chunk_id, conv));
         }
     }
+    crate::mcp::stage_timing::stage("w_anchor_scan", w_start);
     let mut episode_accepted_ids = BTreeSet::new();
 
     for (seed_id, seed_conv) in launches {
+        let w_start = std::time::Instant::now();
         // (1) blended context vector, second-hop chunk search (project-filtered when scoped)
         if let Some(sv) = seed_vecs.get(&seed_id) {
             let bv = blend(&query_vec, sv, cfg.blend_query_weight);
@@ -1084,6 +1113,8 @@ pub async fn reinstate(
             }
         }
 
+        crate::mcp::stage_timing::stage("w_loop_blend", w_start);
+        let w_start = std::time::Instant::now();
         // (2) co-edit spread is the fallback when the query did not resolve a
         // symbol. Every attempted neighbor is a walk; only candidates meeting
         // the structural one-hop cosine floor are accepted.
@@ -1134,6 +1165,8 @@ pub async fn reinstate(
                 push_candidate(&mut pool, candidate);
             }
         }
+        crate::mcp::stage_timing::stage("w_loop_graph", w_start);
+        let w_start = std::time::Instant::now();
 
         // (3) episode chain: seed session's episode -> prev episode -> its session
         let prev_episode = episode_prev_session(storage, &seed_conv)?;
@@ -1165,10 +1198,12 @@ pub async fn reinstate(
                 EpisodeTarget::Unembedded => trace.episode_unembedded += 1,
             }
         }
+        crate::mcp::stage_timing::stage("w_loop_episode", w_start);
     }
 
     let mut fused: Vec<Candidate> = pool.into_values().collect();
     fused.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let w_start = std::time::Instant::now();
 
     // Detail (provenance/timestamp/content) for the WHOLE pool, not just top-k:
     // the pool is bounded by cfg (k + seeds*(5 + graph_cap_per_seed + 1), ~46 at
@@ -1202,12 +1237,15 @@ pub async fn reinstate(
             );
         }
     }
+    crate::mcp::stage_timing::stage("w_detail", w_start);
+    let w_start = std::time::Instant::now();
     // Drop candidates whose backing row vanished (pruned chunk, deleted
     // reflection) BEFORE ranking so they don't occupy ranked slots.
     fused.retain(|c| detail.contains_key(&c.id));
 
     let fused = rerank_pool(fused, &detail, query);
     let fused = truncate_with_episode_quota(fused, cfg.k, 0.30 * cfg.graph_boost);
+    crate::mcp::stage_timing::stage("w_rerank", w_start);
 
     // Shadow signal only: fetch after ordering is fully fixed (sort + rerank +
     // truncate). Never used for ranking, filtering, or score mutation.

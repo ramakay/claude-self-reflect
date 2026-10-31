@@ -2897,16 +2897,35 @@ impl Storage {
             .into_iter()
             .collect();
         conversation_ids.sort();
+        let w_start = std::time::Instant::now();
         let grouped = self.witness_verdicts_for_conversations(&conversation_ids)?;
+        crate::mcp::stage_timing::stage("s_w_grouped", w_start);
         let candidate_owners: HashMap<&str, &str> = chunks
             .iter()
             .map(|(chunk_id, conversation_id)| (chunk_id.as_str(), conversation_id.as_str()))
             .collect();
         let mut persisted_by_conversation: HashMap<String, Vec<String>> = HashMap::new();
-        {
+        // The persisted chunk ids of a conversation are read only to bind a legacy
+        // conversation-keyed Demote hit (see `rebind_verdict_hits`). Almost every
+        // batch has no such hit, and listing every chunk of every candidate
+        // conversation is the expensive part, so only the conversations that
+        // carry one are listed.
+        let needs_persisted: Vec<String> = conversation_ids
+            .iter()
+            .filter(|conversation_id| {
+                grouped.get(conversation_id.as_str()).is_some_and(|hits| {
+                    hits.iter().any(|hit| {
+                        hit.chunk_id.is_empty()
+                            && hit.channel == witness_verdicts::VerdictChannel::Demote
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+        if !needs_persisted.is_empty() {
             let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
             const BATCH: usize = 400;
-            for batch in conversation_ids.chunks(BATCH) {
+            for batch in needs_persisted.chunks(BATCH) {
                 let placeholders: Vec<String> =
                     (1..=batch.len()).map(|i| format!("?{i}")).collect();
                 let sql = format!(

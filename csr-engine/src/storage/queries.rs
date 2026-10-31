@@ -4863,37 +4863,36 @@ pub fn get_chunk_ids_for_conversation_in_projects(
 /// The first stored chunk of each requested conversation, cut to `prefix_chars`
 /// characters: `(conversation_id, content prefix)`. "First" is the lowest `seq`
 /// (rows whose `seq` was never backfilled sort after numbered ones, then by
-/// rowid). Conversations with no chunks are absent from the result. One batched
-/// query per 400 ids, never one per conversation.
+/// rowid). Conversations with no chunks are absent from the result. Each
+/// conversation is ranked once, over its own chunks through the conversation
+/// index. The earlier single query ranked a conversation's chunks once per chunk
+/// (a correlated subquery per row), which on a conversation of thousands of
+/// chunks took seconds.
 pub fn first_chunk_prefixes(
     conn: &Connection,
     conversation_ids: &[String],
     prefix_chars: usize,
 ) -> Result<Vec<(String, String)>> {
     let mut out = Vec::with_capacity(conversation_ids.len());
-    for batch in conversation_ids.chunks(400) {
-        let sql = format!(
-            "SELECT c.conversation_id, substr(c.content, 1, ?)
-             FROM chunks c
-             WHERE c.conversation_id IN ({})
-               AND c.id = (
-                   SELECT f.id FROM chunks f
-                   WHERE f.conversation_id = c.conversation_id
-                   ORDER BY f.seq IS NULL, f.seq, f.rowid
-                   LIMIT 1
-               )",
-            string_placeholders(batch.len())
-        );
-        let prefix_chars = prefix_chars as i64;
-        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(batch.len() + 1);
-        params.push(&prefix_chars);
-        params.extend(batch.iter().map(|id| id as &dyn rusqlite::ToSql));
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            out.push(row?);
+    let mut seen = std::collections::HashSet::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT substr(content, 1, ?1)
+         FROM chunks
+         WHERE conversation_id = ?2
+         ORDER BY seq IS NULL, seq, rowid
+         LIMIT 1",
+    )?;
+    for conversation_id in conversation_ids {
+        if !seen.insert(conversation_id.as_str()) {
+            continue;
+        }
+        let prefix = stmt
+            .query_row(params![prefix_chars as i64, conversation_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        if let Some(prefix) = prefix {
+            out.push((conversation_id.clone(), prefix));
         }
     }
     Ok(out)
@@ -6487,6 +6486,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(triggers, 3);
+    }
+
+    /// The single query `first_chunk_prefixes` used to run: a correlated
+    /// subquery per chunk. It is the oracle for the per-conversation form.
+    fn first_chunk_prefixes_oracle(
+        conn: &Connection,
+        conversations: &[String],
+        prefix_chars: usize,
+    ) -> Vec<(String, String)> {
+        let sql = format!(
+            "SELECT c.conversation_id, substr(c.content, 1, ?)
+             FROM chunks c
+             WHERE c.conversation_id IN ({})
+               AND c.id = (
+                   SELECT f.id FROM chunks f
+                   WHERE f.conversation_id = c.conversation_id
+                   ORDER BY f.seq IS NULL, f.seq, f.rowid
+                   LIMIT 1
+               )",
+            string_placeholders(conversations.len())
+        );
+        let prefix_chars = prefix_chars as i64;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&prefix_chars];
+        params.extend(conversations.iter().map(|id| id as &dyn rusqlite::ToSql));
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        let mut out: Vec<(String, String)> = rows.map(|r| r.unwrap()).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn first_chunk_prefixes_matches_the_correlated_query() {
+        let conn = mem();
+        // (id, conversation, seq): out-of-order numbers, a numbered row inserted
+        // after unnumbered ones, an all-unnumbered conversation, a single chunk.
+        let rows: [(&str, &str, Option<i64>); 9] = [
+            ("a3", "conv-a", Some(3)),
+            ("a1", "conv-a", Some(1)),
+            ("a2", "conv-a", Some(2)),
+            ("b-null-1", "conv-b", None),
+            ("b-null-2", "conv-b", None),
+            ("c-null", "conv-c", None),
+            ("c-num", "conv-c", Some(7)),
+            ("d-only", "conv-d", Some(0)),
+            ("e-tie-1", "conv-e", Some(5)),
+        ];
+        for (id, conversation, seq) in rows {
+            let mut chunk = test_chunk(id, &format!("opening of {id} with a long enough text"));
+            chunk.conversation_id = conversation.into();
+            insert_chunk(&conn, &chunk, &[0.1; 4]).unwrap();
+            conn.execute("UPDATE chunks SET seq = ?1 WHERE id = ?2", params![seq, id])
+                .unwrap();
+        }
+        let mut chunk = test_chunk("e-tie-2", "second at the same seq");
+        chunk.conversation_id = "conv-e".into();
+        insert_chunk(&conn, &chunk, &[0.1; 4]).unwrap();
+        conn.execute("UPDATE chunks SET seq = 5 WHERE id = 'e-tie-2'", [])
+            .unwrap();
+
+        let asked: Vec<String> = [
+            "conv-a",
+            "conv-b",
+            "conv-c",
+            "conv-d",
+            "conv-e",
+            "conv-none",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for prefix_chars in [5usize, 512] {
+            let mut got = first_chunk_prefixes(&conn, &asked, prefix_chars).unwrap();
+            got.sort();
+            assert_eq!(
+                got,
+                first_chunk_prefixes_oracle(&conn, &asked, prefix_chars)
+            );
+            assert_eq!(got.len(), 5, "an unknown conversation is absent: {got:?}");
+        }
+        let got = first_chunk_prefixes(&conn, &asked, 512).unwrap();
+        let by_conv: std::collections::HashMap<_, _> = got.into_iter().collect();
+        assert!(by_conv["conv-a"].starts_with("opening of a1"));
+        assert!(by_conv["conv-b"].starts_with("opening of b-null-1"));
+        assert!(by_conv["conv-c"].starts_with("opening of c-num"));
+        // A conversation named twice is read once.
+        let twice = vec!["conv-a".to_string(), "conv-a".to_string()];
+        assert_eq!(first_chunk_prefixes(&conn, &twice, 512).unwrap().len(), 1);
     }
 
     #[test]

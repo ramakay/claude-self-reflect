@@ -283,6 +283,12 @@ fn synthetic_ids_if(enabled: bool, storage: &Storage, candidates: &[ChunkRef]) -
     dropped
 }
 
+/// Judge `conversations` into the process cache ahead of the filter that will
+/// ask for them. Nothing is returned and nothing is decided here.
+pub(crate) fn prefetch_verdicts(storage: &Storage, conversations: &[&str]) {
+    let _ = session_verdicts(storage, conversations);
+}
+
 /// The verdict of each of `conversations`: from the process cache while it is
 /// fresh, the rest from one batched scan (cached on the way out).
 fn session_verdicts<'a>(
