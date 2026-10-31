@@ -520,6 +520,22 @@ pub fn engine_outputs() -> Vec<Output> {
         .iter()
         .map(|path| path.to_string())
         .collect();
+    // A prompt too long to quote and settled evidence: no head words at all.
+    let mut headless = plain.clone();
+    headless.anchor_request =
+        Some("a peer is coming in with a new track that goes to devi shakti".into());
+    headless.completions.clear();
+    headless.anchor_receipts = None;
+    let recap_headless = recap::compose_recap_with_deliveries(&headless, &full_feeds(), age)
+        .expect("a head-less recap composes")
+        .text;
+    assert!(recap_headless.starts_with("recap ["), "{recap_headless}");
+    out.push(output(
+        "tier0-recap-headless",
+        "recap",
+        R::Recap,
+        recap_backed(&recap_headless, &[]),
+    ));
     out.push(output(
         "tier0-recap-uncommitted",
         "recap",

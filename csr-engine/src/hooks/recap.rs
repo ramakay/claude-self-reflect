@@ -281,7 +281,11 @@ fn compose_recap_inner(
         recap_intent(ep)
     };
     let completed = recap_completed(ep, ctx);
-    if intent.is_none() && completed.is_none() {
+    // SessionStart can still compose with no head words at all (a prompt too
+    // long to quote and nothing landed): the evidence lines below carry it, and
+    // the check after them abstains when they are not primary evidence.
+    let headless = intent.is_none() && completed.is_none();
+    if headless && !abstain_intent_only {
         return None;
     }
 
@@ -311,9 +315,11 @@ fn compose_recap_inner(
             format!("recap [{age}]: Latest: {}", terminate_clause(completed))
         }
         (None, Some(completed)) => format!("recap [{age}]: {}", terminate_clause(completed)),
-        (None, None) => unreachable!("empty episodes abstain above"),
+        // Nothing to quote and nothing landed: the sentinel stands alone and
+        // the evidence lines carry the paragraph. Words are never invented.
+        (None, None) => format!("recap [{age}]:"),
     };
-    if let Some(then) = then {
+    if let (Some(then), false) = (then, headless) {
         recap.push_str(&format!(" {THEN_CLAUSE_PREFIX}{}", terminate_clause(then)));
     }
     // Machine-owned sentinel, accounted for INSIDE the MAX_CHARS budget below
@@ -531,6 +537,15 @@ fn compose_recap_inner(
         && completed.is_none()
         && next_line.is_none()
         && (0..clauses.len()).all(|index| substantive(index) == 0)
+    {
+        return None;
+    }
+    // With no head words, a paragraph of only a dream, a retired note or a
+    // bare `Next:` has nothing the session did to stand on: the fragment fallback says more.
+    if headless
+        && [SETTLED, NOW, CORRECTED]
+            .iter()
+            .all(|&index| substantive(index) == 0)
     {
         return None;
     }
@@ -3581,6 +3596,47 @@ mod tests {
         let mut bare = bare_episode();
         bare.anchor_request = Some(FIELD_PROMPT.into());
         assert!(compose_recap_with_deliveries(&bare, &RecapFeeds::empty(), "9m ago").is_none());
+    }
+
+    #[test]
+    fn a_too_long_prompt_with_settled_evidence_keeps_the_recap_without_a_head() {
+        // Replay of a real session: a 14-word prompt with no clause boundary and
+        // user-confirmed evidence. Dropping the whole recap lost that evidence.
+        let mut bare = bare_episode();
+        bare.anchor_request =
+            Some("a peer is coming in with a new track that goes to devi shakti".into());
+        let mut feeds = RecapFeeds::empty();
+        feeds.settled = vec![SettledFact {
+            claim: "schema is stable".into(),
+            receipt: "810283b".into(),
+            status: "resolved".into(),
+            source: "user_confirmed".into(),
+        }];
+        let got = compose_recap_with_deliveries(&bare, &feeds, "3d ago")
+            .expect("the evidence stands without a head")
+            .text;
+        assert!(
+            got.starts_with("recap [3d ago]: [[CSR:RECAP]]\nSettled: schema is stable (810283b)."),
+            "{got}"
+        );
+        assert!(
+            !got.contains("peer"),
+            "the long prompt is not pasted: {got}"
+        );
+        assert!(
+            crate::extraction::provenance::is_csr_emission(&got),
+            "{got}"
+        );
+        assert!(
+            crate::import::contamination::strip_hits(&got)
+                .trim()
+                .is_empty(),
+            "the scrubber removes the whole head-less block: {got}"
+        );
+        // A dream alone is not what the session did: the fallback runs instead.
+        let mut dream_only = RecapFeeds::empty();
+        dream_only.top_dream = Some(dream());
+        assert!(compose_recap_with_deliveries(&bare, &dream_only, "3d ago").is_none());
     }
 
     #[test]

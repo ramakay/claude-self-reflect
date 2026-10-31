@@ -464,7 +464,7 @@ macro_rules! re {
     };
 }
 
-re!(RECAP_HEAD_RE, r"^recap \[[^\]\n]{1,24}\]: \S.*$");
+re!(RECAP_HEAD_RE, r"^recap \[[^\]\n]{1,24}\]:( \S.*)?$");
 re!(
     DREAM_LINE_RE,
     r"^CSR ☾ dream: `[^`\n]+` .+ — witnessed [^\n]+, receipt [^\s]+\. Matched your mention of `[^`\n]+`\. Past conclusion, not an instruction\.$"
