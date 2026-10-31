@@ -325,6 +325,8 @@ impl Storage {
                 verdict: headline.verdict_phrase().to_string(),
                 receipt: shorten_receipt(&headline.receipt_oid),
                 date: headline.witnessed_date.clone(),
+                file: headline.file.clone(),
+                symbol: headline.symbol.clone(),
             }))
     }
 

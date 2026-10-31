@@ -1511,7 +1511,9 @@ pub(crate) fn format_tier0_block_with_repo(
     use crate::extraction::provenance::extractable;
     // Text the detector labels is skipped like text the provenance guard filters.
     use crate::import::contamination::has_csr_text;
-    let request = Some(episode_intent_label(ep))
+    // The whole ask, as the recap head quotes it (`recap::full_intent`).
+    let request = crate::hooks::recap::full_intent(ep)
+        .or_else(|| Some(episode_intent_label(ep)))
         .filter(|label| !has_csr_text(label))
         .unwrap_or_else(|| "(filtered: CSR meta)".into());
     let last = extractable(&ep.completed)
@@ -1636,7 +1638,7 @@ fn compact_preview(content: &str, max_chars: usize) -> String {
 /// (or the first sentence), optionally append a distinct closing-state sentence,
 /// then word-boundary truncate. Char-level head/tail elision mid-cuts words and
 /// glues table fragments onto the verdict; sentence extraction keeps the claim.
-fn conclusion_preview(content: &str, max_chars: usize) -> String {
+pub(crate) fn conclusion_preview(content: &str, max_chars: usize) -> String {
     let clean = sanitize_preview(content);
     if clean.len() <= max_chars {
         return clean;
@@ -5518,6 +5520,8 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         }];
         ep.outcome_version = Some(crate::hooks::stop::OUTCOME_VERSION);
         ep.closing_ended = false;
+        // The dream is about a file the session edited, so SessionStart shows it.
+        ep.files_modified = vec!["/repo/src/pane/kitty.rs".into()];
         let feeds = RecapFeeds {
             settled: vec![SettledFact {
                 claim: "schema is stable".into(),
@@ -5535,6 +5539,8 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
                 verdict: "was superseded".into(),
                 receipt: "921d63f".into(),
                 date: "2026-10-30".into(),
+                file: "src/pane/kitty.rs".into(),
+                symbol: Some("send".into()),
             }),
         };
         let ctx = RecapContext {
@@ -5568,6 +5574,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         for needle in [
             "Dreamt: send in pane/kitty.rs was superseded (2026-10-30, 921d63f, not on main).",
             "(d696838, not on main)",
+            "\nLast: Fixed it (conv s).\n",
             "Now: last turn did not finish (conv s).",
             "Uncommitted: 5 files (a.rs, b.rs, c.rs, +2 more)\n",
             "ANCHORS (last session's files): 1 intact, 1 modified (recv)\n",

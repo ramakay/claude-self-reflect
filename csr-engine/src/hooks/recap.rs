@@ -36,6 +36,12 @@ pub struct DreamClause {
     pub receipt: String,
     /// `YYYY-MM-DD` the verdict was witnessed.
     pub date: String,
+    /// The anchor file the conclusion is about, as the dreamer stored it.
+    /// SessionStart shows the clause only when the previous session touched
+    /// this file, or the request names it or its symbol.
+    pub file: String,
+    /// The anchor symbol, when the conclusion is about one.
+    pub symbol: Option<String>,
 }
 
 /// A previously held line invalidated while the user was away.
@@ -234,16 +240,8 @@ fn compose_with_then(
     let base = compose_recap_inner(ep, feeds, age, None, abstain_intent_only, ctx)?;
     // The `Then:` clause is a pure addition: it is kept only when every other
     // line of the recap comes out exactly as it would without it. It follows
-    // the same length rule as the intent: a long last prompt is shortened at a
-    // clause boundary or left out, never pasted.
-    let then = then_clause(ep).and_then(|ask| {
-        if abstain_intent_only {
-            short_intent(&ask)
-        } else {
-            Some(ask)
-        }
-    });
-    if let Some(then) = then {
+    // the same length rule as the intent (`cap_words`).
+    if let Some(then) = then_clause(ep) {
         if let Some(with) =
             compose_recap_inner(ep, feeds, age, Some(&then), abstain_intent_only, ctx)
         {
@@ -273,23 +271,30 @@ fn compose_recap_inner(
     use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
     use crate::import::contamination::has_csr_text;
 
-    // SessionStart (the abstaining form) quotes a prompt only when it is short;
-    // the repo recap labels its intent "you asked" itself and keeps the whole.
+    // SessionStart (the abstaining form) quotes the whole ask, up to
+    // `INTENT_MAX_WORDS`; the repo recap labels its intent "you asked" itself.
     let intent = if abstain_intent_only {
-        recap_head_intent(ep)
+        full_intent(ep)
     } else {
         recap_intent(ep)
     };
     let completed = recap_completed(ep, ctx);
-    // SessionStart can still compose with no head words at all (a prompt too
-    // long to quote and nothing landed): the evidence lines below carry it, and
-    // the check after them abstains when they are not primary evidence.
+    // SessionStart can still compose with no head words at all (no clean
+    // intent and nothing landed): the evidence lines below carry it, and the
+    // check after them falls back to the fragment block unless a `Settled:` or
+    // a named `Now:` entry stands.
     let headless = intent.is_none() && completed.is_none();
-    // Only for a prompt the word cap dropped: a session with no clean intent at
-    // all keeps the fragment block, whose LAST line says more than a bare head.
-    if headless && !(abstain_intent_only && recap_intent(ep).is_some()) {
+    if headless && !abstain_intent_only {
         return None;
     }
+    // What the request says, for the relevance check on project-wide evidence.
+    // Read from the episode, not from `then`: the paragraph with and without its
+    // `Then:` clause must keep the same evidence lines.
+    let request_text = format!(
+        "{} {}",
+        intent.as_deref().unwrap_or(""),
+        then_clause(ep).unwrap_or_default()
+    );
 
     let mut recap = match (intent.as_deref(), completed.as_deref()) {
         // The receipts shown were all made under the anchor's own task (see
@@ -321,6 +326,12 @@ fn compose_recap_inner(
         // the evidence lines carry the paragraph. Words are never invented.
         (None, None) => format!("recap [{age}]:"),
     };
+    // The session's own last finding (SessionStart only): the fragment block's
+    // LAST line, kept so the paragraph never says less than the block it
+    // replaces. Read before `Then:` is added, so both forms carry the same line.
+    let last_line = abstain_intent_only
+        .then(|| last_clause(ep, &recap))
+        .flatten();
     if let (Some(then), false) = (then, headless) {
         recap.push_str(&format!(" {THEN_CLAUSE_PREFIX}{}", terminate_clause(then)));
     }
@@ -340,7 +351,7 @@ fn compose_recap_inner(
         .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
         .filter(|fact| !has_csr_text(&normalize_feed_text(&fact.claim)))
         .map(|fact| format_fact(fact, ctx))
-        .chain(session_settled(ep, ctx))
+        .chain(session_settled(ep, ctx, abstain_intent_only))
         .take(3)
         .collect();
 
@@ -373,18 +384,46 @@ fn compose_recap_inner(
             feeds.open_proposals
         ));
     }
-    let open_todos = ep
+    // `Next:` is the stored next step, else the first open todo.
+    let next_from_steps = ep
+        .next_steps
+        .as_deref()
+        .and_then(next_preview)
+        .filter(|next| !has_csr_text(next));
+    let todo_titles: Vec<String> = ep
         .todos
         .iter()
         .filter(|todo| todo.status != "completed")
-        .count();
-    // The count carries its receipt (the session it was read from): an
-    // unreceipted count is not evidence.
+        .filter_map(|todo| next_preview(&todo.content))
+        .collect();
+    let next = next_from_steps.or_else(|| todo_titles.first().cloned());
+    // Open todos by name, with the session they came from as the receipt. A
+    // count with no names is not said, and the todo `Next:` already names is
+    // not said twice.
     let session8: String = ep.session_id.chars().take(8).collect();
-    let todo_entry = (open_todos > 0 && !session8.is_empty()).then(|| {
+    let next_key = next.as_deref().map(word_key);
+    let named_todos: Vec<String> = todo_titles
+        .iter()
+        .filter(|title| next_key.as_deref() != Some(word_key(title).as_str()))
+        .filter(|title| !has_csr_text(title))
+        .map(|title| compact_preview(title, TODO_TITLE_MAX_CHARS))
+        .collect();
+    let todo_entry = (!named_todos.is_empty() && !session8.is_empty()).then(|| {
+        let shown = named_todos.iter().take(2).cloned().collect::<Vec<_>>();
+        let more = named_todos.len() - shown.len();
         format!(
-            "{open_todos} {} open (conv {session8})",
-            if open_todos == 1 { "todo" } else { "todos" }
+            "{}: {}{} (conv {session8})",
+            if named_todos.len() == 1 {
+                "open todo"
+            } else {
+                "open todos"
+            },
+            shown.join("; "),
+            if more > 0 {
+                format!("; +{more} more")
+            } else {
+                String::new()
+            }
         )
     });
     let priority_now_entries = usize::from(!now_parts.is_empty());
@@ -400,17 +439,6 @@ fn compose_recap_inner(
     {
         now_parts.push(format!("last turn did not finish (conv {session8})"));
     }
-    let next = ep
-        .next_steps
-        .as_deref()
-        .and_then(next_preview)
-        .filter(|next| !has_csr_text(next))
-        .or_else(|| {
-            ep.todos
-                .iter()
-                .filter(|todo| todo.status != "completed")
-                .find_map(|todo| next_preview(&todo.content))
-        });
 
     let retired_entries: Vec<String> = feeds
         .retired_while_away
@@ -428,6 +456,12 @@ fn compose_recap_inner(
         })
         .collect();
     let next_line = next.map(|next| format!("Next: {next}."));
+    let line_cost =
+        |line: &Option<String>| line.as_ref().map_or(0, |line| line.chars().count() + 1);
+    // `Last:` is reserved after `Next:`, when it fits at all.
+    let last_line = last_line.filter(|line| {
+        recap.chars().count() + line_cost(&next_line) + line.chars().count() < MAX_CHARS
+    });
     // The native-window warning: one line of its own, reserved like `Next:` when it fits at all.
     let warn_line = feeds
         .native_warn
@@ -436,9 +470,8 @@ fn compose_recap_inner(
         .filter(|line| crate::extraction::provenance::is_native_warn_line(line))
         .filter(|line| {
             recap.chars().count()
-                + next_line
-                    .as_ref()
-                    .map_or(0, |next| next.chars().count() + 1)
+                + line_cost(&next_line)
+                + line_cost(&last_line)
                 + line.chars().count()
                 < MAX_CHARS
         });
@@ -469,6 +502,9 @@ fn compose_recap_inner(
     let dream_entries: Vec<String> = feeds
         .top_dream
         .iter()
+        // SessionStart: a project-wide conclusion is shown only when it is about
+        // what this session touched or what the request names.
+        .filter(|dream| !abstain_intent_only || dream_is_relevant(ep, dream, &request_text))
         .filter(|dream| !normalize_feed_text(&dream.receipt).is_empty())
         .filter(|dream| has_substance(&normalize_feed_text(&dream.label)))
         .filter(|dream| is_qualified_dream_label(&normalize_feed_text(&dream.label)))
@@ -501,12 +537,9 @@ fn compose_recap_inner(
     // substantive Now entries precede the first Settled fact, then Corrected.
     // Lower-value extras consume only the residual budget.
     let used = recap.chars().count()
-        + next_line
-            .as_ref()
-            .map_or(0, |line| line.chars().count() + 1)
-        + warn_line
-            .as_ref()
-            .map_or(0, |line| line.chars().count() + 1);
+        + line_cost(&next_line)
+        + line_cost(&last_line)
+        + line_cost(&warn_line);
     let mut remaining = MAX_CHARS.saturating_sub(used);
     for _ in 0..priority_now_entries {
         if !clauses[NOW].add_one_within(&mut remaining) {
@@ -542,13 +575,10 @@ fn compose_recap_inner(
     {
         return None;
     }
-    // With no head words, a paragraph of only a dream, a retired note or a
-    // bare `Next:` has nothing the session did to stand on: the fragment fallback says more.
-    if headless
-        && [SETTLED, NOW, CORRECTED]
-            .iter()
-            .all(|&index| substantive(index) == 0)
-    {
+    // With no head words, only a `Settled:` fact or a named `Now:` entry makes
+    // the paragraph worth more than the fragment block and its LAST line: a
+    // correction, a dream, a retired note or a bare `Next:` alone falls back.
+    if headless && [SETTLED, NOW].iter().all(|&index| substantive(index) == 0) {
         return None;
     }
 
@@ -558,9 +588,9 @@ fn compose_recap_inner(
         .map(|line| CorrectionIdentity::from(*line))
         .collect();
 
-    for line in clauses
-        .iter()
-        .filter_map(ListClause::render)
+    for line in last_line
+        .into_iter()
+        .chain(clauses.iter().filter_map(ListClause::render))
         .chain(warn_line)
         .chain(next_line)
     {
@@ -720,87 +750,175 @@ pub(crate) fn recap_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
     extractable(&source).and_then(|text| clean_intent(&text))
 }
 
-/// Longest prompt, in words, the recap pastes as it was typed.
-pub const INTENT_MAX_WORDS: usize = 12;
+/// Most words of a typed ask the recap quotes. Longer, it is cut at a word
+/// boundary and ends in an ellipsis.
+pub const INTENT_MAX_WORDS: usize = 40;
 
-/// Fewest words a quoted intent may have: a lone "Thanks." names no task.
-const INTENT_MIN_WORDS: usize = 3;
+/// Fewest words, after fillers, a later ask needs to be named as `Then:`.
+const THEN_MIN_WORDS: usize = 4;
 
-/// The recap's head clause: the session's intent, quoted only when short.
-/// `None` makes the paragraph lead with what the session landed instead.
-pub(crate) fn recap_head_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
-    short_intent(&recap_intent(ep)?)
+/// Longest todo title the `Now:` clause names.
+const TODO_TITLE_MAX_CHARS: usize = 60;
+
+/// Longest `Last:` text: the fragment block's `LAST:` budget.
+const LAST_MAX_CHARS: usize = 120;
+
+/// Fewest words a `Last:` finding needs ("Done." is not one).
+const LAST_MIN_WORDS: usize = 2;
+
+/// The SessionStart head clause: the session's whole ask, as typed. The stored
+/// anchor is whole sentences up to [`INTENT_MAX_CHARS`]; when it is the start
+/// of the session's first prompt, the rest of that prompt's opening paragraph
+/// is quoted too. Either way [`cap_words`] applies. No word is added or
+/// respelled, and which prompt is the intent is unchanged.
+pub(crate) fn full_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
+    let intent = recap_intent(ep)?;
+    let whole = first_prompt_continuation(ep, &intent).unwrap_or(intent);
+    Some(cap_words(&whole))
 }
 
-/// Words that cannot end a clause: a cut that stops on one leaves a fragment.
-const DANGLING_WORDS: &[&str] = &[
-    "a", "an", "the", "to", "of", "for", "with", "and", "or", "but", "in", "on", "at", "by",
-    "from", "into", "that", "which", "how", "what", "where", "when", "why", "if", "so", "as", "is",
-    "are", "was", "were", "be", "we", "our", "my", "me", "i", "it", "its", "you", "your", "this",
-    "these", "those", "then", "than", "not", "also", "about", "over", "up", "out",
-];
+/// The first prompt's opening paragraph, when the stored anchor is its start
+/// and it says more. The stored prompt was cut at
+/// [`LEGACY_REQUEST_CAP_BYTES`]; a word that cut may have split is dropped and
+/// an ellipsis marks the cut.
+fn first_prompt_continuation(ep: &crate::hooks::stop::Episode, intent: &str) -> Option<String> {
+    use crate::extraction::provenance::extractable;
+    ep.recap_evidence_version?;
+    let text = extractable(&ep.request)?;
+    if crate::import::contamination::has_csr_text(&text) {
+        return None;
+    }
+    let mut paragraph = first_paragraph(&text)?;
+    let cut_inside =
+        ep.request.len() + 4 > LEGACY_REQUEST_CAP_BYTES && paragraph == sanitize_preview(&text);
+    if cut_inside {
+        let at = paragraph.rfind(char::is_whitespace)?;
+        paragraph = format!(
+            "{}\u{2026}",
+            paragraph[..at].trim_end().trim_end_matches(TRAILING_JUNK)
+        );
+    }
+    let (whole, anchor) = (word_key(&paragraph), word_key(intent));
+    (!anchor.is_empty() && whole.len() > anchor.len() && whole.starts_with(&format!("{anchor} ")))
+        .then_some(paragraph)
+}
 
-/// A typed prompt as a recap clause, never longer than [`INTENT_MAX_WORDS`]
-/// words and never a cut mid-clause. In order: the prompt as it is when it is
-/// short; its leading whole sentences that fit; its first sentence cut at the
-/// last clause boundary that leaves a whole clause; else `None`. No word is
-/// added, replaced or respelled.
-pub(crate) fn short_intent(intent: &str) -> Option<String> {
-    let intent = intent.trim();
-    let words = |text: &str| text.split_whitespace().count();
-    if words(intent) <= INTENT_MAX_WORDS {
-        return (words(intent) > 0).then(|| intent.to_string());
+/// `text` up to [`INTENT_MAX_WORDS`] words. Longer, it is cut after the last
+/// whole word that fits and ends in `…`.
+pub(crate) fn cap_words(text: &str) -> String {
+    let text = text.trim();
+    let mut words = 0;
+    let mut in_word = false;
+    for (at, character) in text.char_indices() {
+        if character.is_whitespace() {
+            if in_word && words == INTENT_MAX_WORDS {
+                return format!("{}\u{2026}", text[..at].trim_end_matches(TRAILING_JUNK));
+            }
+            in_word = false;
+        } else if !in_word {
+            in_word = true;
+            words += 1;
+        }
     }
-    let sentences = split_preview_sentences(intent);
-    let mut taken = 0;
-    for (_, end) in &sentences {
-        if words(&intent[..*end]) > INTENT_MAX_WORDS {
-            break;
-        }
-        taken = *end;
+    text.to_string()
+}
+
+/// A command whose object only points back into the conversation ("save
+/// this", "do it"): it names nothing a reader of the recap could act on.
+const DEICTIC_OBJECTS: &[&str] = &["this", "that", "it", "them", "these", "those"];
+
+/// True when `text` is a later ask worth naming: a request ([`is_request`]),
+/// not an acknowledgement, at least [`THEN_MIN_WORDS`] words after fillers,
+/// and not a command whose object is only "this" or "it".
+pub(crate) fn is_substantive_ask(text: &str) -> bool {
+    if !is_request(text) || is_acknowledgement(text) {
+        return false;
     }
-    if taken > 0 {
-        let head = intent[..taken].trim();
-        return (words(head) >= INTENT_MIN_WORDS).then(|| head.to_string());
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .skip_while(|word| REQUEST_FILLERS.contains(&word.as_str()))
+        .collect();
+    if words.len() < THEN_MIN_WORDS {
+        return false;
     }
-    // The first sentence alone is too long: keep its opening clause.
-    let (start, end) = *sentences.first()?;
-    let first = &intent[start..end];
-    let mut best: Option<String> = None;
-    for (at, _) in first.char_indices() {
-        if !CLAUSE_BOUNDARIES.iter().any(|b| first[at..].starts_with(b)) {
-            continue;
-        }
-        let clause = first[..at].trim_end_matches(|c: char| {
-            c.is_whitespace() || c.is_ascii_punctuation() || c == '\u{2013}' || c == '\u{2014}'
-        });
-        let clause_words: Vec<&str> = clause.split_whitespace().collect();
-        if clause_words.len() > INTENT_MAX_WORDS {
-            break;
-        }
-        if clause_words.iter().any(|w| is_path_or_url(w)) {
-            // Every later clause contains this path too.
-            break;
-        }
-        let last = clause_words
-            .last()
-            .map(|w| {
-                w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
-                    .to_lowercase()
-            })
-            .unwrap_or_default();
-        let balanced = clause.matches('(').count() == clause.matches(')').count()
-            && clause.matches('"').count() % 2 == 0
-            && clause.matches('`').count() % 2 == 0;
-        if clause_words.len() >= MIN_CLAUSE_WORDS
-            && has_substance(clause)
-            && !DANGLING_WORDS.contains(&last.as_str())
-            && balanced
+    !(COMMAND_OPENERS.contains(&words[0].as_str()) && DEICTIC_OBJECTS.contains(&words[1].as_str()))
+}
+
+/// `Last: <finding> (conv <sid8>)`: the closing summary's finding as the
+/// fragment block's `LAST:` line reads it (`conclusion_preview`: its verdict
+/// sentence, else its first sentence, with a distinct closing sentence when
+/// both fit), so a recap never says less than the block it replaces. `None`
+/// when there is none, it is CSR text, or `head` already says it.
+fn last_clause(ep: &crate::hooks::stop::Episode, head: &str) -> Option<String> {
+    use crate::extraction::provenance::extractable;
+    let session8: String = ep.session_id.chars().take(8).collect();
+    if session8.is_empty() {
+        return None;
+    }
+    let text = extractable(&ep.completed)?;
+    if crate::import::contamination::has_csr_text(&text) {
+        return None;
+    }
+    let finding = crate::hooks::session_start::conclusion_preview(&text, LAST_MAX_CHARS);
+    let body = finding
+        .trim_end()
+        .trim_end_matches(['.', ':', ';', ',', '-'])
+        .trim_end();
+    if !has_substance(body) || body.split_whitespace().count() < LAST_MIN_WORDS {
+        return None;
+    }
+    let (said, last) = (word_key(head), word_key(body));
+    if said.contains(&last) {
+        return None;
+    }
+    Some(format!("Last: {body} (conv {session8})."))
+}
+
+/// Whether a project-wide dream is about this session: its anchor file is one
+/// the session touched (edited, or holding an anchor it recorded), or the
+/// request names the file or the symbol. Files compare by their last two path
+/// components, so a worktree and the main checkout match.
+fn dream_is_relevant(ep: &crate::hooks::stop::Episode, dream: &DreamClause, request: &str) -> bool {
+    fn tail(path: &str, n: usize) -> Vec<&str> {
+        let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        parts[parts.len().saturating_sub(n)..].to_vec()
+    }
+    let file = dream.file.trim();
+    if !file.is_empty() {
+        let depth = tail(file, 2).len();
+        let same = |touched: &str| {
+            let touched = tail(touched.trim(), depth);
+            touched.len() == depth && touched == tail(file, depth)
+        };
+        if ep.files_modified.iter().any(|path| same(path))
+            || ep.anchors.iter().any(|anchor| same(&anchor.file))
         {
-            best = Some(clause.to_string());
+            return true;
         }
     }
-    best
+    let lower = request.to_lowercase();
+    let named = |word: &str, text: &str| {
+        text.match_indices(word).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + word.len()..].chars().next();
+            let is_word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            !is_word(before) && !is_word(after)
+        })
+    };
+    let basename = tail(file, 1).first().copied().unwrap_or("").to_lowercase();
+    if basename.chars().count() >= 4 && named(&basename, &lower) {
+        return true;
+    }
+    dream
+        .symbol
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|symbol| symbol.chars().count() >= 4 && named(symbol, request))
 }
 
 /// The short handoff `/clear` receives in place of a recap: what the cleared session was doing,
@@ -845,29 +963,37 @@ pub(crate) fn compose_clear_handoff(ep: &crate::hooks::stop::Episode, age: &str)
     Some(out)
 }
 
-/// The literal last typed message, as a `Then:` clause: whole leading
-/// sentences, only when it reads as an ask and says something the displayed
-/// intent does not. `None` means the recap names no later ask. It never looks
-/// at an older message: with no evidence of which one the session was on, the
-/// recap stays as it was.
+/// A later ask, as a `Then:` clause: the session's literal last typed message
+/// when it is a substantive ask ([`is_substantive_ask`]), else the latest task
+/// prompt Stop recorded after the anchor (`compact_anchor`) when that one is.
+/// Its opening paragraph, cut by [`cap_words`]; never one the intent already
+/// covers. `None` means the recap names no later ask: a remark, "save this",
+/// "ok" or "continue" is never named.
 pub(crate) fn then_clause(ep: &crate::hooks::stop::Episode) -> Option<String> {
     use crate::extraction::provenance::extractable;
     let intent = recap_intent(ep)?;
-    let ask = ep
-        .latest_ask
-        .as_deref()
-        .and_then(extractable)
-        .and_then(|text| clean_intent(&text))?;
-    if crate::import::contamination::has_csr_text(&ask) || !is_request(&ask) {
-        return None;
-    }
-    let ask_key = word_key(&ask);
-    let covered = |other: &str| {
-        let other = word_key(other);
-        !other.is_empty() && (other.contains(&ask_key) || ask_key.contains(&other))
-    };
+    let whole = full_intent(ep).unwrap_or_default();
     let anchor = ep.anchor_request.as_deref().unwrap_or("");
-    (!ask_key.is_empty() && !covered(&intent) && !covered(anchor)).then_some(ask)
+    let later = ep
+        .compact_anchor
+        .as_ref()
+        .map(|later| later.request.as_str());
+    [ep.latest_ask.as_deref(), later]
+        .into_iter()
+        .flatten()
+        .find_map(|typed| {
+            let ask = extractable(typed).and_then(|text| first_paragraph(&text))?;
+            if crate::import::contamination::has_csr_text(&ask) || !is_substantive_ask(&ask) {
+                return None;
+            }
+            let ask_key = word_key(&ask);
+            let covered = |other: &str| {
+                let other = word_key(other);
+                !other.is_empty() && (other.contains(&ask_key) || ask_key.contains(&other))
+            };
+            (!ask_key.is_empty() && !covered(&intent) && !covered(anchor) && !covered(&whole))
+                .then(|| cap_words(&ask))
+        })
 }
 
 /// Lowercase alphanumeric words joined by single spaces, for comparing two
@@ -1076,7 +1202,19 @@ pub(crate) fn is_request(text: &str) -> bool {
 /// merged PRs by OID, else completed tasks) that the head clause does not
 /// already carry, as `<claim> (<receipt>)`. Needs no ledger verdict: a receipt
 /// is a commit the transcript saw succeed.
-fn session_settled(ep: &crate::hooks::stop::Episode, ctx: &RecapContext) -> Vec<String> {
+fn session_settled(
+    ep: &crate::hooks::stop::Episode,
+    ctx: &RecapContext,
+    drop_predating: bool,
+) -> Vec<String> {
+    // Receipts sit in transcript order and the anchor's own form one run: one
+    // listed before the anchor's first receipt was made under an earlier
+    // prompt, before the anchor request was typed, and answers something else.
+    let first_own = ep
+        .anchor_receipts
+        .as_ref()
+        .and_then(|own| own.iter().min().copied())
+        .filter(|_| drop_predating);
     let shown: Vec<String> = {
         let own = anchor_completions(ep);
         displayed_receipts(&own)
@@ -1091,6 +1229,7 @@ fn session_settled(ep: &crate::hooks::stop::Episode, ctx: &RecapContext) -> Vec<
                 .get(*index)
                 .is_some_and(|done| !shown.contains(&done.receipt))
         })
+        .filter(|(index, _)| first_own.is_none_or(|first| *index >= first))
         .map(|(_, entry)| ctx.mark_entry(entry))
         .collect()
 }
@@ -2129,7 +2268,7 @@ mod tests {
             got,
             "recap [28m ago]: Fix the recap composer. Latest: Implemented deterministic recap output (abc1234). [[CSR:RECAP]]\n\
              Settled: schema is stable (810283b); queries are indexed (T2 2026-07-27).\n\
-             Now: waiting for storage migration | Windows path behavior (91abcde) | 2 proposals awaiting csr_resolve | 1 todo open (conv session-).\n\
+             Now: waiting for storage migration | Windows path behavior (91abcde) | 2 proposals awaiting csr_resolve | open todo: wire session start (conv session-).\n\
              Learnt-then-retired while away: old schema assumption (superseded 2026-08-06, 77fedca).\n\
              Next: Run the integration suite."
         );
@@ -2755,6 +2894,8 @@ mod tests {
             verdict: "went stale".into(),
             receipt: "abc1234".into(),
             date: "2026-08-11".into(),
+            file: "src/config.rs".into(),
+            symbol: Some("parse_config".into()),
         }
     }
 
@@ -3533,80 +3674,126 @@ mod tests {
 
     const FIELD_PROMPT: &str = "Review previous sesison - create a simple unwall for me where we are and how we get to 10.1.";
 
-    #[test]
-    fn short_intent_keeps_a_short_prompt_as_typed_and_never_pastes_a_long_one() {
-        // Twelve words or fewer: kept as typed, typos and all.
-        assert_eq!(
-            short_intent("Fix the recap composr bug").as_deref(),
-            Some("Fix the recap composr bug")
-        );
-        // The field prompt: 18 words, its only boundary leaves 3 words.
-        assert_eq!(short_intent(FIELD_PROMPT), None);
-        // Whole leading sentences that fit.
-        assert_eq!(
-            short_intent(
-                "Fix the bug. Then deploy the release to staging and verify the dashboards afterwards please."
-            )
-            .as_deref(),
-            Some("Fix the bug.")
-        );
-        // One long sentence: cut at the last clause boundary that leaves a whole clause.
-        assert_eq!(
-            short_intent(
-                "Wire the session start hook into the recap composer, then run the whole integration suite twice before merging"
-            )
-            .as_deref(),
-            Some("Wire the session start hook into the recap composer")
-        );
-        // A cut that would end on a dangling word is not taken.
-        assert_eq!(
-            short_intent(
-                "Refactor the parser and the lexer together with, then verify all the downstream callers again today"
-            ),
-            None
-        );
-        // A cut never keeps a path.
-        assert_eq!(
-            short_intent(
-                "Look at src/hooks/recap.rs, which builds the paragraph and cuts every prompt it quotes badly"
-            ),
-            None
-        );
-        // Nothing is added: the cut is a prefix of the prompt.
-        let long =
-            "Make the recap shorter, because the rater found the pasted prompt hard to read at all";
-        let cut = short_intent(long).expect("a clause");
-        assert!(long.starts_with(&cut), "{cut}");
-        assert!(cut.split_whitespace().count() <= INTENT_MAX_WORDS);
+    fn session_start(ep: &Episode, feeds: &RecapFeeds) -> Option<String> {
+        compose_recap_with_deliveries(ep, feeds, "3d ago").map(|composed| composed.text)
     }
 
+    // (a) The head quotes the whole ask.
     #[test]
-    fn recap_leads_with_latest_when_the_prompt_is_too_long_to_quote() {
+    fn the_head_quotes_a_multi_part_ask_in_full() {
+        // Replay case 5: the 12-word cap kept only "please pull the latest 24h data".
+        let ask = "please pull the latest 24h data - then ask the anukriti campagin about our latest chakho reel for mirabhai then check this boost proposal for mamta";
         let mut ep = episode();
-        ep.anchor_request = Some(FIELD_PROMPT.into());
-        let got = compose_recap_with_deliveries(&ep, &RecapFeeds::empty(), "9m ago")
-            .expect("composes")
-            .text;
+        ep.anchor_request = Some(ask.into());
+        let got = session_start(&ep, &RecapFeeds::empty()).expect("composes");
         assert!(
-            got.starts_with(
-                "recap [9m ago]: Latest: Implemented deterministic recap output (abc1234)."
-            ),
+            got.starts_with(&format!("recap [3d ago]: {ask}. Latest: ")),
             "{got}"
         );
-        assert!(!got.contains("sesison"), "{got}");
-        // No intent and nothing landed: the paragraph abstains.
-        let mut bare = bare_episode();
-        bare.anchor_request = Some(FIELD_PROMPT.into());
-        assert!(compose_recap_with_deliveries(&bare, &RecapFeeds::empty(), "9m ago").is_none());
+        // Replay case 17: the cut lost "and suggest how you plan to execute it".
+        ep.anchor_request = Some(
+            "Please check studio connectivity and then review .plans/10.1-core-rewrite - and suggest how you plan to execute it".into(),
+        );
+        let got = session_start(&ep, &RecapFeeds::empty()).unwrap();
+        assert!(
+            got.contains("and suggest how you plan to execute it."),
+            "{got}"
+        );
+        ep.anchor_request = Some(FIELD_PROMPT.into());
+        let got = session_start(&ep, &RecapFeeds::empty()).unwrap();
+        assert!(
+            got.starts_with(&format!("recap [3d ago]: {FIELD_PROMPT}")),
+            "{got}"
+        );
     }
 
     #[test]
-    fn a_too_long_prompt_with_settled_evidence_keeps_the_recap_without_a_head() {
-        // Replay of a real session: a 14-word prompt with no clause boundary and
-        // user-confirmed evidence. Dropping the whole recap lost that evidence.
-        let mut bare = bare_episode();
-        bare.anchor_request =
-            Some("a peer is coming in with a new track that goes to devi shakti".into());
+    fn an_ask_over_forty_words_is_cut_at_a_word_with_an_ellipsis() {
+        let words: Vec<String> = (1..=45).map(|n| format!("word{n}")).collect();
+        let long = words.join(" ");
+        let cut = cap_words(&long);
+        assert_eq!(cut, format!("{}\u{2026}", words[..40].join(" ")));
+        assert_eq!(cap_words(&words[..40].join(" ")), words[..40].join(" "));
+        assert_eq!(cap_words("short ask, kept"), "short ask, kept");
+        // The stored anchor is the opening clause of a longer first prompt: the
+        // head quotes the prompt, and marks the 200-byte cut with an ellipsis.
+        let mut ep = bare_episode();
+        ep.anchor_request = Some(
+            "review 57552011 - previous session, the quality is still off - deploy a blind worker"
+                .into(),
+        );
+        ep.request = "review 57552011 - previous session, the quality is still off - deploy a blind worker - explain the environment and the desire and let it propose something completely blind on how the ranking should work, then compare it with ou".into();
+        assert!(ep.request.len() > 196);
+        assert_eq!(
+            full_intent(&ep).as_deref(),
+            Some("review 57552011 - previous session, the quality is still off - deploy a blind worker - explain the environment and the desire and let it propose something completely blind on how the ranking should work, then compare it with\u{2026}")
+        );
+        ep.next_steps = Some("Rank the blind set".into());
+        let got = session_start(&ep, &RecapFeeds::empty()).expect("composes");
+        assert!(
+            got.starts_with("recap [3d ago]: review 57552011 - previous session, the quality is still off - deploy a blind worker - explain the environment and the desire and let it propose something completely blind on how the ranking should work, then compare it with\u{2026} [[CSR:RECAP]]"),
+            "{got}"
+        );
+        // A first prompt that is not the anchor's start is never quoted.
+        ep.request = "something else entirely that the session opened with".into();
+        assert_eq!(
+            full_intent(&ep).as_deref(),
+            Some("review 57552011 - previous session, the quality is still off - deploy a blind worker")
+        );
+    }
+
+    #[test]
+    fn then_names_a_later_substantive_ask_and_never_a_remark() {
+        let mut ep = episode();
+        let then = |ep: &Episode| {
+            session_start(ep, &RecapFeeds::empty())
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        for remark in [
+            "save this",
+            "ok",
+            "continue",
+            "please make this memory from the draft above",
+            "status?",
+        ] {
+            ep.latest_ask = Some(remark.into());
+            assert!(!then(&ep).contains("Then:"), "{remark}: {}", then(&ep));
+        }
+        // The last message is a remark: the latest task prompt after the anchor is named.
+        ep.latest_ask = Some("i am off TB now on wifi".into());
+        ep.compact_anchor = Some(crate::hooks::stop::CompactAnchor {
+            request:
+                "please fix the homepage bow bug, first check how headless browsers see the preview"
+                    .into(),
+            completions_untied: true,
+            receipts: Some(vec![]),
+        });
+        assert!(
+            then(&ep).contains(
+                "Then: please fix the homepage bow bug, first check how headless browsers see the preview."
+            ),
+            "{}",
+            then(&ep)
+        );
+        // A long later ask follows the same cap as the intent.
+        let words: Vec<String> = (1..=45).map(|n| format!("w{n}")).collect();
+        ep.latest_ask = Some(format!("Why did the importer drop {}?", words.join(" ")));
+        let got = then(&ep);
+        assert!(got.contains("Then: Why did the importer drop w1"), "{got}");
+        assert!(got.contains("w35\u{2026}"), "{got}");
+        assert!(!got.contains("w36"), "{got}");
+    }
+
+    // (c) The LAST finding is never lost.
+    #[test]
+    fn a_head_keeps_the_last_finding_and_a_bare_head_needs_named_evidence() {
+        let mut ep = bare_episode();
+        // Replay case 1: the finding sits in the bold verdict, not the first sentence.
+        ep.completed = "Deployed and verified. All 37 articles still ship in the server HTML and the cap is paint-only, so the crawl is intact. **The bug was the opposite of what it looked like.** The mobile grid is 6 columns.".into();
         let mut feeds = RecapFeeds::empty();
         feeds.settled = vec![SettledFact {
             claim: "schema is stable".into(),
@@ -3614,62 +3801,169 @@ mod tests {
             status: "resolved".into(),
             source: "user_confirmed".into(),
         }];
-        let got = compose_recap_with_deliveries(&bare, &feeds, "3d ago")
-            .expect("the evidence stands without a head")
-            .text;
+        let got = session_start(&ep, &feeds).expect("composes");
+        assert_eq!(
+            lines_of(&got)[1],
+            "Last: The bug was the opposite of what it looked like. \u{2026} The mobile grid is 6 columns (conv session-).",
+            "{got}"
+        );
+        // The same finding the fragment block's LAST line carries.
+        let fragment = crate::hooks::session_start::format_tier0_block_with_recap(
+            &ep,
+            &[],
+            "3d ago",
+            None,
+            crate::provenance::TrustTier::Unknown,
+        );
+        let last = fragment
+            .lines()
+            .find_map(|line| line.strip_prefix("LAST: "))
+            .and_then(|line| line.rsplit_once(" ("))
+            .map(|(finding, _)| finding.trim_end_matches('.').to_string())
+            .expect("a LAST line");
         assert!(
-            got.starts_with("recap [3d ago]: [[CSR:RECAP]]\nSettled: schema is stable (810283b)."),
+            lines_of(&got)[1].starts_with(&format!("Last: {last} (conv")),
+            "{last}\n{got}"
+        );
+        // The repo recap keeps its own grammar.
+        assert!(!compose_recap(&ep, &feeds, "now").unwrap().contains("Last:"));
+        // No intent: a correction alone does not make a bare head, the fragment block runs.
+        ep.anchor_request = None;
+        let mut correction_only = RecapFeeds::empty();
+        correction_only.corrections = vec![CorrectionLine {
+            quote: "no, keep the old path".into(),
+            session8: "abcd1234".into(),
+            turn: 3,
+            date: "2026-10-30".into(),
+        }];
+        assert!(session_start(&ep, &correction_only).is_none());
+        // A named todo stands: the bare head carries the finding too.
+        ep.todos = vec![
+            TodoItem {
+                content: "Decide scene nav label casing".into(),
+                status: "pending".into(),
+            },
+            TodoItem {
+                content: "Fix the bento grid on mobile".into(),
+                status: "pending".into(),
+            },
+        ];
+        let got = session_start(&ep, &correction_only).expect("composes");
+        assert!(
+            got.starts_with("recap [3d ago]: [[CSR:RECAP]]\nLast: The bug was"),
             "{got}"
         );
         assert!(
-            !got.contains("peer"),
-            "the long prompt is not pasted: {got}"
+            got.contains("Now: open todo: Fix the bento grid on mobile (conv session-)."),
+            "{got}"
+        );
+        assert!(
+            got.ends_with("Next: Decide scene nav label casing."),
+            "{got}"
         );
         assert!(
             crate::extraction::provenance::is_csr_emission(&got),
             "{got}"
         );
+    }
+
+    // (b) Now names todos.
+    #[test]
+    fn now_names_open_todos_by_title_and_never_a_bare_count() {
+        let mut ep = episode();
+        ep.blockers = None;
+        ep.todos = vec![
+            TodoItem {
+                content: "wire it".into(),
+                status: "in_progress".into(),
+            },
+            TodoItem {
+                content: "test it".into(),
+                status: "pending".into(),
+            },
+            TodoItem {
+                content: "ship it".into(),
+                status: "pending".into(),
+            },
+        ];
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
         assert!(
-            crate::import::contamination::strip_hits(&got)
-                .trim()
-                .is_empty(),
-            "the scrubber removes the whole head-less block: {got}"
+            got.contains("Now: open todos: wire it; test it; +1 more (conv session-)."),
+            "{got}"
         );
-        // No prompt at all (nothing was dropped): the fragment block runs.
-        let mut none = bare_episode();
-        none.anchor_request = None;
-        assert!(compose_recap_with_deliveries(&none, &feeds, "3d ago").is_none());
-        // A dream alone is not what the session did: the fallback runs instead.
-        let mut dream_only = RecapFeeds::empty();
-        dream_only.top_dream = Some(dream());
-        assert!(compose_recap_with_deliveries(&bare, &dream_only, "3d ago").is_none());
+        assert!(!got.contains("todos open"), "{got}");
+        // `Next:` names the first open todo; `Now:` does not repeat it.
+        ep.next_steps = None;
+        ep.todos.pop();
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert!(
+            got.contains("Now: open todo: test it (conv session-)."),
+            "{got}"
+        );
+        assert!(got.ends_with("Next: wire it."), "{got}");
+        // A stored next step that is an open todo is not said twice either.
+        ep.next_steps = Some("Wire it".into());
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert!(
+            got.contains("Now: open todo: test it (conv session-)."),
+            "{got}"
+        );
+        assert!(got.ends_with("Next: Wire it."), "{got}");
+        // Todos with no nameable title: no `Now:` entry at all.
+        ep.todos = vec![TodoItem {
+            content: "...".into(),
+            status: "pending".into(),
+        }];
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert!(!got.contains("Now:"), "{got}");
+    }
+
+    // (d) Project-wide evidence must be about the request.
+    #[test]
+    fn a_dream_is_shown_only_when_it_is_about_the_session() {
+        let mut ep = episode();
+        let mut feeds = RecapFeeds::empty();
+        feeds.top_dream = Some(dream());
+        let got = session_start(&ep, &feeds).unwrap();
+        assert!(!got.contains("Dreamt:"), "unrelated dream: {got}");
+        // The session edited the anchor file (another checkout of it).
+        ep.files_modified = vec!["/Users/x/worktree/src/config.rs".into()];
+        let got = session_start(&ep, &feeds).unwrap();
+        assert!(
+            got.contains("Dreamt: parse_config in src/config.rs went stale"),
+            "{got}"
+        );
+        // A file with the same name elsewhere is not the anchor file.
+        ep.files_modified = vec!["/Users/x/repo/other/config.rs".into()];
+        assert!(!session_start(&ep, &feeds).unwrap().contains("Dreamt:"));
+        // The request names the symbol.
+        ep.files_modified.clear();
+        ep.anchor_request = Some("Why does parse_config drop the env override".into());
+        let got = session_start(&ep, &feeds).unwrap();
+        assert!(got.contains("Dreamt: parse_config"), "{got}");
+        // The repo recap is unchanged.
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        assert!(got.contains("Dreamt:"), "{got}");
     }
 
     #[test]
-    fn then_clause_follows_the_same_word_cap() {
+    fn a_session_receipt_made_before_the_anchor_request_is_not_settled() {
         let mut ep = episode();
-        let long = "Why did the importer drop every chunk that the scrubber had already marked as hook text last week?";
-        let session_start = |ep: &Episode| {
-            compose_recap_with_deliveries(ep, &RecapFeeds::empty(), "now")
-                .unwrap()
-                .text
-        };
-        ep.latest_ask = Some(long.into());
-        let got = session_start(&ep);
-        assert!(!got.contains("Then:"), "a 19-word ask is not pasted: {got}");
-        ep.latest_ask = Some("Why did the importer drop every chunk?".into());
-        let got = session_start(&ep);
+        ep.completions = vec![
+            receipt("chore: bump the lockfile", "1111111"),
+            receipt("Implemented deterministic recap output", "abc1234"),
+        ];
+        ep.anchor_receipts = Some(vec![1]);
+        let got = session_start(&ep, &RecapFeeds::empty()).unwrap();
         assert!(
-            got.contains("Then: Why did the importer drop every chunk?"),
-            "{got}"
+            !got.contains("1111111"),
+            "made under an earlier prompt: {got}"
         );
-        // The repo recap labels its intent itself and keeps the whole ask.
-        ep.latest_ask = Some(long.into());
-        let repo = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
-        assert!(
-            repo.contains("Then: Why did the importer drop every chunk that"),
-            "{repo}"
-        );
+        assert!(got.contains("(abc1234)"), "{got}");
+        // The repo recap keeps every session receipt.
+        assert!(compose_recap(&ep, &RecapFeeds::empty(), "now")
+            .unwrap()
+            .contains("1111111"));
     }
 
     fn off_branch(label: &str, receipts: &[&str]) -> RecapContext {
@@ -3683,6 +3977,8 @@ mod tests {
     #[test]
     fn off_branch_receipts_are_marked_with_the_head_branch_name() {
         let mut ep = episode();
+        // The dream's anchor file is one the session edited.
+        ep.files_modified = vec!["src/config.rs".into()];
         ep.completions.push(receipt("Second change", "def5678"));
         ep.anchor_receipts = Some(vec![0, 1]);
         let mut feeds = RecapFeeds::empty();
@@ -3739,24 +4035,6 @@ mod tests {
             vec!["abc1234".to_string()],
             "one entry per distinct commit, no task receipts"
         );
-    }
-
-    #[test]
-    fn now_names_open_todos_with_the_session_they_came_from() {
-        let mut ep = episode();
-        ep.blockers = None;
-        ep.todos = vec![
-            TodoItem {
-                content: "wire it".into(),
-                status: "in_progress".into(),
-            },
-            TodoItem {
-                content: "test it".into(),
-                status: "pending".into(),
-            },
-        ];
-        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
-        assert!(got.contains("Now: 2 todos open (conv session-)."), "{got}");
     }
 
     #[test]

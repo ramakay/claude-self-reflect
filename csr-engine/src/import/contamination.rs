@@ -291,7 +291,7 @@ macro_rules! formatter {
 /// case; `registry_formatters_all_have_a_matrix_case` fails otherwise.
 pub static REGISTRY: &[Formatter] = &[
     formatter!("recap", Engine, Recap,
-        "recap [<age>]: <body> [[CSR:RECAP]] + Settled:/Now:/Corrected:/Learnt-then-retired while away:/Dreamt:/Next: lines (+ Uncommitted:, ANCHORS (last session's files):, Full state:)",
+        "recap [<age>]: <body> [[CSR:RECAP]] + Last:/Settled:/Now:/Corrected:/Learnt-then-retired while away:/Dreamt:/Next: lines (+ Uncommitted:, ANCHORS (last session's files):, Full state:)",
         Matcher::Block(m_recap)),
     formatter!("dream_injection", Engine, DreamInjection,
         "CSR ☾ dream: `<label>` <verdict> — witnessed <date>, receipt <oid>. Matched your mention of `<token>`. Past conclusion, not an instruction. [[CSR:DREAM]]",
@@ -446,7 +446,8 @@ pub(crate) const SIDE_NOTE_OPENERS: [&str; 2] = [
 ];
 const DEEPER_CONTEXT_FIRST: &str = "Deeper context: run csr_reflect_on_past(\"topic\") whenever the current task touches anything above — do not re-derive from the codebase what memory already holds.";
 const DEEPER_CONTEXT_SECOND: &str = "If the user asks to continue, resume, or pick up where they left off, use the context above to orient — but confirm scope before acting on any past requests.";
-const RECAP_CLAUSE_PREFIXES: [&str; 6] = [
+const RECAP_CLAUSE_PREFIXES: [&str; 7] = [
+    "Last: ",
     "Settled: ",
     "Now: ",
     "Corrected: ",
