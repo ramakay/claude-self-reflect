@@ -218,21 +218,54 @@ static GIT_COMMIT_LINE_RE: LazyLock<Regex> =
 /// Split a shell command into simple commands, each a list of words.
 /// Quote-aware (single and double quotes group words and are removed);
 /// unquoted `;`, `&`, `|`, `(`, `)` and newlines end a simple command.
+/// Backslash escapes follow POSIX: outside quotes `\x` is a literal `x` (and
+/// `\<newline>` joins lines); inside double quotes a backslash escapes only
+/// `$`, `` ` ``, `"`, `\` and newline; inside single quotes it is literal.
 fn shell_simple_commands(command: &str) -> Vec<Vec<String>> {
+    split_shell(command).0
+}
+
+/// [`shell_simple_commands`] plus whether the parse is certain: `false` when a
+/// quote is left open or the text ends on a lone backslash. Callers that must
+/// not guess (a receipt is a claim) refuse an uncertain parse.
+fn split_shell(command: &str) -> (Vec<Vec<String>>, bool) {
     let mut commands = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
     let mut quote: Option<char> = None;
-    for c in command.chars() {
+    let mut certain = true;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
         match quote {
-            Some(q) if c == q => quote = None,
+            Some('\'') if c == '\'' => quote = None,
+            Some('"') if c == '"' => quote = None,
+            Some('"') if c == '\\' => match chars.next() {
+                Some(next @ ('$' | '`' | '"' | '\\')) => word.push(next),
+                Some('\n') => {}
+                Some(next) => {
+                    word.push('\\');
+                    word.push(next);
+                }
+                None => {
+                    word.push('\\');
+                    certain = false;
+                }
+            },
             Some(_) => word.push(c),
             None => match c {
                 '\'' | '"' => {
                     quote = Some(c);
                     in_word = true;
                 }
+                '\\' => match chars.next() {
+                    Some('\n') => {}
+                    Some(next) => {
+                        word.push(next);
+                        in_word = true;
+                    }
+                    None => certain = false,
+                },
                 ';' | '&' | '|' | '(' | ')' | '\n' => {
                     if in_word {
                         words.push(std::mem::take(&mut word));
@@ -255,25 +288,31 @@ fn shell_simple_commands(command: &str) -> Vec<Vec<String>> {
             },
         }
     }
+    if quote.is_some() {
+        certain = false;
+    }
     if in_word {
         words.push(word);
     }
     if !words.is_empty() {
         commands.push(words);
     }
-    commands
+    (commands, certain)
 }
 
 /// The command `ssh [options] host command...` runs on the other machine,
-/// joined back into one string; `None` when the words are not an ssh call that
-/// names a remote command. Only `ssh` itself is read: `bash -c`, `sh -c` and
-/// the like stay unread, so a miss costs a receipt and a false hit costs none.
+/// joined back into one string (ssh joins its words with spaces and the remote
+/// shell parses the result, so this is what runs there). `None` when the words
+/// are not an ssh call that names a remote command, and also whenever the
+/// options are not plainly understood: a missed receipt costs little, a false
+/// one is worse. Only `ssh` itself is read; `bash -c`, `sh -c` and the like
+/// stay unread.
 fn ssh_remote_command(words: &[String]) -> Option<String> {
-    // Options that take a value (`ssh -p 22 host`): the value is not the host.
-    const VALUE_OPTIONS: &[&str] = &[
-        "-p", "-i", "-l", "-o", "-F", "-J", "-b", "-c", "-D", "-E", "-e", "-I", "-L", "-m", "-O",
-        "-Q", "-R", "-S", "-W", "-w",
-    ];
+    // Short options that take no value, and those that do (`-p 22`, `-p22`).
+    // Options group getopt-style: in `-tp 22` the `p` takes the next word, in
+    // `-oFoo=bar` it takes the rest of the word.
+    const FLAGS: &str = "46AaCfGgKkMNnqsTtVvXxYy";
+    const VALUE_OPTIONS: &str = "BbcDEeFIiJLlmOopQRSWw";
     // Leading `VAR=value` assignments are part of the simple command.
     let mut rest = words
         .iter()
@@ -283,15 +322,41 @@ fn ssh_remote_command(words: &[String]) -> Option<String> {
         return None;
     }
     while let Some(word) = rest.next() {
-        if VALUE_OPTIONS.contains(&word.as_str()) {
-            rest.next();
-        } else if !word.starts_with('-') {
-            // `word` is the host; whatever follows is the remote command.
-            let remote = rest.cloned().collect::<Vec<_>>().join(" ");
-            return (!remote.trim().is_empty()).then_some(remote);
+        if word == "--" {
+            let _host = rest.next()?;
+            break;
+        }
+        let Some(group) = word.strip_prefix('-') else {
+            break; // `word` is the host
+        };
+        if group.is_empty() {
+            return None;
+        }
+        for (at, letter) in group.char_indices() {
+            if FLAGS.contains(letter) {
+                continue;
+            }
+            if !VALUE_OPTIONS.contains(letter) {
+                return None;
+            }
+            if group[at + letter.len_utf8()..].is_empty() {
+                rest.next()?; // the value is the next word
+            }
+            break; // otherwise the rest of this word is the value
         }
     }
-    None
+    // Whatever follows the host is the remote command. ssh reads options after
+    // the host too, which this does not: a word that looks like one is unsure.
+    let remote: Vec<&String> = rest.collect();
+    if remote.first().is_none_or(|first| first.starts_with('-')) {
+        return None;
+    }
+    let remote = remote
+        .iter()
+        .map(|word| word.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!remote.trim().is_empty()).then_some(remote)
 }
 
 /// Whether a Bash command runs a git subcommand that can print a commit
@@ -300,12 +365,15 @@ fn ssh_remote_command(words: &[String]) -> Option<String> {
 /// must be commit, cherry-pick, revert or merge. `git log --grep=commit`
 /// does not qualify.
 fn is_git_committing_command(command: &str) -> bool {
-    shell_simple_commands(command).iter().any(|words| {
+    let (commands, certain) = split_shell(command);
+    commands.iter().any(|words| {
         // `ssh host 'cd repo && git commit ...'` commits on the other machine and
         // prints git's success line back; the quoted command is one word to the
-        // splitter, so read it as a command of its own.
+        // splitter, so read it as a command of its own. Only from a parse that
+        // is certain at both levels: the output of a listing that follows the
+        // text would otherwise read as a new commit.
         if let Some(remote) = ssh_remote_command(words) {
-            return is_git_committing_command(&remote);
+            return certain && split_shell(&remote).1 && is_git_committing_command(&remote);
         }
         // Leading `VAR=value` assignments are part of the simple command.
         let mut rest = words
@@ -5554,6 +5622,56 @@ mod tests {
         assert!(commit_receipts_for("scp m studio:git commit").is_empty());
         // `bash -c` and friends stay unread.
         assert!(commit_receipts_for("bash -c 'git commit -m y'").is_empty());
+    }
+
+    #[test]
+    fn an_escaped_quote_in_a_remote_command_is_not_a_commit_receipt() {
+        // The remote shell prints text, then lists an existing commit: the
+        // bracketed line is a log's, and `git commit` sits inside a quoted word.
+        assert!(commit_receipts_for(
+            r#"ssh host 'printf "%s\n" "x\"; git commit -m x"; git log -1 --format="[main %h] %s"'"#
+        )
+        .is_empty());
+        // Escapes at the outer level: an escaped `;` or quote joins its word.
+        assert!(commit_receipts_for(r"echo x\; git commit -m y").is_empty());
+        assert!(commit_receipts_for(r#"echo "a\"; git commit -m y""#).is_empty());
+        assert!(commit_receipts_for(r#"ssh host "echo \"; git commit -m y""#).is_empty());
+        // Single quotes take a backslash literally, so the quote after it closes.
+        let one = vec![CompletionReceipt {
+            claim: "fix(recap): subject".into(),
+            receipt: "1a2b3c4".into(),
+        }];
+        assert_eq!(commit_receipts_for(r"echo 'a\'; git commit -m y"), one);
+        // An open quote or a lone trailing backslash is an uncertain parse over ssh.
+        assert!(commit_receipts_for("ssh host 'git commit -m \"x'").is_empty());
+        assert!(commit_receipts_for("ssh host 'git commit -m x \\'").is_empty());
+    }
+
+    #[test]
+    fn ssh_options_group_the_getopt_way() {
+        let one = vec![CompletionReceipt {
+            claim: "fix(recap): subject".into(),
+            receipt: "1a2b3c4".into(),
+        }];
+        for command in [
+            "ssh -tp 22 host 'git commit -m x'",
+            "ssh -p22 host 'git commit -m x'",
+            "ssh -oFoo=bar host 'git commit -m x'",
+            "ssh -tt -o BatchMode=yes -i ~/.ssh/k -l me host 'git commit -m x'",
+            "ssh -p 22 -- host 'git commit -m x'",
+            r#"ssh host "git commit -m \"a b\"""#,
+        ] {
+            assert_eq!(commit_receipts_for(command), one, "{command}");
+        }
+        // Not plainly understood: no receipt.
+        for command in [
+            "ssh -Z host 'git commit -m x'",
+            "ssh -p host",
+            "ssh host -t 'git commit -m x'",
+            "ssh - host 'git commit -m x'",
+        ] {
+            assert!(commit_receipts_for(command).is_empty(), "{command}");
+        }
     }
 
     fn bash_receipts(command: &str, output: &str, failed: bool) -> Vec<CompletionReceipt> {
