@@ -73,8 +73,8 @@ const WAIT_KILL_SWITCH_RECHECK_SECS: u64 = 1;
 
 /// `meta` key: RFC3339 timestamp of the daemon's last COMPLETED dream cycle.
 pub const META_LAST_RUN_AT: &str = "dream_daemon_last_run_at";
-/// `meta` key: which trigger started the last completed cycle — `"idle"` or
-/// `"nightly_floor"` (see [`Trigger`]). Written only on completion, so it
+/// `meta` key: which trigger started the last completed cycle — `"idle"`,
+/// `"nightly_floor"` or `"overdue"` (see [`Trigger`]). Written only on completion, so it
 /// always describes a pass that actually happened.
 pub const META_LAST_TRIGGER: &str = "dream_daemon_last_trigger";
 /// `meta` key: JSON `{cap, used, queued}` from the last completed cycle's
@@ -171,6 +171,12 @@ pub fn interval_secs() -> u64 {
 // `csr-engine status` (`cadence.floor_deferred_active_session`) — the honest
 // statement is "owed, waiting for quiet", never a pass forced into a working
 // session.
+//
+// The wait is bounded twice. The floor grace ([`DEFAULT_FLOOR_GRACE_HOURS`])
+// ends it at most 6 hours after the floor boundary, once a day. The overdue
+// override ([`is_overdue`]) ends it when the pass is a full cadence interval
+// past due, or has never run, so a machine that is never quiet still dreams
+// on roughly its own cadence rather than once a day.
 
 /// Default idleness required before an idle-triggered pass: 30 minutes.
 pub const DEFAULT_IDLE_MINS: u64 = 30;
@@ -197,6 +203,9 @@ pub enum Trigger {
     Idle,
     /// No pass has completed since the most recent nightly floor boundary.
     NightlyFloor,
+    /// Nothing else could start the pass and it is overdue by at least one
+    /// full cadence interval (or has never run): see [`is_overdue`].
+    Overdue,
 }
 
 impl Trigger {
@@ -204,6 +213,7 @@ impl Trigger {
         match self {
             Trigger::Idle => "idle",
             Trigger::NightlyFloor => "nightly_floor",
+            Trigger::Overdue => "overdue",
         }
     }
 }
@@ -332,6 +342,26 @@ pub fn floor_grace_expired(
     waited >= Duration::seconds(i64::try_from(grace_secs).unwrap_or(i64::MAX))
 }
 
+/// Is the pass overdue by at least one full cadence interval? The pass is due
+/// at `last_run + interval_secs` (see [`next_due`]); it is overdue one more
+/// interval after that, so `now - last_run >= 2 * interval_secs`. The
+/// threshold is derived from the cadence, so `CSR_DREAM_INTERVAL_SECS` moves
+/// it too. A machine that has never completed a pass (`last_run = None`) is
+/// overdue by definition.
+///
+/// Overdue passes ignore the quiet window: a machine that is never idle for
+/// [`DEFAULT_IDLE_MINS`] would otherwise dream only when the nightly floor
+/// grace expires.
+pub fn is_overdue(last_run: Option<DateTime<Utc>>, now: DateTime<Utc>, interval_secs: u64) -> bool {
+    match last_run {
+        Some(t) => i64::try_from(interval_secs.saturating_mul(2))
+            .ok()
+            .and_then(Duration::try_seconds)
+            .is_some_and(|threshold| now.signed_duration_since(t) >= threshold),
+        None => true,
+    }
+}
+
 /// Config for [`choose_trigger`], resolved once per decision.
 #[derive(Debug, Clone, Copy)]
 pub struct CadenceConfig {
@@ -392,6 +422,10 @@ impl CadenceDecision {
 ///   actually completes, so nothing is lost — only postponed to quiet. The
 ///   postponement is bounded: once the pass has been owed for
 ///   `floor_grace_secs` it runs even without a quiet window.
+/// * **Overdue** ([`is_overdue`]) is the second bound: a pass that is a full
+///   cadence interval past due, or has never run, starts without a quiet
+///   window. It is checked last, so an idle machine keeps the `Idle` or
+///   `NightlyFloor` label and only a busy one reports `Overdue`.
 ///
 /// `now_local` is the same instant as `now` expressed in local time; it is
 /// passed in rather than computed so the decision is deterministic under
@@ -405,11 +439,14 @@ pub fn choose_trigger(
     config: CadenceConfig,
 ) -> CadenceDecision {
     let idle = is_idle(last_activity, now, config.idle_secs);
+    let overdue = is_overdue(last_run, now, config.interval_secs);
     if floor_due(last_run_local, now_local, config.floor_hour) {
         let grace_expired =
             floor_grace_expired(now_local, config.floor_hour, config.floor_grace_secs);
         return if idle || grace_expired {
             CadenceDecision::Run(Trigger::NightlyFloor)
+        } else if overdue {
+            CadenceDecision::Run(Trigger::Overdue)
         } else {
             CadenceDecision::FloorOwedDeferred
         };
@@ -417,11 +454,18 @@ pub fn choose_trigger(
     if is_due(last_run, now, config.interval_secs) && idle {
         return CadenceDecision::Run(Trigger::Idle);
     }
+    if overdue {
+        return CadenceDecision::Run(Trigger::Overdue);
+    }
     CadenceDecision::Wait
 }
 
-/// [`choose_trigger`] against live storage and the system clock.
+/// [`choose_trigger`] against live storage and the system clock. The
+/// `CSR_NO_DREAMING` kill switch wins over every trigger, overdue included.
 pub fn current_trigger(storage: &Storage, config: CadenceConfig) -> CadenceDecision {
+    if dreaming_disabled() {
+        return CadenceDecision::Wait;
+    }
     let now = Utc::now();
     let last_run = read_last_run(storage);
     choose_trigger(
@@ -440,6 +484,7 @@ pub fn current_trigger(storage: &Storage, config: CadenceConfig) -> CadenceDecis
 /// rendered from absence of evidence, and `last_activity = None` is not idle.
 pub fn floor_deferred_for_activity(
     last_activity: Option<DateTime<Utc>>,
+    last_run: Option<DateTime<Utc>>,
     last_run_local: Option<chrono::NaiveDateTime>,
     now: DateTime<Utc>,
     now_local: chrono::NaiveDateTime,
@@ -447,6 +492,7 @@ pub fn floor_deferred_for_activity(
 ) -> bool {
     floor_due(last_run_local, now_local, config.floor_hour)
         && !is_idle(last_activity, now, config.idle_secs)
+        && !is_overdue(last_run, now, config.interval_secs)
         && !floor_grace_expired(now_local, config.floor_hour, config.floor_grace_secs)
 }
 
@@ -1331,6 +1377,7 @@ mod tests {
         assert!(
             floor_deferred_for_activity(
                 Some(now - Duration::seconds(5)),
+                Some(now - Duration::hours(7)),
                 last_run_local,
                 now,
                 naive("2026-08-11 09:00:00"),
@@ -1351,6 +1398,7 @@ mod tests {
         assert_eq!(quiet, CadenceDecision::Run(Trigger::NightlyFloor));
         assert!(!floor_deferred_for_activity(
             Some(now - Duration::hours(2)),
+            Some(now - Duration::hours(7)),
             last_run_local,
             now,
             naive("2026-08-11 09:00:00"),
@@ -1370,7 +1418,7 @@ mod tests {
         assert_eq!(
             choose_trigger(
                 Some(now - Duration::seconds(5)),
-                Some(now - Duration::hours(40)),
+                Some(now - Duration::hours(7)),
                 now,
                 naive("2026-08-11 08:00:00"),
                 last_run_local,
@@ -1383,7 +1431,7 @@ mod tests {
         assert_eq!(
             choose_trigger(
                 Some(now - Duration::seconds(5)),
-                Some(now - Duration::hours(40)),
+                Some(now - Duration::hours(7)),
                 now,
                 late,
                 last_run_local,
@@ -1394,6 +1442,7 @@ mod tests {
         );
         assert!(!floor_deferred_for_activity(
             Some(now - Duration::seconds(5)),
+            Some(now - Duration::hours(7)),
             last_run_local,
             now,
             late,
@@ -1413,7 +1462,7 @@ mod tests {
         assert_eq!(
             choose_trigger(
                 Some(now - Duration::seconds(5)),
-                Some(now - Duration::hours(40)),
+                Some(now - Duration::hours(7)),
                 now,
                 naive("2026-08-11 09:30:00"),
                 Some(naive("2026-08-09 13:00:00")),
@@ -1456,7 +1505,7 @@ mod tests {
         let now = ts(0);
         let trigger = choose_trigger(
             None, // nothing observed at all
-            Some(now - Duration::hours(20)),
+            Some(now - Duration::hours(7)),
             now,
             naive("2026-08-11 09:00:00"),
             Some(naive("2026-08-10 13:00:00")),
@@ -1482,6 +1531,169 @@ mod tests {
             naive("2026-08-11 09:00:00"),
             3
         ));
+    }
+
+    // ── overdue override (a machine that is never quiet) ──
+
+    #[test]
+    fn overdue_means_a_full_interval_past_due() {
+        let now = ts(0);
+        // 6h cadence: due at 6h, overdue at 12h.
+        assert!(!is_overdue(Some(now - Duration::hours(7)), now, 6 * 3600));
+        assert!(!is_overdue(
+            Some(now - Duration::hours(12) + Duration::seconds(1)),
+            now,
+            6 * 3600
+        ));
+        assert!(is_overdue(Some(now - Duration::hours(12)), now, 6 * 3600));
+        assert!(is_overdue(None, now, 6 * 3600), "never ran is overdue");
+        // The threshold follows the cadence, not a constant.
+        assert!(is_overdue(Some(now - Duration::minutes(25)), now, 600));
+        assert!(!is_overdue(Some(now - Duration::minutes(15)), now, 600));
+        // A huge interval saturates instead of overflowing.
+        assert!(!is_overdue(Some(now - Duration::days(30)), now, u64::MAX));
+    }
+
+    #[test]
+    fn an_overdue_pass_fires_on_a_machine_that_is_never_idle() {
+        let now = ts(0);
+        // Floor already satisfied today, so only the idle path or the
+        // override could start it. Typing right now; 13h since the last pass.
+        let decision = choose_trigger(
+            Some(now - Duration::seconds(5)),
+            Some(now - Duration::hours(13)),
+            now,
+            naive("2026-08-11 09:00:00"),
+            Some(naive("2026-08-11 04:00:00")),
+            cfg(6 * 3600, 1800),
+        );
+        assert_eq!(decision, CadenceDecision::Run(Trigger::Overdue));
+        // The same state with no observed activity at all also fires.
+        let unobserved = choose_trigger(
+            None,
+            Some(now - Duration::hours(13)),
+            now,
+            naive("2026-08-11 09:00:00"),
+            Some(naive("2026-08-11 04:00:00")),
+            cfg(6 * 3600, 1800),
+        );
+        assert_eq!(unobserved, CadenceDecision::Run(Trigger::Overdue));
+    }
+
+    #[test]
+    fn an_overdue_owed_floor_pass_does_not_wait_for_quiet_or_grace() {
+        let now = ts(0);
+        let last_run_local = Some(naive("2026-08-10 20:00:00")); // floor owed
+                                                                 // 08:00 local is inside the 6h grace and the user is typing.
+        let config = CadenceConfig {
+            floor_grace_secs: 6 * 3600,
+            ..cfg(6 * 3600, 1800)
+        };
+        assert_eq!(
+            choose_trigger(
+                Some(now - Duration::seconds(5)),
+                Some(now - Duration::hours(13)),
+                now,
+                naive("2026-08-11 08:00:00"),
+                last_run_local,
+                config,
+            ),
+            CadenceDecision::Run(Trigger::Overdue)
+        );
+        assert!(!floor_deferred_for_activity(
+            Some(now - Duration::seconds(5)),
+            Some(now - Duration::hours(13)),
+            last_run_local,
+            now,
+            naive("2026-08-11 08:00:00"),
+            config,
+        ));
+    }
+
+    #[test]
+    fn a_pass_not_yet_overdue_still_waits_for_idle() {
+        let now = ts(0);
+        // 7h since the last pass on a 6h cadence: due, not overdue. Busy.
+        let busy = choose_trigger(
+            Some(now - Duration::seconds(5)),
+            Some(now - Duration::hours(7)),
+            now,
+            naive("2026-08-11 09:00:00"),
+            Some(naive("2026-08-11 04:00:00")),
+            cfg(6 * 3600, 1800),
+        );
+        assert_eq!(busy, CadenceDecision::Wait);
+        // The same state, quiet, still runs on the Idle trigger (the label
+        // is not rewritten to Overdue).
+        let quiet = choose_trigger(
+            Some(now - Duration::hours(2)),
+            Some(now - Duration::hours(7)),
+            now,
+            naive("2026-08-11 09:00:00"),
+            Some(naive("2026-08-11 04:00:00")),
+            cfg(6 * 3600, 1800),
+        );
+        assert_eq!(quiet, CadenceDecision::Run(Trigger::Idle));
+        // An idle, long-overdue machine keeps the Idle label too.
+        let idle_overdue = choose_trigger(
+            Some(now - Duration::hours(2)),
+            Some(now - Duration::hours(13)),
+            now,
+            naive("2026-08-11 09:00:00"),
+            Some(naive("2026-08-11 04:00:00")),
+            cfg(6 * 3600, 1800),
+        );
+        assert_eq!(idle_overdue, CadenceDecision::Run(Trigger::Idle));
+    }
+
+    #[test]
+    fn a_machine_that_has_never_dreamed_does_not_wait_for_idle() {
+        let now = ts(0);
+        // 05:00 local: inside the floor grace, user typing, no last run.
+        let decision = choose_trigger(
+            Some(now - Duration::seconds(5)),
+            None,
+            now,
+            naive("2026-08-11 05:00:00"),
+            None,
+            cfg(6 * 3600, 1800),
+        );
+        assert_eq!(decision, CadenceDecision::Run(Trigger::Overdue));
+        assert!(!floor_deferred_for_activity(
+            Some(now - Duration::seconds(5)),
+            None,
+            None,
+            now,
+            naive("2026-08-11 05:00:00"),
+            cfg(6 * 3600, 1800),
+        ));
+    }
+
+    #[test]
+    fn the_kill_switch_beats_the_overdue_override() {
+        let _guard = env_guard();
+        let storage = Storage::open_memory().unwrap();
+        // Never ran, so the pure decision would be Run(Overdue).
+        std::env::remove_var("CSR_NO_DREAMING");
+        // (The label depends on the wall clock: the floor grace may already
+        // have expired. What matters is that a pass is allowed to start.)
+        assert!(
+            current_trigger(&storage, cfg(6 * 3600, 1800))
+                .trigger()
+                .is_some(),
+            "an empty database that never dreamed is overdue"
+        );
+        // And with a stale last run recorded.
+        storage
+            .set_meta(META_LAST_RUN_AT, &ts(-100 * 3600).to_rfc3339())
+            .unwrap();
+        assert!(current_trigger(&storage, cfg(6 * 3600, 1800))
+            .trigger()
+            .is_some());
+        std::env::set_var("CSR_NO_DREAMING", "1");
+        let disabled = current_trigger(&storage, cfg(6 * 3600, 1800));
+        std::env::remove_var("CSR_NO_DREAMING");
+        assert_eq!(disabled, CadenceDecision::Wait);
     }
 
     #[test]

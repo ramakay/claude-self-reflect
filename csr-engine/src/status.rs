@@ -817,8 +817,8 @@ pub struct DreamCadenceStatus {
     /// Whether the machine is quiet enough for an idle pass right now.
     /// `false` when `last_activity` is `None` — unobserved is not idle.
     pub idle_now: bool,
-    /// Which trigger started the last COMPLETED pass — `"idle"` or
-    /// `"nightly_floor"`. `None` before any pass has completed.
+    /// Which trigger started the last COMPLETED pass — `"idle"`,
+    /// `"nightly_floor"` or `"overdue"`. `None` before any pass has completed.
     pub last_trigger: Option<String>,
     /// Whether the nightly floor pass is currently owed.
     pub floor_due: bool,
@@ -2192,6 +2192,7 @@ fn gather_cadence(
         floor_due: cadence::floor_due(last_run_local, now_local, floor_hour),
         floor_deferred_awaiting_idle: cadence::floor_deferred_for_activity(
             last_activity,
+            last_daemon_run,
             last_run_local,
             now,
             now_local,
