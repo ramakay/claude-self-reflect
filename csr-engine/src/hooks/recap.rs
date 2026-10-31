@@ -108,6 +108,57 @@ const MAX_CHARS: usize = 700;
 /// The clause naming the session's literal last typed message.
 pub const THEN_CLAUSE_PREFIX: &str = "Then: ";
 
+/// Facts about the working tree the composer is handed. The composer never
+/// reads git itself (`hooks::recap_git` does, with a timeout, and fails open
+/// to [`RecapContext::default`]).
+#[derive(Debug, Clone, Default)]
+pub struct RecapContext {
+    /// Receipt commits proved NOT to be ancestors of the working tree's HEAD.
+    /// A receipt absent from this set is shown unmarked, whatever the reason.
+    pub off_head: std::collections::HashSet<String>,
+    /// What HEAD is called in `not on <label>`: the branch name, or `HEAD`
+    /// when detached.
+    pub head_label: String,
+    /// The episode's session is the one now running (a compaction of it): its
+    /// last turn is in flight by definition, so "ended mid-turn" is not said.
+    pub session_is_live: bool,
+}
+
+impl RecapContext {
+    /// `<label>` for a receipt proved off HEAD, else `None`.
+    fn off_head_note(&self, receipt: &str) -> Option<String> {
+        let receipt = receipt.trim();
+        (!receipt.is_empty() && self.off_head.contains(receipt)).then(|| {
+            let label = self.head_label.trim();
+            format!("not on {}", if label.is_empty() { "HEAD" } else { label })
+        })
+    }
+
+    /// `receipt` followed by its off-branch note, when it has one.
+    fn mark_receipt(&self, receipt: &str) -> String {
+        match self.off_head_note(receipt) {
+            Some(note) => format!("{receipt}, {note}"),
+            None => receipt.to_string(),
+        }
+    }
+
+    /// An entry rendered as `<claim> (<receipt>)` with the note added inside
+    /// its closing parenthesis. Any other shape is returned as it is.
+    fn mark_entry(&self, entry: String) -> String {
+        if self.off_head.is_empty() || !entry.ends_with(')') {
+            return entry;
+        }
+        let Some(open) = entry.rfind(" (") else {
+            return entry;
+        };
+        let receipt = &entry[open + 2..entry.len() - 1];
+        match self.off_head_note(receipt) {
+            Some(note) => format!("{} ({receipt}, {note})", &entry[..open]),
+            None => entry,
+        }
+    }
+}
+
 /// Compose an evidence-backed recap without reading external state.
 ///
 /// This form may return a paragraph whose only content is the session's intent:
@@ -118,7 +169,7 @@ pub fn compose_recap(
     feeds: &RecapFeeds,
     age: &str,
 ) -> Option<String> {
-    compose_with_then(ep, feeds, age, false).map(|composed| composed.text)
+    compose_with_then(ep, feeds, age, false, &RecapContext::default()).map(|composed| composed.text)
 }
 
 /// The SessionStart recap. A paragraph that would carry no evidenced clause (it
@@ -129,7 +180,48 @@ pub fn compose_recap_with_deliveries(
     feeds: &RecapFeeds,
     age: &str,
 ) -> Option<ComposedRecap> {
-    compose_with_then(ep, feeds, age, true)
+    compose_with_then(ep, feeds, age, true, &RecapContext::default())
+}
+
+/// [`compose_recap_with_deliveries`] with the working-tree facts SessionStart read.
+pub fn compose_recap_in_context(
+    ep: &crate::hooks::stop::Episode,
+    feeds: &RecapFeeds,
+    age: &str,
+    ctx: &RecapContext,
+) -> Option<ComposedRecap> {
+    compose_with_then(ep, feeds, age, true, ctx)
+}
+
+/// Commit receipts the recap could render for this episode and feeds: the
+/// candidates for the off-branch check. Bounded: at most the receipts the
+/// composer itself caps (two per list, three settled, one dream).
+pub fn candidate_receipts(ep: &crate::hooks::stop::Episode, feeds: &RecapFeeds) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |receipt: &str| {
+        let receipt = receipt.trim();
+        if is_commit_receipt(receipt) && !out.iter().any(|seen| seen == receipt) {
+            out.push(receipt.to_string());
+        }
+    };
+    for done in anchor_completions(ep) {
+        push(&done.receipt);
+    }
+    for (index, _) in displayed_receipts(&ep.completions) {
+        if let Some(done) = ep.completions.get(index) {
+            push(&done.receipt);
+        }
+    }
+    for fact in feeds.settled.iter().take(3) {
+        push(&fact.receipt);
+    }
+    for fact in feeds.still_open.iter().take(STILL_OPEN_LIMIT) {
+        push(&fact.receipt);
+    }
+    if let Some(dream) = &feeds.top_dream {
+        push(&dream.receipt);
+    }
+    out
 }
 
 fn compose_with_then(
@@ -137,12 +229,24 @@ fn compose_with_then(
     feeds: &RecapFeeds,
     age: &str,
     abstain_intent_only: bool,
+    ctx: &RecapContext,
 ) -> Option<ComposedRecap> {
-    let base = compose_recap_inner(ep, feeds, age, None, abstain_intent_only)?;
+    let base = compose_recap_inner(ep, feeds, age, None, abstain_intent_only, ctx)?;
     // The `Then:` clause is a pure addition: it is kept only when every other
-    // line of the recap comes out exactly as it would without it.
-    if let Some(then) = then_clause(ep) {
-        if let Some(with) = compose_recap_inner(ep, feeds, age, Some(&then), abstain_intent_only) {
+    // line of the recap comes out exactly as it would without it. It follows
+    // the same length rule as the intent: a long last prompt is shortened at a
+    // clause boundary or left out, never pasted.
+    let then = then_clause(ep).and_then(|ask| {
+        if abstain_intent_only {
+            short_intent(&ask)
+        } else {
+            Some(ask)
+        }
+    });
+    if let Some(then) = then {
+        if let Some(with) =
+            compose_recap_inner(ep, feeds, age, Some(&then), abstain_intent_only, ctx)
+        {
             if with.text.chars().count() <= MAX_CHARS
                 && with
                     .text
@@ -164,12 +268,19 @@ fn compose_recap_inner(
     age: &str,
     then: Option<&str>,
     abstain_intent_only: bool,
+    ctx: &RecapContext,
 ) -> Option<ComposedRecap> {
     use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
     use crate::import::contamination::has_csr_text;
 
-    let intent = recap_intent(ep);
-    let completed = recap_completed(ep);
+    // SessionStart (the abstaining form) quotes a prompt only when it is short;
+    // the repo recap labels its intent "you asked" itself and keeps the whole.
+    let intent = if abstain_intent_only {
+        recap_head_intent(ep)
+    } else {
+        recap_intent(ep)
+    };
+    let completed = recap_completed(ep, ctx);
     if intent.is_none() && completed.is_none() {
         return None;
     }
@@ -194,6 +305,11 @@ fn compose_recap_inner(
             terminate_clause(completed)
         ),
         (Some(intent), None) => format!("recap [{age}]: {}", terminate_clause(intent)),
+        // SessionStart found no intent short enough to quote: lead with what the
+        // session landed. (Elsewhere a missing intent is just missing.)
+        (None, Some(completed)) if abstain_intent_only => {
+            format!("recap [{age}]: Latest: {}", terminate_clause(completed))
+        }
         (None, Some(completed)) => format!("recap [{age}]: {}", terminate_clause(completed)),
         (None, None) => unreachable!("empty episodes abstain above"),
     };
@@ -215,8 +331,8 @@ fn compose_recap_inner(
         .filter(|fact| fact.source == "user_confirmed")
         .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
         .filter(|fact| !has_csr_text(&normalize_feed_text(&fact.claim)))
-        .map(format_fact)
-        .chain(session_settled(ep))
+        .map(|fact| format_fact(fact, ctx))
+        .chain(session_settled(ep, ctx))
         .take(3)
         .collect();
 
@@ -241,7 +357,7 @@ fn compose_recap_inner(
             .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
             .filter(|fact| !has_csr_text(&normalize_feed_text(&fact.claim)))
             .take(STILL_OPEN_LIMIT)
-            .map(format_fact),
+            .map(|fact| format_fact(fact, ctx)),
     );
     if feeds.open_proposals > 0 {
         now_parts.push(format!(
@@ -254,9 +370,28 @@ fn compose_recap_inner(
         .iter()
         .filter(|todo| todo.status != "completed")
         .count();
-    let todo_entry = (open_todos > 0).then(|| format!("{open_todos} todos open"));
+    // The count carries its receipt (the session it was read from): an
+    // unreceipted count is not evidence.
+    let session8: String = ep.session_id.chars().take(8).collect();
+    let todo_entry = (open_todos > 0 && !session8.is_empty()).then(|| {
+        format!(
+            "{open_todos} {} open (conv {session8})",
+            if open_todos == 1 { "todo" } else { "todos" }
+        )
+    });
     let priority_now_entries = usize::from(!now_parts.is_empty());
     now_parts.extend(todo_entry);
+    // The stored episode says the session's last turn never finished (no
+    // closing assistant reply: cut off or interrupted). Said only for an
+    // episode whose outcome rule ran, and never for the session now running.
+    let evidenced_now_entries = now_parts.len();
+    if ep.outcome_version.is_some()
+        && !ep.closing_ended
+        && !ctx.session_is_live
+        && !session8.is_empty()
+    {
+        now_parts.push(format!("last turn did not finish (conv {session8})"));
+    }
     let next = ep
         .next_steps
         .as_deref()
@@ -328,6 +463,7 @@ fn compose_recap_inner(
         .iter()
         .filter(|dream| !normalize_feed_text(&dream.receipt).is_empty())
         .filter(|dream| has_substance(&normalize_feed_text(&dream.label)))
+        .filter(|dream| is_qualified_dream_label(&normalize_feed_text(&dream.label)))
         .filter(|dream| !has_csr_text(&normalize_feed_text(&dream.verdict)))
         .map(|dream| {
             format!(
@@ -335,7 +471,7 @@ fn compose_recap_inner(
                 normalize_feed_text(&dream.label),
                 normalize_feed_text(&dream.verdict),
                 normalize_feed_text(&dream.date),
-                normalize_feed_text(&dream.receipt)
+                ctx.mark_receipt(&normalize_feed_text(&dream.receipt))
             )
         })
         .collect();
@@ -381,10 +517,20 @@ fn compose_recap_inner(
     // echo the last thing they typed (typos included): abstain, so the fragment
     // fallback runs. `warn_line` is a notice about Claude Code, not about this
     // session, so it does not count either.
+    // The "last turn did not finish" flag is a note about the session, not a
+    // finding: alone it does not make a paragraph worth composing.
+    let substantive = |index: usize| {
+        let selected = clauses[index].selected;
+        if index == NOW {
+            selected.min(evidenced_now_entries)
+        } else {
+            selected
+        }
+    };
     if abstain_intent_only
         && completed.is_none()
         && next_line.is_none()
-        && clauses.iter().all(|clause| clause.selected == 0)
+        && (0..clauses.len()).all(|index| substantive(index) == 0)
     {
         return None;
     }
@@ -456,14 +602,24 @@ impl ListClause {
     }
 }
 
-fn format_fact(fact: &SettledFact) -> String {
+fn format_fact(fact: &SettledFact, ctx: &RecapContext) -> String {
     let claim = normalize_feed_text(&fact.claim);
     let claim = if claim.is_empty() {
         "evidence".to_string()
     } else {
         claim
     };
-    format!("{claim} ({})", normalize_feed_text(&fact.receipt))
+    format!(
+        "{claim} ({})",
+        ctx.mark_receipt(&normalize_feed_text(&fact.receipt))
+    )
+}
+
+/// A dream label names what the conclusion is about well enough to find it: a
+/// path, or a symbol said with its file (`send in pane/kitty.rs`). A bare
+/// one-word symbol is not printed.
+fn is_qualified_dream_label(label: &str) -> bool {
+    label.split_whitespace().count() >= 2 || label.contains('/') || label.contains('.')
 }
 
 fn normalize_feed_text(text: &str) -> String {
@@ -545,6 +701,89 @@ pub(crate) fn recap_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
         ep.request.clone()
     };
     extractable(&source).and_then(|text| clean_intent(&text))
+}
+
+/// Longest prompt, in words, the recap pastes as it was typed.
+pub const INTENT_MAX_WORDS: usize = 12;
+
+/// Fewest words a quoted intent may have: a lone "Thanks." names no task.
+const INTENT_MIN_WORDS: usize = 3;
+
+/// The recap's head clause: the session's intent, quoted only when short.
+/// `None` makes the paragraph lead with what the session landed instead.
+pub(crate) fn recap_head_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
+    short_intent(&recap_intent(ep)?)
+}
+
+/// Words that cannot end a clause: a cut that stops on one leaves a fragment.
+const DANGLING_WORDS: &[&str] = &[
+    "a", "an", "the", "to", "of", "for", "with", "and", "or", "but", "in", "on", "at", "by",
+    "from", "into", "that", "which", "how", "what", "where", "when", "why", "if", "so", "as", "is",
+    "are", "was", "were", "be", "we", "our", "my", "me", "i", "it", "its", "you", "your", "this",
+    "these", "those", "then", "than", "not", "also", "about", "over", "up", "out",
+];
+
+/// A typed prompt as a recap clause, never longer than [`INTENT_MAX_WORDS`]
+/// words and never a cut mid-clause. In order: the prompt as it is when it is
+/// short; its leading whole sentences that fit; its first sentence cut at the
+/// last clause boundary that leaves a whole clause; else `None`. No word is
+/// added, replaced or respelled.
+pub(crate) fn short_intent(intent: &str) -> Option<String> {
+    let intent = intent.trim();
+    let words = |text: &str| text.split_whitespace().count();
+    if words(intent) <= INTENT_MAX_WORDS {
+        return (words(intent) > 0).then(|| intent.to_string());
+    }
+    let sentences = split_preview_sentences(intent);
+    let mut taken = 0;
+    for (_, end) in &sentences {
+        if words(&intent[..*end]) > INTENT_MAX_WORDS {
+            break;
+        }
+        taken = *end;
+    }
+    if taken > 0 {
+        let head = intent[..taken].trim();
+        return (words(head) >= INTENT_MIN_WORDS).then(|| head.to_string());
+    }
+    // The first sentence alone is too long: keep its opening clause.
+    let (start, end) = *sentences.first()?;
+    let first = &intent[start..end];
+    let mut best: Option<String> = None;
+    for (at, _) in first.char_indices() {
+        if !CLAUSE_BOUNDARIES.iter().any(|b| first[at..].starts_with(b)) {
+            continue;
+        }
+        let clause = first[..at].trim_end_matches(|c: char| {
+            c.is_whitespace() || c.is_ascii_punctuation() || c == '\u{2013}' || c == '\u{2014}'
+        });
+        let clause_words: Vec<&str> = clause.split_whitespace().collect();
+        if clause_words.len() > INTENT_MAX_WORDS {
+            break;
+        }
+        if clause_words.iter().any(|w| is_path_or_url(w)) {
+            // Every later clause contains this path too.
+            break;
+        }
+        let last = clause_words
+            .last()
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+                    .to_lowercase()
+            })
+            .unwrap_or_default();
+        let balanced = clause.matches('(').count() == clause.matches(')').count()
+            && clause.matches('"').count() % 2 == 0
+            && clause.matches('`').count() % 2 == 0;
+        if clause_words.len() >= MIN_CLAUSE_WORDS
+            && has_substance(clause)
+            && !DANGLING_WORDS.contains(&last.as_str())
+            && balanced
+        {
+            best = Some(clause.to_string());
+        }
+    }
+    best
 }
 
 /// The short handoff `/clear` receives in place of a recap: what the cleared session was doing,
@@ -820,7 +1059,7 @@ pub(crate) fn is_request(text: &str) -> bool {
 /// merged PRs by OID, else completed tasks) that the head clause does not
 /// already carry, as `<claim> (<receipt>)`. Needs no ledger verdict: a receipt
 /// is a commit the transcript saw succeed.
-fn session_settled(ep: &crate::hooks::stop::Episode) -> Vec<String> {
+fn session_settled(ep: &crate::hooks::stop::Episode, ctx: &RecapContext) -> Vec<String> {
     let shown: Vec<String> = {
         let own = anchor_completions(ep);
         displayed_receipts(&own)
@@ -835,7 +1074,7 @@ fn session_settled(ep: &crate::hooks::stop::Episode) -> Vec<String> {
                 .get(*index)
                 .is_some_and(|done| !shown.contains(&done.receipt))
         })
-        .map(|(_, entry)| entry)
+        .map(|(_, entry)| ctx.mark_entry(entry))
         .collect()
 }
 
@@ -894,10 +1133,10 @@ fn anchor_completions(
 
 /// The completed clause: the anchor's own `displayed_receipts`, never
 /// assistant prose. Legacy episodes carry none and abstain.
-fn recap_completed(ep: &crate::hooks::stop::Episode) -> Option<String> {
+fn recap_completed(ep: &crate::hooks::stop::Episode, ctx: &RecapContext) -> Option<String> {
     let entries: Vec<String> = displayed_receipts(&anchor_completions(ep))
         .into_iter()
-        .map(|(_, entry)| entry)
+        .map(|(_, entry)| ctx.mark_entry(entry))
         .collect();
     (!entries.is_empty()).then(|| entries.join("; "))
 }
@@ -1873,7 +2112,7 @@ mod tests {
             got,
             "recap [28m ago]: Fix the recap composer. Latest: Implemented deterministic recap output (abc1234). [[CSR:RECAP]]\n\
              Settled: schema is stable (810283b); queries are indexed (T2 2026-07-27).\n\
-             Now: waiting for storage migration | Windows path behavior (91abcde) | 2 proposals awaiting csr_resolve | 1 todos open.\n\
+             Now: waiting for storage migration | Windows path behavior (91abcde) | 2 proposals awaiting csr_resolve | 1 todo open (conv session-).\n\
              Learnt-then-retired while away: old schema assumption (superseded 2026-08-06, 77fedca).\n\
              Next: Run the integration suite."
         );
@@ -2495,7 +2734,7 @@ mod tests {
 
     fn dream() -> DreamClause {
         DreamClause {
-            label: "parse_config".into(),
+            label: "parse_config in src/config.rs".into(),
             verdict: "went stale".into(),
             receipt: "abc1234".into(),
             date: "2026-08-11".into(),
@@ -2510,7 +2749,7 @@ mod tests {
         };
         let got = compose_recap(&episode(), &feeds, "now").unwrap();
         assert!(
-            got.contains("Dreamt: parse_config went stale (2026-08-11, abc1234)."),
+            got.contains("Dreamt: parse_config in src/config.rs went stale (2026-08-11, abc1234)."),
             "clause missing or unreceipted: {got}"
         );
     }
@@ -3271,5 +3510,253 @@ mod tests {
                 "genuine prose wrongly rejected: {sample:?}"
             );
         }
+    }
+
+    // ---- batch 4a: the recap a blind rater reads ----
+
+    const FIELD_PROMPT: &str = "Review previous sesison - create a simple unwall for me where we are and how we get to 10.1.";
+
+    #[test]
+    fn short_intent_keeps_a_short_prompt_as_typed_and_never_pastes_a_long_one() {
+        // Twelve words or fewer: kept as typed, typos and all.
+        assert_eq!(
+            short_intent("Fix the recap composr bug").as_deref(),
+            Some("Fix the recap composr bug")
+        );
+        // The field prompt: 18 words, its only boundary leaves 3 words.
+        assert_eq!(short_intent(FIELD_PROMPT), None);
+        // Whole leading sentences that fit.
+        assert_eq!(
+            short_intent(
+                "Fix the bug. Then deploy the release to staging and verify the dashboards afterwards please."
+            )
+            .as_deref(),
+            Some("Fix the bug.")
+        );
+        // One long sentence: cut at the last clause boundary that leaves a whole clause.
+        assert_eq!(
+            short_intent(
+                "Wire the session start hook into the recap composer, then run the whole integration suite twice before merging"
+            )
+            .as_deref(),
+            Some("Wire the session start hook into the recap composer")
+        );
+        // A cut that would end on a dangling word is not taken.
+        assert_eq!(
+            short_intent(
+                "Refactor the parser and the lexer together with, then verify all the downstream callers again today"
+            ),
+            None
+        );
+        // A cut never keeps a path.
+        assert_eq!(
+            short_intent(
+                "Look at src/hooks/recap.rs, which builds the paragraph and cuts every prompt it quotes badly"
+            ),
+            None
+        );
+        // Nothing is added: the cut is a prefix of the prompt.
+        let long =
+            "Make the recap shorter, because the rater found the pasted prompt hard to read at all";
+        let cut = short_intent(long).expect("a clause");
+        assert!(long.starts_with(&cut), "{cut}");
+        assert!(cut.split_whitespace().count() <= INTENT_MAX_WORDS);
+    }
+
+    #[test]
+    fn recap_leads_with_latest_when_the_prompt_is_too_long_to_quote() {
+        let mut ep = episode();
+        ep.anchor_request = Some(FIELD_PROMPT.into());
+        let got = compose_recap_with_deliveries(&ep, &RecapFeeds::empty(), "9m ago")
+            .expect("composes")
+            .text;
+        assert!(
+            got.starts_with(
+                "recap [9m ago]: Latest: Implemented deterministic recap output (abc1234)."
+            ),
+            "{got}"
+        );
+        assert!(!got.contains("sesison"), "{got}");
+        // No intent and nothing landed: the paragraph abstains.
+        let mut bare = bare_episode();
+        bare.anchor_request = Some(FIELD_PROMPT.into());
+        assert!(compose_recap_with_deliveries(&bare, &RecapFeeds::empty(), "9m ago").is_none());
+    }
+
+    #[test]
+    fn then_clause_follows_the_same_word_cap() {
+        let mut ep = episode();
+        let long = "Why did the importer drop every chunk that the scrubber had already marked as hook text last week?";
+        let session_start = |ep: &Episode| {
+            compose_recap_with_deliveries(ep, &RecapFeeds::empty(), "now")
+                .unwrap()
+                .text
+        };
+        ep.latest_ask = Some(long.into());
+        let got = session_start(&ep);
+        assert!(!got.contains("Then:"), "a 19-word ask is not pasted: {got}");
+        ep.latest_ask = Some("Why did the importer drop every chunk?".into());
+        let got = session_start(&ep);
+        assert!(
+            got.contains("Then: Why did the importer drop every chunk?"),
+            "{got}"
+        );
+        // The repo recap labels its intent itself and keeps the whole ask.
+        ep.latest_ask = Some(long.into());
+        let repo = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert!(
+            repo.contains("Then: Why did the importer drop every chunk that"),
+            "{repo}"
+        );
+    }
+
+    fn off_branch(label: &str, receipts: &[&str]) -> RecapContext {
+        RecapContext {
+            off_head: receipts.iter().map(|r| r.to_string()).collect(),
+            head_label: label.into(),
+            session_is_live: false,
+        }
+    }
+
+    #[test]
+    fn off_branch_receipts_are_marked_with_the_head_branch_name() {
+        let mut ep = episode();
+        ep.completions.push(receipt("Second change", "def5678"));
+        ep.anchor_receipts = Some(vec![0, 1]);
+        let mut feeds = RecapFeeds::empty();
+        feeds.settled = vec![SettledFact {
+            claim: "schema is stable".into(),
+            receipt: "810283b".into(),
+            status: "resolved".into(),
+            source: "user_confirmed".into(),
+        }];
+        feeds.top_dream = Some(dream());
+        let ctx = off_branch("main", &["abc1234", "810283b"]);
+        let got = compose_recap_in_context(&ep, &feeds, "9m ago", &ctx)
+            .unwrap()
+            .text;
+        assert!(
+            got.contains("Implemented deterministic recap output (abc1234, not on main)"),
+            "{got}"
+        );
+        assert!(
+            got.contains("Second change (def5678)"),
+            "an on-branch receipt stays bare: {got}"
+        );
+        assert!(
+            got.contains("schema is stable (810283b, not on main)"),
+            "{got}"
+        );
+        assert!(
+            got.contains("went stale (2026-08-11, abc1234, not on main)"),
+            "{got}"
+        );
+        // Detached HEAD has no branch name.
+        let detached = off_branch("HEAD", &["abc1234"]);
+        let got = compose_recap_in_context(&ep, &feeds, "now", &detached)
+            .unwrap()
+            .text;
+        assert!(got.contains("(abc1234, not on HEAD)"), "{got}");
+        // No context (no repo, timeout, failure): the recap is what it always was.
+        let plain = compose_recap_with_deliveries(&ep, &feeds, "now")
+            .unwrap()
+            .text;
+        assert!(!plain.contains("not on"), "{plain}");
+    }
+
+    #[test]
+    fn candidate_receipts_are_the_commits_the_recap_can_show() {
+        let mut ep = episode();
+        ep.completions
+            .push(receipt("Task done", "task #3 completed"));
+        let mut feeds = RecapFeeds::empty();
+        feeds.top_dream = Some(dream());
+        let got = candidate_receipts(&ep, &feeds);
+        assert_eq!(
+            got,
+            vec!["abc1234".to_string()],
+            "one entry per distinct commit, no task receipts"
+        );
+    }
+
+    #[test]
+    fn now_names_open_todos_with_the_session_they_came_from() {
+        let mut ep = episode();
+        ep.blockers = None;
+        ep.todos = vec![
+            TodoItem {
+                content: "wire it".into(),
+                status: "in_progress".into(),
+            },
+            TodoItem {
+                content: "test it".into(),
+                status: "pending".into(),
+            },
+        ];
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert!(got.contains("Now: 2 todos open (conv session-)."), "{got}");
+    }
+
+    #[test]
+    fn now_says_the_last_turn_did_not_finish_only_with_evidence() {
+        let mut ep = episode();
+        ep.blockers = None;
+        ep.todos.clear();
+        ep.outcome_version = Some(crate::hooks::stop::OUTCOME_VERSION);
+        ep.closing_ended = false;
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert!(
+            got.contains("Now: last turn did not finish (conv session-)."),
+            "{got}"
+        );
+        // The session now running is mid-turn by definition.
+        let live = RecapContext {
+            session_is_live: true,
+            ..Default::default()
+        };
+        let got = compose_recap_in_context(&ep, &RecapFeeds::empty(), "now", &live)
+            .unwrap()
+            .text;
+        assert!(!got.contains("Now:"), "{got}");
+        // An episode whose outcome rule never ran cannot say it.
+        ep.outcome_version = None;
+        assert!(!compose_recap(&ep, &RecapFeeds::empty(), "now")
+            .unwrap()
+            .contains("Now:"));
+        // A session that ended on a finished reply does not say it.
+        ep.outcome_version = Some(crate::hooks::stop::OUTCOME_VERSION);
+        ep.closing_ended = true;
+        assert!(!compose_recap(&ep, &RecapFeeds::empty(), "now")
+            .unwrap()
+            .contains("Now:"));
+    }
+
+    #[test]
+    fn the_unfinished_turn_note_alone_does_not_make_a_paragraph() {
+        let mut ep = bare_episode();
+        ep.outcome_version = Some(crate::hooks::stop::OUTCOME_VERSION);
+        ep.closing_ended = false;
+        assert!(
+            compose_recap_with_deliveries(&ep, &RecapFeeds::empty(), "now").is_none(),
+            "intent plus the note is still only the prompt"
+        );
+    }
+
+    #[test]
+    fn a_bare_one_word_dream_label_is_never_printed() {
+        let mut feeds = RecapFeeds::empty();
+        let mut bare = dream();
+        bare.label = "send".into();
+        feeds.top_dream = Some(bare);
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        assert!(!got.contains("Dreamt:"), "{got}");
+        let mut qualified = dream();
+        qualified.label = "send in pane/kitty.rs".into();
+        feeds.top_dream = Some(qualified);
+        let got = compose_recap(&episode(), &feeds, "now").unwrap();
+        assert!(
+            got.contains("Dreamt: send in pane/kitty.rs went stale"),
+            "{got}"
+        );
     }
 }

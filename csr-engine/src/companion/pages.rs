@@ -637,7 +637,7 @@ fn told_section(s: &Value) -> Option<Value> {
         .collect();
     let anchors = lines
         .iter()
-        .find(|l| l.starts_with("ANCHORS:"))
+        .find(|l| l.starts_with("ANCHORS:") || l.starts_with("ANCHORS ("))
         .copied()
         .unwrap_or("");
     let full = lines

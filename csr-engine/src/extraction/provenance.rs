@@ -98,11 +98,12 @@ const EMISSION_HEADERS: [&str; 16] = [
 /// Case-sensitive on purpose: our emissions are uppercase-exact; genuine prose
 /// ("next: fix the todos counter") is not. One token can occur in real text;
 /// two or more distinct tokens means the text is echoing our format.
-const EMISSION_FIELD_TOKENS: [&str; 8] = [
+const EMISSION_FIELD_TOKENS: [&str; 9] = [
     "LAST:",
     "NEXT:",
     "TODOS:",
     "ANCHORS:",
+    "ANCHORS (last session's files):",
     "CONTINUED FROM [",
     "Past session [",
     "(outcome=",

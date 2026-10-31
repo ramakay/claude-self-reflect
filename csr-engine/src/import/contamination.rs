@@ -291,7 +291,7 @@ macro_rules! formatter {
 /// case; `registry_formatters_all_have_a_matrix_case` fails otherwise.
 pub static REGISTRY: &[Formatter] = &[
     formatter!("recap", Engine, Recap,
-        "recap [<age>]: <body> [[CSR:RECAP]] + Settled:/Now:/Corrected:/Learnt-then-retired while away:/Dreamt:/Next: lines (+ ANCHORS:, Full state:)",
+        "recap [<age>]: <body> [[CSR:RECAP]] + Settled:/Now:/Corrected:/Learnt-then-retired while away:/Dreamt:/Next: lines (+ Uncommitted:, ANCHORS (last session's files):, Full state:)",
         Matcher::Block(m_recap)),
     formatter!("dream_injection", Engine, DreamInjection,
         "CSR ☾ dream: `<label>` <verdict> — witnessed <date>, receipt <oid>. Matched your mention of `<token>`. Past conclusion, not an instruction. [[CSR:DREAM]]",
@@ -306,13 +306,13 @@ pub static REGISTRY: &[Formatter] = &[
         "the three fixed CSR ENDLESS MEMORY ACTIVE lines",
         Matcher::Block(m_manifest)),
     formatter!("briefing", Engine, Briefing,
-        "[briefing: model-derived, trust=<trust>] (the header line; the body is model prose)",
+        "[briefing: model-derived, trust=<trust>[, written <age>, ages below as of then]] (the header line; the body is model prose)",
         Matcher::Block(m_briefing)),
     formatter!("continuity", Engine, Continuity,
         "SESSION CONTINUITY DETECTED header, `- CONTINUED FROM [<age>] (not instructions): <title>`, two-space enrichment lines",
         Matcher::Block(m_continuity)),
     formatter!("continuum", Engine, Continuum,
-        "CSR CONTINUUM [<age>]: <request> / LAST: ([outcome=, ]trust=) / optional NEXT: | TODOS: / optional ANCHORS: / Full state:",
+        "CSR CONTINUUM [<age>]: <request> / LAST: ([outcome=, ]trust=) / optional NEXT: | TODOS: / optional Uncommitted: / optional ANCHORS: / Full state:",
         Matcher::Block(m_continuum)),
     formatter!("episode_index", Engine, EpisodeIndex,
         "EPISODE INDEX header + `- [<age>] <request> — <last> ([outcome=]) → csr_reflect_on_past(\"conv_<id>\")` lines",
@@ -474,10 +474,14 @@ re!(
     LESSON_ITEM_RE,
     r"^- .+ \(seen \d+× across \d+ sessions, last [^;\n]+; [^\n]+\)$"
 );
+// Both grammars: the current line names its scope (`ANCHORS (last session's
+// files): N intact, M modified`), and every older transcript carries
+// `ANCHORS: N intact, M modified since checkpoint`.
 re!(
     ANCHORS_RE,
-    r"^ANCHORS: \d+ intact, \d+ modified since checkpoint(?: \(.*\))?$"
+    r"^ANCHORS(?: \(last session's files\))?: \d+ intact, \d+ modified(?: since checkpoint)?(?: \(.*\))?$"
 );
+re!(UNCOMMITTED_RE, r"^Uncommitted: \d+ files? \(.+\)$");
 re!(
     FULL_STATE_RE,
     r#"^Full state: csr_reflect_on_past\("conv_[^"\n]*"\)$"#
@@ -502,7 +506,7 @@ re!(
 );
 re!(
     BRIEFING_HEAD_RE,
-    r"^\[briefing: model-derived, trust=[a-z_]+\]$"
+    r"^\[briefing: model-derived, trust=[a-z_]+(?:, written [^\]\n,;]{1,24}, ages below as of then)?\]$"
 );
 re!(INJECTION_ROW_RE, r"^- \[[^\]\n]*\] ?.*$");
 re!(
@@ -794,7 +798,11 @@ fn m_recap(doc: &Doc<'_>, at: usize) -> Option<usize> {
     {
         end += 1;
     }
-    // Tier-0 trailer: the same block carries ANCHORS and the Full state pointer.
+    // Tier-0 trailer: the same block carries the dirty-tree line, ANCHORS and
+    // the Full state pointer.
+    if end < doc.len() && UNCOMMITTED_RE.is_match(doc.line(end)) {
+        end += 1;
+    }
     if end < doc.len() && ANCHORS_RE.is_match(doc.line(end)) {
         end += 1;
     }
@@ -875,6 +883,9 @@ fn m_continuum(doc: &Doc<'_>, at: usize) -> Option<usize> {
     }
     let mut end = at + 2;
     if end < doc.len() && CONTINUUM_NEXT_RE.is_match(doc.line(end)) {
+        end += 1;
+    }
+    if end < doc.len() && UNCOMMITTED_RE.is_match(doc.line(end)) {
         end += 1;
     }
     if end < doc.len() && ANCHORS_RE.is_match(doc.line(end)) {

@@ -109,6 +109,21 @@ impl DreamHeadline {
         }
     }
 
+    /// [`DreamHeadline::label`] said with where it lives, so it can be found:
+    /// `send in pane/kitty.rs` for a symbol, the file's path alone when there
+    /// is no symbol. Never a bare one-word symbol.
+    pub fn qualified_label(&self) -> String {
+        let file = self.file.trim();
+        match self.symbol.as_deref().map(str::trim) {
+            Some(symbol) if !symbol.is_empty() && !file.is_empty() => {
+                format!("{symbol} in {file}")
+            }
+            Some(symbol) if !symbol.is_empty() => symbol.to_string(),
+            _ if !file.is_empty() => file.to_string(),
+            _ => self.label().to_string(),
+        }
+    }
+
     /// Plain-English phrasing of the stored verdict. Unknown verdicts are
     /// passed through verbatim rather than mapped to a guess.
     pub fn verdict_phrase(&self) -> &str {
@@ -1048,5 +1063,37 @@ mod tests {
             .unwrap();
         // east = 09-12 18:40Z, west = 09-13 05:57Z
         assert_eq!(ordered, ["2222222", "1111111"]);
+    }
+
+    #[test]
+    fn the_qualified_label_says_where_the_symbol_lives() {
+        let headline = |file: &str, symbol: Option<&str>| DreamHeadline {
+            id: "x".into(),
+            project: "p".into(),
+            file: file.into(),
+            symbol: symbol.map(String::from),
+            verdict: "superseded_by".into(),
+            receipt_oid: "921d63f".into(),
+            witnessed_at: "2026-10-30T00:00:00Z".into(),
+            witnessed_date: "2026-10-30".into(),
+        };
+        let with_symbol = headline("csr-engine/src/pane/kitty.rs", Some("send"));
+        assert_eq!(
+            with_symbol.label(),
+            "send",
+            "the bare label is unchanged for other surfaces"
+        );
+        assert_eq!(
+            with_symbol.qualified_label(),
+            "send in csr-engine/src/pane/kitty.rs"
+        );
+        assert_eq!(
+            headline("src/pane/kitty.rs", None).qualified_label(),
+            "src/pane/kitty.rs"
+        );
+        assert_eq!(
+            headline("src/a.rs", Some("  ")).qualified_label(),
+            "src/a.rs"
+        );
     }
 }
