@@ -1230,13 +1230,11 @@ pub fn handle(
     swiftbar: bool,
     deep: bool,
 ) -> Result<()> {
-    // The statusline refresh is a hot path: it gathers only what the compact
-    // line prints, from cheap state (see `Scope::Compact`).
     let report = gather_status_with(
         db_path,
         projects_dir,
         deep,
-        if compact { Scope::Compact } else { Scope::Full },
+        scope_for(compact, swiftbar),
         crate::binary_identity::default_run_dir().as_deref(),
         crate::hooks::install::default_settings_path().as_deref(),
     )?;
@@ -1250,6 +1248,18 @@ pub fn handle(
     }
 
     Ok(())
+}
+
+/// The gather a renderer needs. Only the plain compact line (the statusline's
+/// hot path) gets [`Scope::Compact`]; SwiftBar and the JSON report read blocks
+/// the compact gather leaves at their defaults, so they always get
+/// [`Scope::Full`], and `--deep` keeps its meaning wherever that runs.
+fn scope_for(compact: bool, swiftbar: bool) -> Scope {
+    if compact && !swiftbar {
+        Scope::Compact
+    } else {
+        Scope::Full
+    }
 }
 
 /// `csr-engine status --stale` — a DB-free fast path that ONLY reads the run
@@ -1658,14 +1668,36 @@ pub fn refresh_provenance_cache(storage: &Storage) -> Result<()> {
     Ok(())
 }
 
+/// How old the daemon's provenance measurement may be before the compact line
+/// stops printing it. The daemon refreshes hourly, so a day-old row means the
+/// refresh is failing while imports go on, and old counts would read as current.
+const PROVENANCE_CACHE_MAX_AGE_HOURS: i64 = 24;
+
 /// The compact line's coverage: the daemon's last measurement, or the empty
-/// block (no `prov` segment) before the daemon has made one.
+/// block (no `prov` segment) when there is none, when it is older than
+/// [`PROVENANCE_CACHE_MAX_AGE_HOURS`], or when its `measured_at` is in the
+/// future or does not parse.
 fn cached_provenance_coverage(storage: &Storage) -> ProvenanceCoverageStatus {
+    cached_provenance_coverage_at(storage, chrono::Utc::now())
+}
+
+fn cached_provenance_coverage_at(
+    storage: &Storage,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ProvenanceCoverageStatus {
     storage
         .get_meta(PROVENANCE_CACHE_META_KEY)
         .ok()
         .flatten()
         .and_then(|json| serde_json::from_str::<ProvenanceCache>(&json).ok())
+        .filter(|cache| {
+            chrono::DateTime::parse_from_rfc3339(&cache.measured_at)
+                .map(|at| now.signed_duration_since(at))
+                .is_ok_and(|age| {
+                    age >= chrono::Duration::zero()
+                        && age <= chrono::Duration::hours(PROVENANCE_CACHE_MAX_AGE_HOURS)
+                })
+        })
         .map(|cache| ProvenanceCoverageStatus {
             chunks_with_spans: cache.chunks_with_spans,
             chunks_unknown: cache.chunks_unknown,

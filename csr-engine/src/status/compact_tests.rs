@@ -134,3 +134,108 @@ fn compact_status_treats_a_garbled_provenance_row_as_not_measured() {
         ProvenanceCoverageStatus::default()
     );
 }
+
+fn store_cache_measured_at(db_path: &Path, measured_at: &str) {
+    let storage = Storage::open(db_path).unwrap();
+    let cache = serde_json::json!({
+        "chunks_with_spans": 12, "chunks_unknown": 0, "chunks_total": 12,
+        "tool_result_share_mean": null, "source_missing": 0,
+        "source_unparsed": 0, "source_unmatched": 0, "measured_at": measured_at,
+    });
+    storage
+        .set_meta(PROVENANCE_CACHE_META_KEY, &cache.to_string())
+        .unwrap();
+}
+
+fn prov_total_at(db_path: &Path, age: chrono::Duration) -> i64 {
+    store_cache_measured_at(db_path, &(chrono::Utc::now() - age).to_rfc3339());
+    let storage = Storage::open_read_only(db_path).unwrap();
+    cached_provenance_coverage(&storage).chunks_total
+}
+
+/// A fresh row shows; one past the 24 h limit, one dated in the future and one
+/// that does not parse are dropped, so old counts never read as current.
+#[test]
+fn compact_status_drops_a_stale_future_or_unparsable_provenance_row() {
+    let _guard = crate::daemon::dream_cadence::env_test_guard();
+    let (_dir, db_path, _projects_dir) = seeded_db();
+    assert_eq!(prov_total_at(&db_path, chrono::Duration::minutes(5)), 12);
+    assert_eq!(prov_total_at(&db_path, chrono::Duration::hours(23)), 12);
+    assert_eq!(
+        prov_total_at(&db_path, chrono::Duration::hours(25)),
+        0,
+        "stale"
+    );
+    assert_eq!(
+        prov_total_at(&db_path, chrono::Duration::days(30)),
+        0,
+        "stale"
+    );
+    assert_eq!(
+        prov_total_at(&db_path, -chrono::Duration::hours(1)),
+        0,
+        "future"
+    );
+    store_cache_measured_at(&db_path, "yesterday-ish");
+    let storage = Storage::open_read_only(&db_path).unwrap();
+    assert_eq!(cached_provenance_coverage(&storage).chunks_total, 0);
+}
+
+/// The compact line prints `prov` for a fresh row and omits it for a stale one.
+#[test]
+fn compact_line_shows_prov_only_while_the_row_is_fresh() {
+    let _guard = crate::daemon::dream_cadence::env_test_guard();
+    let (_dir, db_path, projects_dir) = seeded_db();
+    store_cache_measured_at(
+        &db_path,
+        &(chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+    );
+    let fresh = gather(&db_path, &projects_dir, false, Scope::Compact);
+    assert!(format_compact(&fresh, 0).contains("| prov 12/12 "));
+    store_cache_measured_at(
+        &db_path,
+        &(chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339(),
+    );
+    let stale = gather(&db_path, &projects_dir, false, Scope::Compact);
+    assert!(!format_compact(&stale, 0).contains("prov "));
+}
+
+/// Only the plain compact line runs the cheap gather.
+#[test]
+fn only_the_plain_compact_line_gets_the_compact_scope() {
+    assert_eq!(scope_for(true, false), Scope::Compact);
+    assert_eq!(scope_for(false, false), Scope::Full);
+    assert_eq!(scope_for(false, true), Scope::Full);
+    assert_eq!(scope_for(true, true), Scope::Full);
+}
+
+/// `--compact --swiftbar` must print what `--swiftbar` prints: both gather the
+/// same report (SwiftBar is a function of the report alone), with the chunk
+/// count and the other blocks the compact gather leaves out.
+#[test]
+fn compact_swiftbar_gathers_the_same_report_as_swiftbar() {
+    let _guard = crate::daemon::dream_cadence::env_test_guard();
+    let (_dir, db_path, projects_dir) = seeded_db();
+    let with = |compact, swiftbar, deep| {
+        serde_json::to_value(gather(
+            &db_path,
+            &projects_dir,
+            deep,
+            scope_for(compact, swiftbar),
+        ))
+        .unwrap()
+    };
+    let swiftbar = with(false, true, false);
+    assert_eq!(with(true, true, false), swiftbar);
+    assert_eq!(
+        swiftbar["chunks"], 12,
+        "SwiftBar prints Chunks from the full gather"
+    );
+    // `--deep` still runs the integrity check under SwiftBar, compact or not
+    assert_eq!(with(true, true, true)["healthy"], true);
+    assert_eq!(
+        with(true, false, false)["chunks"],
+        0,
+        "the compact gather skips the count"
+    );
+}
