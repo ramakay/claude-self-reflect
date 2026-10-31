@@ -111,6 +111,9 @@ pub const DREAM_CLAUSE_PREFIX: &str = "Dreamt: ";
 pub const CORRECTION_CLAUSE_PREFIX: &str = "Corrected: ";
 /// The recap's character budget, sentinel included.
 const MAX_CHARS: usize = 700;
+
+/// Longest branch name an off-branch note quotes; longer ones end in `…`.
+const BRANCH_LABEL_MAX_CHARS: usize = 32;
 /// The clause naming the session's literal last typed message.
 pub const THEN_CLAUSE_PREFIX: &str = "Then: ";
 
@@ -136,7 +139,16 @@ impl RecapContext {
         let receipt = receipt.trim();
         (!receipt.is_empty() && self.off_head.contains(receipt)).then(|| {
             let label = self.head_label.trim();
-            format!("not on {}", if label.is_empty() { "HEAD" } else { label })
+            let label = if label.is_empty() { "HEAD" } else { label };
+            // The head carries up to two marked receipts and is not trimmed
+            // after marking, so the branch name is bounded: with it, the head
+            // stays inside `MAX_CHARS` whatever the branch is called.
+            if label.chars().count() > BRANCH_LABEL_MAX_CHARS {
+                let cut: String = label.chars().take(BRANCH_LABEL_MAX_CHARS - 1).collect();
+                format!("not on {cut}\u{2026}")
+            } else {
+                format!("not on {label}")
+            }
         })
     }
 
@@ -287,13 +299,14 @@ fn compose_recap_inner(
     if headless && !abstain_intent_only {
         return None;
     }
-    // What the request says, for the relevance check on project-wide evidence.
-    // Read from the episode, not from `then`: the paragraph with and without its
-    // `Then:` clause must keep the same evidence lines.
+    // What the head says, for the relevance check on project-wide evidence:
+    // the intent, and the `Then:` clause only when this paragraph renders it.
+    // `compose_with_then` keeps a `Then:` only when every other line is the same
+    // as without it, so a verdict only `Then:` names never reaches the output.
     let request_text = format!(
         "{} {}",
         intent.as_deref().unwrap_or(""),
-        then_clause(ep).unwrap_or_default()
+        then.filter(|_| !headless).unwrap_or_default()
     );
 
     let mut recap = match (intent.as_deref(), completed.as_deref()) {
@@ -4075,6 +4088,72 @@ mod tests {
         let got = session_start(&ep, &feeds).unwrap();
         assert!(!got.contains("Dreamt:"), "{got}");
         assert!(!got.contains("Learnt-then-retired"), "{got}");
+    }
+
+    #[test]
+    fn a_then_clause_that_does_not_fit_cannot_justify_a_dream() {
+        // Review P2: the relevance check read the `Then:` ask even when the
+        // clause was dropped, so a dream only that ask named survived.
+        let mut ep = episode();
+        ep.anchor_request = Some("Fix the login regression".into());
+        ep.next_steps = Some("Run the login tests".into());
+        ep.latest_ask = Some(format!(
+            "Review the implementation in kitty.rs {}",
+            "x".repeat(800)
+        ));
+        let feeds = RecapFeeds {
+            top_dream: Some(witness_dream(
+                "transmit in pane/kitty.rs",
+                "src/pane/kitty.rs",
+                "transmit",
+            )),
+            ..RecapFeeds::empty()
+        };
+        let got = session_start(&ep, &feeds).unwrap();
+        assert!(!got.contains("Then:"), "{got}");
+        assert!(!got.contains("Dreamt:"), "{got}");
+        // A `Then:` that fits and names the file still cannot add the dream:
+        // `compose_with_then` keeps `Then:` only when the lines below match the
+        // paragraph without it.
+        ep.latest_ask = Some("Review the implementation in kitty.rs again".into());
+        let got = session_start(&ep, &feeds).unwrap();
+        assert!(!got.contains("Dreamt:"), "{got}");
+    }
+
+    #[test]
+    fn a_long_branch_name_cannot_push_the_head_past_the_budget() {
+        // Review P2: two marked receipts with a 240-char branch name made a
+        // 765-char head.
+        let mut ep = episode();
+        ep.anchor_request = Some("Fix the login regression".into());
+        let claim = |n: &str| format!("{n} {}", "c".repeat(90 - n.len() - 1));
+        ep.completions = vec![
+            receipt(&claim("first"), "abc1234"),
+            receipt(&claim("second"), "def5678"),
+        ];
+        ep.anchor_receipts = Some(vec![0, 1]);
+        let ctx = off_branch(&"b".repeat(240), &["abc1234", "def5678"]);
+        let got = compose_recap_in_context(&ep, &RecapFeeds::empty(), "9m ago", &ctx)
+            .unwrap()
+            .text;
+        let head = got.lines().next().unwrap();
+        assert!(
+            head.chars().count() <= MAX_CHARS,
+            "{} chars: {head}",
+            head.chars().count()
+        );
+        assert!(got.chars().count() <= MAX_CHARS, "{got}");
+        let note = format!(
+            "(abc1234, not on {}\u{2026})",
+            "b".repeat(BRANCH_LABEL_MAX_CHARS - 1)
+        );
+        assert!(head.contains(&note), "{head}");
+        // A branch name that fits is quoted whole.
+        let ctx = off_branch("fix/recap4", &["abc1234"]);
+        let got = compose_recap_in_context(&ep, &RecapFeeds::empty(), "9m ago", &ctx)
+            .unwrap()
+            .text;
+        assert!(got.contains("(abc1234, not on fix/recap4)"), "{got}");
     }
 
     fn witness_dream(label: &str, file: &str, symbol: &str) -> DreamClause {
