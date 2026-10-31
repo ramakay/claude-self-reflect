@@ -32,6 +32,11 @@ use crate::hooks;
 use crate::import;
 use crate::storage::Storage;
 
+/// One line in the setup output: what calls `claude -p`, under whose account,
+/// and the switch that stops it. The README and the docs-site installation page
+/// carry the full text; keep the three in step.
+const CLAUDE_P_NOTICE: &str = "  Note: session briefings, narratives, ratification and dreams run `claude -p` on your own Claude account (your plan's usage). CSR_NO_AI_NARRATIVES=1 turns them all off; CSR_NO_DREAMING=1 stops dreams only.";
+
 /// Run the full setup flow.
 pub async fn handle(
     db_path: &Path,
@@ -279,8 +284,9 @@ pub async fn handle(
         save_anthropic_key(csr_dir, key)?;
         eprintln!("  Saved to {}", csr_dir.join(".env").display());
     } else {
-        eprintln!("[6/8] Skipping AI narratives (no --anthropic-key provided)");
+        eprintln!("[6/8] No --anthropic-key provided (optional)");
     }
+    eprintln!("{CLAUDE_P_NOTICE}");
 
     // Step 7: Dreaming consent (Journal v4 P5, locked decision 15). Presented
     // ON by default, with a per-night token estimate computed from the corpus
@@ -2872,6 +2878,16 @@ mod tests {
             incomplete_error(true, true),
             "MCP server not registered and hook install failed"
         );
+    }
+
+    #[test]
+    fn setup_discloses_the_claude_p_spend_and_its_switches() {
+        assert!(CLAUDE_P_NOTICE.contains("`claude -p`"));
+        assert!(CLAUDE_P_NOTICE.contains("your own Claude account"));
+        assert!(CLAUDE_P_NOTICE.contains("CSR_NO_AI_NARRATIVES=1"));
+        assert!(CLAUDE_P_NOTICE.contains("CSR_NO_DREAMING=1"));
+        // one line, so it sits beside the other step notices
+        assert!(!CLAUDE_P_NOTICE.contains('\n'));
     }
 
     #[test]
