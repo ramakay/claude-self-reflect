@@ -1230,12 +1230,13 @@ pub fn handle(
     swiftbar: bool,
     deep: bool,
 ) -> Result<()> {
-    // The statusline refresh is a hot path and prints none of the code map.
+    // The statusline refresh is a hot path: it gathers only what the compact
+    // line prints, from cheap state (see `Scope::Compact`).
     let report = gather_status_with(
         db_path,
         projects_dir,
         deep,
-        !compact,
+        if compact { Scope::Compact } else { Scope::Full },
         crate::binary_identity::default_run_dir().as_deref(),
         crate::hooks::install::default_settings_path().as_deref(),
     )?;
@@ -1332,21 +1333,37 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         db_path,
         projects_dir,
         deep,
-        true,
+        Scope::Full,
         crate::binary_identity::default_run_dir().as_deref(),
         crate::hooks::install::default_settings_path().as_deref(),
     )
 }
 
-/// [`gather_status`] with the code map block switchable (`--compact` passes
-/// `false` and gets the default block without touching the code map tables)
-/// and the process registry's run directory and Claude Code settings file
-/// passed in, so a test reads its own and never the installation's.
+/// How much of the report a gather fills in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// Every block, live (the JSON report and the swiftbar view).
+    Full,
+    /// Only what [`format_compact`] prints, read from cheap state: indexed
+    /// counts, `meta` rows and file stats. The statusline runs this on every
+    /// refresh, so it never runs a table scan, the integrity check, or anything
+    /// that loads the HNSW index or the embedding model. Blocks the line does
+    /// not print stay at their defaults; the provenance coverage comes from the
+    /// daemon-written [`PROVENANCE_CACHE_META_KEY`] row (absent until the
+    /// daemon has measured it, and then the line drops that segment). `deep`
+    /// is ignored: the integrity check is never run from the statusline.
+    Compact,
+}
+
+/// [`gather_status`] with the amount gathered switchable (`--compact` passes
+/// [`Scope::Compact`]) and the process registry's run directory and Claude
+/// Code settings file passed in, so a test reads its own and never the
+/// installation's.
 fn gather_status_with(
     db_path: &Path,
     projects_dir: &Path,
     deep: bool,
-    with_codemap: bool,
+    scope: Scope,
     run_dir: Option<&Path>,
     settings: Option<&Path>,
 ) -> Result<StatusReport> {
@@ -1417,12 +1434,23 @@ fn gather_status_with(
     }
 
     let storage = Storage::open_read_only(db_path)?;
+    let compact = scope == Scope::Compact;
+    // The statusline never runs the integrity check, even with `--deep`.
+    let deep = deep && !compact;
     let narratives = gather_narratives(&storage);
 
     let conversations = storage.count_conversations().unwrap_or(0);
-    let ratification = gather_ratification(&storage, conversations);
+    let ratification = if compact {
+        RatificationStatus::default()
+    } else {
+        gather_ratification(&storage, conversations)
+    };
     let projects = storage.count_projects().unwrap_or(0);
-    let chunks = storage.count_chunk_embeddings().unwrap_or(0);
+    let chunks = if compact {
+        0
+    } else {
+        storage.count_chunk_embeddings().unwrap_or(0)
+    };
     let reflections = storage.count_reflection_embeddings().unwrap_or(0);
     let imported_files = storage.count_imported_files().unwrap_or(0);
     let csr_self_suppressed = storage.get_csr_self_suppressed().unwrap_or(0);
@@ -1433,15 +1461,18 @@ fn gather_status_with(
         .ok()
         .flatten()
         .filter(|e| !e.is_empty());
-    let secrets_redacted = SecretsRedactedStatus::read(&storage);
-    let mirror = MirrorStatus::read(&storage);
-    let codemap = if with_codemap {
-        CodemapStatusBlock::read(&storage)
+    // The compact line prints none of the blocks below.
+    let (secrets_redacted, mirror, codemap, legacy_frontier, queued_prompts) = if compact {
+        Default::default()
     } else {
-        CodemapStatusBlock::default()
+        (
+            SecretsRedactedStatus::read(&storage),
+            MirrorStatus::read(&storage),
+            CodemapStatusBlock::read(&storage),
+            LegacyFrontierStatus::read(&storage),
+            QueuedPromptsStatus::read(&storage),
+        )
     };
-    let legacy_frontier = LegacyFrontierStatus::read(&storage);
-    let queued_prompts = QueuedPromptsStatus::read(&storage);
     let contamination = if deep {
         storage.refresh_contamination_cache().ok()
     } else {
@@ -1450,42 +1481,18 @@ fn gather_status_with(
     .map(ContaminationStatus::from)
     .unwrap_or_default();
     let memory_health = gather_memory_health(Some(&storage));
-    let [source_missing, source_unparsed, source_unmatched] =
-        storage.provenance_failure_counts().unwrap_or_default();
-    let artifacts: Vec<ArtifactTierCounts> = storage
-        .artifact_tier_histograms()
-        .map(|rows| {
-            rows.into_iter()
-                .map(|(kind, c)| ArtifactTierCounts {
-                    kind: kind.as_str().to_string(),
-                    unknown: c[0],
-                    external: c[1],
-                    trusted_tool: c[2],
-                    user_history: c[3],
-                    user_confirmed: c[4],
-                    system: c[5],
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let provenance_coverage = storage
-        .provenance_coverage()
-        .map(
-            |(chunks_with_spans, chunks_unknown, chunks_total, tool_result_share_mean)| {
-                ProvenanceCoverageStatus {
-                    chunks_with_spans,
-                    chunks_unknown,
-                    chunks_total,
-                    tool_result_share_mean,
-                    source_missing,
-                    source_unparsed,
-                    artifacts: artifacts.clone(),
-                    source_unmatched,
-                }
-            },
-        )
-        .unwrap_or_default();
-    let newest_chunk = storage.get_newest_chunk_timestamp().unwrap_or(None);
+    // Two table scans (the span join and the receipt join), 6 s on a 900k-chunk
+    // store: the compact line reads the daemon's last measurement instead.
+    let provenance_coverage = if compact {
+        cached_provenance_coverage(&storage)
+    } else {
+        gather_provenance_coverage(&storage)
+    };
+    let newest_chunk = if compact {
+        None
+    } else {
+        storage.get_newest_chunk_timestamp().unwrap_or(None)
+    };
     let db_size_bytes = storage.get_db_size().unwrap_or(0);
     // Ordinary status is read-only and never scans, even on a cache miss.
     let healthy = if deep {
@@ -1506,9 +1513,14 @@ fn gather_status_with(
         0.0
     };
 
-    // Enrichment breakdown
+    // Enrichment breakdown (the compact line prints none of it)
     let mut enrichment = EnrichmentBreakdown::default();
-    if let Ok(breakdown) = storage.get_enrichment_breakdown() {
+    let breakdown = if compact {
+        Vec::new()
+    } else {
+        storage.get_enrichment_breakdown().unwrap_or_default()
+    };
+    {
         for (etype, status, count) in &breakdown {
             match (etype.as_str(), status.as_str()) {
                 ("heuristic", "completed") => enrichment.heuristic_completed = *count,
@@ -1523,15 +1535,38 @@ fn gather_status_with(
         }
     }
 
-    let aux = gather_aux(&storage, projects_dir, settings);
     let mut dream = gather_dream(&storage);
     dream.dreams_recent = gather_recent_dreams(&storage, db_path);
-    let dream_threads = gather_dream_threads(&storage);
-    let memory_registry = gather_memory_registry(&storage);
-    let trained_rerank = gather_trained_rerank(&storage);
-    let backfill = gather_backfill(&storage);
-    let codex_backfill = gather_codex_backfill(&storage);
-    let import_watcher = gather_import_watcher(&storage);
+    // The blocks below are not on the compact line.
+    let (
+        aux,
+        dream_threads,
+        memory_registry,
+        trained_rerank,
+        backfill,
+        codex_backfill,
+        import_watcher,
+    ) = if compact {
+        (
+            AuxStatus::default(),
+            DreamThreadStatus::default(),
+            MemoryRegistryStatus::default(),
+            empty_trained_rerank_status(),
+            BackfillStatus::default(),
+            CodexBackfillStatus::default(),
+            ImportWatcherStatus::default(),
+        )
+    } else {
+        (
+            gather_aux(&storage, projects_dir, settings),
+            gather_dream_threads(&storage),
+            gather_memory_registry(&storage),
+            gather_trained_rerank(&storage),
+            gather_backfill(&storage),
+            gather_codex_backfill(&storage),
+            gather_import_watcher(&storage),
+        )
+    };
 
     Ok(StatusReport {
         mcp_binary_stale,
@@ -1561,7 +1596,11 @@ fn gather_status_with(
         ratification,
         newest_chunk,
         db_size_bytes,
-        legacy_index: legacy_index_status(db_path),
+        legacy_index: if compact {
+            None
+        } else {
+            legacy_index_status(db_path)
+        },
         db_path: db_path.to_string_lossy().to_string(),
         healthy,
         aux,
@@ -1576,6 +1615,108 @@ fn gather_status_with(
         codex_backfill,
         import_watcher,
     })
+}
+
+/// `meta` row holding the daemon's last [`ProvenanceCache`] measurement.
+pub const PROVENANCE_CACHE_META_KEY: &str = "status_provenance_cache_v1";
+
+/// What the statusline's `prov` segment prints, measured by the daemon so the
+/// statusline refresh never scans `chunks` or the receipt tables.
+#[derive(Serialize, serde::Deserialize, Debug, PartialEq)]
+struct ProvenanceCache {
+    chunks_with_spans: i64,
+    chunks_unknown: i64,
+    chunks_total: i64,
+    tool_result_share_mean: Option<f64>,
+    source_missing: i64,
+    source_unparsed: i64,
+    source_unmatched: i64,
+    measured_at: String,
+}
+
+/// Measure the provenance coverage and store it in `meta` (daemon only; a
+/// read-only handle measures and stores nothing). Both queries are table
+/// scans, which is why the statusline reads this row instead.
+pub fn refresh_provenance_cache(storage: &Storage) -> Result<()> {
+    let (chunks_with_spans, chunks_unknown, chunks_total, tool_result_share_mean) =
+        storage.provenance_coverage()?;
+    let [source_missing, source_unparsed, source_unmatched] =
+        storage.provenance_failure_counts()?;
+    let cache = ProvenanceCache {
+        chunks_with_spans,
+        chunks_unknown,
+        chunks_total,
+        tool_result_share_mean,
+        source_missing,
+        source_unparsed,
+        source_unmatched,
+        measured_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if !storage.with_connection(|conn| Ok(conn.is_readonly("main")?))? {
+        storage.set_meta(PROVENANCE_CACHE_META_KEY, &serde_json::to_string(&cache)?)?;
+    }
+    Ok(())
+}
+
+/// The compact line's coverage: the daemon's last measurement, or the empty
+/// block (no `prov` segment) before the daemon has made one.
+fn cached_provenance_coverage(storage: &Storage) -> ProvenanceCoverageStatus {
+    storage
+        .get_meta(PROVENANCE_CACHE_META_KEY)
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<ProvenanceCache>(&json).ok())
+        .map(|cache| ProvenanceCoverageStatus {
+            chunks_with_spans: cache.chunks_with_spans,
+            chunks_unknown: cache.chunks_unknown,
+            chunks_total: cache.chunks_total,
+            tool_result_share_mean: cache.tool_result_share_mean,
+            source_missing: cache.source_missing,
+            source_unparsed: cache.source_unparsed,
+            source_unmatched: cache.source_unmatched,
+            artifacts: Vec::new(),
+        })
+        .unwrap_or_default()
+}
+
+/// The live provenance coverage block: scans every chunk and every receipt, so
+/// the statusline never calls it (see [`cached_provenance_coverage`]).
+fn gather_provenance_coverage(storage: &Storage) -> ProvenanceCoverageStatus {
+    let [source_missing, source_unparsed, source_unmatched] =
+        storage.provenance_failure_counts().unwrap_or_default();
+    let artifacts: Vec<ArtifactTierCounts> = storage
+        .artifact_tier_histograms()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(kind, c)| ArtifactTierCounts {
+                    kind: kind.as_str().to_string(),
+                    unknown: c[0],
+                    external: c[1],
+                    trusted_tool: c[2],
+                    user_history: c[3],
+                    user_confirmed: c[4],
+                    system: c[5],
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    storage
+        .provenance_coverage()
+        .map(
+            |(chunks_with_spans, chunks_unknown, chunks_total, tool_result_share_mean)| {
+                ProvenanceCoverageStatus {
+                    chunks_with_spans,
+                    chunks_unknown,
+                    chunks_total,
+                    tool_result_share_mean,
+                    source_missing,
+                    source_unparsed,
+                    artifacts: artifacts.clone(),
+                    source_unmatched,
+                }
+            },
+        )
+        .unwrap_or_default()
 }
 
 /// Assemble the codex-rollout backfill status block. Fail-soft to defaults
@@ -2752,6 +2893,9 @@ fn format_dreaming_elapsed(elapsed_secs: u64) -> String {
 #[cfg(test)]
 mod codemap_tests;
 
+#[cfg(test)]
+mod compact_tests;
+
 /// The run directory a status test reads: beside its database, never the
 /// installation's `~/.claude-self-reflect/run` (whose dead-pid records
 /// `stale_processes` deletes).
@@ -2778,7 +2922,7 @@ mod tests {
             db_path,
             projects_dir,
             deep,
-            true,
+            Scope::Full,
             Some(&test_run_dir(db_path)),
             Some(&test_settings(db_path)),
         )

@@ -79,7 +79,8 @@ enum Commands {
         /// SwiftBar-compatible output for macOS menu bar plugin
         #[arg(long)]
         swiftbar: bool,
-        /// Force a fresh full integrity check (slow on large DBs; otherwise cached)
+        /// Force a fresh full integrity check (slow on large DBs; otherwise cached;
+        /// ignored with --compact)
         #[arg(long)]
         deep: bool,
         /// DB-free fast path: only the stale-process report (run registry +

@@ -1914,6 +1914,8 @@ impl SearchEngine {
         expected_reflections: usize,
         budget: std::time::Duration,
     ) -> Result<Option<Self>> {
+        #[cfg(test)]
+        heavy_loads::note();
         let lock = match std::fs::File::open(dir.join("index.lock")) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1955,6 +1957,8 @@ impl SearchEngine {
         expected_reflections: usize,
         budget: std::time::Duration,
     ) -> Result<Option<Self>> {
+        #[cfg(test)]
+        heavy_loads::note();
         let Some(watermark) = crate::index_gen::read_watermark(storage)? else {
             return Ok(None);
         };
@@ -2647,6 +2651,28 @@ fn data_file_is_mmappable(_path: &Path) -> bool {
 
 struct PendingHnswIo {
     io: NonNull<HnswIo>,
+}
+
+/// Test-only count of the heavy loads a cheap path must never start: opening
+/// the vector index (`SearchEngine::load_from_disk*`, `load_with_generation*`)
+/// and loading the embedding model (`EmbeddingEngine::ensure_loaded`). Per
+/// thread, so parallel tests cannot see each other's loads. The statusline's
+/// `status --compact` asserts it stays at zero.
+#[cfg(test)]
+pub(crate) mod heavy_loads {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LOADS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note() {
+        LOADS.with(|loads| loads.set(loads.get() + 1));
+    }
+
+    pub(crate) fn count() -> usize {
+        LOADS.with(Cell::get)
+    }
 }
 
 impl PendingHnswIo {

@@ -11,7 +11,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         db_path,
         projects_dir,
         deep,
-        true,
+        Scope::Full,
         Some(&test_run_dir(db_path)),
         Some(&test_settings(db_path)),
     )
@@ -256,7 +256,7 @@ fn status_json_has_the_codemap_block_for_an_empty_and_a_filled_map() {
         &db_path,
         &projects_dir,
         false,
-        false,
+        Scope::Compact,
         Some(&test_run_dir(&db_path)),
         Some(&test_settings(&db_path)),
     )

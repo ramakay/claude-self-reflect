@@ -208,6 +208,8 @@ impl EmbeddingEngine {
         if guard.is_some() {
             return Ok(());
         }
+        #[cfg(test)]
+        crate::search::heavy_loads::note();
 
         let cache_dir = cache::cache_dir();
         std::fs::create_dir_all(&cache_dir)?;

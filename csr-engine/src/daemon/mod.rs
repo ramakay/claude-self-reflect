@@ -522,6 +522,35 @@ impl Daemon {
         };
         tracing::info!("maintenance loop started (integrity cache + WAL checkpoint)");
 
+        // Provenance coverage cache: the statusline prints it, but measuring it
+        // scans every chunk and receipt (6 s on a 900k-chunk store), so the
+        // daemon measures it (30 s after start, then hourly) and
+        // `status --compact` reads the stored row.
+        let provenance_cache_handle = {
+            let storage = self.storage.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let mut wait_ticks = 3;
+                loop {
+                    for _ in 0..wait_ticks {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    wait_ticks = 360;
+                    let s = storage.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        match crate::status::refresh_provenance_cache(&s) {
+                            Ok(()) => tracing::debug!("provenance coverage cache refreshed"),
+                            Err(e) => tracing::warn!("provenance cache refresh failed: {e}"),
+                        }
+                    })
+                    .await;
+                }
+            })
+        };
+
         // Registry loop: every 10 minutes, incrementally ingest ~/.claude/history.jsonl
         // into session_registry (coverage spine — never embedded, never injected).
         // Daemon is the ONLY caller by design: single-writer serialization is part of
@@ -1658,6 +1687,7 @@ impl Daemon {
         }
         let _ = tokio::time::timeout(timeout, consolidation_handle).await;
         let _ = tokio::time::timeout(timeout, maintenance_handle).await;
+        let _ = tokio::time::timeout(timeout, provenance_cache_handle).await;
         let _ = tokio::time::timeout(timeout, registry_handle).await;
         // Derived-table rebuild in one transaction: a timeout loses nothing.
         let _ = tokio::time::timeout(timeout, assertions_handle).await;
