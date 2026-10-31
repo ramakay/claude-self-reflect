@@ -405,8 +405,8 @@ async fn on_the_first_look_waits_until_claude_has_spent_10_tokens_for_each_one_i
     let explained = r.band().await;
     assert!(explained.has("Notes could follow side branches"));
     assert!(explained.has("this look 41,000 tokens"));
-    // Ask Claude: the box is filled, and the dream is adopted, which gives its place back.
-    r.press_label("Ask Claude").await;
+    // Ask the agent: the box is filled, and the dream is adopted, which gives its place back.
+    r.press_label("Ask the agent").await;
     let filled = r.fx.host.seen.lock().unwrap().filled.clone();
     assert_eq!(filled.len(), 1);
     assert!(filled[0].starts_with(&format!("“{DREAM_LINE}”")));

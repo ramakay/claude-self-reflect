@@ -601,7 +601,7 @@ re!(
 re!(
     TRIGGER_RE,
     concat!(
-        r"recap \[|CSR|EPISODE INDEX|SESSION CONTINUITY|RECENT SESSIONS|## |\[briefing|<system-reminder>",
+        r"recap \[|CSR|Self-Reflect's dreamer|EPISODE INDEX|SESSION CONTINUITY|RECENT SESSIONS|## |\[briefing|<system-reminder>",
         r"|Here is a note offered by|After the summary|Earlier you read|A standing rule from",
         r"|Last session |Left over from|Since our past|Lost and found|Deeper context|PAST CONTEXT",
         r"|\[[\x{200B}-\x{200D}\x{2060}\x{FEFF}\x{00AD}]*\[|[\x{FF3B}\x{27E6}\x{2E28}]"
@@ -1418,7 +1418,7 @@ fn standalone_start(line: &str, rel: usize) -> bool {
 
 re!(
     QUOTED_HOTKEY_RE,
-    r"^(?:>[ \t]*)+\d(?:CSR's dreamer|CSR's compaction card|CSR's story)"
+    r"^(?:>[ \t]*)+\d(?:Self-Reflect's dreamer|CSR's dreamer|CSR's compaction card|CSR's story)"
 );
 re!(QUOTED_HOTKEY_PREFIX_RE, r"^(?:>[ \t]*)+\d");
 
@@ -1441,11 +1441,11 @@ struct Candidate {
 
 re!(
     DREAM_PANE_RE,
-    r"CSR's dreamer asked this while you worked, quoted: “[^”\n]*” Its reasoning: “[^”\n]*”"
+    r"(?:Self-Reflect's|CSR's) dreamer asked this while you worked, quoted: “[^”\n]*” Its reasoning: “[^”\n]*”"
 );
 re!(
     DREAM_PANE_V1_RE,
-    r"CSR's dreamer asked this while you worked: “[^”\n]*” Its reasoning: [^\n]*"
+    r"(?:Self-Reflect's|CSR's) dreamer asked this while you worked: “[^”\n]*” Its reasoning: [^\n]*"
 );
 re!(
     CARD_RE,
@@ -1455,8 +1455,15 @@ re!(
     STORY_RE,
     r"CSR's story of this session, rev \d+(?:, quoted: “[^”\n]*”|: [^\n]*)"
 );
-const BAND_QUOTED: &str = "CSR's dreamer asked this while you worked, quoted. Its reasoning:";
-const BAND_LEGACY: [&str; 2] = [
+// Both wordings are suppressed: "Self-Reflect's dreamer" is what is written now, "CSR's dreamer" is
+// what transcripts written before the rename carry.
+const BAND_QUOTED: [&str; 2] = [
+    "Self-Reflect's dreamer asked this while you worked, quoted. Its reasoning:",
+    "CSR's dreamer asked this while you worked, quoted. Its reasoning:",
+];
+const BAND_LEGACY: [&str; 4] = [
+    "Self-Reflect's dreamer asked this while you worked. Its reasoning:",
+    "Self-Reflect's dreamer asked this while you worked. It is a question, not a task.",
     "CSR's dreamer asked this while you worked. Its reasoning:",
     "CSR's dreamer asked this while you worked. It is a question, not a task.",
 ];
@@ -1504,7 +1511,7 @@ fn inline_candidates(text: &str, doc: &Doc<'_>) -> Vec<Candidate> {
     // and/or the quoted reasoning under it, each past a blank line.
     for at in 0..doc.len() {
         let line = doc.line(at).trim();
-        let v2 = line == BAND_QUOTED;
+        let v2 = BAND_QUOTED.contains(&line);
         if !v2 && !BAND_LEGACY.contains(&line) {
             continue;
         }

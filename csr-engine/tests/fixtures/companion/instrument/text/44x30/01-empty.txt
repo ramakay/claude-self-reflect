@@ -16,8 +16,8 @@ Why did we change this file? Follow the
 conversation behind the code.
 Where did we fix this bug before? Find
 earlier attempts and the final fix.
-What did I ask Claude to remember? Look up
-saved instructions and preferences.
+What did I ask the agent to remember? Look
+up saved instructions and preferences.
 Show the history of this function. Find
 prior edits and their context.
 What changed in the last session? Review the

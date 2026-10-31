@@ -13,7 +13,7 @@ is checked by `tests/pane_contract.rs` for every fixture, pane size and theme. A
    height: a long question or status loses its last lines ("…"), never grows the canvas.
 3. **Tiers.** T0 is never folded: the dreamer card (hero), the Context card, an open section or
    page, the stack row and the open accordion card. T1 never folds and stays small: notice,
-   agents bar, empty-session help. T2 folds into the stack: the two lists (Confused Claude,
+   agents bar, empty-session help. T2 folds into the stack: the two lists (What confused the agent,
    Should be a skill / memory / tool), the story (Where the work stands) and CSR performance.
 4. **Collapse order.** Content gives way in `FIT_STEPS` order, first to go first: performance
    check rows, its clock and bar, list rows to 3, list rows to 1, the credit row, rings to one

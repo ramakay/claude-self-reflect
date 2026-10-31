@@ -1537,7 +1537,7 @@ async fn learn_more_explains_the_dream_and_ask_claude_hands_it_over() {
     let explained = r.band().await;
     assert!(explained.has(TITLE));
     assert!(explained.has("this look 41,000 tokens"));
-    assert!(r.press("Ask Claude").await);
+    assert!(r.press("Ask the agent").await);
     let filled = r.filled();
     assert_eq!(filled.len(), 1);
     assert!(filled[0].starts_with(&format!("“{DREAM_LINE}”")));

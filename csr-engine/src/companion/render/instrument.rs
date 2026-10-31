@@ -1023,7 +1023,7 @@ fn meta(c: &Composition) -> String {
         bits.push(format!("dreamer {b}"));
     }
     if d.handed > 0 {
-        bits.push(format!("{} asked Claude", d.handed));
+        bits.push(format!("{} asked the agent", d.handed));
     }
     if d.carried {
         bits.push("carried".into());
@@ -1301,7 +1301,7 @@ fn scroll_footer(from: usize, shown: usize, total: usize) -> String {
 fn more_line(hidden: usize) -> String {
     format!("+{hidden} more")
 }
-pub(super) const CONFUSED_TITLE: &str = "Confused Claude";
+pub(super) const CONFUSED_TITLE: &str = "What confused the agent";
 pub(super) const SHOULD_BE_TITLE: &str = "Should be a skill / memory / tool";
 /// Every `kind` the dreamer may write on a should-be item, and the label its row carries. Any
 /// other kind reads "tool". The pane contract draws every row of this table.
@@ -1596,7 +1596,7 @@ fn assemble(
     }
     if c.dream.state == Batch::Ready {
         hero.extend(fact_rows(
-            "1 helpful · 2 thought of it · 3 not relevant · 4 ask Claude",
+            "1 helpful · 2 thought of it · 3 not relevant · 4 ask the agent",
             cols,
         ));
     }
@@ -1840,7 +1840,7 @@ fn starter_questions() -> [(&'static str, &'static str); 8] {
             "Find earlier attempts and the final fix.",
         ),
         (
-            "What did I ask Claude to remember?",
+            "What did I ask the agent to remember?",
             "Look up saved instructions and preferences.",
         ),
         (
@@ -3411,7 +3411,7 @@ pub fn draw(
     //   3. the lists' rows, down to 3,
     //   4. the lists' rows, down to 1,
     //   5. the API credit row,
-    //   6. "CSR this session" from rings to one line of words,
+    //   6. "Self-Reflect this session" from rings to one line of words,
     //   7. both lists fold into the stack row,
     //   8. the story ("Where the work stands") folds into the stack row,
     //   9. the CSR performance card folds into the stack row,
@@ -3874,7 +3874,7 @@ pub fn draw(
                 "The dreamer asks"
             }
         } else {
-            "CSR's dreamer"
+            "Self-Reflect's dreamer"
         };
         label(
             &mut canvas,
@@ -4002,7 +4002,7 @@ pub fn draw(
                 ("1 ✓ helpful", "helpful"),
                 ("2 \u{e1c2} thought of it", "thought_of_it"),
                 ("3 ✗ not relevant", "not_relevant"),
-                ("4 → ask Claude", "ask_claude"),
+                ("4 → ask the agent", "ask_claude"),
             ] {
                 let w = canvas.text(
                     f,
@@ -5706,7 +5706,7 @@ struct DashPlan {
     csr: Vec<CsrRing>,
     /// The most lines any ring's label wraps to.
     csr_label_lines: usize,
-    /// "CSR this session" as one line of words, for a pane too short for its rings.
+    /// "Self-Reflect this session" as one line of words, for a pane too short for its rings.
     csr_compact: bool,
     status: Option<(String, bool)>,
 }
@@ -5720,7 +5720,7 @@ struct FitStep {
     cap: usize,
     /// Keep the API credit row.
     credit: bool,
-    /// "CSR this session" as one line of words instead of rings.
+    /// "Self-Reflect this session" as one line of words instead of rings.
     compact: bool,
     /// The stackable cards folded into the stack row (`FOLD_*` bits).
     fold: u8,
@@ -5759,7 +5759,7 @@ const fn step(
 /// The cards a stack row can hold, in the order it lists them: the bit that folds each, and its
 /// name in the row.
 pub const STACKABLE: [(u8, &str); 4] = [
-    (FOLD_CONFUSED, "Confused Claude"),
+    (FOLD_CONFUSED, "What confused the agent"),
     (FOLD_SHOULD, "Should be"),
     (FOLD_STORY, "Story"),
     (FOLD_PERF, "Performance"),
@@ -5804,7 +5804,7 @@ impl DashPlan {
     }
 }
 
-/// One ring of "CSR this session": the number in it, the words under it, and the fraction of the
+/// One ring of "Self-Reflect this session": the number in it, the words under it, and the fraction of the
 /// ring it fills when that fraction means something. A count has none: it is a full ring.
 #[derive(Clone, Debug)]
 struct CsrRing {
@@ -5812,7 +5812,7 @@ struct CsrRing {
     label: String,
     fill: Option<f64>,
 }
-/// The radius of a "CSR this session" ring, in layout points.
+/// The radius of a "Self-Reflect this session" ring, in layout points.
 const CSR_RING_R: f32 = 24.;
 
 fn dash_sev_ink(sev: &str, t: &Tokens) -> Rgba {
@@ -6044,7 +6044,7 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
 fn dash_heights(p: &DashPlan, full: bool) -> (f32, f32, f32, f32, f32) {
     dash_heights_with(p, full, true, p.csr_compact)
 }
-/// `dash_heights` with the API credit row and the rings of "CSR this session" kept or dropped.
+/// `dash_heights` with the API credit row and the rings of "Self-Reflect this session" kept or dropped.
 fn dash_heights_with(
     p: &DashPlan,
     full: bool,
@@ -6489,7 +6489,7 @@ fn draw_dashboard(
     // D. what CSR did this session: a ring to each measured value, its words under it
     if !p.csr.is_empty() && p.csr_compact {
         let st = sans(11., t.medium);
-        let lead = "CSR this session: ";
+        let lead = "Self-Reflect this session: ";
         let lead_w = f.width(lead, sans(11., t.bold));
         let mut parts: Vec<&str> = p.csr.iter().map(|r| r.label.as_str()).collect();
         while parts.len() > 1 && lead_w + f.width(&parts.join(" · "), st) > IW - 10. {
@@ -6514,7 +6514,7 @@ fn draw_dashboard(
         label(
             c,
             f,
-            "CSR this session",
+            "Self-Reflect this session",
             IX,
             at + f.cap(heading(t)),
             theme::TITLE_SIZE,
@@ -6569,7 +6569,7 @@ fn draw_dashboard(
             });
         }
         dash.csr_row = Some(format!(
-            "CSR this session: {}",
+            "Self-Reflect this session: {}",
             p.csr
                 .iter()
                 .map(|r| r.label.as_str())
@@ -6933,7 +6933,7 @@ pub fn acts(c: &Composition, cols: usize) -> BTreeMap<usize, Value> {
     if c.dream.state == Batch::Ready {
         let send = crate::companion::send::closed_send(
             &format!(
-                "CSR's dreamer asked this while you worked, quoted: “{}” Its reasoning:",
+                "Self-Reflect's dreamer asked this while you worked, quoted: “{}” Its reasoning:",
                 crate::companion::send::straight(string(&c.dream.top["line"]))
             ),
             &format!(
@@ -7859,7 +7859,9 @@ mod tests {
                     assert!(d.context_head.as_deref().unwrap().contains("880k free"));
                     let row = d.csr_row.as_deref().expect("a CSR row");
                     assert!(
-                        row.starts_with("CSR this session: 2 compactions · ~851k tokens saved"),
+                        row.starts_with(
+                            "Self-Reflect this session: 2 compactions · ~851k tokens saved"
+                        ),
                         "{at}: {row}"
                     );
                     assert!(row.contains("4 recalls used"), "{at}: {row}");
@@ -8005,12 +8007,10 @@ mod tests {
             m.dash.unwrap().csr_row
         };
         let all = row(&|_| {}).expect("a row");
-        for part in [
-            "2 compactions",
-            "~851k tokens saved",
-            "4 recalls used",
-            "0.4 pts of the weekly limit",
-        ] {
+        // "Self-Reflect this session: " is longer than the "CSR this session: " it replaced, so at the
+        // card's width the last part (the share of the weekly limit) is the one that gives way; it
+        // shows whenever the row has room for it (below).
+        for part in ["2 compactions", "~851k tokens saved", "4 recalls used"] {
             assert!(all.contains(part), "{all}");
         }
         let no_tally = row(&|c| c.tally = Value::Null).unwrap();
@@ -8023,6 +8023,15 @@ mod tests {
         assert!(
             !no_asks.contains("recall") && no_asks.contains("2 compactions"),
             "{no_asks}"
+        );
+        let only_share = row(&|c| {
+            c.tally = Value::Null;
+            c.figure["asks"] = json!(0);
+        })
+        .unwrap();
+        assert!(
+            only_share.contains("0.4 pts of the weekly limit"),
+            "{only_share}"
         );
         let none = row(&|c| {
             c.tally = Value::Null;
@@ -8248,7 +8257,7 @@ mod tests {
                     d.csr_row
                         .as_deref()
                         .unwrap()
-                        .starts_with("CSR this session: 2 compactions"),
+                        .starts_with("Self-Reflect this session: 2 compactions"),
                     "{at}"
                 );
             }
@@ -8289,13 +8298,13 @@ mod tests {
             }
             let counts = f.width("5 \u{b7} o opens", sans(theme::CAPTION_SIZE, t.regular));
             for title in [
-                "CSR's dreamer",
+                "Self-Reflect's dreamer",
                 "The dreamer asks \u{b7} asked while you were away",
                 CONFUSED_TITLE,
                 SHOULD_BE_TITLE,
                 "Where the work stands",
                 "CSR performance",
-                "CSR this session",
+                "Self-Reflect this session",
                 "Context",
             ] {
                 let w = 14. + ICON_GAP + f.width(title, st);

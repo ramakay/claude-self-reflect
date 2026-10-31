@@ -749,10 +749,12 @@ pub fn dream_id(line: &str, at: f64) -> String {
 
 // ---------------------------------------------------------------- what the person sends back
 
-/// "CSR's dreamer asked this while you worked": csr-engine's provenance guard and the pane's
-/// `voice_and_lines` match it word for word, so the dreamer's words are never read back as the
-/// person's.
-pub const DREAMER_SAID: &str = "CSR's dreamer asked this while you worked";
+/// "Self-Reflect's dreamer asked this while you worked": csr-engine's provenance guard and the
+/// pane's `voice_and_lines` match it word for word, so the dreamer's words are never read back as
+/// the person's. [`DREAMER_SAID_OLD`] is the wording older transcripts carry; both are read, only
+/// the new one is written.
+pub const DREAMER_SAID: &str = "Self-Reflect's dreamer asked this while you worked";
+pub const DREAMER_SAID_OLD: &str = "CSR's dreamer asked this while you worked";
 
 /// A note's words put in the prompt box as text, never as directives: an `@` before a word would
 /// attach a file, "[Pasted text #2]" would expand a paste, "ultrathink" would raise the effort;
@@ -808,13 +810,25 @@ pub fn clean_for_draft(text: &str) -> String {
 // after an opening " closes it. See the TypeScript for the shapes: the pane's dream, the compaction
 // card's draft, the session story's, the band's dream (`ask_claude`), a side agent's note.
 
-const BAND_SAID: [&str; 2] = [
+// Each form is written with "Self-Reflect's dreamer" and read with either that or the "CSR's
+// dreamer" wording older transcripts carry (the `_OLD` and the second half of `BAND_SAID`).
+const BAND_SAID: [&str; 4] = [
+    "Self-Reflect's dreamer asked this while you worked. Its reasoning:",
+    "Self-Reflect's dreamer asked this while you worked. It is a question, not a task.",
     "CSR's dreamer asked this while you worked. Its reasoning:",
     "CSR's dreamer asked this while you worked. It is a question, not a task.",
 ];
-pub const BAND_QUOTED: &str = "CSR's dreamer asked this while you worked, quoted. Its reasoning:";
-const PANE_V1: &str = "CSR's dreamer asked this while you worked: “";
-const PANE_V2: &str = "CSR's dreamer asked this while you worked, quoted: “";
+pub const BAND_QUOTED: &str =
+    "Self-Reflect's dreamer asked this while you worked, quoted. Its reasoning:";
+const BAND_QUOTED_OLD: &str = "CSR's dreamer asked this while you worked, quoted. Its reasoning:";
+const PANE_V1: &str = "Self-Reflect's dreamer asked this while you worked: “";
+const PANE_V2: &str = "Self-Reflect's dreamer asked this while you worked, quoted: “";
+const PANE_V1_OLD: &str = "CSR's dreamer asked this while you worked: “";
+const PANE_V2_OLD: &str = "CSR's dreamer asked this while you worked, quoted: “";
+
+fn is_band_quoted(line: &str) -> bool {
+    line == BAND_QUOTED || line == BAND_QUOTED_OLD
+}
 const CARD_OPEN: &str = "CSR's compaction card (";
 const CARD_STAGES: [&str; 4] = [
     "compacting soon",
@@ -874,23 +888,27 @@ fn closed_end(line: &str, start: usize, from: usize, most: usize) -> usize {
 /// The next one-line forward on a line at or after `at`: where it starts and ends.
 fn next_send(line: &str, at: usize) -> Option<(usize, usize)> {
     let mut found: Vec<(usize, usize)> = Vec::new();
-    if let Some(v2) = find_from(line, PANE_V2, at) {
-        let question = find_from(line, "”", v2 + PANE_V2.len());
-        let end = match question {
-            Some(close) if line[close..].starts_with(THEN_REASONING) => {
-                closed_end(line, v2, close + THEN_REASONING.len(), SEND_PANE)
-            }
-            _ => line.len(),
-        };
-        found.push((v2, end));
-    }
-    let mut v1 = find_from(line, PANE_V1, at);
-    while let Some(i) = v1 {
-        if line[i + PANE_V1.len()..].contains("” Its reasoning:") {
-            found.push((i, legacy_end(line, i, SEND_PANE)));
-            break;
+    for open in [PANE_V2, PANE_V2_OLD] {
+        if let Some(v2) = find_from(line, open, at) {
+            let question = find_from(line, "”", v2 + open.len());
+            let end = match question {
+                Some(close) if line[close..].starts_with(THEN_REASONING) => {
+                    closed_end(line, v2, close + THEN_REASONING.len(), SEND_PANE)
+                }
+                _ => line.len(),
+            };
+            found.push((v2, end));
         }
-        v1 = find_from(line, PANE_V1, i + 1);
+    }
+    for open in [PANE_V1, PANE_V1_OLD] {
+        let mut v1 = find_from(line, open, at);
+        while let Some(i) = v1 {
+            if line[i + open.len()..].contains("” Its reasoning:") {
+                found.push((i, legacy_end(line, i, SEND_PANE)));
+                break;
+            }
+            v1 = find_from(line, open, i + 1);
+        }
     }
     let mut card = find_from(line, CARD_OPEN, at);
     while let Some(i) = card {
@@ -962,7 +980,7 @@ pub fn strip_forwards(source: &str) -> String {
     for at in 0..lines.len() {
         let here = js_trim(&lines[at]).to_string();
         let v1 = BAND_SAID.contains(&here.as_str());
-        let v2 = here == BAND_QUOTED;
+        let v2 = is_band_quoted(&here);
         if !v1 && !v2 && !NOTE_OPENERS.contains(&here.as_str()) {
             continue;
         }
@@ -1081,7 +1099,7 @@ pub fn sent_questions(text: &str) -> Vec<String> {
     let lines: Vec<&str> = flat.split('\n').collect();
     let mut out = Vec::new();
     for (at, line) in lines.iter().enumerate() {
-        for open in [PANE_V2, PANE_V1] {
+        for open in [PANE_V2, PANE_V2_OLD, PANE_V1, PANE_V1_OLD] {
             let mut i = find_from(line, open, 0);
             while let Some(start) = i {
                 if let Some(close) = find_from(line, "” Its reasoning:", start + open.len()) {
@@ -1092,7 +1110,7 @@ pub fn sent_questions(text: &str) -> Vec<String> {
         }
         let here = js_trim(line);
         let v1 = BAND_SAID.contains(&here);
-        if !v1 && here != BAND_QUOTED {
+        if !v1 && !is_band_quoted(here) {
             continue;
         }
         let mut above = at as isize - 1;
@@ -1136,7 +1154,7 @@ pub trait Logged {
 /// forward spans holds, compared in the form v2 writes it (straight), the band's `clean_for_draft`
 /// or not. The newest such dream.
 pub fn dream_sent<'a, T: Logged>(text: &str, dreams: &'a [T]) -> Option<&'a T> {
-    if !text.contains(DREAMER_SAID) {
+    if !text.contains(DREAMER_SAID) && !text.contains(DREAMER_SAID_OLD) {
         return None;
     }
     let asked: HashSet<String> = sent_questions(text).iter().map(|q| straight(q)).collect();

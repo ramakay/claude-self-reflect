@@ -303,7 +303,7 @@ fn buttons_of(view: &Value) -> Vec<Button> {
         Some("explained") => {
             row.push(button("band-understood", "1", "Understood"));
             let chat = if dream {
-                "Ask Claude"
+                "Ask the agent"
             } else {
                 "Chat in main session"
             };
@@ -402,7 +402,7 @@ async fn turn_off(cx: &Ctx, shown: &Value) -> Result<()> {
     set_view(cx, view)
 }
 
-/// Chat in main session / Ask Claude: the note into the prompt box, if the box is empty.
+/// Chat in main session / Ask the agent: the note into the prompt box, if the box is empty.
 async fn chat(cx: &Ctx, shown: &Value) -> Result<()> {
     let boxed = cx.host.call("prompt.read", vec![]).await.ok();
     if boxed.is_some_and(|read| !js_trim(read["text"].as_str().unwrap_or("")).is_empty()) {

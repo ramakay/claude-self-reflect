@@ -1539,7 +1539,7 @@ fn forwarded_note_headline(text: &str) -> Option<String> {
             .strip_prefix('\u{201c}')
             .and_then(|inner| inner.strip_suffix('\u{201d}'))
             .unwrap_or(question);
-        return (!question.starts_with(crate::extraction::provenance::DREAMER_ATTRIBUTION)
+        return (!crate::extraction::provenance::starts_with_dreamer_attribution(question)
             && !question.contains('\n'))
         .then(|| question.to_string());
     }

@@ -329,8 +329,25 @@ pub fn is_csr_emission(text: &str) -> bool {
         >= 2
 }
 
-/// The attribution sentence the companion dreamer's "ask Claude" message carries.
-pub(crate) const DREAMER_ATTRIBUTION: &str = "CSR's dreamer asked this while you worked";
+/// The attribution sentence the companion dreamer's "ask the agent" message carries today.
+pub(crate) const DREAMER_ATTRIBUTION: &str = "Self-Reflect's dreamer asked this while you worked";
+
+/// The attribution sentence before the Self-Reflect rename. Older transcripts carry it, so it is read
+/// (suppressed) exactly as the current one is; only [`DREAMER_ATTRIBUTION`] is written.
+pub(crate) const DREAMER_ATTRIBUTION_OLD: &str = "CSR's dreamer asked this while you worked";
+
+/// Both wordings, current first.
+const DREAMER_ATTRIBUTIONS: [&str; 2] = [DREAMER_ATTRIBUTION, DREAMER_ATTRIBUTION_OLD];
+
+/// True when `text` holds either wording of the dreamer's attribution sentence.
+pub(crate) fn has_dreamer_attribution(text: &str) -> bool {
+    DREAMER_ATTRIBUTIONS.iter().any(|a| text.contains(a))
+}
+
+/// True when `text` opens with either wording of the attribution sentence.
+pub(crate) fn starts_with_dreamer_attribution(text: &str) -> bool {
+    DREAMER_ATTRIBUTIONS.iter().any(|a| text.starts_with(a))
+}
 
 /// The band's attribution paragraph, word for word. Forward grammar v2 (`.plans/release-10.1/forward-grammar.md`)
 /// marks its own with `quoted`: [`DREAMER_BAND_QUOTED`]. Legacy (v1) forms already sit in transcripts:
@@ -338,15 +355,24 @@ pub(crate) const DREAMER_ATTRIBUTION: &str = "CSR's dreamer asked this while you
 /// (1d23d675) carry the second. A paragraph that only opens with the attribution's words is the person's: "...
 /// while you worked yesterday, but I wrote today's question myself." (Codex review r2, #7).
 const DREAMER_BAND_QUOTED: &str =
+    "Self-Reflect's dreamer asked this while you worked, quoted. Its reasoning:";
+const DREAMER_BAND_QUOTED_OLD: &str =
     "CSR's dreamer asked this while you worked, quoted. Its reasoning:";
-const DREAMER_BAND_LEGACY: [&str; 2] = [
+const DREAMER_BAND_LEGACY: [&str; 4] = [
+    "Self-Reflect's dreamer asked this while you worked. Its reasoning:",
+    "Self-Reflect's dreamer asked this while you worked. It is a question, not a task.",
     "CSR's dreamer asked this while you worked. Its reasoning:",
     "CSR's dreamer asked this while you worked. It is a question, not a task.",
 ];
 
+/// The v2 (`quoted`) band attribution, in either wording.
+fn is_band_quoted(line: &str) -> bool {
+    line == DREAMER_BAND_QUOTED || line == DREAMER_BAND_QUOTED_OLD
+}
+
 fn is_band_attribution(line: &str) -> bool {
     let line = line.trim();
-    line == DREAMER_BAND_QUOTED || DREAMER_BAND_LEGACY.contains(&line)
+    is_band_quoted(line) || DREAMER_BAND_LEGACY.contains(&line)
 }
 
 /// What marks a v2 one-line forward right after its header: its body follows, wrapped in curly quotes. The
@@ -500,7 +526,10 @@ fn body_forward_end(
 
 /// The pane's dream starting at `start` (where the attribution sentence is): its end, or `None`.
 fn pane_dream_end(line: &str, start: usize) -> Option<(usize, bool)> {
-    let after = start + DREAMER_ATTRIBUTION.len();
+    let attribution = DREAMER_ATTRIBUTIONS
+        .iter()
+        .find(|a| line[start..].starts_with(**a))?;
+    let after = start + attribution.len();
     let rest = &line[after..];
     if rest.starts_with(QUOTED_OPEN) {
         let limit = send_limit(line, start, DREAMER_PANE_SEND_CHARS);
@@ -519,11 +548,14 @@ fn pane_dream_end(line: &str, start: usize) -> Option<(usize, bool)> {
 /// The first one-line forward in `line` at or after byte `from`: its `(start, end)`. The card and the story count
 /// only when `others`.
 fn next_one_line_forward(line: &str, from: usize, others: bool) -> Option<(usize, usize, bool)> {
-    let dream = line[from..]
-        .match_indices(DREAMER_ATTRIBUTION)
-        .find_map(|(at, _)| {
-            pane_dream_end(line, from + at).map(|(end, bounded)| (from + at, end, bounded))
-        });
+    let dream = DREAMER_ATTRIBUTIONS
+        .iter()
+        .filter_map(|attribution| {
+            line[from..].match_indices(attribution).find_map(|(at, _)| {
+                pane_dream_end(line, from + at).map(|(end, bounded)| (from + at, end, bounded))
+            })
+        })
+        .min_by_key(|found| found.0);
     let card = || {
         line[from..]
             .match_indices(COMPACTION_CARD_OPEN)
@@ -619,7 +651,7 @@ fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize)> 
 /// Read `text` by line for the forwards [`strip_csr_forwards`] names (the card and the story only when `others`).
 /// `None` when there are none.
 fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
-    if !text.contains(DREAMER_ATTRIBUTION)
+    if !has_dreamer_attribution(text)
         && !(others && (text.contains(COMPACTION_CARD_OPEN) || text.contains(STORY_OPEN)))
     {
         return None;
@@ -646,7 +678,7 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
         if kept[at].is_none() || !is_band_attribution(lines[at]) {
             continue;
         }
-        let v2 = lines[at].trim() == DREAMER_BAND_QUOTED;
+        let v2 = is_band_quoted(lines[at].trim());
         // The question: the line above, past at least one blank line.
         let mut above = at;
         while above > 0 && blank(lines[above - 1]) {
@@ -730,7 +762,7 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
 
 // The pane follows its displayed prompt grammar without changing import classification.
 fn scan_companion_forwards(text: &str, others: bool) -> Option<Forwards> {
-    if !text.contains(DREAMER_ATTRIBUTION)
+    if !has_dreamer_attribution(text)
         && !(others
             && (text.contains(COMPACTION_CARD_OPEN)
                 || text.contains(STORY_OPEN)
@@ -764,7 +796,7 @@ fn scan_companion_forwards(text: &str, others: bool) -> Option<Forwards> {
         if kept[at].is_none() || !(is_band_attribution(lines[at]) || note) {
             continue;
         }
-        let v2 = lines[at].trim() == DREAMER_BAND_QUOTED;
+        let v2 = is_band_quoted(lines[at].trim());
         // The question: the nearest nonblank line above the attribution.
         let mut above = at;
         while above > 0 && blank(lines[above - 1]) {
@@ -1438,6 +1470,56 @@ mod tests {
                 &format!("I vote\t2{forward} Keep the deployment frozen."),
                 Some("I vote\t2 Keep the deployment frozen."),
             );
+        }
+    }
+
+    /// The dreamer's attribution was renamed "CSR's dreamer" -> "Self-Reflect's dreamer". What is
+    /// written now and what old transcripts carry must both be suppressed, in every form.
+    #[test]
+    fn the_self_reflect_and_the_old_csr_dreamer_wordings_are_both_suppressed() {
+        for who in ["Self-Reflect's dreamer", "CSR's dreamer"] {
+            let band_v1 = format!(
+                "What if we reuse the palette?\n\n{who} asked this while you worked. Its reasoning:\n\n> **Reuse**\n> Shared colours."
+            );
+            let band_v2 = format!(
+                "\u{201c}What if we reuse the palette?\u{201d}\n\n{who} asked this while you worked, quoted. Its reasoning:\n\n> **Reuse**\n> Shared colours."
+            );
+            let pane_v1 = format!(
+                "{who} asked this while you worked: \u{201c}What if?\u{201d} Its reasoning: Queue. Moved."
+            );
+            let pane_v2 = format!(
+                "{who} asked this while you worked, quoted: \u{201c}What if?\u{201d} Its reasoning: \u{201c}Queue moved.\u{201d}"
+            );
+            for whole in [&band_v1, &band_v2] {
+                assert!(is_dreamer_prompt(whole), "{who}: {whole}");
+                assert!(is_csr_emission(whole), "{who}: {whole}");
+                assert_eq!(strip_dreamer_prompt(whole).as_deref(), Some(""), "{who}");
+                assert_eq!(extractable(whole), None, "{who}: {whole}");
+                assert!(labeled(whole), "import labels {who}: {whole}");
+            }
+            // v1 never searches for a closing quote, so it runs to the end of its line; v2 ends at its
+            // closing quote and the person's words after it stay.
+            for (line, after) in [(&pane_v1, ""), (&pane_v2, " Thanks.")] {
+                assert!(is_csr_emission(line), "{who}: {line}");
+                assert_eq!(strip_csr_forwards(line).as_deref(), Some(""), "{who}");
+                assert!(labeled(line), "import labels {who}: {line}");
+                let mixed = format!("Keep it frozen. {line}{after}");
+                assert_eq!(
+                    strip_csr_forwards(&mixed).as_deref(),
+                    Some(if after.is_empty() {
+                        "Keep it frozen."
+                    } else {
+                        "Keep it frozen. Thanks."
+                    }),
+                    "{who}"
+                );
+            }
+            // The person talking ABOUT the dreamer is never suppressed, in either wording.
+            let talk = format!(
+                "{who} asked this while you worked yesterday, but I wrote today's question myself."
+            );
+            assert!(!is_dreamer_prompt(&talk));
+            assert_eq!(strip_csr_forwards(&talk), None, "{who}");
         }
     }
 

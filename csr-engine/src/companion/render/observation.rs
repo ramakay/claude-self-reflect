@@ -1,4 +1,4 @@
-//! The detail popup of an observation card ("Confused Claude", "Should be a skill / memory / tool").
+//! The detail popup of an observation card ("What confused the agent", "Should be a skill / memory / tool").
 //! A card row is one truncated line; the popup shows one item in full, what happened, and a next
 //! step. The explanation and next step come from the dreamer when it wrote them (`explain`, `next`)
 //! and are otherwise composed here from the item's kind, line and evidence. No model runs at
@@ -143,7 +143,7 @@ fn next_step(card: ObsCard, item: &Value) -> String {
         ),
         ObsCard::ShouldBe => match should_be_kind(item) {
             "skill" => "Press c to copy a skill draft, then save it as .claude/skills/<name>/SKILL.md.",
-            "memory" => "Press c to copy a memory draft, then ask Claude to remember it.",
+            "memory" => "Press c to copy a memory draft, then ask the agent to remember it.",
             "hook" => "Press c to copy a hook sketch, then add the hook to your settings.",
             "CLAUDE.md rule" => "Press c to copy the rule, then paste it into CLAUDE.md.",
             _ => "Press c to copy a tool sketch, then turn it into a small script Claude can call.",
@@ -189,7 +189,7 @@ fn send_text(card: ObsCard, item: &Value, explain: &str) -> String {
         ObsCard::More => String::new(),
         ObsCard::Confusing => format!(
             "{opener}\n\n{}\n\nYou may have gone off course here. Please say what you got wrong and correct course.",
-            quoted(&format!("Confused Claude: {line}\nEvidence: {evidence}"))
+            quoted(&format!("What confused the agent: {line}\nEvidence: {evidence}"))
         ),
         ObsCard::ShouldBe => {
             let kind = should_be_kind(item);
@@ -215,7 +215,7 @@ pub fn detail(items: &[Value], at: PopupAt) -> Option<Detail> {
     );
     let copy = match at.card {
         ObsCard::Confusing => format!(
-            "Confused Claude: {line}\nEvidence: {evidence}\nWhat happened: {explain}\nNext step: {next}\n"
+            "What confused the agent: {line}\nEvidence: {evidence}\nWhat happened: {explain}\nNext step: {next}\n"
         ),
         ObsCard::ShouldBe => draft(item, &explain),
         ObsCard::More => format!("{}\n{line}\n", string(&item["title"])),
@@ -651,7 +651,7 @@ mod tests {
         assert!(d.next.starts_with("Re-read turns 12, 15"), "{}", d.next);
         // The copy carries the item and its explanation.
         for want in [
-            "Confused Claude: Repeated the rejected approach.",
+            "What confused the agent: Repeated the rejected approach.",
             "Evidence: Turns 12 and 15: 'keep it local'",
             "What happened: The dreamer flagged",
             "Next step: Re-read turns 12, 15",
@@ -802,7 +802,7 @@ mod tests {
         let d = detail(&items, at(ObsCard::Confusing, 0)).unwrap();
         assert_eq!(
             d.send,
-            "Here is a note offered by CSR (claude-self-reflect):\n\n> Confused Claude: Said it passed.\n> Evidence: Turn 3: 'it should pass'\n\nYou may have gone off course here. Please say what you got wrong and correct course."
+            "Here is a note offered by CSR (claude-self-reflect):\n\n> What confused the agent: Said it passed.\n> Evidence: Turn 3: 'it should pass'\n\nYou may have gone off course here. Please say what you got wrong and correct course."
         );
         let items = vec![json!({"kind":"CLAUDE.md","line":"Run fmt.","evidence":"Turn 4: 'fmt'"})];
         let d = detail(&items, at(ObsCard::ShouldBe, 0)).unwrap();

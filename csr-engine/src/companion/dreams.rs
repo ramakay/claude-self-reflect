@@ -250,7 +250,7 @@ pub fn feed(dreams: &[Value], chapter: &Value, sid: &str) -> Value {
 }
 pub fn answer_word(word: &str) -> &str {
     match word {
-        "ask_claude" => "asked Claude",
+        "ask_claude" => "asked the agent",
         "thought_of_it" => "you'd thought of it",
         "not_relevant" => "not relevant",
         "got_it" => "read",

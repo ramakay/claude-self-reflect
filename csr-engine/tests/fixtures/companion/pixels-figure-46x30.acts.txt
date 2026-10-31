@@ -1,6 +1,6 @@
 14	{"key":"instrument:dreams"}
 15	{"key":"instrument:dreams"}
-16	{"dream":"newest","key":"dream:newest","send":"CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”","spans":[[0,11,"helpful"],[11,23,"thought_of_it"],[23,34,"not_relevant"],[34,46,"ask_claude"]]}
+16	{"dream":"newest","key":"dream:newest","send":"Self-Reflect's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”","spans":[[0,11,"helpful"],[11,23,"thought_of_it"],[23,34,"not_relevant"],[34,46,"ask_claude"]]}
 18	{"key":"instrument:threads"}
 20	{"key":"instrument:changes"}
 21	{"key":"instrument:figure"}

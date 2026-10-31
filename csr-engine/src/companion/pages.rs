@@ -122,7 +122,7 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
             .collect();
         send::closed_send(
             &format!(
-                "CSR's dreamer asked this while you worked, quoted: “{}” Its reasoning:",
+                "Self-Reflect's dreamer asked this while you worked, quoted: “{}” Its reasoning:",
                 send::straight(string(&d["line"]))
             ),
             &format!(
@@ -1330,7 +1330,7 @@ fn draw_sections(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
                     ],
                     [
                         ("not_relevant", "✗ not relevant"),
-                        ("ask_claude", "→ ask Claude"),
+                        ("ask_claude", "→ ask the agent"),
                     ],
                 ] {
                     let mut text = " ".repeat(at);

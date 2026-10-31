@@ -5,7 +5,7 @@ the star of the pane, as you wanted on
 0.82 · pane redesign · ⌗6ca2a4d5 10-09
 +2 more · dreamer 14k of 40k
 1 helpful · 2 thought of it
-3 not relevant · 4 ask Claude
+3 not relevant · 4 ask the agent
 Story · refreshed <1m ago
 Text parity is ready for review.
 ~ reader.rs · read ⌗8e4e3f27
