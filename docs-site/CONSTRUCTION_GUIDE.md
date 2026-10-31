@@ -1147,8 +1147,8 @@ Typography specs:
 - Section number `03`: JetBrains Mono, 16px, 500, color `#6b5b95`.
 - Headline `The Search`: Newsreader, 19px, 650, color `#1a1a2e`, line-height 1.08.
 - Query `"auth bug from last week"`: JetBrains Mono, 14px, 500, color `#1a1a2e`, line-height 1.45.
-- Metric `<1ms`: JetBrains Mono, 32px, 700, color `#1a1a2e`, line-height 1.
-- Caption `local vector lookup`: Inter, 11px, 500, color `#767692`, line-height 1.35.
+- Metric `1ms target`: JetBrains Mono, 32px, 700, color `#1a1a2e`, line-height 1.
+- Caption `index lookup only, not a full recall`: Inter, 11px, 500, color `#767692`, line-height 1.35.
 - p95 callout: JetBrains Mono, 11px, 500, color `#6b5b95`.
 
 Data visualization specs:
@@ -1158,7 +1158,7 @@ Data visualization specs:
 - Stroke: `#6b5b95`, strokeWidth `2`, strokeLinecap `round`, pathLength `1`
 - Fill path: `M6 24 L48 34 L90 28 L132 40 L174 33 L174 58 L6 58 Z`, fill `rgba(107,91,149,0.08)`
 - Axis labels: `0ms`, `1ms`, `2ms`
-- Callout: `p95 0.82ms`
+- Callout: `p95 lookup, timed by eval`
 
 Animation specs:
 
@@ -1202,9 +1202,9 @@ function SearchCard() {
         <div className="result-strip type-caption">Related file / hooks.yaml</div>
       </div>
       <div className="rule mt-4 pt-4">
-        <p className="type-metric-lg">&lt;1ms</p>
-        <p className="type-caption mt-1">local vector lookup</p>
-        <svg viewBox="0 0 180 64" role="img" aria-label="Search latency stays below one millisecond">
+        <p className="type-metric-lg">1ms target</p>
+        <p className="type-caption mt-1">index lookup only, not a full recall</p>
+        <svg viewBox="0 0 180 64" role="img" aria-label="The index lookup targets one millisecond; a full recall takes longer">
           <path d="M6 24 L48 34 L90 28 L132 40 L174 33 L174 58 L6 58 Z" fill="rgba(107,91,149,0.08)" />
           <path
             className="chart-path"
@@ -1216,7 +1216,7 @@ function SearchCard() {
             strokeLinecap="round"
             style={{ animationDelay: '340ms' }}
           />
-          <text x="6" y="62" className="chart-label">p95 0.82ms</text>
+          <text x="6" y="62" className="chart-label">p95 lookup, timed by eval</text>
         </svg>
       </div>
     </BentoCard>
@@ -1431,7 +1431,7 @@ Typography specs:
 
 - Section number `05`: JetBrains Mono, 16px, 500, color `#b5838d`.
 - Headline `One Binary`: Newsreader, 19px, 650, color `#1a1a2e`, line-height 1.08.
-- Main metric `44MB`: JetBrains Mono, 32px, 700, color `#1a1a2e`, line-height 1.
+- Main metric `135MB`: JetBrains Mono, 32px, 700, color `#1a1a2e`, line-height 1.
 - Stamp label `CSR single binary`: JetBrains Mono, 11px, 500, color `#343145`.
 - Caption: Inter, 11px, 500, color `#767692`.
 - Competitor labels: JetBrains Mono, 10px, 500, color `#343145`.
@@ -1441,7 +1441,7 @@ Data visualization specs:
 - Stamp SVG viewBox: `0 0 150 150`
 - Circle path: `M75 14 A61 61 0 1 1 74.9 14`, stroke `rgba(26,26,46,0.62)`, strokeWidth `2`, fill `rgba(246,230,169,0.20)`
 - Competitor stack values: Docker, Python, DB, plus caption `~1.2GB and 40+ dependencies`
-- CSR value: `44MB`
+- CSR value: `135MB`
 
 Animation specs:
 
@@ -1467,9 +1467,9 @@ function OneBinaryCard() {
         <span className="card-kicker__rule" />
       </div>
       <h2 className="type-card-headline-sm">One Binary</h2>
-      <div className="binary-stamp" aria-label="Claude Self-Reflect is a 44 megabyte single binary">
+      <div className="binary-stamp" aria-label="Claude Self-Reflect is a single binary of about 135 megabytes">
         <div>
-          <p className="type-metric-lg text-center">44MB</p>
+          <p className="type-metric-lg text-center">135MB</p>
           <p className="type-caption text-center">CSR single binary</p>
         </div>
       </div>

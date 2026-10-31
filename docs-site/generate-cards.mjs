@@ -89,7 +89,7 @@ Layout:
   {
     output: 'card-02-arch-dark.png',
     source: 'card-02-arch-dark.png',
-    title: 'One Binary. 78MB.',
+    title: 'One Binary. About 135 MB.',
     prompt: `
 ${sharedStyle}
 
@@ -98,16 +98,16 @@ Theme:
 
 Exact content:
 - Top-left small section number: "02".
-- Large headline: "One Binary. 78MB."
+- Large headline: "One Binary. About 135 MB."
 - Subtitle: "Everything runs locally. No Docker. No database. No API keys."
 - Central architecture panel labeled "csr-engine" at the top center.
 - Inside the panel, four rounded rectangular modules connected left-to-right by arrows:
   1. Purple module labeled "SQLite".
-  2. Magenta module labeled "HNSW" with small sublabel "<1ms".
+  2. Magenta module labeled "HNSW" with small sublabel "index lookup".
   3. Blue module labeled "FastEmbed" with small sublabel "384-dim".
   4. Green module labeled "AST" with small sublabel "6 languages".
-- Text below the panel: "6 hooks across session lifecycle. 16 MCP tools for search."
-- Bottom badges: "local-first" and "93ms startup".
+- Text below the panel: "7 hooks across session lifecycle. 16 MCP tools for search."
+- Bottom badges: "local-first" and "cached startup".
 
 Layout:
 - Match the source dark card: headline and subtitle at top, wide horizontal architecture diagram across the middle, statement and two badges centered below.
@@ -116,7 +116,7 @@ Layout:
   {
     output: 'card-02-arch-light.png',
     source: 'card-02-arch-light.png',
-    title: 'One Binary. 78MB.',
+    title: 'One Binary. About 135 MB.',
     prompt: `
 ${sharedStyle}
 
@@ -125,16 +125,16 @@ Theme:
 
 Exact content:
 - Top-left small section number: "02".
-- Large headline: "One Binary. 78MB."
+- Large headline: "One Binary. About 135 MB."
 - Subtitle: "Everything runs locally. No Docker. No database. No API keys."
 - Central architecture diagram with a center rounded rectangle labeled "csr-engine".
 - Four rounded module boxes arranged around the center and connected by arrows:
   1. Upper left purple box labeled "SQLite" with a small database cylinder icon.
-  2. Upper right green box labeled "HNSW" with small sublabel "<1ms" and a graph/vector icon.
+  2. Upper right green box labeled "HNSW" with small sublabel "index lookup" and a graph/vector icon.
   3. Lower left red/pink box labeled "FastEmbed" with small sublabel "384-dim" and a brain icon.
   4. Lower right green box labeled "AST" with small sublabel "6 languages" and a tree icon.
-- Text centered below diagram: "6 hooks across session lifecycle. 16 MCP tools for search."
-- Bottom badges: "local-first" and "93ms startup".
+- Text centered below diagram: "7 hooks across session lifecycle. 16 MCP tools for search."
+- Bottom badges: "local-first" and "cached startup".
 
 Layout:
 - Match the source light card: framed card centered on a pale backdrop, divider line near the top, architecture diagram in the middle, statement and badges below.

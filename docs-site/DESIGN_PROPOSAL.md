@@ -154,8 +154,8 @@ Typography:
 
 - Headline: "The Search", small serif.
 - Query: `"auth bug from last week"` in mono.
-- Metric: "<1ms", mono metric large.
-- Caption: "local vector lookup"
+- Metric: "1ms target", mono metric large.
+- Caption: "index lookup only, not a full recall"
 
 Visual treatment:
 
@@ -165,7 +165,7 @@ Visual treatment:
 Data shown:
 
 - Sparkline of search latency over time: 0.9ms, 0.7ms, 0.8ms, 0.6ms, 0.7ms.
-- Callout: "p95 0.82ms".
+- Callout: "p95 lookup, timed by eval".
 
 Interaction:
 
@@ -201,23 +201,23 @@ Interaction:
 
 ### 5. One Binary
 
-Layout: compact comparison card with a 44MB circle on the left and competitor stack on the right.
+Layout: compact comparison card with a 135MB circle on the left and competitor stack on the right.
 
 Typography:
 
 - Headline: "One Binary", small serif.
-- Main metric: "44MB", mono metric large.
+- Main metric: "135MB", mono metric large.
 - Caption: "ship it as a single artifact"
 
 Visual treatment:
 
-- The 44MB circle is a quiet ink stamp, not a shiny badge.
+- The 135MB circle is a quiet ink stamp, not a shiny badge.
 - Competitor stack appears as three offset post-it strips labeled Docker, Python, DB.
 - A small note reads "less to remember before memory can work".
 
 Data shown:
 
-- CSR: 44MB.
+- CSR: 135MB.
 - Competitor stack: Docker + Python + DB, shown as layered blocks.
 
 Interaction:

@@ -275,7 +275,7 @@ Claude Self-Reflect should differentiate around operational simplicity, local sp
 
 ### Single Binary, Not a Multi-Service Stack
 
-The strongest practical advantage is the single 44MB `csr-engine` binary. A prospect does not have to reason about a separate worker, Python vector service, Chroma, Qdrant daemon, Bun process manager, Docker Compose, Valkey, OAuth remote MCP, or a dashboard service. The product story is: install the binary, run `csr-engine setup`, restart Claude Code.
+The strongest practical advantage is the single `csr-engine` binary of about 135 MB. A prospect does not have to reason about a separate worker, Python vector service, Chroma, Qdrant daemon, Bun process manager, Docker Compose, Valkey, OAuth remote MCP, or a dashboard service. The product story is: install the binary, run `csr-engine setup`, restart Claude Code.
 
 That matters because memory tools fail when users cannot tell which process owns ingest, embeddings, search, hooks, and MCP. A single-process architecture makes support, upgrades, and mental model much simpler.
 
@@ -292,9 +292,9 @@ The buyer-facing message is not just "easier install." It is fewer ways to fail:
 - No embedding server.
 - No mandatory cloud API cost.
 
-### Sub-Millisecond Search
+### Fast Local Lookup
 
-Claude Self-Reflect's current README claims p95 search latency under 1ms, cached startup at 93ms, embedding at 0.73ms/text batch, and HNSW approximate nearest-neighbor search. This should be front and center. Many competitors claim memory intelligence, but few can credibly make "search is effectively instant" the default local UX.
+Claude Self-Reflect's README states a vector index lookup target of under 1 ms (p95, timed by `csr-engine eval` on the user's own index). That figure covers the lookup only, not a full recall call: keyword ranking, verdict annotation and reranking sit on top of it, and a full `csr_reflect_on_past` call takes a fraction of a second to a second or two on a large corpus. Cached startup loads the saved index and grows with index size, and embedding runs locally with no API call. Say "local, no API call" and quote the lookup figure only with its scope.
 
 This lets the product support prompt-time and hook-time retrieval without making Claude Code feel sluggish.
 
