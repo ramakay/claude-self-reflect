@@ -944,6 +944,13 @@ body {
   margin: 12px 0 6px;
 }
 
+ul.latency-compare {
+  list-style: none;
+  padding: 0;
+  font-size: 0.8125rem;
+  line-height: 1.6;
+}
+
 .bar-horiz {
   transform: scaleX(0);
   transform-box: fill-box;
@@ -1087,7 +1094,7 @@ body {
   color: var(--color-heading);
 }
 
-/* Multi-source card (v9.4) — task ledger micro-animation */
+/* Multi-source card — task ledger micro-animation */
 .card--multisource {
   background:
     radial-gradient(circle at 75% 20%, rgba(124,148,115,0.14), transparent 55%),

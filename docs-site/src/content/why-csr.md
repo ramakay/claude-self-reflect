@@ -12,15 +12,15 @@ Claude Code has no persistent memory. Every session starts from zero. Architectu
 
 Most memory tools require multiple services: vector databases, Python runtimes, Docker containers, background daemons, web UI servers.
 
-CSR is a single 94MB binary. SQLite, HNSW search, FastEmbed embeddings, MCP server, and all 6 hooks — compiled into one executable.
+CSR is a single 94MB binary. SQLite, HNSW search, FastEmbed embeddings, MCP server, and all 7 hooks — compiled into one executable.
 
 | | CSR | Typical Memory Tool |
 |--|-----|---------------------|
 | **Install** | `curl \| sh` (one command, asks before activating) | npm + Docker + Python + DB |
 | **Dependencies** | None | Docker, Python, vector DB, Node.js |
 | **Processes** | 1 (on-demand) | 3-5 background services |
-| **Startup** | Seconds (cached index load; 7s at 834K chunks) | Seconds to minutes |
-| **Search** | <1ms (HNSW) | 10-100ms typical |
+| **Startup** | Loads a saved index; time grows with index size | Seconds to minutes |
+| **Search** | Local in-memory HNSW index | Network round trip to a hosted service |
 
 ### Active Injection, Not Passive Search
 

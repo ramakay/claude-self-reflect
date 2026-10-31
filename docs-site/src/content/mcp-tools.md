@@ -17,7 +17,7 @@ Semantic search across all past conversations.
 | min_score | float | 0.3 | Minimum similarity (0-1) |
 
 ### csr_quick_check
-Fast existence check — count + top match only, with measured abstention (v9.5).
+Fast existence check — count + top match only, with measured abstention.
 
 The score floor is derived from probing topics that were never discussed
 against the full corpus. Below the floor the tool refuses rather than
@@ -50,7 +50,7 @@ Time-constrained search. Supports: "today", "last week", "last 3 months", etc.
 Find conversations that discussed or modified a file. Uses 2-component matching (parent + filename).
 
 For code files with graph coverage, returns a per-symbol ledger with
-two-channel attribution (v9.5) — each symbol shows *how* its origin is known,
+two-channel attribution — each symbol shows *how* its origin is known,
 never a guess:
 
 ```xml
@@ -81,7 +81,7 @@ Pagination for additional results.
 ### csr_code_graph
 Conversation-provenance code graph. Query which conversations touched a function or file — AST anchors link code symbols to the sessions that shaped them.
 
-Since v9.5, every edge and origin claim is evidence-labeled: call/import
+Every edge and origin claim is evidence-labeled: call/import
 edges resolve only through recorded witnesses (or state why they cannot —
 `external`, `method-dispatched`, `stale`, `local`), symbol origins come from
 the two-channel attribution described under `csr_search_by_file`, and the

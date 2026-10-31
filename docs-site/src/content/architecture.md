@@ -10,7 +10,7 @@ CSR is a single 94MB Rust binary. Everything — storage, search, embeddings, MC
 
 ## Hooks: The Active Memory Loop
 
-Six hooks fire at strategic moments during Claude Code sessions. They run inline as CLI subcommands — no background daemon.
+Seven hooks fire at strategic moments during Claude Code sessions. They run inline as CLI subcommands — no background daemon.
 
 ![Hooks Lifecycle Diagram](/claude-self-reflect/images/hooks-diagram.png)
 
@@ -21,25 +21,24 @@ All hooks use catch-all error handling — they log and return OK, never blockin
 ### JSONL Parser (`src/import/`)
 Parses Claude Code conversations from `~/.claude/projects/**/*.jsonl`. Splits into searchable chunks and extracts tool context from `tool_use` blocks. Since ~74% of Claude Code sessions are tool interactions, this extraction produces 2.8x more searchable content.
 
-**Speed**: ~20 conversations/second using batch embedding.
+Conversations are embedded in batches.
 
 ### Embedding Engine (`src/embeddings/`)
 Uses FastEmbed with `all-MiniLM-L6-v2` to generate 384-dimensional vectors locally. No API calls, no cloud service.
 
-| Operation | Latency |
-|-----------|---------|
-| Single embed | 2.5ms |
-| Batch (10 texts) | 7.3ms (0.73ms each) |
-| Model size | ~23MB (cached locally) |
+| Property | Value |
+|----------|-------|
+| Model file | 90MB (cached locally; measured 90,387,630 bytes) |
+| Batching | Texts are embedded in batches |
 
 ### HNSW Search Index (`src/search/`)
 Hierarchical Navigable Small World graph for approximate nearest neighbor search. Index lives in memory, persisted to disk for fast reload.
 
 | Operation | Latency |
 |-----------|---------|
-| Search (p95) | < 1ms |
-| Cached startup | 7.1s with an 834K-chunk index; scales with index size |
-| Cold startup | ~14s (rebuild from SQLite) |
+| Index lookup (p95) | Timed by `csr-engine eval` on your own index; the target is under 1 ms. It covers the lookup only, not a full recall call. |
+| Cached startup | Loads the saved index; the time grows with index size |
+| Cold startup | Rebuilds the index from SQLite; slower than a cached load |
 
 Staleness detection via `IndexManifest` — rebuilds only when DB has new data.
 
@@ -89,7 +88,7 @@ source code → language detect → tree-sitter parse → AST → extract nodes 
 AST parsing is wrapped in `catch_unwind` for robustness — malformed code won't crash the engine.
 
 ### Continuity Engine (`src/provenance.rs`, `src/ledger/`, `src/governor/`)
-Provenance-aware retrieval added in v9.2. Every chunk carries speaker attribution, source conversation, and supersession state. The re-ranker demotes assistant scaffold text (proposals, plans) and boosts primary sources (decisions, outcomes), so recall favors what actually happened. A Derivation Ledger tracks where injected context came from, and an Injection Governor applies reuse tracking and an anti-flap budget so repeated prompts don't thrash the same context in and out.
+Retrieval is provenance-aware. Every chunk carries speaker attribution, source conversation, and supersession state. The re-ranker demotes assistant scaffold text (proposals, plans) and boosts primary sources (decisions, outcomes), so recall favors what actually happened. A Derivation Ledger tracks where injected context came from, and an Injection Governor applies reuse tracking and an anti-flap budget so repeated prompts don't thrash the same context in and out.
 
 Verified live: `csr-engine eval --continuity-live` probes the real index (not fixtures) against a grep baseline.
 
@@ -125,6 +124,6 @@ score = raw_score * ((1 - 0.3) + 0.3 * 2^(-age_days / 90))
 
 **Why SQLite over Qdrant?** — Eliminated Docker dependency entirely. Single-file database is easy to backup, move, inspect. Good enough for single-user workloads.
 
-**Why HNSW in-memory?** — `sqlite-vec` only supports brute-force KNN. HNSW gives sub-millisecond approximate nearest neighbor search at 15K+ vectors.
+**Why HNSW in-memory?** — `sqlite-vec` only supports brute-force KNN. HNSW gives fast in-memory approximate nearest neighbor search.
 
 **Why FastEmbed over Voyage AI?** — No API key required, no network dependency, no per-query cost, privacy-first. Good enough accuracy for conversation search.

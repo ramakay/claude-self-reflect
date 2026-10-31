@@ -118,7 +118,7 @@ function HookTimeline() {
   ]
 
   return (
-    <svg className="hook-timeline" viewBox="0 0 418 92" role="img" aria-label="Six active memory lifecycle hooks">
+    <svg className="hook-timeline" viewBox="0 0 418 92" role="img" aria-label="Active memory lifecycle hooks">
       <line x1="28" x2="388" y1="38" y2="38" stroke="rgba(107,91,149,0.32)" strokeWidth="2" />
       {nodes.map(([label, x, color], i) => (
         <g key={`${label}-${i}`} className="hook-node">
@@ -137,7 +137,7 @@ function SearchLatencyBars() {
 
   return (
     <figure className="search-bars">
-      <svg viewBox="0 0 220 132" role="img" aria-label="Latency distribution from zero to twenty five milliseconds">
+      <svg viewBox="0 0 220 132" role="img" aria-label="Illustration of search latency bars">
         {[16, 58, 100].map((y) => (
           <line key={y} x1="34" x2="206" y1={y} y2={y} className="chart-grid" />
         ))}
@@ -161,12 +161,6 @@ function SearchLatencyBars() {
             />
           )
         })}
-        <text x="25" y="104" textAnchor="end" className="chart-label">0ms</text>
-        <text x="25" y="62" textAnchor="end" className="chart-label">12</text>
-        <text x="25" y="20" textAnchor="end" className="chart-label">25</text>
-        <text x="34" y="123" textAnchor="middle" className="chart-label">0ms</text>
-        <text x="120" y="123" textAnchor="middle" className="chart-label">12ms</text>
-        <text x="206" y="123" textAnchor="middle" className="chart-label">25ms</text>
       </svg>
     </figure>
   )
@@ -284,10 +278,10 @@ function ActiveMemoryCard() {
       <CardKicker number="02" />
       <h2 className="type-hl-md">Active Memory</h2>
       <p className="type-dateline mt-3">Context appears when you need it</p>
-      <p className="type-body-sm active-copy">Six hooks across the session lifecycle. Context injected at start, on prompt, after edits, on stop, before compaction, and at end. 16 MCP tools for explicit search.</p>
+      <p className="type-body-sm active-copy">Seven hooks across the session lifecycle. Context injected at start, on prompt, after edits, on stop, around compaction, and at end. 16 MCP tools for explicit search.</p>
       <HookTimeline />
       <div className="rule mt-4 pt-4">
-        <p className="active-metric">&lt; 50ms — you never notice</p>
+        <p className="active-metric">Local, inline, no API call</p>
         <p className="type-caption mt-2">Runs locally. Never blocks. <Link to="/docs/hooks" className="type-caption" style={{ color: 'var(--color-purple)' }}>How it works →</Link></p>
       </div>
     </BentoCard>
@@ -299,9 +293,9 @@ function SearchCard() {
     <BentoCard className="card--search" delay={160}>
       <CardKicker number="03" />
       <h2 className="type-hl-sm">The Search</h2>
-      <p className="type-dateline mt-3">From query to relevant memory in</p>
-      <div className="search-metric">&lt;1ms</div>
-      <p className="type-caption">P95 search latency</p>
+      <p className="type-dateline mt-3">From query to relevant memory</p>
+      <div className="search-metric">Local</div>
+      <p className="type-caption">Vector index lookup, timed by csr-engine eval</p>
       <SearchLatencyBars />
       <ul className="search-flow">
         <li>natural language query</li>
@@ -527,7 +521,7 @@ function InstallCard() {
           </div>
           <p className="type-caption mt-2">One command. Downloads binary, then asks before activating hooks + MCP. Restart Claude Code.</p>
           <div className="install-tabs-inline">
-            {['94MB binary', 'zero deps', '6 hooks', '16 MCP tools'].map((label, index) => (
+            {['94MB binary', 'zero deps', '7 hooks', '16 MCP tools'].map((label, index) => (
               <span key={label} className="tear-tab" style={{ animationDelay: `${720 + index * 70}ms` }}>{label}</span>
             ))}
           </div>
@@ -586,7 +580,7 @@ function ArchCard() {
           <TechBadge name="Rust" abbr="zero-cost abstractions" color="var(--color-rose)" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.8" /><path d="M8 16l4-10 4 10M9.5 13h5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" /></svg>
           } />
-          <TechBadge name="HNSW" abbr="vector search <1ms" color="var(--color-purple)" icon={
+          <TechBadge name="HNSW" abbr="in-memory vector search" color="var(--color-purple)" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="6" r="2.5" fill="currentColor" opacity="0.6" /><circle cx="6" cy="16" r="2.5" fill="currentColor" opacity="0.6" /><circle cx="18" cy="16" r="2.5" fill="currentColor" opacity="0.6" /><line x1="12" y1="8.5" x2="7" y2="13.5" stroke="currentColor" strokeWidth="1.2" /><line x1="12" y1="8.5" x2="17" y2="13.5" stroke="currentColor" strokeWidth="1.2" /><line x1="8.5" y1="16" x2="15.5" y2="16" stroke="currentColor" strokeWidth="1.2" /></svg>
           } />
           <TechBadge name="FastEmbed" abbr="384-dim local vectors" color="var(--color-sage)" icon={
@@ -637,7 +631,7 @@ function RotatingQuestions() {
 function AskPipeline() {
   const steps = [
     { label: 'Install', icon: '↓', sub: 'curl | sh' },
-    { label: 'Hooks inject', icon: '⚡', sub: 'auto, <50ms' },
+    { label: 'Hooks inject', icon: '⚡', sub: 'auto, local' },
     { label: 'You ask', icon: '?', sub: 'natural language' },
     { label: 'Next session', icon: '∞', sub: 'context persists' },
   ]
@@ -750,36 +744,18 @@ function ExtractionLossChart() {
 }
 
 function LatencyCompareChart() {
-  // Horizontal bar chart: local <1ms vs cloud 100-500ms
+  // No numbers: neither a local nor a cloud latency figure is measured anywhere in the repo.
   const rows = [
-    { label: 'CSR local', ms: '0.8ms', w: 4, color: 'var(--color-sage)' },
-    { label: 'cloud API', ms: '~300ms', w: 148, color: 'var(--color-rose)' },
+    { label: 'CSR', text: 'runs on your machine' },
+    { label: 'Hosted memory', text: 'every query crosses the network' },
   ]
 
   return (
-    <svg className="latency-compare" viewBox="0 0 240 96" role="img" aria-label="Local search zero point eight milliseconds versus cloud three hundred milliseconds">
-      {rows.map((row, i) => {
-        const y = 10 + i * 42
-        return (
-          <g key={row.label}>
-            <text x="66" y={y + 14} textAnchor="end" className="chart-label">{row.label}</text>
-            <rect
-              className="bar-horiz"
-              x={70} y={y}
-              width={row.w} height="22" rx="3"
-              fill={row.color} opacity="0.65"
-              style={{ animationDelay: `${960 + i * 100}ms` }}
-            />
-            <text x={70 + row.w + 6} y={y + 15} className="chart-label" style={{ fontWeight: 700, fontSize: '11px' }}>{row.ms}</text>
-          </g>
-        )
-      })}
-      {/* Scale */}
-      <line x1="70" x2="220" y1="82" y2="82" className="chart-axis" />
-      <text x="70" y="92" className="chart-label">0</text>
-      <text x="144" y="92" textAnchor="middle" className="chart-label">150ms</text>
-      <text x="220" y="92" textAnchor="end" className="chart-label">300ms</text>
-    </svg>
+    <ul className="latency-compare" aria-label="Where a query runs: locally or over the network">
+      {rows.map((row) => (
+        <li key={row.label}><strong>{row.label}</strong> {row.text}</li>
+      ))}
+    </ul>
   )
 }
 
@@ -825,11 +801,11 @@ function PullQuoteCard() {
           <cite className="pull-quote__attribution">— Claude, comparing its own curated MEMORY.md against CSR in a live session</cite>
         </footer>
       </blockquote>
-      <p className="pull-quote__support type-caption">A hand-curated memory note answered with stale information; CSR's search over past conversations surfaced the current thread in about 20ms.</p>
+      <p className="pull-quote__support type-caption">A hand-curated memory note answered with stale information; CSR's search over past conversations surfaced the current thread.</p>
       <div className="pull-quote__receipts">
         <p className="pull-quote__receipts-label">One session's ledger, misses included — not a benchmark</p>
         <ul className="pull-quote__receipts-list">
-          <li><span className="pull-quote__receipts-metric">0.728 / ~20ms</span>a pre-compaction turn, retrieved after the session had compacted twice</li>
+          <li><span className="pull-quote__receipts-metric">0.728</span>a pre-compaction turn, retrieved after the session had compacted twice</li>
           <li><span className="pull-quote__receipts-metric">0.78</span>a minutes-old message, retrieved after compaction</li>
           <li><span className="pull-quote__receipts-metric">stale</span>MEMORY.md's hand-curated note; retrieval held the current thread</li>
           <li><span className="pull-quote__receipts-metric">2 / 5</span>queries that session came back weak — flagged uncalibrated by the tool itself</li>
@@ -1212,7 +1188,7 @@ function GoDeeper() {
           <strong>Built for long-term context.</strong>
           <p>CSR gives Claude Code a persistent local memory that gets better over time.</p>
         </div>
-        <Link to="/docs/installation">Get started in 60 seconds</Link>
+        <Link to="/docs/installation">Get started</Link>
       </div>
     </section>
   )

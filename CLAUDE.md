@@ -164,7 +164,7 @@ cargo bench --bench spike_bench
 
 ## Hooks
 
-6 hooks fire at strategic moments:
+7 hooks fire at strategic moments:
 
 | Hook | When | What |
 |------|------|------|
@@ -173,9 +173,10 @@ cargo bench --bench spike_bench
 | PostToolUse | After Edit/Write, and after a Bash call that wrote a file (`sed -i`, `perl -pi`, redirects, `tee`, Python writes) | Tracks file changes; a Bash call that wrote nothing exits before any other work |
 | Stop | Every response | Spools its input and returns; a detached `hook stop-work` worker stores iteration learnings (`CSR_STOP_INLINE=1` runs it inline) |
 | PreCompact | Before compaction | Backs up state |
+| PostCompact | After compaction | Stores Claude Code's own compaction summary once, as derived context |
 | SessionEnd | Session ends | Stores narrative |
 
-Hook CLI: `csr-engine hook session-start|session-end|precompact|stop|post-tool-use|prompt-submit|install` (`subagent-stop` is a deprecated no-op kept so old settings.json entries don't fail; `hook install --apply` removes them)
+Hook CLI: `csr-engine hook session-start|session-end|precompact|post-compact|stop|post-tool-use|prompt-submit|install` (`subagent-stop` is a deprecated no-op kept so old settings.json entries don't fail; `hook install --apply` removes them)
 
 ## File Layout
 

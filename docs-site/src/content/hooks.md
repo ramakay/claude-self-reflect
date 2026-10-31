@@ -4,13 +4,13 @@ title: Active Memory Hooks
 
 ## The Hook Architecture
 
-Six hooks fire at specific moments in the session lifecycle. Each performs its work in milliseconds and either injects context or stores data.
+Seven hooks fire at specific moments in the session lifecycle. Each performs its work in milliseconds and either injects context or stores data.
 
 This is what separates CSR from passive memory tools. **Context finds you.**
 
 ## Session Lifecycle
 
-![Session lifecycle hook timeline — six hooks fire at key moments, injecting context and storing data](/claude-self-reflect/images/hooks-lifecycle-2.png)
+![Session lifecycle hook timeline — hooks fire at key moments, injecting context and storing data](/claude-self-reflect/images/hooks-lifecycle-2.png)
 
 ## SessionStart — Past Context Injection
 
@@ -36,7 +36,7 @@ Turn them off with `CSR_NO_RECAP=1` and `CSR_NO_LEARNT=1`.
 
 Fires every prompt. Routes first, then scores.
 
-**Intent routing (v9.2, extended v9.3)** — a semantic classifier (exemplar embeddings over the same local MiniLM model, no extra model shipped) detects three intents:
+**Intent routing** — a semantic classifier (exemplar embeddings over the same local MiniLM model, no extra model shipped) detects three intents:
 
 | Route | Intent | Threshold | Action |
 |-------|--------|-----------|--------|
@@ -85,6 +85,10 @@ Fires at the end of every response. Imports the growing transcript so it is sear
 ## PreCompact: Refresh, Dream
 
 Fires before a compaction. Reads the transcript to refresh the saved task anchor, so the post-compaction recap names the current task, and starts one detached dream cycle. It does not index the transcript: the file survives the compaction, and the daemon's watcher and the Stop worker index it, so nothing waits on embeddings while Claude Code compacts. Opt out of the dream with `CSR_NO_DREAM_ON_COMPACT=1` or `CSR_NO_DREAMING=1`.
+
+## PostCompact: Keep Claude Code's Summary
+
+Fires after a compaction. Stores the summary Claude Code wrote, once, as derived context. It is recalled as context and is never a source that a claim is checked against.
 
 ## PostToolUse — File Edit Tracking
 

@@ -17,7 +17,7 @@ Single 94MB binary. Embedded SQLite, no database server. No containers. No API k
 > Dreaming checks old conclusions against your git history and marks a stale anchor with the commit that changed it. No LLM in that check.
 > CSR also reads plans, task state, Codex sessions, subagent transcripts, memory-file metadata and the session registry, and ships a companion plugin with a pane beside the session.
 > A live code map covers every definition in the repos your sessions work in, across main and every worktree, so CSR can answer for code no conversation touched.
-> Sub-millisecond search, 5,316 tests passing (4,821 lib, 495 across 23 integration targets, 19 more ignored; verified at commit e7c6e00e), zero external dependencies.
+> Local vector search, 5,316 tests passing (4,821 lib, 495 across 23 integration targets, 19 more ignored; verified at commit e7c6e00e), zero external dependencies.
 > [Release notes](CHANGELOG.md)
 
 <img src="docs-site/public/images/csr-demo.gif" alt="CSR Demo — Setup, Search, and Hooks" width="800" />
@@ -71,11 +71,11 @@ No special syntax. No commands. Install once, and past context appears automatic
 Everything runs locally in a single process. No Docker, no database server, no API keys required.
 
 - **SQLite** — storage for chunks, embeddings, enrichment state
-- **HNSW** — sub-millisecond vector search (<1ms p95)
+- **HNSW** — in-memory vector index; `csr-engine eval` times the index lookup on your own data
 - **FastEmbed** — 384-dim local embeddings
 - **AST** — code-aware search across 6 languages
 
-**6 hooks** fire across the session lifecycle. **16 MCP tools** for explicit search — including `csr_code_graph`, linking code symbols to the conversations that shaped them.
+**7 hooks** fire across the session lifecycle. **16 MCP tools** for explicit search — including `csr_code_graph`, linking code symbols to the conversations that shaped them.
 
 <br clear="both" />
 
@@ -229,7 +229,7 @@ The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew instal
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
 ```
 
-Downloads the binary (SHA256-verified), then asks before activating. Setup registers the MCP server, installs 6 hooks, imports your conversations, installs the companion plugin and, on macOS, installs and starts the background daemon (a launchd agent that runs dreams and enrichment; `CSR_NO_DAEMON=1` skips it). It only runs with your consent. Restart Claude Code after.
+Downloads the binary (SHA256-verified), then asks before activating. Setup registers the MCP server, installs 7 hooks, imports your conversations, installs the companion plugin and, on macOS, installs and starts the background daemon (a launchd agent that runs dreams and enrichment; `CSR_NO_DAEMON=1` skips it). It only runs with your consent. Restart Claude Code after.
 
 Non-interactive installs never activate on their own: set `CSR_AUTO_SETUP=1` to opt in, or run `csr-engine setup` yourself.
 
@@ -286,15 +286,14 @@ No special syntax. No commands. CSR finds relevant past context and injects it a
 </details>
 
 <details>
-<summary><strong>Performance</strong> — sub-millisecond search</summary>
+<summary><strong>Performance</strong> — what the built-in eval measures</summary>
 
 | Metric | Value |
 |--------|-------|
-| **Cached startup** | 7.1s with an 834K-chunk index (`csr-engine eval` startup line); scales with index size |
-| **Search latency (p95)** | <1ms |
+| **Cached startup** | Loads the saved index; the time grows with index size |
+| **Vector index lookup (p95)** | Timed by `csr-engine eval` on your own index (target under 1 ms). It covers the lookup only, not a full recall call. |
 | **Binary size** | 94MB (aarch64-apple-darwin release build) |
-| **Import speed** | ~20 conversations/sec |
-| **Embedding** | 0.73ms/text (batch) |
+| **Embedding** | Local MiniLM model, 384 dimensions, no API call |
 
 </details>
 
@@ -325,7 +324,7 @@ All tools include [MCP tool annotations](https://spec.modelcontextprotocol.io/sp
 </details>
 
 <details>
-<summary><strong>Hooks</strong> — 6 session lifecycle hooks</summary>
+<summary><strong>Hooks</strong> — 7 session lifecycle hooks</summary>
 
 | Hook | What it does |
 |------|-------------|
@@ -334,6 +333,7 @@ All tools include [MCP tool annotations](https://spec.modelcontextprotocol.io/sp
 | **PostToolUse** | Tracks file edits with session-scoped dedup |
 | **Stop** | Imports the transcript, keeps a rolling summary, stores a structured episode |
 | **PreCompact** | Imports the transcript, refreshes the recap anchor, starts one dream cycle |
+| **PostCompact** | Stores Claude Code's own compaction summary once, as derived context |
 | **SessionEnd** | Stores session narrative for future retrieval |
 
 All hooks use catch-all error handling. They never block Claude Code.
@@ -354,7 +354,7 @@ CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir /abs/path/claude-self-re
 ```
 
 Observed on Claude Code 2.1.270: MCP answered in 95 ms, block attached in 99 ms, hook
-settled in 997 ms. The six shell hooks keep running underneath. Receipts and caveats in
+settled in 997 ms. The shell hooks keep running underneath. Receipts and caveats in
 `mods/csr-recall/README.md`.
 
 </details>
@@ -394,7 +394,7 @@ csr-engine status              System status (JSON)
 csr-engine status --compact    One-line statusline output
 csr-engine daemon              Background enrichment daemon
 csr-engine hook install --apply Install Claude Code hooks
-csr-engine eval                Quick eval (6 checks, ~20ms after the index loads)
+csr-engine eval                Quick eval (6 checks)
 csr-engine eval --full         Full eval (24 results plus a census line; 44s on a 10GB database, most of it the integrity check)
 csr-engine quality <file>      AST-based code quality analysis
 ```
@@ -423,7 +423,7 @@ Your conversation data (`~/.claude/projects/`) is untouched. The new engine re-i
 | No search results | Run `csr-engine setup` |
 | MCP tools not available | Run `csr-engine setup`, restart Claude Code |
 | "spawn ENOENT" in MCP | Ensure `csr-engine` is in PATH |
-| Slow first startup | Normal (~14s for index rebuild; a cached load grows with the index, 7s at 834K chunks) |
+| Slow first startup | Normal (the index is rebuilt once; later starts load the saved index, which takes longer for a larger index) |
 
 Full guide: [Documentation](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
@@ -450,7 +450,7 @@ rm ~/.local/bin/csr-engine
 npm uninstall -g claude-self-reflect  # if installed via npm
 ```
 
-Then open `~/.claude/settings.json` and delete every entry under `hooks` whose command starts with `csr-engine hook` (SessionStart, UserPromptSubmit, PostToolUse, Stop, PreCompact, SessionEnd). Claude Code keeps calling them until you do, and they fail once the binary is gone. If you installed the companion plugin, remove it with `/plugin` in Claude Code.
+Then open `~/.claude/settings.json` and delete every entry under `hooks` whose command starts with `csr-engine hook` (SessionStart, UserPromptSubmit, PostToolUse, Stop, PreCompact, PostCompact, SessionEnd). Claude Code keeps calling them until you do, and they fail once the binary is gone. If you installed the companion plugin, remove it with `/plugin` in Claude Code.
 
 </details>
 

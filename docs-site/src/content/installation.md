@@ -17,7 +17,7 @@ No Docker, no API keys, and no Node, TypeScript or Python at run time: the compa
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
 ```
 
-Downloads the binary (SHA256-verified) and then **asks before activating**. Setup, which imports conversations, registers the MCP server, installs all 6 hooks, installs the csr-companion plugin and, on macOS, installs and starts the background daemon, only runs after you confirm at the prompt.
+Downloads the binary (SHA256-verified) and then **asks before activating**. Setup, which imports conversations, registers the MCP server, installs all 7 hooks, installs the csr-companion plugin and, on macOS, installs and starts the background daemon, only runs after you confirm at the prompt.
 
 Non-interactive installs (CI, scripts) never activate automatically. Control the behavior with:
 

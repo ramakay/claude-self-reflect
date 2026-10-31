@@ -34,7 +34,7 @@ csr-engine daemon --batch-size 10 --no-ai
 
 ### eval
 ```bash
-csr-engine eval                   # Quick (6 checks, ~20ms after the index loads)
+csr-engine eval                   # Quick (6 checks)
 csr-engine eval --full            # Full (24 results)
 csr-engine eval --continuity-live # Live continuity probe vs the real index
 ```
