@@ -433,6 +433,34 @@ Full guide: [Documentation](https://ramakay.github.io/claude-self-reflect/#/docs
 </details>
 
 <details>
+<summary><strong>Backups</strong> — what Time Machine skips, and a safe nightly copy of the database</summary>
+
+On macOS, `csr-engine setup` tells Time Machine to skip three folders inside `~/.claude-self-reflect/`: `index-v3/` (the search index, about 2 GB on a long history and rewritten whenever it rebuilds), `models/` (the embedding models) and `cache/`. Self-Reflect can rebuild or re-download all three, and they would otherwise be copied into every hourly backup. The exclusion is per folder and sticky: it needs no sudo and stays on the folder if you re-run setup, which leaves already-skipped folders alone. `CSR_NO_TM_EXCLUDE=1` skips this step. If `tmutil` is missing or fails, setup prints one line and carries on.
+
+The database (`csr-engine.db`, with its `-wal` and `-shm` files) and `mirror/` stay in your backups on purpose. The mirror is the only copy of transcripts Claude Code has deleted, and the database holds your verdicts and notes. Neither can be rebuilt.
+
+The live database changes constantly, so Time Machine copies the whole file on each backup, and a copy taken mid-write can be inconsistent. For a copy that is safe while Self-Reflect is running, use SQLite's online backup, which is safe in WAL mode:
+
+```bash
+mkdir -p "$HOME/csr-backups"
+sqlite3 "$HOME/.claude-self-reflect/csr-engine.db" ".backup '$HOME/csr-backups/csr-engine-$(date +%F).db'"
+# keep the newest two, delete the rest
+ls -t "$HOME"/csr-backups/csr-engine-*.db | tail -n +3 | xargs rm -f
+```
+
+Run it nightly from cron or launchd. Keep a couple of copies and keep them local: the database holds your transcripts, so do not sync the folder to a cloud drive or a shared disk.
+
+To undo the exclusion and let Time Machine back a folder up again:
+
+```bash
+tmutil removeexclusion "$HOME/.claude-self-reflect/index-v3"
+```
+
+Do the same for `models` and `cache`. Running `csr-engine setup` again re-applies the exclusion, so set `CSR_NO_TM_EXCLUDE=1` first if you want it to stay off.
+
+</details>
+
+<details>
 <summary><strong>Uninstall</strong></summary>
 
 There is no `uninstall` command. `npm uninstall` does not touch your Claude Code settings, and `csr-engine hook install --apply` only adds hooks. Remove the hooks and the daemon by hand:

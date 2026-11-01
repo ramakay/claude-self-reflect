@@ -54,6 +54,8 @@ pub async fn handle(
     let csr_dir = db_path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(csr_dir)?;
     eprintln!("[1/8] Database directory ready: {}", csr_dir.display());
+    // Before the engine writes its first index or model file, so the skip is already in place.
+    eprint!("{}", time_machine_step(csr_dir));
     let eng = Engine::new(db_path, projects_dir)?;
     eng.embeddings().warm()?;
     eprintln!("  Embedding model ready");
@@ -360,6 +362,149 @@ pub async fn handle(
     eprint!("{}", next_steps(report.as_ref()));
 
     Ok(())
+}
+
+/// Data-dir folders Self-Reflect can rebuild or re-download: the search index, the downloaded
+/// embedding models and a cache. Setup asks Time Machine to skip exactly these. The database
+/// (`csr-engine.db`, `-wal`, `-shm`) and `mirror/` are not here and must never be: the mirror is
+/// the only copy of transcripts Claude Code has deleted, and the database holds your verdicts
+/// and notes.
+const TM_SKIP_DIRS: [&str; 3] = ["index-v3", "models", "cache"];
+
+/// The skipped folders setup creates when they are missing, so the exclusion is already on the
+/// folder before the first index or model write lands in it. `cache` is not created: nothing in
+/// the engine writes there today, so an empty one would only be clutter. An empty `index-v3` is
+/// read as "no index yet", the same as a missing one.
+const TM_CREATE_FIRST: [&str; 2] = ["index-v3", "models"];
+
+const TMUTIL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `CSR_NO_TM_EXCLUDE=1` (or `true`) is the opt-out.
+fn tm_exclude_opted_out() -> bool {
+    std::env::var("CSR_NO_TM_EXCLUDE").is_ok_and(|v| matches!(v.trim(), "1" | "true"))
+}
+
+/// Run `tmutil <args>`; the stdout on success, or one line saying what failed.
+fn real_tmutil(args: &[&str]) -> std::result::Result<String, String> {
+    let sub = args.first().copied().unwrap_or("").to_owned();
+    let owned: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            Command::new("tmutil")
+                .args(&owned)
+                .stdin(Stdio::null())
+                .output(),
+        );
+    });
+    match rx.recv_timeout(TMUTIL_TIMEOUT) {
+        Err(_) => Err(format!(
+            "`tmutil {sub}` did not finish within {} s",
+            TMUTIL_TIMEOUT.as_secs()
+        )),
+        Ok(Err(e)) => Err(format!("could not run tmutil: {e}")),
+        Ok(Ok(out)) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+        Ok(Ok(out)) => {
+            let said = String::from_utf8_lossy(&out.stderr).into_owned();
+            let said = if said.trim().is_empty() {
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            } else {
+                said
+            };
+            let said = said
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("no detail");
+            Err(format!(
+                "`tmutil {sub}` failed: {}",
+                said.trim().chars().take(200).collect::<String>()
+            ))
+        }
+    }
+}
+
+/// Ask Time Machine to skip the rebuildable folders under `csr_dir`; the lines setup prints.
+///
+/// `tmutil addexclusion <path>` without `-p` is the sticky form: it sets a flag on the folder
+/// itself, needs no sudo, and follows the folder if the data dir is moved. Already-excluded
+/// folders are left alone, so a second setup run changes nothing. This never fails setup: a
+/// missing or erroring `tmutil` costs one line, and the folders simply stay in backups.
+///
+/// `macos` and `opted_out` are parameters, and `tmutil` is a closure, so tests drive every path
+/// without the real tool.
+fn time_machine_exclusion(
+    csr_dir: &Path,
+    macos: bool,
+    opted_out: bool,
+    tmutil: &mut dyn FnMut(&[&str]) -> std::result::Result<String, String>,
+) -> String {
+    if !macos {
+        return String::new();
+    }
+    if opted_out {
+        return "  Time Machine exclusion skipped (CSR_NO_TM_EXCLUDE is set).\n".to_owned();
+    }
+    for name in TM_CREATE_FIRST {
+        // Best effort: a folder that cannot be made is skipped below, not reported.
+        let _ = std::fs::create_dir_all(csr_dir.join(name));
+    }
+
+    let (mut added, mut already) = (Vec::new(), Vec::new());
+    let mut failure = None;
+    for name in TM_SKIP_DIRS {
+        let path = csr_dir.join(name);
+        // A real folder only: a symlink would get the flag, not the folder it points to.
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let shown = path.to_string_lossy().into_owned();
+        let step = tmutil(&["isexcluded", &shown]).and_then(|said| {
+            if said.contains("[Excluded]") {
+                Ok(true)
+            } else {
+                tmutil(&["addexclusion", &shown]).map(|_| false)
+            }
+        });
+        match step {
+            Ok(true) => already.push(name),
+            Ok(false) => added.push(name),
+            Err(why) => {
+                failure = Some((name, why));
+                break;
+            }
+        }
+    }
+
+    let mut text = String::new();
+    if !added.is_empty() {
+        text.push_str(&format!(
+            "  Time Machine now skips {} (Self-Reflect can rebuild them). The database and mirror stay in your backups.\n",
+            added.join(", ")
+        ));
+    }
+    if !already.is_empty() {
+        text.push_str(&format!(
+            "  Time Machine already skips {}.\n",
+            already.join(", ")
+        ));
+    }
+    if let Some((name, why)) = failure {
+        text.push_str(&format!(
+            "  Time Machine: could not mark {name} as skipped ({why}). Setup continues; it stays in backups.\n"
+        ));
+    }
+    text
+}
+
+fn time_machine_step(csr_dir: &Path) -> String {
+    time_machine_exclusion(
+        csr_dir,
+        cfg!(target_os = "macos"),
+        tm_exclude_opted_out(),
+        &mut real_tmutil,
+    )
 }
 
 /// Run the hook install and keep its failure for the summary. The error is
@@ -5372,5 +5517,213 @@ esac
             install_run(&spec, &mut FakeLaunchctl::new(false)).previous_pid,
             None
         );
+    }
+
+    /// A fake `tmutil` over a recorded call list. `excluded` names the folders (by last path
+    /// component) that already read `[Excluded]`; `fail_on` makes that subcommand error.
+    struct FakeTmutil {
+        calls: Vec<Vec<String>>,
+        excluded: Vec<&'static str>,
+        fail_on: Option<&'static str>,
+    }
+
+    impl FakeTmutil {
+        fn new() -> Self {
+            Self {
+                calls: Vec::new(),
+                excluded: Vec::new(),
+                fail_on: None,
+            }
+        }
+        fn run(&mut self, args: &[&str]) -> std::result::Result<String, String> {
+            self.calls
+                .push(args.iter().map(|a| (*a).to_owned()).collect());
+            if self.fail_on == Some("*") || self.fail_on == args.first().copied() {
+                return Err(format!("`tmutil {}` failed: boom", args[0]));
+            }
+            let path = args.get(1).copied().unwrap_or("");
+            if args[0] == "isexcluded" {
+                let on = self.excluded.iter().any(|n| path.ends_with(n));
+                return Ok(format!(
+                    "{}  {path}\n",
+                    if on { "[Excluded]" } else { "[Included]" }
+                ));
+            }
+            Ok(String::new())
+        }
+        fn added(&self) -> Vec<String> {
+            self.calls
+                .iter()
+                .filter(|c| c[0] == "addexclusion")
+                .map(|c| c[1].clone())
+                .collect()
+        }
+    }
+
+    /// A data dir shaped like a real one: the database trio, the mirror, and the three folders.
+    fn tm_data_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["csr-engine.db", "csr-engine.db-wal", "csr-engine.db-shm"] {
+            std::fs::write(dir.path().join(file), b"x").unwrap();
+        }
+        for sub in ["mirror", "index-v3", "models", "cache"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn time_machine_excludes_only_the_three_rebuildable_dirs() {
+        let dir = tm_data_dir();
+        let mut fake = FakeTmutil::new();
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+
+        let mut want: Vec<String> = ["index-v3", "models", "cache"]
+            .iter()
+            .map(|n| dir.path().join(n).to_string_lossy().into_owned())
+            .collect();
+        let mut got = fake.added();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want);
+
+        // The sticky per-item form only: `addexclusion <path>`, never `-p`, never anything else.
+        for call in &fake.calls {
+            assert!(
+                matches!(call[0].as_str(), "isexcluded" | "addexclusion"),
+                "{call:?}"
+            );
+            assert_eq!(call.len(), 2, "{call:?}");
+            assert!(!call.iter().any(|a| a == "-p"), "{call:?}");
+            // never the database trio, the mirror, or the data dir itself
+            let leaf = Path::new(&call[1]).file_name().unwrap().to_string_lossy();
+            assert!(
+                matches!(leaf.as_ref(), "index-v3" | "models" | "cache"),
+                "{call:?}"
+            );
+            assert!(!call[1].contains("csr-engine.db"), "{call:?}");
+            assert!(!call[1].contains("mirror"), "{call:?}");
+        }
+        assert_eq!(
+            said,
+            "  Time Machine now skips index-v3, models, cache (Self-Reflect can rebuild them). The database and mirror stay in your backups.\n"
+        );
+    }
+
+    #[test]
+    fn time_machine_never_touches_db_wal_shm_or_mirror_even_when_they_are_the_only_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["csr-engine.db", "csr-engine.db-wal", "csr-engine.db-shm"] {
+            std::fs::write(dir.path().join(file), b"x").unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("mirror")).unwrap();
+        let mut fake = FakeTmutil::new();
+        time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+        let all = fake.calls.concat().join(" ");
+        for protected in ["csr-engine.db", "-wal", "-shm", "mirror"] {
+            assert!(!all.contains(protected), "{protected} in {all}");
+        }
+        // index-v3 and models were created and excluded; cache does not exist, so is skipped
+        assert_eq!(fake.added().len(), 2, "{all}");
+        assert!(dir.path().join("index-v3").is_dir());
+        assert!(dir.path().join("models").is_dir());
+        assert!(!dir.path().join("cache").exists());
+    }
+
+    #[test]
+    fn time_machine_skips_dirs_that_are_already_excluded() {
+        let dir = tm_data_dir();
+        let mut fake = FakeTmutil::new();
+        fake.excluded = vec!["models", "cache"];
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+        assert_eq!(
+            fake.added(),
+            vec![dir.path().join("index-v3").to_string_lossy().into_owned()]
+        );
+        assert!(said.contains("now skips index-v3 (Self-Reflect"), "{said}");
+        assert!(said.contains("already skips models, cache."), "{said}");
+
+        // A second run with everything excluded changes nothing.
+        let mut again = FakeTmutil::new();
+        again.excluded = vec!["index-v3", "models", "cache"];
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| again.run(a));
+        assert!(again.added().is_empty());
+        assert_eq!(
+            said,
+            "  Time Machine already skips index-v3, models, cache.\n"
+        );
+    }
+
+    #[test]
+    fn time_machine_failure_is_one_line_and_never_an_error() {
+        // tmutil missing or failing on the very first call
+        let dir = tm_data_dir();
+        let mut fake = FakeTmutil::new();
+        fake.fail_on = Some("*");
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+        assert_eq!(said.lines().count(), 1, "{said}");
+        assert!(
+            said.contains("could not mark index-v3 as skipped"),
+            "{said}"
+        );
+        assert!(said.contains("Setup continues"), "{said}");
+        assert!(fake.added().is_empty());
+        // it stopped at the first failure instead of retrying each folder
+        assert_eq!(fake.calls.len(), 1);
+
+        // addexclusion failing after a clean isexcluded
+        let dir = tm_data_dir();
+        let mut fake = FakeTmutil::new();
+        fake.fail_on = Some("addexclusion");
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+        assert_eq!(said.lines().count(), 1, "{said}");
+        assert!(said.contains("boom"), "{said}");
+
+        // a failure after a success reports both
+        let dir = tm_data_dir();
+        let mut n = 0;
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| {
+            n += 1;
+            if n > 2 {
+                Err("`tmutil isexcluded` failed: nope".to_owned())
+            } else if a[0] == "isexcluded" {
+                Ok("[Included]".to_owned())
+            } else {
+                Ok(String::new())
+            }
+        });
+        assert!(said.contains("now skips index-v3 ("), "{said}");
+        assert!(said.contains("could not mark models as skipped"), "{said}");
+    }
+
+    #[test]
+    fn time_machine_is_a_no_op_off_macos_and_when_opted_out() {
+        for (macos, opted_out) in [(false, false), (false, true), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut fake = FakeTmutil::new();
+            let said = time_machine_exclusion(dir.path(), macos, opted_out, &mut |a| fake.run(a));
+            assert!(fake.calls.is_empty(), "macos={macos} opted_out={opted_out}");
+            assert!(
+                !dir.path().join("index-v3").exists() && !dir.path().join("models").exists(),
+                "no folders are created when nothing is excluded"
+            );
+            if macos {
+                assert!(said.contains("CSR_NO_TM_EXCLUDE"), "{said}");
+            } else {
+                assert_eq!(said, "");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn time_machine_leaves_a_symlinked_dir_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("index-v3")).unwrap();
+        let mut fake = FakeTmutil::new();
+        time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+        let all = fake.calls.concat().join(" ");
+        assert!(!all.contains("index-v3"), "{all}");
     }
 }
