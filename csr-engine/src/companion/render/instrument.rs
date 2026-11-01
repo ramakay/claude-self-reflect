@@ -686,7 +686,7 @@ impl Composition {
             self.agents
                 .agents
                 .iter()
-                .filter(|a| agents::is_active(a))
+                .filter(|a| agents::is_active(a, self.now))
                 .map(|a| agents::stalled(a, self.now).to_string()),
         );
         out.extend(agent_lines(self));
@@ -765,6 +765,10 @@ impl Composition {
         for a in self.agents.agents.iter() {
             if a.status == "running" && !agents::stalled(a, now) {
                 due.push(a.last_at / 1000. + 600.);
+            }
+            // A waiting row drops out of the bar once it has been quiet for two hours.
+            if a.status == "waiting" && agents::is_active(a, now) {
+                due.push(a.last_at / 1000. + agents::WAITING_STALE);
             }
             if open.agents {
                 // The label rounds to the nearest minute (`{:.0}m`): it moves at 30 s, 90 s, ...
@@ -1687,7 +1691,7 @@ fn assemble(
         let reserved = figure_rows
             + 1
             + if show_figure { 0 } else { 7 }
-            + usize::from(c.agents.agents.iter().any(agents::is_active));
+            + usize::from(c.agents.agents.iter().any(|a| agents::is_active(a, c.now)));
         let room = rows.saturating_sub(out.len() + reserved);
         let wanted = details.len().saturating_sub(open.scroll);
         // The note or heading always shows, whatever else is squeezed.
@@ -1752,7 +1756,7 @@ fn assemble(
         .agents
         .agents
         .iter()
-        .filter(|a| agents::is_active(a))
+        .filter(|a| agents::is_active(a, c.now))
         .collect();
     // Past the pane's last row the tail is cut. An open section must not be what goes: fold the
     // observation cards (a second pass), then give up the rows between them and the open section.
@@ -1964,7 +1968,7 @@ fn agent_name(a: &agents::Agent) -> Option<&str> {
 /// agent (the one stuck longest), in the warning. An agent with no description has no name to
 /// show, and then no dot is drawn either.
 fn agents_bar(agents: &[agents::Agent], now: f64) -> (String, bool) {
-    let active = || agents.iter().filter(|a| agents::is_active(a));
+    let active = || agents.iter().filter(|a| agents::is_active(a, now));
     let stalled: Vec<_> = active().filter(|a| agents::stalled(a, now)).collect();
     let (count, word, shown) = if stalled.is_empty() {
         let newest = active()
@@ -3253,7 +3257,7 @@ pub fn draw(
         };
     let hero_full_h = hero_h;
     let hero_h = if page { 0. } else { hero_full_h };
-    let active = !page && c.agents.agents.iter().any(agents::is_active);
+    let active = !page && c.agents.agents.iter().any(|a| agents::is_active(a, c.now));
     let agents_h = if active {
         P * 2. + theme::BODY_LINE
     } else {
@@ -4560,7 +4564,7 @@ pub fn draw(
             .agents
             .agents
             .iter()
-            .filter(|a| agents::is_active(a))
+            .filter(|a| agents::is_active(a, c.now))
             .take(10)
         {
             let is_stalled = agents::stalled(a, c.now);
@@ -7460,6 +7464,26 @@ mod tests {
         );
         let waiting = [agent_at("  ", "waiting", live_at)];
         assert_eq!(said(&waiting), "1 running");
+        // The live case of 2026-11-01: two agents "waiting" for 12.9 h and 20.6 h, never
+        // finished, beside the one that runs. Only the running one is counted and named.
+        let ago = |hours: f64| ((now - hours * 3600.) * 1000.) as i64;
+        let beside = [
+            agent_at("Check the relay", "waiting", ago(20.6)),
+            agent_at("Fix load-flaky pane frame tests", "waiting", ago(12.9)),
+            agent_at("Fix load-flaky pane frame tests", "running", live_at),
+        ];
+        assert_eq!(said(&beside), "1 running · Fix load-flaky pane frame tests");
+        assert!(!agents_bar(&beside, now).1, "and nothing is called stalled");
+        // A waiting row is counted until it has been quiet for two hours, then it is not.
+        let edge = |quiet_s: f64| {
+            let rows = [
+                agent_at("Wait on build", "waiting", ((now - quiet_s) * 1000.) as i64),
+                agent_at("Fresh scan", "running", live_at),
+            ];
+            agents_bar(&rows, now).0
+        };
+        assert_eq!(edge(2. * 3600. - 60.), "2 running · Fresh scan");
+        assert_eq!(edge(2. * 3600.), "1 running · Fresh scan");
         // One stalled agent: the warning, naming that agent even when a live one is newer.
         let only = [agent_at("Scan the repo", "running", stalled_at)];
         assert_eq!(said(&only), "1 stalled · Scan the repo");
@@ -7489,6 +7513,26 @@ mod tests {
             agent_at("Stuck", "running", stalled_at),
         ];
         assert_eq!(said(&done), "1 stalled · Stuck");
+    }
+
+    #[test]
+    fn waiting_agents_quiet_for_two_hours_draw_no_agents_bar() {
+        let ago = |hours: f64| ((1_800_000_000. - hours * 3600.) * 1000.) as i64;
+        let region = |rows: Vec<agents::Agent>| {
+            let mut c = quota_composition();
+            c.now = 1_800_000_000.;
+            c.agents.agents = rows;
+            let (_, m) = draw(&c, 1210, 2000, Theme::Dark, Open::default(), false).expect("draws");
+            m.agents_region
+        };
+        // The two rows of the live case: nothing runs, so no bar.
+        assert!(region(vec![
+            agent_at("Fix load-flaky pane frame tests", "waiting", ago(12.9)),
+            agent_at("Check the relay", "waiting", ago(20.6)),
+        ])
+        .is_none());
+        // 1 h 59 m ago it still shows.
+        assert!(region(vec![agent_at("Wait", "waiting", ago(2. - 1. / 60.))]).is_some());
     }
 
     #[test]

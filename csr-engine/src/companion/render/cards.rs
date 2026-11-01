@@ -1725,14 +1725,14 @@ pub fn build(
         let running = agents
             .agents
             .iter()
-            .filter(|a| agents::is_active(a))
+            .filter(|a| agents::is_active(a, now))
             .count();
         let done = agents.agents.len() - running;
         out.push(Card::Agents {
             slots: shown
                 .iter()
                 .map(|a| {
-                    if !agents::is_active(a) {
+                    if !agents::is_active(a, now) {
                         Slot::Done
                     } else if agents::stalled(a, now) {
                         Slot::Stalled
