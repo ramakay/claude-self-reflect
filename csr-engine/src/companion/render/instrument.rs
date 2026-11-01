@@ -7835,8 +7835,8 @@ mod tests {
             "windows": [
                 {"code":"5H","name":"5 Hour","used":18.,"sev":"ok","tick":46.,"early":false,
                  "blended":false,"line":"On pace for about 46% by reset · resets in 4h 35m"},
-                {"code":"7D","name":"Weekly","used":45.,"sev":"ok","tick":71.,"early":true,
-                 "blended":true,"line":"On pace for about 71% by reset · resets in 2d 20h (early)"},
+                {"code":"7D","name":"Weekly","used":45.,"sev":"ok","tick":null,"early":true,
+                 "blended":false,"line":"Early · last week peaked at 71% · resets in 2d 20h"},
             ],
         });
         c.figure["breakdown"] = json!({
@@ -7879,7 +7879,12 @@ mod tests {
                     let codes: Vec<_> = d.limits.iter().map(|l| l.code.as_str()).collect();
                     assert_eq!(codes, vec!["5H", "7D", "CX"], "{at}");
                     assert!(d.limits[0].line.contains("On pace for about 46% by reset"));
-                    assert!(d.limits[1].line.ends_with("(early)"), "{at}");
+                    assert!(
+                        d.limits[1]
+                            .line
+                            .starts_with("Early · last week peaked at 71%"),
+                        "{at}"
+                    );
                     for l in &d.limits {
                         let (bx, by, bw, bh) = l.bar;
                         assert!(bw > 200. && bh >= 6., "{at}: {l:?}");
@@ -7891,7 +7896,7 @@ mod tests {
                     }
                     // The forecast tick sits where the outlook said, on the bar.
                     assert_eq!(d.limits[0].tick, Some(0.46));
-                    assert_eq!(d.limits[1].tick, Some(0.71));
+                    assert_eq!(d.limits[1].tick, None, "an early window has no tick");
                     assert_eq!(d.limits[2].tick, None, "Codex has no forecast");
                     assert!(
                         d.context_head
