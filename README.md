@@ -439,16 +439,20 @@ On macOS, `csr-engine setup` tells Time Machine to skip three folders inside `~/
 
 The database (`csr-engine.db`, with its `-wal` and `-shm` files) and `mirror/` stay in your backups on purpose. The mirror is the only copy of transcripts Claude Code has deleted, and the database holds your verdicts and notes. Neither can be rebuilt.
 
-The live database changes constantly, so Time Machine copies the whole file on each backup, and a copy taken mid-write can be inconsistent. For a copy that is safe while Self-Reflect is running, use SQLite's online backup, which is safe in WAL mode:
+The live database changes constantly, so Time Machine copies the whole file on each backup, and a copy taken mid-write can be inconsistent. Time Machine is a fine backup for it. If you also want a dated copy that is consistent while Self-Reflect is running, use SQLite's online backup, which is safe in WAL mode:
 
 ```bash
 mkdir -p "$HOME/csr-backups"
-sqlite3 "$HOME/.claude-self-reflect/csr-engine.db" ".backup '$HOME/csr-backups/csr-engine-$(date +%F).db'"
-# keep the newest two, delete the rest
-ls -t "$HOME"/csr-backups/csr-engine-*.db | tail -n +3 | xargs rm -f
+tmutil addexclusion "$HOME/csr-backups"   # Time Machine already copies the live DB; don't copy it twice
+dest="$HOME/csr-backups/csr-engine-$(date +%F).db"
+sqlite3 "$HOME/.claude-self-reflect/csr-engine.db" ".backup '$dest.tmp'" \
+  && [ "$(sqlite3 "$dest.tmp" 'PRAGMA quick_check;')" = ok ] \
+  && mv "$dest.tmp" "$dest" \
+  && ls -t "$HOME"/csr-backups/csr-engine-*.db | tail -n +3 | while IFS= read -r f; do rm -f -- "$f"; done
+rm -f "$dest.tmp" "$dest.tmp-wal" "$dest.tmp-shm"   # clear the leftovers of a failed run
 ```
 
-Run it nightly from cron or launchd. Keep a couple of copies and keep them local: the database holds your transcripts, so do not sync the folder to a cloud drive or a shared disk.
+The copy is written to a temporary name and checked with `PRAGMA quick_check` before it replaces anything. Only a copy that passed is kept, and only then are older copies pruned (the newest two stay), so a failed run never costs you a good copy. The `tmutil addexclusion` line keeps the folder out of Time Machine: the database can be many GB, and a fresh copy every night would otherwise be backed up on top of the live file. Run it nightly from cron or launchd. The copies hold your transcripts, so keep them local. Copy the folder to another drive if you want a copy off this disk, and never to a cloud drive or a shared disk.
 
 To undo the exclusion and let Time Machine back a folder up again:
 

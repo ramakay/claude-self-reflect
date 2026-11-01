@@ -389,14 +389,18 @@ fn real_tmutil(args: &[&str]) -> std::result::Result<String, String> {
     let sub = args.first().copied().unwrap_or("").to_owned();
     let owned: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(
-            Command::new("tmutil")
-                .args(&owned)
-                .stdin(Stdio::null())
-                .output(),
-        );
-    });
+    // `Builder::spawn`, not `thread::spawn`: a refused thread is an error to report, never a panic.
+    std::thread::Builder::new()
+        .name("tmutil".to_owned())
+        .spawn(move || {
+            let _ = tx.send(
+                Command::new("tmutil")
+                    .args(&owned)
+                    .stdin(Stdio::null())
+                    .output(),
+            );
+        })
+        .map_err(|e| format!("could not start `tmutil {sub}`: {e}"))?;
     match rx.recv_timeout(TMUTIL_TIMEOUT) {
         Err(_) => Err(format!(
             "`tmutil {sub}` did not finish within {} s",
