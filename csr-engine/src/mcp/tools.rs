@@ -3126,13 +3126,17 @@ fn read_keyword_legs(
 ) -> Option<KeywordLegs> {
     let mut postings_hits: Vec<(String, f64)> = Vec::new();
     let mut postings_weight = 0.0_f64;
+    // Empty (no allocation) unless stage timing is on.
+    let timing = super::stage_timing::enabled();
     let mut leg_ms: Vec<(&'static str, f64)> = Vec::new();
     if search_mode == SearchMode::Hybrid {
         let idents = crate::search::identifiers::analyze_query(query);
         if !idents.is_empty() {
             let sub_start = Instant::now();
             postings_hits = leg_rows(storage.search_postings(&idents, fetch, family), strict)?;
-            leg_ms.push(("f_postings", sub_start.elapsed().as_secs_f64() * 1000.0));
+            if timing {
+                leg_ms.push(("f_postings", sub_start.elapsed().as_secs_f64() * 1000.0));
+            }
             if !postings_hits.is_empty() {
                 postings_weight = id_channel_weight(&idents, &postings_term_dfs(storage, &idents));
             }
@@ -3141,28 +3145,24 @@ fn read_keyword_legs(
     let sub_start = Instant::now();
     let family_vec = family.map(<[&str]>::to_vec);
     let keyword = if strict {
-        // The lane's unscoped ranking is split across connections; a failed
-        // shard falls back to the one-connection read below.
-        match family_vec {
-            None => crate::search::hybrid::keyword_chunk_hits_sharded(storage, query, fetch)
-                .or_else(|| {
-                    crate::search::hybrid::keyword_chunk_hits_strict(storage, query, fetch, None)
-                })?,
-            family_vec => {
-                crate::search::hybrid::keyword_chunk_hits_strict(storage, query, fetch, family_vec)?
-            }
-        }
+        crate::search::hybrid::keyword_chunk_hits_strict(storage, query, fetch, family_vec)?
     } else {
         keyword_chunk_hits(storage, query, fetch, family_vec)
     };
-    leg_ms.push(("f_chunks_fts", sub_start.elapsed().as_secs_f64() * 1000.0));
+    if timing {
+        leg_ms.push(("f_chunks_fts", sub_start.elapsed().as_secs_f64() * 1000.0));
+    }
     let sub_start = Instant::now();
     let reflection_fts_hits = leg_rows(storage.fts5_search_reflections(query, fetch), strict)?;
-    leg_ms.push(("f_refl_fts", sub_start.elapsed().as_secs_f64() * 1000.0));
+    if timing {
+        leg_ms.push(("f_refl_fts", sub_start.elapsed().as_secs_f64() * 1000.0));
+    }
     let sub_start = Instant::now();
     let reflection_prefix_ids =
         leg_rows(storage.fts5_reflection_prefix_matches(query, fetch), strict)?;
-    leg_ms.push(("f_refl_prefix", sub_start.elapsed().as_secs_f64() * 1000.0));
+    if timing {
+        leg_ms.push(("f_refl_prefix", sub_start.elapsed().as_secs_f64() * 1000.0));
+    }
     Some(KeywordLegs {
         postings_hits,
         postings_weight,
@@ -3208,7 +3208,7 @@ fn spawn_keyword_lane_with(
         .is_some()
         .then(|| scope.family_projects.iter().cloned().collect());
     Some(tokio::task::spawn_blocking(move || {
-        let lane = storage.open_prompt_lane().ok().flatten()?;
+        let lane = storage.open_read_lane().ok().flatten()?;
         prepare(&lane);
         let family: Option<Vec<&str>> = family
             .as_ref()
@@ -3248,7 +3248,7 @@ fn spawn_verdict_prefetch(
     let storage = Arc::clone(storage);
     let conversations = distinct_conversation_ids_of_chunks(chunks);
     Some(tokio::task::spawn_blocking(move || {
-        if let Ok(Some(lane)) = storage.open_prompt_lane() {
+        if let Ok(Some(lane)) = storage.open_read_lane() {
             let refs: Vec<&str> = conversations.iter().map(String::as_str).collect();
             super::synthetic::prefetch_verdicts(&lane, &refs);
         }

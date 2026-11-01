@@ -279,18 +279,6 @@ pub fn keyword_chunk_hits_strict(
     Some(assemble_keyword_hits(windows, fetch))
 }
 
-/// [`keyword_chunk_hits_strict`] for the unscoped search with the bm25 ranking
-/// split across connections ([`Storage::fts5_search_sharded`]): the same hits in
-/// the same order. `None` when any shard failed.
-pub fn keyword_chunk_hits_sharded(
-    storage: &Storage,
-    query: &str,
-    fetch: usize,
-) -> Option<KeywordChunkHits> {
-    let window = storage.fts5_search_sharded(query, fetch).ok()?;
-    Some(assemble_keyword_hits(vec![window], fetch))
-}
-
 fn keyword_windows(
     storage: &Storage,
     query: &str,
