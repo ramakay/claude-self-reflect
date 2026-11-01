@@ -950,7 +950,11 @@ pub(crate) fn recent_project_episodes_resuming(
     predecessor: Option<&str>,
 ) -> Vec<(Episode, String)> {
     let project_tag = format!("project_{}", project);
-    let Ok(rows) = storage.get_reflections_by_tag(&project_tag, 50) else {
+    // Episodes only, by exact tag: a 50-row window of every row the tag
+    // substring matched lost the latest episode to sibling projects
+    // (`anukriti-website`, `claude-self-reflect-csr-engine`) and to the
+    // project's own cache and narrative rows.
+    let Ok(rows) = storage.recent_episode_rows(project, 50) else {
         return Vec::new();
     };
     let now = Utc::now();
@@ -3821,6 +3825,144 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         assert_eq!(session_ids(&resumed), ["middle", "newest", "oldest"]);
         let same = recent_project_episodes_resuming(&storage, "proj", 10, None);
         assert_eq!(session_ids(&same), session_ids(&plain));
+    }
+
+    fn insert_row(
+        storage: &crate::storage::Storage,
+        id: &str,
+        content: &str,
+        tags: &[String],
+        timestamp: &str,
+    ) {
+        storage
+            .insert_reflection(id, content, tags, &[0.0; 4])
+            .unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE reflections SET timestamp = ?1 WHERE id = ?2",
+                    rusqlite::params![timestamp, id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn insert_episode(storage: &crate::storage::Storage, project: &str, session: &str, ts: &str) {
+        let mut ep = minimal_episode("Fix the auth middleware regression", "", None);
+        ep.session_id = session.into();
+        ep.project = project.into();
+        let tags = crate::hooks::stop::episode_tags(&ep);
+        insert_row(
+            storage,
+            &format!("ep-{project}-{session}"),
+            &serde_json::to_string(&ep).unwrap(),
+            &tags,
+            ts,
+        );
+    }
+
+    #[test]
+    fn the_latest_episode_leads_however_busy_the_sibling_projects_and_cache_rows_are() {
+        // Replay trace: `LIKE '%project_anukriti%'` also matched
+        // `project_Anukriti-Campaigns` and `project_anukriti-website`, and the
+        // 50-row window held no anukriti episode at all.
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        insert_episode(&storage, "proj", "older", "2026-10-10T10:00:00Z");
+        insert_episode(&storage, "proj", "latest", "2026-10-11T10:00:00Z");
+        for i in 0..30 {
+            // Sibling projects whose names start with this one, one in another case.
+            insert_episode(
+                &storage,
+                "Proj-Campaigns",
+                &format!("sib-{i}"),
+                &format!("2026-10-12T10:{i:02}:00Z"),
+            );
+            insert_row(
+                &storage,
+                &format!("cache-sib-{i}"),
+                "{}",
+                &[
+                    "context_cache".to_string(),
+                    "project_proj-csr-engine".to_string(),
+                ],
+                &format!("2026-10-12T11:{i:02}:00Z"),
+            );
+        }
+        for i in 0..60 {
+            // The project's own cache and narrative rows, all newer.
+            let kind = if i % 2 == 0 {
+                "context_cache"
+            } else {
+                "narrative_extracted_v3"
+            };
+            insert_row(
+                &storage,
+                &format!("own-{i}"),
+                "{}",
+                &[
+                    kind.to_string(),
+                    "conv_latest".to_string(),
+                    "project_proj".to_string(),
+                ],
+                &format!("2026-10-13T10:{i:02}:00Z"),
+            );
+        }
+        // The old substring window holds no episode of this project.
+        let window = storage.get_reflections_by_tag("project_proj", 50).unwrap();
+        assert!(!window.iter().any(|(_, _, tags, _)| {
+            tags.iter().any(|t| t == "session_episode") && tags.iter().any(|t| t == "project_proj")
+        }));
+        let episodes = recent_project_episodes(&storage, "proj", 10);
+        assert_eq!(session_ids(&episodes), ["latest", "older"]);
+        // The sibling's own lookup is unaffected.
+        assert_eq!(
+            recent_project_episodes(&storage, "Proj-Campaigns", 50).len(),
+            30
+        );
+    }
+
+    #[test]
+    fn the_episode_lookup_matches_the_project_tag_exactly_and_case_sensitively() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        insert_episode(&storage, "proj", "lower", "2026-10-10T10:00:00Z");
+        insert_episode(&storage, "Proj", "upper", "2026-10-11T10:00:00Z");
+        insert_episode(&storage, "proj-website", "prefixed", "2026-10-12T10:00:00Z");
+        insert_episode(&storage, "my-proj", "suffixed", "2026-10-13T10:00:00Z");
+        // 50 newer episodes of the same name in another case: a
+        // case-insensitive match fills the whole window with them.
+        for i in 0..50 {
+            insert_episode(
+                &storage,
+                "Proj",
+                &format!("upper-{i}"),
+                &format!("2026-10-15T10:{i:02}:00Z"),
+            );
+        }
+        assert_eq!(
+            session_ids(&recent_project_episodes(&storage, "proj", 10)),
+            ["lower"]
+        );
+        let upper = recent_project_episodes(&storage, "Proj", 10);
+        assert_eq!(upper.len(), 10);
+        assert_eq!(session_ids(&upper)[0], "upper-49");
+        assert_eq!(
+            session_ids(&recent_project_episodes(&storage, "proj-website", 10)),
+            ["prefixed"]
+        );
+        assert!(recent_project_episodes(&storage, "pro", 10).is_empty());
+        // Only episode rows count: a newer non-episode row of the project is not one.
+        insert_row(
+            &storage,
+            "story",
+            "{}",
+            &["session_story".to_string(), "project_proj".to_string()],
+            "2026-10-14T10:00:00Z",
+        );
+        assert_eq!(
+            session_ids(&recent_project_episodes(&storage, "proj", 10)),
+            ["lower"]
+        );
     }
 
     const RULE_TEXT: &str = "A standing rule from 10-12: “Keep receipts”";

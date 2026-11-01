@@ -2592,6 +2592,55 @@ fn fts5_search_matched(
 
 // ─── Reflection tag queries ───
 
+/// The newest `session_episode` rows of one project, at most `limit`, newest
+/// first, Shift Ledger rows excluded.
+///
+/// Unlike [`get_reflections_by_tag`] (a case-insensitive substring `LIKE`),
+/// both tags must appear as whole JSON strings, matched case-sensitively with
+/// `instr`: `project_anukriti` does not match `project_Anukriti-Campaigns` or
+/// `project_anukriti-website`, and the window holds episodes only, so a busy
+/// sibling project or the project's own narrative and cache rows cannot push
+/// its latest episode out of it. The needle is the tag as `serde_json` writes
+/// it, quotes and escapes included, so it does not depend on the separator.
+/// Like [`get_reflections_by_tag`], the inner match runs on
+/// `idx_reflections_tags_timestamp` (a covering scan) and only the winning rows
+/// are read whole.
+pub fn recent_episode_rows(
+    conn: &Connection,
+    project: &str,
+    limit: usize,
+) -> Result<Vec<ReflectionRow>> {
+    let project_needle = serde_json::to_string(&format!("project_{project}"))?;
+    let episode_needle = serde_json::to_string("session_episode")?;
+    let ledger_needle = serde_json::to_string(crate::story_map::store::LEDGER_TAG)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, content, tags, timestamp FROM reflections
+         WHERE rowid IN (SELECT rowid FROM reflections
+                         WHERE instr(tags, ?1) > 0
+                           AND instr(tags, ?2) > 0
+                           AND instr(tags, ?3) = 0
+                         ORDER BY timestamp DESC LIMIT ?4)
+         ORDER BY timestamp DESC",
+    )?;
+    let rows = stmt.query_map(
+        params![project_needle, episode_needle, ledger_needle, limit as i64],
+        |row| {
+            let id: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let tags_json: String = row.get(2)?;
+            let timestamp: String = row.get(3)?;
+            Ok((id, content, tags_json, timestamp))
+        },
+    )?;
+    let mut results = Vec::new();
+    for row in rows {
+        let (id, content, tags_json, timestamp) = row?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        results.push((id, content, tags, timestamp));
+    }
+    Ok(results)
+}
+
 /// Get reflections matching a specific tag substring (for session learnings).
 /// Shift Ledger rows (`narrative_shift`) are excluded inside the LIMIT window;
 /// ledger code asks for them through [`get_ledger_reflections_by_tag`].

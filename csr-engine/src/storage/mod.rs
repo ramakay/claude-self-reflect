@@ -1032,6 +1032,17 @@ impl Storage {
 
     // ─── Reflection tag queries ───
 
+    /// See [`queries::recent_episode_rows`]: one project's newest episodes, by
+    /// exact tag.
+    pub fn recent_episode_rows(
+        &self,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<queries::ReflectionRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::recent_episode_rows(&conn, project, limit)
+    }
+
     pub fn get_reflections_by_tag(
         &self,
         tag: &str,
