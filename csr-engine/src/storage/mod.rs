@@ -950,6 +950,121 @@ impl Storage {
         queries::fts5_search(&conn, query, limit, project)
     }
 
+    /// [`Self::fts5_search`] over the whole table (no project), with the bm25
+    /// ranking split by row-id range across several connections and threads.
+    /// The same rows in the same order with the same scores: bm25 does not
+    /// depend on the range a row is ranked in, and equal scores keep the
+    /// serial query's order (the FTS scan order, row id ascending). Any failure
+    /// is an `Err`, so the caller can ask the serial query instead.
+    pub(crate) fn fts5_search_sharded(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(ConversationChunk, usize, f64)>> {
+        let Some(fts_query) = queries::fts5_match_expr(query) else {
+            return Ok(Vec::new());
+        };
+        let ranges = self.fts_shard_ranges()?;
+        if ranges.len() < 2 || limit == 0 {
+            return self.fts5_search(query, limit, None);
+        }
+        self.fts5_search_in_ranges(&fts_query, limit, &ranges)
+    }
+
+    /// The ranking and merge of [`Self::fts5_search_sharded`] over `ranges`
+    /// (non-empty, together all of `i64`), the first on this connection and the
+    /// others each on a connection and thread of their own.
+    fn fts5_search_in_ranges(
+        &self,
+        fts_query: &str,
+        limit: usize,
+        ranges: &[(i64, i64)],
+    ) -> Result<Vec<(ConversationChunk, usize, f64)>> {
+        let ranked: Vec<Result<Vec<(i64, f64)>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = ranges[1..]
+                .iter()
+                .map(|&(low, high)| {
+                    scope.spawn(move || -> Result<Vec<(i64, f64)>> {
+                        let lane = self
+                            .open_prompt_lane()?
+                            .context("no second connection for a shard")?;
+                        let conn = lane.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                        queries::fts5_rank_window(&conn, fts_query, low, high, limit)
+                    })
+                })
+                .collect();
+            let (low, high) = ranges[0];
+            let mut out = vec![self
+                .conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("lock: {e}"))
+                .and_then(|conn| queries::fts5_rank_window(&conn, fts_query, low, high, limit))];
+            out.extend(handles.into_iter().map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("FTS shard thread panicked")))
+            }));
+            out
+        });
+        let mut merged: Vec<(i64, f64)> = Vec::new();
+        for part in ranked {
+            merged.extend(part?);
+        }
+        merged.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        merged.truncate(limit);
+        let rowids: Vec<i64> = merged.iter().map(|(rowid, _)| *rowid).collect();
+        let by_rowid = {
+            let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            queries::chunks_by_rowids(&conn, &rowids)?
+        };
+        Ok(merged
+            .into_iter()
+            .enumerate()
+            .filter_map(|(ordinal, (rowid, bm25))| {
+                by_rowid
+                    .get(&rowid)
+                    .cloned()
+                    .map(|chunk| (chunk, ordinal, bm25))
+            })
+            .collect())
+    }
+
+    /// The row-id ranges [`Self::fts5_search_sharded`] ranks in: cut once per
+    /// database file per half hour (a sample read, about 20 ms at 900k rows).
+    /// `CSR_NO_FTS_SHARDS=1` gives one range; otherwise 4.
+    fn fts_shard_ranges(&self) -> Result<Vec<(i64, i64)>> {
+        const REFRESH: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+        type Cut = (String, std::time::Instant, Vec<(i64, i64)>);
+        static CUTS: Mutex<Vec<Cut>> = Mutex::new(Vec::new());
+        let shards = if std::env::var("CSR_NO_FTS_SHARDS").is_ok_and(|v| v == "1") {
+            1
+        } else {
+            4
+        };
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let Some(path) = conn.path().filter(|p| !p.is_empty()).map(str::to_string) else {
+            return Ok(vec![(i64::MIN, i64::MAX)]);
+        };
+        let key = format!("{path}#{shards}");
+        {
+            let cuts = CUTS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, at, ranges)) = cuts.iter().find(|(k, _, _)| *k == key) {
+                if at.elapsed() < REFRESH {
+                    return Ok(ranges.clone());
+                }
+            }
+        }
+        let ranges = queries::chunk_rowid_shards(&conn, shards)?;
+        let mut cuts = CUTS.lock().unwrap_or_else(|e| e.into_inner());
+        cuts.retain(|(k, _, _)| *k != key);
+        cuts.push((key, std::time::Instant::now(), ranges.clone()));
+        Ok(ranges)
+    }
+
     /// The newest row ids of the two verdict tables, `(resolution_ledger,
     /// witness_verdicts)`: both are append-only, so the pair changes when a
     /// verdict is recorded, by this process or another. Two cheap index reads.
@@ -3198,6 +3313,93 @@ mod tests {
             .unwrap();
         assert_eq!(cache, -65536);
         assert_eq!(mmap, 2147418112);
+    }
+
+    /// The sharded FTS ranking returns exactly the serial query's rows: same
+    /// ids, same order (ties included), same bm25 bits, whatever the cut points.
+    #[test]
+    fn sharded_fts_ranking_equals_the_serial_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("csr.db")).unwrap();
+        let words = [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+        ];
+        storage
+            .with_connection(|conn| {
+                for n in 0..600usize {
+                    // Repeated texts give equal bm25 scores across row ids.
+                    let content: String = (0..1 + n % 7)
+                        .map(|i| words[(n % 5 + i * 3) % words.len()])
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    conn.execute(
+                        "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
+                         VALUES (?1, 'c', 'p', '2026-01-01T00:00:00Z', ?2, 1)",
+                        rusqlite::params![format!("id-{n:04}"), content],
+                    )?;
+                }
+                // Gaps in the row ids, as live.
+                conn.execute("DELETE FROM chunks WHERE rowid % 7 = 3", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let max_rowid: i64 = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row("SELECT max(rowid) FROM chunks", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        let ranges_sets: Vec<Vec<(i64, i64)>> = vec![
+            vec![(i64::MIN, i64::MAX)],
+            vec![(i64::MIN, 99), (100, i64::MAX)],
+            vec![
+                (i64::MIN, 10),
+                (11, 250),
+                (251, 252),
+                (253, max_rowid - 5),
+                (max_rowid - 4, i64::MAX),
+            ],
+        ];
+        for query in [
+            "alpha beta",
+            "gamma",
+            "zeta eta theta iota kappa alpha",
+            "nomatchatall",
+        ] {
+            let fts_query = queries::fts5_match_expr(query).unwrap();
+            for limit in [1usize, 5, 60, 1000] {
+                let serial = storage.fts5_search(query, limit, None).unwrap();
+                for ranges in &ranges_sets {
+                    let sharded = storage
+                        .fts5_search_in_ranges(&fts_query, limit, ranges)
+                        .unwrap();
+                    let key =
+                        |hits: &[(ConversationChunk, usize, f64)]| -> Vec<(String, usize, u64)> {
+                            hits.iter()
+                                .map(|(c, o, b)| (c.id.clone(), *o, b.to_bits()))
+                                .collect()
+                        };
+                    assert_eq!(
+                        key(&sharded),
+                        key(&serial),
+                        "{query} limit {limit} {ranges:?}"
+                    );
+                }
+            }
+        }
+        // The cut points: ranges tile the whole row-id space, in order.
+        let cuts = storage
+            .with_connection(|conn| queries::chunk_rowid_shards_sampled(conn, 4, 3, 10))
+            .unwrap();
+        assert_eq!(cuts.len(), 4);
+        assert_eq!(cuts[0].0, i64::MIN);
+        assert_eq!(cuts[3].1, i64::MAX);
+        for pair in cuts.windows(2) {
+            assert_eq!(pair[0].1 + 1, pair[1].0);
+        }
+        let too_few = storage
+            .with_connection(|conn| queries::chunk_rowid_shards_sampled(conn, 4, 251, 200))
+            .unwrap();
+        assert_eq!(too_few, vec![(i64::MIN, i64::MAX)]);
     }
 
     #[test]

@@ -318,14 +318,12 @@ fn session_verdicts<'a>(
     // A failed read is a pass for this call (the filter never removes what it
     // cannot judge) but never a verdict: it is not cached, so the next ask
     // scans again instead of keeping "clean" for the whole TTL.
-    let scan = storage.with_connection(|conn| {
-        crate::storage::queries::conversation_eval_scan_many(
-            conn,
-            &uncached,
-            MARKER_LIKE,
-            OUTPUT_LIKE,
-        )
-    });
+    let scan_start = Instant::now();
+    let scan = scan_conversations(storage, &uncached);
+    crate::mcp::stage_timing::add_ms(
+        "synthetic_scan",
+        scan_start.elapsed().as_secs_f64() * 1000.0,
+    );
     let scan_ok = scan.is_ok();
     let mut scanned = scan.unwrap_or_default();
     let mut held = cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -349,6 +347,85 @@ fn session_verdicts<'a>(
         verdicts.insert(conversation, verdict);
     }
     verdicts
+}
+
+/// Conversations a scan must hold before it is split across connections: one
+/// batch of a few conversations is cheaper read in place than set up in threads.
+const PARALLEL_SCAN_FROM: usize = 6;
+/// Connections (threads) a large scan is split across.
+const SCAN_LANES: usize = 4;
+
+/// The scan rows of `conversations`, keyed by conversation. A large set is
+/// dealt round-robin over [`SCAN_LANES`] connections read at once (every
+/// conversation is scanned by exactly one of them, so the rows are the ones a
+/// single read would return); a small one, an in-memory store, or a failure to
+/// open the other connections reads on `storage` alone. `CSR_NO_RECALL_LANES=1`
+/// keeps the single read.
+fn scan_conversations(
+    storage: &Storage,
+    conversations: &[String],
+) -> anyhow::Result<HashMap<String, Vec<EvalScanRow>>> {
+    let single = |ids: &[String]| {
+        storage.with_connection(|conn| {
+            crate::storage::queries::conversation_eval_scan_many(
+                conn,
+                ids,
+                MARKER_LIKE,
+                OUTPUT_LIKE,
+            )
+        })
+    };
+    if conversations.len() < PARALLEL_SCAN_FROM || !super::tools::recall_lanes_enabled() {
+        return single(conversations);
+    }
+    let lanes = SCAN_LANES;
+    let mut groups: Vec<Vec<String>> = vec![Vec::new(); lanes];
+    for (n, conversation) in conversations.iter().enumerate() {
+        groups[n % lanes].push(conversation.clone());
+    }
+    type Part = anyhow::Result<Option<HashMap<String, Vec<EvalScanRow>>>>;
+    let parts: Vec<Part> = std::thread::scope(|scope| {
+        let handles: Vec<_> = groups[1..]
+            .iter()
+            .map(|group| {
+                scope.spawn(move || {
+                    let Some(lane) = storage.open_prompt_lane()? else {
+                        return Ok(None);
+                    };
+                    lane.with_connection(|conn| {
+                        crate::storage::queries::conversation_eval_scan_many(
+                            conn,
+                            group,
+                            MARKER_LIKE,
+                            OUTPUT_LIKE,
+                        )
+                    })
+                    .map(Some)
+                })
+            })
+            .collect();
+        let mut out = vec![single(&groups[0]).map(Some)];
+        out.extend(handles.into_iter().map(|handle| {
+            handle
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("scan thread panicked")))
+        }));
+        out
+    });
+    let mut found: HashMap<String, Vec<EvalScanRow>> = HashMap::new();
+    let mut complete = true;
+    for part in parts {
+        match part? {
+            Some(rows) => found.extend(rows),
+            // No second connection (an in-memory store): read it all in place.
+            None => complete = false,
+        }
+    }
+    if complete {
+        Ok(found)
+    } else {
+        single(conversations)
+    }
 }
 
 /// One candidate row for [`rig_sunk_ids`].

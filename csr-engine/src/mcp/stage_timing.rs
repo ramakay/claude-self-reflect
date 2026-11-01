@@ -35,6 +35,9 @@ pub(crate) struct CallTimer {
     started: Instant,
     stages: BTreeMap<&'static str, f64>,
     counts: BTreeMap<&'static str, u64>,
+    /// (stage, start offset ms, duration ms) in completion order; kept only
+    /// with `CSR_STAGE_TIMELINE=1`, so the gaps between stages can be found.
+    timeline: Option<Vec<(&'static str, f64, f64)>>,
 }
 
 impl CallTimer {
@@ -45,13 +48,21 @@ impl CallTimer {
             started: Instant::now(),
             stages: BTreeMap::new(),
             counts: BTreeMap::new(),
+            timeline: std::env::var_os("CSR_STAGE_TIMELINE")
+                .is_some_and(|value| value == "1")
+                .then(Vec::new),
         }
     }
 
     /// Add the time since `started` to stage `name` (a stage that runs in both
     /// passes accumulates).
     pub(crate) fn stage(&mut self, name: &'static str, started: Instant) {
-        *self.stages.entry(name).or_insert(0.0) += started.elapsed().as_secs_f64() * 1000.0;
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        *self.stages.entry(name).or_insert(0.0) += ms;
+        if let Some(timeline) = self.timeline.as_mut() {
+            let offset = started.saturating_duration_since(self.started);
+            timeline.push((name, offset.as_secs_f64() * 1000.0, ms));
+        }
     }
 
     /// Add `n` to counter `name`.
@@ -76,6 +87,7 @@ impl CallTimer {
             "passes": self.counts.get("passes").copied().unwrap_or(0),
             "ms": self.stages,
             "counts": self.counts,
+            "timeline": self.timeline,
         });
         let mut text = line.to_string();
         text.push('\n');
@@ -125,6 +137,14 @@ fn with_timer(f: impl FnOnce(&mut CallTimer)) {
 /// Add the time since `started` to stage `name` of the current call.
 pub(crate) fn stage(name: &'static str, started: Instant) {
     with_timer(|timer| timer.stage(name, started));
+}
+
+/// Add `ms` milliseconds to stage `name` of the current call: for a stage that
+/// ran on another thread, where the call's timer is not in scope.
+pub(crate) fn add_ms(name: &'static str, ms: f64) {
+    with_timer(|timer| {
+        *timer.stages.entry(name).or_insert(0.0) += ms;
+    });
 }
 
 /// Add `n` to counter `name` of the current call.

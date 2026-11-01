@@ -2543,6 +2543,99 @@ pub fn fts5_search_projects(
     Ok(out)
 }
 
+/// Row-id ranges (inclusive, together all of `i64`) that split `chunks` into
+/// about `shards` parts holding about the same number of rows, for ranking one
+/// FTS5 query on several connections at once. Row ids are far from even (live:
+/// 590k of 906k rows sit in one million-wide band), so the cut points are
+/// quantiles of a sample: every 251st row id, read off a covering index. One
+/// range, `(i64::MIN, i64::MAX)`, when `shards` is below 2 or the sample is too
+/// small to be worth splitting.
+pub fn chunk_rowid_shards(conn: &Connection, shards: usize) -> Result<Vec<(i64, i64)>> {
+    chunk_rowid_shards_sampled(conn, shards, 251, 200)
+}
+
+/// [`chunk_rowid_shards`] with the sampling stride and the smallest sample
+/// worth splitting given (a test uses a small table).
+pub fn chunk_rowid_shards_sampled(
+    conn: &Connection,
+    shards: usize,
+    sample_every: i64,
+    min_samples: usize,
+) -> Result<Vec<(i64, i64)>> {
+    let whole = vec![(i64::MIN, i64::MAX)];
+    if shards < 2 {
+        return Ok(whole);
+    }
+    let mut stmt = conn.prepare_cached("SELECT rowid FROM chunks WHERE rowid % ?1 = 0")?;
+    let mut sample = stmt
+        .query_map([sample_every], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    if sample.len() < min_samples {
+        return Ok(whole);
+    }
+    sample.sort_unstable();
+    let mut cuts: Vec<i64> = (1..shards)
+        .map(|i| sample[i * sample.len() / shards])
+        .collect();
+    cuts.dedup();
+    let mut ranges = Vec::with_capacity(cuts.len() + 1);
+    let mut low = i64::MIN;
+    for cut in cuts {
+        ranges.push((low, cut - 1));
+        low = cut;
+    }
+    ranges.push((low, i64::MAX));
+    Ok(ranges)
+}
+
+/// `(rowid, bm25)` of the best `limit` rows of `chunks_fts` for `fts_query`
+/// whose row id lies in `low..=high`, best first. bm25 reads corpus statistics
+/// from the whole index, so a row scores the same whatever range it is ranked
+/// in; merging the ranges' best rows gives the best rows of the whole.
+pub fn fts5_rank_window(
+    conn: &Connection,
+    fts_query: &str,
+    low: i64,
+    high: i64,
+    limit: usize,
+) -> Result<Vec<(i64, f64)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT fts.rowid, bm25(chunks_fts)
+         FROM chunks_fts fts
+         WHERE chunks_fts MATCH ?1 AND fts.rowid BETWEEN ?2 AND ?3
+         ORDER BY fts.rank
+         LIMIT ?4",
+    )?;
+    let rows = stmt
+        .query_map(params![fts_query, low, high, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The chunk rows with these row ids, keyed by row id.
+pub fn chunks_by_rowids(
+    conn: &Connection,
+    rowids: &[i64],
+) -> Result<std::collections::HashMap<i64, ConversationChunk>> {
+    if rowids.is_empty() {
+        return Ok(Default::default());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count,
+                c.summary, c.is_sidechain, c.rowid
+         FROM chunks c
+         WHERE c.rowid IN (SELECT value FROM json_each(?1))",
+    )?;
+    let rows = stmt
+        .query_map([serde_json::to_string(rowids)?], |row| {
+            Ok((row.get::<_, i64>(8)?, row_to_chunk(row)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
 fn fts5_search_matched(
     conn: &Connection,
     fts_query: &str,
@@ -4480,6 +4573,25 @@ fn escape_like(prefix: &str) -> String {
 /// List distinct project names matching a prefix (for MCP completions).
 /// Returns up to `limit` results, sorted alphabetically.
 pub fn list_project_names(conn: &Connection, prefix: &str, limit: usize) -> Result<Vec<String>> {
+    if prefix.is_empty() {
+        // Every project: one index seek per project instead of a scan of every
+        // chunk row. `DISTINCT ... LIKE '%'` walked all of `idx_chunks_project`
+        // (about 60 ms at 950k chunks, every recall); each step here seeks to
+        // the next name past the last, so the cost follows the project count.
+        // Same rows, same order (the index's), NULL names excluded as before.
+        let mut stmt = conn.prepare_cached(
+            "WITH RECURSIVE p(n) AS (
+                 SELECT min(project_name) FROM chunks
+                 UNION ALL
+                 SELECT (SELECT min(project_name) FROM chunks WHERE project_name > p.n)
+                 FROM p WHERE n IS NOT NULL)
+             SELECT n FROM p WHERE n IS NOT NULL ORDER BY n LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| row.get(0))?;
+        return rows
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(|e| anyhow::anyhow!("{}", e));
+    }
     let pattern = format!("{}%", escape_like(prefix));
     let mut stmt = conn.prepare(
         "SELECT DISTINCT project_name FROM chunks
@@ -5984,6 +6096,61 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrations::run(&conn).unwrap();
         conn
+    }
+
+    /// The `DISTINCT ... LIKE` form `list_project_names` used for every prefix,
+    /// the oracle for its index-seek form on an empty prefix.
+    fn project_names_oracle(conn: &Connection, limit: i64) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT project_name FROM chunks
+                 WHERE project_name LIKE '%' ESCAPE '\\'
+                 ORDER BY project_name
+                 LIMIT ?1",
+            )
+            .unwrap();
+        stmt.query_map([limit], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn list_project_names_empty_prefix_matches_the_distinct_scan() {
+        let conn = mem();
+        assert!(list_project_names(&conn, "", i64::MAX as usize)
+            .unwrap()
+            .is_empty());
+        let names = [
+            "",
+            "a",
+            "A",
+            "a_b",
+            "a%b",
+            "a-b",
+            "ab",
+            "claude-self-reflect",
+            "Zed",
+            "zed",
+            "é",
+            "日本",
+            "with space",
+        ];
+        for (n, name) in names.iter().cycle().take(40).enumerate() {
+            conn.execute(
+                "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
+                 VALUES (?1, 'c', ?2, '2026-01-01T00:00:00Z', 'x', 1)",
+                params![format!("id-{n}"), name],
+            )
+            .unwrap();
+        }
+        for limit in [0_i64, 1, 3, 7, 13, 100, i64::MAX] {
+            assert_eq!(
+                list_project_names(&conn, "", limit as usize).unwrap(),
+                project_names_oracle(&conn, limit),
+                "limit {limit}"
+            );
+        }
     }
 
     fn test_chunk(id: &str, content: &str) -> ConversationChunk {
