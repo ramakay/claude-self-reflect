@@ -1941,6 +1941,16 @@ fn with_forecast(mut figure: Value, forecast: &Value) -> Value {
             if q["used"].is_number() && window["text"].is_string() {
                 q["forecast"] = window;
             }
+            // An early window has no caption under its circle, but its words still go in the
+            // facts: what the last window peaked at, or that it is too soon to tell.
+            let early = array(&forecast["windows"])
+                .iter()
+                .find(|w| w["code"] == q["code"] && w["early"] == true)
+                .and_then(|w| w["line"].as_str())
+                .map(|l| l.split(" · resets in ").next().unwrap_or(l).to_owned());
+            if let Some(line) = early.filter(|_| q["used"].is_number()) {
+                q["early"] = json!(line);
+            }
         }
     }
     if forecast["windows"].is_array() {
@@ -1954,7 +1964,7 @@ fn with_forecast(mut figure: Value, forecast: &Value) -> Value {
 /// One window's line in the facts: its words, then where it is headed when that is known.
 fn quota_fact(q: &Value) -> String {
     let line = text::paced(q);
-    match q["forecast"]["text"].as_str() {
+    match q["forecast"]["text"].as_str().or(q["early"].as_str()) {
         Some(forecast) => format!("{line} · {forecast}"),
         None => line,
     }
@@ -9748,5 +9758,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_an_early_window_keeps_its_words_in_the_facts() {
+        let figure = json!({"quotas": [
+            {"code": "5H", "used": 2., "text": "5H 2%"},
+            {"code": "7D", "used": 1., "text": "7D 1%"},
+        ]});
+        let forecast = json!({
+            "quota": {"5H": {"text": "→ ~30% at reset", "out": false}},
+            "windows": [
+                {"code": "5H", "early": false, "line": "On pace for about 30% by reset · resets in 3h"},
+                {"code": "7D", "early": true, "line": "Early · last week peaked at 93% · resets in 6d 21h"},
+            ],
+        });
+        let got = with_forecast(figure, &forecast);
+        let q = array(&got["quotas"]);
+        // The early week has no circle caption, only its words, without the reset tail.
+        assert!(q[1]["forecast"].is_null(), "{got}");
+        assert_eq!(quota_fact(&q[1]), "7D 1% · Early · last week peaked at 93%");
+        // A window past its early stretch keeps its caption and gets no early words.
+        assert!(q[0]["early"].is_null(), "{got}");
+        assert_eq!(quota_fact(&q[0]), "5H 2% · → ~30% at reset");
     }
 }
