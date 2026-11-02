@@ -1965,33 +1965,50 @@ pub(crate) fn drops_as_marker_only(msg: &serde_json::Value, combined_text: &str)
 /// Codex code mode runs every tool call inside one script tool of this name.
 const CODEX_CODE_MODE_TOOL: &str = "exec";
 
-/// Every use of the code-mode `tools` object in a script.
-static CODE_MODE_TOOLS_WORD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\btools\b").expect("code-mode tools word regex"));
-
-/// A direct CSR call, anchored at a `tools` use.
-static CODE_MODE_CSR_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\Atools\s*\.\s*mcp__claude_self_reflect__[A-Za-z0-9_]+\s*\(")
-        .expect("code-mode CSR call regex")
+/// One whole statement that calls one CSR tool and prints only its result,
+/// anchored at the start of what is left of the script. Two forms:
+/// `text(await tools.mcp__claude_self_reflect__<name>({...}));` and
+/// `const r = await tools.mcp__claude_self_reflect__<name>({...}); text(r);`.
+/// The argument is a flat object with no parentheses, braces, backticks or
+/// semicolons, so it can hold no call and no second statement.
+static CODE_MODE_CSR_STATEMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\A\s*(?:",
+        r"text\(\s*await\s+tools\s*\.\s*mcp__claude_self_reflect__[A-Za-z0-9_]+\(\s*(?:\{[^(){}`;]*\})?\s*\)\s*\)",
+        r"|(?:const|let|var)\s+(?P<bound>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*await\s+tools\s*\.\s*mcp__claude_self_reflect__[A-Za-z0-9_]+\(\s*(?:\{[^(){}`;]*\})?\s*\)\s*;\s*text\(\s*(?P<used>[A-Za-z_][A-Za-z0-9_]*)\s*\)",
+        r")[ \t]*(?:;|\r?\n|\z)",
+    ))
+    .expect("code-mode CSR statement regex")
 });
 
-/// Whether a Codex code-mode script calls CSR tools and nothing else.
+/// Whether a Codex code-mode script calls CSR tools and prints nothing else.
 ///
-/// A whitelist that abstains: every use of `tools` must be a direct
-/// `tools.mcp__claude_self_reflect__<name>(` call. Any other use (another
-/// tool, an alias such as `const t = tools`, `tools?.`, a computed
-/// `tools[...]`, a mention in a string) keeps the whole output. The output of
-/// a mixed script also holds the other tool's result, and dropping it would
-/// lose real work; a missed CSR-only script only leaks, as before this check.
+/// A whitelist of the whole script that abstains: every statement must be one
+/// of the two forms in [`CODE_MODE_CSR_STATEMENT_RE`]. Anything else (another
+/// tool, a second `text(...)`, an alias, a batch, a comment, a string that
+/// only looks like a call) keeps the whole output. The output of a mixed
+/// script also holds real work, and dropping it would lose that work; a
+/// missed CSR-only script only leaks, as before this check.
 fn code_mode_script_calls_only_csr(script: &str) -> bool {
-    let mut calls_csr = false;
-    for word in CODE_MODE_TOOLS_WORD_RE.find_iter(script) {
-        if !CODE_MODE_CSR_CALL_RE.is_match(&script[word.start()..]) {
+    let mut rest = script;
+    let mut statements = 0usize;
+    while !rest.trim().is_empty() {
+        let Some(statement) = CODE_MODE_CSR_STATEMENT_RE.captures(rest) else {
+            return false;
+        };
+        if let (Some(bound), Some(used)) = (statement.name("bound"), statement.name("used")) {
+            if bound.as_str() != used.as_str() {
+                return false;
+            }
+        }
+        let end = statement.get(0).map_or(0, |whole| whole.end());
+        if end == 0 {
             return false;
         }
-        calls_csr = true;
+        rest = &rest[end..];
+        statements += 1;
     }
-    calls_csr
+    statements > 0
 }
 
 pub(crate) fn is_csr_tool_use(item: &serde_json::Value, name: &str) -> bool {
@@ -2065,16 +2082,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_codex_code_mode_script_is_csr_only_when_every_tool_it_calls_is_csr() {
+    fn a_codex_code_mode_script_is_csr_only_when_every_statement_prints_one_csr_call() {
         let exec = |script: &str| serde_json::json!({"type":"tool_use","id":"c1","name":"exec","input":script});
         let is_csr = |script: &str| is_csr_tool_use(&exec(script), "exec");
 
-        // As Codex 0.166 writes it, single and batched.
+        // As Codex 0.166 writes it: one call printed, alone or in sequence.
         assert!(is_csr(
             r#"const r=await tools.mcp__claude_self_reflect__csr_reflect_on_past({query:"why did we drop Qdrant",limit:3});text(r);"#
         ));
         assert!(is_csr(
-            "const rs = await Promise.allSettled([tools.mcp__claude_self_reflect__csr_reflect_on_past({query:\"a\"}), tools . mcp__claude_self_reflect__csr_why({target:\"b\"})]); text(rs);"
+            "text(await tools.mcp__claude_self_reflect__csr_reflect_on_past({query:\"ramastyle CSR\",limit:2}));\n"
+        ));
+        assert!(is_csr(
+            "text(await tools . mcp__claude_self_reflect__csr_reflect_on_past({query:\"a\"}))\nconst w = await tools.mcp__claude_self_reflect__csr_why({target:\"b\"});\ntext(w);"
+        ));
+        assert!(is_csr(
+            "text(await tools.mcp__claude_self_reflect__get_recent_work());"
+        ));
+        // A batch is not one of the whitelisted forms: abstain.
+        assert!(!is_csr(
+            "const rs = await Promise.allSettled([tools.mcp__claude_self_reflect__csr_reflect_on_past({query:\"a\"}), tools.mcp__claude_self_reflect__csr_why({target:\"b\"})]); text(rs);"
+        ));
+        // Any other printed text is real work, whatever the CSR call around it.
+        assert!(!is_csr(
+            r#"text("tools.mcp__claude_self_reflect__csr_why("); text("REAL NOTE");"#
+        ));
+        assert!(!is_csr(
+            r#"text(await tools.mcp__claude_self_reflect__csr_why({target:"x"})); text("REAL NOTE");"#
+        ));
+        assert!(!is_csr(
+            r#"const r = await tools.mcp__claude_self_reflect__csr_why({target:"x"}); text(note);"#
+        ));
+        // An argument that could hide a call or a second statement: abstain.
+        assert!(!is_csr(
+            r#"text(await tools.mcp__claude_self_reflect__csr_why({target:"x"}); text("REAL NOTE"); ({})));"#
+        ));
+        assert!(!is_csr(
+            "text(await tools.mcp__claude_self_reflect__csr_why({target:`${text(\"REAL\")}`}));"
+        ));
+        assert!(!is_csr(
+            "// text(await tools.mcp__claude_self_reflect__csr_why({}));\ntext(\"REAL NOTE\");"
+        ));
+        assert!(!is_csr(
+            "text(await tools.mcp__claude_self_reflect__csr_why({}))text(\"REAL NOTE\")"
         ));
         // Mixed with another tool: the output holds real work, keep it.
         assert!(!is_csr(

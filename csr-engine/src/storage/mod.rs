@@ -40,6 +40,16 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::import::{ConversationChunk, CsrSuppressionStats};
 
+/// One chunk read and embedded in full before any write, for
+/// [`Storage::replace_conversation_chunks`].
+#[derive(Debug, Clone)]
+pub struct StagedChunk {
+    pub chunk: ConversationChunk,
+    pub embedding: Vec<f32>,
+    pub evidence: crate::provenance::ChunkEvidence,
+    pub provenance: crate::provenance::ChunkProvenance,
+}
+
 /// Page cache and memory-mapped reads for a multi-GB database. SQLite's
 /// defaults (a 2 MB cache, no mmap) turn every prompt render into a stream of
 /// `pread` calls: sampled live 2026-10-11, the render's samples sat mostly in
@@ -1693,6 +1703,42 @@ impl Storage {
         let value = apply(&tx)?;
         tx.commit()?;
         Ok(value)
+    }
+
+    /// Replace one conversation's chunks in a single `BEGIN IMMEDIATE`
+    /// transaction: delete the old rows, write `staged` with provenance and
+    /// evidence, and stamp `import_state` for `file_path`. Any error rolls all
+    /// of it back, so the old rows stay as they were. Returns the deleted chunk
+    /// ids, for the caller to drop from the search index after the commit.
+    pub fn replace_conversation_chunks(
+        &self,
+        conversation_id: &str,
+        staged: &[StagedChunk],
+        source: &str,
+        file_path: &str,
+        mtime: &str,
+    ) -> Result<Vec<String>> {
+        self.with_immediate_transaction(|tx| {
+            let mut stmt = tx.prepare("SELECT id FROM chunks WHERE conversation_id = ?1")?;
+            let old_ids = stmt
+                .query_map([conversation_id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            queries::delete_chunks_for_conversation(tx, conversation_id)?;
+            for row in staged {
+                queries::insert_chunk_with_source(tx, &row.chunk, &row.embedding, source)?;
+                queries::insert_chunk_provenance(tx, &row.chunk.id, &row.provenance)?;
+                queries::replace_chunk_evidence_in(tx, &row.evidence)?;
+            }
+            queries::upsert_import_state_explicit(
+                tx,
+                file_path,
+                conversation_id,
+                staged.len(),
+                mtime,
+            )?;
+            Ok(old_ids)
+        })
     }
 
     /// How long this connection waits for another writer before SQLITE_BUSY.

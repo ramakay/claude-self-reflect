@@ -14,7 +14,7 @@ use crate::engine::Engine;
 use crate::import::scrub::is_database_busy;
 use crate::import::{ConversationChunk, CsrSuppressionStats};
 use crate::provenance::{ChunkEvidence, ChunkProvenance, ProvenanceEvent, TrustTier};
-use crate::storage::Storage;
+use crate::storage::{StagedChunk, Storage};
 
 const ROLLOUT_EMBED_BATCH_SIZE: usize = 32;
 /// How many times one rollout is re-attempted after SQLite reports the database
@@ -994,16 +994,100 @@ fn import_rollout_with_retries(
     engine: &Engine,
     file: &RolloutFile,
 ) -> Result<Option<RolloutStreamOutcome>> {
-    let mut attempt = 0;
+    with_busy_retries(|| import_rollout(engine, file))
+}
+
+/// Run `attempt`, re-running it while SQLite reports the database busy.
+fn with_busy_retries<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut tries = 0;
     loop {
-        match import_rollout(engine, file) {
-            Err(error) if attempt < ROLLOUT_BUSY_RETRIES && is_database_busy(&error) => {
-                attempt += 1;
-                std::thread::sleep(ROLLOUT_BUSY_BACKOFF * attempt as u32);
+        match attempt() {
+            Err(error) if tries < ROLLOUT_BUSY_RETRIES && is_database_busy(&error) => {
+                tries += 1;
+                std::thread::sleep(ROLLOUT_BUSY_BACKOFF * tries as u32);
             }
             result => return result,
         }
     }
+}
+
+/// The CSR-leak repair's import of one rollout. Unlike [`import_rollout`],
+/// it reads and embeds the whole file before it writes anything, then
+/// replaces the conversation's rows in one transaction. A file that vanishes,
+/// fails to read or fails to embed, or a write that fails, leaves the stored
+/// rows as they were. A file that now yields no chunks is not trusted to
+/// replace stored rows either.
+fn reimport_rollout_staged(
+    engine: &Engine,
+    file: &RolloutFile,
+) -> Result<Option<RolloutStreamOutcome>> {
+    let _operation = engine.storage().operation_lock()?;
+    let storage = engine.storage();
+    let Some(metadata) = scan_rollout_metadata(&file.path)? else {
+        return Ok(None);
+    };
+    let mut staged = Vec::new();
+    let outcome = stream_rollout_chunk_batches(
+        &file.path,
+        &metadata,
+        ROLLOUT_EMBED_BATCH_SIZE,
+        |chunks, evidence| {
+            let texts = chunks
+                .iter()
+                .map(|chunk| chunk.content.as_str())
+                .collect::<Vec<_>>();
+            let embeddings = engine.embeddings().embed(&texts)?;
+            anyhow::ensure!(
+                embeddings.len() == chunks.len(),
+                "embedded {} of {} rollout chunks",
+                embeddings.len(),
+                chunks.len()
+            );
+            for ((chunk, chunk_evidence), embedding) in chunks.iter().zip(evidence).zip(embeddings)
+            {
+                staged.push(StagedChunk {
+                    chunk: chunk.clone(),
+                    embedding,
+                    evidence: chunk_evidence.clone(),
+                    provenance: ChunkProvenance {
+                        author: chunk.author,
+                        source_conv_id: metadata.conversation_id.clone(),
+                        supersedes: None,
+                    },
+                });
+            }
+            Ok(())
+        },
+    )?;
+    anyhow::ensure!(
+        !staged.is_empty(),
+        "Codex rollout yielded no chunks on re-import: {}",
+        file.path.display()
+    );
+    let key = file.path.to_string_lossy();
+    let old_ids = storage.replace_conversation_chunks(
+        &metadata.conversation_id,
+        &staged,
+        "codex_rollout",
+        &key,
+        &file.mtime,
+    )?;
+    {
+        let mut index = engine.search().blocking_write();
+        for id in old_ids {
+            index.remove_chunk(&id);
+        }
+        for row in staged {
+            index.insert_chunk(row.chunk.id, row.embedding);
+        }
+    }
+    storage.bump_aux_counter_by("codex_rollout", outcome.schema_misses)?;
+    storage.bump_aux_counter_by(
+        "codex_harness_context_stripped",
+        outcome.harness_context_stripped,
+    )?;
+    storage.record_secrets_redacted(&key, &outcome.suppression.secrets)?;
+    Ok(Some(outcome))
 }
 
 /// `Ok(None)` means the rollout vanished between discovery and reading it,
@@ -1541,7 +1625,7 @@ pub fn csr_exec_leak_reimport_batch(
             continue;
         };
         let file = RolloutFile { path, mtime };
-        match import_rollout_with_retries(engine, &file) {
+        match with_busy_retries(|| reimport_rollout_staged(engine, &file)) {
             Ok(Some(_)) => stats.reimported += 1,
             Ok(None) => stats.vanished += 1,
             Err(error) => {
@@ -3296,6 +3380,73 @@ mod tests {
         }
         // The file is gone, so nothing proves the stored text is CSR's: kept.
         assert_eq!(leaked_left(&conversations[3]), 1);
+    }
+
+    /// A re-import whose write fails part way keeps every stored row, and one
+    /// whose file is gone writes nothing.
+    #[test]
+    fn a_failed_staged_reimport_keeps_the_stored_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout-0.jsonl");
+        let lines = [
+            serde_json::json!({"timestamp":"2026-10-31T12:00:00Z","type":"session_meta","payload":{"id":"staged-0","timestamp":"2026-10-31T12:00:00Z","cwd":"/workspace/staged"}}),
+            serde_json::json!({"timestamp":"2026-10-31T12:00:01Z","type":"response_item","payload":{"type":"message","id":"u1","role":"user","content":[{"type":"input_text","text":"why did we drop Qdrant?"}]}}),
+            serde_json::json!({"timestamp":"2026-10-31T12:00:04Z","type":"response_item","payload":{"type":"message","id":"a1","role":"assistant","content":[{"type":"output_text","text":"We dropped Qdrant for one binary."}]}}),
+        ]
+        .map(|value| value.to_string())
+        .join("\n");
+        std::fs::write(&path, lines).unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+        import_changed_rollouts(&engine, root.path()).unwrap();
+        let stored = || -> Vec<(String, String)> {
+            storage
+                .with_connection(|conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, content FROM chunks WHERE conversation_id = 'codex:staged-0' ORDER BY id",
+                    )?;
+                    let rows = stmt
+                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                })
+                .unwrap()
+        };
+        let before = stored();
+        assert!(!before.is_empty());
+        let file = RolloutFile {
+            path: path.clone(),
+            mtime: "2026-10-31T12:00:05Z".to_string(),
+        };
+
+        // The provenance write fails after the old rows were deleted and the
+        // first new chunk was written: all of it rolls back.
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch(
+                    "CREATE TEMP TRIGGER fail_provenance BEFORE INSERT ON main.chunk_provenance
+                     BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let error = reimport_rollout_staged(&engine, &file).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected write failure"),
+            "{error:#}"
+        );
+        assert_eq!(stored(), before);
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_provenance;")?;
+                Ok(())
+            })
+            .unwrap();
+
+        // A file gone before the read is reported vanished and writes nothing.
+        std::fs::remove_file(&path).unwrap();
+        assert!(reimport_rollout_staged(&engine, &file).unwrap().is_none());
+        assert_eq!(stored(), before);
     }
 
     #[test]

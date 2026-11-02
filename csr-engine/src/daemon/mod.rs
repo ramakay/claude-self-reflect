@@ -1334,39 +1334,52 @@ impl Daemon {
                     else {
                         return;
                     };
-                    let leak_engine = engine.clone();
-                    let leak_shutdown = shutdown.clone();
-                    let leak_result = tokio::task::spawn_blocking(move || {
-                        let _permit = leak_permit;
-                        crate::import::codex_rollout::csr_exec_leak_reimport_batch(
-                            &leak_engine,
-                            crate::import::codex_rollout::CSR_EXEC_REIMPORT_BATCH,
-                            leak_shutdown.as_ref(),
+                    // The harness batch may have run long, so check idle
+                    // again under this permit, as that batch does under its own.
+                    if codex_import_disabled()
+                        || !dream_cadence::is_idle(
+                            dream_cadence::last_activity_at(&storage),
+                            chrono::Utc::now(),
+                            dream_cadence::idle_secs(),
                         )
-                    })
-                    .await;
-                    match leak_result {
-                        Ok(Ok(stats)) if stats.already_applied => {}
-                        Ok(Ok(stats)) => {
-                            tracing::info!(
-                                reimported = stats.reimported,
-                                failed = stats.failed,
-                                vanished = stats.vanished,
-                                remaining = stats.remaining,
-                                conversations_leaked = stats.conversations_leaked,
-                                conversations_missing_file = stats.conversations_missing_file,
-                                done = stats.done,
-                                "Codex CSR-leak reimport batch completed"
-                            );
-                            if !stats.done {
-                                wait_secs = HARNESS_STRIP_DRAIN_POLL_SECS;
+                    {
+                        drop(leak_permit);
+                        wait_secs = HARNESS_STRIP_BUSY_POLL_SECS;
+                    } else {
+                        let leak_engine = engine.clone();
+                        let leak_shutdown = shutdown.clone();
+                        let leak_result = tokio::task::spawn_blocking(move || {
+                            let _permit = leak_permit;
+                            crate::import::codex_rollout::csr_exec_leak_reimport_batch(
+                                &leak_engine,
+                                crate::import::codex_rollout::CSR_EXEC_REIMPORT_BATCH,
+                                leak_shutdown.as_ref(),
+                            )
+                        })
+                        .await;
+                        match leak_result {
+                            Ok(Ok(stats)) if stats.already_applied => {}
+                            Ok(Ok(stats)) => {
+                                tracing::info!(
+                                    reimported = stats.reimported,
+                                    failed = stats.failed,
+                                    vanished = stats.vanished,
+                                    remaining = stats.remaining,
+                                    conversations_leaked = stats.conversations_leaked,
+                                    conversations_missing_file = stats.conversations_missing_file,
+                                    done = stats.done,
+                                    "Codex CSR-leak reimport batch completed"
+                                );
+                                if !stats.done {
+                                    wait_secs = HARNESS_STRIP_DRAIN_POLL_SECS;
+                                }
                             }
-                        }
-                        Ok(Err(error)) => {
-                            tracing::warn!(%error, "Codex CSR-leak reimport batch failed")
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "Codex CSR-leak reimport batch panicked")
+                            Ok(Err(error)) => {
+                                tracing::warn!(%error, "Codex CSR-leak reimport batch failed")
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "Codex CSR-leak reimport batch panicked")
+                            }
                         }
                     }
                     match &result {
