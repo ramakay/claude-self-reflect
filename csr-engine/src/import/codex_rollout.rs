@@ -390,13 +390,6 @@ fn string_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
     current.as_str().map(str::to_string)
 }
 
-/// Stand-in ids for a Codex tool call or output that carries none. They
-/// differ, so an id-less output never pairs with an id-less call: the
-/// shared sanitizer drops a CSR call's output by id, and a shared stand-in
-/// would let one id-less CSR call drop every other id-less output.
-const MISSING_CALL_ID: &str = "codex-call-without-id";
-const MISSING_OUTPUT_ID: &str = "codex-output-without-id";
-
 fn parse_response_item(
     value: &serde_json::Value,
     messages: &mut Vec<serde_json::Value>,
@@ -431,21 +424,24 @@ fn parse_response_item(
                 .get("name")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
-            // A call with no id gets one no output can carry, so suppressing
-            // it can never take another call's output with it.
+            // A call with no id is stored with none. The shared sanitizer
+            // pairs a CSR call with its output by id; any stand-in would be a
+            // string a real call or output can also carry.
             let id = payload
                 .get("call_id")
                 .or_else(|| payload.get("id"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(MISSING_CALL_ID);
+                .and_then(serde_json::Value::as_str);
             let input = payload
                 .get("arguments")
                 .or_else(|| payload.get("input"))
                 .map(parse_json_string)
                 .unwrap_or(serde_json::Value::Null);
             let mut tool = serde_json::json!({
-                "type":"tool_use", "id":id, "name":name, "input":input
+                "type":"tool_use", "name":name, "input":input
             });
+            if let Some(id) = id {
+                tool["id"] = serde_json::Value::String(id.to_string());
+            }
             if let Some(namespace) = payload.get("namespace") {
                 tool["namespace"] = namespace.clone();
             }
@@ -455,14 +451,13 @@ fn parse_response_item(
             let id = payload
                 .get("call_id")
                 .or_else(|| payload.get("id"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(MISSING_OUTPUT_ID);
+                .and_then(serde_json::Value::as_str);
             let output = payload.get("output").map(value_text).unwrap_or_default();
-            messages.push(block_message(
-                "user",
-                serde_json::json!({"type":"tool_result", "tool_use_id":id, "content":output}),
-                timestamp,
-            ));
+            let mut result = serde_json::json!({"type":"tool_result", "content":output});
+            if let Some(id) = id {
+                result["tool_use_id"] = serde_json::Value::String(id.to_string());
+            }
+            messages.push(block_message("user", result, timestamp));
         }
         // Reasoning and encrypted internals are intentionally not searchable text.
         Some("reasoning") => {}
@@ -3009,6 +3004,126 @@ mod tests {
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
     }
 
+    /// A script that calls CSR among other work keeps its output, minus each
+    /// line that is, whole, the printed JSON of one CSR result. Every other
+    /// line stays, CSR text included when it is printed any other way.
+    #[test]
+    fn a_mixed_script_drops_only_its_printed_csr_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-mixed.jsonl");
+        let line = |value: serde_json::Value| value.to_string();
+        let envelope = |marker: &str| {
+            format!(
+                "🎯 RESULTS: 1 matches (good relevance, top score: 0.497)\n⚡ PERFORMANCE: 12ms (1 collection searched)\n\n<search>\n  <meta>\n    <q>q</q>\n  </meta>\n  <results>\n    <r rank=\"1\"><excerpt>{marker}</excerpt></r>\n  </results>\n</search>"
+            )
+        };
+        let result = |marker: &str| serde_json::json!({"content":[{"type":"text","text":envelope(marker)}],"isError":false});
+        let notice = crate::binary_identity::replacement_notice("2026-10-30T00:37:29Z");
+        let cut = serde_json::json!({"i":5,"value":result("CUT SHORT KEPT")}).to_string();
+        let printed = [
+            result("DIRECT CSR GONE").to_string(),
+            serde_json::json!({"i":0,"status":"fulfilled","value":result("SETTLED CSR GONE")})
+                .to_string(),
+            serde_json::json!({"i":1,"result":{"status":"fulfilled","value":{"content":[{"type":"text","text":envelope("NOTICED CSR GONE")},{"type":"text","text":notice}]}}})
+                .to_string(),
+            serde_json::json!({"i":2,"status":"fulfilled","value":{"chunk_id":"ab12","exit_code":0,"output":"REAL SHELL OUTPUT KEPT"}})
+                .to_string(),
+            serde_json::json!({"note":"REAL NOTE BESIDE KEPT","value":result("BESIDE A NOTE")})
+                .to_string(),
+            serde_json::json!({"content":[{"type":"text","text":envelope("ERROR RESULT KEPT")}],"isError":true})
+                .to_string(),
+            serde_json::json!({"content":[{"type":"text","text":"OTHER SERVER TEXT KEPT"}]})
+                .to_string(),
+            serde_json::json!({"value":result("FIRST OF TWO KEPT"),"result":result("SECOND OF TWO")})
+                .to_string(),
+            // Data printed beside the result keeps the whole line.
+            serde_json::json!({"memory":result("BESIDE GIT"),"gitExitCode":1,"hasChanges":true})
+                .to_string(),
+            serde_json::json!({"i":0,"status":"fulfilled","value":result("BESIDE A FLAG KEPT"),"cached":true})
+                .to_string(),
+            cut[..cut.len() - 40].to_string(),
+            // A `csr_why` form takes any text on its last line: never removed.
+            serde_json::json!({"content":[{"type":"text","text":"WHY: storage\n\nNo evidence chain found.\nreceipt: BUILD FAILED KEPT"}]})
+                .to_string(),
+        ]
+        .join("\n");
+        let output = serde_json::json!([
+            {"type":"input_text","text":"Script completed\nWall time 1.5 seconds\nOutput:\n"},
+            {"type":"input_text","text":printed}
+        ]);
+        let mixed = "const r = await Promise.allSettled([tools.mcp__claude_self_reflect__csr_reflect_on_past({query:\"q\"}), tools.exec_command({cmd:\"ls\"})]); r.forEach((x,i)=>text({i,...x}));";
+        std::fs::write(
+            &path,
+            [
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:00Z","type":"session_meta","payload":{"id":"mixed","timestamp":"2026-11-02T12:00:00Z","cwd":"/workspace/mixed"}})),
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:01Z","type":"response_item","payload":{"type":"message","id":"u1","role":"user","content":[{"type":"input_text","text":"what changed?"}]}})),
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t1","call_id":"mixed-exec","name":"exec","input":mixed}})),
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o1","call_id":"mixed-exec","output":output}})),
+                // A plain-string output is scrubbed line by line too.
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:04Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t2","call_id":"string-exec","name":"exec","input":mixed}})),
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:05Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o2","call_id":"string-exec","output":format!("{}\nPLAIN STRING SHELL KEPT", result("STRING CSR GONE"))}})),
+                // No CSR call in the script: nothing is scrubbed.
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:06Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t3","call_id":"plain-exec","name":"exec","input":"text(await tools.exec_command({cmd:\"cat saved.json\"}));"}})),
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:07Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o3","call_id":"plain-exec","output":result("NO CSR CALL KEPT").to_string()}})),
+                // A CSR name only in a comment, `tools` aliased, or a regex
+                // literal the reader cannot place: nothing is scrubbed.
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:08Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t4","call_id":"comment-exec","name":"exec","input":"// tools.mcp__claude_self_reflect__csr_why({})\ntext(JSON.parse((await tools.exec_command({cmd:\"cat f.json\"})).output));"}})),
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:09Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o4","call_id":"comment-exec","output":result("COMMENT ONLY KEPT").to_string()}})),
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:10Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t5","call_id":"alias-exec","name":"exec","input":"const t = tools; text(await t.mcp__claude_self_reflect__csr_why({})); text(await tools.mcp__claude_self_reflect__csr_why({})); text(await tools.exec_command({cmd:\"ls\"}));"}})),
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:11Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o5","call_id":"alias-exec","output":result("ALIAS KEPT").to_string()}})),
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:12Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t6","call_id":"regex-exec","name":"exec","input":"text(await tools.mcp__claude_self_reflect__csr_reflect_on_past({query:\"q\"})); text([\"a\"].filter(x=>/a/.test(x)));"}})),
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:13Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o6","call_id":"regex-exec","output":result("REGEX ABSTAIN KEPT").to_string()}})),
+                line(serde_json::json!({"timestamp":"2026-11-02T12:00:14Z","type":"response_item","payload":{"type":"message","id":"a1","role":"assistant","content":[{"type":"output_text","text":"Two files changed."}]}})),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let metadata = scan_rollout_metadata(&path).unwrap().unwrap();
+        let mut chunks = Vec::new();
+        stream_rollout_chunk_batches(&path, &metadata, ROLLOUT_EMBED_BATCH_SIZE, |batch, _| {
+            chunks.extend_from_slice(batch);
+            Ok(())
+        })
+        .unwrap();
+        let all = chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for gone in [
+            "DIRECT CSR GONE",
+            "SETTLED CSR GONE",
+            "NOTICED CSR GONE",
+            "STRING CSR GONE",
+        ] {
+            assert!(!all.contains(gone), "{gone} leaked: {all}");
+        }
+        for kept in [
+            "Script completed",
+            "REAL SHELL OUTPUT KEPT",
+            "REAL NOTE BESIDE KEPT",
+            "ERROR RESULT KEPT",
+            "OTHER SERVER TEXT KEPT",
+            "FIRST OF TWO KEPT",
+            "gitExitCode",
+            "BESIDE A FLAG KEPT",
+            "CUT SHORT KEPT",
+            "PLAIN STRING SHELL KEPT",
+            "NO CSR CALL KEPT",
+            "BUILD FAILED KEPT",
+            "COMMENT ONLY KEPT",
+            "ALIAS KEPT",
+            "REGEX ABSTAIN KEPT",
+            "what changed?",
+            "Two files changed.",
+        ] {
+            assert!(all.contains(kept), "{kept} lost: {all}");
+        }
+        let parsed = parse_rollout(&path).unwrap().unwrap();
+        assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 4);
+    }
+
     /// A CSR `exec` with no call id cannot take an id-less output with it.
     #[test]
     fn an_id_less_csr_call_keeps_every_id_less_output() {
@@ -3023,6 +3138,14 @@ mod tests {
                 line(serde_json::json!({"timestamp":"2026-10-31T12:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","output":"CSR RESULT LEAKS"}})),
                 line(serde_json::json!({"timestamp":"2026-10-31T12:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"text(\"REAL NOTE\");"}})),
                 line(serde_json::json!({"timestamp":"2026-10-31T12:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","output":"REAL NOTE KEPT"}})),
+                // An explicit id equal to an old stand-in pairs with nothing.
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:05Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"codex-call-without-id","name":"exec","input":"text(await tools.exec_command({cmd:\"ls\"}));"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:06Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"codex-call-without-id","output":"EXPLICIT ID KEPT"}})),
+                // An id-less mixed script marks no id, so a later output with
+                // any id keeps a printed result line.
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:07Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.mcp__claude_self_reflect__csr_why({}); text(await tools.exec_command({cmd:\"ls\"}));"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:08Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"codex-call-without-id","name":"exec","input":"text(1);"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:09Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"codex-call-without-id","output":serde_json::json!({"content":[{"type":"text","text":"🎯 RESULTS: 1 matches (good relevance, top score: 0.497)\n\n<search>\n  <meta>\n  </meta>\n  <results>\n    <r>FIXTURE LINE KEPT</r>\n  </results>\n</search>\n"}]}).to_string()}})),
             ]
             .join("\n"),
         )
@@ -3040,6 +3163,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(all.contains("REAL NOTE KEPT"), "{all}");
+        assert!(all.contains("EXPLICIT ID KEPT"), "{all}");
+        assert!(all.contains("FIXTURE LINE KEPT"), "{all}");
         // Abstain: with no id, nothing proves which output is CSR's.
         assert!(all.contains("CSR RESULT LEAKS"), "{all}");
     }

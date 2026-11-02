@@ -117,9 +117,13 @@ struct CsrMessageSanitizer {
     /// Derived artifacts (learnings, episodes, narratives, recap feeds) may skip
     /// CSR's own text; the stored conversation never does. Chunk import keeps
     /// every byte a grammar matches and only cuts what is structural: CSR's
-    /// own tool calls and results, and a complete hook-labelled wrapper.
+    /// own tool calls and results, the printed result of a CSR call inside a
+    /// Codex script, and a complete hook-labelled wrapper.
     derived: bool,
     suppressed_tool_use_ids: HashSet<String>,
+    /// Codex code-mode scripts that call a CSR tool among other work. Their
+    /// output keeps every line except a printed CSR result.
+    csr_mixed_script_ids: HashSet<String>,
     stats: CsrSuppressionStats,
 }
 
@@ -129,6 +133,7 @@ impl CsrMessageSanitizer {
         Self {
             derived: false,
             suppressed_tool_use_ids: HashSet::new(),
+            csr_mixed_script_ids: HashSet::new(),
             stats: CsrSuppressionStats::default(),
         }
     }
@@ -1695,15 +1700,23 @@ fn sanitize_content(
                     sanitizer.stats.csr_tool_blocks_suppressed += 1;
                     continue;
                 }
+                if is_code_mode_script_calling_csr(&item, name) {
+                    if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
+                        sanitizer.csr_mixed_script_ids.insert(id.to_string());
+                    }
+                }
             }
             Some("tool_result") => {
-                let is_csr_result = item
-                    .get("tool_use_id")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|id| sanitizer.suppressed_tool_use_ids.contains(id));
-                if is_csr_result {
+                let id = item.get("tool_use_id").and_then(|value| value.as_str());
+                if id.is_some_and(|id| sanitizer.suppressed_tool_use_ids.contains(id)) {
                     sanitizer.stats.csr_tool_blocks_suppressed += 1;
                     continue;
+                }
+                if id.is_some_and(|id| sanitizer.csr_mixed_script_ids.contains(id)) {
+                    if let Some(content) = item.get_mut("content") {
+                        sanitizer.stats.csr_tool_blocks_suppressed +=
+                            scrub_code_mode_csr_results(content);
+                    }
                 }
             }
             Some("text") => {
@@ -2022,6 +2035,260 @@ fn code_mode_script_calls_only_csr(script: &str) -> bool {
     statements > 0
 }
 
+/// What follows `tools` in a call to a CSR tool, and in any reference to one.
+static CODE_MODE_CSR_MEMBER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\A\.\s*mcp__claude_self_reflect__").expect("code-mode CSR member regex")
+});
+static CODE_MODE_CSR_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\A\.\s*mcp__claude_self_reflect__[A-Za-z0-9_]+\s*\(")
+        .expect("code-mode CSR call regex")
+});
+
+/// Whether a code-mode script calls a CSR tool and is not wholly CSR's (that
+/// case drops the whole call and output in [`is_csr_tool_use`]). It only marks
+/// the script's output for [`scrub_code_mode_csr_results`]; the line check
+/// there decides what goes.
+fn is_code_mode_script_calling_csr(item: &serde_json::Value, name: &str) -> bool {
+    name == CODEX_CODE_MODE_TOOL
+        && item
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .and_then(code_mode_code_only)
+            .is_some_and(|code| code_calls_csr_tool(&code))
+}
+
+/// Whether script code, with strings and comments already blanked, calls a
+/// CSR tool as `tools.mcp__claude_self_reflect__<name>(`. It abstains (false)
+/// when the script uses `tools` any other way (aliased, passed, rebound,
+/// destructured, or as some object's property) or names a CSR tool without
+/// calling it, since either can
+/// make the printed "result" something the script built itself.
+fn code_calls_csr_tool(code: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let mut calls = false;
+    for (at, word) in code.match_indices("tools") {
+        let after = &code[at + word.len()..];
+        if code[..at].chars().next_back().is_some_and(is_ident) || after.starts_with(is_ident) {
+            continue;
+        }
+        // `x.tools`, `x . tools`, `x?.tools`: some other object's `tools`.
+        if code[..at].trim_end().ends_with('.') {
+            return false;
+        }
+        let member = after.trim_start();
+        if !member.starts_with('.') {
+            return false;
+        }
+        if CODE_MODE_CSR_MEMBER_RE.is_match(member) {
+            if !CODE_MODE_CSR_CALL_RE.is_match(member) {
+                return false;
+            }
+            calls = true;
+        }
+    }
+    calls
+}
+
+/// A code-mode script with every string, template and comment blanked to one
+/// space, so a CSR tool name inside one is not read as a call. `None` when
+/// the script holds anything this cannot read for sure: a `/` that does not
+/// open a comment (a regex literal or a division), a template with `${`, or
+/// an unterminated string or comment.
+fn code_mode_code_only(script: &str) -> Option<String> {
+    let mut code = String::with_capacity(script.len());
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                loop {
+                    match chars.next()? {
+                        '\\' => {
+                            chars.next()?;
+                        }
+                        '\n' if c != '`' => return None,
+                        '$' if c == '`' && chars.peek() == Some(&'{') => return None,
+                        close if close == c => break,
+                        _ => {}
+                    }
+                }
+                code.push(' ');
+            }
+            '/' => match chars.next()? {
+                '/' => {
+                    for skipped in chars.by_ref() {
+                        if skipped == '\n' {
+                            break;
+                        }
+                    }
+                    code.push('\n');
+                }
+                '*' => {
+                    let mut star = false;
+                    loop {
+                        let next = chars.next()?;
+                        if star && next == '/' {
+                            break;
+                        }
+                        star = next == '*';
+                    }
+                    code.push(' ');
+                }
+                _ => return None,
+            },
+            other => code.push(other),
+        }
+    }
+    Some(code)
+}
+
+/// Removes the printed CSR results from the output of a code-mode script that
+/// calls CSR among other work, and returns how many lines it removed.
+///
+/// A whitelist that abstains, line by line. Code mode prints each `text(x)` as
+/// one line, and an object as its JSON, so a printed CSR result is one line
+/// that [`is_printed_csr_result_line`] accepts. Every other line stays: the
+/// run's header, a truncation note, another tool's result, a line cut short,
+/// and a CSR result printed any other way (that one leaks, as before).
+///
+/// Codex stores the output as a list of text items, which reaches here as its
+/// JSON. That list is read, scrubbed per item and written back; a string that
+/// is not such a list is scrubbed as it is. Nothing is rewritten when no line
+/// goes.
+fn scrub_code_mode_csr_results(content: &mut serde_json::Value) -> usize {
+    match content {
+        serde_json::Value::String(text) => {
+            if let Ok(serde_json::Value::Array(mut items)) =
+                serde_json::from_str::<serde_json::Value>(text)
+            {
+                let removed = scrub_text_items(&mut items);
+                if removed > 0 {
+                    *text = serde_json::Value::Array(items).to_string();
+                }
+                return removed;
+            }
+            let (kept, removed) = scrub_printed_csr_lines(text);
+            if removed > 0 {
+                *text = kept;
+            }
+            removed
+        }
+        serde_json::Value::Array(items) => scrub_text_items(items),
+        _ => 0,
+    }
+}
+
+fn scrub_text_items(items: &mut [serde_json::Value]) -> usize {
+    let mut removed = 0;
+    for item in items {
+        if let Some(serde_json::Value::String(text)) = item.get_mut("text") {
+            let (kept, count) = scrub_printed_csr_lines(text);
+            if count > 0 {
+                *text = kept;
+                removed += count;
+            }
+        }
+    }
+    removed
+}
+
+fn scrub_printed_csr_lines(text: &str) -> (String, usize) {
+    let mut kept = String::with_capacity(text.len());
+    let mut removed = 0;
+    for line in text.split_inclusive('\n') {
+        if is_printed_csr_result_line(line.trim_end_matches(['\n', '\r'])) {
+            removed += 1;
+        } else {
+            kept.push_str(line);
+        }
+    }
+    (kept, removed)
+}
+
+/// Whether one printed line is, whole, the JSON of one CSR tool result: the
+/// MCP result itself (`text(r)`), or that result inside a wrapper made only
+/// of an integer `i` or `index`, the status `"fulfilled"`, and the result
+/// under `value` or `result` (`text({i, ...settled})`,
+/// `text({i, result: settled})`). The result must
+/// hold text items only, not be an error, and its first text must be one
+/// whole search result as the emitter writes it
+/// ([`crate::import::contamination::is_whole_search_envelope`]);
+/// any later item must be CSR's stale-binary notice. A wrapper that carries
+/// anything else, a second result, or text cut short is kept.
+fn is_printed_csr_result_line(line: &str) -> bool {
+    let line = line.trim();
+    if !(line.starts_with('{') && line.ends_with('}')) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let mut results = 0usize;
+    wraps_only_csr_results(&value, &mut results) && results == 1
+}
+
+fn wraps_only_csr_results(value: &serde_json::Value, results: &mut usize) -> bool {
+    let serde_json::Value::Object(map) = value else {
+        return false;
+    };
+    if map.contains_key("content") {
+        *results += 1;
+        return is_csr_mcp_result(map);
+    }
+    // Only the fields a settled promise and a loop index add. Any other field
+    // can be real data printed beside the result (an exit code, a flag).
+    !map.is_empty()
+        && map.iter().all(|(key, field)| match key.as_str() {
+            "i" | "index" => field.is_u64(),
+            "status" => field.as_str() == Some("fulfilled"),
+            "value" | "result" => wraps_only_csr_results(field, results),
+            _ => false,
+        })
+}
+
+fn is_csr_mcp_result(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    if map.keys().any(|key| key != "content" && key != "isError") {
+        return false;
+    }
+    if map
+        .get("isError")
+        .is_some_and(|flag| flag != &serde_json::Value::Bool(false))
+    {
+        return false;
+    }
+    let Some(serde_json::Value::Array(items)) = map.get("content") else {
+        return false;
+    };
+    let mut texts = items.iter().map(|item| {
+        let block = item.as_object()?;
+        let only_type_and_text = block.len() == 2
+            && block.get("type").and_then(serde_json::Value::as_str) == Some("text");
+        only_type_and_text
+            .then(|| block.get("text").and_then(serde_json::Value::as_str))
+            .flatten()
+    });
+    let Some(Some(first)) = texts.next() else {
+        return false;
+    };
+    crate::import::contamination::is_whole_search_envelope(first)
+        && texts.all(|text| text.is_some_and(is_csr_stale_binary_notice))
+}
+
+/// The notice CSR appends to a tool result when the server runs a superseded
+/// build ([`crate::binary_identity::replacement_notice`]), matched by the
+/// emitter's own text around its one variable part.
+fn is_csr_stale_binary_notice(text: &str) -> bool {
+    const SLOT: &str = "\u{0}";
+    let template = crate::binary_identity::replacement_notice(SLOT);
+    let Some((head, tail)) = template.split_once(SLOT) else {
+        return false;
+    };
+    let text = text.trim();
+    text.len() > head.len() + tail.len()
+        && text.starts_with(head)
+        && text.ends_with(tail)
+        && !text[head.len()..text.len() - tail.len()].contains(['<', '\n'])
+}
+
 pub(crate) fn is_csr_tool_use(item: &serde_json::Value, name: &str) -> bool {
     if name == CODEX_CODE_MODE_TOOL {
         return item
@@ -2091,6 +2358,42 @@ fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A script counts as calling CSR only for a real call in code: never a
+    /// name in a string or comment, never through an alias, and never when the
+    /// reader meets a `/` or `${` it cannot place.
+    #[test]
+    fn a_code_mode_script_calls_csr_only_from_code_it_can_read() {
+        let calls = |script: &str| {
+            let exec =
+                serde_json::json!({"type":"tool_use","id":"c1","name":"exec","input":script});
+            is_code_mode_script_calling_csr(&exec, "exec")
+        };
+        assert!(calls("text(await tools.mcp__claude_self_reflect__csr_why({})); text(await tools.exec_command({cmd:\"ls\"}));"));
+        assert!(calls("const r = await Promise.allSettled([tools . mcp__claude_self_reflect__csr_reflect_on_past({query:'a // b'}), tools.exec_command({cmd:\"x\"})]);\n// done\n/* note */ text(r);"));
+        for script in [
+            "// tools.mcp__claude_self_reflect__csr_why({})\ntext(1);",
+            "/* tools.mcp__claude_self_reflect__csr_why({}) */ text(1);",
+            "text(\"tools.mcp__claude_self_reflect__csr_why(\");",
+            "text('tools.mcp__claude_self_reflect__csr_why(');",
+            "text(`tools.mcp__claude_self_reflect__csr_why(`);",
+            "const t = tools; text(await t.mcp__claude_self_reflect__csr_why({})); text(await tools.mcp__claude_self_reflect__csr_why({}));",
+            "const {mcp__claude_self_reflect__csr_why: w} = tools; text(await tools.mcp__claude_self_reflect__csr_why({}));",
+            "tools.mcp__claude_self_reflect__csr_why = async () => FAKE; text(await tools.mcp__claude_self_reflect__csr_why({}));",
+            "text(await tools.mcp__claude_self_reflect__csr_why({})); text([1].filter(x => /1/.test(x)));",
+            "text(await tools.mcp__claude_self_reflect__csr_why({})); text(4 / 2);",
+            "text(await tools.mcp__claude_self_reflect__csr_why({q:`${x}`}));",
+            "text(await tools.mcp__claude_self_reflect__csr_why({q:\"open}));",
+            "text(await mytools.mcp__claude_self_reflect__csr_why({}));",
+            "text(client . tools.mcp__claude_self_reflect__csr_why({}));",
+            "text(client.tools.mcp__claude_self_reflect__csr_why({}));",
+            "text(client?.\ntools.mcp__claude_self_reflect__csr_why({}));",
+        ] {
+            assert!(!calls(script), "{script}");
+        }
+        let other = serde_json::json!({"type":"tool_use","id":"c1","name":"Bash","input":"tools.mcp__claude_self_reflect__csr_why({})"});
+        assert!(!is_code_mode_script_calling_csr(&other, "Bash"));
+    }
 
     #[test]
     fn a_codex_code_mode_script_is_csr_only_when_every_statement_prints_one_csr_call() {

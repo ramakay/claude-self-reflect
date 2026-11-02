@@ -1721,7 +1721,7 @@ pub fn registered_formatter_ids() -> impl Iterator<Item = &'static str> {
 
 mod payload;
 mod terminal;
-pub use payload::is_csr_tool_payload;
+pub use payload::{is_csr_tool_payload, is_whole_search_envelope};
 pub use terminal::is_terminal_replay;
 
 #[cfg(test)]

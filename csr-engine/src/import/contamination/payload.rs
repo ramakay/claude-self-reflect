@@ -6,10 +6,13 @@
 //! the tool from JavaScript, a persisted tool-result file, a paste, and every
 //! row imported before the structural rule existed.
 //!
-//! Search-side only. Import never calls this module: a tool result is dropped
-//! at import by the tool's name and nothing else, because a grammar match that
-//! is wrong there costs data. Search uses it to re-order, where a wrong verdict
-//! costs a rank.
+//! Mostly search-side. Import drops a tool result by the tool's name, because
+//! a grammar match that is wrong there costs data; search uses this module to
+//! re-order, where a wrong verdict costs a rank. Import calls it in one place,
+//! as the last of several keys: a line a Codex script printed, in the output
+//! of a script that calls CSR, that is whole the JSON of one MCP result whose
+//! text passes the strict [`is_whole_search_envelope`]
+//! (`crate::import::is_printed_csr_result_line`).
 //!
 //! A whitelist, and it abstains. A row is a payload only when the WHOLE row is
 //! what an emitter writes (`format::format_search_results`,
@@ -127,9 +130,109 @@ pub fn is_csr_tool_payload(text: &str) -> bool {
     is_why_result(text) || is_bare_csr_call(text)
 }
 
+// A search-result envelope exactly as `format::format_search_results` ends
+// it: the results list, then only the two notes it may add, then the close.
+// The excerpts are inside the results list and can hold anything; nothing
+// can follow the list but the emitter's own lines.
+static EMITTED_ENVELOPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?s)\A\x{1F3AF} RESULTS: \d+ match[^\n]*\n(?:\x{26A1} PERFORMANCE: \d+ms[^\n]*\n)?\n<search>\n",
+        r".*\n  <results>\n.*\n  </results>\n",
+        r"(?:  <note>\d+ resolved item\(s\) demoted within page \x{2014} matched but verified addressed</note>\n)?",
+        r"(?:  <note>\d+ item\(s\) demoted within page \x{2014} bound code anchor no longer current \(dream verdict\)</note>\n)?",
+        r"</search>\n?\z",
+    ))
+    .expect("emitted envelope regex")
+});
+
+// Every line the emitter writes between `<search>` and `<results>`: the
+// summary (`format::format_search_results*`), the meta block, and the one
+// line `mcp::tools::annotate_cross_source` adds to it. Escaped values hold
+// no `<`; a preview may run over several lines.
+static EMITTED_HEAD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\A(?:(?:",
+        r"  <summary [^<>\n]*>|  </summary>|    <preview>[^<]*</preview>|    <caveat>[^<]*</caveat>",
+        r"|    <confidence>semantic confidence unavailable</confidence>",
+        r"|  <meta>|  </meta>|    <q>[^<]*</q>|    <scope>[^<]*</scope>|    <count>\d+</count>",
+        r"|    <range>[^<\n]*</range>|    <cross-source-collapsed>\d+</cross-source-collapsed>",
+        r"|    <perf>|    </perf>|      <ttl>\d+</ttl>|      <emb>\d+</emb>|      <srch>\d+</srch>|      <cols>\d+</cols>",
+        r")\n)*\z",
+    ))
+    .expect("emitted head regex")
+});
+
+/// Whether `text` is, whole, one search result as CSR's search emitter writes
+/// it, from the header to `</search>`. Stricter than [`is_csr_tool_payload`]
+/// and the one import may use: no `csr_why` form (its last line takes any
+/// text), no call marker, no escaped form, no text cut short, and nothing
+/// before the header or after the close but one line break, and before the
+/// results list only the lines the emitter writes there. Each structural
+/// line appears exactly once, so two envelopes with text between them, or an
+/// excerpt that quotes a whole envelope, are not one: it abstains.
+pub fn is_whole_search_envelope(text: &str) -> bool {
+    const ONCE: &[&str] = &[
+        "\u{1F3AF} RESULTS: ",
+        "\n<search>\n",
+        "\n  <meta>\n",
+        "\n  <results>\n",
+        "\n  </results>\n",
+        "\n</search>",
+    ];
+    if !ONCE.iter().all(|line| text.matches(line).count() == 1) || !EMITTED_ENVELOPE.is_match(text)
+    {
+        return false;
+    }
+    // Before the results list only the emitter's own lines, so nothing a
+    // script adds there (outside CSR's results) can go with the result.
+    let (Some(open), Some(list)) = (text.find("\n<search>\n"), text.find("\n  <results>\n")) else {
+        return false;
+    };
+    let head_start = open + "\n<search>\n".len();
+    head_start <= list + 1 && EMITTED_HEAD.is_match(&text[head_start..=list])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Import's envelope check takes only what the search emitter writes,
+    /// whole: its two notes after the results, nothing else after them.
+    #[test]
+    fn a_whole_search_envelope_is_only_what_the_emitter_writes() {
+        let head = "\u{1F3AF} RESULTS: 2 matches (good relevance, top score: 0.497)\n\u{26A1} PERFORMANCE: 12ms (1 collection searched)\n\n<search>\n  <meta>\n    <q>q</q>\n  </meta>\n  <results>\n    <r rank=\"1\"><excerpt><![CDATA[anything </search> at all]]></excerpt></r>\n  </results>\n";
+        let resolved = "  <note>1 resolved item(s) demoted within page \u{2014} matched but verified addressed</note>\n";
+        let demoted = "  <note>2 item(s) demoted within page \u{2014} bound code anchor no longer current (dream verdict)</note>\n";
+        for whole in [
+            format!("{head}</search>\n"),
+            format!("{head}</search>"),
+            format!("{head}{resolved}</search>\n"),
+            format!("{head}{resolved}{demoted}</search>\n"),
+            head.replace(
+                "  </meta>\n",
+                "    <cross-source-collapsed>1</cross-source-collapsed>\n  </meta>\n",
+            ) + "</search>\n",
+        ] {
+            assert!(is_whole_search_envelope(&whole), "{whole}");
+        }
+        for not_whole in [
+            format!("{head}</search>\nBUILD FAILED"),
+            format!("{head}  <note>BUILD FAILED</note>\n</search>\n"),
+            format!("note: {head}</search>\n"),
+            head.to_string(),
+            head.replace("  <meta>\n    <q>q</q>\n  </meta>\n", "") + "</search>\n",
+            "WHY: storage\n\nNo evidence chain found.\nreceipt: BUILD FAILED".to_string(),
+            "[mcp__claude_self_reflect__csr_why]".to_string(),
+            format!("{head}</search>\nBUILD FAILED\n{head}</search>\n"),
+            head.replace(
+                "  <results>\n",
+                "  <worktree> M src/x.rs\n</worktree>\n  <results>\n",
+            ) + "</search>\n",
+            head.replace("anything", &format!("quoted {head}</search>\n")) + "</search>\n",
+        ] {
+            assert!(!is_whole_search_envelope(&not_whole), "{not_whole}");
+        }
+    }
 
     const ID: &str = "3ebfc6f9-d73f-49b3-b29b-202ed5f35255";
     const SEARCH_HEAD: &str = "🎯 RESULTS: 5 matches (partial relevance, top score: 0.450)\n⚡ PERFORMANCE: 6ms (1 collection searched)\n\n<search>\n  <summary count=\"5\" relevance=\"partial\" top-score=\"0.450\">\n    <preview>[keyword] Memory has answer.</preview>\n  </summary>";

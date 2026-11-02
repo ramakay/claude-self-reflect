@@ -23,11 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CSR's own results no longer come back as Codex history.** Codex code mode calls tools inside one `exec` script, so the
   importer's by-name check missed CSR calls and stored their results. An `exec` script made only of statements that print
   one CSR call (`text(await tools.mcp__claude_self_reflect__*({...}))`, or `const r = await ...; text(r)`, with literal
-  argument values) is now suppressed, call and output. Any other script keeps its whole output: one that also runs another
-  tool, prints other text, batches calls or passes an expression. Most real Codex scripts mix CSR with `exec_command`, so
-  those still store the CSR result next to the real work. A Codex call or output with no id no longer shares the stand-in
-  id `unknown`, so an id-less CSR call cannot drop another call's output. Results stored before this change stay as they
-  are.
+  argument values) is now suppressed, call and output. A script that calls CSR among other work, the common case, keeps
+  its output minus each printed line that is, whole, the JSON of one CSR search result (bare, or wrapped by
+  `Promise.allSettled` with only an index and status beside it). Every other line stays, including other CSR tools'
+  results, CSR text printed any other way or cut short by Codex's output truncation, and the output of any script whose
+  CSR call the importer cannot read for sure (a regex literal, a template expression, `tools` used any other way). A Codex call or output with no id no longer shares the stand-in id
+  `unknown`, so an id-less CSR call cannot drop another call's output. Results stored before this change stay as they are.
 
 **Already shipped in 9.5.1-9.5.8, carried here, not new:** 92acc3bd, cdd23033, c46702aa, f0cf3a83, 56dddc3a,
 71457f3c, 31d78e5b, d6b9c454, 46e14f16, 962f8e03, 6e3a08b1, aededb4a (replaced by 76e390d6), cecddb48, c7e4e285,
