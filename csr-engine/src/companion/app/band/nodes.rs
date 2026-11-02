@@ -229,7 +229,7 @@ pub(super) fn note_node(shown: &Value) -> Value {
         let source = if dream {
             let tokens = note["tokens"].as_f64().unwrap_or(0.);
             format!(
-                "From CSR's dreamer · this look {} tokens, mostly re-read from the prompt cache",
+                "From Self-Reflect's dreamer · this look {} tokens, mostly re-read from the prompt cache",
                 thousands(tokens)
             )
         } else {

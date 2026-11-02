@@ -1,5 +1,5 @@
 27	{"key":"instrument:dreams"}
-28	{"dream":"newest","key":"dream:newest","send":"CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”","spans":[[0,25,"helpful"],[25,50,"thought_of_it"],[50,75,"not_relevant"],[75,100,"ask_claude"]]}
+28	{"dream":"newest","key":"dream:newest","send":"Self-Reflect's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”","spans":[[0,25,"helpful"],[25,50,"thought_of_it"],[50,75,"not_relevant"],[75,100,"ask_claude"]]}
 29	{"key":"instrument:threads"}
 31	{"key":"instrument:changes"}
 32	{"key":"instrument:figure"}

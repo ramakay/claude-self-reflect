@@ -283,6 +283,12 @@ fn synthetic_ids_if(enabled: bool, storage: &Storage, candidates: &[ChunkRef]) -
     dropped
 }
 
+/// Judge `conversations` into the process cache ahead of the filter that will
+/// ask for them. Nothing is returned and nothing is decided here.
+pub(crate) fn prefetch_verdicts(storage: &Storage, conversations: &[&str]) {
+    let _ = session_verdicts(storage, conversations);
+}
+
 /// The verdict of each of `conversations`: from the process cache while it is
 /// fresh, the rest from one batched scan (cached on the way out).
 fn session_verdicts<'a>(
@@ -309,19 +315,21 @@ fn session_verdicts<'a>(
     if uncached.is_empty() {
         return verdicts;
     }
-    // A failed read is a pass: the filter never removes what it cannot judge.
-    let mut scanned = storage
-        .with_connection(|conn| {
-            crate::storage::queries::conversation_eval_scan_many(
-                conn,
-                &uncached,
-                MARKER_LIKE,
-                OUTPUT_LIKE,
-            )
-        })
-        .unwrap_or_default();
+    // A failed read is a pass for this call (the filter never removes what it
+    // cannot judge) but never a verdict: it is not cached, so the next ask
+    // scans again instead of keeping "clean" for the whole TTL.
+    let scan_start = Instant::now();
+    let scan = scan_conversations(storage, &uncached);
+    if crate::mcp::stage_timing::enabled() {
+        crate::mcp::stage_timing::add_ms(
+            "synthetic_scan",
+            scan_start.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+    let scan_ok = scan.is_ok();
+    let mut scanned = scan.unwrap_or_default();
     let mut held = cache().lock().unwrap_or_else(|e| e.into_inner());
-    if held.len() + uncached.len() >= CACHE_CAP {
+    if scan_ok && held.len() + uncached.len() >= CACHE_CAP {
         held.clear();
     }
     for &conversation in conversations {
@@ -332,13 +340,102 @@ fn session_verdicts<'a>(
         let mut judged = judge_session(&rows);
         judged.parent = parent_of(&rows, conversation);
         let verdict = Arc::new(judged);
-        held.insert(
-            conversation.to_string(),
-            (Instant::now(), Arc::clone(&verdict)),
-        );
+        if scan_ok {
+            held.insert(
+                conversation.to_string(),
+                (Instant::now(), Arc::clone(&verdict)),
+            );
+        }
         verdicts.insert(conversation, verdict);
     }
     verdicts
+}
+
+/// Conversations a scan must hold before it is split across connections: one
+/// batch of a few conversations is cheaper read in place than set up in threads.
+const PARALLEL_SCAN_FROM: usize = 6;
+/// Connections (threads) a large scan is split across.
+const SCAN_LANES: usize = 4;
+
+type ScanRows = HashMap<String, Vec<EvalScanRow>>;
+
+/// The scan rows of `conversations`, keyed by conversation. A large set is
+/// dealt round-robin over [`SCAN_LANES`] read-only connections read at once
+/// (every conversation is scanned by exactly one of them, so the rows are the
+/// ones a single read would return); a small one, an in-memory store, or a
+/// failure to open the other connections reads on `storage` alone. Any failure
+/// of a lane (open, query or panic) discards the lanes' rows and reads the
+/// whole set serially: a partial scan would leave sessions looking clean.
+/// `CSR_NO_RECALL_LANES=1` keeps the single read.
+fn scan_conversations(storage: &Storage, conversations: &[String]) -> anyhow::Result<ScanRows> {
+    scan_conversations_with(storage, conversations, |lane_storage, group| {
+        let Some(lane) = lane_storage.open_read_lane()? else {
+            return Ok(None);
+        };
+        lane.with_connection(|conn| {
+            crate::storage::queries::conversation_eval_scan_many(
+                conn,
+                group,
+                MARKER_LIKE,
+                OUTPUT_LIKE,
+            )
+        })
+        .map(Some)
+    })
+}
+
+/// [`scan_conversations`] with the read of one lane given (`Ok(None)`: no
+/// second connection to be had), so a test can make a lane fail.
+fn scan_conversations_with<F>(
+    storage: &Storage,
+    conversations: &[String],
+    lane_scan: F,
+) -> anyhow::Result<ScanRows>
+where
+    F: Fn(&Storage, &[String]) -> anyhow::Result<Option<ScanRows>> + Sync,
+{
+    let single = |ids: &[String]| {
+        storage.with_connection(|conn| {
+            crate::storage::queries::conversation_eval_scan_many(
+                conn,
+                ids,
+                MARKER_LIKE,
+                OUTPUT_LIKE,
+            )
+        })
+    };
+    if conversations.len() < PARALLEL_SCAN_FROM || !super::tools::recall_lanes_enabled() {
+        return single(conversations);
+    }
+    let lanes = SCAN_LANES;
+    let mut groups: Vec<Vec<String>> = vec![Vec::new(); lanes];
+    for (n, conversation) in conversations.iter().enumerate() {
+        groups[n % lanes].push(conversation.clone());
+    }
+    let lane_scan = &lane_scan;
+    let parts: Vec<anyhow::Result<Option<ScanRows>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = groups[1..]
+            .iter()
+            .map(|group| scope.spawn(move || lane_scan(storage, group)))
+            .collect();
+        let mut out = vec![single(&groups[0]).map(Some)];
+        out.extend(handles.into_iter().map(|handle| {
+            handle
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("scan thread panicked")))
+        }));
+        out
+    });
+    let mut found: ScanRows = HashMap::new();
+    for part in parts {
+        match part {
+            Ok(Some(rows)) => found.extend(rows),
+            // No second connection (an in-memory store) or a failed lane: the
+            // whole set is read again, serially, on `storage`.
+            Ok(None) | Err(_) => return single(conversations),
+        }
+    }
+    Ok(found)
 }
 
 /// One candidate row for [`rig_sunk_ids`].
@@ -487,6 +584,145 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// Eight rig sessions and two plain ones in a file store: enough
+    /// conversations for the scan to split across lanes.
+    fn lane_scan_fixture() -> (tempfile::TempDir, Storage, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("csr-engine.db")).unwrap();
+        let bench = "[Bash: csr-engine bench --probe --db-path /x/.testbed/db]";
+        let mut ids = Vec::new();
+        for n in 0..8 {
+            let id = format!("rig-{n}");
+            for seq in 0..6 {
+                put(&storage, &id, seq, Speaker::Assistant, bench);
+            }
+            ids.push(id);
+        }
+        for n in 0..2 {
+            let id = format!("plain-{n}");
+            put(&storage, &id, 0, Speaker::User, "how do I sort a vec");
+            put(&storage, &id, 1, Speaker::Assistant, "use sort_by");
+            ids.push(id);
+        }
+        (dir, storage, ids)
+    }
+
+    fn scan_shape(rows: &ScanRows) -> Vec<(String, usize)> {
+        let mut shape: Vec<(String, usize)> =
+            rows.iter().map(|(k, v)| (k.clone(), v.len())).collect();
+        shape.sort();
+        shape
+    }
+
+    #[test]
+    fn a_failed_scan_lane_reads_the_whole_set_serially() {
+        let (_dir, storage, ids) = lane_scan_fixture();
+        let serial = storage
+            .with_connection(|conn| {
+                crate::storage::queries::conversation_eval_scan_many(
+                    conn,
+                    &ids,
+                    MARKER_LIKE,
+                    OUTPUT_LIKE,
+                )
+            })
+            .unwrap();
+        assert_eq!(serial.len(), 10);
+        // The healthy lanes agree with the serial read.
+        let healthy = scan_conversations(&storage, &ids).unwrap();
+        assert_eq!(scan_shape(&healthy), scan_shape(&serial));
+        // A lane that cannot open, one whose query fails, one that panics and
+        // one with no connection each give the serial rows, none fewer.
+        type LaneFailure = fn() -> anyhow::Result<Option<ScanRows>>;
+        let failures: [(&str, LaneFailure); 4] = [
+            ("open", || Err(anyhow::anyhow!("lane open failed"))),
+            ("query", || Err(anyhow::anyhow!("lane query failed"))),
+            ("none", || Ok(None)),
+            ("panic", || panic!("lane panicked")),
+        ];
+        for (name, failure) in failures {
+            let hit = std::sync::atomic::AtomicUsize::new(0);
+            let scanned = scan_conversations_with(&storage, &ids, |_, _| {
+                hit.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                failure()
+            })
+            .unwrap();
+            assert!(hit.load(std::sync::atomic::Ordering::SeqCst) > 0, "{name}");
+            assert_eq!(scan_shape(&scanned), scan_shape(&serial), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_failed_scan_lane_still_drops_the_rig_sessions() {
+        let (_dir, storage, ids) = lane_scan_fixture();
+        // One lane cannot read `chunks` (a temp table shadows it there only).
+        let scanned = scan_conversations_with(&storage, &ids, |lane_storage, group| {
+            let lane = lane_storage.open_read_lane()?.expect("a file store");
+            lane.with_connection(|conn| {
+                conn.execute_batch("CREATE TEMP TABLE chunks (x TEXT);")?;
+                Ok(())
+            })?;
+            lane.with_connection(|conn| {
+                crate::storage::queries::conversation_eval_scan_many(
+                    conn,
+                    group,
+                    MARKER_LIKE,
+                    OUTPUT_LIKE,
+                )
+            })
+            .map(Some)
+        })
+        .unwrap();
+        let mut dropped = 0;
+        for id in ids.iter().filter(|id| id.starts_with("rig-")) {
+            let rows = scanned.get(id.as_str()).cloned().unwrap_or_default();
+            assert!(judge_session(&rows).eval_session, "{id}");
+            dropped += 1;
+        }
+        assert_eq!(dropped, 8);
+    }
+
+    #[test]
+    fn a_recall_lane_is_read_only() {
+        let (_dir, storage, _ids) = lane_scan_fixture();
+        let lane = storage.open_read_lane().unwrap().expect("a file store");
+        let write = lane.with_connection(|conn| {
+            conn.execute("DELETE FROM chunks", [])?;
+            Ok(())
+        });
+        assert!(write.is_err(), "a read lane accepted a write");
+        let rows: i64 = lane
+            .with_connection(|conn| {
+                Ok(conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert!(rows > 0);
+    }
+
+    #[test]
+    fn a_failed_prefetch_scan_is_not_cached_as_a_clean_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("csr-engine.db")).unwrap();
+        let bench = "[Bash: csr-engine bench --probe --db-path /x/.testbed/failscan]";
+        for seq in 0..6 {
+            put(&storage, "failscan-rig", seq, Speaker::Assistant, bench);
+        }
+        // The prefetch lane cannot read `chunks` (a temp table shadows it on
+        // that connection alone), so its scan fails.
+        let lane = storage.open_prompt_lane().unwrap().expect("a file store");
+        lane.with_connection(|conn| {
+            conn.execute_batch("CREATE TEMP TABLE chunks (x TEXT);")?;
+            Ok(())
+        })
+        .unwrap();
+        prefetch_verdicts(&lane, &["failscan-rig"]);
+        // The consuming filter must scan again on its healthy connection and
+        // drop the rig's rows, not trust a cached "clean".
+        let candidates = refs(&storage, "failscan-rig", 6);
+        let dropped = synthetic_ids_if(true, &storage, &candidates);
+        assert_eq!(dropped.len(), 6, "{dropped:?}");
     }
 
     #[test]

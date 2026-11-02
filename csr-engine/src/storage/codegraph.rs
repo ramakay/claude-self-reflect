@@ -1573,6 +1573,59 @@ pub fn nodes_for_conversations(
     Ok(out)
 }
 
+/// The five `code_nodes` columns witness binding reads: where a symbol lives,
+/// its bare name and the two conversations it is attributed to.
+pub struct WitnessNode {
+    pub project: String,
+    pub file: String,
+    pub name: String,
+    pub first_conv_id: String,
+    pub last_conv_id: String,
+}
+
+/// [`nodes_for_conversations`] narrowed to [`WitnessNode`]: the same rows in the
+/// same order (`ORDER BY id`), without the eight columns the binding never
+/// reads. One busy conversation holds tens of thousands of nodes, and building
+/// a whole `NodeRow` for each cost more than the lookup that found them.
+pub fn witness_nodes_for_conversations(
+    conn: &Connection,
+    conversation_ids: &[String],
+) -> Result<Vec<WitnessNode>> {
+    if conversation_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    const BATCH: usize = 400;
+    let mut out = Vec::new();
+    for batch in conversation_ids.chunks(BATCH) {
+        let placeholders: Vec<String> = (1..=batch.len()).map(|i| format!("?{i}")).collect();
+        let in_list = placeholders.join(", ");
+        let sql = format!(
+            "SELECT project, file, name, first_conv_id, last_conv_id FROM code_nodes
+             WHERE kind != 'module'
+               AND (first_conv_id IN ({in_list}) OR last_conv_id IN ({in_list}))
+             ORDER BY id"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = batch
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(WitnessNode {
+                project: row.get(0)?,
+                file: row.get(1)?,
+                name: row.get(2)?,
+                first_conv_id: row.get(3)?,
+                last_conv_id: row.get(4)?,
+            })
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
 // ─── Two-channel symbol attribution (WP2 Stage 2) ───
 //
 // H4 (receipt R2 in `.plans/2026-07-31-codegraph-shipping-plan.md`) measured

@@ -16,7 +16,7 @@
 [48;2;18;20;23m[38;2;242;244;246mconversation behind the code.                 [0m
 [48;2;18;20;23m[38;2;242;244;246mWhere did we fix this bug before? Find earlier[0m
 [48;2;18;20;23m[38;2;242;244;246mattempts and the final fix.                   [0m
-[48;2;18;20;23m[38;2;242;244;246mWhat did I ask Claude to remember? Look up    [0m
+[48;2;18;20;23m[38;2;242;244;246mWhat did I ask the agent to remember? Look up [0m
 [48;2;18;20;23m[38;2;242;244;246msaved instructions and preferences.           [0m
 [48;2;18;20;23m[38;2;242;244;246mShow the history of this function. Find prior [0m
 [48;2;18;20;23m[38;2;242;244;246medits and their context.                      [0m

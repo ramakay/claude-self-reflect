@@ -2592,6 +2592,55 @@ fn fts5_search_matched(
 
 // ─── Reflection tag queries ───
 
+/// The newest `session_episode` rows of one project, at most `limit`, newest
+/// first, Shift Ledger rows excluded.
+///
+/// Unlike [`get_reflections_by_tag`] (a case-insensitive substring `LIKE`),
+/// both tags must appear as whole JSON strings, matched case-sensitively with
+/// `instr`: `project_anukriti` does not match `project_Anukriti-Campaigns` or
+/// `project_anukriti-website`, and the window holds episodes only, so a busy
+/// sibling project or the project's own narrative and cache rows cannot push
+/// its latest episode out of it. The needle is the tag as `serde_json` writes
+/// it, quotes and escapes included, so it does not depend on the separator.
+/// Like [`get_reflections_by_tag`], the inner match runs on
+/// `idx_reflections_tags_timestamp` (a covering scan) and only the winning rows
+/// are read whole.
+pub fn recent_episode_rows(
+    conn: &Connection,
+    project: &str,
+    limit: usize,
+) -> Result<Vec<ReflectionRow>> {
+    let project_needle = serde_json::to_string(&format!("project_{project}"))?;
+    let episode_needle = serde_json::to_string("session_episode")?;
+    let ledger_needle = serde_json::to_string(crate::story_map::store::LEDGER_TAG)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, content, tags, timestamp FROM reflections
+         WHERE rowid IN (SELECT rowid FROM reflections
+                         WHERE instr(tags, ?1) > 0
+                           AND instr(tags, ?2) > 0
+                           AND instr(tags, ?3) = 0
+                         ORDER BY timestamp DESC LIMIT ?4)
+         ORDER BY timestamp DESC",
+    )?;
+    let rows = stmt.query_map(
+        params![project_needle, episode_needle, ledger_needle, limit as i64],
+        |row| {
+            let id: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let tags_json: String = row.get(2)?;
+            let timestamp: String = row.get(3)?;
+            Ok((id, content, tags_json, timestamp))
+        },
+    )?;
+    let mut results = Vec::new();
+    for row in rows {
+        let (id, content, tags_json, timestamp) = row?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        results.push((id, content, tags, timestamp));
+    }
+    Ok(results)
+}
+
 /// Get reflections matching a specific tag substring (for session learnings).
 /// Shift Ledger rows (`narrative_shift`) are excluded inside the LIMIT window;
 /// ledger code asks for them through [`get_ledger_reflections_by_tag`].
@@ -4431,6 +4480,25 @@ fn escape_like(prefix: &str) -> String {
 /// List distinct project names matching a prefix (for MCP completions).
 /// Returns up to `limit` results, sorted alphabetically.
 pub fn list_project_names(conn: &Connection, prefix: &str, limit: usize) -> Result<Vec<String>> {
+    if prefix.is_empty() {
+        // Every project: one index seek per project instead of a scan of every
+        // chunk row. `DISTINCT ... LIKE '%'` walked all of `idx_chunks_project`
+        // (about 60 ms at 950k chunks, every recall); each step here seeks to
+        // the next name past the last, so the cost follows the project count.
+        // Same rows, same order (the index's), NULL names excluded as before.
+        let mut stmt = conn.prepare_cached(
+            "WITH RECURSIVE p(n) AS (
+                 SELECT min(project_name) FROM chunks
+                 UNION ALL
+                 SELECT (SELECT min(project_name) FROM chunks WHERE project_name > p.n)
+                 FROM p WHERE n IS NOT NULL)
+             SELECT n FROM p WHERE n IS NOT NULL ORDER BY n LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| row.get(0))?;
+        return rows
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(|e| anyhow::anyhow!("{}", e));
+    }
     let pattern = format!("{}%", escape_like(prefix));
     let mut stmt = conn.prepare(
         "SELECT DISTINCT project_name FROM chunks
@@ -4863,37 +4931,36 @@ pub fn get_chunk_ids_for_conversation_in_projects(
 /// The first stored chunk of each requested conversation, cut to `prefix_chars`
 /// characters: `(conversation_id, content prefix)`. "First" is the lowest `seq`
 /// (rows whose `seq` was never backfilled sort after numbered ones, then by
-/// rowid). Conversations with no chunks are absent from the result. One batched
-/// query per 400 ids, never one per conversation.
+/// rowid). Conversations with no chunks are absent from the result. Each
+/// conversation is ranked once, over its own chunks through the conversation
+/// index. The earlier single query ranked a conversation's chunks once per chunk
+/// (a correlated subquery per row), which on a conversation of thousands of
+/// chunks took seconds.
 pub fn first_chunk_prefixes(
     conn: &Connection,
     conversation_ids: &[String],
     prefix_chars: usize,
 ) -> Result<Vec<(String, String)>> {
     let mut out = Vec::with_capacity(conversation_ids.len());
-    for batch in conversation_ids.chunks(400) {
-        let sql = format!(
-            "SELECT c.conversation_id, substr(c.content, 1, ?)
-             FROM chunks c
-             WHERE c.conversation_id IN ({})
-               AND c.id = (
-                   SELECT f.id FROM chunks f
-                   WHERE f.conversation_id = c.conversation_id
-                   ORDER BY f.seq IS NULL, f.seq, f.rowid
-                   LIMIT 1
-               )",
-            string_placeholders(batch.len())
-        );
-        let prefix_chars = prefix_chars as i64;
-        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(batch.len() + 1);
-        params.push(&prefix_chars);
-        params.extend(batch.iter().map(|id| id as &dyn rusqlite::ToSql));
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            out.push(row?);
+    let mut seen = std::collections::HashSet::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT substr(content, 1, ?1)
+         FROM chunks
+         WHERE conversation_id = ?2
+         ORDER BY seq IS NULL, seq, rowid
+         LIMIT 1",
+    )?;
+    for conversation_id in conversation_ids {
+        if !seen.insert(conversation_id.as_str()) {
+            continue;
+        }
+        let prefix = stmt
+            .query_row(params![prefix_chars as i64, conversation_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        if let Some(prefix) = prefix {
+            out.push((conversation_id.clone(), prefix));
         }
     }
     Ok(out)
@@ -5938,6 +6005,61 @@ mod tests {
         conn
     }
 
+    /// The `DISTINCT ... LIKE` form `list_project_names` used for every prefix,
+    /// the oracle for its index-seek form on an empty prefix.
+    fn project_names_oracle(conn: &Connection, limit: i64) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT project_name FROM chunks
+                 WHERE project_name LIKE '%' ESCAPE '\\'
+                 ORDER BY project_name
+                 LIMIT ?1",
+            )
+            .unwrap();
+        stmt.query_map([limit], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn list_project_names_empty_prefix_matches_the_distinct_scan() {
+        let conn = mem();
+        assert!(list_project_names(&conn, "", i64::MAX as usize)
+            .unwrap()
+            .is_empty());
+        let names = [
+            "",
+            "a",
+            "A",
+            "a_b",
+            "a%b",
+            "a-b",
+            "ab",
+            "claude-self-reflect",
+            "Zed",
+            "zed",
+            "é",
+            "日本",
+            "with space",
+        ];
+        for (n, name) in names.iter().cycle().take(40).enumerate() {
+            conn.execute(
+                "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
+                 VALUES (?1, 'c', ?2, '2026-01-01T00:00:00Z', 'x', 1)",
+                params![format!("id-{n}"), name],
+            )
+            .unwrap();
+        }
+        for limit in [0_i64, 1, 3, 7, 13, 100, i64::MAX] {
+            assert_eq!(
+                list_project_names(&conn, "", limit as usize).unwrap(),
+                project_names_oracle(&conn, limit),
+                "limit {limit}"
+            );
+        }
+    }
+
     fn test_chunk(id: &str, content: &str) -> ConversationChunk {
         ConversationChunk {
             id: id.into(),
@@ -6487,6 +6609,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(triggers, 3);
+    }
+
+    /// The single query `first_chunk_prefixes` used to run: a correlated
+    /// subquery per chunk. It is the oracle for the per-conversation form.
+    fn first_chunk_prefixes_oracle(
+        conn: &Connection,
+        conversations: &[String],
+        prefix_chars: usize,
+    ) -> Vec<(String, String)> {
+        let sql = format!(
+            "SELECT c.conversation_id, substr(c.content, 1, ?)
+             FROM chunks c
+             WHERE c.conversation_id IN ({})
+               AND c.id = (
+                   SELECT f.id FROM chunks f
+                   WHERE f.conversation_id = c.conversation_id
+                   ORDER BY f.seq IS NULL, f.seq, f.rowid
+                   LIMIT 1
+               )",
+            string_placeholders(conversations.len())
+        );
+        let prefix_chars = prefix_chars as i64;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&prefix_chars];
+        params.extend(conversations.iter().map(|id| id as &dyn rusqlite::ToSql));
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        let mut out: Vec<(String, String)> = rows.map(|r| r.unwrap()).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn first_chunk_prefixes_matches_the_correlated_query() {
+        let conn = mem();
+        // (id, conversation, seq): out-of-order numbers, a numbered row inserted
+        // after unnumbered ones, an all-unnumbered conversation, a single chunk.
+        let rows: [(&str, &str, Option<i64>); 9] = [
+            ("a3", "conv-a", Some(3)),
+            ("a1", "conv-a", Some(1)),
+            ("a2", "conv-a", Some(2)),
+            ("b-null-1", "conv-b", None),
+            ("b-null-2", "conv-b", None),
+            ("c-null", "conv-c", None),
+            ("c-num", "conv-c", Some(7)),
+            ("d-only", "conv-d", Some(0)),
+            ("e-tie-1", "conv-e", Some(5)),
+        ];
+        for (id, conversation, seq) in rows {
+            let mut chunk = test_chunk(id, &format!("opening of {id} with a long enough text"));
+            chunk.conversation_id = conversation.into();
+            insert_chunk(&conn, &chunk, &[0.1; 4]).unwrap();
+            conn.execute("UPDATE chunks SET seq = ?1 WHERE id = ?2", params![seq, id])
+                .unwrap();
+        }
+        let mut chunk = test_chunk("e-tie-2", "second at the same seq");
+        chunk.conversation_id = "conv-e".into();
+        insert_chunk(&conn, &chunk, &[0.1; 4]).unwrap();
+        conn.execute("UPDATE chunks SET seq = 5 WHERE id = 'e-tie-2'", [])
+            .unwrap();
+
+        let asked: Vec<String> = [
+            "conv-a",
+            "conv-b",
+            "conv-c",
+            "conv-d",
+            "conv-e",
+            "conv-none",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for prefix_chars in [5usize, 512] {
+            let mut got = first_chunk_prefixes(&conn, &asked, prefix_chars).unwrap();
+            got.sort();
+            assert_eq!(
+                got,
+                first_chunk_prefixes_oracle(&conn, &asked, prefix_chars)
+            );
+            assert_eq!(got.len(), 5, "an unknown conversation is absent: {got:?}");
+        }
+        let got = first_chunk_prefixes(&conn, &asked, 512).unwrap();
+        let by_conv: std::collections::HashMap<_, _> = got.into_iter().collect();
+        assert!(by_conv["conv-a"].starts_with("opening of a1"));
+        assert!(by_conv["conv-b"].starts_with("opening of b-null-1"));
+        assert!(by_conv["conv-c"].starts_with("opening of c-num"));
+        // A conversation named twice is read once.
+        let twice = vec!["conv-a".to_string(), "conv-a".to_string()];
+        assert_eq!(first_chunk_prefixes(&conn, &twice, 512).unwrap().len(), 1);
     }
 
     #[test]

@@ -678,7 +678,8 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let mut last_key = None;
     let mut restart_due = None;
     let mut wake = Debounce::default();
-    // For tests that count what the loop draws: one line per frame drawn and written out, and why.
+    // For tests that count what the loop draws: one line per frame drawn and written out, and why
+    // (`wake`, `pressed` or `due`).
     let frame_log = std::env::var_os("CSR_PANE_FRAME_LOG").map(PathBuf::from);
     // On inside herdr (`CSR_PANE_HERDR_EVENTS=0` turns it off): herdr says when the agent's status
     // changes and when its pane ends. Without herdr, or when it cannot be reached, nothing changes.
@@ -805,7 +806,8 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                     wake.signal(at, WakeKind::Burst);
                 }
             }
-            pressed |= wake.ready(Instant::now());
+            let woke = wake.ready(Instant::now());
+            pressed |= woke;
             // The Shift Map's hold is up and it folds: draw it now.
             pressed |= pane.map_wait(now).1;
             // A compaction ended: draw it now.
@@ -815,7 +817,15 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                     && (pressed || (last.elapsed() >= Duration::from_secs(1) && pane.due(now))))
             {
                 let (cols, rows) = terminal::size().unwrap_or((60, 30));
-                let why = if pressed { "pressed" } else { "due" };
+                // A draw a wake earned is told from the clock's and the gate's own, so a test of
+                // the debounce counts only its own.
+                let why = if woke {
+                    "wake"
+                } else if pressed {
+                    "pressed"
+                } else {
+                    "due"
+                };
                 let frame = boundary.run(&paths, now, || {
                     pane.frame(cols as usize, rows as usize, now)
                 });

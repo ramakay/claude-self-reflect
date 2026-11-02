@@ -1280,7 +1280,9 @@ pub(crate) async fn reflect_on_past_with_vec_mode(
     rerank_mode: RecallRerankMode<'_>,
     record_retrievals: bool,
 ) -> Result<String> {
+    let scope_start = Instant::now();
     let scope = resolve_search_scope(storage, project)?;
+    super::stage_timing::stage("p_scope", scope_start);
     reflect_on_past_with_vec_in_scope_mode(
         storage,
         search,
@@ -1844,7 +1846,9 @@ async fn reflect_final_page(
 ) -> Result<FinalPage> {
     // Read before the pool is built: a verdict that lands while it is built
     // leaves the pool keyed to the older generation, i.e. stale, never fresh.
+    let gen_start = Instant::now();
     let verdict_generation = storage.verdict_generation();
+    super::stage_timing::stage("p_verdict_gen", gen_start);
     let mut pool = settled_pool(
         storage,
         search,
@@ -3056,6 +3060,201 @@ fn drop_echo_rows(
     dropped
 }
 
+/// `CSR_NO_RECALL_LANES=1` runs every read of a recall pass on the one
+/// connection, in sequence, as it did before the keyword and verdict reads were
+/// overlapped.
+pub(crate) fn recall_lanes_enabled() -> bool {
+    std::env::var("CSR_NO_RECALL_LANES").map_or(true, |value| value != "1")
+}
+
+/// The keyword reads of one recall pass: the rows that depend on the query and
+/// the window size alone.
+struct KeywordLegs {
+    postings_hits: Vec<(String, f64)>,
+    postings_weight: f64,
+    keyword: crate::search::hybrid::KeywordChunkHits,
+    reflection_fts_hits: Vec<(String, usize, f64)>,
+    reflection_prefix_ids: Vec<String>,
+    /// Milliseconds each read took, by stage name (read on the lane thread).
+    leg_ms: Vec<(&'static str, f64)>,
+}
+
+/// Run the keyword reads of a recall pass on `storage`: the identifier
+/// postings (hybrid only), the chunk and reflection bm25 rankings and the
+/// exact-prefix reflections. Each read fails open to an empty result.
+fn keyword_legs(
+    storage: &Storage,
+    query: &str,
+    fetch: usize,
+    search_mode: SearchMode,
+    family: Option<&[&str]>,
+) -> KeywordLegs {
+    read_keyword_legs(storage, query, fetch, search_mode, family, false)
+        .expect("a fail-open read always answers")
+}
+
+/// [`keyword_legs`] on a lane connection: `None` when any read failed, so the
+/// caller reruns the legs on the main connection instead of taking a lane's
+/// transient error for "no keyword matches".
+fn keyword_legs_strict(
+    storage: &Storage,
+    query: &str,
+    fetch: usize,
+    search_mode: SearchMode,
+    family: Option<&[&str]>,
+) -> Option<KeywordLegs> {
+    read_keyword_legs(storage, query, fetch, search_mode, family, true)
+}
+
+/// One read of a leg: its rows, an empty result when a failure is tolerated, or
+/// `None` when it is not (`strict`).
+fn leg_rows<T: Default>(read: anyhow::Result<T>, strict: bool) -> Option<T> {
+    match read {
+        Ok(rows) => Some(rows),
+        Err(_) if !strict => Some(T::default()),
+        Err(_) => None,
+    }
+}
+
+fn read_keyword_legs(
+    storage: &Storage,
+    query: &str,
+    fetch: usize,
+    search_mode: SearchMode,
+    family: Option<&[&str]>,
+    strict: bool,
+) -> Option<KeywordLegs> {
+    let mut postings_hits: Vec<(String, f64)> = Vec::new();
+    let mut postings_weight = 0.0_f64;
+    // Empty (no allocation) unless stage timing is on.
+    let timing = super::stage_timing::enabled();
+    let mut leg_ms: Vec<(&'static str, f64)> = Vec::new();
+    if search_mode == SearchMode::Hybrid {
+        let idents = crate::search::identifiers::analyze_query(query);
+        if !idents.is_empty() {
+            let sub_start = Instant::now();
+            postings_hits = leg_rows(storage.search_postings(&idents, fetch, family), strict)?;
+            if timing {
+                leg_ms.push(("f_postings", sub_start.elapsed().as_secs_f64() * 1000.0));
+            }
+            if !postings_hits.is_empty() {
+                postings_weight = id_channel_weight(&idents, &postings_term_dfs(storage, &idents));
+            }
+        }
+    }
+    let sub_start = Instant::now();
+    let family_vec = family.map(<[&str]>::to_vec);
+    let keyword = if strict {
+        crate::search::hybrid::keyword_chunk_hits_strict(storage, query, fetch, family_vec)?
+    } else {
+        keyword_chunk_hits(storage, query, fetch, family_vec)
+    };
+    if timing {
+        leg_ms.push(("f_chunks_fts", sub_start.elapsed().as_secs_f64() * 1000.0));
+    }
+    let sub_start = Instant::now();
+    let reflection_fts_hits = leg_rows(storage.fts5_search_reflections(query, fetch), strict)?;
+    if timing {
+        leg_ms.push(("f_refl_fts", sub_start.elapsed().as_secs_f64() * 1000.0));
+    }
+    let sub_start = Instant::now();
+    let reflection_prefix_ids =
+        leg_rows(storage.fts5_reflection_prefix_matches(query, fetch), strict)?;
+    if timing {
+        leg_ms.push(("f_refl_prefix", sub_start.elapsed().as_secs_f64() * 1000.0));
+    }
+    Some(KeywordLegs {
+        postings_hits,
+        postings_weight,
+        keyword,
+        reflection_fts_hits,
+        reflection_prefix_ids,
+        leg_ms,
+    })
+}
+
+/// Start [`keyword_legs`] on the blocking pool over a lane connection of its
+/// own (a WAL reader, so it never waits on the main connection). `None` when
+/// the pass has no keyword channel, lanes are off, or the store has no file; the
+/// pass then runs the legs inline, which returns the same rows. The task yields
+/// `None` when the lane would not open or any of its reads failed.
+fn spawn_keyword_lane(
+    storage: &Arc<Storage>,
+    query: &str,
+    fetch: usize,
+    scope: &SearchProjectScope,
+    search_mode: SearchMode,
+) -> Option<tokio::task::JoinHandle<Option<KeywordLegs>>> {
+    spawn_keyword_lane_with(storage, query, fetch, scope, search_mode, |_| {})
+}
+
+/// [`spawn_keyword_lane`] with a hook run on the lane connection before its
+/// reads (the tests break the lane alone with it).
+fn spawn_keyword_lane_with(
+    storage: &Arc<Storage>,
+    query: &str,
+    fetch: usize,
+    scope: &SearchProjectScope,
+    search_mode: SearchMode,
+    prepare: impl FnOnce(&Storage) + Send + 'static,
+) -> Option<tokio::task::JoinHandle<Option<KeywordLegs>>> {
+    if search_mode == SearchMode::Vector || !recall_lanes_enabled() {
+        return None;
+    }
+    let storage = Arc::clone(storage);
+    let query = query.to_string();
+    let family: Option<Vec<String>> = scope
+        .effective_project
+        .is_some()
+        .then(|| scope.family_projects.iter().cloned().collect());
+    Some(tokio::task::spawn_blocking(move || {
+        let lane = storage.open_read_lane().ok().flatten()?;
+        prepare(&lane);
+        let family: Option<Vec<&str>> = family
+            .as_ref()
+            .map(|projects| projects.iter().map(String::as_str).collect());
+        keyword_legs_strict(&lane, &query, fetch, search_mode, family.as_deref())
+    }))
+}
+
+/// The keyword legs of a pass: the lane's when it answered whole, otherwise the
+/// same reads inline on the main connection.
+async fn collect_keyword_legs(
+    lane: Option<tokio::task::JoinHandle<Option<KeywordLegs>>>,
+    storage: &Storage,
+    query: &str,
+    fetch: usize,
+    search_mode: SearchMode,
+    family: Option<&[&str]>,
+) -> KeywordLegs {
+    match lane {
+        Some(handle) => handle.await.ok().flatten(),
+        None => None,
+    }
+    .unwrap_or_else(|| keyword_legs(storage, query, fetch, search_mode, family))
+}
+
+/// Judge, on a lane connection of its own, the sessions of the semantic
+/// candidates for the synthetic-content filter, so the filter finds their
+/// verdicts cached when the keyword rows have arrived. The verdicts are the ones
+/// the filter would compute itself, from the same scan.
+fn spawn_verdict_prefetch(
+    storage: &Arc<Storage>,
+    chunks: &[crate::import::ConversationChunk],
+) -> Option<tokio::task::JoinHandle<()>> {
+    if chunks.is_empty() || !recall_lanes_enabled() || !super::synthetic::filter_enabled() {
+        return None;
+    }
+    let storage = Arc::clone(storage);
+    let conversations = distinct_conversation_ids_of_chunks(chunks);
+    Some(tokio::task::spawn_blocking(move || {
+        if let Ok(Some(lane)) = storage.open_read_lane() {
+            let refs: Vec<&str> = conversations.iter().map(String::as_str).collect();
+            super::synthetic::prefetch_verdicts(&lane, &refs);
+        }
+    }))
+}
+
 /// Leave out of `enriched` the transcript rows that are eval or synthetic
 /// content by provenance ([`super::synthetic`]): rows of a bench/eval session
 /// and the tool output of a bench/eval call. Returns their ids. Runs at the
@@ -3299,6 +3498,11 @@ async fn reflect_gather_pass(
         fetch
     };
     super::stage_timing::count("passes", 1);
+    // The keyword legs read the query alone, so they start now on their own
+    // connection and are collected where their rows are first needed.
+    let lane_start = Instant::now();
+    let mut keyword_lane = spawn_keyword_lane(storage, query, fetch, scope, search_mode);
+    super::stage_timing::stage("p_lane_spawn", lane_start);
     let search_start = Instant::now();
 
     // Search BOTH chunks and reflections unless keyword-only ablation is active.
@@ -3326,7 +3530,10 @@ async fn reflect_gather_pass(
 
     // Enrich chunk results with metadata
     let chunk_ids: Vec<String> = chunk_results.iter().map(|r| r.id.clone()).collect();
+    let sub_start = Instant::now();
     let chunks = storage.get_chunks_by_ids(&chunk_ids)?;
+    super::stage_timing::stage("d_chunks_by_ids", sub_start);
+    let mut verdict_lane = spawn_verdict_prefetch(storage, &chunks);
 
     if crate::mcp::stage_probe::is_active() {
         let chunk_conv: HashMap<&str, &str> = chunks
@@ -3363,16 +3570,20 @@ async fn reflect_gather_pass(
     // below merges in verdicts for conversations the semantic pass never
     // saw. The final sink/annotate step (mirroring
     // `apply_resolutions_before_limit`) reuses this same map.
+    let sub_start = Instant::now();
     let mut signals = CandidateSignals::load(storage, &chunks, partition_enabled, consumption_mode);
+    super::stage_timing::stage("d_signals_load", sub_start);
     let queried_chunk_ids: HashSet<String> = chunks.iter().map(|chunk| chunk.id.clone()).collect();
 
     let now = chrono::Utc::now();
 
     // Batch-fetch TAD events for all chunk results (single DB query)
     let chunk_ids_for_tad: Vec<&str> = chunk_results.iter().map(|r| r.id.as_str()).collect();
+    let sub_start = Instant::now();
     let tad_events = storage
         .get_retrieval_events_batch(&chunk_ids_for_tad)
         .unwrap_or_default();
+    super::stage_timing::stage("d_tad_events", sub_start);
     let tad_config = decay::DecayConfig::for_search();
 
     let mut ancestry_applied_ids = HashSet::new();
@@ -3484,28 +3695,32 @@ async fn reflect_gather_pass(
             .effective_project
             .is_some()
             .then(|| scope.family_projects.iter().map(String::as_str).collect());
-        if search_mode == SearchMode::Hybrid {
-            let idents = crate::search::identifiers::analyze_query(query);
-            if !idents.is_empty() {
-                postings_hits = storage
-                    .search_postings(&idents, fetch, family.as_deref())
-                    .unwrap_or_default();
-                if !postings_hits.is_empty() {
-                    postings_weight =
-                        id_channel_weight(&idents, &postings_term_dfs(storage, &idents));
-                }
-            }
+        // The legs that read the query alone ran on a lane connection while the
+        // semantic candidates were enriched; the same function runs inline when
+        // no lane was available.
+        let sub_start = Instant::now();
+        let legs = collect_keyword_legs(
+            keyword_lane.take(),
+            storage,
+            query,
+            fetch,
+            search_mode,
+            family.as_deref(),
+        )
+        .await;
+        super::stage_timing::stage("f_keyword_wait", sub_start);
+        for (name, ms) in &legs.leg_ms {
+            super::stage_timing::add_ms(name, *ms);
         }
-        let keyword = keyword_chunk_hits(storage, query, fetch, family);
-        let mut fts_window_full = keyword.window_full;
-        let fts_hits = keyword.hits;
+        postings_hits = legs.postings_hits;
+        postings_weight = legs.postings_weight;
+        let mut fts_window_full = legs.keyword.window_full;
+        let fts_hits = legs.keyword.hits;
         // Reflections have their own keyword index (`reflections_fts`). Merge
         // both families by bm25 into ONE keyword ranking, so a stored memory can
         // earn a keyword rank in the RRF fusion below instead of always arriving
         // semantic-only and losing to any chunk present in both lists.
-        reflection_fts_hits = storage
-            .fts5_search_reflections(query, fetch)
-            .unwrap_or_default();
+        reflection_fts_hits = legs.reflection_fts_hits;
         // `reflections_fts` carries no project column (only the tags JSON
         // does), so the keyword channel is unscoped: out-of-family hits are
         // not dropped here — `sink_out_of_family_under_explicit_scope`
@@ -3520,9 +3735,7 @@ async fn reflect_gather_pass(
         // surfaced its 3 memories because 267 rows matched the OR terms).
         // Prepended ahead of the bm25 merge so it always wins the keyword
         // channel rather than just competing on bm25 scale.
-        reflection_prefix_ids = storage
-            .fts5_reflection_prefix_matches(query, fetch)
-            .unwrap_or_default();
+        reflection_prefix_ids = legs.reflection_prefix_ids;
         fts_order = {
             let mut keyword_ranking: Vec<(&str, usize, f64)> = fts_hits
                 .iter()
@@ -3594,8 +3807,10 @@ async fn reflect_gather_pass(
                 .filter(|chunk| !queried_chunk_ids.contains(&chunk.id))
                 .cloned()
                 .collect();
+            let sub_start = Instant::now();
             let ancestry_revoked =
                 signals.extend(storage, &extra_chunks, partition_enabled, consumption_mode);
+            super::stage_timing::stage("f_signals_extend", sub_start);
             if ancestry_revoked {
                 // Semantic scores were computed before the FTS-only validity
                 // batch existed. Replay exactly those candidates without
@@ -3721,6 +3936,9 @@ async fn reflect_gather_pass(
     // Eval and synthetic content leaves the pool at the same point, by
     // provenance (the session ran the bench/eval rig, or the row is a rig
     // call's output). The page counts both as dropped for the refetch.
+    if let Some(handle) = verdict_lane.take() {
+        let _ = handle.await;
+    }
     echo_dropped.extend(drop_synthetic_rows(
         storage,
         &mut enriched,
@@ -5304,6 +5522,23 @@ pub async fn why(
     project: Option<&str>,
     cfg: &crate::search::reinstatement::ReinstateConfig,
 ) -> Result<String> {
+    // With `CSR_STAGE_TIMING_FILE` set, the call appends its per-stage times
+    // (the `w_*` stages) like a recall does.
+    super::stage_timing::scope(
+        query,
+        why_untimed(storage, embeddings, search, query, project, cfg),
+    )
+    .await
+}
+
+async fn why_untimed(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+    project: Option<&str>,
+    cfg: &crate::search::reinstatement::ReinstateConfig,
+) -> Result<String> {
     let (effective_project, _) = cross_project::normalize_project_scope(storage, project)?;
 
     let reinstatement = crate::search::reinstatement::reinstate(
@@ -5317,8 +5552,11 @@ pub async fn why(
     .await?;
 
     // D2: local recency tie-break, csr_why only — see apply_why_recency_tiebreak.
+    let w_start = Instant::now();
     let anchors = resolve_why_anchors(storage, &reinstatement.items);
     let ranking = apply_why_recency_tiebreak(reinstatement.items, &anchors);
+    super::stage_timing::stage("w_anchors", w_start);
+    let w_start = Instant::now();
 
     // TAD: log each returned chunk as an MCP-search retrieval event. session_id="mcp" is
     // a fixed label for the log (not the Claude Code session) — same pattern as
@@ -5327,13 +5565,17 @@ pub async fn why(
         let _ = storage.log_retrieval_event(&item.chunk_id, "chunk", "mcp_search", "mcp");
     }
 
-    render_why_evidence(
+    super::stage_timing::stage("w_retrieval_log", w_start);
+    let w_start = Instant::now();
+    let rendered = render_why_evidence(
         storage,
         query,
         ranking.items,
         &ranking.hoisted_chunk_ids,
         &reinstatement.trace,
-    )
+    );
+    super::stage_timing::stage("w_render", w_start);
+    rendered
 }
 
 /// The one rendering of csr_why evidence, ranked or keyword: label the chunks
@@ -6450,11 +6692,14 @@ impl CandidateSignals {
             }
             Err(_) => csr_text_labels_only(storage, chunks),
         };
+        let s_start = Instant::now();
+        let ancestry = storage
+            .ancestry_labels_for_conversations(&conversation_ids)
+            .unwrap_or_default();
+        super::stage_timing::stage("s_ancestry", s_start);
         Self {
             validity,
-            ancestry: storage
-                .ancestry_labels_for_conversations(&conversation_ids)
-                .unwrap_or_default(),
+            ancestry,
             ancestry_allowed: true,
         }
     }
@@ -6595,7 +6840,9 @@ fn resolve_validity_checked(
             .iter()
             .map(|chunk| (chunk.id.clone(), chunk.conversation_id.clone()))
             .collect();
+        let s_start = Instant::now();
         let hits = storage.witness_verdicts_for_chunks(&identities)?;
+        super::stage_timing::stage("s_witness", s_start);
         reduce_validity_hits(hits, chunks)
     };
     // The dream mode gates what a dream verdict may do; CSR-text labels and their
@@ -6639,7 +6886,9 @@ fn add_csr_text_labels(
     storage: &Arc<Storage>,
     chunks: &[crate::import::ConversationChunk],
 ) {
+    let s_start = Instant::now();
     let hits = storage.csr_text_hits(chunks);
+    super::stage_timing::stage("s_csr_text", s_start);
     for chunk in chunks {
         let Some(hit) = hits.get(&chunk.id) else {
             continue;
@@ -18108,5 +18357,194 @@ mod representative_tests {
         // An error passes through untouched.
         let failed = stamp_whole_call(Instant::now(), async { anyhow::bail!("boom") }).await;
         assert_eq!(failed.unwrap_err().to_string(), "boom");
+    }
+}
+
+#[cfg(test)]
+mod recall_lane_tests {
+    use super::*;
+    use crate::import::ConversationChunk;
+    use crate::provenance::Speaker;
+
+    fn chunk(id: &str, conversation: &str, content: &str) -> ConversationChunk {
+        ConversationChunk {
+            id: id.into(),
+            conversation_id: conversation.into(),
+            project_name: "alpha".into(),
+            timestamp: "2026-10-10T00:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        }
+    }
+
+    fn unscoped() -> SearchProjectScope {
+        SearchProjectScope {
+            effective_project: None,
+            scope_label: "all".into(),
+            current_project_for_all_scope: None,
+            family_anchor: None,
+            family_projects: HashSet::new(),
+            projects_root_override: None,
+        }
+    }
+
+    fn file_store(rows: &[(&str, &str, &str)]) -> (tempfile::TempDir, Arc<Storage>) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(&dir.path().join("csr-engine.db")).unwrap());
+        for (id, conversation, content) in rows {
+            storage
+                .insert_chunk(&chunk(id, conversation, content), &[1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+        }
+        (dir, storage)
+    }
+
+    fn rows_of(legs: &KeywordLegs) -> Vec<(String, usize, u64)> {
+        legs.keyword
+            .hits
+            .iter()
+            .map(|(chunk, ordinal, bm25)| (chunk.id.clone(), *ordinal, bm25.to_bits()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn lane_keyword_legs_equal_the_inline_legs() {
+        let rows: Vec<(String, String, String)> = (0..12)
+            .map(|n| {
+                (
+                    format!("lane-id{n}"),
+                    format!("lane-conv{}", n % 4),
+                    format!("quartzlane notes about retries {n} {}", "filler ".repeat(n)),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+            .collect();
+        let (_dir, storage) = file_store(&refs);
+        let scope = unscoped();
+        let inline = keyword_legs(
+            &storage,
+            "quartzlane retries notes",
+            30,
+            SearchMode::Hybrid,
+            None,
+        );
+        assert!(!inline.keyword.hits.is_empty());
+        let lane = spawn_keyword_lane(
+            &storage,
+            "quartzlane retries notes",
+            30,
+            &scope,
+            SearchMode::Hybrid,
+        )
+        .expect("a file store has a lane")
+        .await
+        .unwrap()
+        .expect("the lane opened");
+        assert_eq!(rows_of(&inline), rows_of(&lane));
+        assert_eq!(inline.keyword.window_full, lane.keyword.window_full);
+        assert_eq!(inline.postings_hits, lane.postings_hits);
+        assert_eq!(
+            inline.postings_weight.to_bits(),
+            lane.postings_weight.to_bits()
+        );
+        assert_eq!(inline.reflection_fts_hits, lane.reflection_fts_hits);
+        assert_eq!(inline.reflection_prefix_ids, lane.reflection_prefix_ids);
+    }
+
+    #[tokio::test]
+    async fn a_failed_lane_read_reruns_the_legs_on_the_main_connection() {
+        let rows: Vec<(String, String, String)> = (0..6)
+            .map(|n| {
+                (
+                    format!("faultlane-id{n}"),
+                    format!("faultlane-conv{n}"),
+                    format!("zirconfault notes about retries {n}"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+            .collect();
+        let (_dir, storage) = file_store(&refs);
+        let scope = unscoped();
+        let query = "zirconfault retries notes";
+        let inline = keyword_legs(&storage, query, 30, SearchMode::Hybrid, None);
+        assert!(!inline.keyword.hits.is_empty());
+        // A temp table shadows `chunks_fts` on the lane connection only: its
+        // chunk read errors while the main connection stays healthy.
+        let lane =
+            spawn_keyword_lane_with(&storage, query, 30, &scope, SearchMode::Hybrid, |lane| {
+                lane.with_connection(|conn| {
+                    conn.execute_batch("CREATE TEMP TABLE chunks_fts (content TEXT);")?;
+                    Ok(())
+                })
+                .unwrap();
+            })
+            .expect("a file store has a lane");
+        let legs =
+            collect_keyword_legs(Some(lane), &storage, query, 30, SearchMode::Hybrid, None).await;
+        assert_eq!(rows_of(&inline), rows_of(&legs));
+        assert_eq!(inline.keyword.window_full, legs.keyword.window_full);
+    }
+
+    #[tokio::test]
+    async fn no_lane_for_a_memory_store_or_a_vector_pass() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let scope = unscoped();
+        let lane = spawn_keyword_lane(&storage, "anything", 10, &scope, SearchMode::Hybrid)
+            .expect("hybrid spawns")
+            .await
+            .unwrap();
+        assert!(lane.is_none(), "a memory store has no file to open twice");
+        assert!(spawn_keyword_lane(&storage, "anything", 10, &scope, SearchMode::Vector).is_none());
+    }
+
+    #[tokio::test]
+    async fn verdict_prefetch_judges_the_same_sessions_the_filter_would() {
+        let marked: Vec<(String, String, String)> = (0..6)
+            .map(|n| {
+                (
+                    format!("prefetch-eval-{n}"),
+                    "prefetch-eval-session".to_string(),
+                    format!("ran the rig under .testbed/run{n}"),
+                )
+            })
+            .collect();
+        let mut refs: Vec<(&str, &str, &str)> = marked
+            .iter()
+            .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+            .collect();
+        refs.push((
+            "prefetch-plain-0",
+            "prefetch-plain-session",
+            "ordinary design talk",
+        ));
+        let (_dir, storage) = file_store(&refs);
+        let chunks = storage
+            .get_chunks_by_ids(&refs.iter().map(|r| r.0.to_string()).collect::<Vec<_>>())
+            .unwrap();
+        spawn_verdict_prefetch(&storage, &chunks)
+            .expect("a file store has a lane")
+            .await
+            .unwrap();
+        let candidates: Vec<super::super::synthetic::ChunkRef> = chunks
+            .iter()
+            .map(|c| super::super::synthetic::ChunkRef {
+                id: c.id.clone(),
+                conversation_id: c.conversation_id.clone(),
+                author: Some(Speaker::User),
+            })
+            .collect();
+        let dropped = super::super::synthetic::synthetic_ids(&storage, &candidates);
+        assert_eq!(dropped.len(), 6, "{dropped:?}");
+        assert!(dropped.iter().all(|id| id.starts_with("prefetch-eval-")));
     }
 }

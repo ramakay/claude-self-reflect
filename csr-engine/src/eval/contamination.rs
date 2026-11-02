@@ -281,7 +281,7 @@ fn fixture_episode(overrides: serde_json::Value) -> crate::hooks::stop::Episode 
         "timestamp": "2026-10-13T00:00:00Z",
         "request": "Fix the importer span ownership",
         "investigated": [],
-        "completed": "Added provenance checks for chunk spans",
+        "completed": "Added span_matcher provenance checks to scrub.rs",
         "next_steps": null,
         "blockers": null,
         "outcome": "success",
@@ -329,10 +329,12 @@ fn full_feeds() -> crate::hooks::recap::RecapFeeds {
         open_proposals: 2,
         native_warn: None,
         top_dream: Some(DreamClause {
-            label: "scrub".to_string(),
+            label: "scrub in csr-engine/src/import/scrub.rs".to_string(),
             verdict: "went stale".to_string(),
             receipt: "abc1234".to_string(),
             date: "2026-10-13".to_string(),
+            file: "csr-engine/src/import/scrub.rs".to_string(),
+            symbol: Some("scrub".to_string()),
         }),
     }
 }
@@ -504,6 +506,66 @@ pub fn engine_outputs() -> Vec<Output> {
         R::Recap,
         recap_backed(&recap_full, &modified),
     ));
+    // The block as SessionStart writes it in a dirty tree with off-branch receipts.
+    let off_head_ctx = recap::RecapContext {
+        off_head: ["abc1234".to_string(), "abc1234".to_string()]
+            .into_iter()
+            .collect(),
+        head_label: "main".to_string(),
+        session_is_live: false,
+    };
+    let recap_marked =
+        recap::compose_recap_in_context(&with_next, &full_feeds(), age, &off_head_ctx)
+            .expect("recap composes")
+            .text;
+    let dirty: Vec<String> = ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]
+        .iter()
+        .map(|path| path.to_string())
+        .collect();
+    // No clean intent, nothing landed, and settled evidence: no head words at all.
+    let mut headless = plain.clone();
+    headless.anchor_request = None;
+    headless.completions.clear();
+    headless.anchor_receipts = None;
+    let recap_headless = recap::compose_recap_with_deliveries(&headless, &full_feeds(), age)
+        .expect("a head-less recap composes")
+        .text;
+    assert!(
+        recap_headless.starts_with("recap [4m ago]: [[CSR:RECAP]]\n"),
+        "{recap_headless}"
+    );
+    out.push(output(
+        "tier0-recap-headless",
+        "recap",
+        R::Recap,
+        recap_backed(&recap_headless, &[]),
+    ));
+    out.push(output(
+        "tier0-recap-uncommitted",
+        "recap",
+        R::Recap,
+        session_start::format_tier0_block_with_repo(
+            &plain,
+            &modified,
+            age,
+            Some(&recap_marked),
+            crate::provenance::TrustTier::UserHistory,
+            &dirty,
+        ),
+    ));
+    out.push(output(
+        "continuum-uncommitted",
+        "continuum",
+        R::Continuum,
+        session_start::format_tier0_block_with_repo(
+            &plain,
+            &intact,
+            age,
+            None,
+            crate::provenance::TrustTier::UserHistory,
+            &dirty,
+        ),
+    ));
 
     // episode index
     let earlier = fixture_episode(serde_json::json!({"session_id": "def456"}));
@@ -550,6 +612,16 @@ pub fn engine_outputs() -> Vec<Output> {
         session_start::format_briefing(
             crate::provenance::TrustTier::External,
             "## Session Intelligence (CSR v9.2)\nThe prior run fixed the parser.",
+        ),
+    ));
+    out.push(output(
+        "briefing-written",
+        "briefing",
+        R::Briefing,
+        session_start::format_briefing_written(
+            crate::provenance::TrustTier::External,
+            "## Session Intelligence (CSR v9.2)\nThe prior run fixed the parser.",
+            "7m ago",
         ),
     ));
     let continuity = |enrichment: &str, last: Option<&str>| {

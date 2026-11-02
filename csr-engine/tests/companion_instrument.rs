@@ -811,7 +811,7 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
                 "2 findings confirmed",
                 "1 fact retired",
                 "unverified",
-                "Confused Claude",
+                "What confused the agent",
                 "Should be a skill / memory / tool",
                 "hook: Check the card height after each layout edit.",
                 "turns 4, 8",
@@ -1902,7 +1902,10 @@ fn number_keys_open_an_observation_item_and_the_popup_is_modal() {
     let (_home, paths) = observed_home();
     let mut pane = Pane::new(paths, &args("main", "sess-now", 100, 60));
     let rows = plain_rows(&mut pane, 100, 60);
-    assert!(rows.iter().any(|l| l == "Confused Claude"), "{rows:#?}");
+    assert!(
+        rows.iter().any(|l| l == "What confused the agent"),
+        "{rows:#?}"
+    );
     assert!(
         rows.last().unwrap().contains("o details"),
         "{:?}",
@@ -1911,7 +1914,7 @@ fn number_keys_open_an_observation_item_and_the_popup_is_modal() {
     // 2 opens the second item of the first card, in full, with the dreamer's own words.
     assert!(pane.key("2"));
     let rows = plain_rows(&mut pane, 100, 60);
-    let top = row_of(&rows, "Confused Claude · 2 of 3");
+    let top = row_of(&rows, "What confused the agent · 2 of 3");
     assert_eq!(rows[top + 1], "Repeated the rejected approach.");
     assert!(rows[top + 2].starts_with("Evidence: Turns 12 and 15"));
     assert_eq!(
@@ -1948,10 +1951,14 @@ fn number_keys_open_an_observation_item_and_the_popup_is_modal() {
         "Should be a skill / memory / tool · 1 of 2 · hook"
     );
     pane.key("k");
-    assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 3 of 3"));
+    assert!(
+        first_row(&plain_rows(&mut pane, 100, 60)).starts_with("What confused the agent · 3 of 3")
+    );
     // A number past the card's last item changes nothing.
     pane.key("5");
-    assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 3 of 3"));
+    assert!(
+        first_row(&plain_rows(&mut pane, 100, 60)).starts_with("What confused the agent · 3 of 3")
+    );
     // Tab goes to the next item, which here is the first of the other card.
     pane.key("tab");
     let rows = plain_rows(&mut pane, 100, 60);
@@ -1962,14 +1969,19 @@ fn number_keys_open_an_observation_item_and_the_popup_is_modal() {
     // esc closes the popup and the pane is as it was.
     pane.key("escape");
     let rows = plain_rows(&mut pane, 100, 60);
-    assert!(rows.iter().any(|l| l == "Confused Claude"), "{rows:#?}");
+    assert!(
+        rows.iter().any(|l| l == "What confused the agent"),
+        "{rows:#?}"
+    );
     // q closes an open popup first; the next q closes the pane.
     pane.key("o");
-    assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 1 of 3"));
+    assert!(
+        first_row(&plain_rows(&mut pane, 100, 60)).starts_with("What confused the agent · 1 of 3")
+    );
     assert!(pane.key("q"));
     assert!(plain_rows(&mut pane, 100, 60)
         .iter()
-        .any(|l| l == "Confused Claude"));
+        .any(|l| l == "What confused the agent"));
     assert!(!pane.key("q"));
 }
 
@@ -1985,7 +1997,7 @@ fn c_copies_the_item_with_its_explanation_or_a_draft_for_a_should_be_item() {
     pane.key("c");
     let copied = pane.take_copy().expect("c copies");
     assert!(
-        copied.starts_with("Confused Claude: Misread which pane should change.\nEvidence: Turn 4: 'the companion pane'\nWhat happened: The dreamer flagged"),
+        copied.starts_with("What confused the agent: Misread which pane should change.\nEvidence: Turn 4: 'the companion pane'\nWhat happened: The dreamer flagged"),
         "{copied}"
     );
     assert!(copied.contains("Next step: Re-read turn 4"), "{copied}");
@@ -2031,7 +2043,7 @@ fn a_ready_dream_keeps_the_number_keys_and_o_opens_the_cards() {
     pane.key("o");
     let rows = plain_rows(&mut pane, 100, 60);
     assert!(
-        first_row(&rows).starts_with("Confused Claude · 1 of 1"),
+        first_row(&rows).starts_with("What confused the agent · 1 of 1"),
         "{rows:#?}"
     );
     pane.key("escape");
@@ -2040,7 +2052,9 @@ fn a_ready_dream_keeps_the_number_keys_and_o_opens_the_cards() {
     pane.key("1");
     let rows = plain_rows(&mut pane, 100, 60);
     assert!(
-        !rows.iter().any(|l| l.starts_with("Confused Claude ·")),
+        !rows
+            .iter()
+            .any(|l| l.starts_with("What confused the agent ·")),
         "{rows:#?}"
     );
 }
@@ -2055,7 +2069,7 @@ fn clicking_an_observation_row_opens_it_and_any_click_closes_it() {
     assert!(pane.click(row, 10, NOW));
     let shown = plain_rows(&mut pane, 100, 60);
     assert!(
-        first_row(&shown).starts_with("Confused Claude · 2 of 3"),
+        first_row(&shown).starts_with("What confused the agent · 2 of 3"),
         "{shown:#?}"
     );
     // The popup's footer answers: a click on c copies.
@@ -2066,7 +2080,10 @@ fn clicking_an_observation_row_opens_it_and_any_click_closes_it() {
     // Any other click closes.
     assert!(pane.click(5, 5, NOW));
     let rows = plain_rows(&mut pane, 100, 60);
-    assert!(rows.iter().any(|l| l == "Confused Claude"), "{rows:#?}");
+    assert!(
+        rows.iter().any(|l| l == "What confused the agent"),
+        "{rows:#?}"
+    );
     // A should-be row opens its own card.
     let row = row_of(&rows, "skill: Bump the version in both files.");
     pane.click(row, 3, NOW);
@@ -2169,7 +2186,7 @@ fn every_wrapped_row_of_an_observation_opens_it_in_the_text_pane() {
     assert!(pane.click(first + 1, 3, NOW));
     let shown = plain_rows(&mut pane, 30, 60);
     assert!(
-        first_row(&shown).starts_with("Confused Claude"),
+        first_row(&shown).starts_with("What confused the agent"),
         "{shown:#?}"
     );
 }
@@ -2475,7 +2492,7 @@ fn every_row_of_the_three_cards_opens_its_own_item_by_click_or_by_a_step() {
     println!("{}", table.join("\n"));
 }
 
-/// The real session's shape: five Confused Claude rows and five should-be rows.
+/// The real session's shape: five What confused the agent rows and five should-be rows.
 fn five_and_five_home() -> (tempfile::TempDir, Paths) {
     let (home, paths) = state_home("08b-nothing");
     let log = paths.keep.join("dreams.jsonl");
@@ -2507,7 +2524,7 @@ fn a_click_on_row_n_of_five_opens_n_of_five_in_the_text_and_the_picture() {
         assert!(pane.click(row, 5, NOW));
         let shown = plain_rows(&mut pane, 100, 60);
         assert!(
-            first_row(&shown).starts_with(&format!("Confused Claude · {n} of 5")),
+            first_row(&shown).starts_with(&format!("What confused the agent · {n} of 5")),
             "{n}: {shown:#?}"
         );
         pane.key("escape");
@@ -2541,7 +2558,7 @@ fn a_click_on_row_n_of_five_opens_n_of_five_in_the_text_and_the_picture() {
                 assert!(open[&row].starts_with("observe:2"), "row {row}: {copy}");
                 continue;
             }
-            let word = if copy.starts_with("Confused Claude: ") {
+            let word = if copy.starts_with("What confused the agent: ") {
                 "Confused"
             } else {
                 "Should-be"
@@ -2585,11 +2602,11 @@ fn a_title_and_the_story_open_in_the_text_pane_too() {
     let (_home, paths) = observed_home();
     let mut pane = Pane::new(paths, &args("main", "sess-now", 100, 60));
     let rows = plain_rows(&mut pane, 100, 60);
-    let title = row_of(&rows, "Confused Claude");
+    let title = row_of(&rows, "What confused the agent");
     assert!(pane.click(title, 3, NOW));
     let shown = plain_rows(&mut pane, 100, 60);
     assert!(
-        first_row(&shown).starts_with("Confused Claude · 1 of 3"),
+        first_row(&shown).starts_with("What confused the agent · 1 of 3"),
         "{shown:#?}"
     );
     pane.key("escape");
@@ -2616,7 +2633,9 @@ fn a_title_and_the_story_open_in_the_text_pane_too() {
     );
     // The story is the last step of the cards: tab goes round to the first item.
     pane.key("tab");
-    assert!(first_row(&plain_rows(&mut pane, 100, 60)).starts_with("Confused Claude · 1 of 3"));
+    assert!(
+        first_row(&plain_rows(&mut pane, 100, 60)).starts_with("What confused the agent · 1 of 3")
+    );
 }
 
 #[test]
@@ -2625,7 +2644,7 @@ fn s_types_the_item_into_claude_unsent_and_says_so_when_it_cannot() {
     let (_home, paths) = observed_home();
     let mut pane = Pane::new(paths, &agent_args(100, 60));
     plain_rows(&mut pane, 100, 60);
-    // Confused Claude: the line and its evidence, quoted, then the ask.
+    // What confused the agent: the line and its evidence, quoted, then the ask.
     pane.key("o");
     plain_rows(&mut pane, 100, 60);
     pane.key("s");
@@ -2638,7 +2657,7 @@ fn s_types_the_item_into_claude_unsent_and_says_so_when_it_cannot() {
         typed,
         [
             "Here is a note offered by CSR (claude-self-reflect):",
-            "> Confused Claude: Misread which pane should change.",
+            "> What confused the agent: Misread which pane should change.",
             "> Evidence: Turn 4: 'the companion pane'",
             "You may have gone off course here. Please say what you got wrong and correct course.",
         ],
@@ -2756,7 +2775,7 @@ fn x_hides_the_item_on_the_next_frame_and_after_a_restart_and_records_a_no() {
         "{rows:#?}"
     );
     assert!(
-        rows.iter().any(|l| l == "Confused Claude"),
+        rows.iter().any(|l| l == "What confused the agent"),
         "the popup closed: {rows:#?}"
     );
     assert!(rows.iter().any(|l| l.starts_with("Misread which pane")));
@@ -2782,7 +2801,9 @@ fn x_hides_the_item_on_the_next_frame_and_after_a_restart_and_records_a_no() {
     );
     // It shows the other items in the same order, numbered again from 1.
     again.key("o");
-    assert!(first_row(&plain_rows(&mut again, 100, 60)).starts_with("Confused Claude · 1 of 2"));
+    assert!(
+        first_row(&plain_rows(&mut again, 100, 60)).starts_with("What confused the agent · 1 of 2")
+    );
     again.key("escape");
 }
 
@@ -2809,7 +2830,7 @@ fn the_popups_footer_keys_answer_a_click_in_the_text_pane_and_in_the_picture() {
     pane.click(footer, shown[footer].find("tab next").unwrap(), NOW);
     let shown = plain_rows(&mut pane, 100, 60);
     assert!(
-        first_row(&shown).starts_with("Confused Claude · 2 of 3"),
+        first_row(&shown).starts_with("What confused the agent · 2 of 3"),
         "{shown:#?}"
     );
     // x dismiss hides it and closes the popup.
@@ -2825,7 +2846,7 @@ fn the_popups_footer_keys_answer_a_click_in_the_text_pane_and_in_the_picture() {
     pane.click(footer, shown[footer].find("esc close").unwrap(), NOW);
     assert!(plain_rows(&mut pane, 100, 60)
         .iter()
-        .any(|l| l == "Confused Claude"));
+        .any(|l| l == "What confused the agent"));
 
     // The footer the picture draws inside the panel answers too, at 46x30 on a 16x34 cell.
     let (_home, paths) = observed_home();
@@ -2915,7 +2936,7 @@ const BEFORE_CLOSED_35: Before = (
     1.5041,
     &[
         ("hero", 3),
-        ("Confused Claude", 1),
+        ("What confused the agent", 1),
         ("Should be a skill / memory / tool", 1),
         ("Where the work stands", 5),
         ("CSR performance", 1),
@@ -2926,7 +2947,7 @@ const BEFORE_FOLDED_35: Before = (
     1.5041,
     &[
         ("hero", 3),
-        ("Confused Claude", 0),
+        ("What confused the agent", 0),
         ("Should be a skill / memory / tool", 0),
         ("Where the work stands", 0),
         ("CSR performance", 1),
@@ -3012,7 +3033,10 @@ fn text_stays_at_the_width_fit_until_nothing_else_can_go_and_freed_room_is_used(
             assert!(shot.scale <= width_fit + 1e-4, "{at}: {}", shot.scale);
             assert!(shot.scale >= was_scale - 1e-3, "{at}: {}", shot.scale);
             let titles: Vec<_> = shot.metrics.cards.iter().map(|c| c.title).collect();
-            let hideable = ["Confused Claude", "Should be a skill / memory / tool"];
+            let hideable = [
+                "What confused the agent",
+                "Should be a skill / memory / tool",
+            ];
             let hidden_any = was_cards
                 .iter()
                 .any(|(t, _)| *t != "hero" && !titles.contains(t));
@@ -3054,7 +3078,7 @@ fn legend_keys(pane: &Pane, rows: usize) -> Vec<String> {
         .collect()
 }
 const DASHBOARD_ONLY: [&str; 6] = [
-    "Confused Claude",
+    "What confused the agent",
     "Should be a skill",
     "CSR performance",
     "Where the work stands",
@@ -3138,14 +3162,14 @@ fn each_page_holds_only_its_own_content() {
             pane.key(key);
             let back = plain_rows(&mut pane, cols, rows).join(" ");
             assert!(
-                back.contains("Confused Claude") || back.contains("CTX"),
+                back.contains("What confused the agent") || back.contains("CTX"),
                 "{back}"
             );
             pane.key(key);
             pane.key("escape");
             let back = plain_rows(&mut pane, cols, rows).join(" ");
             assert!(
-                back.contains("Confused Claude") || back.contains("CTX"),
+                back.contains("What confused the agent") || back.contains("CTX"),
                 "{back}"
             );
         }

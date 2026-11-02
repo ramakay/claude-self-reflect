@@ -87,7 +87,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::codegraph::{self, NodeRow};
+use super::codegraph;
 use super::witness_verdicts;
 #[cfg(test)]
 use super::witness_verdicts::VerdictChannel;
@@ -496,21 +496,25 @@ pub fn witness_verdict_for_chunks(
     let candidates: std::collections::HashSet<&str> =
         conversation_ids.iter().map(|s| s.as_str()).collect();
 
-    let nodes: Vec<NodeRow> = codegraph::nodes_for_conversations(&tx, conversation_ids)?;
+    let w_start = std::time::Instant::now();
+    let nodes: Vec<codegraph::WitnessNode> =
+        codegraph::witness_nodes_for_conversations(&tx, conversation_ids)?;
+    crate::mcp::stage_timing::stage("s_w_nodes", w_start);
+    crate::mcp::stage_timing::count("s_w_node_rows", nodes.len() as u64);
 
     // node -> the input conversation_ids it is attributed to (first and/or
     // last touch; almost always the same single id, but both are checked so
     // neither channel silently loses a match).
-    let mut node_convs: Vec<(usize, Vec<String>)> = Vec::with_capacity(nodes.len());
+    let mut node_convs: Vec<(usize, Vec<&str>)> = Vec::with_capacity(nodes.len());
     for (idx, node) in nodes.iter().enumerate() {
         let mut convs = Vec::new();
         if candidates.contains(node.first_conv_id.as_str()) {
-            convs.push(node.first_conv_id.clone());
+            convs.push(node.first_conv_id.as_str());
         }
         if node.last_conv_id != node.first_conv_id
             && candidates.contains(node.last_conv_id.as_str())
         {
-            convs.push(node.last_conv_id.clone());
+            convs.push(node.last_conv_id.as_str());
         }
         if !convs.is_empty() {
             node_convs.push((idx, convs));
@@ -526,17 +530,18 @@ pub fn witness_verdict_for_chunks(
     // in-memory against (a)'s per-file symbol sets.
     let mut file_keys: Vec<(String, String)> = Vec::new();
     {
-        let mut seen: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
         for (idx, _) in &node_convs {
             let node = &nodes[*idx];
-            let key = (node.project.clone(), node.file.clone());
-            if seen.insert(key.clone()) {
-                file_keys.push(key);
+            if seen.insert((node.project.as_str(), node.file.as_str())) {
+                file_keys.push((node.project.clone(), node.file.clone()));
             }
         }
     }
+    let w_start = std::time::Instant::now();
     let (symbols_by_file, lineages) = witness_symbols_for_files(&tx, &file_keys)?;
+    crate::mcp::stage_timing::stage("s_w_symbols", w_start);
+    let w_start = std::time::Instant::now();
 
     let mut resolved = Vec::new();
     let mut state_anchors = Vec::new();
@@ -595,6 +600,7 @@ pub fn witness_verdict_for_chunks(
             }
         }
     }
+    crate::mcp::stage_timing::stage("s_w_states", w_start);
     let negative_witness_ids: Vec<i64> = states
         .values()
         .flat_map(|state| state.negative_witness_ids.iter().copied())
@@ -632,7 +638,7 @@ pub fn witness_verdict_for_chunks(
                 if let Some(bindings) = chunk_bindings.get(witness_id) {
                     has_exact_binding = true;
                     for (chunk_id, conversation_id) in bindings {
-                        if conversation_id == conv {
+                        if conversation_id.as_str() == *conv {
                             exact_chunk_ids.insert(chunk_id.clone());
                         }
                     }
@@ -642,10 +648,12 @@ pub fn witness_verdict_for_chunks(
                 for chunk_id in exact_chunk_ids {
                     let mut bound_hit = hit.clone();
                     bound_hit.chunk_id = chunk_id;
-                    out.entry(conv.clone()).or_default().push(bound_hit);
+                    out.entry((*conv).to_string()).or_default().push(bound_hit);
                 }
             } else {
-                out.entry(conv.clone()).or_default().push(hit.clone());
+                out.entry((*conv).to_string())
+                    .or_default()
+                    .push(hit.clone());
             }
         }
     }
@@ -687,6 +695,45 @@ mod tests {
             name_only: false,
             attribution: String::new(),
         }
+    }
+
+    #[test]
+    fn witness_nodes_are_the_node_rows_narrowed() {
+        let conn = open();
+        for (name, first, last) in [
+            ("a", "conv-1", "conv-1"),
+            ("b", "conv-2", "conv-1"),
+            ("c", "conv-3", "conv-3"),
+            ("d", "conv-1", "conv-4"),
+        ] {
+            upsert_node(&conn, &node(name, first, last)).unwrap();
+        }
+        let mut module = node("m", "conv-1", "conv-1");
+        module.kind = "module".into();
+        module.id =
+            crate::extraction::codegraph::node_id("proj", "/repo/src/lib.rs", "module", "m");
+        upsert_node(&conn, &module).unwrap();
+        let ids: Vec<String> = ["conv-1", "conv-4", "conv-none"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        let full = codegraph::nodes_for_conversations(&conn, &ids).unwrap();
+        let slim = codegraph::witness_nodes_for_conversations(&conn, &ids).unwrap();
+        assert_eq!(full.len(), 3);
+        assert_eq!(slim.len(), full.len());
+        for (full, slim) in full.iter().zip(&slim) {
+            assert_eq!(
+                (&full.project, &full.file, &full.name),
+                (&slim.project, &slim.file, &slim.name)
+            );
+            assert_eq!(
+                (&full.first_conv_id, &full.last_conv_id),
+                (&slim.first_conv_id, &slim.last_conv_id)
+            );
+        }
+        assert!(codegraph::witness_nodes_for_conversations(&conn, &[])
+            .unwrap()
+            .is_empty());
     }
 
     fn ledger_row(symbol: &str, at_oid: &str, stamp: &str) -> WitnessLedgerRow {

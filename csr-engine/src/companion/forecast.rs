@@ -21,6 +21,9 @@ pub const FILE: &str = "usage-history.jsonl";
 pub const MIN_SAMPLES: usize = 6;
 /// The least share of the window those readings must span.
 pub const MIN_SPAN: f64 = 0.10;
+/// A window is early until this share of it has passed. While it is early the pace may still
+/// swing and the card shows no projected figure, only what earlier windows reached.
+pub const EARLY_UNTIL: f64 = 0.10;
 /// A reading that did not move is written again after this long, so the file shows the gap.
 const REPEAT_AFTER: f64 = 600.;
 /// A window's reset time may differ this much between readings and still be the same window.
@@ -160,7 +163,8 @@ pub struct Estimate {
     pub at_reset: f64,
     /// When the window fills before its reset, when it does.
     pub runs_out: Option<f64>,
-    /// Less than a tenth of the window has passed: the figure may still swing.
+    /// Less than a tenth of the window has passed: the figure may still swing. The card shows no
+    /// figure for an early window (see `outlook`); the math is kept for the later ones.
     pub early: bool,
     /// Finished windows' peaks were blended in, not the live pace alone.
     pub blended: bool,
@@ -202,9 +206,15 @@ pub fn estimate(
     Some(Estimate {
         at_reset: reach,
         runs_out,
-        early: elapsed < 0.10,
+        early: is_early(elapsed),
         blended,
     })
+}
+
+/// Whether `elapsed` (the share of the window gone) is under `EARLY_UNTIL`. A hair of slack so a
+/// tenth that float division lands on 0.0999999999 still counts as a tenth.
+fn is_early(elapsed: f64) -> bool {
+    elapsed < EARLY_UNTIL - 1e-9
 }
 
 fn median(values: &[f64]) -> Option<f64> {
@@ -223,8 +233,15 @@ fn median(values: &[f64]) -> Option<f64> {
 
 /// The highest figure each finished window of `kind` reached, from its readings, where the
 /// readings reach the window's last fifth (a window seen only at its start says nothing of its
-/// end). The current window, the one that resets at `resets`, is not one of them.
-fn peaks(rows: &[(String, Sample)], kind: &str, len: f64, resets: f64, now: f64) -> Vec<f64> {
+/// end). The current window, the one that resets at `resets`, is not one of them. Each peak
+/// comes with the reset time of its window, oldest first.
+fn finished(
+    rows: &[(String, Sample)],
+    kind: &str,
+    len: f64,
+    resets: f64,
+    now: f64,
+) -> Vec<(f64, f64)> {
     let mut mine: Vec<Sample> = rows
         .iter()
         .filter(|(k, s)| k == kind && (s.resets - resets).abs() >= SAME_WINDOW && s.resets < now)
@@ -237,7 +254,10 @@ fn peaks(rows: &[(String, Sample)], kind: &str, len: f64, resets: f64, now: f64)
         if let Some(first) = group.first() {
             let end = group.iter().map(|s| s.at).fold(f64::MIN, f64::max);
             if end >= first.resets - len * 0.2 {
-                out.push(group.iter().map(|s| s.used).fold(0., f64::max));
+                out.push((
+                    first.resets,
+                    group.iter().map(|s| s.used).fold(0., f64::max),
+                ));
             }
         }
         group.clear();
@@ -319,13 +339,53 @@ fn reset_name(at: f64, now: f64) -> String {
     }
 }
 
+/// What the finished windows before this one reached: the median of their peaks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Past {
+    median: f64,
+    /// How many finished windows the median stands on.
+    count: usize,
+    /// Exactly one, and it ended just before this one began: it is "last week", not "a week".
+    last: bool,
+}
+
+impl Past {
+    /// `done` is `finished()`'s output for the window that resets at `resets`.
+    fn of(done: &[(f64, f64)], len: f64, resets: f64) -> Option<Past> {
+        let median = median(&done.iter().map(|d| d.1).collect::<Vec<_>>())?;
+        Some(Past {
+            median,
+            count: done.len(),
+            last: done.len() == 1 && resets - done[0].0 < 1.5 * len,
+        })
+    }
+
+    /// "last week peaked at 93%": which window it was, and the figure it reached.
+    fn words(&self, code: &str) -> String {
+        let peak = self.median.round();
+        match (code == "7D", self.count, self.last) {
+            (true, _, _) if self.count > 1 => format!("earlier weeks peaked around {peak}%"),
+            (true, _, true) => format!("last week peaked at {peak}%"),
+            (true, _, false) => format!("an earlier week peaked at {peak}%"),
+            (false, _, _) if self.count > 1 => {
+                format!("earlier 5-hour windows peaked around {peak}%")
+            }
+            (false, _, true) => format!("the last 5-hour window peaked at {peak}%"),
+            (false, _, false) => format!("an earlier 5-hour window peaked at {peak}%"),
+        }
+    }
+}
+
 /// One window as the card says it.
 struct Row {
     code: &'static str,
     name: &'static str,
     used: f64,
     resets: f64,
+    /// The figure the card stands on. `None` while the window is early: nothing is projected.
     estimate: Option<Estimate>,
+    early: bool,
+    past: Option<Past>,
 }
 
 impl Row {
@@ -350,24 +410,32 @@ impl Row {
         if self.used >= 100. {
             return format!("Limit reached · resets in {left}");
         }
+        // Early in the window there is no pace to state: say what earlier windows reached, or
+        // that it is too soon. A prior is never worded as a measured pace.
+        if self.early {
+            return match self.past {
+                Some(past) => format!("Early · {} · resets in {left}", past.words(self.code)),
+                None => format!("Too early to tell · resets in {left}"),
+            };
+        }
         let Some(e) = self.estimate else {
             return format!("Pace shows after a few readings · resets in {left}");
         };
-        let early = if e.early { " (early)" } else { "" };
         match e.runs_out {
             Some(at) => format!(
-                "On pace to run out around {} · resets in {left}{early}",
+                "On pace to run out around {} · resets in {left}",
                 clock(at, now)
             ),
             None => format!(
-                "On pace for about {:.0}% by reset · resets in {left}{early}",
+                "On pace for about {:.0}% by reset · resets in {left}",
                 e.at_reset.round()
             ),
         }
     }
 }
 
-/// The sentence that heads the card and the colour it is in.
+/// The sentence that heads the card and the colour it is in. It stands on the windows that are
+/// past their early stretch; an early window adds only what it has already used, never a guess.
 fn headline(rows: &[Row], now: f64) -> Option<(String, &'static str)> {
     let first = rows.first()?;
     let soonest = rows
@@ -375,17 +443,11 @@ fn headline(rows: &[Row], now: f64) -> Option<(String, &'static str)> {
         .filter_map(|r| Some((r, r.estimate?.runs_out?)))
         .min_by(|a, b| a.1.total_cmp(&b.1));
     if let Some((row, at)) = soonest {
-        let early = row.estimate.is_some_and(|e| e.early);
         return Some((
             format!(
-                "On course to run out: {} limit hit around {}.{}",
+                "On course to run out: {} limit hit around {}.",
                 row.name,
-                clock(at, now),
-                if early {
-                    " It is early, so this may change."
-                } else {
-                    ""
-                }
+                clock(at, now)
             ),
             "red",
         ));
@@ -403,30 +465,60 @@ fn headline(rows: &[Row], now: f64) -> Option<(String, &'static str)> {
     let reach = |r: &Row| r.estimate.map_or(r.used, |e| e.at_reset.max(r.used));
     let worst = rows
         .iter()
-        .max_by(|a, b| reach(a).total_cmp(&reach(b)))
-        .unwrap_or(first);
-    let at = reach(worst);
-    if at >= 90. {
+        .filter(|r| !r.early)
+        .max_by(|a, b| reach(a).total_cmp(&reach(b)));
+    let at = worst.map_or(0., reach);
+    // An early window far into its limit already says so, in what it has used.
+    let used_up = rows
+        .iter()
+        .filter(|r| r.early && r.used >= 75. && r.used > at)
+        .max_by(|a, b| a.used.total_cmp(&b.used));
+    if let Some(row) = used_up {
         return Some((
             format!(
-                "Close to the limit. Expect about {:.0}% of the {} limit by reset.",
-                at.round(),
-                worst.name
+                "{} is already at {:.0}% of its limit.",
+                row.name,
+                row.used.round()
             ),
-            "red",
+            if row.used >= 90. { "red" } else { "amber" },
         ));
     }
-    if at >= 75. {
-        return Some((
-            format!(
-                "Heading toward the limit: about {:.0}% of the {} limit by reset.",
-                at.round(),
-                worst.name
-            ),
-            "amber",
-        ));
+    if let Some(worst) = worst {
+        if at >= 90. {
+            return Some((
+                format!(
+                    "Close to the limit. Expect about {:.0}% of the {} limit by reset.",
+                    at.round(),
+                    worst.name
+                ),
+                "red",
+            ));
+        }
+        if at >= 75. {
+            return Some((
+                format!(
+                    "Heading toward the limit: about {:.0}% of the {} limit by reset.",
+                    at.round(),
+                    worst.name
+                ),
+                "amber",
+            ));
+        }
     }
     if rows.iter().all(|r| r.estimate.is_none()) {
+        // Every window is early, or has no pace yet: no verdict, only where it stands.
+        if rows.iter().all(|r| r.early) {
+            let lead = rows.iter().find(|r| r.code == "7D").unwrap_or(first);
+            let span = if lead.code == "7D" { "week" } else { "window" };
+            return Some((
+                format!(
+                    "Early in the {span}. {} is at {:.0}% so far.",
+                    lead.name,
+                    lead.used.round()
+                ),
+                "quiet",
+            ));
+        }
         return Some((
             format!(
                 "Watching the limits: {} is at {:.0}% so far.",
@@ -436,18 +528,16 @@ fn headline(rows: &[Row], now: f64) -> Option<(String, &'static str)> {
             "quiet",
         ));
     }
-    // The reset it names is the week's, as the usage mod does; the 5 Hour's when there is no week.
-    let lead = rows.iter().find(|r| r.code == "7D").unwrap_or(worst);
-    let early = rows.iter().any(|r| r.estimate.is_some_and(|e| e.early));
+    // The reset it names is the week's, as the usage mod does; the 5 Hour's when the week is
+    // early or absent.
+    let lead = rows
+        .iter()
+        .find(|r| r.code == "7D" && r.estimate.is_some())
+        .or(worst)?;
     Some((
         format!(
-            "On track. You should reach {} with room to spare.{}",
-            reset_name(lead.resets, now),
-            if early {
-                " Early, so it may change."
-            } else {
-                ""
-            }
+            "On track. You should reach {} with room to spare.",
+            reset_name(lead.resets, now)
         ),
         "ok",
     ))
@@ -482,13 +572,18 @@ pub fn outlook(keep: &Path, rate_limits: &Value, now: f64) -> Value {
             .map(|(_, s)| s.at.floor() as i64)
             .collect::<std::collections::BTreeSet<_>>()
             .len();
-        let past = peaks(&rows, kind, len, resets, now);
+        let done = finished(&rows, kind, len, resets, now);
+        let peaks: Vec<f64> = done.iter().map(|d| d.1).collect();
+        let early = is_early(1. - (resets - now) / len);
         windows.push(Row {
             code,
             name: if code == "5H" { "5 Hour" } else { "Weekly" },
             used,
             resets,
-            estimate: estimate(len, used, resets, now, seen, &past),
+            // The math runs for every window, but an early one shows no figure from it.
+            estimate: estimate(len, used, resets, now, seen, &peaks).filter(|_| !early),
+            early,
+            past: Past::of(&done, len, resets),
         });
     }
     let mut quota = serde_json::Map::new();
@@ -510,7 +605,7 @@ pub fn outlook(keep: &Path, rate_limits: &Value, now: f64) -> Value {
             "used": r.used,
             "sev": r.sev(),
             "tick": r.estimate.map(|e| e.at_reset.clamp(0., 100.).round()),
-            "early": r.estimate.is_some_and(|e| e.early),
+            "early": r.early,
             "blended": r.estimate.is_some_and(|e| e.blended),
             "line": r.line(now),
         })).collect::<Vec<_>>(),
@@ -621,11 +716,11 @@ mod tests {
             ],
         );
         assert_eq!(
-            peaks(&rows, "five_hour", LEN, RESETS, RESETS - 600.),
-            vec![42.]
+            finished(&rows, "five_hour", LEN, RESETS, RESETS - 600.),
+            vec![(old, 42.)]
         );
         // Other kinds are not mixed in.
-        assert!(peaks(&rows, "seven_day", LEN, RESETS, RESETS - 600.).is_empty());
+        assert!(finished(&rows, "seven_day", LEN, RESETS, RESETS - 600.).is_empty());
     }
 
     fn limits(five: f64, week: f64, now: f64) -> Value {
@@ -641,28 +736,32 @@ mod tests {
     fn test_the_outlook_speaks_from_the_first_reading_and_names_the_headline() {
         let d = tempfile::tempdir().unwrap();
         let keep = d.path().join("csr-companion");
-        // No history file at all: the live pace stands once a twentieth of the window is gone.
+        // No history file at all.
         let now = 1_800_000_000.;
         let got = outlook(&keep, &limits(8., 20., now), now);
         let w = got["windows"].as_array().unwrap();
         assert_eq!(w.len(), 2);
         assert_eq!(w[0]["code"], "5H");
         let line = w[0]["line"].as_str().unwrap();
-        // 25 minutes of 300 gone, 8 used: about 96% by reset (early: under a tenth).
-        assert!(
-            line.starts_with("On pace for about 96% by reset · resets in 4h 35m"),
-            "{line}"
-        );
-        assert!(line.ends_with("(early)"), "{line}");
-        assert!(w[0]["tick"].as_f64().unwrap() > 90.);
-        // The week: 4.2 days gone? no, 2d20h left of 7d: 59% gone, 20 used: 34%.
+        // 25 minutes of 300 gone: under a tenth, so no pace is stated, however high it reads.
+        assert_eq!(line, "Too early to tell · resets in 4h 35m");
+        assert!(w[0]["tick"].is_null() && w[0]["early"] == true);
+        // The week: 2d20h left of 7d is 59% gone, 20 used: 34%.
         let week = w[1]["line"].as_str().unwrap();
         assert!(
             week.starts_with("On pace for about 34% by reset · resets in 2d 20h"),
             "{week}"
         );
-        assert_eq!(got["headline"]["sev"], "red", "{got}");
-        assert_eq!(got["quota"]["5H"]["out"], false);
+        assert!(w[1]["tick"].as_f64().unwrap() > 30. && w[1]["early"] == false);
+        // The headline rests on the week alone.
+        assert_eq!(got["headline"]["sev"], "ok", "{got}");
+        assert!(got["headline"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("On track. You should reach "));
+        // No caption under the early window's circle.
+        assert!(got["quota"]["5H"].is_null(), "{got}");
+        assert_eq!(got["quota"]["7D"]["out"], false);
     }
 
     #[test]
@@ -710,24 +809,28 @@ mod tests {
         let none = outlook(&keep, &json!({}), now);
         assert_eq!(none["headline"], Value::Null);
         assert_eq!(none["windows"], json!([]));
-        // Too soon in a window for any pace: it says it is watching, with no number invented.
+        // Too soon in a window for any pace: it says so, with no number invented.
         let soon = json!({"five_hour": {"used_percentage": 1., "resets_at": now + 17900.}});
         let got = outlook(&keep, &soon, now);
         assert_eq!(got["headline"]["sev"], "quiet", "{got}");
+        assert_eq!(
+            got["headline"]["text"],
+            "Early in the window. 5 Hour is at 1% so far."
+        );
         assert!(got["windows"][0]["tick"].is_null());
         assert!(got["windows"][0]["line"]
             .as_str()
             .unwrap()
-            .starts_with("Pace shows after"));
+            .starts_with("Too early to tell"));
     }
 
     #[test]
-    fn test_the_on_track_headline_names_the_weeks_reset_and_marks_an_early_estimate() {
+    fn test_the_on_track_headline_names_the_weeks_reset_and_ignores_an_early_window() {
         let d = tempfile::tempdir().unwrap();
         let keep = d.path().join("csr-companion");
         let now = 1_800_000_000.;
         // Two hours of five left, little used: the sentence names the week's reset, not the
-        // 5 Hour's, and carries no early mark.
+        // 5 Hour's.
         let calm = outlook(&keep, &limits_left(12., 10., now, 7200.), now);
         let text = calm["headline"]["text"].as_str().unwrap();
         let week = reset_name(now + 2. * 86400. + 20. * 3600., now);
@@ -736,15 +839,206 @@ mod tests {
             format!("On track. You should reach {week} with room to spare.")
         );
         assert!(week.ends_with("'s reset"), "{week}");
-        // A tenth of the window not yet gone: the same sentence with the early mark, same state.
+        // The 5 Hour is early (a twentieth gone): it adds nothing, and the sentence is the same
+        // with no early mark, resting on the week.
         let early = outlook(&keep, &limits_left(1., 10., now, 17000.), now);
-        let text = early["headline"]["text"].as_str().unwrap();
-        assert!(
-            text.starts_with("On track. You should reach ")
-                && text.ends_with(" Early, so it may change."),
-            "{text}"
-        );
+        assert_eq!(early["headline"]["text"], calm["headline"]["text"]);
         assert_eq!(early["headline"]["sev"], "ok");
+        // An early 5 Hour that reads as a fast pace does not turn the headline red or amber.
+        let fast = outlook(&keep, &limits_left(30., 10., now, 17100.), now);
+        assert_eq!(fast["headline"]["text"], calm["headline"]["text"], "{fast}");
+        assert!(fast["windows"][0]["tick"].is_null());
+        assert_eq!(fast["quota"]["5H"], Value::Null);
+    }
+
+    #[test]
+    fn test_an_early_week_with_a_calm_five_hour_names_the_five_hour_reset() {
+        let d = tempfile::tempdir().unwrap();
+        let keep = d.path().join("csr-companion");
+        let now = 1_800_000_000.;
+        // The week is 1% into its first day; the 5 Hour is two hours in with 12% used.
+        let limits = json!({
+            "five_hour": {"used_percentage": 12., "resets_at": now + 7200.},
+            "seven_day": {"used_percentage": 1., "resets_at": now + 0.9831 * 604800.}});
+        let got = outlook(&keep, &limits, now);
+        assert_eq!(
+            got["headline"]["text"],
+            format!(
+                "On track. You should reach {} with room to spare.",
+                reset_name(now + 7200., now)
+            ),
+            "{got}"
+        );
+        assert_eq!(got["windows"][1]["early"], true);
+        assert!(got["windows"][1]["tick"].is_null());
+    }
+
+    #[test]
+    fn test_the_headline_when_every_window_is_early_is_neutral() {
+        let d = tempfile::tempdir().unwrap();
+        let keep = d.path().join("csr-companion");
+        let now = 1_800_000_000.;
+        // The live case of 2026-11-01: week 1% used, 1.7% gone; the 5 Hour just opened.
+        let limits = json!({
+            "five_hour": {"used_percentage": 2., "resets_at": now + 17000.},
+            "seven_day": {"used_percentage": 1., "resets_at": now + 0.9831 * 604800.}});
+        let got = outlook(&keep, &limits, now);
+        assert_eq!(
+            got["headline"]["text"],
+            "Early in the week. Weekly is at 1% so far."
+        );
+        assert_eq!(got["headline"]["sev"], "quiet");
+        // Not on track, not running out, and no number projected.
+        let said = got.to_string();
+        assert!(
+            !said.contains("On track") && !said.contains("run out"),
+            "{said}"
+        );
+        assert!(
+            !said.contains("by reset") && !said.contains("at reset"),
+            "{said}"
+        );
+        // Much used already, early: it says what is used, not what it may reach.
+        let hot = json!({"five_hour": {"used_percentage": 80., "resets_at": now + 17000.}});
+        let got = outlook(&keep, &hot, now);
+        assert_eq!(
+            got["headline"]["text"],
+            "5 Hour is already at 80% of its limit."
+        );
+        assert_eq!(got["headline"]["sev"], "amber");
+        assert_eq!(got["windows"][0]["sev"], "amber");
+    }
+
+    /// One finished window of `kind`: readings through its last fifth that peak at `peak`.
+    fn finished_window(kind: &str, len: f64, resets: f64, peak: f64) -> String {
+        [(0.4, peak / 2.), (0.9, peak), (0.97, peak - 1.)]
+            .iter()
+            .map(|(share, used)| {
+                format!(
+                    "{}\n",
+                    line_of(
+                        kind,
+                        &Sample {
+                            at: resets - len + share * len,
+                            used: *used,
+                            resets,
+                        }
+                    )
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_an_early_window_with_history_says_what_the_last_one_peaked_at() {
+        let d = tempfile::tempdir().unwrap();
+        let keep = d.path().join("csr-companion");
+        std::fs::create_dir_all(&keep).unwrap();
+        let now = 1_800_000_000.;
+        // The live case: the week is 1.69% gone with 1% used (a pace of 59%), and last week
+        // peaked at 93%. The 5 Hour opened 17000 s from its reset; the one before peaked at 40%.
+        let week = now + 0.9831 * 604800.;
+        let five = now + 17000.;
+        let body = [
+            finished_window("seven_day", 604800., week - 604800., 93.),
+            finished_window("five_hour", 18000., five - 18000., 40.),
+        ]
+        .concat();
+        std::fs::write(keep.join(FILE), body).unwrap();
+        let limits = json!({
+            "five_hour": {"used_percentage": 2., "resets_at": five},
+            "seven_day": {"used_percentage": 1., "resets_at": week}});
+        let got = outlook(&keep, &limits, now);
+        let w = got["windows"].as_array().unwrap();
+        assert_eq!(
+            w[0]["line"],
+            format!(
+                "Early · the last 5-hour window peaked at 40% · resets in {}",
+                until(five - now)
+            )
+        );
+        assert_eq!(
+            w[1]["line"],
+            format!(
+                "Early · last week peaked at 93% · resets in {}",
+                until(week - now)
+            )
+        );
+        // The prior is not worded as a pace and not drawn as a tick, a caption or a headline.
+        assert!(w
+            .iter()
+            .all(|r| r["tick"].is_null() && r["blended"] == false));
+        assert_eq!(got["quota"], json!({}));
+        assert_eq!(
+            got["headline"]["text"],
+            "Early in the week. Weekly is at 1% so far."
+        );
+        assert!(!got.to_string().contains("86"), "{got}");
+        // A week skipped in between: it is no longer "last week".
+        std::fs::write(
+            keep.join(FILE),
+            finished_window("seven_day", 604800., week - 2. * 604800., 93.),
+        )
+        .unwrap();
+        let got = outlook(&keep, &limits, now);
+        assert!(got["windows"][1]["line"]
+            .as_str()
+            .unwrap()
+            .starts_with("Early · an earlier week peaked at 93% ·"));
+    }
+
+    #[test]
+    fn test_several_finished_windows_are_worded_as_the_median_they_are() {
+        let past = |peaks: &[(f64, f64)]| Past::of(peaks, LEN, RESETS).unwrap();
+        // Two peaks: 30 and 60. The figure is their median, 45, and the words say "around".
+        let two = past(&[(RESETS - 2. * LEN, 30.), (RESETS - LEN, 60.)]);
+        assert_eq!(two.median, 45.);
+        assert_eq!(two.words("7D"), "earlier weeks peaked around 45%");
+        assert_eq!(two.words("5H"), "earlier 5-hour windows peaked around 45%");
+        let one = past(&[(RESETS - LEN, 93.4)]);
+        assert_eq!(one.words("7D"), "last week peaked at 93%");
+        assert_eq!(one.words("5H"), "the last 5-hour window peaked at 93%");
+        assert_eq!(Past::of(&[], LEN, RESETS), None);
+    }
+
+    #[test]
+    fn test_a_window_is_early_until_a_tenth_of_it_has_gone() {
+        let d = tempfile::tempdir().unwrap();
+        let keep = d.path().join("csr-companion");
+        let now = 1_800_000_000.;
+        for len in [18000., 604800.] {
+            let code = if len == 18000. { "5H" } else { "7D" };
+            let kind = if len == 18000. {
+                "five_hour"
+            } else {
+                "seven_day"
+            };
+            let at = |left: f64| {
+                let limits = json!({kind: {"used_percentage": 5., "resets_at": now + left}});
+                outlook(&keep, &limits, now)["windows"][0].clone()
+            };
+            // Exactly a tenth gone: the pace stands (5 used over a tenth: 50 at the reset).
+            let tenth = at(0.9 * len);
+            assert_eq!(tenth["code"], code);
+            assert_eq!(tenth["early"], false, "{code}: {tenth}");
+            assert_eq!(tenth["tick"], 50., "{code}: {tenth}");
+            assert!(
+                tenth["line"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("On pace for about 50% by reset"),
+                "{code}: {tenth}"
+            );
+            assert!(!tenth["line"].as_str().unwrap().contains("Early"));
+            // A second short of it: still early, nothing projected.
+            let before = at(0.9 * len + 1.);
+            assert_eq!(before["early"], true, "{code}: {before}");
+            assert!(before["tick"].is_null(), "{code}: {before}");
+            assert!(before["line"]
+                .as_str()
+                .unwrap()
+                .starts_with("Too early to tell"));
+        }
     }
 
     #[test]
@@ -753,7 +1047,8 @@ mod tests {
         let keep = d.path().join("csr-companion");
         std::fs::create_dir_all(&keep).unwrap();
         let now = 1_800_000_000.;
-        let resets = now + 4. * 3600. + 35. * 60.;
+        // A fifth of the window gone, past its early stretch: 8 used is 40 at the reset alone.
+        let resets = now + 4. * 3600.;
         let old = resets - 2. * LEN;
         let body: String = [(0.3, 10.), (0.9, 20.), (0.97, 20.)]
             .iter()
@@ -772,27 +1067,37 @@ mod tests {
             })
             .collect();
         std::fs::write(keep.join(FILE), body).unwrap();
-        let alone = outlook(
-            &tempfile::tempdir().unwrap().path().join("x"),
-            &limits(8., 20., now),
-            now,
-        );
-        let got = outlook(&keep, &limits(8., 20., now), now);
+        let limits = limits_left(8., 20., now, 4. * 3600.);
+        let alone = outlook(&tempfile::tempdir().unwrap().path().join("x"), &limits, now);
+        let got = outlook(&keep, &limits, now);
         assert_eq!(got["windows"][0]["blended"], true);
         assert_eq!(alone["windows"][0]["blended"], false);
-        // The past peak of 20 pulls the early 96% down.
+        // The past peak of 20 pulls the 40% pace down.
         assert!(
             got["windows"][0]["tick"].as_f64().unwrap()
                 < alone["windows"][0]["tick"].as_f64().unwrap()
         );
+        // Early in the same window, the same history shows as a peak, not as a figure.
+        let early = outlook(
+            &keep,
+            &limits_left(8., 20., now, 4. * 3600. + 35. * 60.),
+            now,
+        );
+        assert_eq!(early["windows"][0]["blended"], false);
+        assert!(early["windows"][0]["tick"].is_null());
+        assert!(early["windows"][0]["line"]
+            .as_str()
+            .unwrap()
+            .starts_with("Early · an earlier 5-hour window peaked at 20% ·"));
     }
 
     #[test]
-    fn test_the_same_reading_written_twice_is_one_reading() {
+    fn test_readings_of_an_early_window_never_make_a_pace_on_the_card() {
         let d = tempfile::tempdir().unwrap();
         let keep = d.path().join("csr-companion");
         std::fs::create_dir_all(&keep).unwrap();
-        // 3% of the window gone: two readings would be enough for a pace, one is not.
+        // 3% of the window gone. Two readings would be enough for `estimate` to state a pace;
+        // the card still shows none while the window is early, one reading or several.
         let now = 1_800_000_000.;
         let resets = now + 0.97 * LEN;
         let one = Sample {
@@ -800,18 +1105,15 @@ mod tests {
             used: 2.,
             resets,
         };
+        let limits = json!({"five_hour": {"used_percentage": 2., "resets_at": resets}});
         let twice = format!("{0}\n{0}\n", line_of("five_hour", &one));
         std::fs::write(keep.join(FILE), twice).unwrap();
-        let limits = json!({"five_hour": {"used_percentage": 2., "resets_at": resets}});
-        let got = outlook(&keep, &limits, now);
-        assert!(
-            got["windows"][0]["line"]
-                .as_str()
-                .unwrap()
-                .starts_with("Pace shows after"),
-            "{got}"
-        );
-        // A second reading a minute on is a second reading.
+        let said = |keep: &Path| {
+            let got = outlook(keep, &limits, now);
+            assert!(got["windows"][0]["tick"].is_null(), "{got}");
+            got["windows"][0]["line"].as_str().unwrap().to_owned()
+        };
+        assert!(said(&keep).starts_with("Too early to tell"));
         let more = Sample {
             at: now - 90.,
             ..one
@@ -822,8 +1124,7 @@ mod tests {
             line_of("five_hour", &one)
         );
         std::fs::write(keep.join(FILE), both).unwrap();
-        let got = outlook(&keep, &limits, now);
-        assert!(got["windows"][0]["tick"].is_number(), "{got}");
+        assert!(said(&keep).starts_with("Too early to tell"));
     }
 
     #[test]

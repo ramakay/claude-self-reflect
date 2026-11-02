@@ -30,7 +30,7 @@ pub fn short_path(rel: &str, parts: usize) -> String {
 /// runs, else to its last event.
 fn flight_minutes(row: &Agent, now: f64) -> i64 {
     let begun = row.started.filter(|s| *s != 0.).unwrap_or(row.first_seen) / 1000.;
-    let end = if agents::is_active(row) {
+    let end = if agents::is_active(row, now) {
         now
     } else {
         row.last_at / 1000.
@@ -256,8 +256,8 @@ pub fn flight_section(
         return None;
     }
     let folded = |name: &str| folds.contains(&json!(name));
-    let tree = agents::tree(rows);
-    let live = rows.iter().filter(|r| agents::is_active(r)).count() as u64;
+    let tree = agents::tree(rows, now);
+    let live = rows.iter().filter(|r| agents::is_active(r, now)).count() as u64;
     let recent = agents::recent_completion(rows, now);
     let is_open = live > 0 || recent.is_some();
     let times: Vec<f64> = rows.iter().map(|r| r.last_at / 1000.).collect();

@@ -645,7 +645,7 @@ pub struct DashSegment {
     pub legend: Option<String>,
 }
 
-/// One ring of "CSR this session" as drawn.
+/// One ring of "Self-Reflect this session" as drawn.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct DashRing {
     /// The number inside the ring, and the words under it.

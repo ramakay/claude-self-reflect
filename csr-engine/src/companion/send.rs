@@ -452,6 +452,8 @@ mod python_cases {
                 show savings in tokens.",
             "CSR's dreamer asked this while you worked yesterday, but I \
                 wrote today's question myself.",
+            "Self-Reflect's dreamer asked this while you worked yesterday, but I \
+                wrote today's question myself.",
         ] {
             assert_eq!(own_words(text), text);
         }
@@ -518,6 +520,11 @@ mod python_cases {
                 1200,
             ),
             closed_send(
+                "Self-Reflect's dreamer asked this while you worked, quoted: “What if?” Its reasoning:",
+                "Say fresh. Read the queue.",
+                700,
+            ),
+            closed_send(
                 "CSR's dreamer asked this while you worked, quoted: “What if?” Its reasoning:",
                 "Say fresh. Read the queue.",
                 700,
@@ -545,6 +552,32 @@ mod python_cases {
             1200,
         );
         assert_eq!(own_words(&format!("{cjk}　次は？")), "次は？");
+    }
+    #[test]
+    fn test_the_self_reflect_wording_and_the_csr_wording_are_both_cut_from_a_prompt() {
+        for who in ["Self-Reflect's dreamer", "CSR's dreamer"] {
+            let v1 = format!("{who} asked this while you worked: “What if?” Its reasoning: x.");
+            let v2 = format!(
+                "{who} asked this while you worked, quoted: “What if?” Its reasoning: “x.”"
+            );
+            // v1 never searches for a closing quote: it runs to the end of its line.
+            assert_eq!(own_words(&format!("Before. {v1} After.")), "Before.");
+            assert_eq!(own_words(&format!("Before. {v2} After.")), "Before. After.");
+            let band_v1 = format!(
+                "What if we reuse the palette?\n\n{who} asked this while you worked. Its \
+                reasoning:\n\n> **Reuse**\n> Shared colours."
+            );
+            let band_v2 = format!(
+                "“What if we reuse the palette?”\n\n{who} asked this while you worked, \
+                quoted. Its reasoning:\n\n> **Reuse**\n> Shared colours."
+            );
+            for band in [band_v1, band_v2] {
+                assert_eq!(
+                    own_words(&format!("Keep the deployment frozen.\n\n{band}\n\nNo.")),
+                    "Keep the deployment frozen.\n\nNo."
+                );
+            }
+        }
     }
     #[test]
     fn test_v2_question_ends_its_line_and_v1_never_searches_for_a_closing_quote() {

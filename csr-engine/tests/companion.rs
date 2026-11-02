@@ -370,15 +370,7 @@ fn terminal_session(reload: bool) {
         wakes.exists(),
         "the pane keeps a pipe for the relay's wakes"
     );
-    // Let the first frames land and the pane go quiet; away from a minute edge, whose clock
-    // labels would redraw it for their own reasons.
-    let seconds = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            % 60
-    };
+    // Let the first frames land and the pane go quiet.
     let drain = |master: &mut fs::File, output: &mut Vec<u8>, span: Duration| {
         let until = Instant::now() + span;
         while Instant::now() < until {
@@ -404,7 +396,18 @@ fn terminal_session(reload: bool) {
             }
         }
     };
-    let frames = |log: &std::path::Path| fs::read_to_string(log).map_or(0, |t| t.lines().count());
+    // One word per frame drawn and written out, from the pane's frame log: `wake` for a draw a
+    // wake earned, `pressed` for a key or a fold, `due` for the gate's own (a label that moves
+    // on a clock edge, work that finished). A frame that draws the same bytes writes none to the
+    // terminal, so quiet output proves nothing about these.
+    let causes = |log: &std::path::Path| -> Vec<String> {
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let frames = |log: &std::path::Path| causes(log).len();
     // The log records a frame when it is written out, not when it begins: wait for the first one
     // (a loaded machine takes a while) before judging anything quiet.
     let began = Instant::now();
@@ -416,13 +419,13 @@ fn terminal_session(reload: bool) {
         drain(&mut master, &mut output, Duration::from_millis(50));
     }
     quiet(&mut master, &mut output);
-    while seconds() >= 52 {
-        drain(&mut master, &mut output, Duration::from_millis(500));
-    }
     let settled = frames(&frame_log);
     // Fifty wakes of each kind in half a second, written to the live pane: they draw it once at
     // the leading edge and once more for the rest, a second later; never fifty times. A loaded
     // machine can stretch the burst past the spacing, which earns one more draw per spacing.
+    // The pane also draws for reasons of its own while this goes on (the fixture's labels move
+    // at clock edges such as :00 and :30, and work the first frames started can finish late):
+    // the log tells those apart, they are counted apart, and the clock bounds them.
     let burst = Instant::now();
     for _ in 0..50 {
         assert!(csr_engine::companion::wake::notify(
@@ -437,13 +440,20 @@ fn terminal_session(reload: bool) {
         ));
         drain(&mut master, &mut output, Duration::from_millis(10));
     }
-    let burst = burst.elapsed();
+    let sent = burst.elapsed();
     let stretched =
-        (burst.as_secs_f64() / csr_engine::companion::wake::SPACING.as_secs_f64()) as usize;
+        (sent.as_secs_f64() / csr_engine::companion::wake::SPACING.as_secs_f64()) as usize;
+    let since = |log: &std::path::Path, why: &str| {
+        causes(log)
+            .iter()
+            .skip(settled)
+            .filter(|cause| *cause == why)
+            .count()
+    };
     // The first wake's frame, then the frames' count unchanged for longer than the spacing and a
     // slow build together.
     let began = Instant::now();
-    while frames(&frame_log) == settled {
+    while since(&frame_log, "wake") == 0 {
         assert!(
             began.elapsed() < Duration::from_secs(60),
             "100 wakes drew no frame"
@@ -459,13 +469,32 @@ fn terminal_session(reload: bool) {
             changed = Instant::now();
         }
     }
-    let drawn = frames(&frame_log) - settled;
+    let window = burst.elapsed();
+    let woken = since(&frame_log, "wake");
+    let log = || fs::read_to_string(&frame_log);
     assert!(
-        (1..=2 + stretched).contains(&drawn),
-        "100 wakes drew {drawn} frames, want 1 to {} (burst took {:?}, settled at {settled}, log {:?})",
+        (1..=2 + stretched).contains(&woken),
+        "100 wakes drew {woken} frames, want 1 to {} (burst took {:?}, settled at {settled}, log {:?})",
         2 + stretched,
-        burst,
-        fs::read_to_string(&frame_log)
+        sent,
+        log()
+    );
+    // Nothing here presses a key, resizes, folds the map or reloads: a draw the log calls
+    // `pressed` is a wake that went round the debounce.
+    let pressed = since(&frame_log, "pressed");
+    assert_eq!(
+        pressed,
+        0,
+        "{pressed} frames drawn as if a key were pressed (settled at {settled}, log {:?})",
+        log()
+    );
+    // The gate's own draws, at clock edges and when work finishes: the loop paces them to one a
+    // second, so many more than the seconds that passed is a pane redrawing for the wakes.
+    let due = since(&frame_log, "due");
+    assert!(
+        due <= 1 + window.as_secs() as usize,
+        "{due} frames due on the clock in {window:?} (settled at {settled}, log {:?})",
+        log()
     );
     assert!(
         child_guard.0.try_wait().unwrap().is_none(),

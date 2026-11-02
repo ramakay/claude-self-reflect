@@ -227,8 +227,15 @@ pub fn agents_of(paths: &Paths, session: &str) -> Projection {
         .map(|p| read_agents(&p, session))
         .unwrap_or_default()
 }
-pub fn is_active(row: &Agent) -> bool {
-    ["pending", "running", "waiting"].contains(&row.status.as_str())
+/// A waiting row no event has touched for this long is not active: the harness last said it
+/// waited on its own background work and never sent a final update.
+pub const WAITING_STALE: f64 = 2. * 3600.;
+pub fn is_active(row: &Agent, now: f64) -> bool {
+    match row.status.as_str() {
+        "pending" | "running" => true,
+        "waiting" => now - row.last_at / 1000. < WAITING_STALE,
+        _ => false,
+    }
 }
 pub fn stalled(row: &Agent, now: f64) -> bool {
     row.status == "running" && now - row.last_at / 1000. >= 600.
@@ -252,7 +259,7 @@ pub fn recent_completion(agents: &[Agent], now: f64) -> Option<f64> {
         .filter(|t| now - t <= 1800.)
         .max_by(f64::total_cmp)
 }
-pub fn tree(agents: &[Agent]) -> Vec<(&Agent, usize, bool)> {
+pub fn tree(agents: &[Agent], now: f64) -> Vec<(&Agent, usize, bool)> {
     fn visit<'a>(
         row: &'a Agent,
         depth: usize,
@@ -277,8 +284,8 @@ pub fn tree(agents: &[Agent]) -> Vec<(&Agent, usize, bool)> {
     }
     let mut order: Vec<_> = agents.iter().collect();
     order.sort_by(|a, b| {
-        (!is_active(a))
-            .cmp(&(!is_active(b)))
+        (!is_active(a, now))
+            .cmp(&(!is_active(b, now)))
             .then(b.last_at.total_cmp(&a.last_at))
             .then(a.id.cmp(&b.id))
     });
@@ -760,7 +767,7 @@ mod tests {
         b["parent"] = "a".into();
         c["parent"] = "absent".into();
         let projection = check(&doc(vec![a, b, c]), "sess-a");
-        let tree = tree(&projection.agents);
+        let tree = tree(&projection.agents, 1800000000.);
         assert_eq!(tree.len(), 3);
         assert!(tree.iter().any(|(a, d, u)| a.id == "c" && *d == 0 && *u));
         assert_eq!(tree.iter().filter(|(_, d, _)| *d == 1).count(), 1);
@@ -795,6 +802,41 @@ mod tests {
         a.completion.as_mut().unwrap().answer = " Report. ".into();
         assert_eq!(reported(&a), "Report.");
         assert_eq!(recent_completion(&[a], 1800000001.), Some(1800000000.));
+    }
+    #[test]
+    fn test_a_waiting_row_with_no_update_for_two_hours_is_no_longer_active() {
+        let now = 1800000000.;
+        let at = |quiet: f64, status: &str| {
+            let mut raw = row("w1");
+            raw["status"] = status.into();
+            raw["last_at"] = ((now - quiet) as i64 * 1000).into();
+            row_of(&raw).unwrap()
+        };
+        let (h, m) = (3600., 60.);
+        // 1 h 59 m: still active. 2 h exactly: not. Never called stalled either way.
+        assert!(is_active(&at(h + 59. * m, "waiting"), now));
+        assert!(!is_active(&at(2. * h, "waiting"), now));
+        assert!(!is_active(&at(20.6 * h, "waiting"), now));
+        assert!(!stalled(&at(20.6 * h, "waiting"), now));
+        // A fresh update brings it back: the row is judged by its last update, not its age.
+        assert!(is_active(&at(5., "waiting"), now));
+        // Pending and running rows are active however long they have been quiet; the stall
+        // flag for a running row is unchanged.
+        for quiet in [5., 2. * h, 20. * h] {
+            assert!(is_active(&at(quiet, "running"), now));
+            assert!(is_active(&at(quiet, "pending"), now));
+        }
+        assert!(stalled(&at(600., "running"), now) && !stalled(&at(599., "running"), now));
+        for status in ["idle", "completed", "failed", "killed", "unknown"] {
+            assert!(!is_active(&at(5., status), now), "{status}");
+        }
+        // A stale waiting row sorts after a live one.
+        let rows = [at(20.6 * h, "waiting"), {
+            let mut live = at(5., "running");
+            live.id = "r1".into();
+            live
+        }];
+        assert_eq!(tree(&rows, now)[0].0.id, "r1");
     }
     #[test]
     fn test_the_context_envelope_is_exactly_three_lines_with_its_brackets_escaped() {
@@ -936,7 +978,7 @@ mod tests {
                 .len(),
             8
         );
-        assert_eq!(tree(&projection.agents)[0].0.id, "p1");
+        assert_eq!(tree(&projection.agents, 1800000000.)[0].0.id, "p1");
     }
     #[test]
     fn test_handoff_times_the_hooks_write_in_milliseconds_read_as_seconds() {

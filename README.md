@@ -196,6 +196,7 @@ The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew instal
 - **autoCompact:** `off`, `suggest` (default) or `auto`.
 - **`/csr statusline`:** moves your status bar into the pane, and restores it when the pane closes.
 - **Phone layout:** the pane has a layout for a narrow terminal.
+- **Road trial line (maintainers):** a trial spec with `"track": "road"` adds one line to the CSR performance card; off by default, switch on with `CSR_PANE_ROAD=1` or `"road": true` under the `csr-companion` entry of `pluginConfigs` in `~/.claude/settings.json`.
 - **One dreamer per session, crash guard:** a lease stops two dreamers on one session, and a broken edit to the pane does not kill it.
 
 ### Quiet MCP niceties
@@ -429,6 +430,43 @@ Your conversation data (`~/.claude/projects/`) is untouched. The new engine re-i
 | Slow first startup | Normal (the index is rebuilt once; later starts load the saved index, which takes longer for a larger index) |
 
 Full guide: [Documentation](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
+
+</details>
+
+<details>
+<summary><strong>Backups</strong> — what Time Machine skips, and a safe nightly copy of the database</summary>
+
+On macOS, `csr-engine setup` tells Time Machine to skip three folders inside `~/.claude-self-reflect/`: `index-v3/` (the search index, about 2 GB on a long history and rewritten whenever it rebuilds), `models/` (the embedding models) and `cache/`. Self-Reflect can rebuild or re-download all three, and they would otherwise be copied into every hourly backup. The exclusion is per folder and sticky: it needs no sudo and stays on the folder if you re-run setup, which leaves already-skipped folders alone. `CSR_NO_TM_EXCLUDE=1` skips this step. If `tmutil` is missing or fails, setup prints one line and carries on.
+
+The database (`csr-engine.db`, with its `-wal` and `-shm` files) and `mirror/` stay in your backups on purpose. The mirror is the only copy of transcripts Claude Code has deleted, and the database holds your verdicts and notes. Neither can be rebuilt.
+
+The live database changes constantly, so Time Machine copies the whole file on each backup, and a copy taken mid-write can be inconsistent. Time Machine is a fine backup for it. If you also want a dated copy that is consistent while Self-Reflect is running, use SQLite's online backup, which is safe in WAL mode:
+
+```bash
+mkdir -p "$HOME/csr-backups"
+tmutil addexclusion "$HOME/csr-backups"   # Time Machine already copies the live DB; don't copy it twice
+dest="$HOME/csr-backups/csr-engine-$(date +%F).db"
+ok=1
+sqlite3 "$HOME/.claude-self-reflect/csr-engine.db" ".backup '$dest.tmp'" \
+  && [ "$(sqlite3 "$dest.tmp" 'PRAGMA quick_check;')" = ok ] \
+  && mv "$dest.tmp" "$dest" && ok=0
+rm -f "$dest.tmp" "$dest.tmp-wal" "$dest.tmp-shm"   # clear the leftovers of a failed run
+if [ "$ok" = 0 ]; then
+  ls -t "$HOME"/csr-backups/csr-engine-*.db | tail -n +3 | while IFS= read -r f; do rm -f -- "$f"; done
+else
+  echo "csr-engine backup failed; older copies kept" >&2; false
+fi
+```
+
+The copy is written to a temporary name and checked with `PRAGMA quick_check` before it replaces anything. Only a copy that passed is kept, and only then are older copies pruned (the newest two stay), so a failed run never costs you a good copy. A failed run also prints one line to stderr and ends with a non-zero status (there is no `exit`, so it is safe to paste into an interactive shell), which is what cron or launchd needs to tell you the backup did not happen. The `tmutil addexclusion` line keeps the folder out of Time Machine: the database can be many GB, and a fresh copy every night would otherwise be backed up on top of the live file. Run it nightly from cron or launchd. The copies hold your transcripts, so keep them local. Copy the folder to another drive if you want a copy off this disk, and never to a cloud drive or a shared disk.
+
+To undo the exclusion and let Time Machine back a folder up again:
+
+```bash
+tmutil removeexclusion "$HOME/.claude-self-reflect/index-v3"
+```
+
+Do the same for `models` and `cache`. Running `csr-engine setup` again re-applies the exclusion, so set `CSR_NO_TM_EXCLUDE=1` first if you want it to stay off.
 
 </details>
 

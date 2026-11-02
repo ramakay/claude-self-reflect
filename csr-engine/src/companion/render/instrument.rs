@@ -686,7 +686,7 @@ impl Composition {
             self.agents
                 .agents
                 .iter()
-                .filter(|a| agents::is_active(a))
+                .filter(|a| agents::is_active(a, self.now))
                 .map(|a| agents::stalled(a, self.now).to_string()),
         );
         out.extend(agent_lines(self));
@@ -765,6 +765,10 @@ impl Composition {
         for a in self.agents.agents.iter() {
             if a.status == "running" && !agents::stalled(a, now) {
                 due.push(a.last_at / 1000. + 600.);
+            }
+            // A waiting row drops out of the bar once it has been quiet for two hours.
+            if a.status == "waiting" && agents::is_active(a, now) {
+                due.push(a.last_at / 1000. + agents::WAITING_STALE);
             }
             if open.agents {
                 // The label rounds to the nearest minute (`{:.0}m`): it moves at 30 s, 90 s, ...
@@ -1023,7 +1027,7 @@ fn meta(c: &Composition) -> String {
         bits.push(format!("dreamer {b}"));
     }
     if d.handed > 0 {
-        bits.push(format!("{} asked Claude", d.handed));
+        bits.push(format!("{} asked the agent", d.handed));
     }
     if d.carried {
         bits.push("carried".into());
@@ -1301,7 +1305,7 @@ fn scroll_footer(from: usize, shown: usize, total: usize) -> String {
 fn more_line(hidden: usize) -> String {
     format!("+{hidden} more")
 }
-pub(super) const CONFUSED_TITLE: &str = "Confused Claude";
+pub(super) const CONFUSED_TITLE: &str = "What confused the agent";
 pub(super) const SHOULD_BE_TITLE: &str = "Should be a skill / memory / tool";
 /// Every `kind` the dreamer may write on a should-be item, and the label its row carries. Any
 /// other kind reads "tool". The pane contract draws every row of this table.
@@ -1596,7 +1600,7 @@ fn assemble(
     }
     if c.dream.state == Batch::Ready {
         hero.extend(fact_rows(
-            "1 helpful · 2 thought of it · 3 not relevant · 4 ask Claude",
+            "1 helpful · 2 thought of it · 3 not relevant · 4 ask the agent",
             cols,
         ));
     }
@@ -1687,7 +1691,7 @@ fn assemble(
         let reserved = figure_rows
             + 1
             + if show_figure { 0 } else { 7 }
-            + usize::from(c.agents.agents.iter().any(agents::is_active));
+            + usize::from(c.agents.agents.iter().any(|a| agents::is_active(a, c.now)));
         let room = rows.saturating_sub(out.len() + reserved);
         let wanted = details.len().saturating_sub(open.scroll);
         // The note or heading always shows, whatever else is squeezed.
@@ -1703,6 +1707,9 @@ fn assemble(
         }
         for row in card.rows.iter().filter(|r| r.mark == "✗") {
             out.extend(wrap(&format!("{} {}", row.mark, row.text)));
+        }
+        if let Some(road) = &card.road {
+            out.extend(wrap(&format!("{} {}", road.mark, road.text)));
         }
         if let Some(warning) = &card.warning {
             out.extend(wrap(warning));
@@ -1749,7 +1756,7 @@ fn assemble(
         .agents
         .agents
         .iter()
-        .filter(|a| agents::is_active(a))
+        .filter(|a| agents::is_active(a, c.now))
         .collect();
     // Past the pane's last row the tail is cut. An open section must not be what goes: fold the
     // observation cards (a second pass), then give up the rows between them and the open section.
@@ -1837,7 +1844,7 @@ fn starter_questions() -> [(&'static str, &'static str); 8] {
             "Find earlier attempts and the final fix.",
         ),
         (
-            "What did I ask Claude to remember?",
+            "What did I ask the agent to remember?",
             "Look up saved instructions and preferences.",
         ),
         (
@@ -1934,6 +1941,16 @@ fn with_forecast(mut figure: Value, forecast: &Value) -> Value {
             if q["used"].is_number() && window["text"].is_string() {
                 q["forecast"] = window;
             }
+            // An early window has no caption under its circle, but its words still go in the
+            // facts: what the last window peaked at, or that it is too soon to tell.
+            let early = array(&forecast["windows"])
+                .iter()
+                .find(|w| w["code"] == q["code"] && w["early"] == true)
+                .and_then(|w| w["line"].as_str())
+                .map(|l| l.split(" · resets in ").next().unwrap_or(l).to_owned());
+            if let Some(line) = early.filter(|_| q["used"].is_number()) {
+                q["early"] = json!(line);
+            }
         }
     }
     if forecast["windows"].is_array() {
@@ -1947,7 +1964,7 @@ fn with_forecast(mut figure: Value, forecast: &Value) -> Value {
 /// One window's line in the facts: its words, then where it is headed when that is known.
 fn quota_fact(q: &Value) -> String {
     let line = text::paced(q);
-    match q["forecast"]["text"].as_str() {
+    match q["forecast"]["text"].as_str().or(q["early"].as_str()) {
         Some(forecast) => format!("{line} · {forecast}"),
         None => line,
     }
@@ -1961,7 +1978,7 @@ fn agent_name(a: &agents::Agent) -> Option<&str> {
 /// agent (the one stuck longest), in the warning. An agent with no description has no name to
 /// show, and then no dot is drawn either.
 fn agents_bar(agents: &[agents::Agent], now: f64) -> (String, bool) {
-    let active = || agents.iter().filter(|a| agents::is_active(a));
+    let active = || agents.iter().filter(|a| agents::is_active(a, now));
     let stalled: Vec<_> = active().filter(|a| agents::stalled(a, now)).collect();
     let (count, word, shown) = if stalled.is_empty() {
         let newest = active()
@@ -3250,7 +3267,7 @@ pub fn draw(
         };
     let hero_full_h = hero_h;
     let hero_h = if page { 0. } else { hero_full_h };
-    let active = !page && c.agents.agents.iter().any(agents::is_active);
+    let active = !page && c.agents.agents.iter().any(|a| agents::is_active(a, c.now));
     let agents_h = if active {
         P * 2. + theme::BODY_LINE
     } else {
@@ -3408,7 +3425,7 @@ pub fn draw(
     //   3. the lists' rows, down to 3,
     //   4. the lists' rows, down to 1,
     //   5. the API credit row,
-    //   6. "CSR this session" from rings to one line of words,
+    //   6. "Self-Reflect this session" from rings to one line of words,
     //   7. both lists fold into the stack row,
     //   8. the story ("Where the work stands") folds into the stack row,
     //   9. the CSR performance card folds into the stack row,
@@ -3871,7 +3888,7 @@ pub fn draw(
                 "The dreamer asks"
             }
         } else {
-            "CSR's dreamer"
+            "Self-Reflect's dreamer"
         };
         label(
             &mut canvas,
@@ -3999,7 +4016,7 @@ pub fn draw(
                 ("1 ✓ helpful", "helpful"),
                 ("2 \u{e1c2} thought of it", "thought_of_it"),
                 ("3 ✗ not relevant", "not_relevant"),
-                ("4 → ask Claude", "ask_claude"),
+                ("4 → ask the agent", "ask_claude"),
             ] {
                 let w = canvas.text(
                     f,
@@ -4557,7 +4574,7 @@ pub fn draw(
             .agents
             .agents
             .iter()
-            .filter(|a| agents::is_active(a))
+            .filter(|a| agents::is_active(a, c.now))
             .take(10)
         {
             let is_stalled = agents::stalled(a, c.now);
@@ -5448,6 +5465,8 @@ struct SoakPlan {
     /// The check rows drawn, and how many `level` has: fewer drawn ends in a "+N more" row.
     shown: usize,
     total: usize,
+    /// Whether the road line is drawn under the checks.
+    road: bool,
 }
 /// The height of the progress bar under the card's clock line.
 const SOAK_BAR_H: f32 = 6.;
@@ -5467,7 +5486,8 @@ fn soak_plan(
     let clock = level >= 1 && !card.line2.is_empty();
     let total = soak_rows(card, level).count();
     let shown = total.min(max_rows.max(1));
-    let rows = shown + usize::from(card.warning.is_some());
+    let road = level >= 1 && card.road.is_some();
+    let rows = shown + usize::from(card.warning.is_some()) + usize::from(road);
     let h = P
         + theme::TITLE_LINE
         + S2
@@ -5479,6 +5499,7 @@ fn soak_plan(
         }
         + if rows > 0 { S2 } else { 0. }
         + rows as f32 * DASH_ROW
+        + if road { S1 } else { 0. }
         + P;
     SoakPlan {
         head,
@@ -5487,6 +5508,7 @@ fn soak_plan(
         level,
         shown,
         total,
+        road,
     }
 }
 /// The check rows a card shows at `level`: all of them at 2, only the failing ones below.
@@ -5600,7 +5622,7 @@ fn draw_soak(
         }
         at += SOAK_BAR_H;
     }
-    if plan.shown > 0 || card.warning.is_some() {
+    if plan.shown > 0 || card.warning.is_some() || plan.road {
         at += S2;
     }
     let row_st = sans(11., t.regular);
@@ -5637,6 +5659,20 @@ fn draw_soak(
             t.quiet,
             A::L,
         );
+        at += DASH_ROW;
+    }
+    if let Some(road) = card.road.as_ref().filter(|_| plan.road) {
+        // A hairline in the air above, so the road reads as its own track and not as one more check.
+        c.rect(IX, at + S1 / 2., IW, t.hair_width, t.hair);
+        at += S1;
+        let mark = match road.sev.as_str() {
+            "ok" => t.mint,
+            "red" => t.risk,
+            _ => t.quiet,
+        };
+        let base = at + f.cap(row_st);
+        c.text(f, &road.mark, IX, base, sans(11., t.bold), mark, A::L);
+        single(c, f, &road.text, IX + 16., base, IW - 16., 11., t.ink, t);
         at += DASH_ROW;
     }
     if let Some(warning) = &card.warning {
@@ -5684,7 +5720,7 @@ struct DashPlan {
     csr: Vec<CsrRing>,
     /// The most lines any ring's label wraps to.
     csr_label_lines: usize,
-    /// "CSR this session" as one line of words, for a pane too short for its rings.
+    /// "Self-Reflect this session" as one line of words, for a pane too short for its rings.
     csr_compact: bool,
     status: Option<(String, bool)>,
 }
@@ -5698,7 +5734,7 @@ struct FitStep {
     cap: usize,
     /// Keep the API credit row.
     credit: bool,
-    /// "CSR this session" as one line of words instead of rings.
+    /// "Self-Reflect this session" as one line of words instead of rings.
     compact: bool,
     /// The stackable cards folded into the stack row (`FOLD_*` bits).
     fold: u8,
@@ -5737,7 +5773,7 @@ const fn step(
 /// The cards a stack row can hold, in the order it lists them: the bit that folds each, and its
 /// name in the row.
 pub const STACKABLE: [(u8, &str); 4] = [
-    (FOLD_CONFUSED, "Confused Claude"),
+    (FOLD_CONFUSED, "What confused the agent"),
     (FOLD_SHOULD, "Should be"),
     (FOLD_STORY, "Story"),
     (FOLD_PERF, "Performance"),
@@ -5782,7 +5818,7 @@ impl DashPlan {
     }
 }
 
-/// One ring of "CSR this session": the number in it, the words under it, and the fraction of the
+/// One ring of "Self-Reflect this session": the number in it, the words under it, and the fraction of the
 /// ring it fills when that fraction means something. A count has none: it is a full ring.
 #[derive(Clone, Debug)]
 struct CsrRing {
@@ -5790,7 +5826,7 @@ struct CsrRing {
     label: String,
     fill: Option<f64>,
 }
-/// The radius of a "CSR this session" ring, in layout points.
+/// The radius of a "Self-Reflect this session" ring, in layout points.
 const CSR_RING_R: f32 = 24.;
 
 fn dash_sev_ink(sev: &str, t: &Tokens) -> Rgba {
@@ -6022,7 +6058,7 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
 fn dash_heights(p: &DashPlan, full: bool) -> (f32, f32, f32, f32, f32) {
     dash_heights_with(p, full, true, p.csr_compact)
 }
-/// `dash_heights` with the API credit row and the rings of "CSR this session" kept or dropped.
+/// `dash_heights` with the API credit row and the rings of "Self-Reflect this session" kept or dropped.
 fn dash_heights_with(
     p: &DashPlan,
     full: bool,
@@ -6467,7 +6503,7 @@ fn draw_dashboard(
     // D. what CSR did this session: a ring to each measured value, its words under it
     if !p.csr.is_empty() && p.csr_compact {
         let st = sans(11., t.medium);
-        let lead = "CSR this session: ";
+        let lead = "Self-Reflect this session: ";
         let lead_w = f.width(lead, sans(11., t.bold));
         let mut parts: Vec<&str> = p.csr.iter().map(|r| r.label.as_str()).collect();
         while parts.len() > 1 && lead_w + f.width(&parts.join(" · "), st) > IW - 10. {
@@ -6492,7 +6528,7 @@ fn draw_dashboard(
         label(
             c,
             f,
-            "CSR this session",
+            "Self-Reflect this session",
             IX,
             at + f.cap(heading(t)),
             theme::TITLE_SIZE,
@@ -6547,7 +6583,7 @@ fn draw_dashboard(
             });
         }
         dash.csr_row = Some(format!(
-            "CSR this session: {}",
+            "Self-Reflect this session: {}",
             p.csr
                 .iter()
                 .map(|r| r.label.as_str())
@@ -6911,7 +6947,7 @@ pub fn acts(c: &Composition, cols: usize) -> BTreeMap<usize, Value> {
     if c.dream.state == Batch::Ready {
         let send = crate::companion::send::closed_send(
             &format!(
-                "CSR's dreamer asked this while you worked, quoted: “{}” Its reasoning:",
+                "Self-Reflect's dreamer asked this while you worked, quoted: “{}” Its reasoning:",
                 crate::companion::send::straight(string(&c.dream.top["line"]))
             ),
             &format!(
@@ -7438,6 +7474,26 @@ mod tests {
         );
         let waiting = [agent_at("  ", "waiting", live_at)];
         assert_eq!(said(&waiting), "1 running");
+        // The live case of 2026-11-01: two agents "waiting" for 12.9 h and 20.6 h, never
+        // finished, beside the one that runs. Only the running one is counted and named.
+        let ago = |hours: f64| ((now - hours * 3600.) * 1000.) as i64;
+        let beside = [
+            agent_at("Check the relay", "waiting", ago(20.6)),
+            agent_at("Fix load-flaky pane frame tests", "waiting", ago(12.9)),
+            agent_at("Fix load-flaky pane frame tests", "running", live_at),
+        ];
+        assert_eq!(said(&beside), "1 running · Fix load-flaky pane frame tests");
+        assert!(!agents_bar(&beside, now).1, "and nothing is called stalled");
+        // A waiting row is counted until it has been quiet for two hours, then it is not.
+        let edge = |quiet_s: f64| {
+            let rows = [
+                agent_at("Wait on build", "waiting", ((now - quiet_s) * 1000.) as i64),
+                agent_at("Fresh scan", "running", live_at),
+            ];
+            agents_bar(&rows, now).0
+        };
+        assert_eq!(edge(2. * 3600. - 60.), "2 running · Fresh scan");
+        assert_eq!(edge(2. * 3600.), "1 running · Fresh scan");
         // One stalled agent: the warning, naming that agent even when a live one is newer.
         let only = [agent_at("Scan the repo", "running", stalled_at)];
         assert_eq!(said(&only), "1 stalled · Scan the repo");
@@ -7467,6 +7523,26 @@ mod tests {
             agent_at("Stuck", "running", stalled_at),
         ];
         assert_eq!(said(&done), "1 stalled · Stuck");
+    }
+
+    #[test]
+    fn waiting_agents_quiet_for_two_hours_draw_no_agents_bar() {
+        let ago = |hours: f64| ((1_800_000_000. - hours * 3600.) * 1000.) as i64;
+        let region = |rows: Vec<agents::Agent>| {
+            let mut c = quota_composition();
+            c.now = 1_800_000_000.;
+            c.agents.agents = rows;
+            let (_, m) = draw(&c, 1210, 2000, Theme::Dark, Open::default(), false).expect("draws");
+            m.agents_region
+        };
+        // The two rows of the live case: nothing runs, so no bar.
+        assert!(region(vec![
+            agent_at("Fix load-flaky pane frame tests", "waiting", ago(12.9)),
+            agent_at("Check the relay", "waiting", ago(20.6)),
+        ])
+        .is_none());
+        // 1 h 59 m ago it still shows.
+        assert!(region(vec![agent_at("Wait", "waiting", ago(2. - 1. / 60.))]).is_some());
     }
 
     #[test]
@@ -7769,8 +7845,8 @@ mod tests {
             "windows": [
                 {"code":"5H","name":"5 Hour","used":18.,"sev":"ok","tick":46.,"early":false,
                  "blended":false,"line":"On pace for about 46% by reset · resets in 4h 35m"},
-                {"code":"7D","name":"Weekly","used":45.,"sev":"ok","tick":71.,"early":true,
-                 "blended":true,"line":"On pace for about 71% by reset · resets in 2d 20h (early)"},
+                {"code":"7D","name":"Weekly","used":45.,"sev":"ok","tick":null,"early":true,
+                 "blended":false,"line":"Early · last week peaked at 71% · resets in 2d 20h"},
             ],
         });
         c.figure["breakdown"] = json!({
@@ -7813,7 +7889,12 @@ mod tests {
                     let codes: Vec<_> = d.limits.iter().map(|l| l.code.as_str()).collect();
                     assert_eq!(codes, vec!["5H", "7D", "CX"], "{at}");
                     assert!(d.limits[0].line.contains("On pace for about 46% by reset"));
-                    assert!(d.limits[1].line.ends_with("(early)"), "{at}");
+                    assert!(
+                        d.limits[1]
+                            .line
+                            .starts_with("Early · last week peaked at 71%"),
+                        "{at}"
+                    );
                     for l in &d.limits {
                         let (bx, by, bw, bh) = l.bar;
                         assert!(bw > 200. && bh >= 6., "{at}: {l:?}");
@@ -7825,7 +7906,7 @@ mod tests {
                     }
                     // The forecast tick sits where the outlook said, on the bar.
                     assert_eq!(d.limits[0].tick, Some(0.46));
-                    assert_eq!(d.limits[1].tick, Some(0.71));
+                    assert_eq!(d.limits[1].tick, None, "an early window has no tick");
                     assert_eq!(d.limits[2].tick, None, "Codex has no forecast");
                     assert!(
                         d.context_head
@@ -7837,7 +7918,9 @@ mod tests {
                     assert!(d.context_head.as_deref().unwrap().contains("880k free"));
                     let row = d.csr_row.as_deref().expect("a CSR row");
                     assert!(
-                        row.starts_with("CSR this session: 2 compactions · ~851k tokens saved"),
+                        row.starts_with(
+                            "Self-Reflect this session: 2 compactions · ~851k tokens saved"
+                        ),
                         "{at}: {row}"
                     );
                     assert!(row.contains("4 recalls used"), "{at}: {row}");
@@ -7983,12 +8066,10 @@ mod tests {
             m.dash.unwrap().csr_row
         };
         let all = row(&|_| {}).expect("a row");
-        for part in [
-            "2 compactions",
-            "~851k tokens saved",
-            "4 recalls used",
-            "0.4 pts of the weekly limit",
-        ] {
+        // "Self-Reflect this session: " is longer than the "CSR this session: " it replaced, so at the
+        // card's width the last part (the share of the weekly limit) is the one that gives way; it
+        // shows whenever the row has room for it (below).
+        for part in ["2 compactions", "~851k tokens saved", "4 recalls used"] {
             assert!(all.contains(part), "{all}");
         }
         let no_tally = row(&|c| c.tally = Value::Null).unwrap();
@@ -8001,6 +8082,15 @@ mod tests {
         assert!(
             !no_asks.contains("recall") && no_asks.contains("2 compactions"),
             "{no_asks}"
+        );
+        let only_share = row(&|c| {
+            c.tally = Value::Null;
+            c.figure["asks"] = json!(0);
+        })
+        .unwrap();
+        assert!(
+            only_share.contains("0.4 pts of the weekly limit"),
+            "{only_share}"
         );
         let none = row(&|c| {
             c.tally = Value::Null;
@@ -8226,7 +8316,7 @@ mod tests {
                     d.csr_row
                         .as_deref()
                         .unwrap()
-                        .starts_with("CSR this session: 2 compactions"),
+                        .starts_with("Self-Reflect this session: 2 compactions"),
                     "{at}"
                 );
             }
@@ -8267,13 +8357,13 @@ mod tests {
             }
             let counts = f.width("5 \u{b7} o opens", sans(theme::CAPTION_SIZE, t.regular));
             for title in [
-                "CSR's dreamer",
+                "Self-Reflect's dreamer",
                 "The dreamer asks \u{b7} asked while you were away",
                 CONFUSED_TITLE,
                 SHOULD_BE_TITLE,
                 "Where the work stands",
                 "CSR performance",
-                "CSR this session",
+                "Self-Reflect this session",
                 "Context",
             ] {
                 let w = 14. + ICON_GAP + f.width(title, st);
@@ -8316,6 +8406,7 @@ mod tests {
                 .collect(),
             warning: None,
             next_change: None,
+            road: None,
         }
     }
 
@@ -8442,6 +8533,36 @@ mod tests {
             m.soak_region.is_some(),
             "unreadable data is a card that says so, never a hole"
         );
+    }
+
+    #[test]
+    fn the_road_line_adds_one_row_and_a_short_pane_keeps_the_card_without_it() {
+        let height = |card: crate::companion::live_eval::Card, h: u32| {
+            let mut c = dash_composition("ok");
+            c.soak = Some(card);
+            let (_, m) = draw(&c, 704, h, Theme::Dark, Open::default(), false).unwrap();
+            m.soak_region.expect("the card stays").1
+        };
+        let mut with = soak_card(5);
+        with.road = Some(crate::companion::live_eval::Row {
+            mark: "\u{2026}".into(),
+            sev: "quiet".into(),
+            text: "Road to blind 4.5 stars \u{b7} 3 of 7 \u{b7} next: Recap judge: recaps worse"
+                .into(),
+        });
+        let (plain, road) = (height(soak_card(5), 1800), height(with.clone(), 1800));
+        assert!(road > plain, "{road} vs {plain}");
+        assert!(height(with, 900) >= 80., "the card stays on a short pane");
+        let mut c = dash_composition("ok");
+        let mut card = soak_card(5);
+        card.road = Some(crate::companion::live_eval::Row {
+            mark: "\u{2026}".into(),
+            sev: "quiet".into(),
+            text: "Road to blind 4.5 stars \u{b7} 3 of 7 \u{b7} next: Recap judge".into(),
+        });
+        c.soak = Some(card);
+        let text = text_rows(&c, 80, 40, Open::default()).join("\n");
+        assert!(text.contains("next: Recap judge"), "{text}");
     }
 
     #[test]
@@ -9637,5 +9758,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_an_early_window_keeps_its_words_in_the_facts() {
+        let figure = json!({"quotas": [
+            {"code": "5H", "used": 2., "text": "5H 2%"},
+            {"code": "7D", "used": 1., "text": "7D 1%"},
+        ]});
+        let forecast = json!({
+            "quota": {"5H": {"text": "→ ~30% at reset", "out": false}},
+            "windows": [
+                {"code": "5H", "early": false, "line": "On pace for about 30% by reset · resets in 3h"},
+                {"code": "7D", "early": true, "line": "Early · last week peaked at 93% · resets in 6d 21h"},
+            ],
+        });
+        let got = with_forecast(figure, &forecast);
+        let q = array(&got["quotas"]);
+        // The early week has no circle caption, only its words, without the reset tail.
+        assert!(q[1]["forecast"].is_null(), "{got}");
+        assert_eq!(quota_fact(&q[1]), "7D 1% · Early · last week peaked at 93%");
+        // A window past its early stretch keeps its caption and gets no early words.
+        assert!(q[0]["early"].is_null(), "{got}");
+        assert_eq!(quota_fact(&q[0]), "5H 2% · → ~30% at reset");
     }
 }

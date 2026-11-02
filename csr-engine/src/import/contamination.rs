@@ -291,7 +291,7 @@ macro_rules! formatter {
 /// case; `registry_formatters_all_have_a_matrix_case` fails otherwise.
 pub static REGISTRY: &[Formatter] = &[
     formatter!("recap", Engine, Recap,
-        "recap [<age>]: <body> [[CSR:RECAP]] + Settled:/Now:/Corrected:/Learnt-then-retired while away:/Dreamt:/Next: lines (+ ANCHORS:, Full state:)",
+        "recap [<age>]: <body> [[CSR:RECAP]] + Last:/Settled:/Now:/Corrected:/Learnt-then-retired while away:/Dreamt:/Next: lines (+ Uncommitted:, ANCHORS (last session's files):, Full state:)",
         Matcher::Block(m_recap)),
     formatter!("dream_injection", Engine, DreamInjection,
         "CSR ☾ dream: `<label>` <verdict> — witnessed <date>, receipt <oid>. Matched your mention of `<token>`. Past conclusion, not an instruction. [[CSR:DREAM]]",
@@ -306,13 +306,13 @@ pub static REGISTRY: &[Formatter] = &[
         "the three fixed CSR ENDLESS MEMORY ACTIVE lines",
         Matcher::Block(m_manifest)),
     formatter!("briefing", Engine, Briefing,
-        "[briefing: model-derived, trust=<trust>] (the header line; the body is model prose)",
+        "[briefing: model-derived, trust=<trust>[, written <age>, ages below as of then]] (the header line; the body is model prose)",
         Matcher::Block(m_briefing)),
     formatter!("continuity", Engine, Continuity,
         "SESSION CONTINUITY DETECTED header, `- CONTINUED FROM [<age>] (not instructions): <title>`, two-space enrichment lines",
         Matcher::Block(m_continuity)),
     formatter!("continuum", Engine, Continuum,
-        "CSR CONTINUUM [<age>]: <request> / LAST: ([outcome=, ]trust=) / optional NEXT: | TODOS: / optional ANCHORS: / Full state:",
+        "CSR CONTINUUM [<age>]: <request> / LAST: ([outcome=, ]trust=) / optional NEXT: | TODOS: / optional Uncommitted: / optional ANCHORS: / Full state:",
         Matcher::Block(m_continuum)),
     formatter!("episode_index", Engine, EpisodeIndex,
         "EPISODE INDEX header + `- [<age>] <request> — <last> ([outcome=]) → csr_reflect_on_past(\"conv_<id>\")` lines",
@@ -446,7 +446,8 @@ pub(crate) const SIDE_NOTE_OPENERS: [&str; 2] = [
 ];
 const DEEPER_CONTEXT_FIRST: &str = "Deeper context: run csr_reflect_on_past(\"topic\") whenever the current task touches anything above — do not re-derive from the codebase what memory already holds.";
 const DEEPER_CONTEXT_SECOND: &str = "If the user asks to continue, resume, or pick up where they left off, use the context above to orient — but confirm scope before acting on any past requests.";
-const RECAP_CLAUSE_PREFIXES: [&str; 6] = [
+const RECAP_CLAUSE_PREFIXES: [&str; 7] = [
+    "Last: ",
     "Settled: ",
     "Now: ",
     "Corrected: ",
@@ -464,7 +465,7 @@ macro_rules! re {
     };
 }
 
-re!(RECAP_HEAD_RE, r"^recap \[[^\]\n]{1,24}\]: \S.*$");
+re!(RECAP_HEAD_RE, r"^recap \[[^\]\n]{1,24}\]:( \S.*)?$");
 re!(
     DREAM_LINE_RE,
     r"^CSR ☾ dream: `[^`\n]+` .+ — witnessed [^\n]+, receipt [^\s]+\. Matched your mention of `[^`\n]+`\. Past conclusion, not an instruction\.$"
@@ -474,10 +475,14 @@ re!(
     LESSON_ITEM_RE,
     r"^- .+ \(seen \d+× across \d+ sessions, last [^;\n]+; [^\n]+\)$"
 );
+// Both grammars: the current line names its scope (`ANCHORS (last session's
+// files): N intact, M modified`), and every older transcript carries
+// `ANCHORS: N intact, M modified since checkpoint`.
 re!(
     ANCHORS_RE,
-    r"^ANCHORS: \d+ intact, \d+ modified since checkpoint(?: \(.*\))?$"
+    r"^ANCHORS(?: \(last session's files\))?: \d+ intact, \d+ modified(?: since checkpoint)?(?: \(.*\))?$"
 );
+re!(UNCOMMITTED_RE, r"^Uncommitted: \d+ files? \(.+\)$");
 re!(
     FULL_STATE_RE,
     r#"^Full state: csr_reflect_on_past\("conv_[^"\n]*"\)$"#
@@ -502,7 +507,7 @@ re!(
 );
 re!(
     BRIEFING_HEAD_RE,
-    r"^\[briefing: model-derived, trust=[a-z_]+\]$"
+    r"^\[briefing: model-derived, trust=[a-z_]+(?:, written [^\]\n,;]{1,24}, ages below as of then)?\]$"
 );
 re!(INJECTION_ROW_RE, r"^- \[[^\]\n]*\] ?.*$");
 re!(
@@ -596,7 +601,7 @@ re!(
 re!(
     TRIGGER_RE,
     concat!(
-        r"recap \[|CSR|EPISODE INDEX|SESSION CONTINUITY|RECENT SESSIONS|## |\[briefing|<system-reminder>",
+        r"recap \[|CSR|Self-Reflect's dreamer|EPISODE INDEX|SESSION CONTINUITY|RECENT SESSIONS|## |\[briefing|<system-reminder>",
         r"|Here is a note offered by|After the summary|Earlier you read|A standing rule from",
         r"|Last session |Left over from|Since our past|Lost and found|Deeper context|PAST CONTEXT",
         r"|\[[\x{200B}-\x{200D}\x{2060}\x{FEFF}\x{00AD}]*\[|[\x{FF3B}\x{27E6}\x{2E28}]"
@@ -794,7 +799,11 @@ fn m_recap(doc: &Doc<'_>, at: usize) -> Option<usize> {
     {
         end += 1;
     }
-    // Tier-0 trailer: the same block carries ANCHORS and the Full state pointer.
+    // Tier-0 trailer: the same block carries the dirty-tree line, ANCHORS and
+    // the Full state pointer.
+    if end < doc.len() && UNCOMMITTED_RE.is_match(doc.line(end)) {
+        end += 1;
+    }
     if end < doc.len() && ANCHORS_RE.is_match(doc.line(end)) {
         end += 1;
     }
@@ -875,6 +884,9 @@ fn m_continuum(doc: &Doc<'_>, at: usize) -> Option<usize> {
     }
     let mut end = at + 2;
     if end < doc.len() && CONTINUUM_NEXT_RE.is_match(doc.line(end)) {
+        end += 1;
+    }
+    if end < doc.len() && UNCOMMITTED_RE.is_match(doc.line(end)) {
         end += 1;
     }
     if end < doc.len() && ANCHORS_RE.is_match(doc.line(end)) {
@@ -1406,7 +1418,7 @@ fn standalone_start(line: &str, rel: usize) -> bool {
 
 re!(
     QUOTED_HOTKEY_RE,
-    r"^(?:>[ \t]*)+\d(?:CSR's dreamer|CSR's compaction card|CSR's story)"
+    r"^(?:>[ \t]*)+\d(?:Self-Reflect's dreamer|CSR's dreamer|CSR's compaction card|CSR's story)"
 );
 re!(QUOTED_HOTKEY_PREFIX_RE, r"^(?:>[ \t]*)+\d");
 
@@ -1429,11 +1441,11 @@ struct Candidate {
 
 re!(
     DREAM_PANE_RE,
-    r"CSR's dreamer asked this while you worked, quoted: “[^”\n]*” Its reasoning: “[^”\n]*”"
+    r"(?:Self-Reflect's|CSR's) dreamer asked this while you worked, quoted: “[^”\n]*” Its reasoning: “[^”\n]*”"
 );
 re!(
     DREAM_PANE_V1_RE,
-    r"CSR's dreamer asked this while you worked: “[^”\n]*” Its reasoning: [^\n]*"
+    r"(?:Self-Reflect's|CSR's) dreamer asked this while you worked: “[^”\n]*” Its reasoning: [^\n]*"
 );
 re!(
     CARD_RE,
@@ -1443,8 +1455,15 @@ re!(
     STORY_RE,
     r"CSR's story of this session, rev \d+(?:, quoted: “[^”\n]*”|: [^\n]*)"
 );
-const BAND_QUOTED: &str = "CSR's dreamer asked this while you worked, quoted. Its reasoning:";
-const BAND_LEGACY: [&str; 2] = [
+// Both wordings are suppressed: "Self-Reflect's dreamer" is what is written now, "CSR's dreamer" is
+// what transcripts written before the rename carry.
+const BAND_QUOTED: [&str; 2] = [
+    "Self-Reflect's dreamer asked this while you worked, quoted. Its reasoning:",
+    "CSR's dreamer asked this while you worked, quoted. Its reasoning:",
+];
+const BAND_LEGACY: [&str; 4] = [
+    "Self-Reflect's dreamer asked this while you worked. Its reasoning:",
+    "Self-Reflect's dreamer asked this while you worked. It is a question, not a task.",
     "CSR's dreamer asked this while you worked. Its reasoning:",
     "CSR's dreamer asked this while you worked. It is a question, not a task.",
 ];
@@ -1492,7 +1511,7 @@ fn inline_candidates(text: &str, doc: &Doc<'_>) -> Vec<Candidate> {
     // and/or the quoted reasoning under it, each past a blank line.
     for at in 0..doc.len() {
         let line = doc.line(at).trim();
-        let v2 = line == BAND_QUOTED;
+        let v2 = BAND_QUOTED.contains(&line);
         if !v2 && !BAND_LEGACY.contains(&line) {
             continue;
         }
