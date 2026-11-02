@@ -1140,36 +1140,6 @@ impl Daemon {
                         }
                     }
 
-                    // Meta-gated one-shot: deletes CSR's own search results
-                    // that Codex code mode stored as history before the
-                    // importer knew its `exec` tool. A no-op meta lookup after.
-                    let Some(purge_permit) =
-                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
-                            .await
-                    else {
-                        return;
-                    };
-                    let purge_storage = storage.clone();
-                    let purge_result = tokio::task::spawn_blocking(move || {
-                        let _permit = purge_permit;
-                        crate::import::codex_rollout::purge_codex_csr_exec_output(&purge_storage)
-                    })
-                    .await;
-                    match purge_result {
-                        Ok(Ok(stats)) if stats.already_applied => {}
-                        Ok(Ok(stats)) => tracing::info!(
-                            chunks_deleted = stats.chunks_deleted,
-                            conversations = stats.conversations,
-                            "Codex code-mode CSR output purge completed"
-                        ),
-                        Ok(Err(error)) => {
-                            tracing::warn!(%error, "Codex code-mode CSR output purge failed")
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "Codex code-mode CSR output purge panicked")
-                        }
-                    }
-
                     for _ in 0..180 {
                         if shutdown.load(Ordering::SeqCst) {
                             return;
@@ -1355,6 +1325,50 @@ impl Daemon {
                     wait_secs = harness_strip_next_wait_secs(
                         result.as_ref().ok().and_then(|inner| inner.as_ref().ok()),
                     );
+
+                    // Same idle-gated cadence: re-import conversations that
+                    // hold CSR results Codex code mode stored as history.
+                    let Some(leak_permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
+                            .await
+                    else {
+                        return;
+                    };
+                    let leak_engine = engine.clone();
+                    let leak_shutdown = shutdown.clone();
+                    let leak_result = tokio::task::spawn_blocking(move || {
+                        let _permit = leak_permit;
+                        crate::import::codex_rollout::csr_exec_leak_reimport_batch(
+                            &leak_engine,
+                            crate::import::codex_rollout::CSR_EXEC_REIMPORT_BATCH,
+                            leak_shutdown.as_ref(),
+                        )
+                    })
+                    .await;
+                    match leak_result {
+                        Ok(Ok(stats)) if stats.already_applied => {}
+                        Ok(Ok(stats)) => {
+                            tracing::info!(
+                                reimported = stats.reimported,
+                                failed = stats.failed,
+                                vanished = stats.vanished,
+                                remaining = stats.remaining,
+                                conversations_leaked = stats.conversations_leaked,
+                                conversations_missing_file = stats.conversations_missing_file,
+                                done = stats.done,
+                                "Codex CSR-leak reimport batch completed"
+                            );
+                            if !stats.done {
+                                wait_secs = HARNESS_STRIP_DRAIN_POLL_SECS;
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "Codex CSR-leak reimport batch failed")
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "Codex CSR-leak reimport batch panicked")
+                        }
+                    }
                     match &result {
                         Ok(Ok(_)) => {}
                         Ok(Err(error)) => {

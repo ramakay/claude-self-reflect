@@ -131,23 +131,6 @@ pub async fn handle(
                 Err(e) => eprintln!("  Warning: Codex timestamp backfill failed: {e}"),
             }
 
-            // One-time, meta-guarded: delete CSR's own search results that
-            // Codex code mode stored as history (see the purge's doc).
-            let purge_storage = eng.storage().clone();
-            match tokio::task::spawn_blocking(move || {
-                crate::import::codex_rollout::purge_codex_csr_exec_output(&purge_storage)
-            })
-            .await
-            {
-                Ok(Ok(stats)) if !stats.already_applied => eprintln!(
-                    "  Removed {} stored Codex chunks of CSR's own search results from {} conversations",
-                    stats.chunks_deleted, stats.conversations,
-                ),
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => eprintln!("  Warning: Codex CSR output purge failed: {e}"),
-                Err(e) => eprintln!("  Warning: Codex CSR output purge failed: {e}"),
-            }
-
             // One-time, meta-guarded backfill for rollouts imported before the
             // harness-marker-stripping adapter fix: invalidate their stored
             // mtime so the `import_changed_rollouts` pass just above (this

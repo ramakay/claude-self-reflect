@@ -1398,93 +1398,186 @@ pub fn backfill_codex_subagent_sidechain(
     Ok(stats)
 }
 
-/// Meta key guarding [`purge_codex_csr_exec_output`]. Its value is the JSON
-/// receipt of the pass that ran.
-pub const CSR_EXEC_OUTPUT_PURGE_META_KEY: &str = "codex_csr_exec_output_purge_v1";
+/// Meta key written when [`csr_exec_leak_reimport_batch`] has finished. Its
+/// value is the JSON receipt.
+pub const CSR_EXEC_REIMPORT_META_KEY: &str = "codex_csr_exec_reimport_v1";
+
+/// The frozen work list of [`csr_exec_leak_reimport_batch`].
+pub const CSR_EXEC_REIMPORT_PENDING_META_KEY: &str = "codex_csr_exec_reimport_v1_pending";
+
+/// Conversations the daemon re-imports per tick for the CSR-leak repair.
+pub const CSR_EXEC_REIMPORT_BATCH: usize = 8;
 
 /// How a stored code-mode `exec` result opens: the chunker stores the output
 /// array as JSON, so the newline is the two characters `\n`.
 const CODE_MODE_RESULT_OPENING: &str = r#"[{"text":"Script completed\n"#;
 
 /// CSR's search result banner, raw and as an escaped JSON string.
-const CSR_RESULT_BANNERS: [&str; 2] = ["🎯 RESULTS: ", r"🎯 RESULTS: "];
+const CSR_RESULT_BANNER: &str = "\u{1F3AF} RESULTS: ";
+const CSR_RESULT_BANNER_ESCAPED: &str = concat!("\\", "ud83c", "\\", "udfaf RESULTS: ");
 
-/// What Codex's shell tool prints: a chunk holding it is a mixed script.
-const SHELL_OUTPUT_MARK: &str = "Process exited with code";
+/// The frozen work list: rollout files still on disk whose stored chunks hold
+/// a code-mode CSR result, plus what could not be repaired.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CsrExecReimportPending {
+    pub files: Vec<String>,
+    pub conversations_leaked: usize,
+    pub conversations_missing_file: usize,
+    #[serde(default)]
+    pub reimported: usize,
+    #[serde(default)]
+    pub failed: usize,
+}
 
-/// Receipt for [`purge_codex_csr_exec_output`].
+/// Receipt for one [`csr_exec_leak_reimport_batch`] call.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct CsrExecOutputPurgeStats {
-    pub chunks_deleted: usize,
-    pub conversations: usize,
+pub struct CsrExecReimportStats {
+    pub reimported: usize,
+    pub failed: usize,
+    pub vanished: usize,
+    pub remaining: usize,
+    pub conversations_leaked: usize,
+    pub conversations_missing_file: usize,
+    pub done: bool,
     pub already_applied: bool,
 }
 
-/// One-time, meta-guarded repair for CSR results that Codex code mode put in
-/// stored history before [`crate::import::is_csr_tool_use`] knew `exec`.
-///
-/// Re-import cannot do this: Codex deletes most rollout files, and the stored
-/// call chunk keeps only `[exec]`, not the script. So the repair reads the
-/// stored output and deletes a chunk only when all of these hold:
-/// - a `codex_rollout` chunk of one message that is all tool output;
-/// - it opens as a code-mode `exec` result;
-/// - it carries CSR's search result banner;
-/// - it has no shell output, the mark of a script that also ran a command.
-///
-/// Anything else is left as it is: a long result's continuation chunks, file
-/// reads that quote CSR's banner, and mixed scripts. The delete is the normal
-/// `delete_chunk` path, so FTS triggers and index sync remove the rest.
-pub fn purge_codex_csr_exec_output(storage: &Storage) -> Result<CsrExecOutputPurgeStats> {
-    if storage.get_meta(CSR_EXEC_OUTPUT_PURGE_META_KEY)?.is_some() {
-        return Ok(CsrExecOutputPurgeStats {
-            already_applied: true,
-            ..CsrExecOutputPurgeStats::default()
-        });
-    }
-    let rows: Vec<(String, String)> = storage.with_connection(|conn| {
+/// `codex_rollout` conversations whose stored chunks hold a code-mode `exec`
+/// result carrying CSR's search banner, with their rollout file paths.
+fn csr_exec_leaked_conversations(storage: &Storage) -> Result<Vec<(String, String)>> {
+    storage.with_connection(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id FROM chunks
-             WHERE source = 'codex_rollout'
-               AND conversation_id LIKE 'codex:%'
-               AND message_count = 1
-               AND COALESCE(tool_result_share, 0) >= 0.999
-               AND substr(content, 1, length(?1)) = ?1
-               AND (instr(content, ?2) > 0 OR instr(content, ?3) > 0)
-               AND instr(content, ?4) = 0",
+            "SELECT DISTINCT i.file_path, c.conversation_id
+             FROM chunks c JOIN import_state i ON i.conversation_id = c.conversation_id
+             WHERE c.source = 'codex_rollout'
+               AND c.conversation_id LIKE 'codex:%'
+               AND substr(c.content, 1, length(?1)) = ?1
+               AND (instr(c.content, ?2) > 0 OR instr(c.content, ?3) > 0)
+             ORDER BY c.conversation_id",
         )?;
         let rows = stmt
             .query_map(
                 rusqlite::params![
                     CODE_MODE_RESULT_OPENING,
-                    CSR_RESULT_BANNERS[0],
-                    CSR_RESULT_BANNERS[1],
-                    SHELL_OUTPUT_MARK
+                    CSR_RESULT_BANNER,
+                    CSR_RESULT_BANNER_ESCAPED
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
-    })?;
+    })
+}
 
-    let mut conversations = std::collections::HashSet::new();
-    for (chunk_id, conversation_id) in &rows {
-        storage.delete_chunk(chunk_id)?;
-        conversations.insert(conversation_id.as_str());
+/// Repair for CSR results that Codex code mode put in stored history before
+/// [`crate::import::is_csr_tool_use`] knew `exec`: re-import each affected
+/// conversation through the fixed importer, a bounded batch per call.
+///
+/// Re-import is the only repair with proof. The stored call chunk keeps only
+/// `[exec]`, not the script, and one result spans several chunks, so stored
+/// text cannot show whether a script also ran another tool. The fixed
+/// importer reads the script itself and drops only CSR-only scripts. A
+/// conversation whose rollout file is gone (Codex deletes most of them) is
+/// counted in `conversations_missing_file` and left as it is: nothing is
+/// deleted without proof that it is CSR's.
+///
+/// The work list is computed once, by the first call, and frozen in meta.
+/// Only the daemon calls this, so the importer that wrote the list's rows
+/// has already been replaced by the fixed binary. Writes
+/// [`CSR_EXEC_REIMPORT_META_KEY`] when the list is empty.
+pub fn csr_exec_leak_reimport_batch(
+    engine: &Engine,
+    batch_size: usize,
+    shutdown: &AtomicBool,
+) -> Result<CsrExecReimportStats> {
+    anyhow::ensure!(
+        batch_size > 0,
+        "CSR-leak reimport batch size must be positive"
+    );
+    let storage = engine.storage();
+    if storage.get_meta(CSR_EXEC_REIMPORT_META_KEY)?.is_some() {
+        return Ok(CsrExecReimportStats {
+            already_applied: true,
+            ..CsrExecReimportStats::default()
+        });
     }
-    let stats = CsrExecOutputPurgeStats {
-        chunks_deleted: rows.len(),
-        conversations: conversations.len(),
-        already_applied: false,
+
+    let mut pending = match storage
+        .get_meta(CSR_EXEC_REIMPORT_PENDING_META_KEY)?
+        .and_then(|raw| serde_json::from_str::<CsrExecReimportPending>(&raw).ok())
+    {
+        Some(pending) => pending,
+        None => {
+            let leaked = csr_exec_leaked_conversations(storage)?;
+            let mut pending = CsrExecReimportPending {
+                conversations_leaked: leaked.len(),
+                ..CsrExecReimportPending::default()
+            };
+            for (file_path, _) in leaked {
+                if Path::new(&file_path).exists() {
+                    pending.files.push(file_path);
+                } else {
+                    pending.conversations_missing_file += 1;
+                }
+            }
+            pending
+        }
     };
-    storage.set_meta(
-        CSR_EXEC_OUTPUT_PURGE_META_KEY,
-        &serde_json::json!({
-            "at": chrono::Utc::now().to_rfc3339(),
-            "chunks_deleted": stats.chunks_deleted,
-            "conversations": stats.conversations,
-        })
-        .to_string(),
-    )?;
+
+    let mut stats = CsrExecReimportStats {
+        conversations_leaked: pending.conversations_leaked,
+        conversations_missing_file: pending.conversations_missing_file,
+        ..CsrExecReimportStats::default()
+    };
+    let mut processed = 0;
+    for file_path in pending.files.iter().take(batch_size) {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        processed += 1;
+        let path = PathBuf::from(file_path);
+        let Some(mtime) = file_mtime(&path) else {
+            stats.vanished += 1;
+            continue;
+        };
+        let file = RolloutFile { path, mtime };
+        match import_rollout_with_retries(engine, &file) {
+            Ok(Some(_)) => stats.reimported += 1,
+            Ok(None) => stats.vanished += 1,
+            Err(error) => {
+                stats.failed += 1;
+                tracing::warn!(
+                    file = %file.path.display(),
+                    %error,
+                    "codex CSR-leak reimport failed"
+                );
+            }
+        }
+    }
+    pending.files.drain(..processed);
+    pending.reimported += stats.reimported;
+    pending.failed += stats.failed;
+    stats.remaining = pending.files.len();
+
+    if pending.files.is_empty() {
+        storage.set_meta(
+            CSR_EXEC_REIMPORT_META_KEY,
+            &serde_json::json!({
+                "at": chrono::Utc::now().to_rfc3339(),
+                "conversations_leaked": pending.conversations_leaked,
+                "conversations_missing_file": pending.conversations_missing_file,
+                "reimported": pending.reimported,
+                "failed": pending.failed,
+            })
+            .to_string(),
+        )?;
+        stats.done = true;
+    } else {
+        storage.set_meta(
+            CSR_EXEC_REIMPORT_PENDING_META_KEY,
+            &serde_json::to_string(&pending)?,
+        )?;
+    }
     Ok(stats)
 }
 
@@ -3090,106 +3183,119 @@ mod tests {
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
     }
 
-    /// The repair deletes only stored code-mode CSR results, once.
+    /// The CSR-leak repair re-imports leaked conversations whose file is on
+    /// disk, in bounded batches, and leaves a conversation whose file is gone.
     #[test]
-    fn the_csr_exec_output_purge_deletes_only_pure_code_mode_csr_results_once() {
-        let storage = Storage::open_memory().unwrap();
-        let wrapper = r#"[{"text":"Script completed\nWall time 1.5 seconds\nOutput:\n","type":"input_text"},{"text":"#;
-        let insert = |id: &str, conversation: &str, source: &str, content: String, share: f64| {
-            let chunk = ConversationChunk {
-                id: id.to_string(),
-                conversation_id: conversation.to_string(),
-                project_name: "p".to_string(),
-                timestamp: "2026-10-31T12:00:00Z".to_string(),
-                content,
-                message_count: 1,
-                summary: None,
-                author: crate::provenance::Speaker::ToolResult,
-                seq: 0,
-                is_sidechain: false,
-            };
-            let mut embedding = vec![0.0_f32; 384];
-            embedding[0] = 1.0;
-            storage
-                .insert_chunk_with_source(&chunk, &embedding, source)
-                .unwrap();
-            storage
-                .with_connection(|conn| {
-                    conn.execute(
-                        "UPDATE chunks SET tool_result_share = ?2 WHERE id = ?1",
-                        rusqlite::params![id, share],
-                    )?;
-                    Ok(())
-                })
-                .unwrap();
+    fn the_csr_leak_reimport_repairs_files_on_disk_and_leaves_gone_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let rollout = |n: usize| {
+            let line = |value: serde_json::Value| value.to_string();
+            [
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:00Z","type":"session_meta","payload":{"id":format!("leak-{n}"),"timestamp":"2026-10-31T12:00:00Z","cwd":"/workspace/leak"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:01Z","type":"response_item","payload":{"type":"message","id":"u1","role":"user","content":[{"type":"input_text","text":"why did we drop Qdrant?"}]}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t1","call_id":"csr-exec","name":"exec","input":"const r=await tools.mcp__claude_self_reflect__csr_reflect_on_past({query:\"q\"});text(r);"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o1","call_id":"csr-exec","output":[{"type":"input_text","text":"Script completed\nWall time 1.5 seconds\nOutput:\n"},{"type":"input_text","text":"\u{1F3AF} RESULTS: 3 matches LEAKED RESULT"}]}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:04Z","type":"response_item","payload":{"type":"message","id":"a1","role":"assistant","content":[{"type":"output_text","text":"We dropped Qdrant for one binary."}]}})),
+            ]
+            .join("\n")
         };
-        let csr = |banner: &str| format!("{wrapper}\"{banner}3 matches (top score: 0.480)\"}}]");
-        insert("raw", "codex:a", "codex_rollout", csr("🎯 RESULTS: "), 1.0);
-        insert(
-            "escaped",
-            "codex:a",
-            "codex_rollout",
-            csr(r"🎯 RESULTS: "),
-            1.0,
-        );
-        insert(
-            "batched",
-            "codex:b",
-            "codex_rollout",
-            csr("{\\\"i\\\":0,\\\"status\\\":\\\"fulfilled\\\",\\\"value\\\":🎯 RESULTS: "),
-            1.0,
-        );
-        // Kept: a mixed script, a continuation chunk, prose quoting the banner,
-        // a Claude transcript, and a chunk that is partly prose.
-        insert(
-            "mixed",
-            "codex:c",
-            "codex_rollout",
-            format!("{wrapper}\"🎯 RESULTS: 1 matches\\nProcess exited with code 0\"}}]"),
-            1.0,
-        );
-        insert(
-            "continuation",
-            "codex:c",
-            "codex_rollout",
-            "rest of a long result 🎯 RESULTS: 2 matches".to_string(),
-            1.0,
-        );
-        insert("claude", "conv-1", "conversation", csr("🎯 RESULTS: "), 1.0);
-        insert(
-            "partial",
-            "codex:d",
-            "codex_rollout",
-            csr("🎯 RESULTS: "),
-            0.5,
+        for n in 0..4 {
+            std::fs::write(root.path().join(format!("rollout-{n}.jsonl")), rollout(n)).unwrap();
+        }
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+        assert_eq!(
+            import_changed_rollouts(&engine, root.path())
+                .unwrap()
+                .files_imported,
+            4
         );
 
-        let stats = purge_codex_csr_exec_output(&storage).unwrap();
-        assert_eq!(stats.chunks_deleted, 3, "{stats:?}");
-        assert_eq!(stats.conversations, 2, "{stats:?}");
-        let left: Vec<String> = storage
+        // What an importer without the `exec` check stored: the result chunk.
+        let conversations: Vec<String> = storage
             .with_connection(|conn| {
-                let mut stmt = conn.prepare("SELECT id FROM chunks ORDER BY id")?;
+                let mut stmt = conn.prepare(
+                    "SELECT conversation_id FROM import_state WHERE conversation_id LIKE 'codex:%' ORDER BY file_path",
+                )?;
                 let ids = stmt
                     .query_map([], |row| row.get(0))?
                     .collect::<rusqlite::Result<Vec<String>>>()?;
                 Ok(ids)
             })
             .unwrap();
-        assert_eq!(left, ["claude", "continuation", "mixed", "partial"]);
+        assert_eq!(conversations.len(), 4);
+        for (n, conversation_id) in conversations.iter().enumerate() {
+            let chunk = ConversationChunk {
+                id: format!("leaked-{n}"),
+                conversation_id: conversation_id.clone(),
+                project_name: "leak".to_string(),
+                timestamp: "2026-10-31T12:00:03Z".to_string(),
+                content: "[{\"text\":\"Script completed\\nWall time 1.5 seconds\\nOutput:\\n\",\"type\":\"input_text\"},{\"text\":\"\u{1F3AF} RESULTS: 3 matches LEAKED RESULT\",\"type\":\"input_text\"}]".to_string(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::ToolResult,
+                seq: 99,
+                is_sidechain: false,
+            };
+            let mut embedding = vec![0.0_f32; 384];
+            embedding[0] = 1.0;
+            storage
+                .insert_chunk_with_source(&chunk, &embedding, "codex_rollout")
+                .unwrap();
+        }
+        std::fs::remove_file(root.path().join("rollout-3.jsonl")).unwrap();
+
+        let shutdown = AtomicBool::new(false);
+        let first = csr_exec_leak_reimport_batch(&engine, 2, &shutdown).unwrap();
+        assert_eq!(first.conversations_leaked, 4, "{first:?}");
+        assert_eq!(first.conversations_missing_file, 1, "{first:?}");
+        assert_eq!(first.reimported, 2, "{first:?}");
+        assert_eq!(first.remaining, 1, "{first:?}");
+        assert!(!first.done);
+        let second = csr_exec_leak_reimport_batch(&engine, 10, &shutdown).unwrap();
+        assert_eq!(second.reimported, 1, "{second:?}");
+        assert!(second.done, "{second:?}");
         let receipt: serde_json::Value = serde_json::from_str(
             &storage
-                .get_meta(CSR_EXEC_OUTPUT_PURGE_META_KEY)
+                .get_meta(CSR_EXEC_REIMPORT_META_KEY)
                 .unwrap()
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(receipt["chunks_deleted"], 3);
+        assert_eq!(receipt["reimported"], 3);
+        assert_eq!(receipt["conversations_missing_file"], 1);
+        assert!(
+            csr_exec_leak_reimport_batch(&engine, 10, &shutdown)
+                .unwrap()
+                .already_applied
+        );
 
-        insert("late", "codex:e", "codex_rollout", csr("🎯 RESULTS: "), 1.0);
-        let again = purge_codex_csr_exec_output(&storage).unwrap();
-        assert!(again.already_applied);
-        assert_eq!(again.chunks_deleted, 0);
+        let leaked_left = |conversation_id: &str| -> i64 {
+            storage
+                .with_connection(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT COUNT(*) FROM chunks WHERE conversation_id = ?1 AND content LIKE '%LEAKED RESULT%'",
+                        rusqlite::params![conversation_id],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        for conversation_id in &conversations[..3] {
+            assert_eq!(leaked_left(conversation_id), 0, "{conversation_id}");
+            let prose: i64 = storage
+                .with_connection(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT COUNT(*) FROM chunks WHERE conversation_id = ?1 AND content LIKE '%dropped Qdrant for one binary%'",
+                        rusqlite::params![conversation_id],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(prose, 1, "{conversation_id}");
+        }
+        // The file is gone, so nothing proves the stored text is CSR's: kept.
+        assert_eq!(leaked_left(&conversations[3]), 1);
     }
 
     #[test]

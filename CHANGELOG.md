@@ -21,10 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   versioned binary. Never fails setup. `csr-engine setup --codex-only` runs this step alone;
   `CSR_NO_CODEX_MCP=1` skips it.
 - **CSR's own results no longer come back as Codex history.** Codex code mode calls tools inside one `exec` script, so the
-  importer's by-name check missed CSR calls and stored their results. An `exec` script whose every `tools.*` call is a CSR
-  tool is now suppressed, call and output; a script that also runs another tool is kept. A one-time repair (daemon and
-  setup, meta key `codex_csr_exec_output_purge_v1`) deletes already-stored chunks that are a code-mode CSR search result
-  and nothing else; mixed scripts, continuation chunks and quotes stay.
+  importer's by-name check missed CSR calls and stored their results. An `exec` script whose every use of `tools` is a direct
+  `tools.mcp__claude_self_reflect__*(` call is now suppressed, call and output; any other use (another tool, an alias,
+  `tools?.`, `tools[...]`, a string mention) keeps the whole output. The daemon re-imports, in idle-gated batches of 8, each
+  stored conversation that holds a code-mode CSR result and whose rollout file still exists (meta key
+  `codex_csr_exec_reimport_v1`). A conversation whose file is gone is counted and left as it is: the stored call keeps
+  only `[exec]`, so nothing proves which results are CSR's.
 
 **Already shipped in 9.5.1-9.5.8, carried here, not new:** 92acc3bd, cdd23033, c46702aa, f0cf3a83, 56dddc3a,
 71457f3c, 31d78e5b, d6b9c454, 46e14f16, 962f8e03, 6e3a08b1, aededb4a (replaced by 76e390d6), cecddb48, c7e4e285,

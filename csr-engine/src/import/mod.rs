@@ -1965,27 +1965,31 @@ pub(crate) fn drops_as_marker_only(msg: &serde_json::Value, combined_text: &str)
 /// Codex code mode runs every tool call inside one script tool of this name.
 const CODEX_CODE_MODE_TOOL: &str = "exec";
 
-/// A tool reference in a Codex code-mode script: `tools.<name>` (group 1) or a
-/// computed `tools[...]` lookup (no group).
-static CODE_MODE_TOOL_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\btools\s*(?:\.\s*([A-Za-z_$][A-Za-z0-9_$]*)|\[)")
-        .expect("code-mode tool reference regex")
+/// Every use of the code-mode `tools` object in a script.
+static CODE_MODE_TOOLS_WORD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\btools\b").expect("code-mode tools word regex"));
+
+/// A direct CSR call, anchored at a `tools` use.
+static CODE_MODE_CSR_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\Atools\s*\.\s*mcp__claude_self_reflect__[A-Za-z0-9_]+\s*\(")
+        .expect("code-mode CSR call regex")
 });
 
 /// Whether a Codex code-mode script calls CSR tools and nothing else.
 ///
-/// A whitelist that abstains: one other tool, or one computed `tools[...]`
-/// lookup, keeps the whole output, because the output of a mixed script also
-/// holds that other tool's result and dropping it would lose real work.
+/// A whitelist that abstains: every use of `tools` must be a direct
+/// `tools.mcp__claude_self_reflect__<name>(` call. Any other use (another
+/// tool, an alias such as `const t = tools`, `tools?.`, a computed
+/// `tools[...]`, a mention in a string) keeps the whole output. The output of
+/// a mixed script also holds the other tool's result, and dropping it would
+/// lose real work; a missed CSR-only script only leaks, as before this check.
 fn code_mode_script_calls_only_csr(script: &str) -> bool {
     let mut calls_csr = false;
-    for reference in CODE_MODE_TOOL_REF_RE.captures_iter(script) {
-        match reference.get(1) {
-            Some(name) if name.as_str().starts_with("mcp__claude_self_reflect__") => {
-                calls_csr = true;
-            }
-            _ => return false,
+    for word in CODE_MODE_TOOLS_WORD_RE.find_iter(script) {
+        if !CODE_MODE_CSR_CALL_RE.is_match(&script[word.start()..]) {
+            return false;
         }
+        calls_csr = true;
     }
     calls_csr
 }
@@ -2079,6 +2083,21 @@ mod tests {
         // A computed lookup could be any tool: abstain.
         assert!(!is_csr(
             r#"text(await tools["mcp__claude_self_reflect__csr_why"]({target:"x"}));"#
+        ));
+        // An alias can hide another tool: abstain, so the diff is kept.
+        assert!(!is_csr(
+            r#"const t=tools; text(await tools.mcp__claude_self_reflect__csr_why({target:"x"})); text(await t.exec_command({cmd:"git diff"}));"#
+        ));
+        // Abstain also on a CSR-only alias or optional call: a leak, never a loss.
+        assert!(!is_csr(
+            r#"const t=tools; text(await t.mcp__claude_self_reflect__csr_why({target:"x"}));"#
+        ));
+        assert!(!is_csr(
+            r#"text(await tools?.mcp__claude_self_reflect__csr_why({target:"x"}));"#
+        ));
+        // A mention in a string is not a call.
+        assert!(!is_csr(
+            r#"text("tools.mcp__claude_self_reflect__csr_why");"#
         ));
         // Tool discovery calls nothing; other servers and look-alike names are not CSR.
         assert!(!is_csr(
