@@ -66,6 +66,8 @@ impl Call {
 pub type Detached = Box<dyn FnOnce(Arc<dyn Host>) -> BoxFuture<()> + Send>;
 
 #[async_trait]
+// async_trait marks each boxed-future method `#[must_use]`; clippy 1.99 flags that as doubled.
+#[allow(clippy::double_must_use)]
 pub trait Host: Send + Sync {
     /// Several calls in one round trip. The outer error means the conversation is gone (dropped,
     /// timed out); each inner one is what Claude Code answered for that call.

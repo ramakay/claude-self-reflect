@@ -30,6 +30,8 @@ const STEP_LIMIT: Duration = Duration::from_secs(2);
 const LEASES: &str = "dreamer-lease";
 
 #[async_trait]
+// async_trait marks each boxed-future method `#[must_use]`; clippy 1.99 flags that as doubled.
+#[allow(clippy::double_must_use)]
 pub trait Outside: Send + Sync {
     /// One lease step for `session`: whether this copy holds the lease afterwards (`lease`).
     async fn lease(&self, session: &str, step: Step, busy: bool, now: f64) -> bool;

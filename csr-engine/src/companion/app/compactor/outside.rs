@@ -39,6 +39,8 @@ const PANE_LIMIT: Duration = Duration::from_secs(20);
 const GIT_LIMIT: Duration = Duration::from_secs(2);
 
 #[async_trait]
+// async_trait marks each boxed-future method `#[must_use]`; clippy 1.99 flags that as doubled.
+#[allow(clippy::double_must_use)]
 pub trait Outside: Send + Sync {
     /// The removed `pane.py --compact-plan --sid SID --ctx CTX`: the plan as JSON; none when it
     /// gave no answer.
