@@ -72,10 +72,9 @@ pub struct SearchEngine {
     /// manifest (safe only when `manifest_backed`) or must describe that
     /// side from memory (required when not: carrying forward a stale
     /// on-disk count for a side with zero DB rows would publish a manifest
-    /// permanently describing an empty side as non-empty, which
-    /// `load_from_disk`'s negative-drift check would then always reject,
-    /// forcing a full rebuild on every single startup). See `dump_to_disk`'s
-    /// doc comment for the full reasoning.
+    /// permanently describing an empty side as non-empty; when negative drift
+    /// still forced a rebuild, that meant a full rebuild on every single
+    /// startup). See `dump_to_disk`'s doc comment for the full reasoning.
     manifest_backed: bool,
 }
 
@@ -220,6 +219,31 @@ impl SearchEngine {
         }
     }
 
+    /// Blank chunk IDs in the map that are not present in the given DB ID set.
+    /// This is the chunk counterpart of [`Self::blank_orphan_reflections`], used
+    /// by `Engine::new` when a loaded cache holds ids the DB has since deleted.
+    /// Returns the number of entries blanked. Marks the chunk side dirty if any
+    /// were removed.
+    pub fn blank_orphan_chunks(&mut self, db_ids: &std::collections::HashSet<&str>) -> usize {
+        let mut blanked = 0;
+        for entry in &mut self.chunk_id_map {
+            if !entry.is_empty() && !db_ids.contains(entry.as_str()) {
+                self.chunk_id_set.remove(entry.as_str());
+                *entry = String::new();
+                blanked += 1;
+            }
+        }
+        if blanked > 0 {
+            self.chunk_dirty = true;
+        }
+        blanked
+    }
+
+    /// Number of live (non-blanked) chunk ids in the index.
+    pub fn live_chunk_count(&self) -> usize {
+        self.chunk_id_set.len()
+    }
+
     /// Check if a reflection ID exists in the index (non-blanked).
     pub fn has_reflection(&self, id: &str) -> bool {
         self.reflection_id_set.contains(id)
@@ -259,10 +283,9 @@ impl SearchEngine {
             return Vec::new();
         }
         // O(1): chunk_id_set holds exactly the live (non-blanked) ids — kept in
-        // sync by insert_chunk/remove_chunk and rebuilt from the non-empty
-        // entries of the loaded manifest on `load_from_disk`. There is no
-        // orphan-blanking pass for chunks (unlike reflections), so this stays
-        // accurate without a dedicated counter.
+        // sync by insert_chunk/remove_chunk/blank_orphan_chunks and rebuilt from
+        // the non-empty entries of the loaded manifest on `load_from_disk`, so
+        // this stays accurate without a dedicated counter.
         let dead = self
             .chunk_id_map
             .len()
@@ -533,9 +556,9 @@ impl SearchEngine {
     /// empty side instead of publishing the true (zero) count from memory,
     /// the manifest would permanently overstate that side; the next
     /// `load_from_disk` would then always see `expected_reflections (0) <
-    /// manifest.reflection_embeddings_expected (stale, nonzero)`, take the
-    /// negative-drift branch, return `None`, and force a full HNSW rebuild —
-    /// on every single startup, forever. So a rebuilt (non-manifest-backed)
+    /// manifest.reflection_embeddings_expected (stale, nonzero)`: negative
+    /// drift on every single startup, forever (which, before negative drift
+    /// was reconciled by id, forced a full HNSW rebuild each time). So a rebuilt (non-manifest-backed)
     /// engine always describes both sides from memory, dumped or not — see
     /// `manifest_only_carries_forward_on_a_manifest_backed_engine`.
     pub fn dump_to_disk(
@@ -747,39 +770,31 @@ impl SearchEngine {
             return None;
         }
 
-        // Staleness is asymmetric. Chunks and reflections normally only grow, so an
-        // ADDITIVE drift (db > cached) is cheap to reconcile: Engine::new loads this
-        // cache and incrementally inserts the few new rows (~ms) instead of rebuilding
-        // the whole HNSW (~tens of seconds). This avoids cache thrash when several
-        // csr-engine processes import transcripts concurrently.
+        // Drift in either direction is reconciled by the caller, never by a rebuild
+        // here. Engine::new compares the live DB ids against the loaded id maps on
+        // every cache load: it backfills ids the cache lacks (ADDITIVE drift,
+        // db > cached, the common case when processes import concurrently) and
+        // blanks ids the DB no longer has (NEGATIVE drift, db < cached).
         //
-        // A NEGATIVE drift (db < cached) means rows were deleted, so the cache holds
-        // orphan vectors — fall back to a full rebuild for correctness.
-        if expected_chunks < manifest.chunk_embeddings_expected {
-            tracing::info!(
-                cached = manifest.chunk_embeddings_expected,
-                db = expected_chunks,
-                "index cache stale (chunks removed) — rebuilding"
-            );
-            return None;
-        }
-        if expected_reflections < manifest.reflection_embeddings_expected {
-            tracing::info!(
-                cached = manifest.reflection_embeddings_expected,
-                db = expected_reflections,
-                "index cache stale (reflections removed) — rebuilding"
-            );
-            return None;
-        }
-        if expected_chunks > manifest.chunk_embeddings_expected
-            || expected_reflections > manifest.reflection_embeddings_expected
+        // Negative drift used to return None and force a synchronous full rebuild.
+        // That is minutes of CPU on a large corpus, and it is not rare: plan
+        // reimport commits its delete before it re-embeds, reflection supersession
+        // deletes the older layer, and a manifest's counts are read from the DB
+        // independently of the id maps it serializes, so a concurrent
+        // insert-then-delete can leave a manifest one row ahead of the DB. Every
+        // hook that started inside such a window rebuilt the whole corpus, each
+        // far past Claude Code's 60s hook timeout, and the storm lasted until an
+        // unrelated insert happened to rebalance the count (upstream fixed the
+        // same stall on the 10.1 line in c95b344b).
+        if expected_chunks != manifest.chunk_embeddings_expected
+            || expected_reflections != manifest.reflection_embeddings_expected
         {
             tracing::info!(
                 cached_chunks = manifest.chunk_embeddings_expected,
                 db_chunks = expected_chunks,
                 cached_reflections = manifest.reflection_embeddings_expected,
                 db_reflections = expected_reflections,
-                "index cache behind DB — loading + incremental backfill"
+                "index cache drifted from DB: loading + reconciling by id"
             );
         }
 
@@ -1690,7 +1705,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_allows_additive_drift_rebuilds_on_deletion() {
+    fn test_load_accepts_drift_in_both_directions() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         std::fs::write(dir.join("index.lock"), "").unwrap();
@@ -1709,14 +1724,19 @@ mod tests {
             SearchEngine::load_from_disk(dir, 8, 3).is_some(),
             "additive drift must load the cache, not rebuild"
         );
-        // Negative drift (rows deleted) → None so the caller does a clean full rebuild.
+        // Negative drift (rows deleted, or a manifest count captured while another
+        // process was between an insert and a delete) → still loads. Engine::new
+        // blanks the orphan ids against the live DB. Returning None here sent
+        // every process that started inside the drift window into a full
+        // corpus rebuild: minutes of CPU each, far past Claude Code's 60s hook
+        // timeout, and none of them ever finished to publish a fresh manifest.
         assert!(
-            SearchEngine::load_from_disk(dir, 4, 1).is_none(),
-            "chunk deletion must force a rebuild"
+            SearchEngine::load_from_disk(dir, 4, 1).is_some(),
+            "chunk deletion must load the cache, not rebuild"
         );
         assert!(
-            SearchEngine::load_from_disk(dir, 5, 0).is_none(),
-            "reflection deletion must force a rebuild"
+            SearchEngine::load_from_disk(dir, 5, 0).is_some(),
+            "reflection deletion must load the cache, not rebuild"
         );
     }
 

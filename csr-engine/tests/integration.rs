@@ -1285,9 +1285,13 @@ fn test_hnsw_stale_index_detection() {
         "additive drift should load the cache (backfill), not rebuild"
     );
 
-    // DB shrank (rows deleted) — must reject so the rebuild drops orphan vectors.
+    // DB shrank (rows deleted): still loads. Engine::new blanks the orphan ids
+    // against the live DB instead of rebuilding the whole corpus.
     let result = SearchEngine::load_from_disk(&index_dir, 5, 0);
-    assert!(result.is_none(), "deletion should reject the stale cache");
+    assert!(
+        result.is_some(),
+        "deletion should load the cache for orphan reconciliation, not rebuild"
+    );
 
     // Exact match should work
     let result = SearchEngine::load_from_disk(&index_dir, 10, 0);
