@@ -138,15 +138,33 @@ impl Engine {
             // memory O(batch) rather than O(corpus).
             if let Ok(db_chunk_ids) = storage.load_all_chunk_ids() {
                 let missing: Vec<String> = db_chunk_ids
-                    .into_iter()
+                    .iter()
                     .filter(|id| !search.has_chunk(id))
+                    .cloned()
                     .collect();
+                let mut chunks_added = 0usize;
                 if !missing.is_empty() {
                     if let Ok(added) = backfill_missing_chunks(&storage, &mut search, &missing) {
                         if added > 0 {
                             tracing::info!(added, "backfilled missing chunks into HNSW cache");
                         }
+                        chunks_added = added;
                         backfill_added += added;
+                    }
+                }
+                // Blank chunks the DB has deleted since the last dump (negative
+                // drift; `load_from_disk` no longer rebuilds for it). After the
+                // backfill, the DB ids live in the index number
+                // `db - missing + added`, so a larger live count means the cache
+                // holds orphans. The O(1) gate keeps the common no-orphan load
+                // from building a corpus-sized id set on every hook.
+                let db_ids_live = db_chunk_ids.len() - missing.len() + chunks_added;
+                if search.live_chunk_count() > db_ids_live {
+                    let db_id_set: std::collections::HashSet<&str> =
+                        db_chunk_ids.iter().map(|s| s.as_str()).collect();
+                    let blanked = search.blank_orphan_chunks(&db_id_set);
+                    if blanked > 0 {
+                        tracing::info!(blanked, "blanked orphan chunk entries in HNSW cache");
                     }
                 }
             }
@@ -759,5 +777,103 @@ mod tests {
         for i in 0..3 {
             assert!(search.has_reflection(&format!("refl-{i}")));
         }
+    }
+
+    fn insert_test_chunk_in(storage: &Storage, id: &str, conversation_id: &str) {
+        storage
+            .insert_chunk(
+                &ConversationChunk {
+                    id: id.into(),
+                    conversation_id: conversation_id.into(),
+                    project_name: "proj".into(),
+                    timestamp: "2026-09-08T00:00:00Z".into(),
+                    content: "x".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &[0.1_f32; 384],
+            )
+            .unwrap();
+    }
+
+    /// The DB can hold fewer rows than the published manifest describes: plan
+    /// reimport deletes before it re-embeds, reflection supersession deletes the
+    /// old layer, and a manifest's counts are captured independently of the
+    /// in-memory id maps, so a concurrent insert-then-delete can land between
+    /// them. Every process that constructed an engine inside that window used to
+    /// rebuild the whole corpus (805k vectors on a real install: minutes of CPU
+    /// per hook, 20+ stacked hooks, none finishing). It must instead reuse the
+    /// cache and blank the vanished ids.
+    #[tokio::test]
+    async fn negative_drift_reuses_cache_and_blanks_orphans_instead_of_rebuilding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let index_dir = tmp.path().join("index");
+
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..10 {
+                insert_test_chunk_in(&storage, &format!("keep-{i}"), "conv-keep");
+            }
+            for i in 0..2 {
+                insert_test_chunk_in(&storage, &format!("gone-{i}"), "plan:gone");
+            }
+            for i in 0..3 {
+                storage
+                    .insert_reflection(&format!("refl-{i}"), "content", &[], &[0.2_f32; 384])
+                    .unwrap();
+            }
+        }
+
+        // No cache yet: the first construction builds one and publishes it.
+        drop(Engine::new(&db_path, &projects_dir).unwrap());
+        let manifest_before = std::fs::read(index_dir.join("manifest.json"))
+            .expect("first Engine::new must publish a manifest");
+
+        // Rows vanish after the manifest was published.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            storage.delete_chunks_for_conversation("plan:gone").unwrap();
+            storage.delete_reflection("refl-0").unwrap();
+        }
+
+        let eng = Engine::new(&db_path, &projects_dir).unwrap();
+
+        // Receipt that the cache was reused: the rebuild path always publishes
+        // a new manifest (new generation basename, new created_at).
+        let manifest_after = std::fs::read(index_dir.join("manifest.json")).unwrap();
+        assert!(
+            manifest_before == manifest_after,
+            "negative drift must reuse the published cache, not rebuild and republish it"
+        );
+
+        let search = eng.search.read().await;
+        for i in 0..2 {
+            assert!(
+                !search.has_chunk(&format!("gone-{i}")),
+                "a chunk deleted from the DB must be blanked on load"
+            );
+        }
+        for i in 0..10 {
+            assert!(search.has_chunk(&format!("keep-{i}")));
+        }
+        assert!(
+            !search.has_reflection("refl-0"),
+            "a reflection deleted from the DB must be blanked on load"
+        );
+        assert!(search.has_reflection("refl-1") && search.has_reflection("refl-2"));
+        assert_eq!(search.reflection_count(), 2);
+
+        let hits = search.search_chunks(&[0.1_f32; 384], 20, 0.0);
+        assert!(
+            hits.iter().all(|h| !h.id.starts_with("gone-")),
+            "blanked chunks must never be returned by search"
+        );
+        assert_eq!(hits.len(), 10, "every live chunk is still returned");
     }
 }
