@@ -62,6 +62,8 @@ pub struct Ran {
 
 /// What the pane needs from outside this process.
 #[async_trait]
+// async_trait marks each boxed-future method `#[must_use]`; clippy 1.99 flags that as doubled.
+#[allow(clippy::double_must_use)]
 pub trait Outside: Send + Sync {
     /// The pane's `--json` data for `cwd` and the session; none when it could not be read in time.
     async fn shifts(&self, cwd: &str, sid: &str) -> Option<Value>;

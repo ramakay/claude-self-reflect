@@ -45,6 +45,8 @@ const STOPWORDS: &[&str] = &[
 /// Where the probe sends a query. Production runs the real recall pipeline
 /// (`mcp::tools`); tests may substitute canned pages.
 #[async_trait::async_trait]
+// async_trait marks each boxed-future method `#[must_use]`; clippy 1.99 flags that as doubled.
+#[allow(clippy::double_must_use)]
 pub trait ProbeBackend: Send + Sync {
     /// The conversation ids of the final result page, in result order.
     async fn final_page(&self, query: &str) -> Result<Vec<String>>;
