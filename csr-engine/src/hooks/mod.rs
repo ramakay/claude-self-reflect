@@ -52,6 +52,76 @@ pub struct HookInput {
 
 /// Read and parse JSON from stdin. Returns a default HookInput if stdin is empty or invalid.
 /// Guards against hanging when invoked from a terminal (S-4 fix).
+/// Claude Code's default hook timeout. The installer sets an explicit timeout
+/// only for session-briefing; every other CSR hook runs under this default.
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 60;
+/// Timeout the installer writes for the async session-briefing hook.
+pub const SESSION_BRIEFING_TIMEOUT_SECS: u64 = 150;
+/// post-tool-use is async; installs that set its timeout explicitly use 120s.
+const POST_TOOL_USE_TIMEOUT_SECS: u64 = 120;
+/// The detached session-end child (see main.rs) is never waited on by Claude
+/// Code and imports the whole transcript, so it gets a longer bound.
+const DETACHED_SESSION_END_DEADLINE_SECS: u64 = 300;
+/// A hook stops itself this long before Claude Code would give up on it.
+const DEADLINE_MARGIN_SECS: u64 = 5;
+
+/// How long a hook process may run before it exits on its own.
+///
+/// Claude Code discards a hook's output when its timeout passes, but it can
+/// leave the process running. A hook that is slow for a systemic reason (a
+/// saturated machine, a cache rebuild) then keeps running while every new
+/// prompt and tool call starts another one: on 2026-11-02, 23 hooks stacked up
+/// for 16 minutes at load average 158. The deadline turns any such cause into
+/// one bounded exit per hook.
+///
+/// `env_override` is `CSR_HOOK_DEADLINE_SECS`: a positive integer replaces the
+/// table, `0` disables the deadline, anything else is ignored.
+pub fn hook_deadline(
+    name: &str,
+    detached: bool,
+    env_override: Option<&str>,
+) -> Option<std::time::Duration> {
+    if let Some(secs) = env_override.and_then(|raw| raw.trim().parse::<u64>().ok()) {
+        return (secs > 0).then(|| std::time::Duration::from_secs(secs));
+    }
+    let secs = match name {
+        "session-end" if detached => DETACHED_SESSION_END_DEADLINE_SECS,
+        "session-briefing" => SESSION_BRIEFING_TIMEOUT_SECS - DEADLINE_MARGIN_SECS,
+        "post-tool-use" => POST_TOOL_USE_TIMEOUT_SECS - DEADLINE_MARGIN_SECS,
+        _ => DEFAULT_HOOK_TIMEOUT_SECS - DEADLINE_MARGIN_SECS,
+    };
+    Some(std::time::Duration::from_secs(secs))
+}
+
+/// Start the deadline for this hook process: a background thread that records
+/// the overrun in hook-timing.log and exits the process with code 1, which
+/// Claude Code treats as a non-blocking hook error (never 2, which blocks).
+///
+/// Exiting at any point is safe for the on-disk state: SQLite rolls back an
+/// open transaction, HNSW generations are written under new names, and the
+/// manifest is published by an atomic rename, so the worst leftover is a stray
+/// temporary file that the next dump's cleanup removes.
+pub fn arm_hook_deadline(name: &str) {
+    let detached = std::env::var("CSR_HOOK_DETACHED").as_deref() == Ok("1");
+    let env_override = std::env::var("CSR_HOOK_DEADLINE_SECS").ok();
+    let Some(deadline) = hook_deadline(name, detached, env_override.as_deref()) else {
+        return;
+    };
+    let name = name.to_string();
+    let _ = std::thread::Builder::new()
+        .name("csr-hook-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(deadline);
+            let line = format!(
+                "CSR hook {name}: exceeded {}s deadline, exiting",
+                deadline.as_secs()
+            );
+            crate::telemetry::append_timing_line(&line);
+            eprintln!("{line} (see ~/.claude-self-reflect/hook-timing.log)");
+            std::process::exit(1);
+        });
+}
+
 pub fn read_stdin_json() -> HookInput {
     use std::io::IsTerminal;
 
@@ -649,6 +719,56 @@ mod tests {
         assert!(
             closed.into_inner().is_empty(),
             "a successful diversion must not close the saved descriptor"
+        );
+    }
+
+    #[test]
+    fn hook_deadline_stays_under_each_hooks_claude_code_timeout() {
+        use std::time::Duration;
+        let secs = |name, detached| hook_deadline(name, detached, None).unwrap();
+
+        for blocking in [
+            "prompt-submit",
+            "stop",
+            "session-start",
+            "precompact",
+            "session-end",
+        ] {
+            assert_eq!(secs(blocking, false), Duration::from_secs(55), "{blocking}");
+        }
+        assert_eq!(secs("session-briefing", false), Duration::from_secs(145));
+        assert!(
+            secs("session-briefing", false) < Duration::from_secs(SESSION_BRIEFING_TIMEOUT_SECS),
+            "briefing deadline must stay under the timeout the installer writes"
+        );
+        assert_eq!(secs("post-tool-use", false), Duration::from_secs(115));
+        // The detached session-end child is never waited on and imports the
+        // whole transcript; the non-detached parent returns immediately.
+        assert_eq!(secs("session-end", true), Duration::from_secs(300));
+        // Unknown names get the default bound, never none.
+        assert_eq!(secs("some-future-hook", false), Duration::from_secs(55));
+    }
+
+    #[test]
+    fn hook_deadline_env_override() {
+        use std::time::Duration;
+        assert_eq!(
+            hook_deadline("stop", false, Some("7")),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            hook_deadline("stop", false, Some(" 7 ")),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            hook_deadline("stop", false, Some("0")),
+            None,
+            "0 disables the deadline"
+        );
+        assert_eq!(
+            hook_deadline("stop", false, Some("soon")),
+            Some(Duration::from_secs(55)),
+            "an unparseable override falls back to the table"
         );
     }
 

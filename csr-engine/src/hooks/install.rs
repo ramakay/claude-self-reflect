@@ -69,7 +69,7 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
                         "type": "command",
                         "command": format!("{} hook session-briefing", binary_path),
                         "async": true,
-                        "timeout": 150,
+                        "timeout": super::SESSION_BRIEFING_TIMEOUT_SECS,
                         "statusMessage": "CSR generating session briefing (async)..."
                     }]
                 }

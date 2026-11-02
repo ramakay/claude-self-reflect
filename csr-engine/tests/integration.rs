@@ -1824,6 +1824,90 @@ mod codegraph_roundtrip {
     }
 }
 
+// ─── Hook deadline: a hook process never outlives its Claude Code timeout ───
+
+/// Claude Code discards a hook's output when its timeout passes but can leave
+/// the process running. On 2026-11-02 that let 23 hooks stack up for 16 minutes,
+/// each rebuilding the HNSW index. A hook must stop itself at its deadline.
+/// The stdin pipe is held open and never written, so the hook blocks reading it:
+/// without a deadline this process would run until the test kills it.
+#[test]
+fn test_hook_exits_at_its_deadline_instead_of_running_on() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let home = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        .args(["hook", "prompt-submit"])
+        .env("HOME", home.path())
+        .env("CSR_HOOK_DEADLINE_SECS", "2")
+        .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+        .env_remove("CSR_HOOK_DETACHED")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let held_stdin = child.stdin.take();
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if started.elapsed() > Duration::from_secs(20) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let elapsed = started.elapsed();
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("hook was still running {elapsed:?} after start with a 2s deadline");
+    }
+    drop(held_stdin);
+    let status = status.unwrap();
+
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "deadline fired early: {elapsed:?}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a deadline exit must be a non-blocking hook error (1), never 2, which blocks Claude Code"
+    );
+    let log = std::fs::read_to_string(home.path().join(".claude-self-reflect/hook-timing.log"))
+        .unwrap_or_default();
+    assert!(
+        log.contains("CSR hook prompt-submit: exceeded 2s deadline"),
+        "the deadline exit must be recorded in hook-timing.log, got: {log}"
+    );
+
+    // A hook that finishes on its own is untouched by the deadline: normal exit 0.
+    let mut quick = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        .args(["hook", "prompt-submit"])
+        .env("HOME", home.path())
+        .env("CSR_HOOK_DEADLINE_SECS", "30")
+        .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+        .env_remove("CSR_HOOK_DETACHED")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    quick.stdin.take().unwrap().write_all(b"{}").unwrap();
+    let quick_started = Instant::now();
+    let quick_status = quick.wait().unwrap();
+    assert!(
+        quick_started.elapsed() < Duration::from_secs(20),
+        "a normal hook must finish well inside its deadline"
+    );
+    assert_eq!(quick_status.code(), Some(0), "a normal hook exits 0");
+}
+
 // ─── `csr-engine --version`: the one probe an installer may run ───
 
 /// The npm postinstall and install.sh decide whether an already present binary
