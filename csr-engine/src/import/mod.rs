@@ -1969,14 +1969,25 @@ const CODEX_CODE_MODE_TOOL: &str = "exec";
 /// anchored at the start of what is left of the script. Two forms:
 /// `text(await tools.mcp__claude_self_reflect__<name>({...}));` and
 /// `const r = await tools.mcp__claude_self_reflect__<name>({...}); text(r);`.
-/// The argument is a flat object with no parentheses, braces, backticks or
-/// semicolons, so it can hold no call and no second statement.
+/// The argument is a flat object of literal values only: a quoted string
+/// with no backslash, a number, `true`, `false` or `null`. No expression can
+/// appear in it, so it can run nothing and rebind nothing.
 static CODE_MODE_CSR_STATEMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(concat!(
-        r"\A\s*(?:",
-        r"text\(\s*await\s+tools\s*\.\s*mcp__claude_self_reflect__[A-Za-z0-9_]+\(\s*(?:\{[^(){}`;]*\})?\s*\)\s*\)",
-        r"|(?:const|let|var)\s+(?P<bound>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*await\s+tools\s*\.\s*mcp__claude_self_reflect__[A-Za-z0-9_]+\(\s*(?:\{[^(){}`;]*\})?\s*\)\s*;\s*text\(\s*(?P<used>[A-Za-z_][A-Za-z0-9_]*)\s*\)",
-        r")[ \t]*(?:;|\r?\n|\z)",
+    const KEY: &str = r#"(?:[A-Za-z_][A-Za-z0-9_]*|"[^"\\\n]*"|'[^'\\\n]*')"#;
+    const VALUE: &str = r#"(?:"[^"\\\n]*"|'[^'\\\n]*'|-?[0-9]+(?:\.[0-9]+)?|true|false|null)"#;
+    let pair = format!(r"{KEY}\s*:\s*{VALUE}");
+    let args = format!(r"\{{\s*(?:{pair}\s*(?:,\s*{pair}\s*)*,?\s*)?\}}");
+    let call = format!(
+        r"await\s+tools\s*\.\s*mcp__claude_self_reflect__[A-Za-z0-9_]+\(\s*(?:{args})?\s*\)"
+    );
+    Regex::new(&format!(
+        concat!(
+            r"\A\s*(?:",
+            r"text\(\s*{call}\s*\)",
+            r"|(?:const|let|var)\s+(?P<bound>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*{call}\s*;\s*text\(\s*(?P<used>[A-Za-z_][A-Za-z0-9_]*)\s*\)",
+            r")[ \t]*(?:;|\r?\n|\z)",
+        ),
+        call = call
     ))
     .expect("code-mode CSR statement regex")
 });
@@ -2122,6 +2133,19 @@ mod tests {
         ));
         assert!(!is_csr(
             "// text(await tools.mcp__claude_self_reflect__csr_why({}));\ntext(\"REAL NOTE\");"
+        ));
+        // Only literal argument values: an expression could rebind a tool or print.
+        assert!(!is_csr(
+            "text(await tools.mcp__claude_self_reflect__csr_reflect_on_past({query:\"x\",ignored:tools.mcp__claude_self_reflect__csr_reflect_on_past=text}));\ntext(await tools.mcp__claude_self_reflect__csr_reflect_on_past({note:\"REAL NOTE\"}));"
+        ));
+        assert!(!is_csr(
+            r#"text(await tools.mcp__claude_self_reflect__csr_why({target:x}));"#
+        ));
+        assert!(!is_csr(
+            r#"text(await tools.mcp__claude_self_reflect__csr_why({target:"a\"+text(1)+\""}));"#
+        ));
+        assert!(is_csr(
+            r#"text(await tools.mcp__claude_self_reflect__csr_reflect_on_past({"query":'why (and how) we cut it',limit:3,brief:true,project:null,}));"#
         ));
         assert!(!is_csr(
             "text(await tools.mcp__claude_self_reflect__csr_why({}))text(\"REAL NOTE\")"

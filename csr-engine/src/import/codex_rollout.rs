@@ -1015,8 +1015,8 @@ fn with_busy_retries<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
 /// it reads and embeds the whole file before it writes anything, then
 /// replaces the conversation's rows in one transaction. A file that vanishes,
 /// fails to read or fails to embed, or a write that fails, leaves the stored
-/// rows as they were. A file that now yields no chunks is not trusted to
-/// replace stored rows either.
+/// rows as they were. A file that now yields no chunks, or that has any line
+/// the reader skipped, is not trusted to replace stored rows either.
 fn reimport_rollout_staged(
     engine: &Engine,
     file: &RolloutFile,
@@ -1064,7 +1064,17 @@ fn reimport_rollout_staged(
         "Codex rollout yielded no chunks on re-import: {}",
         file.path.display()
     );
+    // A line the reader skipped (unreadable, not JSON, an unknown item) may
+    // hold rows stored from an earlier, readable copy: do not replace them.
+    anyhow::ensure!(
+        outcome.schema_misses == 0,
+        "Codex rollout skipped {} line(s) on re-import: {}",
+        outcome.schema_misses,
+        file.path.display()
+    );
     let key = file.path.to_string_lossy();
+    // Read before the commit (see `SearchEngine::defers_to_sync`).
+    let fence = storage.change_fence()?;
     let old_ids = storage.replace_conversation_chunks(
         &metadata.conversation_id,
         &staged,
@@ -1074,14 +1084,15 @@ fn reimport_rollout_staged(
     )?;
     {
         let mut index = engine.search().blocking_write();
-        for id in old_ids {
-            index.remove_chunk(&id);
-        }
-        for row in staged {
-            index.insert_chunk(row.chunk.id, row.embedding);
+        if !index.defers_to_sync(false, fence) {
+            for id in old_ids {
+                index.remove_chunk(&id);
+            }
+            for row in staged {
+                index.insert_chunk(row.chunk.id, row.embedding);
+            }
         }
     }
-    storage.bump_aux_counter_by("codex_rollout", outcome.schema_misses)?;
     storage.bump_aux_counter_by(
         "codex_harness_context_stripped",
         outcome.harness_context_stripped,
@@ -3442,6 +3453,16 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+
+        // A line the reader cannot parse might be a row stored earlier: abstain.
+        let mut damaged = std::fs::read(&path).unwrap();
+        damaged.extend_from_slice(
+            b"\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\"\n",
+        );
+        std::fs::write(&path, &damaged).unwrap();
+        let error = reimport_rollout_staged(&engine, &file).unwrap_err();
+        assert!(format!("{error:#}").contains("skipped"), "{error:#}");
+        assert_eq!(stored(), before);
 
         // A file gone before the read is reported vanished and writes nothing.
         std::fs::remove_file(&path).unwrap();
