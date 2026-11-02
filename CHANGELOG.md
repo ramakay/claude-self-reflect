@@ -22,14 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CSR_NO_CODEX_MCP=1` skips it.
 - **CSR's own results no longer come back as Codex history.** Codex code mode calls tools inside one `exec` script, so the
   importer's by-name check missed CSR calls and stored their results. An `exec` script made only of statements that print
-  one CSR call (`text(await tools.mcp__claude_self_reflect__*({...}))`, or `const r = await ...; text(r)`, with a flat
-  argument object) is now suppressed, call and output. Any other script keeps its whole output: one that also runs another
-  tool, prints other text, batches calls or uses an alias. Most real Codex scripts mix CSR with `exec_command`, so those
-  still store the CSR result next to the real work. The daemon re-imports, in idle-gated batches of 8, each stored
-  conversation that holds a code-mode CSR result and whose rollout file still exists (meta key
-  `codex_csr_exec_reimport_v1`). It reads and embeds the whole file first, then swaps the rows in one transaction, so a
-  file that vanishes or a write that fails leaves the stored rows as they were. A conversation whose file is gone is
-  counted and left as it is: the stored call keeps only `[exec]`, so nothing proves which results are CSR's.
+  one CSR call (`text(await tools.mcp__claude_self_reflect__*({...}))`, or `const r = await ...; text(r)`, with literal
+  argument values) is now suppressed, call and output. Any other script keeps its whole output: one that also runs another
+  tool, prints other text, batches calls or passes an expression. Most real Codex scripts mix CSR with `exec_command`, so
+  those still store the CSR result next to the real work. A Codex call or output with no id no longer shares the stand-in
+  id `unknown`, so an id-less CSR call cannot drop another call's output. Results stored before this change stay as they
+  are.
 
 **Already shipped in 9.5.1-9.5.8, carried here, not new:** 92acc3bd, cdd23033, c46702aa, f0cf3a83, 56dddc3a,
 71457f3c, 31d78e5b, d6b9c454, 46e14f16, 962f8e03, 6e3a08b1, aededb4a (replaced by 76e390d6), cecddb48, c7e4e285,

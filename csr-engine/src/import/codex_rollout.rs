@@ -14,7 +14,7 @@ use crate::engine::Engine;
 use crate::import::scrub::is_database_busy;
 use crate::import::{ConversationChunk, CsrSuppressionStats};
 use crate::provenance::{ChunkEvidence, ChunkProvenance, ProvenanceEvent, TrustTier};
-use crate::storage::{StagedChunk, Storage};
+use crate::storage::Storage;
 
 const ROLLOUT_EMBED_BATCH_SIZE: usize = 32;
 /// How many times one rollout is re-attempted after SQLite reports the database
@@ -390,6 +390,13 @@ fn string_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
     current.as_str().map(str::to_string)
 }
 
+/// Stand-in ids for a Codex tool call or output that carries none. They
+/// differ, so an id-less output never pairs with an id-less call: the
+/// shared sanitizer drops a CSR call's output by id, and a shared stand-in
+/// would let one id-less CSR call drop every other id-less output.
+const MISSING_CALL_ID: &str = "codex-call-without-id";
+const MISSING_OUTPUT_ID: &str = "codex-output-without-id";
+
 fn parse_response_item(
     value: &serde_json::Value,
     messages: &mut Vec<serde_json::Value>,
@@ -424,11 +431,13 @@ fn parse_response_item(
                 .get("name")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
+            // A call with no id gets one no output can carry, so suppressing
+            // it can never take another call's output with it.
             let id = payload
                 .get("call_id")
                 .or_else(|| payload.get("id"))
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
+                .unwrap_or(MISSING_CALL_ID);
             let input = payload
                 .get("arguments")
                 .or_else(|| payload.get("input"))
@@ -447,7 +456,7 @@ fn parse_response_item(
                 .get("call_id")
                 .or_else(|| payload.get("id"))
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
+                .unwrap_or(MISSING_OUTPUT_ID);
             let output = payload.get("output").map(value_text).unwrap_or_default();
             messages.push(block_message(
                 "user",
@@ -994,111 +1003,16 @@ fn import_rollout_with_retries(
     engine: &Engine,
     file: &RolloutFile,
 ) -> Result<Option<RolloutStreamOutcome>> {
-    with_busy_retries(|| import_rollout(engine, file))
-}
-
-/// Run `attempt`, re-running it while SQLite reports the database busy.
-fn with_busy_retries<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
-    let mut tries = 0;
+    let mut attempt = 0;
     loop {
-        match attempt() {
-            Err(error) if tries < ROLLOUT_BUSY_RETRIES && is_database_busy(&error) => {
-                tries += 1;
-                std::thread::sleep(ROLLOUT_BUSY_BACKOFF * tries as u32);
+        match import_rollout(engine, file) {
+            Err(error) if attempt < ROLLOUT_BUSY_RETRIES && is_database_busy(&error) => {
+                attempt += 1;
+                std::thread::sleep(ROLLOUT_BUSY_BACKOFF * attempt as u32);
             }
             result => return result,
         }
     }
-}
-
-/// The CSR-leak repair's import of one rollout. Unlike [`import_rollout`],
-/// it reads and embeds the whole file before it writes anything, then
-/// replaces the conversation's rows in one transaction. A file that vanishes,
-/// fails to read or fails to embed, or a write that fails, leaves the stored
-/// rows as they were. A file that now yields no chunks, or that has any line
-/// the reader skipped, is not trusted to replace stored rows either.
-fn reimport_rollout_staged(
-    engine: &Engine,
-    file: &RolloutFile,
-) -> Result<Option<RolloutStreamOutcome>> {
-    let _operation = engine.storage().operation_lock()?;
-    let storage = engine.storage();
-    let Some(metadata) = scan_rollout_metadata(&file.path)? else {
-        return Ok(None);
-    };
-    let mut staged = Vec::new();
-    let outcome = stream_rollout_chunk_batches(
-        &file.path,
-        &metadata,
-        ROLLOUT_EMBED_BATCH_SIZE,
-        |chunks, evidence| {
-            let texts = chunks
-                .iter()
-                .map(|chunk| chunk.content.as_str())
-                .collect::<Vec<_>>();
-            let embeddings = engine.embeddings().embed(&texts)?;
-            anyhow::ensure!(
-                embeddings.len() == chunks.len(),
-                "embedded {} of {} rollout chunks",
-                embeddings.len(),
-                chunks.len()
-            );
-            for ((chunk, chunk_evidence), embedding) in chunks.iter().zip(evidence).zip(embeddings)
-            {
-                staged.push(StagedChunk {
-                    chunk: chunk.clone(),
-                    embedding,
-                    evidence: chunk_evidence.clone(),
-                    provenance: ChunkProvenance {
-                        author: chunk.author,
-                        source_conv_id: metadata.conversation_id.clone(),
-                        supersedes: None,
-                    },
-                });
-            }
-            Ok(())
-        },
-    )?;
-    anyhow::ensure!(
-        !staged.is_empty(),
-        "Codex rollout yielded no chunks on re-import: {}",
-        file.path.display()
-    );
-    // A line the reader skipped (unreadable, not JSON, an unknown item) may
-    // hold rows stored from an earlier, readable copy: do not replace them.
-    anyhow::ensure!(
-        outcome.schema_misses == 0,
-        "Codex rollout skipped {} line(s) on re-import: {}",
-        outcome.schema_misses,
-        file.path.display()
-    );
-    let key = file.path.to_string_lossy();
-    // Read before the commit (see `SearchEngine::defers_to_sync`).
-    let fence = storage.change_fence()?;
-    let old_ids = storage.replace_conversation_chunks(
-        &metadata.conversation_id,
-        &staged,
-        "codex_rollout",
-        &key,
-        &file.mtime,
-    )?;
-    {
-        let mut index = engine.search().blocking_write();
-        if !index.defers_to_sync(false, fence) {
-            for id in old_ids {
-                index.remove_chunk(&id);
-            }
-            for row in staged {
-                index.insert_chunk(row.chunk.id, row.embedding);
-            }
-        }
-    }
-    storage.bump_aux_counter_by(
-        "codex_harness_context_stripped",
-        outcome.harness_context_stripped,
-    )?;
-    storage.record_secrets_redacted(&key, &outcome.suppression.secrets)?;
-    Ok(Some(outcome))
 }
 
 /// `Ok(None)` means the rollout vanished between discovery and reading it,
@@ -1490,189 +1404,6 @@ pub fn backfill_codex_subagent_sidechain(
         SUBAGENT_SIDECHAIN_META_KEY,
         &chrono::Utc::now().to_rfc3339(),
     )?;
-    Ok(stats)
-}
-
-/// Meta key written when [`csr_exec_leak_reimport_batch`] has finished. Its
-/// value is the JSON receipt.
-pub const CSR_EXEC_REIMPORT_META_KEY: &str = "codex_csr_exec_reimport_v1";
-
-/// The frozen work list of [`csr_exec_leak_reimport_batch`].
-pub const CSR_EXEC_REIMPORT_PENDING_META_KEY: &str = "codex_csr_exec_reimport_v1_pending";
-
-/// Conversations the daemon re-imports per tick for the CSR-leak repair.
-pub const CSR_EXEC_REIMPORT_BATCH: usize = 8;
-
-/// How a stored code-mode `exec` result opens: the chunker stores the output
-/// array as JSON, so the newline is the two characters `\n`.
-const CODE_MODE_RESULT_OPENING: &str = r#"[{"text":"Script completed\n"#;
-
-/// CSR's search result banner, raw and as an escaped JSON string.
-const CSR_RESULT_BANNER: &str = "\u{1F3AF} RESULTS: ";
-const CSR_RESULT_BANNER_ESCAPED: &str = concat!("\\", "ud83c", "\\", "udfaf RESULTS: ");
-
-/// The frozen work list: rollout files still on disk whose stored chunks hold
-/// a code-mode CSR result, plus what could not be repaired.
-#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CsrExecReimportPending {
-    pub files: Vec<String>,
-    pub conversations_leaked: usize,
-    pub conversations_missing_file: usize,
-    #[serde(default)]
-    pub reimported: usize,
-    #[serde(default)]
-    pub failed: usize,
-}
-
-/// Receipt for one [`csr_exec_leak_reimport_batch`] call.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct CsrExecReimportStats {
-    pub reimported: usize,
-    pub failed: usize,
-    pub vanished: usize,
-    pub remaining: usize,
-    pub conversations_leaked: usize,
-    pub conversations_missing_file: usize,
-    pub done: bool,
-    pub already_applied: bool,
-}
-
-/// `codex_rollout` conversations whose stored chunks hold a code-mode `exec`
-/// result carrying CSR's search banner, with their rollout file paths.
-fn csr_exec_leaked_conversations(storage: &Storage) -> Result<Vec<(String, String)>> {
-    storage.with_connection(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT i.file_path, c.conversation_id
-             FROM chunks c JOIN import_state i ON i.conversation_id = c.conversation_id
-             WHERE c.source = 'codex_rollout'
-               AND c.conversation_id LIKE 'codex:%'
-               AND substr(c.content, 1, length(?1)) = ?1
-               AND (instr(c.content, ?2) > 0 OR instr(c.content, ?3) > 0)
-             ORDER BY c.conversation_id",
-        )?;
-        let rows = stmt
-            .query_map(
-                rusqlite::params![
-                    CODE_MODE_RESULT_OPENING,
-                    CSR_RESULT_BANNER,
-                    CSR_RESULT_BANNER_ESCAPED
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    })
-}
-
-/// Repair for CSR results that Codex code mode put in stored history before
-/// [`crate::import::is_csr_tool_use`] knew `exec`: re-import each affected
-/// conversation through the fixed importer, a bounded batch per call.
-///
-/// Re-import is the only repair with proof. The stored call chunk keeps only
-/// `[exec]`, not the script, and one result spans several chunks, so stored
-/// text cannot show whether a script also ran another tool. The fixed
-/// importer reads the script itself and drops only CSR-only scripts. A
-/// conversation whose rollout file is gone (Codex deletes most of them) is
-/// counted in `conversations_missing_file` and left as it is: nothing is
-/// deleted without proof that it is CSR's.
-///
-/// The work list is computed once, by the first call, and frozen in meta.
-/// Only the daemon calls this, so the importer that wrote the list's rows
-/// has already been replaced by the fixed binary. Writes
-/// [`CSR_EXEC_REIMPORT_META_KEY`] when the list is empty.
-pub fn csr_exec_leak_reimport_batch(
-    engine: &Engine,
-    batch_size: usize,
-    shutdown: &AtomicBool,
-) -> Result<CsrExecReimportStats> {
-    anyhow::ensure!(
-        batch_size > 0,
-        "CSR-leak reimport batch size must be positive"
-    );
-    let storage = engine.storage();
-    if storage.get_meta(CSR_EXEC_REIMPORT_META_KEY)?.is_some() {
-        return Ok(CsrExecReimportStats {
-            already_applied: true,
-            ..CsrExecReimportStats::default()
-        });
-    }
-
-    let mut pending = match storage
-        .get_meta(CSR_EXEC_REIMPORT_PENDING_META_KEY)?
-        .and_then(|raw| serde_json::from_str::<CsrExecReimportPending>(&raw).ok())
-    {
-        Some(pending) => pending,
-        None => {
-            let leaked = csr_exec_leaked_conversations(storage)?;
-            let mut pending = CsrExecReimportPending {
-                conversations_leaked: leaked.len(),
-                ..CsrExecReimportPending::default()
-            };
-            for (file_path, _) in leaked {
-                if Path::new(&file_path).exists() {
-                    pending.files.push(file_path);
-                } else {
-                    pending.conversations_missing_file += 1;
-                }
-            }
-            pending
-        }
-    };
-
-    let mut stats = CsrExecReimportStats {
-        conversations_leaked: pending.conversations_leaked,
-        conversations_missing_file: pending.conversations_missing_file,
-        ..CsrExecReimportStats::default()
-    };
-    let mut processed = 0;
-    for file_path in pending.files.iter().take(batch_size) {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-        processed += 1;
-        let path = PathBuf::from(file_path);
-        let Some(mtime) = file_mtime(&path) else {
-            stats.vanished += 1;
-            continue;
-        };
-        let file = RolloutFile { path, mtime };
-        match with_busy_retries(|| reimport_rollout_staged(engine, &file)) {
-            Ok(Some(_)) => stats.reimported += 1,
-            Ok(None) => stats.vanished += 1,
-            Err(error) => {
-                stats.failed += 1;
-                tracing::warn!(
-                    file = %file.path.display(),
-                    %error,
-                    "codex CSR-leak reimport failed"
-                );
-            }
-        }
-    }
-    pending.files.drain(..processed);
-    pending.reimported += stats.reimported;
-    pending.failed += stats.failed;
-    stats.remaining = pending.files.len();
-
-    if pending.files.is_empty() {
-        storage.set_meta(
-            CSR_EXEC_REIMPORT_META_KEY,
-            &serde_json::json!({
-                "at": chrono::Utc::now().to_rfc3339(),
-                "conversations_leaked": pending.conversations_leaked,
-                "conversations_missing_file": pending.conversations_missing_file,
-                "reimported": pending.reimported,
-                "failed": pending.failed,
-            })
-            .to_string(),
-        )?;
-        stats.done = true;
-    } else {
-        storage.set_meta(
-            CSR_EXEC_REIMPORT_PENDING_META_KEY,
-            &serde_json::to_string(&pending)?,
-        )?;
-    }
     Ok(stats)
 }
 
@@ -3278,196 +3009,39 @@ mod tests {
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
     }
 
-    /// The CSR-leak repair re-imports leaked conversations whose file is on
-    /// disk, in bounded batches, and leaves a conversation whose file is gone.
+    /// A CSR `exec` with no call id cannot take an id-less output with it.
     #[test]
-    fn the_csr_leak_reimport_repairs_files_on_disk_and_leaves_gone_ones() {
-        let root = tempfile::tempdir().unwrap();
-        let rollout = |n: usize| {
-            let line = |value: serde_json::Value| value.to_string();
+    fn an_id_less_csr_call_keeps_every_id_less_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-no-ids.jsonl");
+        let line = |value: serde_json::Value| value.to_string();
+        std::fs::write(
+            &path,
             [
-                line(serde_json::json!({"timestamp":"2026-10-31T12:00:00Z","type":"session_meta","payload":{"id":format!("leak-{n}"),"timestamp":"2026-10-31T12:00:00Z","cwd":"/workspace/leak"}})),
-                line(serde_json::json!({"timestamp":"2026-10-31T12:00:01Z","type":"response_item","payload":{"type":"message","id":"u1","role":"user","content":[{"type":"input_text","text":"why did we drop Qdrant?"}]}})),
-                line(serde_json::json!({"timestamp":"2026-10-31T12:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t1","call_id":"csr-exec","name":"exec","input":"const r=await tools.mcp__claude_self_reflect__csr_reflect_on_past({query:\"q\"});text(r);"}})),
-                line(serde_json::json!({"timestamp":"2026-10-31T12:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o1","call_id":"csr-exec","output":[{"type":"input_text","text":"Script completed\nWall time 1.5 seconds\nOutput:\n"},{"type":"input_text","text":"\u{1F3AF} RESULTS: 3 matches LEAKED RESULT"}]}})),
-                line(serde_json::json!({"timestamp":"2026-10-31T12:00:04Z","type":"response_item","payload":{"type":"message","id":"a1","role":"assistant","content":[{"type":"output_text","text":"We dropped Qdrant for one binary."}]}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:00Z","type":"session_meta","payload":{"id":"no-ids","timestamp":"2026-10-31T12:00:00Z","cwd":"/workspace/no-ids"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:01Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"text(await tools.mcp__claude_self_reflect__csr_why({}));"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","output":"CSR RESULT LEAKS"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"text(\"REAL NOTE\");"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","output":"REAL NOTE KEPT"}})),
             ]
-            .join("\n")
-        };
-        for n in 0..4 {
-            std::fs::write(root.path().join(format!("rollout-{n}.jsonl")), rollout(n)).unwrap();
-        }
-        let storage = Arc::new(Storage::open_memory().unwrap());
-        let engine = test_engine(storage.clone(), root.path());
-        assert_eq!(
-            import_changed_rollouts(&engine, root.path())
-                .unwrap()
-                .files_imported,
-            4
-        );
-
-        // What an importer without the `exec` check stored: the result chunk.
-        let conversations: Vec<String> = storage
-            .with_connection(|conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT conversation_id FROM import_state WHERE conversation_id LIKE 'codex:%' ORDER BY file_path",
-                )?;
-                let ids = stmt
-                    .query_map([], |row| row.get(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()?;
-                Ok(ids)
-            })
-            .unwrap();
-        assert_eq!(conversations.len(), 4);
-        for (n, conversation_id) in conversations.iter().enumerate() {
-            let chunk = ConversationChunk {
-                id: format!("leaked-{n}"),
-                conversation_id: conversation_id.clone(),
-                project_name: "leak".to_string(),
-                timestamp: "2026-10-31T12:00:03Z".to_string(),
-                content: "[{\"text\":\"Script completed\\nWall time 1.5 seconds\\nOutput:\\n\",\"type\":\"input_text\"},{\"text\":\"\u{1F3AF} RESULTS: 3 matches LEAKED RESULT\",\"type\":\"input_text\"}]".to_string(),
-                message_count: 1,
-                summary: None,
-                author: crate::provenance::Speaker::ToolResult,
-                seq: 99,
-                is_sidechain: false,
-            };
-            let mut embedding = vec![0.0_f32; 384];
-            embedding[0] = 1.0;
-            storage
-                .insert_chunk_with_source(&chunk, &embedding, "codex_rollout")
-                .unwrap();
-        }
-        std::fs::remove_file(root.path().join("rollout-3.jsonl")).unwrap();
-
-        let shutdown = AtomicBool::new(false);
-        let first = csr_exec_leak_reimport_batch(&engine, 2, &shutdown).unwrap();
-        assert_eq!(first.conversations_leaked, 4, "{first:?}");
-        assert_eq!(first.conversations_missing_file, 1, "{first:?}");
-        assert_eq!(first.reimported, 2, "{first:?}");
-        assert_eq!(first.remaining, 1, "{first:?}");
-        assert!(!first.done);
-        let second = csr_exec_leak_reimport_batch(&engine, 10, &shutdown).unwrap();
-        assert_eq!(second.reimported, 1, "{second:?}");
-        assert!(second.done, "{second:?}");
-        let receipt: serde_json::Value = serde_json::from_str(
-            &storage
-                .get_meta(CSR_EXEC_REIMPORT_META_KEY)
-                .unwrap()
-                .unwrap(),
+            .join("\n"),
         )
         .unwrap();
-        assert_eq!(receipt["reimported"], 3);
-        assert_eq!(receipt["conversations_missing_file"], 1);
-        assert!(
-            csr_exec_leak_reimport_batch(&engine, 10, &shutdown)
-                .unwrap()
-                .already_applied
-        );
-
-        let leaked_left = |conversation_id: &str| -> i64 {
-            storage
-                .with_connection(|conn| {
-                    Ok(conn.query_row(
-                        "SELECT COUNT(*) FROM chunks WHERE conversation_id = ?1 AND content LIKE '%LEAKED RESULT%'",
-                        rusqlite::params![conversation_id],
-                        |row| row.get(0),
-                    )?)
-                })
-                .unwrap()
-        };
-        for conversation_id in &conversations[..3] {
-            assert_eq!(leaked_left(conversation_id), 0, "{conversation_id}");
-            let prose: i64 = storage
-                .with_connection(|conn| {
-                    Ok(conn.query_row(
-                        "SELECT COUNT(*) FROM chunks WHERE conversation_id = ?1 AND content LIKE '%dropped Qdrant for one binary%'",
-                        rusqlite::params![conversation_id],
-                        |row| row.get(0),
-                    )?)
-                })
-                .unwrap();
-            assert_eq!(prose, 1, "{conversation_id}");
-        }
-        // The file is gone, so nothing proves the stored text is CSR's: kept.
-        assert_eq!(leaked_left(&conversations[3]), 1);
-    }
-
-    /// A re-import whose write fails part way keeps every stored row, and one
-    /// whose file is gone writes nothing.
-    #[test]
-    fn a_failed_staged_reimport_keeps_the_stored_rows() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("rollout-0.jsonl");
-        let lines = [
-            serde_json::json!({"timestamp":"2026-10-31T12:00:00Z","type":"session_meta","payload":{"id":"staged-0","timestamp":"2026-10-31T12:00:00Z","cwd":"/workspace/staged"}}),
-            serde_json::json!({"timestamp":"2026-10-31T12:00:01Z","type":"response_item","payload":{"type":"message","id":"u1","role":"user","content":[{"type":"input_text","text":"why did we drop Qdrant?"}]}}),
-            serde_json::json!({"timestamp":"2026-10-31T12:00:04Z","type":"response_item","payload":{"type":"message","id":"a1","role":"assistant","content":[{"type":"output_text","text":"We dropped Qdrant for one binary."}]}}),
-        ]
-        .map(|value| value.to_string())
-        .join("\n");
-        std::fs::write(&path, lines).unwrap();
-        let storage = Arc::new(Storage::open_memory().unwrap());
-        let engine = test_engine(storage.clone(), root.path());
-        import_changed_rollouts(&engine, root.path()).unwrap();
-        let stored = || -> Vec<(String, String)> {
-            storage
-                .with_connection(|conn| {
-                    let mut stmt = conn.prepare(
-                        "SELECT id, content FROM chunks WHERE conversation_id = 'codex:staged-0' ORDER BY id",
-                    )?;
-                    let rows = stmt
-                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    Ok(rows)
-                })
-                .unwrap()
-        };
-        let before = stored();
-        assert!(!before.is_empty());
-        let file = RolloutFile {
-            path: path.clone(),
-            mtime: "2026-10-31T12:00:05Z".to_string(),
-        };
-
-        // The provenance write fails after the old rows were deleted and the
-        // first new chunk was written: all of it rolls back.
-        storage
-            .with_connection(|conn| {
-                conn.execute_batch(
-                    "CREATE TEMP TRIGGER fail_provenance BEFORE INSERT ON main.chunk_provenance
-                     BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        let error = reimport_rollout_staged(&engine, &file).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("injected write failure"),
-            "{error:#}"
-        );
-        assert_eq!(stored(), before);
-        storage
-            .with_connection(|conn| {
-                conn.execute_batch("DROP TRIGGER fail_provenance;")?;
-                Ok(())
-            })
-            .unwrap();
-
-        // A line the reader cannot parse might be a row stored earlier: abstain.
-        let mut damaged = std::fs::read(&path).unwrap();
-        damaged.extend_from_slice(
-            b"\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\"\n",
-        );
-        std::fs::write(&path, &damaged).unwrap();
-        let error = reimport_rollout_staged(&engine, &file).unwrap_err();
-        assert!(format!("{error:#}").contains("skipped"), "{error:#}");
-        assert_eq!(stored(), before);
-
-        // A file gone before the read is reported vanished and writes nothing.
-        std::fs::remove_file(&path).unwrap();
-        assert!(reimport_rollout_staged(&engine, &file).unwrap().is_none());
-        assert_eq!(stored(), before);
+        let metadata = scan_rollout_metadata(&path).unwrap().unwrap();
+        let mut chunks = Vec::new();
+        stream_rollout_chunk_batches(&path, &metadata, ROLLOUT_EMBED_BATCH_SIZE, |batch, _| {
+            chunks.extend_from_slice(batch);
+            Ok(())
+        })
+        .unwrap();
+        let all = chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("REAL NOTE KEPT"), "{all}");
+        // Abstain: with no id, nothing proves which output is CSR's.
+        assert!(all.contains("CSR RESULT LEAKS"), "{all}");
     }
 
     #[test]
