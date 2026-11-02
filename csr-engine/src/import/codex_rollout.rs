@@ -1398,6 +1398,96 @@ pub fn backfill_codex_subagent_sidechain(
     Ok(stats)
 }
 
+/// Meta key guarding [`purge_codex_csr_exec_output`]. Its value is the JSON
+/// receipt of the pass that ran.
+pub const CSR_EXEC_OUTPUT_PURGE_META_KEY: &str = "codex_csr_exec_output_purge_v1";
+
+/// How a stored code-mode `exec` result opens: the chunker stores the output
+/// array as JSON, so the newline is the two characters `\n`.
+const CODE_MODE_RESULT_OPENING: &str = r#"[{"text":"Script completed\n"#;
+
+/// CSR's search result banner, raw and as an escaped JSON string.
+const CSR_RESULT_BANNERS: [&str; 2] = ["🎯 RESULTS: ", r"🎯 RESULTS: "];
+
+/// What Codex's shell tool prints: a chunk holding it is a mixed script.
+const SHELL_OUTPUT_MARK: &str = "Process exited with code";
+
+/// Receipt for [`purge_codex_csr_exec_output`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct CsrExecOutputPurgeStats {
+    pub chunks_deleted: usize,
+    pub conversations: usize,
+    pub already_applied: bool,
+}
+
+/// One-time, meta-guarded repair for CSR results that Codex code mode put in
+/// stored history before [`crate::import::is_csr_tool_use`] knew `exec`.
+///
+/// Re-import cannot do this: Codex deletes most rollout files, and the stored
+/// call chunk keeps only `[exec]`, not the script. So the repair reads the
+/// stored output and deletes a chunk only when all of these hold:
+/// - a `codex_rollout` chunk of one message that is all tool output;
+/// - it opens as a code-mode `exec` result;
+/// - it carries CSR's search result banner;
+/// - it has no shell output, the mark of a script that also ran a command.
+///
+/// Anything else is left as it is: a long result's continuation chunks, file
+/// reads that quote CSR's banner, and mixed scripts. The delete is the normal
+/// `delete_chunk` path, so FTS triggers and index sync remove the rest.
+pub fn purge_codex_csr_exec_output(storage: &Storage) -> Result<CsrExecOutputPurgeStats> {
+    if storage.get_meta(CSR_EXEC_OUTPUT_PURGE_META_KEY)?.is_some() {
+        return Ok(CsrExecOutputPurgeStats {
+            already_applied: true,
+            ..CsrExecOutputPurgeStats::default()
+        });
+    }
+    let rows: Vec<(String, String)> = storage.with_connection(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id FROM chunks
+             WHERE source = 'codex_rollout'
+               AND conversation_id LIKE 'codex:%'
+               AND message_count = 1
+               AND COALESCE(tool_result_share, 0) >= 0.999
+               AND substr(content, 1, length(?1)) = ?1
+               AND (instr(content, ?2) > 0 OR instr(content, ?3) > 0)
+               AND instr(content, ?4) = 0",
+        )?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    CODE_MODE_RESULT_OPENING,
+                    CSR_RESULT_BANNERS[0],
+                    CSR_RESULT_BANNERS[1],
+                    SHELL_OUTPUT_MARK
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })?;
+
+    let mut conversations = std::collections::HashSet::new();
+    for (chunk_id, conversation_id) in &rows {
+        storage.delete_chunk(chunk_id)?;
+        conversations.insert(conversation_id.as_str());
+    }
+    let stats = CsrExecOutputPurgeStats {
+        chunks_deleted: rows.len(),
+        conversations: conversations.len(),
+        already_applied: false,
+    };
+    storage.set_meta(
+        CSR_EXEC_OUTPUT_PURGE_META_KEY,
+        &serde_json::json!({
+            "at": chrono::Utc::now().to_rfc3339(),
+            "chunks_deleted": stats.chunks_deleted,
+            "conversations": stats.conversations,
+        })
+        .to_string(),
+    )?;
+    Ok(stats)
+}
+
 /// Distinct `codex_rollout` conversation ids that still carry pre-strip
 /// harness-marker content — the live signal for "this conversation was
 /// imported (or last reimported) before the harness-marker strip and its
@@ -2948,6 +3038,158 @@ mod tests {
         let parsed = parse_rollout(&path).unwrap().unwrap();
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
         assert_eq!(parsed.suppression.csr_hook_wrappers_scrubbed, 0);
+    }
+
+    /// Codex code mode (0.163+) calls CSR inside one `exec` script. A script
+    /// that calls only CSR is CSR's own traffic and goes, call and output; a
+    /// script that also runs another tool keeps its output.
+    #[test]
+    fn code_mode_csr_scripts_are_suppressed_and_mixed_scripts_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-code-mode.jsonl");
+        let line = |value: serde_json::Value| value.to_string();
+        let output = |text: &str| {
+            serde_json::json!([
+                {"type":"input_text","text":"Script completed\nWall time 1.5 seconds\nOutput:\n"},
+                {"type":"input_text","text":text}
+            ])
+        };
+        std::fs::write(
+            &path,
+            [
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:00Z","type":"session_meta","payload":{"id":"code-mode","timestamp":"2026-10-31T12:00:00Z","cwd":"/workspace/code-mode"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:01Z","type":"response_item","payload":{"type":"message","id":"u1","role":"user","content":[{"type":"input_text","text":"why did we drop Qdrant?"}]}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t1","call_id":"csr-exec","name":"exec","input":"const r=await tools.mcp__claude_self_reflect__csr_reflect_on_past({query:\"CSR QUERY SUPPRESSED\",limit:3});text(r);"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o1","call_id":"csr-exec","output":output("🎯 RESULTS: 3 matches CSR OUTPUT SUPPRESSED")}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:04Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t2","call_id":"mixed-exec","name":"exec","input":"text(await tools.mcp__claude_self_reflect__csr_why({target:\"x\"})); text(await tools.exec_command({cmd:\"cat MIXED.md\"}));"}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:05Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o2","call_id":"mixed-exec","output":output("MIXED OUTPUT KEPT")}})),
+                line(serde_json::json!({"timestamp":"2026-10-31T12:00:06Z","type":"response_item","payload":{"type":"message","id":"a1","role":"assistant","content":[{"type":"output_text","text":"We dropped Qdrant for one binary."}]}})),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let metadata = scan_rollout_metadata(&path).unwrap().unwrap();
+        let mut chunks = Vec::new();
+        stream_rollout_chunk_batches(&path, &metadata, ROLLOUT_EMBED_BATCH_SIZE, |batch, _| {
+            chunks.extend_from_slice(batch);
+            Ok(())
+        })
+        .unwrap();
+        let all = chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains("CSR QUERY SUPPRESSED"), "{all}");
+        assert!(!all.contains("CSR OUTPUT SUPPRESSED"), "{all}");
+        assert!(all.contains("MIXED OUTPUT KEPT"), "{all}");
+        assert!(all.contains("why did we drop Qdrant?"), "{all}");
+        assert!(all.contains("We dropped Qdrant for one binary."), "{all}");
+        let parsed = parse_rollout(&path).unwrap().unwrap();
+        assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
+    }
+
+    /// The repair deletes only stored code-mode CSR results, once.
+    #[test]
+    fn the_csr_exec_output_purge_deletes_only_pure_code_mode_csr_results_once() {
+        let storage = Storage::open_memory().unwrap();
+        let wrapper = r#"[{"text":"Script completed\nWall time 1.5 seconds\nOutput:\n","type":"input_text"},{"text":"#;
+        let insert = |id: &str, conversation: &str, source: &str, content: String, share: f64| {
+            let chunk = ConversationChunk {
+                id: id.to_string(),
+                conversation_id: conversation.to_string(),
+                project_name: "p".to_string(),
+                timestamp: "2026-10-31T12:00:00Z".to_string(),
+                content,
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::ToolResult,
+                seq: 0,
+                is_sidechain: false,
+            };
+            let mut embedding = vec![0.0_f32; 384];
+            embedding[0] = 1.0;
+            storage
+                .insert_chunk_with_source(&chunk, &embedding, source)
+                .unwrap();
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "UPDATE chunks SET tool_result_share = ?2 WHERE id = ?1",
+                        rusqlite::params![id, share],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        let csr = |banner: &str| format!("{wrapper}\"{banner}3 matches (top score: 0.480)\"}}]");
+        insert("raw", "codex:a", "codex_rollout", csr("🎯 RESULTS: "), 1.0);
+        insert(
+            "escaped",
+            "codex:a",
+            "codex_rollout",
+            csr(r"🎯 RESULTS: "),
+            1.0,
+        );
+        insert(
+            "batched",
+            "codex:b",
+            "codex_rollout",
+            csr("{\\\"i\\\":0,\\\"status\\\":\\\"fulfilled\\\",\\\"value\\\":🎯 RESULTS: "),
+            1.0,
+        );
+        // Kept: a mixed script, a continuation chunk, prose quoting the banner,
+        // a Claude transcript, and a chunk that is partly prose.
+        insert(
+            "mixed",
+            "codex:c",
+            "codex_rollout",
+            format!("{wrapper}\"🎯 RESULTS: 1 matches\\nProcess exited with code 0\"}}]"),
+            1.0,
+        );
+        insert(
+            "continuation",
+            "codex:c",
+            "codex_rollout",
+            "rest of a long result 🎯 RESULTS: 2 matches".to_string(),
+            1.0,
+        );
+        insert("claude", "conv-1", "conversation", csr("🎯 RESULTS: "), 1.0);
+        insert(
+            "partial",
+            "codex:d",
+            "codex_rollout",
+            csr("🎯 RESULTS: "),
+            0.5,
+        );
+
+        let stats = purge_codex_csr_exec_output(&storage).unwrap();
+        assert_eq!(stats.chunks_deleted, 3, "{stats:?}");
+        assert_eq!(stats.conversations, 2, "{stats:?}");
+        let left: Vec<String> = storage
+            .with_connection(|conn| {
+                let mut stmt = conn.prepare("SELECT id FROM chunks ORDER BY id")?;
+                let ids = stmt
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(ids)
+            })
+            .unwrap();
+        assert_eq!(left, ["claude", "continuation", "mixed", "partial"]);
+        let receipt: serde_json::Value = serde_json::from_str(
+            &storage
+                .get_meta(CSR_EXEC_OUTPUT_PURGE_META_KEY)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["chunks_deleted"], 3);
+
+        insert("late", "codex:e", "codex_rollout", csr("🎯 RESULTS: "), 1.0);
+        let again = purge_codex_csr_exec_output(&storage).unwrap();
+        assert!(again.already_applied);
+        assert_eq!(again.chunks_deleted, 0);
     }
 
     #[test]

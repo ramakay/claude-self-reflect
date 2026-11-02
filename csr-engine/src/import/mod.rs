@@ -1962,7 +1962,41 @@ pub(crate) fn drops_as_marker_only(msg: &serde_json::Value, combined_text: &str)
         && is_marker_only_text(combined_text)
 }
 
+/// Codex code mode runs every tool call inside one script tool of this name.
+const CODEX_CODE_MODE_TOOL: &str = "exec";
+
+/// A tool reference in a Codex code-mode script: `tools.<name>` (group 1) or a
+/// computed `tools[...]` lookup (no group).
+static CODE_MODE_TOOL_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\btools\s*(?:\.\s*([A-Za-z_$][A-Za-z0-9_$]*)|\[)")
+        .expect("code-mode tool reference regex")
+});
+
+/// Whether a Codex code-mode script calls CSR tools and nothing else.
+///
+/// A whitelist that abstains: one other tool, or one computed `tools[...]`
+/// lookup, keeps the whole output, because the output of a mixed script also
+/// holds that other tool's result and dropping it would lose real work.
+fn code_mode_script_calls_only_csr(script: &str) -> bool {
+    let mut calls_csr = false;
+    for reference in CODE_MODE_TOOL_REF_RE.captures_iter(script) {
+        match reference.get(1) {
+            Some(name) if name.as_str().starts_with("mcp__claude_self_reflect__") => {
+                calls_csr = true;
+            }
+            _ => return false,
+        }
+    }
+    calls_csr
+}
+
 pub(crate) fn is_csr_tool_use(item: &serde_json::Value, name: &str) -> bool {
+    if name == CODEX_CODE_MODE_TOOL {
+        return item
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(code_mode_script_calls_only_csr);
+    }
     if name.starts_with("csr_")
         || name.starts_with("mcp__claude-self-reflect__")
         || name.starts_with("mcp__claude_self_reflect__")
@@ -2025,6 +2059,48 @@ fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_codex_code_mode_script_is_csr_only_when_every_tool_it_calls_is_csr() {
+        let exec = |script: &str| serde_json::json!({"type":"tool_use","id":"c1","name":"exec","input":script});
+        let is_csr = |script: &str| is_csr_tool_use(&exec(script), "exec");
+
+        // As Codex 0.166 writes it, single and batched.
+        assert!(is_csr(
+            r#"const r=await tools.mcp__claude_self_reflect__csr_reflect_on_past({query:"why did we drop Qdrant",limit:3});text(r);"#
+        ));
+        assert!(is_csr(
+            "const rs = await Promise.allSettled([tools.mcp__claude_self_reflect__csr_reflect_on_past({query:\"a\"}), tools . mcp__claude_self_reflect__csr_why({target:\"b\"})]); text(rs);"
+        ));
+        // Mixed with another tool: the output holds real work, keep it.
+        assert!(!is_csr(
+            r#"text(await tools.mcp__claude_self_reflect__csr_reflect_on_past({query:"a"})); text(await tools.exec_command({cmd:"cat F05.md"}));"#
+        ));
+        // A computed lookup could be any tool: abstain.
+        assert!(!is_csr(
+            r#"text(await tools["mcp__claude_self_reflect__csr_why"]({target:"x"}));"#
+        ));
+        // Tool discovery calls nothing; other servers and look-alike names are not CSR.
+        assert!(!is_csr(
+            r#"const ts = ALL_TOOLS.filter(x=>x.name.includes("csr_reflect_on_past")); text(ts);"#
+        ));
+        assert!(!is_csr(
+            r#"text(await tools.mcp__other_server__search({q:"x"}));"#
+        ));
+        assert!(!is_csr(
+            r#"text(await mytools.mcp__claude_self_reflect__csr_why({}));"#
+        ));
+        assert!(!is_csr(""));
+        // Only the code-mode tool reads its script; a non-string input is not CSR.
+        assert!(!is_csr_tool_use(
+            &serde_json::json!({"type":"tool_use","id":"c2","name":"exec","input":{"cmd":"tools.mcp__claude_self_reflect__csr_why()"}}),
+            "exec"
+        ));
+        assert!(!is_csr_tool_use(
+            &serde_json::json!({"type":"tool_use","id":"c3","name":"Bash","input":"tools.mcp__claude_self_reflect__csr_why()"}),
+            "Bash"
+        ));
+    }
 
     #[test]
     fn parser_keeps_every_message_and_never_invents_a_cross_message_label() {

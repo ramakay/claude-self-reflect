@@ -1140,6 +1140,36 @@ impl Daemon {
                         }
                     }
 
+                    // Meta-gated one-shot: deletes CSR's own search results
+                    // that Codex code mode stored as history before the
+                    // importer knew its `exec` tool. A no-op meta lookup after.
+                    let Some(purge_permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
+                            .await
+                    else {
+                        return;
+                    };
+                    let purge_storage = storage.clone();
+                    let purge_result = tokio::task::spawn_blocking(move || {
+                        let _permit = purge_permit;
+                        crate::import::codex_rollout::purge_codex_csr_exec_output(&purge_storage)
+                    })
+                    .await;
+                    match purge_result {
+                        Ok(Ok(stats)) if stats.already_applied => {}
+                        Ok(Ok(stats)) => tracing::info!(
+                            chunks_deleted = stats.chunks_deleted,
+                            conversations = stats.conversations,
+                            "Codex code-mode CSR output purge completed"
+                        ),
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "Codex code-mode CSR output purge failed")
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "Codex code-mode CSR output purge panicked")
+                        }
+                    }
+
                     for _ in 0..180 {
                         if shutdown.load(Ordering::SeqCst) {
                             return;
