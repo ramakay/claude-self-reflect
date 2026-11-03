@@ -483,6 +483,11 @@ async fn run() -> Result<()> {
             return Ok(());
         }
 
+        // Bound this process before anything that can block: reading stdin,
+        // loading or rebuilding the index, the hook itself, and the flush.
+        // See `hooks::hook_deadline`.
+        csr_engine::hooks::arm_hook_deadline(name);
+
         // SessionEnd races app exit: Claude Code cancels hooks still running at
         // quit, so engine startup + HNSW flush (~0.5s) almost always dies as
         // "Hook cancelled". Re-spawn ourselves disowned and return immediately;
