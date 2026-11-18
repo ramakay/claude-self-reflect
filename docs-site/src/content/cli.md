@@ -8,9 +8,10 @@ title: CLI Reference
 Starts MCP server (stdio mode).
 
 ### setup
-One-shot: import + MCP registration + hook installation.
+One-shot: import + MCP registration + hook installation + the background daemon (a launchd agent on macOS; `CSR_NO_DAEMON=1` skips it) + the csr-companion plugin (written by this binary as a local marketplace and installed from it through Claude Code's plugin CLI; retry with `csr-engine companion plugin install`).
 ```bash
 csr-engine setup
+csr-engine setup --no-companion   # skip the plugin
 ```
 
 ### status
@@ -26,15 +27,15 @@ csr-engine hook session-start    # Run specific hook (called by Claude Code)
 ```
 
 ### daemon
-Background enrichment for Layer 3 AI narratives.
+Background enrichment for Layer 3 AI narratives, and the dreams. `csr-engine setup` installs it as a launchd agent on macOS.
 ```bash
 csr-engine daemon --batch-size 10 --no-ai
 ```
 
 ### eval
 ```bash
-csr-engine eval                   # Quick (5 tests)
-csr-engine eval --full            # Full (20 tests, 6 categories)
+csr-engine eval                   # Quick (6 checks)
+csr-engine eval --full            # Full (25 results plus a census line)
 csr-engine eval --continuity-live # Live continuity probe vs the real index
 ```
 
@@ -47,6 +48,21 @@ csr-engine telemetry --json       # Machine-readable
 csr-engine telemetry --tui        # Live ratatui dashboard
 ```
 
+### codemap
+Live code map: a per-worktree map of definitions in supported source files in your repos, so CSR can answer for code no conversation touched. Off with `CSR_NO_CODEMAP=1`.
+```bash
+csr-engine codemap add <path>             # Register a repo (any path inside it) and list its worktrees
+csr-engine codemap remove <path>          # Stop mapping a repo: drops its views, keeps discovery from re-adding it
+csr-engine codemap scan --repo <path>     # Map one repo's worktrees
+csr-engine codemap scan --all             # Every registered repo plus the ones discovery finds
+csr-engine codemap status [--json]        # Per repo and worktree: branch, head, files, dirty, untracked, age; totals
+csr-engine codemap query <text> [--json] [--limit 20]   # Find a definition by name, signature or path
+csr-engine codemap watch [--for <secs>]   # Run the daemon's freshness loop in the foreground and log each action
+```
+`query` shows which worktrees hold the same blob. `status` also lists the repos the map skips and why (`protected-folder: mapped by session only`, `idle > <N>h`, `cap <N>` or `CSR_NO_CODEMAP`).
+
+`scan --session` and `drain` are what the hooks start for repos in macOS-protected folders; you rarely run them by hand. `scan --session` lets one scan enter the protected folder `--repo` is in, and `drain --repo <path>` rescans the queued edits of that repo and exits. The daemon never passes `--session`.
+
 ### quality
 AST-based code quality analysis.
 ```bash
@@ -57,6 +73,8 @@ csr-engine quality src/main.rs
 
 | Flag | Description |
 |------|-------------|
+| `--db-path <path>` | SQLite database file (global; default `~/.claude-self-reflect/csr-engine.db`) |
+| `--projects-dir <path>` | Claude projects directory (global) |
 | `--import` | Import conversations |
 | `--enrich` | Backfill enrichment |
 | `--watch` | Watch for new conversations |
@@ -68,13 +86,13 @@ csr-engine quality src/main.rs
 |----------|---------|-------------|
 | CSR_NARRATIVE_MODEL | (none) | Override AI narrative model (chain: this → `haiku` → CLI default) |
 | CSR_NO_AI_NARRATIVES | (none) | Set to `1` to disable AI narratives |
-| CSR_DB_PATH | ~/.claude-self-reflect/csr-engine.db | DB location |
+| CSR_NO_CODEMAP | (none) | Set to `1` to turn the code map off. See [Configuration](#/docs/configuration) for the other `CSR_CODEMAP_*` variables |
 
 ## Data Locations
 
 | Path | Contents |
 |------|----------|
 | ~/.claude-self-reflect/csr-engine.db | SQLite database |
-| ~/.claude-self-reflect/index/ | HNSW cache |
+| ~/.claude-self-reflect/index-v3/ | HNSW cache |
 | ~/.claude-self-reflect/hook-timing.log | Hook performance |
 | ~/.local/bin/csr-engine | Binary |

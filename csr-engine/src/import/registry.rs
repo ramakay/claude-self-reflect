@@ -23,6 +23,30 @@ pub struct IngestStats {
     pub lines_read: usize,
     pub sessions_upserted: usize,
     pub parse_errors: usize,
+    /// Prompt rows from before Claude Code recorded `sessionId`. They are real
+    /// prompts with nothing to attribute them to, so the session registry
+    /// skips them cleanly; they are not a schema drift and are not counted in
+    /// `parse_errors`.
+    pub legacy_skipped: usize,
+}
+
+/// What one read of `history.jsonl` from an offset produced.
+struct HistoryRead {
+    lines_read: usize,
+    sessions: HashMap<String, SessionRegistryRow>,
+    parse_errors: usize,
+    legacy_skipped: usize,
+    new_offset: u64,
+}
+
+/// How one `history.jsonl` line classified.
+#[derive(Debug)]
+enum HistoryLine {
+    Row(SessionRegistryRow),
+    /// A well-formed prompt row with no `sessionId` key at all (Claude Code
+    /// before it stamped sessions into the history file).
+    LegacyNoSession,
+    Malformed,
 }
 
 /// Per-file identity used to detect that `history.jsonl` was replaced rather
@@ -94,8 +118,13 @@ pub fn ingest_history(storage: &Storage, history_path: &Path) -> Result<IngestSt
     }
 
     // Read + parse without holding the DB lock.
-    let (lines_read, sessions, parse_errors, new_offset) =
-        read_parse_from_offset(history_path, offset)?;
+    let HistoryRead {
+        lines_read,
+        sessions,
+        parse_errors,
+        legacy_skipped,
+        new_offset,
+    } = read_parse_from_offset(history_path, offset)?;
 
     let rows: Vec<SessionRegistryRow> = sessions.into_values().collect();
     let sessions_upserted = rows.len();
@@ -103,6 +132,7 @@ pub fn ingest_history(storage: &Storage, history_path: &Path) -> Result<IngestSt
         lines_read,
         sessions_upserted,
         parse_errors,
+        legacy_skipped,
     };
 
     let inode_str = inode.to_string();
@@ -144,11 +174,8 @@ fn read_first_line_bytes(path: &Path) -> Result<Vec<u8>> {
 }
 
 /// Read from `offset`, parse JSONL lines, aggregate per-session.
-/// Returns (lines_read, session_map, parse_errors, new_byte_offset).
-fn read_parse_from_offset(
-    path: &Path,
-    offset: u64,
-) -> Result<(usize, HashMap<String, SessionRegistryRow>, usize, u64)> {
+/// Counts legacy rows apart from genuine parse errors.
+fn read_parse_from_offset(path: &Path, offset: u64) -> Result<HistoryRead> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(offset))?;
@@ -156,6 +183,7 @@ fn read_parse_from_offset(
     let mut sessions: HashMap<String, SessionRegistryRow> = HashMap::new();
     let mut lines_read = 0usize;
     let mut parse_errors = 0usize;
+    let mut legacy_skipped = 0usize;
     let mut bytes_read = 0u64;
     let mut buf = Vec::new();
 
@@ -189,12 +217,19 @@ fn read_parse_from_offset(
         };
 
         match parse_history_line(line_str) {
-            Some(row) => merge_session(&mut sessions, row),
-            None => parse_errors += 1,
+            HistoryLine::Row(row) => merge_session(&mut sessions, row),
+            HistoryLine::LegacyNoSession => legacy_skipped += 1,
+            HistoryLine::Malformed => parse_errors += 1,
         }
     }
 
-    Ok((lines_read, sessions, parse_errors, offset + bytes_read))
+    Ok(HistoryRead {
+        lines_read,
+        sessions,
+        parse_errors,
+        legacy_skipped,
+        new_offset: offset + bytes_read,
+    })
 }
 
 fn trim_line_ending(buf: &[u8]) -> &[u8] {
@@ -208,10 +243,28 @@ fn trim_line_ending(buf: &[u8]) -> &[u8] {
     &buf[..end]
 }
 
-fn parse_history_line(line: &str) -> Option<SessionRegistryRow> {
-    // Match import/mod.rs: parse via sonic_rs into serde_json::Value for field access.
-    let value: serde_json::Value = sonic_rs::from_str(line).ok()?;
+fn parse_history_line(line: &str) -> HistoryLine {
+    let value: serde_json::Value = match sonic_rs::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return HistoryLine::Malformed,
+    };
+    // A prompt row that predates session stamping: `sessionId` is absent
+    // (not empty, not mistyped) while the rest of the prompt shape is intact.
+    if value.is_object()
+        && value.get("sessionId").is_none()
+        && value.get("display").is_some_and(|v| v.is_string())
+        && value.get("timestamp").is_some_and(|v| v.is_number())
+        && value.get("project").is_some_and(|v| v.is_string())
+    {
+        return HistoryLine::LegacyNoSession;
+    }
+    match history_row(&value) {
+        Some(row) => HistoryLine::Row(row),
+        None => HistoryLine::Malformed,
+    }
+}
 
+fn history_row(value: &serde_json::Value) -> Option<SessionRegistryRow> {
     let display = value.get("display")?.as_str()?.to_string();
     let timestamp_ms = value
         .get("timestamp")?
@@ -482,6 +535,65 @@ mod tests {
             counters.contains(&("history".to_string(), 1)),
             "bump once per call: {counters:?}"
         );
+    }
+
+    const LEGACY_LINE: &str = r#"{"display":"old prompt","pastedContents":{},"timestamp":1759000000000,"project":"/p/proj"}"#;
+
+    fn history_counter(storage: &Storage) -> i64 {
+        storage
+            .get_aux_counters()
+            .unwrap()
+            .into_iter()
+            .find(|(k, _)| k == "history")
+            .map(|(_, v)| v)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn legacy_rows_without_session_id_are_skipped_not_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let hist = dir.path().join("history.jsonl");
+        let good = history_line("ok", 1_721_000_000_000, "/p/proj", "s1");
+        write_history(&hist, &[LEGACY_LINE, &good, LEGACY_LINE]);
+
+        let storage = Storage::open_memory().unwrap();
+        let stats = ingest_history(&storage, &hist).unwrap();
+        assert_eq!(stats.parse_errors, 0, "legacy rows are not schema drift");
+        assert_eq!(stats.legacy_skipped, 2);
+        assert_eq!(stats.sessions_upserted, 1);
+        assert_eq!(history_counter(&storage), 0);
+    }
+
+    #[test]
+    fn a_session_id_of_the_wrong_shape_is_still_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let hist = dir.path().join("history.jsonl");
+        let empty_sid =
+            r#"{"display":"x","timestamp":1721000000000,"project":"/p","sessionId":""}"#;
+        let num_sid = r#"{"display":"x","timestamp":1721000000000,"project":"/p","sessionId":7}"#;
+        write_history(&hist, &[empty_sid, num_sid]);
+
+        let storage = Storage::open_memory().unwrap();
+        let stats = ingest_history(&storage, &hist).unwrap();
+        assert_eq!(stats.parse_errors, 2);
+        assert_eq!(stats.legacy_skipped, 0);
+        assert_eq!(history_counter(&storage), 1);
+    }
+
+    #[test]
+    fn a_counter_an_older_build_left_behind_is_never_erased() {
+        let dir = tempfile::tempdir().unwrap();
+        let hist = dir.path().join("history.jsonl");
+        let good = history_line("ok", 1_721_000_000_000, "/p/proj", "s1");
+        write_history(&hist, &[LEGACY_LINE, &good]);
+
+        // State an older build left behind. It may have been a legacy row or a
+        // genuine miss that the file no longer shows; either way it stays.
+        let storage = Storage::open_memory().unwrap();
+        storage.bump_aux_counter("history").unwrap();
+
+        ingest_history(&storage, &hist).unwrap();
+        assert_eq!(history_counter(&storage), 1, "no reconcile pass erases it");
     }
 
     #[test]

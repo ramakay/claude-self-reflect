@@ -1,5 +1,5 @@
 #!/bin/sh
-# Claude Self-Reflect — install script
+# Self-Reflect — install script
 # Downloads the csr-engine binary from GitHub Releases.
 #
 # Usage:
@@ -163,6 +163,18 @@ download_and_install() {
         err "Binary not found in archive"
     fi
 
+    # Stage, then rename over the destination — `mv -f` within one
+    # filesystem is an atomic rename (POSIX), which gives a NEW inode at the
+    # final path and never touches the bytes any already-running
+    # `csr-engine` process has mapped — a live daemon or MCP server keeps
+    # serving its old image cleanly instead of racing a
+    # partially-overwritten Mach-O/ELF it could page-fault into mid-read.
+    # It is also what makes gap-G2's replacement detection observable:
+    # `exe_replaced` compares dev+ino+len+mtime+ctime, and only a fresh
+    # inode (or a real content change) trips it — a straight `cp` onto the
+    # existing path can reuse the same inode and would otherwise go
+    # undetected.
+    #
     # `mv file some-directory` moves the file *into* the directory, which would
     # report a successful install and leave a stray temp file behind. `-d`
     # follows symlinks, so this also refuses a destination link pointing at a
@@ -201,6 +213,43 @@ download_and_install() {
     STAGE_DIR=""
 
     ok "Installed" "${INSTALL_DIR}/${BINARY_NAME}"
+}
+
+# --- Report stale processes + restart the daemon (gap-G2 spec 2e) ---
+#
+# FORWARD-PORT NOTE (gap-G2 review finding 5): this branch's base predates
+# #316 on main, which rewrote this script's staging/rename logic. `git
+# merge-tree main HEAD` conflicts in this file. When this branch lands,
+# reconcile with that rewrite and port this function's logic + a test
+# alongside installer/lib.js's (see the matching note in postinstall.js).
+
+report_stale_and_kickstart() {
+    # `status --stale` is a DB-free fast path (run-registry read + a
+    # liveness check per pid, milliseconds) — NOT the full `status`, whose
+    # SQLite gather measured 8-31s on a 563k-chunk corpus under load
+    # (gap-G2 review finding 2: the old fixed timeout around the full
+    # command missed on 2 of 3 timed runs). Plain per-line text output
+    # (`pid <n> (<role>, started <ts>, parent <p>)`), one full line per
+    # process — `grep -A3` over pretty JSON used to print only the array
+    # opener plus 3 lines of the FIRST entry (gap-G2 review finding 3).
+    if STALE_OUTPUT="$("${INSTALL_DIR}/${BINARY_NAME}" status --stale 2>/dev/null)"; then
+        if [ -n "$STALE_OUTPUT" ]; then
+            STALE_COUNT="$(printf '%s\n' "$STALE_OUTPUT" | grep -c '^pid ' 2>/dev/null || echo 0)"
+            warn "$STALE_COUNT process(es) are still running the previous csr-engine build:"
+            printf '%s\n' "$STALE_OUTPUT" | while IFS= read -r line; do
+                printf '    %s\n' "$line" >&2
+            done
+            printf '  Restart Claude Code sessions (and any other MCP host) using csr-engine to pick up this build.\n' >&2
+        fi
+    else
+        warn "could not determine stale processes"
+    fi
+
+    DAEMON_LABEL="com.ramakay.csr-engine.daemon"
+    if command -v launchctl >/dev/null 2>&1 && launchctl print "gui/$(id -u)/${DAEMON_LABEL}" >/dev/null 2>&1; then
+        info "Restarting" "daemon (${DAEMON_LABEL}) to pick up the new build..."
+        launchctl kickstart -k "gui/$(id -u)/${DAEMON_LABEL}" 2>/dev/null || warn "launchctl kickstart failed; restart the daemon manually."
+    fi
 }
 
 # --- Ensure PATH ---
@@ -597,28 +646,27 @@ check_shadow() {
 # --- Main ---
 
 main() {
-    printf '\n  \033[1mClaude Self-Reflect Installer\033[0m\n\n'
+    printf '\n  \033[1mSelf-Reflect Installer\033[0m\n\n'
 
     detect_platform
 
     # Intel Mac: no prebuilt binaries (ort/ONNX dropped x86_64-apple-darwin)
     if [ "$TARGET" = "x86_64-apple-darwin" ]; then
-        err "Intel Mac (x86_64) binaries are not provided.
-Build from source instead:
-  git clone https://github.com/${REPO}.git
-  cd claude-self-reflect/csr-engine
-  cargo build --release
-  cp target/release/csr-engine ~/.local/bin/"
+        err "Intel Mac (x86_64) is not supported.
+There is no prebuilt binary, and the ONNX runtime has no x86_64-apple-darwin
+build, so the engine cannot be built for this platform either."
     fi
 
     get_latest_version
     download_and_install
     verify
+    report_stale_and_kickstart
     check_path
     check_shadow
 
     # Setup writes hooks into ~/.claude/settings.json, registers the MCP
-    # server, and imports conversation transcripts — that needs explicit
+    # server, imports conversation transcripts, and installs the csr-companion
+    # plugin through Claude Code's plugin CLI — that needs explicit
     # consent. Prompt when a terminal is available; otherwise (CI, piped
     # non-interactive shells) leave activation to the user.
     RUN_SETUP=no
@@ -630,9 +678,15 @@ Build from source instead:
     # the first `> /dev/tty` would then abort the install under `set -e`. Open
     # it for real in a subshell: a failure there is just a false condition.
     elif [ -r /dev/tty ] && ( : > /dev/tty ) 2>/dev/null; then
-        printf '\n  Setup registers the MCP server, installs 6 Claude Code hooks\n' > /dev/tty
-        printf '  into ~/.claude/settings.json, and imports your conversations\n' > /dev/tty
-        printf '  from ~/.claude/projects/ into a local index.\n\n' > /dev/tty
+        printf '\n  Setup registers the MCP server, installs 8 Claude Code hooks\n' > /dev/tty
+        printf '  (on 7 events) into ~/.claude/settings.json, imports your conversations\n' > /dev/tty
+        printf '  from ~/.claude/projects/ into a local index, and installs the\n' > /dev/tty
+        printf "  csr-companion plugin through Claude Code's plugin CLI. On macOS it\n" > /dev/tty
+        printf '  also installs and starts the background daemon (a launchd agent;\n' > /dev/tty
+        printf '  CSR_NO_DAEMON=1 skips it).\n\n' > /dev/tty
+        printf '  Setup also turns on background `claude -p` calls on your Claude plan\n' > /dev/tty
+        printf '  (narratives, briefing, dreams). CSR_NO_AI_NARRATIVES=1 and\n' > /dev/tty
+        printf '  CSR_NO_DREAMING=1 switch them off.\n\n' > /dev/tty
         printf '  \033[1mRun setup now? [Y/n]\033[0m ' > /dev/tty
         answer=""
         # A failed read is not consent — only a successful (possibly empty)

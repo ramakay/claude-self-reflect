@@ -142,6 +142,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
@@ -544,7 +545,7 @@ pub fn resolve_edges(
     // TASK E (WCR Phase 6): memoizes `repo_scan::project_roots` per project
     // across the whole pass — a DB query, and many pending edges typically
     // share a project.
-    let mut roots_cache: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut memo = Memo::default();
 
     for p in &pending {
         // --- drifted (WCR Phase 8, TASK B): already classified externally,
@@ -599,7 +600,7 @@ pub fn resolve_edges(
                 has_import,
                 module_evidence,
                 &imports_module_by_file,
-                &mut roots_cache,
+                &mut memo,
                 file_exists,
                 zero_defs_anywhere,
                 &local_bindings,
@@ -630,7 +631,8 @@ pub fn resolve_edges(
             p,
             module_evidence,
             defs,
-            &project_roots_for(conn, &p.project, &mut roots_cache),
+            &project_roots_for(conn, &p.project, &mut memo),
+            &mut memo,
         )? {
             bind(conn, p, &dst, &evidence)?;
             resolved += 1;
@@ -662,7 +664,7 @@ pub fn resolve_edges(
                 // with (no code_nodes signal, that's the branch we're in) —
                 // genuinely ambiguous, never guess. Unless the file itself is
                 // gone (TASK C): then the ambiguity is moot, it's history.
-                if resolve_stale_or_unexplained(conn, p, file_exists)? {
+                if resolve_stale_or_unexplained(conn, p, file_exists, &mut memo)? {
                     stale += 1;
                 } else {
                     ambiguous_remaining += 1;
@@ -680,7 +682,7 @@ pub fn resolve_edges(
                     has_import,
                     module_evidence,
                     &imports_module_by_file,
-                    &mut roots_cache,
+                    &mut memo,
                     file_exists,
                     true,
                     &local_bindings,
@@ -728,11 +730,11 @@ pub fn resolve_edges(
         }
 
         // B3: corpus-witnessed via co-edit weight, strict 2x margin.
-        let f_canon = canon_path(&p.src_file);
+        let f_canon = canon_path(&p.src_file, &mut memo);
         let mut scored: Vec<(&String, i64)> = Vec::with_capacity(distinct.len());
         for (file, id) in &distinct {
-            let d_canon = canon_path(file);
-            let weight = coedit_weight(conn, &f_canon, &d_canon)?;
+            let d_canon = canon_path(file, &mut memo);
+            let weight = coedit_weight(conn, &f_canon, &d_canon, &mut memo)?;
             scored.push((id, weight));
         }
         // `distinct` iterates file-sorted; a stable sort by weight desc keeps
@@ -743,7 +745,7 @@ pub fn resolve_edges(
         if weight_top >= 2 && weight_top >= 2 * weight_runnerup {
             bind(conn, p, top_id, &format!("coedit:{weight_top}"))?;
             resolved += 1;
-        } else if resolve_stale_or_unexplained(conn, p, file_exists)? {
+        } else if resolve_stale_or_unexplained(conn, p, file_exists, &mut memo)? {
             stale += 1;
         } else {
             ambiguous_remaining += 1;
@@ -932,7 +934,7 @@ fn classify_only(
     has_import: bool,
     module: Option<&str>,
     imports_module_by_file: &BTreeMap<String, BTreeMap<String, String>>,
-    roots_cache: &mut BTreeMap<String, Vec<PathBuf>>,
+    memo: &mut Memo,
     file_exists: &dyn Fn(&str) -> bool,
     zero_defs_anywhere: bool,
     local_bindings: &BTreeMap<(String, String), BTreeSet<(String, String)>>,
@@ -943,7 +945,7 @@ fn classify_only(
         classify_edge(conn, p, &boundary, &evidence)?;
         return Ok(Some("external"));
     }
-    if let Some((boundary, evidence)) = qualifier_tier(conn, p)? {
+    if let Some((boundary, evidence)) = qualifier_tier(conn, p, memo)? {
         // X1b (TASK B): `via:<qualifier>` evidence classifies purely from
         // the qualifier's root, independent of import evidence.
         classify_edge(conn, p, &boundary, &evidence)?;
@@ -956,7 +958,7 @@ fn classify_only(
     // (alongside `from:`), so a second pass over an unchanged DB re-derives
     // the SAME classification from the SAME module value instead of losing
     // it. See `module_for_pending`'s own doc comment.
-    let ns = external_ns_for(conn, &p.src_file, &p.project, roots_cache);
+    let ns = external_ns_for(conn, &p.src_file, &p.project, memo);
     if let Some((boundary, evidence)) = qualifier_import_tier(p, imports_module_by_file, &ns) {
         // X1c (WCR Phase 7, TASK A): qualifier -> import two-hop chain — the
         // qualifier's root itself is an imported symbol, join through its
@@ -973,7 +975,7 @@ fn classify_only(
         }));
     }
     if let Some((boundary, evidence)) =
-        internal_module_tier(p, &project_roots_for(conn, &p.project, roots_cache))
+        internal_module_tier(p, &project_roots_for(conn, &p.project, memo))
     {
         // WCR Phase 7, TASK E: relative/alias import module resolves to a
         // real on-disk file — explained, but not a symbol-level bind (see
@@ -1034,7 +1036,7 @@ fn classify_only(
             }
         }
     }
-    if resolve_stale_or_unexplained(conn, p, file_exists)? {
+    if resolve_stale_or_unexplained(conn, p, file_exists, memo)? {
         return Ok(Some("stale"));
     }
     Ok(None)
@@ -1069,40 +1071,72 @@ fn chain_prefix_matches(binding_chain: &str, call_chain: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('>'))
 }
 
+/// Lookups a resolve pass would otherwise repeat for every pending edge. A
+/// pass is single-threaded and sees the tables it reads unchanged (the loop
+/// only rewrites `code_edges`), so each answer is computed once and kept.
+///
+/// Measured 2026-10-21 on the owner's 9.9 GB database: one pass over a 56-edge
+/// file took 32 s, 70% of it in `coedit_weight`'s self-join and 17% in
+/// `repo_has_module_named` re-reading every file of the project per edge.
+#[derive(Default)]
+struct Memo {
+    /// `repo_scan::project_roots` per project (see `project_roots_for`).
+    roots: BTreeMap<String, Vec<PathBuf>>,
+    /// Per project, every file stem and directory name of its `repo_defs` and
+    /// `code_nodes` files: the answer set of `repo_has_module_named`.
+    module_names: BTreeMap<String, BTreeSet<String>>,
+    /// Per project, the base names of its Python `repo_defs` files.
+    python_files: BTreeMap<String, BTreeSet<String>>,
+    /// `canon_path` per input.
+    canon: BTreeMap<String, String>,
+    /// The caller's `file_exists` answer per `Pending::src_file`.
+    src_file_exists: BTreeMap<String, bool>,
+    /// `external_ns_for` per `(src_file, project)`.
+    ns: BTreeMap<(String, String), Rc<manifest::ExternalNs>>,
+    /// Per canonical file `f`, every file edited in a session that also edited
+    /// `f`, with the count of those sessions (see `coedit_weight`).
+    coedit: BTreeMap<String, BTreeMap<String, i64>>,
+}
+
 /// Memoized `repo_scan::project_roots` lookup shared by `external_ns_for`
 /// (X1's manifest fallback, WCR Phase 6 TASK E) and `internal_module_tier`
 /// (WCR Phase 7 TASK E's alias-module resolution) — both need "this
 /// project's known roots" and a resolve pass typically has many pending
 /// edges sharing a project, so the DB query only runs once per project.
-fn project_roots_for(
-    conn: &Connection,
-    project: &str,
-    roots_cache: &mut BTreeMap<String, Vec<PathBuf>>,
-) -> Vec<PathBuf> {
-    if !roots_cache.contains_key(project) {
+fn project_roots_for(conn: &Connection, project: &str, memo: &mut Memo) -> Vec<PathBuf> {
+    if !memo.roots.contains_key(project) {
         let roots = repo_scan::project_roots(conn, project).unwrap_or_default();
-        roots_cache.insert(project.to_string(), roots);
+        memo.roots.insert(project.to_string(), roots);
     }
-    roots_cache.get(project).cloned().unwrap_or_default()
+    memo.roots.get(project).cloned().unwrap_or_default()
 }
 
 /// TASK E (WCR Phase 6): resolve the external namespaces reachable from a
 /// pending edge's file, falling back to the project's other known roots
 /// when the direct single-file ancestor walk finds no manifest at all.
 /// `roots_cache` memoizes `repo_scan::project_roots` per project across the
-/// whole resolve pass (see `project_roots_for`).
+/// whole resolve pass (see `project_roots_for`); the answer itself is kept per
+/// `(src_file, project)`.
 fn external_ns_for(
     conn: &Connection,
     src_file: &str,
     project: &str,
-    roots_cache: &mut BTreeMap<String, Vec<PathBuf>>,
-) -> manifest::ExternalNs {
-    let ns = manifest::external_namespaces(Path::new(src_file));
-    if !ns.rust_deps.is_empty() || !ns.js_deps.is_empty() {
-        return ns;
+    memo: &mut Memo,
+) -> Rc<manifest::ExternalNs> {
+    let key = (src_file.to_string(), project.to_string());
+    if let Some(ns) = memo.ns.get(&key) {
+        return Rc::clone(ns);
     }
-    let roots = project_roots_for(conn, project, roots_cache);
-    manifest::apply_project_root_fallback(ns, &roots)
+    let ns = manifest::external_namespaces(Path::new(src_file));
+    let ns = if !ns.rust_deps.is_empty() || !ns.js_deps.is_empty() {
+        ns
+    } else {
+        let roots = project_roots_for(conn, project, memo);
+        manifest::apply_project_root_fallback(ns, &roots)
+    };
+    let ns = Rc::new(ns);
+    memo.ns.insert(key, Rc::clone(&ns));
+    ns
 }
 
 /// The root segment of a qualifier path: everything before the first `::`
@@ -1246,7 +1280,11 @@ const PY_RECEIVER_NAMES: &[&str] = &["self", "cls"];
 /// self-contradictory real-world code (you'd call it bare, not qualified,
 /// if you'd imported the trailing name), so the two tiers' inputs don't
 /// realistically overlap.
-fn qualifier_tier(conn: &Connection, p: &Pending) -> Result<Option<(String, String)>> {
+fn qualifier_tier(
+    conn: &Connection,
+    p: &Pending,
+    memo: &mut Memo,
+) -> Result<Option<(String, String)>> {
     if p.kind != "calls" {
         return Ok(None);
     }
@@ -1268,7 +1306,7 @@ fn qualifier_tier(conn: &Connection, p: &Pending) -> Result<Option<(String, Stri
     let lang_key = manifest::builtin_lang_key_from_file(&p.src_file);
     let is_external = match lang_key {
         Some("rust") => {
-            if repo_has_module_named(conn, &p.project, root)? {
+            if repo_has_module_named(conn, &p.project, root, memo)? {
                 false
             } else {
                 let ns = manifest::external_namespaces(Path::new(&p.src_file));
@@ -1280,7 +1318,8 @@ fn qualifier_tier(conn: &Connection, p: &Pending) -> Result<Option<(String, Stri
                 false
             } else {
                 let ns = manifest::external_namespaces(Path::new(&p.src_file));
-                ns.py_stdlib.contains(root) || !repo_has_python_file_named(conn, &p.project, root)?
+                ns.py_stdlib.contains(root)
+                    || !repo_has_python_file_named(conn, &p.project, root, memo)?
             }
         }
         _ => false,
@@ -1366,45 +1405,71 @@ fn qualifier_import_tier(
 /// module path (a local `src/fs.rs` wrapper's `fs::helper()`) as an external
 /// stdlib/dependency reference just because the root segment happens to
 /// collide with a builtin/dep namespace name.
-fn repo_has_module_named(conn: &Connection, project: &str, root: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT file FROM repo_defs WHERE project = ?1
-         UNION
-         SELECT file FROM code_nodes WHERE project = ?1",
-    )?;
-    let files = stmt.query_map(params![project], |row| row.get::<_, String>(0))?;
-    for file in files {
-        let file = file?;
-        let path = Path::new(&file);
-        if path.file_stem().and_then(|s| s.to_str()) == Some(root) {
-            return Ok(true);
+fn repo_has_module_named(
+    conn: &Connection,
+    project: &str,
+    root: &str,
+    memo: &mut Memo,
+) -> Result<bool> {
+    if !memo.module_names.contains_key(project) {
+        let mut names = BTreeSet::new();
+        let mut stmt = conn.prepare(
+            "SELECT file FROM repo_defs WHERE project = ?1
+             UNION
+             SELECT file FROM code_nodes WHERE project = ?1",
+        )?;
+        let files = stmt.query_map(params![project], |row| row.get::<_, String>(0))?;
+        for file in files {
+            let file = file?;
+            let path = Path::new(&file);
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                names.insert(stem.to_string());
+            }
+            for component in path.components() {
+                if let std::path::Component::Normal(n) = component {
+                    if let Some(n) = n.to_str() {
+                        names.insert(n.to_string());
+                    }
+                }
+            }
         }
-        let hit = path
-            .components()
-            .any(|c| matches!(c, std::path::Component::Normal(n) if n.to_str() == Some(root)));
-        if hit {
-            return Ok(true);
-        }
+        memo.module_names.insert(project.to_string(), names);
     }
-    Ok(false)
+    Ok(memo
+        .module_names
+        .get(project)
+        .is_some_and(|names| names.contains(root)))
 }
 
 /// True when `repo_defs` (for `project`) has a Python file whose basename is
 /// exactly `<root>.py`. Backs `qualifier_tier`'s Python rule: the absence of
 /// such a file is (conservative) positive evidence the qualifier root is not
 /// a local module the repo itself defines.
-fn repo_has_python_file_named(conn: &Connection, project: &str, root: &str) -> Result<bool> {
-    let target = format!("{root}.py");
-    let mut stmt =
-        conn.prepare("SELECT DISTINCT file FROM repo_defs WHERE project = ?1 AND lang = 'python'")?;
-    let files = stmt.query_map(params![project], |row| row.get::<_, String>(0))?;
-    for file in files {
-        let file = file?;
-        if Path::new(&file).file_name().and_then(|n| n.to_str()) == Some(target.as_str()) {
-            return Ok(true);
+fn repo_has_python_file_named(
+    conn: &Connection,
+    project: &str,
+    root: &str,
+    memo: &mut Memo,
+) -> Result<bool> {
+    if !memo.python_files.contains_key(project) {
+        let mut names = BTreeSet::new();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT file FROM repo_defs WHERE project = ?1 AND lang = 'python'",
+        )?;
+        let files = stmt.query_map(params![project], |row| row.get::<_, String>(0))?;
+        for file in files {
+            let file = file?;
+            if let Some(name) = Path::new(&file).file_name().and_then(|n| n.to_str()) {
+                names.insert(name.to_string());
+            }
         }
+        memo.python_files.insert(project.to_string(), names);
     }
-    Ok(false)
+    let target = format!("{root}.py");
+    Ok(memo
+        .python_files
+        .get(project)
+        .is_some_and(|names| names.contains(&target)))
 }
 
 /// File extensions/index-suffixes tried, in order, when resolving a
@@ -1503,6 +1568,7 @@ fn module_bind_tier(
     module: Option<&str>,
     defs: Option<&Vec<(String, String)>>,
     project_roots: &[PathBuf],
+    memo: &mut Memo,
 ) -> Result<Option<(String, String)>> {
     let Some(module) = module else {
         return Ok(None);
@@ -1513,19 +1579,19 @@ fn module_bind_tier(
     let Some(resolved) = resolve_module_file(&p.src_file, module, project_roots) else {
         return Ok(None);
     };
-    let resolved_canon = canon_path(&resolved.to_string_lossy());
+    let resolved_canon = canon_path(&resolved.to_string_lossy(), memo);
     let evidence = format!("module_bind:{}", basename(&resolved.to_string_lossy()));
 
     if let Some(defs) = defs {
         for (file, id) in defs {
-            if canon_path(file) == resolved_canon {
+            if canon_path(file, memo) == resolved_canon {
                 return Ok(Some((id.clone(), evidence)));
             }
         }
     }
 
     for (file, _kind) in crate::storage::codegraph::lookup_repo_defs(conn, &p.project, &p.name)? {
-        if canon_path(&file) == resolved_canon {
+        if canon_path(&file, memo) == resolved_canon {
             return Ok(Some((p.dst_id.clone(), evidence)));
         }
     }
@@ -1579,6 +1645,133 @@ fn internal_module_tier(p: &Pending, project_roots: &[PathBuf]) -> Option<(Strin
     ))
 }
 
+/// A write the resolve pass decided on while planning (see [`plan_resolve`]):
+/// the edge it is for, the state the pass read for that edge, and the change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedWrite {
+    src_id: String,
+    dst_id: String,
+    kind: String,
+    /// The `callee_kind`, `evidence` and `boundary` the pass read: a tier
+    /// verdict is a function of them, so [`apply_planned`] writes only to a row
+    /// that still holds them.
+    callee_kind: String,
+    evidence: String,
+    boundary: String,
+    change: Change,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Change {
+    Bind { new_dst: String, evidence: String },
+    Classify { boundary: String, evidence: String },
+    Clear,
+}
+
+impl PlannedWrite {
+    fn of(p: &Pending, change: Change) -> Self {
+        Self {
+            src_id: p.src_id.clone(),
+            dst_id: p.dst_id.clone(),
+            kind: p.kind.clone(),
+            callee_kind: p.callee_kind.clone(),
+            evidence: p.evidence.clone(),
+            boundary: p.boundary.clone(),
+            change,
+        }
+    }
+}
+
+thread_local! {
+    /// Where `bind`/`classify_edge`/`clear_edge` put their writes while a plan
+    /// is being made on this thread; `None` (the default) writes through.
+    static PLAN: std::cell::RefCell<Option<Vec<PlannedWrite>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether this thread is making a plan, so a write is queued, not executed.
+fn planning() -> bool {
+    PLAN.with(|plan| plan.borrow().is_some())
+}
+
+fn plan_push(write: PlannedWrite) {
+    PLAN.with(|plan| {
+        if let Some(writes) = plan.borrow_mut().as_mut() {
+            writes.push(write);
+        }
+    });
+}
+
+/// `resolve_edges` that writes nothing: it reads the graph (hold a read
+/// transaction around the call for one consistent snapshot) and returns the
+/// writes it would have made, in order, with the stats it would have returned.
+/// The per-edge tiers read the maps they loaded at the start, never the rows
+/// they write, so replaying the list with [`apply_planned`] gives what
+/// `resolve_edges` gives. Planning is what lets the project-wide pass run
+/// without the database write lock: only the replay needs it.
+pub fn plan_resolve(
+    conn: &Connection,
+    project: &str,
+    file_exists: &dyn Fn(&str) -> bool,
+) -> Result<(ResolveStats, Vec<PlannedWrite>)> {
+    // Restores the previous (normally absent) plan even if the pass panics.
+    struct Restore(Option<Vec<PlannedWrite>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PLAN.with(|plan| *plan.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(PLAN.with(|plan| plan.borrow_mut().replace(Vec::new())));
+    let stats = resolve_edges(conn, project, file_exists)?;
+    let writes = PLAN
+        .with(|plan| plan.borrow_mut().take())
+        .unwrap_or_default();
+    Ok((stats, writes))
+}
+
+/// Replay a [`plan_resolve`] list, in order, inside the caller's transaction.
+/// Returns how many writes found their edge changed since the plan was made
+/// (re-extracted, or classified by another writer) and left it alone; the
+/// caller must not call the project settled while that is above zero.
+pub fn apply_planned(conn: &Connection, writes: &[PlannedWrite]) -> Result<usize> {
+    const WHERE: &str = "WHERE src_id = ? AND dst_id = ? AND kind = ? AND resolved = 0
+         AND callee_kind = ? AND evidence = ? AND boundary = ?";
+    let mut bind = conn.prepare(&format!(
+        "UPDATE OR REPLACE code_edges SET dst_id = ?, resolved = 1, boundary = '', evidence = ?
+         {WHERE}"
+    ))?;
+    let mut classify = conn.prepare(&format!(
+        "UPDATE code_edges SET boundary = ?, evidence = ? {WHERE}"
+    ))?;
+    let mut clear = conn.prepare(&format!(
+        "UPDATE code_edges SET boundary = '', evidence = '' {WHERE}"
+    ))?;
+    let mut skipped = 0usize;
+    for w in writes {
+        let key = (
+            &w.src_id,
+            &w.dst_id,
+            &w.kind,
+            &w.callee_kind,
+            &w.evidence,
+            &w.boundary,
+        );
+        let changed = match &w.change {
+            Change::Bind { new_dst, evidence } => bind.execute(params![
+                new_dst, evidence, key.0, key.1, key.2, key.3, key.4, key.5
+            ])?,
+            Change::Classify { boundary, evidence } => classify.execute(params![
+                boundary, evidence, key.0, key.1, key.2, key.3, key.4, key.5
+            ])?,
+            Change::Clear => clear.execute(params![key.0, key.1, key.2, key.3, key.4, key.5])?,
+        };
+        if changed == 0 {
+            skipped += 1;
+        }
+    }
+    Ok(skipped)
+}
+
 /// Bind tier: repoint (or, for repo_scan evidence, leave in place) `dst_id`
 /// and flip `resolved`. `UPDATE OR REPLACE` tolerates the PK collision when
 /// two different placeholder names resolve onto the same real target id.
@@ -1586,6 +1779,14 @@ fn internal_module_tier(p: &Pending, project_roots: &[PathBuf]) -> Option<(Strin
 /// even if a prior pass had classified this exact placeholder before a later
 /// def appeared for it.
 fn bind(conn: &Connection, p: &Pending, new_dst: &str, evidence: &str) -> Result<()> {
+    if planning() {
+        let change = Change::Bind {
+            new_dst: new_dst.to_string(),
+            evidence: evidence.to_string(),
+        };
+        plan_push(PlannedWrite::of(p, change));
+        return Ok(());
+    }
     conn.execute(
         "UPDATE OR REPLACE code_edges SET dst_id = ?1, resolved = 1, boundary = '', evidence = ?2
          WHERE src_id = ?3 AND dst_id = ?4 AND kind = ?5",
@@ -1596,6 +1797,14 @@ fn bind(conn: &Connection, p: &Pending, new_dst: &str, evidence: &str) -> Result
 
 /// Classify tier: leave `resolved = 0`, attach `boundary` + `evidence`.
 fn classify_edge(conn: &Connection, p: &Pending, boundary: &str, evidence: &str) -> Result<()> {
+    if planning() {
+        let change = Change::Classify {
+            boundary: boundary.to_string(),
+            evidence: evidence.to_string(),
+        };
+        plan_push(PlannedWrite::of(p, change));
+        return Ok(());
+    }
     conn.execute(
         "UPDATE code_edges SET boundary = ?1, evidence = ?2
          WHERE src_id = ?3 AND dst_id = ?4 AND kind = ?5",
@@ -1609,6 +1818,10 @@ fn classify_edge(conn: &Connection, p: &Pending, boundary: &str, evidence: &str)
 /// if an earlier pass (with less graph data) had classified this exact
 /// placeholder differently.
 fn clear_edge(conn: &Connection, p: &Pending) -> Result<()> {
+    if planning() {
+        plan_push(PlannedWrite::of(p, Change::Clear));
+        return Ok(());
+    }
     conn.execute(
         "UPDATE code_edges SET boundary = '', evidence = ''
          WHERE src_id = ?1 AND dst_id = ?2 AND kind = ?3",
@@ -1631,8 +1844,13 @@ fn resolve_stale_or_unexplained(
     conn: &Connection,
     p: &Pending,
     file_exists: &dyn Fn(&str) -> bool,
+    memo: &mut Memo,
 ) -> Result<bool> {
-    if file_exists(&p.src_file) {
+    let exists = *memo
+        .src_file_exists
+        .entry(p.src_file.clone())
+        .or_insert_with(|| file_exists(&p.src_file));
+    if exists {
         clear_edge(conn, p)?;
         Ok(false)
     } else {
@@ -1653,10 +1871,19 @@ fn repo_candidate_files(conn: &Connection, project: &str, name: &str) -> Result<
 /// `code_evolution.file_path` (which is written as an absolute path) aren't
 /// thrown off by worktree-relative differences. A no-op for paths that don't
 /// exist on disk (e.g. synthetic test paths) — falls back to the input.
-fn canon_path(s: &str) -> String {
-    super::repo_path::canonical_repo_path(Path::new(s))
+fn canon_path(s: &str, memo: &mut Memo) -> String {
+    if let Some(c) = memo.canon.get(s) {
+        return c.clone();
+    }
+    // The warm spelling, always: the plain lookup spells the first path seen in
+    // a directory with no `.git` as given and later ones resolved, so memoizing
+    // it would pin whichever came first for every edge that repeats the path,
+    // and pairs of paths for one file would compare unequal.
+    let c = super::repo_path::canonical_repo_path_warm(Path::new(s))
         .to_string_lossy()
-        .into_owned()
+        .into_owned();
+    memo.canon.insert(s.to_string(), c.clone());
+    c
 }
 
 fn basename(s: &str) -> &str {
@@ -1668,2559 +1895,37 @@ fn basename(s: &str) -> &str {
 
 /// Number of distinct `code_evolution.session_id`s with a row for both `f`
 /// and `d` (already-canonicalized absolute paths).
-fn coedit_weight(conn: &Connection, f: &str, d: &str) -> Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(DISTINCT a.session_id) FROM code_evolution a
-         JOIN code_evolution b ON a.session_id = b.session_id
-         WHERE a.file_path = ?1 AND b.file_path = ?2",
-        params![f, d],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
+///
+/// One grouped query per `f` per pass instead of one self-join per candidate:
+/// every file edited in a session that also edited `f`, with its session
+/// count. The count for `d` is the same number the old
+/// `a.file_path = f AND b.file_path = d AND a.session_id = b.session_id`
+/// join returned, and 0 when `d` shares no session with `f`.
+fn coedit_weight(conn: &Connection, f: &str, d: &str, memo: &mut Memo) -> Result<i64> {
+    if !memo.coedit.contains_key(f) {
+        let mut stmt = conn.prepare(
+            "SELECT file_path, COUNT(DISTINCT session_id) FROM code_evolution
+             WHERE session_id IN (SELECT session_id FROM code_evolution WHERE file_path = ?1)
+             GROUP BY file_path",
+        )?;
+        let rows = stmt.query_map(params![f], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut by_file = BTreeMap::new();
+        for r in rows {
+            let (file, n) = r?;
+            by_file.insert(file, n);
+        }
+        memo.coedit.insert(f.to_string(), by_file);
+    }
+    Ok(memo
+        .coedit
+        .get(f)
+        .and_then(|by_file| by_file.get(d))
+        .copied()
+        .unwrap_or(0))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::codegraph::{self, upsert_node, upsert_repo_defs, EdgeRow, NodeRow};
-    use crate::storage::migrations;
-
-    fn mem() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        migrations::run(&conn).unwrap();
-        conn
-    }
-
-    fn def(id: &str, file: &str, name: &str) -> NodeRow {
-        NodeRow {
-            id: id.into(),
-            repo: "r".into(),
-            project: "proj".into(),
-            file: file.into(),
-            lang: "rust".into(),
-            kind: "function".into(),
-            name: name.into(),
-            first_conv_id: "c".into(),
-            last_conv_id: "c".into(),
-            ..NodeRow::default()
-        }
-    }
-
-    fn module_node(id: &str, file: &str) -> NodeRow {
-        NodeRow {
-            id: id.into(),
-            repo: "r".into(),
-            project: "proj".into(),
-            file: file.into(),
-            lang: "rust".into(),
-            kind: "module".into(),
-            name: file.into(),
-            first_conv_id: "c".into(),
-            last_conv_id: "c".into(),
-            ..NodeRow::default()
-        }
-    }
-
-    fn call_edge(src: &str, name: &str, file: &str) -> EdgeRow {
-        EdgeRow {
-            src_id: src.into(),
-            dst_id: format!("name:{name}"),
-            kind: "calls".into(),
-            src_file: file.into(),
-            resolved: 0,
-            weight: 1.0,
-            ..EdgeRow::default()
-        }
-    }
-
-    fn import_edge(src: &str, name: &str, file: &str) -> EdgeRow {
-        EdgeRow {
-            src_id: src.into(),
-            dst_id: format!("name:{name}"),
-            kind: "imports".into(),
-            src_file: file.into(),
-            resolved: 0,
-            weight: 1.0,
-            ..EdgeRow::default()
-        }
-    }
-
-    /// An `imports` edge carrying `from:<module>` evidence, as extraction
-    /// (Phase 5 TASK 1) now writes it — feeds the X1 module-aware tier.
-    fn import_edge_from(src: &str, name: &str, file: &str, module: &str) -> EdgeRow {
-        EdgeRow {
-            evidence: format!("from:{module}"),
-            ..import_edge(src, name, file)
-        }
-    }
-
-    /// A `calls` edge carrying `via:<qualifier>` evidence, as extraction
-    /// (Phase 6 TASK A) now writes it — feeds the X1b qualifier tier.
-    fn call_edge_via(src: &str, name: &str, file: &str, qualifier: &str) -> EdgeRow {
-        EdgeRow {
-            evidence: format!("via:{qualifier}"),
-            ..call_edge(src, name, file)
-        }
-    }
-
-    fn insert_evolution(conn: &Connection, session_id: &str, file_path: &str) {
-        conn.execute(
-            "INSERT INTO code_evolution (id, session_id, file_path) VALUES (?1, ?2, ?3)",
-            params![format!("{session_id}:{file_path}"), session_id, file_path],
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn resolves_same_file_def() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &def("bar", "a.rs", "bar")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[call_edge("foo", "bar", "a.rs")])
-            .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.total, 1);
-        assert_eq!(stats.resolved, 1);
-        assert_eq!(stats.unexplained, 0);
-
-        let callees = codegraph::query_callees(&conn, "foo", 10).unwrap();
-        assert!(callees.iter().any(|n| n.id == "bar"), "foo -> bar resolved");
-    }
-
-    #[test]
-    fn ambiguous_stays_unresolved() {
-        let conn = mem();
-        // Two defs named `bar` in different files; caller in a third file,
-        // no import edge, no code_evolution — nothing to disambiguate with.
-        upsert_node(&conn, &def("bar_x", "x.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("bar_y", "y.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("foo", "z.rs", "foo")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", "z.rs", &[call_edge("foo", "bar", "z.rs")])
-            .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.total, 1);
-        assert_eq!(stats.resolved, 0, "ambiguous must not be guessed");
-        assert_eq!(stats.ambiguous_remaining, 1);
-
-        // Edge remains a placeholder.
-        let remaining: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM code_edges WHERE resolved = 0 AND dst_id = 'name:bar'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(remaining, 1);
-    }
-
-    #[test]
-    fn project_unique_resolves_cross_file() {
-        let conn = mem();
-        upsert_node(&conn, &def("bar", "x.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("foo", "z.rs", "foo")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", "z.rs", &[call_edge("foo", "bar", "z.rs")])
-            .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.resolved, 1, "unique cross-file name resolves");
-
-        let evidence: String = conn
-            .query_row(
-                "SELECT evidence FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(evidence, "unique_def");
-    }
-
-    #[test]
-    fn import_bound_picks_the_imported_def_over_ambiguity() {
-        let conn = mem();
-        // "bar" is ambiguous in code_nodes (x.rs and y.rs both define it),
-        // but repo_defs (whole-repo scan) knows the real one lives in y.rs,
-        // and z.rs has a textual `import bar` — that combination must win
-        // over the plain ambiguity that `unique_def`/`coedit` alone would
-        // leave unresolved.
-        upsert_node(&conn, &def("bar_x", "x.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("bar_y", "y.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("foo", "z.rs", "foo")).unwrap();
-        upsert_node(&conn, &module_node("z_mod", "z.rs")).unwrap();
-        upsert_repo_defs(
-            &conn,
-            "proj",
-            "y.rs",
-            &[(
-                "bar".to_string(),
-                "function".to_string(),
-                "rust".to_string(),
-            )],
-        )
-        .unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "z.rs",
-            &[
-                import_edge("z_mod", "bar", "z.rs"),
-                call_edge("foo", "bar", "z.rs"),
-            ],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.total, 2,
-            "the imports edge and the calls edge both target bar"
-        );
-        assert_eq!(stats.resolved, 2);
-
-        let (dst, evidence): (String, String) = conn
-            .query_row(
-                "SELECT dst_id, evidence FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            dst, "bar_y",
-            "picks the repo-defs-confirmed import target, not x.rs"
-        );
-        assert_eq!(evidence, "import_bound");
-    }
-
-    #[test]
-    fn coedit_binds_on_strict_margin_and_refuses_without_it() {
-        let conn = mem();
-        // "bar": binds — x.rs shares 2 sessions with z.rs, y.rs shares 0.
-        // 2 >= 2 and 2 >= 2*0 -> binds.
-        upsert_node(&conn, &def("bar_x", "x.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("bar_y", "y.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("foo", "z.rs", "foo")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", "z.rs", &[call_edge("foo", "bar", "z.rs")])
-            .unwrap();
-        for s in ["s1", "s2"] {
-            insert_evolution(&conn, s, "z.rs");
-            insert_evolution(&conn, s, "x.rs");
-        }
-
-        // "baz": refuses — x2.rs shares 3 sessions with z2.rs, y2.rs shares 2.
-        // 3 >= 2 but 3 >= 2*2=4 is false -> must not guess.
-        upsert_node(&conn, &def("baz_x", "x2.rs", "baz")).unwrap();
-        upsert_node(&conn, &def("baz_y", "y2.rs", "baz")).unwrap();
-        upsert_node(&conn, &def("foo2", "z2.rs", "foo2")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", "z2.rs", &[call_edge("foo2", "baz", "z2.rs")])
-            .unwrap();
-        for s in ["t1", "t2", "t3"] {
-            insert_evolution(&conn, s, "z2.rs");
-            insert_evolution(&conn, s, "x2.rs");
-        }
-        for s in ["t1", "t2"] {
-            insert_evolution(&conn, s, "y2.rs");
-        }
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-
-        let (bar_dst, bar_evidence): (String, String) = conn
-            .query_row(
-                "SELECT dst_id, evidence FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            bar_dst, "bar_x",
-            "2-vs-0 margin binds to the co-edited file"
-        );
-        assert_eq!(bar_evidence, "coedit:2");
-
-        let (baz_resolved, baz_dst): (i64, String) = conn
-            .query_row(
-                "SELECT resolved, dst_id FROM code_edges WHERE src_id = 'foo2' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(baz_resolved, 0, "3-vs-2 margin (< 2x) must not guess");
-        assert_eq!(baz_dst, "name:baz");
-
-        assert_eq!(stats.ambiguous_remaining, 1, "only baz stays ambiguous");
-    }
-
-    #[test]
-    fn x1_rust_std_import_classified_external() {
-        let conn = mem();
-        // `use std;` — the bound symbol IS the literal namespace segment.
-        upsert_node(&conn, &module_node("a_mod", "a.rs")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[import_edge("a_mod", "std", "a.rs")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.external, 1);
-        assert_eq!(stats.resolved, 0);
-
-        let (boundary, evidence, resolved): (String, String, i64) = conn
-            .query_row(
-                "SELECT boundary, evidence, resolved FROM code_edges WHERE src_id = 'a_mod' AND kind = 'imports'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "external");
-        assert_eq!(evidence, "import:std");
-        assert_eq!(resolved, 0);
-    }
-
-    #[test]
-    fn x2_method_call_with_no_def_classified() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        let mut e = call_edge("foo", "push", "a.rs");
-        e.callee_kind = "method".into();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.method, 1);
-        assert_eq!(stats.resolved, 0);
-
-        let (boundary, evidence, resolved): (String, String, i64) = conn
-            .query_row(
-                "SELECT boundary, evidence, resolved FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "method");
-        assert_eq!(evidence, "receiver_call");
-        assert_eq!(resolved, 0);
-    }
-
-    // ─── Finding 2: receiver-aware method-call bind gating (WCR truth pass) ───
-
-    #[test]
-    fn method_call_with_unrelated_receiver_does_not_bind_to_same_file_name_collision() {
-        // `receiver.save()` — a same-file, same-named `save` def exists,
-        // but it's an UNRELATED free function, not evidence about what
-        // `receiver` actually is. Before Finding 2, B0 bound purely on
-        // bare-name identity, corrupting provenance while flattering the
-        // internal-binding metric.
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &def("save_a", "a.rs", "save")).unwrap();
-        let mut e = call_edge_via("foo", "save", "a.rs", "receiver");
-        e.callee_kind = "method".into();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.resolved, 0,
-            "must not bind to the unrelated same-file `save`"
-        );
-        assert_eq!(stats.method, 1);
-
-        let (boundary, evidence, resolved, dst_id): (String, String, i64, String) = conn
-            .query_row(
-                "SELECT boundary, evidence, resolved, dst_id FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "method");
-        assert_eq!(evidence, "receiver_call");
-        assert_eq!(resolved, 0);
-        assert_eq!(
-            dst_id, "name:save",
-            "dst_id stays the placeholder — never bound"
-        );
-    }
-
-    #[test]
-    fn method_call_with_self_receiver_binds_via_b0_same_file() {
-        // `self.save()` — an instance method calling its own class's
-        // method. The self/this/cls receiver IS consistent with B0's
-        // same-file assumption, so this must still bind.
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &def("save_a", "a.rs", "save")).unwrap();
-        let mut e = call_edge_via("foo", "save", "a.rs", "self");
-        e.callee_kind = "method".into();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.resolved, 1,
-            "self.save() binds to the same-file `save` def"
-        );
-        assert_eq!(stats.method, 0);
-
-        let (dst_id, resolved, evidence): (String, i64, String) = conn
-            .query_row(
-                "SELECT dst_id, resolved, evidence FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(dst_id, "save_a");
-        assert_eq!(resolved, 1);
-        assert_eq!(evidence, "same_file");
-    }
-
-    #[test]
-    fn method_call_with_non_self_receiver_does_not_bind_via_unique_def_elsewhere() {
-        // `obj.save()` — `save` has exactly ONE `code_nodes` def
-        // project-wide, but it's in a DIFFERENT file. B2 (`unique_def`) is
-        // a cross-file name-only bind tier; `obj` is not self/this/cls, so
-        // it must not reach B2 at all, classifying `method` instead.
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &def("save_b", "b.rs", "save")).unwrap();
-        let mut e = call_edge_via("foo", "save", "a.rs", "obj");
-        e.callee_kind = "method".into();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.resolved, 0,
-            "must not bind via B2 unique_def — obj isn't self/this/cls"
-        );
-        assert_eq!(stats.method, 1);
-
-        let (boundary, evidence, dst_id): (String, String, String) = conn
-            .query_row(
-                "SELECT boundary, evidence, dst_id FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "method");
-        assert_eq!(evidence, "receiver_call");
-        assert_eq!(dst_id, "name:save");
-    }
-
-    #[test]
-    fn method_call_with_no_via_evidence_does_not_bind_to_same_file_name_collision() {
-        // Simulates a Rust `field_expression` receiver call
-        // (`r.map_err(handler)`), which never captures `via:` qualifier
-        // evidence at all (see `extraction::codegraph::call_qualifier`).
-        // `method_bind_gate` treats "no via: data" the same as "receiver
-        // isn't self/this/cls": skip every bind tier, including B0, even
-        // though a same-file same-named def exists.
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &def("handler_a", "a.rs", "handler")).unwrap();
-        let mut e = call_edge("foo", "handler", "a.rs"); // no `via:` evidence
-        e.callee_kind = "method".into();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.resolved, 0,
-            "no via: evidence -> NoBind, even with a same-file name collision"
-        );
-        assert_eq!(stats.method, 1);
-    }
-
-    #[test]
-    fn unexplained_residual_is_counted() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        // No def anywhere, no import edge, plain (non-method) callee_kind —
-        // nothing binds or classifies it.
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[call_edge("foo", "ghost_symbol_xyz", "a.rs")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.total, 1);
-        assert_eq!(stats.resolved, 0);
-        assert_eq!(stats.external, 0);
-        assert_eq!(stats.method, 0);
-        assert_eq!(stats.unexplained, 1);
-        assert_eq!(stats.ambiguous_remaining, 0);
-    }
-
-    #[test]
-    fn resolve_is_deterministic_across_repeated_runs() {
-        let conn = mem();
-        upsert_node(&conn, &def("bar_x", "x.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("bar_y", "y.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("foo", "z.rs", "foo")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", "z.rs", &[call_edge("foo", "bar", "z.rs")])
-            .unwrap();
-
-        let first = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        let second = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(first, second, "repeated passes over unchanged data agree");
-    }
-
-    // ─── X0 builtin/prelude/global tier (WCR Phase 5, TASK 3) ───
-
-    #[test]
-    fn x0_builtin_classifies_per_language() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[call_edge("foo", "Ok", "a.rs")])
-            .unwrap();
-        upsert_node(&conn, &def("run", "b.ts", "run")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", "b.ts", &[call_edge("run", "fetch", "b.ts")])
-            .unwrap();
-        upsert_node(&conn, &def("main_py", "c.py", "main_py")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "c.py",
-            &[call_edge("main_py", "print", "c.py")],
-        )
-        .unwrap();
-        upsert_node(&conn, &def("main_go", "d.go", "main_go")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "d.go",
-            &[call_edge("main_go", "make", "d.go")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.total, 4);
-        assert_eq!(stats.resolved, 0);
-        assert_eq!(
-            stats.external, 4,
-            "Ok/fetch/print/make all classify external via X0"
-        );
-
-        for (src, dst, expected_evidence) in [
-            ("foo", "name:Ok", "builtin:rust"),
-            ("run", "name:fetch", "builtin:js"),
-            ("main_py", "name:print", "builtin:python"),
-            ("main_go", "name:make", "builtin:go"),
-        ] {
-            let (boundary, evidence): (String, String) = conn
-                .query_row(
-                    "SELECT boundary, evidence FROM code_edges WHERE src_id = ?1 AND dst_id = ?2",
-                    params![src, dst],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(boundary, "external", "{src}/{dst}");
-            assert_eq!(evidence, expected_evidence, "{src}/{dst}");
-        }
-    }
-
-    #[test]
-    fn x0_builtin_does_not_fire_when_a_repo_def_exists() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[call_edge("foo", "Ok", "a.rs")])
-            .unwrap();
-        // A whole-repo scan found a (shadowing, user-defined) `Ok` def — X0
-        // must defer to the repo_scan bind tier, never fire alongside it.
-        upsert_repo_defs(
-            &conn,
-            "proj",
-            "custom_ok.rs",
-            &[("Ok".to_string(), "function".to_string(), "rust".to_string())],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.resolved, 1,
-            "single repo_defs candidate binds via repo_scan, not X0"
-        );
-        assert_eq!(stats.external, 0, "X0 must not fire when a repo def exists");
-
-        let (boundary, evidence): (String, String) = conn
-            .query_row(
-                "SELECT boundary, evidence FROM code_edges WHERE src_id = 'foo' AND dst_id = 'name:Ok'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "");
-        assert!(evidence.starts_with("repo_scan:"), "{evidence}");
-    }
-
-    // ─── Module-aware X1 tier (WCR Phase 5, TASK 4) ───
-
-    #[test]
-    fn x1_module_aware_relative_import_is_never_external() {
-        let conn = mem();
-        upsert_node(&conn, &module_node("a_mod", "a.ts")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.ts",
-            &[import_edge_from("a_mod", "helper", "a.ts", "./util")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.external, 0,
-            "relative module specifier must never classify external"
-        );
-        assert_eq!(stats.unexplained, 1);
-    }
-
-    #[test]
-    fn x1_module_aware_bare_node_prefixed_module_matches_builtin() {
-        let conn = mem();
-        upsert_node(&conn, &module_node("a_mod", "a.ts")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.ts",
-            &[import_edge_from("a_mod", "fs", "a.ts", "node:fs")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.external, 1);
-        let (boundary, evidence): (String, String) = conn
-            .query_row(
-                "SELECT boundary, evidence FROM code_edges WHERE src_id = 'a_mod' AND kind = 'imports'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "external");
-        assert_eq!(evidence, "import:node:fs");
-    }
-
-    #[test]
-    fn x1_module_aware_calls_edge_uses_sibling_import_module() {
-        let conn = mem();
-        upsert_node(&conn, &module_node("a_mod", "a.ts")).unwrap();
-        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.ts",
-            &[
-                import_edge_from("a_mod", "fs", "a.ts", "node:fs"),
-                call_edge("foo", "fs", "a.ts"),
-            ],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.total, 2);
-        assert_eq!(
-            stats.external, 2,
-            "both the imports edge and the sibling calls edge classify external"
-        );
-
-        let (boundary, evidence): (String, String) = conn
-            .query_row(
-                "SELECT boundary, evidence FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            boundary, "external",
-            "calls edge inherits the sibling imports edge's module evidence"
-        );
-        assert_eq!(evidence, "import:node:fs");
-    }
-
-    #[test]
-    fn x1_module_present_but_unmatched_suppresses_degraded_name_fallback() {
-        let conn = mem();
-        upsert_node(&conn, &module_node("a_mod", "a.rs")).unwrap();
-        // Bound symbol name "std" WOULD match the degraded (name-only) path,
-        // but the module evidence does not match anything — once module data
-        // is present it fully replaces the degraded match, it is not tried
-        // as a fallback on a module-classification miss.
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[import_edge_from(
-                "a_mod",
-                "std",
-                "a.rs",
-                "zzz_definitely_not_a_real_module_zzz",
-            )],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.external, 0,
-            "module data present but unmatched must not fall back to degraded name match"
-        );
-        assert_eq!(stats.unexplained, 1);
-    }
-
-    #[test]
-    fn resolve_is_deterministic_with_x0_and_module_aware_x1_tiers() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[call_edge("foo", "Ok", "a.rs")])
-            .unwrap();
-        upsert_node(&conn, &module_node("b_mod", "b.ts")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "b.ts",
-            &[import_edge_from("b_mod", "fs", "b.ts", "node:fs")],
-        )
-        .unwrap();
-
-        let first = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        let second = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            first, second,
-            "X0 + module-aware X1 tiers stay deterministic across repeated passes"
-        );
-        assert_eq!(first.external, 2);
-    }
-
-    // ─── X1b qualifier-aware tier (WCR Phase 6, TASK B) ───
-
-    #[test]
-    fn qualifier_tier_rust_path_call_classifies_external_via_stdlib_namespace() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[call_edge_via("foo", "now", "a.rs", "std::time::Instant")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.external, 1,
-            "std::time::Instant::now() classifies external via qualifier root"
-        );
-        assert_eq!(stats.resolved, 0);
-
-        let (boundary, evidence): (String, String) = conn
-            .query_row(
-                "SELECT boundary, evidence FROM code_edges WHERE src_id = 'foo' AND dst_id = 'name:now'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "external");
-        assert_eq!(evidence, "import:std::time::Instant");
-    }
-
-    #[test]
-    fn qualifier_tier_rust_refuses_when_root_matches_a_repo_module_name() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        // The repo happens to have its own module literally named `std.rs` —
-        // the guard must refuse to classify `std::helper()` external just
-        // because "std" also matches the Rust builtin namespace.
-        upsert_node(&conn, &def("marker", "std.rs", "marker")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[call_edge_via("foo", "helper", "a.rs", "std")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.external, 0,
-            "repo-module-name collision must suppress qualifier classification"
-        );
-        assert_eq!(stats.unexplained, 1);
-    }
-
-    #[test]
-    fn qualifier_tier_python_module_call_classifies_external_via_stdlib() {
-        let conn = mem();
-        upsert_node(&conn, &def("handler", "a.py", "handler")).unwrap();
-        // Realistic: Python's `attribute` AST node makes `json.dumps()`
-        // callee_kind = "method" same as `self.run()` — the qualifier tier
-        // must take priority over X2 so this classifies `external`, not the
-        // vaguer `method`/receiver_call bucket.
-        let mut e = call_edge_via("handler", "dumps", "a.py", "json");
-        e.callee_kind = "method".to_string();
-        codegraph::replace_file_edges(&conn, "proj", "a.py", &[e]).unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.external, 1,
-            "json.dumps() classifies external via qualifier, ahead of X2 method"
-        );
-        assert_eq!(stats.method, 0);
-
-        let (boundary, evidence): (String, String) = conn
-            .query_row(
-                "SELECT boundary, evidence FROM code_edges WHERE src_id = 'handler' AND dst_id = 'name:dumps'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "external");
-        assert_eq!(evidence, "import:json");
-    }
-
-    #[test]
-    fn qualifier_tier_python_self_receiver_never_classifies_external() {
-        let conn = mem();
-        upsert_node(&conn, &def("handler", "a.py", "handler")).unwrap();
-        // Realistic callee_kind: Python's `attribute` node can't
-        // syntactically distinguish `self.run()` from `json.dumps()`, both
-        // are "method". `self` must fall through to the generic X2 tier
-        // instead of being misclassified `external`.
-        let mut e = call_edge_via("handler", "run", "a.py", "self");
-        e.callee_kind = "method".to_string();
-        codegraph::replace_file_edges(&conn, "proj", "a.py", &[e]).unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.external, 0,
-            "self.run() must never classify external — self is a receiver, not a module"
-        );
-        assert_eq!(
-            stats.method, 1,
-            "falls through to the generic X2 method tier instead"
-        );
-        assert_eq!(stats.unexplained, 0);
-    }
-
-    #[test]
-    fn qualifier_tier_python_refuses_when_repo_owns_the_module_file() {
-        let conn = mem();
-        upsert_node(&conn, &def("handler", "a.py", "handler")).unwrap();
-        upsert_repo_defs(
-            &conn,
-            "proj",
-            "myutil.py",
-            &[(
-                "real_fn".to_string(),
-                "function".to_string(),
-                "python".to_string(),
-            )],
-        )
-        .unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.py",
-            &[call_edge_via("handler", "helper", "a.py", "myutil")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.external, 0,
-            "myutil.py exists in this repo — must not classify external"
-        );
-        assert_eq!(stats.unexplained, 1);
-    }
-
-    #[test]
-    fn qualifier_tier_ignores_non_calls_edges() {
-        let conn = mem();
-        upsert_node(&conn, &module_node("a_mod", "a.py")).unwrap();
-        // `via:` evidence only exists on `calls` edges (TASK A); an imports
-        // edge that somehow carried one (shouldn't happen) must not trip
-        // X1b. Bound symbol name is deliberately NOT a stdlib name itself
-        // (unlike the qualifier), isolating this from the pre-existing
-        // degraded X1 name-only match — this test is purely about
-        // `qualifier_tier`'s own `p.kind != "calls"` guard.
-        let mut e = import_edge_from("a_mod", "totally_unknown_symbol_xyz", "a.py", "os");
-        e.evidence = "via:os".to_string();
-        codegraph::replace_file_edges(&conn, "proj", "a.py", &[e]).unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.external, 0);
-        assert_eq!(stats.unexplained, 1);
-    }
-
-    // ─── Stale-file tier (WCR Phase 6, TASK C) ───
-
-    #[test]
-    fn stale_tier_classifies_when_src_file_is_missing_on_disk() {
-        const GONE: &str = "/definitely/does/not/exist/on/disk/a.rs";
-        let conn = mem();
-        upsert_node(&conn, &def("foo", GONE, "foo")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            GONE,
-            &[call_edge("foo", "ghost_symbol_xyz", GONE)],
-        )
-        .unwrap();
-
-        let stats =
-            resolve_edges(&conn, "proj", &|f: &str| std::path::Path::new(f).is_file()).unwrap();
-        assert_eq!(stats.total, 1);
-        assert_eq!(
-            stats.stale, 1,
-            "missing file must classify stale, not unexplained"
-        );
-        assert_eq!(stats.unexplained, 0);
-        assert_eq!(stats.resolved, 0);
-        assert_eq!(stats.external, 0);
-        assert_eq!(stats.method, 0);
-        assert_eq!(
-            stats.closure_rate, 1.0,
-            "stale counts toward closure like external/method"
-        );
-
-        let (boundary, evidence, resolved): (String, String, i64) = conn
-            .query_row(
-                "SELECT boundary, evidence, resolved FROM code_edges
-                 WHERE src_id = 'foo' AND dst_id = 'name:ghost_symbol_xyz'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "stale");
-        assert_eq!(evidence, "file_missing");
-        assert_eq!(
-            resolved, 0,
-            "stale never binds — dst_id stays a placeholder"
-        );
-    }
-
-    #[test]
-    fn stale_tier_does_not_fire_when_file_exists_on_disk() {
-        let tmp = tempfile::tempdir().unwrap();
-        let file_path = tmp.path().join("a.rs");
-        std::fs::write(&file_path, "fn foo() {}\n").unwrap();
-        let file_str = file_path.to_string_lossy().to_string();
-
-        let conn = mem();
-        upsert_node(&conn, &def("foo", &file_str, "foo")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            &file_str,
-            &[call_edge("foo", "ghost_symbol_xyz", &file_str)],
-        )
-        .unwrap();
-
-        let stats =
-            resolve_edges(&conn, "proj", &|f: &str| std::path::Path::new(f).is_file()).unwrap();
-        assert_eq!(stats.stale, 0, "existing file must not classify stale");
-        assert_eq!(stats.unexplained, 1);
-    }
-
-    #[test]
-    fn stale_tier_reclassifies_a_would_be_ambiguous_edge_when_file_missing() {
-        const GONE: &str = "/definitely/does/not/exist/on/disk/z.rs";
-        let conn = mem();
-        // Two defs named `bar` in different (existing-path) files; caller's
-        // own file is missing — the file-existence check runs before the
-        // ambiguity is even considered, so it must win.
-        upsert_node(&conn, &def("bar_x", "x.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("bar_y", "y.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("foo", GONE, "foo")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", GONE, &[call_edge("foo", "bar", GONE)])
-            .unwrap();
-
-        let stats =
-            resolve_edges(&conn, "proj", &|f: &str| std::path::Path::new(f).is_file()).unwrap();
-        assert_eq!(
-            stats.stale, 1,
-            "would-be-ambiguous edge in a missing file classifies stale instead"
-        );
-        assert_eq!(stats.ambiguous_remaining, 0);
-    }
-
-    #[test]
-    fn stale_tier_never_preempts_a_successful_bind() {
-        // B0 same-file bind must still fire even when the file is reported
-        // missing — staleness only applies to the leftover unexplained
-        // remainder, never to edges that already bound to a real def.
-        const GONE: &str = "/definitely/does/not/exist/on/disk/a.rs";
-        let conn = mem();
-        upsert_node(&conn, &def("foo", GONE, "foo")).unwrap();
-        upsert_node(&conn, &def("bar", GONE, "bar")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", GONE, &[call_edge("foo", "bar", GONE)])
-            .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| false).unwrap();
-        assert_eq!(stats.resolved, 1, "same-file bind unaffected by staleness");
-        assert_eq!(stats.stale, 0);
-    }
-
-    #[test]
-    fn resolve_is_deterministic_with_stale_and_qualifier_tiers() {
-        const GONE: &str = "/definitely/does/not/exist/on/disk/a.rs";
-        let conn = mem();
-        upsert_node(&conn, &def("foo", GONE, "foo")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            GONE,
-            &[
-                call_edge("foo", "ghost_symbol_xyz", GONE),
-                call_edge_via("foo", "now", GONE, "std::time::Instant"),
-            ],
-        )
-        .unwrap();
-
-        let checker: &dyn Fn(&str) -> bool = &|f: &str| std::path::Path::new(f).is_file();
-        let first = resolve_edges(&conn, "proj", checker).unwrap();
-        let second = resolve_edges(&conn, "proj", checker).unwrap();
-        assert_eq!(first, second, "stale + qualifier tiers stay deterministic");
-        assert_eq!(first.stale, 1);
-        assert_eq!(first.external, 1);
-    }
-
-    // ─── Qualifier -> import two-hop chain (WCR Phase 7, TASK A) ───
-
-    #[test]
-    fn qualifier_import_tier_rust_binds_via_sibling_import_module() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &module_node("a_mod", "a.rs")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[
-                import_edge_from("a_mod", "Instant", "a.rs", "std::time"),
-                call_edge_via("foo", "now", "a.rs", "Instant"),
-            ],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.external, 2,
-            "both the Instant import edge and the now() call classify external: {stats:?}"
-        );
-
-        let evidence: String = conn
-            .query_row(
-                "SELECT evidence FROM code_edges WHERE src_id = 'foo' AND dst_id = 'name:now'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            evidence, "import:std::time::Instant",
-            "reconstructs the fully-qualified path the `use` statement elided"
-        );
-    }
-
-    #[test]
-    fn qualifier_import_tier_rust_bare_use_module_binding() {
-        // `use std::env;` then `env::temp_dir()` — the qualifier root `env`
-        // is not itself a builtin/dep name, but the sibling import edge for
-        // `env` carries `from:std` evidence. (Deliberately NOT `use
-        // std::fs;` + `fs::...` — `fs` coincidentally collides with
-        // `manifest::NODE_BUILTINS`, so `qualifier_tier`'s own direct check
-        // already classifies it without ever reaching this two-hop tier;
-        // `env` has no such cross-language collision.)
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &module_node("a_mod", "a.rs")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[
-                import_edge_from("a_mod", "env", "a.rs", "std"),
-                call_edge_via("foo", "temp_dir", "a.rs", "env"),
-            ],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.external, 2, "{stats:?}");
-
-        let evidence: String = conn
-            .query_row(
-                "SELECT evidence FROM code_edges WHERE src_id = 'foo' AND dst_id = 'name:temp_dir'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(evidence, "import:std::env");
-    }
-
-    #[test]
-    fn qualifier_import_tier_requires_a_same_file_import_with_module_evidence() {
-        // No import edge for `Instant` in this file at all — must not guess.
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[call_edge_via("foo", "now", "a.rs", "Instant")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.external, 0, "{stats:?}");
-        assert_eq!(stats.unexplained, 1);
-    }
-
-    #[test]
-    fn qualifier_import_tier_does_not_fire_for_javascript() {
-        // Deliberately out of scope (see qualifier_import_tier's doc
-        // comment on replay-safety) — a JS/TS `via:` qualifier backed by a
-        // same-file import must not be two-hop-joined.
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
-        upsert_node(&conn, &module_node("a_mod", "a.ts")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.ts",
-            &[
-                import_edge_from("a_mod", "obj", "a.ts", "some-real-package"),
-                call_edge_via("foo", "helper_call", "a.ts", "obj"),
-            ],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.external, 0,
-            "JS/TS is out of scope for the two-hop chain: {stats:?}"
-        );
-    }
-
-    #[test]
-    fn resolve_is_deterministic_with_qualifier_import_tier() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &module_node("a_mod", "a.rs")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[
-                import_edge_from("a_mod", "env", "a.rs", "std"),
-                call_edge_via("foo", "temp_dir", "a.rs", "env"),
-            ],
-        )
-        .unwrap();
-
-        let first = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        let second = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            first, second,
-            "qualifier-import two-hop tier stays deterministic across repeated passes"
-        );
-        assert_eq!(first.external, 2);
-
-        let evidence: String = conn
-            .query_row(
-                "SELECT evidence FROM code_edges WHERE src_id = 'foo' AND dst_id = 'name:temp_dir'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            evidence, "import:std::env",
-            "evidence must stay byte-identical across the repeated pass"
-        );
-    }
-
-    // ─── Installed-package witness (WCR Phase 7, TASK B) ───
-
-    #[test]
-    fn installed_package_witness_classifies_external_via_node_modules_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("app");
-        let src_dir = root.join("src");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        // `@expo/vector-icons` is deliberately NOT declared — only `expo`
-        // is, matching the real-world "Feather -> @expo/vector-icons"
-        // transitive/bundled dependency case.
-        std::fs::write(
-            root.join("package.json"),
-            r#"{"dependencies": {"expo": "1.0.0"}}"#,
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("node_modules/@expo/vector-icons")).unwrap();
-        let src_file = src_dir.join("Icon.tsx");
-        std::fs::write(&src_file, "// icon\n").unwrap();
-        let src_file_str = src_file.to_string_lossy().to_string();
-
-        let conn = mem();
-        upsert_node(&conn, &module_node("a_mod", &src_file_str)).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            &src_file_str,
-            &[import_edge_from(
-                "a_mod",
-                "Feather",
-                &src_file_str,
-                "@expo/vector-icons",
-            )],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.external, 1,
-            "transitive/bundled dep must classify external via node_modules witness: {stats:?}"
-        );
-
-        let (boundary, evidence): (String, String) = conn
-            .query_row(
-                "SELECT boundary, evidence FROM code_edges WHERE src_id = 'a_mod' AND kind = 'imports'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "external");
-        assert_eq!(evidence, "installed:@expo/vector-icons");
-    }
-
-    #[test]
-    fn installed_package_witness_does_not_fire_when_package_is_absent_everywhere() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("app");
-        let src_dir = root.join("src");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        std::fs::write(root.join("package.json"), "{}").unwrap();
-        let src_file = src_dir.join("a.ts");
-        std::fs::write(&src_file, "// a\n").unwrap();
-        let src_file_str = src_file.to_string_lossy().to_string();
-
-        let conn = mem();
-        upsert_node(&conn, &module_node("a_mod", &src_file_str)).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            &src_file_str,
-            &[import_edge_from(
-                "a_mod",
-                "Thing",
-                &src_file_str,
-                "totally-not-installed-anywhere",
-            )],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.external, 0, "{stats:?}");
-        assert_eq!(stats.unexplained, 1);
-    }
-
-    // ─── Internal-module-file witness fallback (WCR Phase 7, TASK E) ───
-
-    #[test]
-    fn internal_module_tier_classifies_when_relative_target_file_exists_on_disk() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src_dir = tmp.path().join("src");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        let src_file = src_dir.join("a.ts");
-        std::fs::write(&src_file, "// a\n").unwrap();
-        // No code_nodes/repo_defs def recorded for `util` — only the FILE
-        // itself is real.
-        std::fs::write(src_dir.join("util.ts"), "export const x = 1;\n").unwrap();
-        let src_file_str = src_file.to_string_lossy().to_string();
-
-        let conn = mem();
-        upsert_node(&conn, &module_node("a_mod", &src_file_str)).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            &src_file_str,
-            &[import_edge_from("a_mod", "helper", &src_file_str, "./util")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.internal_module, 1, "{stats:?}");
-        assert_eq!(stats.unexplained, 0);
-        assert_eq!(
-            stats.external, 0,
-            "relative module must never classify external"
-        );
-
-        let (boundary, evidence): (String, String) = conn
-            .query_row(
-                "SELECT boundary, evidence FROM code_edges WHERE src_id = 'a_mod' AND kind = 'imports'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "internal_module");
-        assert_eq!(evidence, "module_file:util.ts");
-    }
-
-    #[test]
-    fn internal_module_tier_resolves_directory_index_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src_dir = tmp.path().join("src");
-        std::fs::create_dir_all(src_dir.join("widgets")).unwrap();
-        let src_file = src_dir.join("a.ts");
-        std::fs::write(&src_file, "// a\n").unwrap();
-        std::fs::write(src_dir.join("widgets/index.ts"), "export const w = 1;\n").unwrap();
-        let src_file_str = src_file.to_string_lossy().to_string();
-
-        let conn = mem();
-        upsert_node(&conn, &module_node("a_mod", &src_file_str)).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            &src_file_str,
-            &[import_edge_from(
-                "a_mod",
-                "Widget",
-                &src_file_str,
-                "./widgets",
-            )],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.internal_module, 1, "{stats:?}");
-        let evidence: String = conn
-            .query_row(
-                "SELECT evidence FROM code_edges WHERE src_id = 'a_mod' AND kind = 'imports'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(evidence, "module_file:index.ts");
-    }
-
-    #[test]
-    fn internal_module_tier_does_not_fire_when_target_file_is_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src_dir = tmp.path().join("src");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        let src_file = src_dir.join("a.ts");
-        std::fs::write(&src_file, "// a\n").unwrap();
-        let src_file_str = src_file.to_string_lossy().to_string();
-
-        let conn = mem();
-        upsert_node(&conn, &module_node("a_mod", &src_file_str)).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            &src_file_str,
-            &[import_edge_from("a_mod", "ghost", &src_file_str, "./ghost")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.internal_module, 0, "{stats:?}");
-        assert_eq!(stats.unexplained, 1, "no file backs ./ghost anywhere");
-    }
-
-    #[test]
-    fn internal_module_tier_alias_resolves_against_project_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("app");
-        let src_dir = root.join("src/screens");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        std::fs::write(root.join("package.json"), "{}").unwrap();
-        // `@/components/Button` resolves project-root-relative (see
-        // manifest::is_relative_module's doc comment).
-        std::fs::create_dir_all(root.join("components")).unwrap();
-        std::fs::write(
-            root.join("components/Button.tsx"),
-            "export const Button = 1;\n",
-        )
-        .unwrap();
-        let src_file = src_dir.join("Home.tsx");
-        std::fs::write(&src_file, "// home\n").unwrap();
-        let src_file_str = src_file.to_string_lossy().to_string();
-
-        let conn = mem();
-        // `repo_scan::project_roots` derives roots from `code_nodes.file` —
-        // seed one pointing at this project so the alias resolution has a
-        // root candidate to try.
-        upsert_node(
-            &conn,
-            &NodeRow {
-                id: "root_anchor".into(),
-                project: "proj".into(),
-                file: src_file_str.clone(),
-                kind: "function".into(),
-                name: "anchor".into(),
-                ..NodeRow::default()
-            },
-        )
-        .unwrap();
-        upsert_node(&conn, &module_node("a_mod", &src_file_str)).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            &src_file_str,
-            &[import_edge_from(
-                "a_mod",
-                "Button",
-                &src_file_str,
-                "@/components/Button",
-            )],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.internal_module, 1, "{stats:?}");
-        let evidence: String = conn
-            .query_row(
-                "SELECT evidence FROM code_edges WHERE src_id = 'a_mod' AND kind = 'imports'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(evidence, "module_file:Button.tsx");
-    }
-
-    #[test]
-    fn internal_module_tier_ignores_calls_edges() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src_dir = tmp.path().join("src");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        let src_file = src_dir.join("a.ts");
-        std::fs::write(&src_file, "// a\n").unwrap();
-        std::fs::write(src_dir.join("util.ts"), "export const x = 1;\n").unwrap();
-        let src_file_str = src_file.to_string_lossy().to_string();
-
-        let conn = mem();
-        upsert_node(&conn, &def("foo", &src_file_str, "foo")).unwrap();
-        let mut e = call_edge("foo", "helper", &src_file_str);
-        // Defensive only: `via:`/`from:`-shaped evidence should never
-        // appear on a real calls edge here, but the guard must hold
-        // regardless of what the evidence column happens to contain.
-        e.evidence = "from:./util".to_string();
-        codegraph::replace_file_edges(&conn, "proj", &src_file_str, &[e]).unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.internal_module, 0,
-            "internal_module_tier is imports-only: {stats:?}"
-        );
-    }
-
-    #[test]
-    fn resolve_is_deterministic_with_internal_module_tier() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src_dir = tmp.path().join("src");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        let src_file = src_dir.join("a.ts");
-        std::fs::write(&src_file, "// a\n").unwrap();
-        std::fs::write(src_dir.join("util.ts"), "export const x = 1;\n").unwrap();
-        let src_file_str = src_file.to_string_lossy().to_string();
-
-        let conn = mem();
-        upsert_node(&conn, &module_node("a_mod", &src_file_str)).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            &src_file_str,
-            &[import_edge_from("a_mod", "helper", &src_file_str, "./util")],
-        )
-        .unwrap();
-
-        let first = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        let second = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            first, second,
-            "internal_module tier stays deterministic across repeated passes"
-        );
-        assert_eq!(first.internal_module, 1);
-
-        let evidence: String = conn
-            .query_row(
-                "SELECT evidence FROM code_edges WHERE src_id = 'a_mod' AND kind = 'imports'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(evidence, "module_file:util.ts");
-    }
-
-    // ─── B1 module-path precise bind (WCR Phase 8, TASK A) ───
-
-    #[test]
-    fn module_bind_tier_precise_import_disambiguates_many_candidates() {
-        // The classic per-component `styles` const collision: TWO files each
-        // define a same-named `styles` symbol, but ComponentA's own
-        // `import { styles } from './ComponentA.styles'` names exactly one
-        // of them. Without B1 this would fall to B3 coedit (no margin, no
-        // code_evolution rows here) and land in `ambiguous_remaining`.
-        let tmp = tempfile::tempdir().unwrap();
-        let src_dir = tmp.path().join("src/components");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        std::fs::write(src_dir.join("ComponentA.styles.ts"), "// a styles\n").unwrap();
-        std::fs::write(src_dir.join("ComponentB.styles.ts"), "// b styles\n").unwrap();
-        let a_styles_str = src_dir
-            .join("ComponentA.styles.ts")
-            .to_string_lossy()
-            .to_string();
-        let b_styles_str = src_dir
-            .join("ComponentB.styles.ts")
-            .to_string_lossy()
-            .to_string();
-        let comp_a_str = src_dir.join("ComponentA.tsx").to_string_lossy().to_string();
-
-        let conn = mem();
-        upsert_node(&conn, &def("styles_a", &a_styles_str, "styles")).unwrap();
-        upsert_node(&conn, &def("styles_b", &b_styles_str, "styles")).unwrap();
-        upsert_node(&conn, &module_node("a_mod", &comp_a_str)).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            &comp_a_str,
-            &[import_edge_from(
-                "a_mod",
-                "styles",
-                &comp_a_str,
-                "./ComponentA.styles",
-            )],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.resolved, 1,
-            "precise module-path bind despite two `styles` candidates: {stats:?}"
-        );
-        assert_eq!(
-            stats.ambiguous_remaining, 0,
-            "an import naming one specific file is not ambiguous"
-        );
-
-        let (dst, evidence): (String, String) = conn
-            .query_row(
-                "SELECT dst_id, evidence FROM code_edges WHERE src_id = 'a_mod' AND kind = 'imports'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            dst, "styles_a",
-            "binds to the file the import names, not styles_b"
-        );
-        assert_eq!(evidence, "module_bind:ComponentA.styles.ts");
-    }
-
-    #[test]
-    fn module_bind_tier_works_for_a_calls_edge_via_sibling_import() {
-        // Same shape, but the pending edge is a `calls` edge for `styles`
-        // (not the `imports` edge itself) — module evidence must come from
-        // the SAME-FILE SIBLING `imports` edge (`module_for_pending`'s
-        // calls-edge branch).
-        let tmp = tempfile::tempdir().unwrap();
-        let src_dir = tmp.path().join("src/components");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        std::fs::write(src_dir.join("ComponentA.styles.ts"), "// a styles\n").unwrap();
-        std::fs::write(src_dir.join("ComponentB.styles.ts"), "// b styles\n").unwrap();
-        let a_styles_str = src_dir
-            .join("ComponentA.styles.ts")
-            .to_string_lossy()
-            .to_string();
-        let b_styles_str = src_dir
-            .join("ComponentB.styles.ts")
-            .to_string_lossy()
-            .to_string();
-        let comp_a_str = src_dir.join("ComponentA.tsx").to_string_lossy().to_string();
-
-        let conn = mem();
-        upsert_node(&conn, &def("styles_a", &a_styles_str, "styles")).unwrap();
-        upsert_node(&conn, &def("styles_b", &b_styles_str, "styles")).unwrap();
-        upsert_node(&conn, &def("render", &comp_a_str, "render")).unwrap();
-        upsert_node(&conn, &module_node("a_mod", &comp_a_str)).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            &comp_a_str,
-            &[
-                import_edge_from("a_mod", "styles", &comp_a_str, "./ComponentA.styles"),
-                call_edge("render", "styles", &comp_a_str),
-            ],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.total, 2);
-        assert_eq!(stats.resolved, 2, "both edges bind: {stats:?}");
-        assert_eq!(stats.ambiguous_remaining, 0);
-
-        let dst: String = conn
-            .query_row(
-                "SELECT dst_id FROM code_edges WHERE src_id = 'render' AND kind = 'calls'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            dst, "styles_a",
-            "calls edge inherits the sibling import's precise binding"
-        );
-    }
-
-    #[test]
-    fn module_bind_tier_falls_through_when_module_resolves_to_no_file() {
-        // Relative import evidence is present, but the module doesn't
-        // resolve to any real file on disk — module_bind_tier must no-op,
-        // falling through to the old ambiguity-resolution behavior (no
-        // repo_defs, no code_evolution margin -> stays ambiguous).
-        let conn = mem();
-        upsert_node(&conn, &def("styles_x", "x.ts", "styles")).unwrap();
-        upsert_node(&conn, &def("styles_y", "y.ts", "styles")).unwrap();
-        upsert_node(&conn, &module_node("z_mod", "z.ts")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "z.ts",
-            &[import_edge_from(
-                "z_mod",
-                "styles",
-                "z.ts",
-                "./this_module_does_not_exist_anywhere_zzz",
-            )],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.resolved, 0,
-            "module doesn't resolve to a real file — must never guess: {stats:?}"
-        );
-        assert_eq!(stats.ambiguous_remaining, 1);
-    }
-
-    #[test]
-    fn module_bind_tier_no_import_evidence_multi_candidate_still_ambiguous() {
-        // No `from:<module>` data at all on the imports edge (old-style,
-        // pre-Phase-5 evidence shape) — module_for_pending must return
-        // `None`, module_bind_tier must no-op, and multiple code_nodes
-        // candidates stay genuinely ambiguous exactly as before B1 existed.
-        let conn = mem();
-        upsert_node(&conn, &def("styles_x", "x.ts", "styles")).unwrap();
-        upsert_node(&conn, &def("styles_y", "y.ts", "styles")).unwrap();
-        upsert_node(&conn, &module_node("z_mod", "z.ts")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "z.ts",
-            &[import_edge("z_mod", "styles", "z.ts")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.resolved, 0, "{stats:?}");
-        assert_eq!(stats.ambiguous_remaining, 1);
-    }
-
-    #[test]
-    fn resolve_is_deterministic_with_module_bind_tier() {
-        // module_bind is a BIND tier: once it binds, `resolved = 1` and the
-        // edge drops out of a SECOND pass's pending set entirely (unlike the
-        // classify tiers' "resolve_is_deterministic_with_X_tier" pattern
-        // above, which re-run on the same still-pending edge). The
-        // meaningful determinism property for a bind tier is "same input on
-        // fresh state always makes the same choice" — checked here across
-        // two independently seeded connections, matching how B0/B1b/B2/B3
-        // (which have no dedicated determinism tests of their own either,
-        // for the same reason) are implicitly covered by
-        // `resolve_is_deterministic_across_repeated_runs`'s AMBIGUOUS
-        // (never-binding) scenario instead.
-        fn seed_and_resolve() -> ResolveStats {
-            let tmp = tempfile::tempdir().unwrap();
-            let src_dir = tmp.path().join("src/components");
-            std::fs::create_dir_all(&src_dir).unwrap();
-            std::fs::write(src_dir.join("ComponentA.styles.ts"), "// a styles\n").unwrap();
-            std::fs::write(src_dir.join("ComponentB.styles.ts"), "// b styles\n").unwrap();
-            let a_styles_str = src_dir
-                .join("ComponentA.styles.ts")
-                .to_string_lossy()
-                .to_string();
-            let b_styles_str = src_dir
-                .join("ComponentB.styles.ts")
-                .to_string_lossy()
-                .to_string();
-            let comp_a_str = src_dir.join("ComponentA.tsx").to_string_lossy().to_string();
-
-            let conn = mem();
-            upsert_node(&conn, &def("styles_a", &a_styles_str, "styles")).unwrap();
-            upsert_node(&conn, &def("styles_b", &b_styles_str, "styles")).unwrap();
-            upsert_node(&conn, &module_node("a_mod", &comp_a_str)).unwrap();
-            codegraph::replace_file_edges(
-                &conn,
-                "proj",
-                &comp_a_str,
-                &[import_edge_from(
-                    "a_mod",
-                    "styles",
-                    &comp_a_str,
-                    "./ComponentA.styles",
-                )],
-            )
-            .unwrap();
-
-            resolve_edges(&conn, "proj", &|_: &str| true).unwrap()
-        }
-
-        let first = seed_and_resolve();
-        let second = seed_and_resolve();
-        assert_eq!(
-            first, second,
-            "module_bind tier makes the same choice on fresh, identically seeded state"
-        );
-        assert_eq!(first.resolved, 1);
-        assert_eq!(first.ambiguous_remaining, 0);
-    }
-
-    // ─── drifted tier (WCR Phase 8, TASK B) ───
-
-    #[test]
-    fn drifted_edge_is_skipped_by_all_tiers_and_counted() {
-        let conn = mem();
-        // A same-file def named `bar` exists — this WOULD bind via B0 if
-        // reached. A pre-set `boundary = 'drifted'` must prevent that: every
-        // tier, including B0, is skipped for a drifted edge.
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &def("bar", "a.rs", "bar")).unwrap();
-        let mut e = call_edge("foo", "bar", "a.rs");
-        e.boundary = "drifted".to_string();
-        e.evidence = "not_in_current_source".to_string();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.total, 1);
-        assert_eq!(stats.drifted, 1);
-        assert_eq!(
-            stats.resolved, 0,
-            "drifted edge must never bind, even though bar is same-file"
-        );
-        assert_eq!(stats.unexplained, 0);
-        assert_eq!(
-            stats.closure_rate, 1.0,
-            "drifted counts toward closure like stale/internal_module"
-        );
-        assert_eq!(
-            stats.internal_binding_rate, 1.0,
-            "drifted excluded from the binding denominator (0/0 -> 1.0)"
-        );
-
-        let (boundary, evidence, resolved, dst_id): (String, String, i64, String) = conn
-            .query_row(
-                "SELECT boundary, evidence, resolved, dst_id FROM code_edges
-                 WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            boundary, "drifted",
-            "resolve_edges must not touch a pre-set drifted boundary"
-        );
-        assert_eq!(evidence, "not_in_current_source");
-        assert_eq!(resolved, 0);
-        assert_eq!(
-            dst_id, "name:bar",
-            "drifted never binds — dst_id stays the placeholder"
-        );
-    }
-
-    #[test]
-    fn drifted_edge_excluded_from_internal_binding_denominator_with_other_edges() {
-        // Mix a genuinely bound edge with a drifted one: binding rate must
-        // be computed over the non-drifted denominator only (1/1 = 100%,
-        // not 1/2).
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &def("bar", "a.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("baz", "a.rs", "baz")).unwrap();
-        let mut drifted_edge = call_edge("foo", "ghost", "a.rs");
-        drifted_edge.boundary = "drifted".to_string();
-        drifted_edge.evidence = "not_in_current_source".to_string();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[call_edge("foo", "bar", "a.rs"), drifted_edge],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.total, 2);
-        assert_eq!(stats.resolved, 1, "the real edge binds via B0");
-        assert_eq!(stats.drifted, 1);
-        assert_eq!(
-            stats.internal_binding_rate, 1.0,
-            "denominator excludes the drifted edge: 1 bound / 1 eligible"
-        );
-    }
-
-    #[test]
-    fn resolve_is_deterministic_with_drifted_tier() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &def("bar", "a.rs", "bar")).unwrap();
-        let mut e = call_edge("foo", "bar", "a.rs");
-        e.boundary = "drifted".to_string();
-        e.evidence = "not_in_current_source".to_string();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
-
-        let first = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        let second = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            first, second,
-            "drifted tier stays deterministic across repeated passes"
-        );
-        assert_eq!(first.drifted, 1);
-
-        let (boundary, evidence): (String, String) = conn
-            .query_row(
-                "SELECT boundary, evidence FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            boundary, "drifted",
-            "byte-identical across the repeated pass"
-        );
-        assert_eq!(evidence, "not_in_current_source");
-    }
-
-    // ─── X4 local-binding witness tier (WCR truth pass, TASK 2) ───
-
-    /// `scope` (X4 adversarial review, Finding 1; a full chain as of Finding
-    /// 4, though every EXISTING test below still passes a bare name — a
-    /// bare name is a valid degenerate chain, zero `>anon<idx>` segments —
-    /// see `chain_prefix_matches`'s doc comment) — the nearest enclosing
-    /// named def's name/chain, or `""` for a module-level binding.
-    fn insert_local_binding(conn: &Connection, project: &str, file: &str, scope: &str, name: &str) {
-        conn.execute(
-            "INSERT OR IGNORE INTO local_bindings (project, file, scope, name) VALUES (?1, ?2, ?3, ?4)",
-            params![project, file, scope, name],
-        )
-        .unwrap();
-    }
-
-    /// Second X4 adversarial review, Finding 4: seeds an `edge_scope_chains`
-    /// row directly — the shape `eval::codegraph::backfill_wcr_witnesses`
-    /// would have written for a `(src_id, dst_id, kind)` edge whose call/
-    /// import site sits at `chain` (see `Pending::call_scope_chains`'s doc
-    /// comment). `project`/`file` are fixed at `"proj"`/the edge's own
-    /// `src_file` convention used throughout this test module (`def`/
-    /// `call_edge` above all hardcode `project = "proj"`). `chain` joined
-    /// `edge_scope_chains`' own PRIMARY KEY as of the Codex round 4
-    /// adversarial review (Finding 1), so calling this MORE THAN ONCE for
-    /// the SAME `(src_id, dst_name, kind)` with DIFFERENT `chain` values
-    /// inserts one row PER chain (never overwrites) — exactly what a
-    /// multi-occurrence aggregated edge needs.
-    fn insert_edge_scope_chain(
-        conn: &Connection,
-        file: &str,
-        src_id: &str,
-        dst_name: &str,
-        kind: &str,
-        chain: &str,
-    ) {
-        conn.execute(
-            "INSERT OR IGNORE INTO edge_scope_chains (project, file, src_id, dst_id, kind, chain)
-             VALUES ('proj', ?1, ?2, ?3, ?4, ?5)",
-            params![file, src_id, format!("name:{dst_name}"), kind, chain],
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn x4_local_binding_classifies_when_zero_defs_anywhere_and_witnessed() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
-        // No def anywhere for "playTrack" — code_nodes has no def, repo_defs
-        // is empty.
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.ts",
-            &[call_edge("foo", "playTrack", "a.ts")],
-        )
-        .unwrap();
-        // Scoped to "foo" — the SAME function the call site is inside.
-        insert_local_binding(&conn, "proj", "a.ts", "foo", "playTrack");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.local, 1);
-        assert_eq!(stats.resolved, 0, "local classifies, never binds");
-        assert_eq!(stats.unexplained, 0);
-        assert_eq!(
-            stats.closure_rate, 1.0,
-            "local counts toward the closure numerator"
-        );
-
-        let (boundary, evidence, resolved, dst_id): (String, String, i64, String) = conn
-            .query_row(
-                "SELECT boundary, evidence, resolved, dst_id FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(boundary, "local");
-        assert_eq!(evidence, "local_scope:playTrack");
-        assert_eq!(resolved, 0);
-        assert_eq!(dst_id, "name:playTrack", "dst_id stays the placeholder");
-    }
-
-    #[test]
-    fn x4_local_binding_excluded_from_internal_binding_denominator() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
-        upsert_node(&conn, &def("bar", "a.ts", "bar")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.ts",
-            &[
-                // Binds normally via B0 same_file.
-                call_edge("foo", "bar", "a.ts"),
-                // No def anywhere, but witnessed local.
-                call_edge("foo", "playTrack", "a.ts"),
-            ],
-        )
-        .unwrap();
-        insert_local_binding(&conn, "proj", "a.ts", "foo", "playTrack");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.total, 2);
-        assert_eq!(stats.resolved, 1, "bar binds via B0");
-        assert_eq!(stats.local, 1);
-        assert_eq!(
-            stats.internal_binding_rate, 1.0,
-            "denominator excludes the local edge: 1 bound / 1 eligible"
-        );
-    }
-
-    #[test]
-    fn x4_never_fires_when_a_real_def_exists_elsewhere_for_the_name() {
-        // Adversarial self-check: a name that is BOTH a witnessed local
-        // SOMEWHERE and has a real def elsewhere in the project must NOT
-        // classify local — def_file_count > 0 blocks it (condition (a)).
-        // Uses the same receiver-gated (NoBind) shape as
-        // `method_call_with_non_self_receiver_does_not_bind_via_unique_def_elsewhere`:
-        // a method call off a non-self receiver never reaches a bind tier
-        // even though `save` has exactly one code_nodes def elsewhere, so
-        // the ONLY thing standing between this edge and a wrong `local`
-        // classification is the explicit zero-defs-anywhere check.
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        upsert_node(&conn, &def("save_b", "b.rs", "save")).unwrap();
-        let mut e = call_edge_via("foo", "save", "a.rs", "obj");
-        e.callee_kind = "method".into();
-        codegraph::replace_file_edges(&conn, "proj", "a.rs", &[e]).unwrap();
-        // "save" also happens to be a local binding name in a.rs itself —
-        // must still not classify local, because a real def of "save"
-        // exists (in b.rs).
-        insert_local_binding(&conn, "proj", "a.rs", "foo", "save");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.local, 0, "a real def elsewhere must block X4");
-        assert_eq!(stats.method, 1, "falls through to X2 method instead");
-
-        let boundary: String = conn
-            .query_row(
-                "SELECT boundary FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(boundary, "method");
-    }
-
-    #[test]
-    fn x4_never_preempts_a_successful_bind_tier() {
-        // Adversarial self-check: a local_bindings witness for the SAME
-        // (project, file, name) as an edge that a bind tier can already
-        // resolve must never be reached at all — bind tiers run to
-        // completion (and `continue`) long before `classify_only` (and
-        // therefore X4) is ever called.
-        let conn = mem();
-        upsert_node(&conn, &def("bar", "x.rs", "bar")).unwrap();
-        upsert_node(&conn, &def("foo", "z.rs", "foo")).unwrap();
-        codegraph::replace_file_edges(&conn, "proj", "z.rs", &[call_edge("foo", "bar", "z.rs")])
-            .unwrap();
-        insert_local_binding(&conn, "proj", "z.rs", "foo", "bar");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.local, 0);
-        assert_eq!(stats.resolved, 1, "B2 unique_def still binds it");
-
-        let (dst, evidence): (String, String) = conn
-            .query_row(
-                "SELECT dst_id, evidence FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(dst, "bar");
-        assert_eq!(evidence, "unique_def");
-    }
-
-    #[test]
-    fn x4_silent_when_local_bindings_table_is_empty() {
-        // Empty local_bindings table (every resolve pass outside the WCR
-        // live gate, since only `backfill_wcr_witnesses` ever populates it)
-        // -> zero local classifications, tier silent not erroring; the edge
-        // falls through to the pre-existing unexplained/ambiguous behavior
-        // exactly as before this tier was added.
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.rs", "foo")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[call_edge("foo", "ghost_symbol_xyz", "a.rs")],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.local, 0);
-        assert_eq!(stats.unexplained, 1);
-    }
-
-    #[test]
-    fn resolve_is_deterministic_with_local_tier() {
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.ts",
-            &[call_edge("foo", "playTrack", "a.ts")],
-        )
-        .unwrap();
-        insert_local_binding(&conn, "proj", "a.ts", "foo", "playTrack");
-
-        let first = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        let second = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            first, second,
-            "local tier stays deterministic across repeated passes"
-        );
-        assert_eq!(first.local, 1);
-    }
-
-    // ─── X4 scope qualification (X4 adversarial review, Finding 1) ───
-
-    #[test]
-    fn x4_local_binding_scope_isolates_sibling_functions() {
-        // THE core Finding 1 regression: `handler` is bound only inside
-        // `sibling`, never inside `foo` — a flat, scope-blind name-set per
-        // (project, file) would wrongly classify BOTH edges below as local
-        // (the bug). Scope-qualified, only `sibling`'s own call may match.
-        let conn = mem();
-        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
-        upsert_node(&conn, &def("sibling", "a.ts", "sibling")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.ts",
-            &[
-                call_edge("foo", "handler", "a.ts"),
-                call_edge("sibling", "handler", "a.ts"),
-            ],
-        )
-        .unwrap();
-        insert_local_binding(&conn, "proj", "a.ts", "sibling", "handler");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.local, 1, "only sibling's own call may classify local");
-        assert_eq!(
-            stats.unexplained, 1,
-            "foo's call to a same-named but differently-scoped binding stays unexplained"
-        );
-
-        let foo_boundary: String = conn
-            .query_row(
-                "SELECT boundary FROM code_edges WHERE src_id = 'foo' AND kind = 'calls'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            foo_boundary, "",
-            "foo must NOT classify local — the binding belongs to sibling, not foo"
-        );
-
-        let sibling_boundary: String = conn
-            .query_row(
-                "SELECT boundary FROM code_edges WHERE src_id = 'sibling' AND kind = 'calls'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            sibling_boundary, "local",
-            "sibling's own call, in its own scope, must classify local"
-        );
-    }
-
-    #[test]
-    fn x4_module_level_binding_matches_only_module_level_edges() {
-        // Both directions of the module-vs-function scope boundary in one
-        // deterministic test: a module-scope (`scope == ""`) binding must
-        // match only a module-level edge (src node name == src file), and a
-        // function-scope binding must match only its own function's edge —
-        // neither leaks into the other.
-        let conn = mem();
-        upsert_node(&conn, &module_node("mod_a", "a.ts")).unwrap();
-        upsert_node(&conn, &def("foo", "a.ts", "foo")).unwrap();
-        insert_local_binding(&conn, "proj", "a.ts", "", "ghostGlobal");
-        insert_local_binding(&conn, "proj", "a.ts", "foo", "onlyInFoo");
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.ts",
-            &[
-                // E1: module edge -> module-scope binding. Must classify.
-                call_edge("mod_a", "ghostGlobal", "a.ts"),
-                // E2: function edge -> module-scope binding. Must NOT.
-                call_edge("foo", "ghostGlobal", "a.ts"),
-                // E3: module edge -> function-scope binding. Must NOT.
-                call_edge("mod_a", "onlyInFoo", "a.ts"),
-                // E4: function edge -> its OWN function-scope binding. Must.
-                call_edge("foo", "onlyInFoo", "a.ts"),
-            ],
-        )
-        .unwrap();
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(stats.local, 2, "only E1 and E4 classify local");
-        assert_eq!(stats.unexplained, 2, "E2 and E3 stay unexplained");
-
-        let boundary_of = |src: &str, dst_name: &str| -> String {
-            conn.query_row(
-                "SELECT boundary FROM code_edges WHERE src_id = ?1 AND dst_id = ?2 AND kind = 'calls'",
-                params![src, format!("name:{dst_name}")],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        assert_eq!(boundary_of("mod_a", "ghostGlobal"), "local", "E1");
-        assert_eq!(boundary_of("foo", "ghostGlobal"), "", "E2");
-        assert_eq!(boundary_of("mod_a", "onlyInFoo"), "", "E3");
-        assert_eq!(boundary_of("foo", "onlyInFoo"), "local", "E4");
-    }
-
-    // ─── X4 scope CHAINS (second X4 adversarial review, Finding 4:
-    // sibling anonymous-closure conflation) ───
-
-    #[test]
-    fn chain_prefix_matches_unit_cases() {
-        // Direct unit coverage of the matcher itself, decoupled from the DB.
-        assert!(
-            chain_prefix_matches("Component", "Component"),
-            "equal chains match"
-        );
-        assert!(
-            chain_prefix_matches("Component", "Component>anon7"),
-            "an outer chain is a prefix of a chain nested inside it"
-        );
-        assert!(
-            chain_prefix_matches("Component>anon3", "Component>anon3>anon9"),
-            "flows further inward within the same closure lineage"
-        );
-        assert!(
-            !chain_prefix_matches("Component>anon3", "Component>anon9"),
-            "sibling closures at the same depth must NOT match each other"
-        );
-        assert!(
-            !chain_prefix_matches("Component>anon3", "Component"),
-            "an inner binding must NOT flow OUTWARD to the enclosing function body"
-        );
-        assert!(
-            !chain_prefix_matches("Component", "Other"),
-            "unrelated named defs must never match"
-        );
-        assert!(
-            chain_prefix_matches("", ""),
-            "module-level binding matches a module-level call chain"
-        );
-        assert!(
-            !chain_prefix_matches("", "Component"),
-            "module-level chain ('') is NOT generalized into a universal prefix"
-        );
-        assert!(
-            !chain_prefix_matches("Component", ""),
-            "a function-scoped binding must not match a module-level call"
-        );
-        assert!(
-            !chain_prefix_matches("Component", "ComponentX>anon1"),
-            "segment-boundary-safe: a name-prefix collision is not a chain-prefix match"
-        );
-    }
-
-    #[test]
-    fn x4_chain_sibling_anonymous_closures_do_not_conflate() {
-        // MANDATED TEST (Finding 4): the core regression this fix addresses.
-        // `handler` is bound as a param inside one anonymous closure
-        // (`Component>anon3`) and an UNRELATED `handler()` call sits inside
-        // a SIBLING anonymous closure (`Component>anon9`) — both closures
-        // are nested in the SAME named function `Component`, so BEFORE this
-        // fix (flat scope-equality on the bare enclosing-def name) both
-        // reported scope `"Component"` and wrongly matched. No def anywhere
-        // for `handler`.
-        let conn = mem();
-        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.tsx",
-            &[call_edge("Component", "handler", "a.tsx")],
-        )
-        .unwrap();
-        insert_edge_scope_chain(
-            &conn,
-            "a.tsx",
-            "Component",
-            "handler",
-            "calls",
-            "Component>anon9",
-        );
-        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon3", "handler");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.local, 0,
-            "a binding in one closure must never witness a call in a sibling closure"
-        );
-        assert_eq!(stats.unexplained, 1);
-
-        let boundary: String = conn
-            .query_row(
-                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND kind = 'calls'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(boundary, "", "sibling-closure call must stay unexplained");
-    }
-
-    #[test]
-    fn x4_chain_outer_binding_flows_into_nested_closure() {
-        // MANDATED TEST (Finding 4): "outer bindings flow inward". A
-        // component-level binding (`const playTrack = useCallback(...)`,
-        // chain == the bare enclosing-def name, no closure nesting of its
-        // own) IS visible to a call made from inside a NESTED closure
-        // (`Component>anon7`) — the real-world shape `nearest_def_node`'s
-        // own doc comment describes (`anukriti-mvp-expo`'s radio-context.tsx).
-        let conn = mem();
-        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.tsx",
-            &[call_edge("Component", "playTrack", "a.tsx")],
-        )
-        .unwrap();
-        insert_edge_scope_chain(
-            &conn,
-            "a.tsx",
-            "Component",
-            "playTrack",
-            "calls",
-            "Component>anon7",
-        );
-        insert_local_binding(&conn, "proj", "a.tsx", "Component", "playTrack");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.local, 1,
-            "an outer, non-closure-nested binding must witness a call from a nested closure"
-        );
-
-        let boundary: String = conn
-            .query_row(
-                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND kind = 'calls'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(boundary, "local");
-    }
-
-    #[test]
-    fn x4_chain_nested_shadowing_flows_inward_not_outward_or_sideways() {
-        // MANDATED TEST (Finding 4): "nested shadowing sanity" — a binding
-        // declared inside ONE closure (`Component>anon1`) must: (E_inner)
-        // witness a call nested EVEN DEEPER inside that SAME closure
-        // lineage (`Component>anon1>anon5`); (E_outer) NOT witness a call
-        // made directly in the enclosing function's own body, OUTSIDE the
-        // closure that declared it (`Component`); (E_sibling) NOT witness a
-        // call in an unrelated SIBLING closure at the same depth
-        // (`Component>anon2`).
-        let conn = mem();
-        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.tsx",
-            &[
-                call_edge("Component", "innerCall", "a.tsx"),
-                call_edge("Component", "outerCall", "a.tsx"),
-                call_edge("Component", "siblingCall", "a.tsx"),
-            ],
-        )
-        .unwrap();
-        insert_edge_scope_chain(
-            &conn,
-            "a.tsx",
-            "Component",
-            "innerCall",
-            "calls",
-            "Component>anon1>anon5",
-        );
-        insert_edge_scope_chain(
-            &conn,
-            "a.tsx",
-            "Component",
-            "outerCall",
-            "calls",
-            "Component",
-        );
-        insert_edge_scope_chain(
-            &conn,
-            "a.tsx",
-            "Component",
-            "siblingCall",
-            "calls",
-            "Component>anon2",
-        );
-        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon1", "innerCall");
-        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon1", "outerCall");
-        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon1", "siblingCall");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.local, 1,
-            "only the call nested DEEPER inside the same closure lineage classifies local"
-        );
-
-        let boundary_of = |dst_name: &str| -> String {
-            conn.query_row(
-                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND dst_id = ?1 AND kind = 'calls'",
-                params![format!("name:{dst_name}")],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        assert_eq!(boundary_of("innerCall"), "local", "flows further inward");
-        assert_eq!(
-            boundary_of("outerCall"),
-            "",
-            "must not flow OUTWARD past the closure that declared it"
-        );
-        assert_eq!(
-            boundary_of("siblingCall"),
-            "",
-            "must not flow SIDEWAYS into an unrelated sibling closure"
-        );
-    }
-
-    #[test]
-    fn x4_chain_falls_back_to_bare_scope_when_no_edge_scope_chains_row() {
-        // No `edge_scope_chains` row for this edge (e.g. outside a
-        // `backfill_wcr_witnesses` pass) — `call_scope_chains` must fall back
-        // to the pre-chain bare enclosing-def name, preserving the ORIGINAL
-        // X4 adversarial review (Finding 1) exact-match behavior exactly.
-        // This is also implicitly covered by every OTHER X4 test in this
-        // module (none of them insert an `edge_scope_chains` row), but this
-        // test names the fallback path directly.
-        let conn = mem();
-        upsert_node(&conn, &def("Component", "a.ts", "Component")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.ts",
-            &[call_edge("Component", "playTrack", "a.ts")],
-        )
-        .unwrap();
-        insert_local_binding(&conn, "proj", "a.ts", "Component", "playTrack");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.local, 1,
-            "bare-name fallback still matches a bare-name binding"
-        );
-    }
-
-    // ─── X4 universal quantification over multi-chain edges (Codex round 4
-    // adversarial review, Finding 1: one scope chain reused for multiple
-    // distinct call sites) ───
-
-    #[test]
-    fn x4_multi_chain_aggregate_not_local_when_binding_scope_a_inserted_first() {
-        // MANDATED TEST (Finding 1), order A: the SAME callee (`helper`)
-        // called from TWO SIBLING anonymous closures aggregates into ONE
-        // `code_edges` row (both share src `Component`) but carries TWO
-        // distinct `edge_scope_chains` rows — one per physical site. A
-        // binding witnessed inside only ONE of the two sibling closures
-        // (`Component>anon3`) must NOT classify the aggregate `local`: it
-        // is not a prefix of the OTHER occurrence's chain
-        // (`Component>anon9`), and Finding 1 requires a witness to be a
-        // prefix of EVERY occurrence, not just one. `Component>anon3` row
-        // inserted FIRST here; the companion test below inserts
-        // `Component>anon9` first — both must produce the identical result.
-        let conn = mem();
-        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.tsx",
-            &[call_edge("Component", "helper", "a.tsx")],
-        )
-        .unwrap();
-        insert_edge_scope_chain(
-            &conn,
-            "a.tsx",
-            "Component",
-            "helper",
-            "calls",
-            "Component>anon3",
-        );
-        insert_edge_scope_chain(
-            &conn,
-            "a.tsx",
-            "Component",
-            "helper",
-            "calls",
-            "Component>anon9",
-        );
-        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon3", "helper");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.local, 0,
-            "a binding that only encloses ONE of the aggregate's two sibling-closure \
-             occurrences must never witness the whole aggregate"
-        );
-        assert_eq!(stats.unexplained, 1);
-
-        let boundary: String = conn
-            .query_row(
-                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND kind = 'calls'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(boundary, "", "must stay unexplained, not local");
-    }
-
-    #[test]
-    fn x4_multi_chain_aggregate_not_local_when_binding_scope_b_inserted_first() {
-        // MANDATED TEST (Finding 1), order B: same scenario as the test
-        // above, with the TWO `edge_scope_chains` rows inserted in the
-        // OPPOSITE order (`Component>anon9` first, `Component>anon3`
-        // second). Universal quantification over the full chain SET must
-        // be order-independent — both tests must assert the identical
-        // outcome (`stats.local == 0`).
-        let conn = mem();
-        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.tsx",
-            &[call_edge("Component", "helper", "a.tsx")],
-        )
-        .unwrap();
-        insert_edge_scope_chain(
-            &conn,
-            "a.tsx",
-            "Component",
-            "helper",
-            "calls",
-            "Component>anon9",
-        );
-        insert_edge_scope_chain(
-            &conn,
-            "a.tsx",
-            "Component",
-            "helper",
-            "calls",
-            "Component>anon3",
-        );
-        insert_local_binding(&conn, "proj", "a.tsx", "Component>anon3", "helper");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.local, 0,
-            "insertion order must never change the outcome — same result as scope-A-first"
-        );
-        assert_eq!(stats.unexplained, 1);
-
-        let boundary: String = conn
-            .query_row(
-                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND kind = 'calls'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(boundary, "", "must stay unexplained, not local");
-    }
-
-    #[test]
-    fn x4_multi_chain_aggregate_local_when_binding_prefixes_every_occurrence() {
-        // Positive counterpart: a binding declared directly in `Component`'s
-        // OWN body (chain == the bare name, no closure nesting of its own)
-        // IS a prefix of BOTH sibling closures' chains — universal
-        // quantification must still succeed when the witness genuinely
-        // encloses every occurrence, proving the fix doesn't just block
-        // everything.
-        let conn = mem();
-        upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
-        codegraph::replace_file_edges(
-            &conn,
-            "proj",
-            "a.tsx",
-            &[call_edge("Component", "helper", "a.tsx")],
-        )
-        .unwrap();
-        insert_edge_scope_chain(
-            &conn,
-            "a.tsx",
-            "Component",
-            "helper",
-            "calls",
-            "Component>anon3",
-        );
-        insert_edge_scope_chain(
-            &conn,
-            "a.tsx",
-            "Component",
-            "helper",
-            "calls",
-            "Component>anon9",
-        );
-        insert_local_binding(&conn, "proj", "a.tsx", "Component", "helper");
-
-        let stats = resolve_edges(&conn, "proj", &|_: &str| true).unwrap();
-        assert_eq!(
-            stats.local, 1,
-            "an outer binding that encloses EVERY occurrence must still classify local"
-        );
-
-        let boundary: String = conn
-            .query_row(
-                "SELECT boundary FROM code_edges WHERE src_id = 'Component' AND kind = 'calls'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(boundary, "local");
-    }
-}
+#[path = "resolver_tests.rs"]
+mod tests;

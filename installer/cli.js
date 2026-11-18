@@ -1,20 +1,21 @@
 #!/usr/bin/env node
 
 /**
- * Claude Self-Reflect CLI — thin wrapper around the csr-engine binary.
+ * Self-Reflect CLI — thin wrapper around the csr-engine binary.
  *
  * All real work is done by csr-engine (Rust). This script provides
  * the `claude-self-reflect` npm command and proxies to the binary.
  */
 
 import { spawn, execFileSync } from 'child_process';
+import { readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { findEngineBinary, whichBinary } from './lib.js';
 
 const commands = {
-  setup: 'Import conversations, register MCP server, install hooks',
+  setup: 'Import conversations, register MCP server, install hooks, install the csr-companion plugin',
   status: 'Show system status (JSON)',
   statusline: 'Configure Claude Code statusline integration',
   help: 'Show this help message'
@@ -60,8 +61,19 @@ function runEngine(args) {
   });
 }
 
+/** Version from the package.json this CLI ships in; empty if it cannot be read. */
+function packageVersion() {
+  try {
+    const manifest = new URL('../package.json', import.meta.url);
+    return JSON.parse(readFileSync(manifest, 'utf8')).version || '';
+  } catch {
+    return '';
+  }
+}
+
 function help() {
-  console.log('\nClaude Self-Reflect v8.0 - Perfect memory for Claude\n');
+  const version = packageVersion();
+  console.log(`\nSelf-Reflect${version ? ` v${version}` : ''} - Searchable memory for Claude\n`);
   console.log('Usage: claude-self-reflect <command>\n');
   console.log('Commands:');
   for (const [cmd, desc] of Object.entries(commands)) {

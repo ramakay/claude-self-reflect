@@ -1,0 +1,16 @@
+{
+  "ctx": 300000,
+  "floor": 70000,
+  "measured": true,
+  "summary": 21000,
+  "payback": 12.0,
+  "per_turn": null,
+  "worth": true,
+  "trend": null,
+  "story": {
+    "text": "this session: 1 compaction by CSR \u00b7 0 by you \u00b7 context 300k \u00b7 not yet paid back ~264k tokens",
+    "by_csr": 1,
+    "by_you": 0,
+    "payback": -264000
+  }
+}

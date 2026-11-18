@@ -1,54 +1,55 @@
 ---
-title: Why Claude Self-Reflect?
+title: Why Self-Reflect?
 ---
 
-## The Memory Problem
+## Claude looking back at its own work
 
-Claude Code has no persistent memory. Every session starts from zero. Architecture decisions, debugging breakthroughs, project conventions — gone when the session ends.
+Claude Code starts every session cold. What it decided last week, why a function looks the way it does, which fix was tried and dropped: none of that is in front of it unless something puts it there.
 
-## What Makes CSR Different
+Self-Reflect lets Claude reflect on its own work. It reads the record of past sessions and answers questions such as:
 
-### Single Binary, Not a Service Stack
+- What did we settle, and what is still open?
+- Why does this code exist, and which session shaped it?
+- Did a commit make an earlier conclusion obsolete?
 
-Most memory tools require multiple services: vector databases, Python runtimes, Docker containers, background daemons, web UI servers.
+To do that, Self-Reflect keeps a local index of your sessions. That index is infrastructure. The point is what Claude can do with it. See [Features](#/docs/features) for the full list.
 
-CSR is a single 44MB binary. SQLite, HNSW search, FastEmbed embeddings, MCP server, and all 6 hooks — compiled into one executable.
+## Single binary
 
-| | CSR | Typical Memory Tool |
-|--|-----|---------------------|
-| **Install** | `curl \| sh` (one command, asks before activating) | npm + Docker + Python + DB |
-| **Dependencies** | None | Docker, Python, vector DB, Node.js |
-| **Processes** | 1 (on-demand) | 3-5 background services |
-| **Startup** | ~150ms (cached) | Seconds to minutes |
-| **Search** | <1ms (HNSW) | 10-100ms typical |
+`csr-engine` is one Rust binary. SQLite, HNSW search, FastEmbed embeddings, the MCP server and all 8 hooks are compiled into one executable. Install is `curl | sh`, and it asks before it activates anything. There is no Python, no Docker and no vector database. See [Installation](#/docs/installation).
 
-### Active Injection, Not Passive Search
+## Context arrives without being asked
 
-Most memory tools give you a search box. CSR also **actively injects** relevant context at six strategic moments:
+Self-Reflect hooks into seven moments of a session. Two of them inject context (SessionStart and UserPromptSubmit). The others capture and maintain it:
 
-- **SessionStart** — Searches history and surfaces relevant past work before you ask
-- **UserPromptSubmit** — Predicts context needed from your prompt using multi-signal scoring (semantic 50%, recency 20%, file overlap 20%, error patterns 10%)
-- **SessionEnd** — Auto-generates searchable narratives. No manual tagging
-- **Stop** — Detects stuck patterns, surfaces anti-patterns from past sessions
-- **PreCompact** — Backs up state before context compaction
-- **PostToolUse** — Tracks file edits with session-scoped deduplication
+- **SessionStart**: shows where you left off. That is a recap when the last session left evidence (else the `CSR CONTINUUM` and `LAST` lines), a learnt line when Self-Reflect stored notes, and a compact receipt after a compact.
+- **UserPromptSubmit**: predicts the context your prompt needs from several signals: semantic similarity, recency, file overlap and error patterns.
+- **SessionEnd**: writes a searchable narrative. No manual tagging.
+- **Stop**: imports the transcript, keeps a rolling summary and stores a structured episode.
+- **PreCompact**: refreshes the recap anchor and starts one dream cycle.
+- **PostCompact**: stores Claude Code's own compaction summary once, as derived context.
+- **PostToolUse**: tracks file edits, with session-scoped deduplication.
 
-### Progressive Enrichment
+## Progressive enrichment
 
-3-layer pipeline that progressively improves search quality:
+A 3-layer pipeline improves what Claude can find:
 
-1. **Layer 1: Heuristic** (instant, free) — Extracts key patterns at import time
-2. **Layer 2: V3 Extraction** (inline, free) — Structured extraction at session end
-3. **Layer 3: AI Narrative** (optional, ~$0.012/conv) — Full AI narratives. **9.3x search quality improvement**
+1. **Layer 1: heuristic** (instant, free). Extracts key patterns at import time.
+2. **Layer 2: V3 extraction** (inline, free). Structured extraction at session end.
+3. **Layer 3: AI narrative** (optional, metered). Full narratives written through your own Claude Code login.
 
-### Cross-Project Memory
+## Every project, one index
 
-Indexes ALL your Claude Code projects automatically. Solutions from one project surface in another. No per-project configuration.
+All your Claude Code projects are indexed automatically. A solution from one project can surface in another. There is no per-project configuration.
 
-### Privacy First
+## Privacy
 
-Everything runs on your machine by default. No cloud APIs, no accounts, no telemetry. The only optional cloud feature is AI Narratives (Layer 3).
+Search, storage and embeddings run on your machine. There are no accounts and no telemetry. The first run downloads the embedding model. A few features call a model through your own Claude Code login, and each has an off switch. See [Privacy & Security](#/docs/privacy).
 
-### Consent First
+## Consent first
 
-Install and activation are separate steps. Installing (via `curl | sh` or npm) only downloads the SHA256-verified binary — nothing touches `~/.claude/settings.json`, no MCP server is registered, and no conversations are indexed until you explicitly approve `csr-engine setup` (interactive installs prompt; non-interactive installs never activate on their own). See [Installation](#/docs/installation) for the `CSR_AUTO_SETUP` / `CSR_SKIP_SETUP` controls.
+Install and activation are separate steps. Installing (via `curl | sh` or npm) only downloads the SHA256-verified binary. Nothing touches `~/.claude/settings.json`, no MCP server is registered, and no conversations are indexed until you approve `csr-engine setup`. Interactive installs prompt. Non-interactive installs never activate on their own. See [Installation](#/docs/installation) for the `CSR_AUTO_SETUP` and `CSR_SKIP_SETUP` controls.
+
+## Known gaps
+
+We publish what is not working yet, with numbers. See [What we're working on](#/docs/report-card).

@@ -13,7 +13,24 @@ pub mod text {
 
         // ── DB / Index ────────────────────────────────────────────────────────
         let db_mb = t.status.db_size_bytes as f64 / 1_048_576.0;
-        let health = if t.status.healthy { "ok" } else { "UNHEALTHY" };
+        let health = match t.status.healthy {
+            Some(true) => "ok".to_string(),
+            Some(false) => match crate::storage::integrity::unhealthy_reason(
+                t.status.healthy,
+                t.status.fts_dangling_rowids,
+            ) {
+                Some(reason) => format!("UNHEALTHY ({reason})"),
+                None => "UNHEALTHY".to_string(),
+            },
+            None => "unknown".to_string(),
+        };
+        // `healthy` is the database verdict only; name what else is wrong next to it.
+        let health = crate::telemetry::degraded::health_label(
+            &health,
+            &crate::telemetry::degraded::signals_for_report(
+                &serde_json::to_value(&t.status).unwrap_or_default(),
+            ),
+        );
         println!(
             "  Index   {:>7} chunks  {:>5} reflections  {:>5} conv  {:>3} proj  db={:.1}MB  health={}",
             t.status.chunks,
@@ -29,6 +46,46 @@ pub mod text {
             t.status.imported_files,
             t.status.total_jsonl_files,
         );
+        if let Some(line) = crate::hooks::install::hooks_missing_line(
+            &crate::hooks::install::missing_csr_hook_events_now(),
+        ) {
+            println!("{line}");
+        }
+        if let Some(line) = crate::telemetry::degraded::stale_line(&t.status.stale_processes) {
+            println!("{line}");
+        }
+        println!(
+            "  Provenance {}/{} chunks with spans, {} unknown, tool share mean={}; missing={} unparsed={} unmatched={}",
+            t.status.provenance_coverage.chunks_with_spans,
+            t.status.provenance_coverage.chunks_total,
+            t.status.provenance_coverage.chunks_unknown,
+            t.status
+                .provenance_coverage
+                .tool_result_share_mean
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "unknown".into()),
+            t.status.provenance_coverage.source_missing,
+            t.status.provenance_coverage.source_unparsed,
+            t.status.provenance_coverage.source_unmatched,
+        );
+        for family in t
+            .status
+            .provenance_coverage
+            .artifacts
+            .iter()
+            .filter(|family| family.total() > 0)
+        {
+            println!(
+                "    {:<24} unknown={} external={} trusted_tool={} user_history={} user_confirmed={} system={}",
+                family.kind,
+                family.unknown,
+                family.external,
+                family.trusted_tool,
+                family.user_history,
+                family.user_confirmed,
+                family.system,
+            );
+        }
         let e = &t.status.enrichment;
         println!(
             "  Enrich  heuristic={} v3={} ai={}  (v3_failed={} ai_failed={} ai_processing={})",
@@ -50,8 +107,14 @@ pub mod text {
             src.registry_sessions,
         );
         println!(
-            "          proposals={} verdicts={}  schema_miss: tasks={} plans={} history={}",
-            src.resolution_proposals, src.resolution_verdicts, miss.tasks, miss.plans, miss.history,
+            "          proposals={} verdicts={} (agent={} user_confirmed={})  schema_miss: tasks={} plans={} history={}",
+            src.resolution_proposals,
+            src.resolution_verdicts,
+            src.resolution_verdicts_agent,
+            src.resolution_verdicts_user_confirmed,
+            miss.tasks,
+            miss.plans,
+            miss.history,
         );
         println!();
 

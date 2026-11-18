@@ -6,6 +6,8 @@
 pub mod anti_pattern;
 pub mod formatter;
 pub mod predictor;
+pub mod send_gate;
+pub mod specificity;
 pub mod weights;
 
 /// Context assembled for injection into Claude's context.
@@ -33,6 +35,11 @@ impl InjectionContext {
     /// if total exceeds budget.
     pub fn format(&self, max_tokens: usize) -> String {
         formatter::format_with_budget(self, max_tokens)
+    }
+
+    /// Format and return an exact receipt for items that survived the budget.
+    pub fn format_with_receipt(&self, max_tokens: usize) -> formatter::FormattedInjection {
+        formatter::format_with_budget_receipt(self, max_tokens)
     }
 
     pub fn is_empty(&self) -> bool {

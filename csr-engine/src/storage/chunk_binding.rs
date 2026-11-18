@@ -20,15 +20,11 @@
 //!    where `receipt_oid` is the receipt of the most recent negative event
 //!    for the symbol.
 //!
-//! Rationale: symbol-level binding cannot attribute staleness to individual
-//! chunk COHORTS — chunks minted in the A era and chunks minted in the B
-//! era share the same `(conversation -> symbol)` binding, so demoting on
-//! evolution would punish current-truth chunks alongside stale ones. v10
-//! therefore never demotes on evolution — it annotates with the receipt and
-//! lets the reader decide. (Corollary: a fully-reverted A -> B -> A still
-//! surfaces as Annotate, because B's witness keeps an uncancelled negative
-//! event while the A witnesses are intact at HEAD — "the symbol carries
-//! history of a rejected change".)
+//! Exact `witness_chunk_bindings` carry the stable chunk id to consumers.
+//! Legacy witnesses without that relation surface a conversation-only hit;
+//! the storage facade may safely recover it only when the complete persisted
+//! conversation has one chunk. Ambiguous multi-chunk legacy evidence abstains
+//! instead of guessing from chunk text or demoting siblings.
 //!
 //! # The actual link: `code_nodes.first_conv_id` / `last_conv_id`
 //!
@@ -89,10 +85,12 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::codegraph::{self, NodeRow};
-use super::witness_verdicts::{self, VerdictChannel};
+use super::codegraph;
+use super::witness_verdicts;
+#[cfg(test)]
+use super::witness_verdicts::VerdictChannel;
 
 use super::witness_ledger::WITNESS_EXTRACTOR_VERSION as CURRENT_EXTRACTOR_VERSION;
 
@@ -101,6 +99,24 @@ thread_local! {
     static ANCESTRY_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Comparisons already answered in this process, by repository (common dir)
+/// and commit pair. Once both commits exist their ancestry never changes, so
+/// an answer holds for the life of the process; errors are not kept. The
+/// prompt render re-asks the same (generation HEAD, current HEAD) pairs on
+/// every prompt: sampled 2026-10-11 at background priority, merge-base walks
+/// were half of the slowest renders' time.
+type AncestryKey = (
+    std::path::PathBuf,
+    codewitness::ObjectId,
+    codewitness::ObjectId,
+);
+static ANCESTRY_MEMO: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<AncestryKey, codewitness::CausalOrder>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Bound on [`ANCESTRY_MEMO`]; it is emptied when full (~100 bytes an entry).
+const ANCESTRY_MEMO_MAX: usize = 100_000;
+
 fn compare_commits(
     auditor: &codewitness::Auditor,
     left: codewitness::ObjectId,
@@ -108,7 +124,22 @@ fn compare_commits(
 ) -> codewitness::Result<codewitness::CausalOrder> {
     #[cfg(test)]
     ANCESTRY_COMPARISONS.with(|count| count.set(count.get() + 1));
-    codewitness::causal::compare(auditor.repo(), left, right)
+    let key = (auditor.repo().common_dir().to_path_buf(), left, right);
+    if let Some(order) = ANCESTRY_MEMO
+        .lock()
+        .ok()
+        .and_then(|memo| memo.get(&key).copied())
+    {
+        return Ok(order);
+    }
+    let order = codewitness::causal::compare(auditor.repo(), left, right)?;
+    if let Ok(mut memo) = ANCESTRY_MEMO.lock() {
+        if memo.len() >= ANCESTRY_MEMO_MAX {
+            memo.clear();
+        }
+        memo.insert(key, order);
+    }
+    Ok(order)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,25 +364,7 @@ fn selected_lineage(
     Ok(selection)
 }
 
-/// One verdict hit surfaced for a chunk's conversation — carries the
-/// two-channel contract's `channel` (see the module doc's "Two-channel
-/// consumption") alongside the raw verdict and receipt.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChunkWitnessVerdict {
-    pub file: String,
-    /// `None` only if a future caller ever binds against a whole-file
-    /// witness; `nodes_for_conversations` only returns symbol-level nodes
-    /// today, so this is always `Some` in practice.
-    pub symbol: Option<String>,
-    /// `Demote` (rank-affecting: symbol gone/fully stale at HEAD) or
-    /// `Annotate` (no rank effect: "symbol evolved since earlier evidence;
-    /// current as of `receipt_oid`").
-    pub channel: VerdictChannel,
-    /// `"anchor_obsolete"` | `"superseded_by"` — always negative (reinstated
-    /// verdicts are filtered out before a row is ever constructed).
-    pub verdict: &'static str,
-    pub receipt_oid: Option<String>,
-}
+pub use super::witness_verdicts::ChunkWitnessVerdict;
 
 /// The two known container separators `import::backfill::container_spans`
 /// mints (`"::"` for Rust, `"."` for the rest) — see this module's doc
@@ -419,10 +432,15 @@ fn is_numbered_variant_of(s: &str, bare_name: &str) -> bool {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return false;
     }
-    base == bare_name
-        || CONTAINER_SEPARATORS
-            .iter()
-            .any(|sep| base.ends_with(format!("{sep}{bare_name}").as_str()))
+    base == bare_name || is_container_qualified(base, bare_name)
+}
+
+/// `true` iff `s` ends with `<separator><bare_name>` for a known container
+/// separator. Allocation-free: this runs per node, per witness symbol, per
+/// separator on every prompt.
+fn is_container_qualified(s: &str, bare_name: &str) -> bool {
+    s.strip_suffix(bare_name)
+        .is_some_and(|head| CONTAINER_SEPARATORS.iter().any(|sep| head.ends_with(sep)))
 }
 
 /// Resolve `bare_name` (an unqualified `code_nodes.name`) against the set of
@@ -438,12 +456,7 @@ fn resolve_bound_symbol(witness_symbols: &[String], bare_name: &str) -> Option<S
     }
     let mut suffix_matches: Vec<&String> = witness_symbols
         .iter()
-        .filter(|s| {
-            s.as_str() == bare_name
-                || CONTAINER_SEPARATORS
-                    .iter()
-                    .any(|sep| s.ends_with(format!("{sep}{bare_name}").as_str()))
-        })
+        .filter(|s| s.as_str() == bare_name || is_container_qualified(s, bare_name))
         .collect();
     suffix_matches.dedup();
     match suffix_matches.as_slice() {
@@ -454,7 +467,8 @@ fn resolve_bound_symbol(witness_symbols: &[String], bare_name: &str) -> Option<S
 
 /// Given conversation/chunk identifiers appearing in search results, resolve
 /// their bound witnesses via the code graph and return, per conversation, a
-/// `Vec` of `{file, symbol, channel: Demote|Annotate, verdict, receipt_oid}`
+/// `Vec` of `{chunk_id, file, symbol, channel: Demote|Annotate, verdict,
+/// receipt_oid}`
 /// hits per `witness_verdicts::symbol_verdict_state`'s order-independent
 /// two-channel rule (see the module doc's "Two-channel consumption" and
 /// that module's "Symbol-level current state"). Conversation ids whose
@@ -482,21 +496,25 @@ pub fn witness_verdict_for_chunks(
     let candidates: std::collections::HashSet<&str> =
         conversation_ids.iter().map(|s| s.as_str()).collect();
 
-    let nodes: Vec<NodeRow> = codegraph::nodes_for_conversations(&tx, conversation_ids)?;
+    let w_start = std::time::Instant::now();
+    let nodes: Vec<codegraph::WitnessNode> =
+        codegraph::witness_nodes_for_conversations(&tx, conversation_ids)?;
+    crate::mcp::stage_timing::stage("s_w_nodes", w_start);
+    crate::mcp::stage_timing::count("s_w_node_rows", nodes.len() as u64);
 
     // node -> the input conversation_ids it is attributed to (first and/or
     // last touch; almost always the same single id, but both are checked so
     // neither channel silently loses a match).
-    let mut node_convs: Vec<(usize, Vec<String>)> = Vec::with_capacity(nodes.len());
+    let mut node_convs: Vec<(usize, Vec<&str>)> = Vec::with_capacity(nodes.len());
     for (idx, node) in nodes.iter().enumerate() {
         let mut convs = Vec::new();
         if candidates.contains(node.first_conv_id.as_str()) {
-            convs.push(node.first_conv_id.clone());
+            convs.push(node.first_conv_id.as_str());
         }
         if node.last_conv_id != node.first_conv_id
             && candidates.contains(node.last_conv_id.as_str())
         {
-            convs.push(node.last_conv_id.clone());
+            convs.push(node.last_conv_id.as_str());
         }
         if !convs.is_empty() {
             node_convs.push((idx, convs));
@@ -512,17 +530,18 @@ pub fn witness_verdict_for_chunks(
     // in-memory against (a)'s per-file symbol sets.
     let mut file_keys: Vec<(String, String)> = Vec::new();
     {
-        let mut seen: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
         for (idx, _) in &node_convs {
             let node = &nodes[*idx];
-            let key = (node.project.clone(), node.file.clone());
-            if seen.insert(key.clone()) {
-                file_keys.push(key);
+            if seen.insert((node.project.as_str(), node.file.as_str())) {
+                file_keys.push((node.project.clone(), node.file.clone()));
             }
         }
     }
+    let w_start = std::time::Instant::now();
     let (symbols_by_file, lineages) = witness_symbols_for_files(&tx, &file_keys)?;
+    crate::mcp::stage_timing::stage("s_w_symbols", w_start);
+    let w_start = std::time::Instant::now();
 
     let mut resolved = Vec::new();
     let mut state_anchors = Vec::new();
@@ -554,7 +573,40 @@ pub fn witness_verdict_for_chunks(
         resolved.push((*idx, convs, bound_symbol));
     }
 
-    let states = witness_verdicts::symbol_verdict_states_for_lineages(&tx, &state_anchors)?;
+    let mut states = witness_verdicts::symbol_verdict_states_for_lineages(&tx, &state_anchors)?;
+    // Legacy-lineage fallback (annotate channel only): when a file has a
+    // rederived-v2 generation, the anchor filter above restricts verdicts to
+    // that lineage — silently hiding every verdict recorded on the file's
+    // pre-rederivation witnesses (observed live: 545/545 verdicts invisible
+    // in search, 2026-08-09). A negative latest event on the SAME
+    // (project,file,symbol) in the legacy lineage is still true history for
+    // the conversations that produced that code, so it surfaces as an
+    // annotation with its receipt — but it is forced onto the Annotate
+    // channel: only strictly-current-lineage states may ever demote.
+    {
+        let missing: Vec<(String, String, String, Option<String>)> = state_anchors
+            .iter()
+            .filter(|(project, file, symbol, source_id)| {
+                source_id.is_some()
+                    && !states.contains_key(&(project.clone(), file.clone(), symbol.clone()))
+            })
+            .map(|(project, file, symbol, _)| (project.clone(), file.clone(), symbol.clone(), None))
+            .collect();
+        if !missing.is_empty() {
+            let legacy = witness_verdicts::symbol_verdict_states_for_lineages(&tx, &missing)?;
+            for (key, mut state) in legacy {
+                state.channel = witness_verdicts::VerdictChannel::Annotate;
+                states.entry(key).or_insert(state);
+            }
+        }
+    }
+    crate::mcp::stage_timing::stage("s_w_states", w_start);
+    let negative_witness_ids: Vec<i64> = states
+        .values()
+        .flat_map(|state| state.negative_witness_ids.iter().copied())
+        .collect();
+    let chunk_bindings =
+        witness_verdicts::chunk_bindings_for_witnesses(&tx, &negative_witness_ids)?;
 
     for (idx, convs, bound_symbol) in resolved {
         let node = &nodes[idx];
@@ -572,6 +624,7 @@ pub fn witness_verdict_for_chunks(
         );
 
         let hit = ChunkWitnessVerdict {
+            chunk_id: String::new(),
             file: node.file.clone(),
             symbol: Some(bound_symbol.clone()),
             channel: state.channel,
@@ -579,7 +632,29 @@ pub fn witness_verdict_for_chunks(
             receipt_oid: state.representative.receipt_oid.clone(),
         };
         for conv in convs {
-            out.entry(conv.clone()).or_default().push(hit.clone());
+            let mut exact_chunk_ids = BTreeSet::new();
+            let mut has_exact_binding = false;
+            for witness_id in &state.negative_witness_ids {
+                if let Some(bindings) = chunk_bindings.get(witness_id) {
+                    has_exact_binding = true;
+                    for (chunk_id, conversation_id) in bindings {
+                        if conversation_id.as_str() == *conv {
+                            exact_chunk_ids.insert(chunk_id.clone());
+                        }
+                    }
+                }
+            }
+            if has_exact_binding {
+                for chunk_id in exact_chunk_ids {
+                    let mut bound_hit = hit.clone();
+                    bound_hit.chunk_id = chunk_id;
+                    out.entry((*conv).to_string()).or_default().push(bound_hit);
+                }
+            } else {
+                out.entry((*conv).to_string())
+                    .or_default()
+                    .push(hit.clone());
+            }
         }
     }
 
@@ -620,6 +695,45 @@ mod tests {
             name_only: false,
             attribution: String::new(),
         }
+    }
+
+    #[test]
+    fn witness_nodes_are_the_node_rows_narrowed() {
+        let conn = open();
+        for (name, first, last) in [
+            ("a", "conv-1", "conv-1"),
+            ("b", "conv-2", "conv-1"),
+            ("c", "conv-3", "conv-3"),
+            ("d", "conv-1", "conv-4"),
+        ] {
+            upsert_node(&conn, &node(name, first, last)).unwrap();
+        }
+        let mut module = node("m", "conv-1", "conv-1");
+        module.kind = "module".into();
+        module.id =
+            crate::extraction::codegraph::node_id("proj", "/repo/src/lib.rs", "module", "m");
+        upsert_node(&conn, &module).unwrap();
+        let ids: Vec<String> = ["conv-1", "conv-4", "conv-none"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        let full = codegraph::nodes_for_conversations(&conn, &ids).unwrap();
+        let slim = codegraph::witness_nodes_for_conversations(&conn, &ids).unwrap();
+        assert_eq!(full.len(), 3);
+        assert_eq!(slim.len(), full.len());
+        for (full, slim) in full.iter().zip(&slim) {
+            assert_eq!(
+                (&full.project, &full.file, &full.name),
+                (&slim.project, &slim.file, &slim.name)
+            );
+            assert_eq!(
+                (&full.first_conv_id, &full.last_conv_id),
+                (&slim.first_conv_id, &slim.last_conv_id)
+            );
+        }
+        assert!(codegraph::witness_nodes_for_conversations(&conn, &[])
+            .unwrap()
+            .is_empty());
     }
 
     fn ledger_row(symbol: &str, at_oid: &str, stamp: &str) -> WitnessLedgerRow {
@@ -740,6 +854,128 @@ mod tests {
             .trim()
             .to_string();
         (tmp, head)
+    }
+
+    /// The allocating versions this module used to have, kept as the oracle.
+    fn old_is_numbered_variant_of(s: &str, bare_name: &str) -> bool {
+        let Some(pos) = s.rfind('#') else {
+            return false;
+        };
+        let (base, digits) = (&s[..pos], &s[pos + 1..]);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        base == bare_name
+            || CONTAINER_SEPARATORS
+                .iter()
+                .any(|sep| base.ends_with(format!("{sep}{bare_name}").as_str()))
+    }
+
+    fn old_resolve_bound_symbol(witness_symbols: &[String], bare_name: &str) -> Option<String> {
+        if witness_symbols
+            .iter()
+            .any(|s| old_is_numbered_variant_of(s, bare_name))
+        {
+            return None;
+        }
+        let mut suffix_matches: Vec<&String> = witness_symbols
+            .iter()
+            .filter(|s| {
+                s.as_str() == bare_name
+                    || CONTAINER_SEPARATORS
+                        .iter()
+                        .any(|sep| s.ends_with(format!("{sep}{bare_name}").as_str()))
+            })
+            .collect();
+        suffix_matches.dedup();
+        match suffix_matches.as_slice() {
+            [only] => Some((*only).clone()),
+            _ => None,
+        }
+    }
+
+    /// Every symbol built from a small alphabet of names, separators, `#N`
+    /// suffixes and near-miss spellings, checked old against new.
+    fn generated_symbols() -> Vec<String> {
+        let names = ["run", "x", "", "run_all", "É", "a:b"];
+        let heads = [
+            "", "Foo", "Foo::Bar", "a.b", ":", "::", ".", "Foo:", "Foo::.",
+        ];
+        let seps = ["", "::", ".", ":", "..", ":::", "-", "_"];
+        let tails = ["", "#2", "#10", "#", "#x", "#2#3", "#2a"];
+        let mut out = Vec::new();
+        for head in heads {
+            for sep in seps {
+                for name in names {
+                    for tail in tails {
+                        out.push(format!("{head}{sep}{name}{tail}"));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn allocation_free_matching_equals_the_old_version_over_generated_symbols() {
+        let symbols = generated_symbols();
+        let bares = ["run", "x", "", "run_all", "É", "a:b", "b", "Bar", "missing"];
+        let mut checked = 0usize;
+        for bare in bares {
+            for s in &symbols {
+                assert_eq!(
+                    is_numbered_variant_of(s, bare),
+                    old_is_numbered_variant_of(s, bare),
+                    "is_numbered_variant_of({s:?}, {bare:?})"
+                );
+                checked += 1;
+            }
+            // Resolution over sets: singles, pairs, and a rolling window.
+            for (i, s) in symbols.iter().enumerate() {
+                let sets: [Vec<String>; 3] = [
+                    vec![s.clone()],
+                    vec![s.clone(), symbols[(i * 7 + 1) % symbols.len()].clone()],
+                    symbols.iter().skip(i).take(5).cloned().collect(),
+                ];
+                for set in &sets {
+                    assert_eq!(
+                        resolve_bound_symbol(set, bare),
+                        old_resolve_bound_symbol(set, bare),
+                        "resolve_bound_symbol({set:?}, {bare:?})"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100_000, "generated {checked}");
+    }
+
+    /// Run on demand: `-- --ignored --nocapture`. Prints old vs new time.
+    #[test]
+    #[ignore]
+    fn bench_allocation_free_matching_old_vs_new() {
+        let symbols = generated_symbols();
+        let names: Vec<&str> = vec!["run", "x", "run_all", "missing"];
+        let time = |f: &dyn Fn(&[String], &str) -> Option<String>| {
+            let start = std::time::Instant::now();
+            let mut sink = 0usize;
+            for _ in 0..3 {
+                for bare in &names {
+                    for window in symbols.chunks(40) {
+                        sink += f(window, bare).map_or(0, |s| s.len());
+                    }
+                }
+            }
+            (start.elapsed(), sink)
+        };
+        let (old, a) = time(&old_resolve_bound_symbol);
+        let (new, b) = time(&resolve_bound_symbol);
+        assert_eq!(a, b);
+        println!(
+            "resolve_bound_symbol over {} symbols: old {old:?} new {new:?} ({:.1}x)",
+            symbols.len(),
+            old.as_secs_f64() / new.as_secs_f64().max(1e-9)
+        );
     }
 
     #[test]
@@ -1497,6 +1733,98 @@ mod tests {
     }
 
     #[test]
+    fn legacy_lineage_verdict_surfaces_as_annotation_when_rederived_lineage_is_clean() {
+        // Live-corpus shape (2026-08-09): a file has a complete rederived-v2
+        // generation with NO verdicts, while the superseded_by verdict sits on
+        // an older legacy `backfill` witness. The lineage-restricted lookup
+        // alone hides all such verdicts (observed: 545/545 invisible in
+        // search). The legacy fallback must surface it — Annotate channel
+        // only, never demote.
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_COMMON_DIR")
+                .env("GIT_AUTHOR_NAME", "CSR Test")
+                .env("GIT_AUTHOR_EMAIL", "csr@example.invalid")
+                .env("GIT_COMMITTER_NAME", "CSR Test")
+                .env("GIT_COMMITTER_EMAIL", "csr@example.invalid")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        std::fs::write(repo.join("history.txt"), "one\n").unwrap();
+        assert!(git(&["add", "history.txt"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "one"]).status.success());
+        let old_head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(repo.join("history.txt"), "two\n").unwrap();
+        assert!(git(&["add", "history.txt"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "two"]).status.success());
+        let new_head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let conn = open();
+        upsert_node(&conn, &node("shared", "conv-1", "conv-1")).unwrap();
+        let repo_root = repo.to_string_lossy();
+
+        // Selected lineage: complete rederived generation at HEAD, clean.
+        let mut current = ledger_row("Outer::shared", &new_head, "b3:new");
+        current.source_kind = "backfill_rederived_v2".into();
+        current.source_id = Some("run-new".into());
+        witness_ledger::insert_witness(&conn, &current).unwrap();
+        generation(&conn, "run-new", &new_head, "complete", Some(&repo_root));
+
+        // Legacy witness (plain backfill) carrying the only verdict.
+        let legacy = ledger_row("Outer::shared", &old_head, "b3:old");
+        witness_ledger::insert_witness(&conn, &legacy).unwrap();
+        let legacy_id = witness_ledger::latest_witness_for_symbol(
+            &conn,
+            "proj",
+            "/repo/src/lib.rs",
+            Some("Outer::shared"),
+        )
+        .unwrap()
+        .unwrap()
+        .id;
+        witness_verdicts::insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: legacy_id,
+                verdict: VerdictKind::SupersededBy,
+                successor_witness_id: None,
+                receipt_oid: Some("receiptoid".into()),
+                observed_head_oid: new_head.clone(),
+            },
+        )
+        .unwrap();
+
+        let out = witness_verdict_for_chunks(&conn, &["conv-1".to_string()]).unwrap();
+        let hits = out
+            .get("conv-1")
+            .expect("legacy verdict must annotate the conversation");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].verdict, "superseded_by");
+        assert_eq!(hits[0].receipt_oid.as_deref(), Some("receiptoid"));
+        assert_eq!(
+            hits[0].channel,
+            witness_verdicts::VerdictChannel::Annotate,
+            "legacy-lineage fallback may only annotate, never demote"
+        );
+    }
+
+    #[test]
     fn last_conv_id_channel_also_binds() {
         let conn = open();
         upsert_node(&conn, &node("foo", "conv-intro", "conv-last")).unwrap();
@@ -1526,6 +1854,36 @@ mod tests {
         assert!(
             out.contains_key("conv-last"),
             "last_conv_id must also resolve a binding"
+        );
+    }
+
+    #[test]
+    fn an_ancestry_answer_is_kept_for_the_process() {
+        let (repo, first) = initialized_repo();
+        std::fs::write(repo.path().join("history.txt"), "two\n").unwrap();
+        assert!(git(&["commit", "-qam", "two"], repo.path())
+            .status
+            .success());
+        let second = String::from_utf8(git(&["rev-parse", "HEAD"], repo.path()).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let auditor = codewitness::Auditor::open(repo.path()).unwrap();
+        let (a, b) = (
+            first.parse::<codewitness::ObjectId>().unwrap(),
+            second.parse::<codewitness::ObjectId>().unwrap(),
+        );
+        let fresh = compare_commits(&auditor, a, b).unwrap();
+        assert_eq!(fresh, codewitness::CausalOrder::AncestorOf);
+        let key = (auditor.repo().common_dir().to_path_buf(), a, b);
+        assert_eq!(
+            ANCESTRY_MEMO.lock().unwrap().get(&key).copied(),
+            Some(fresh)
+        );
+        assert_eq!(compare_commits(&auditor, a, b).unwrap(), fresh);
+        assert_eq!(
+            compare_commits(&auditor, b, a).unwrap(),
+            codewitness::CausalOrder::DescendantOf
         );
     }
 }

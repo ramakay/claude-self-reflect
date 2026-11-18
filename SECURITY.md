@@ -9,7 +9,7 @@
 
 ## Security Model
 
-Claude Self-Reflect v8 runs as a single local Rust binary (`csr-engine`).
+Self-Reflect v8 runs as a single local Rust binary (`csr-engine`).
 There is no Docker service, Qdrant server, Python runtime, or hosted database in
 the default deployment.
 

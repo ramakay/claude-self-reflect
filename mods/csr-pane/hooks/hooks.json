@@ -1,0 +1,4 @@
+{
+  "description": "csr-pane: draws the Self-Reflect pane from csr-engine output, and a one-row band above the prompt while the pane has no seat.",
+  "modules": ["./register.tsx"]
+}

@@ -5,6 +5,864 @@
 
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn searching_hook_startup_cannot_publish_a_rebuilt_index() {
+    let dir = TempDir::new().unwrap();
+    let index = dir.path().join("index-v3");
+    std::fs::create_dir(&index).unwrap();
+    std::fs::write(index.join("manifest.json"), "invalid cache sentinel").unwrap();
+    let engine = csr_engine::engine::Engine::new_for_hook_with_home(
+        &dir.path().join("test.db"),
+        &dir.path().join("projects"),
+        None,
+    )
+    .unwrap();
+    engine.flush_index().await;
+    assert_eq!(
+        std::fs::read_to_string(index.join("manifest.json")).unwrap(),
+        "invalid cache sentinel"
+    );
+    assert_eq!(std::fs::read_dir(index).unwrap().count(), 1);
+}
+
+/// F2.6: a subagent's own compaction must not inject the parent's recap or respin the
+/// parent's story. Runs the real binary against a temp db/HOME, never live data.
+#[cfg(unix)]
+mod subagent_compaction {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    struct Run {
+        stdout: String,
+        timing: String,
+        /// The data directory the hook ran against (its parent holds the db).
+        dir: tempfile::TempDir,
+    }
+
+    fn session_start_compact(extra: serde_json::Value) -> Run {
+        session_start_in(extra, |_| {})
+    }
+
+    /// `session_start_compact` after `before` has prepared the data directory.
+    fn session_start_in(extra: serde_json::Value, before: impl FnOnce(&std::path::Path)) -> Run {
+        session_start_with(extra, before, &[])
+    }
+
+    /// `session_start_in` with extra environment variables for the hook process.
+    fn session_start_with(
+        extra: serde_json::Value,
+        before: impl FnOnce(&std::path::Path),
+        envs: &[(&str, &str)],
+    ) -> Run {
+        let dir = tempfile::tempdir().unwrap();
+        before(dir.path());
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let timing = dir.path().join("timing.log");
+        let transcript = dir.path().join("projects/proj/parent-session.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        if !transcript.exists() {
+            std::fs::write(&transcript, "").unwrap();
+        }
+        let mut payload = serde_json::json!({
+            "session_id": "parent-session",
+            "transcript_path": transcript,
+            "cwd": dir.path(),
+            "source": "compact",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            payload[k] = v.clone();
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["hook", "session-start", "--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.path().join("projects"))
+            .env("HOME", &home)
+            .env("CSR_TIMING_LOG", &timing)
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .envs(envs.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        Run {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            timing: std::fs::read_to_string(&timing).unwrap_or_default(),
+            dir,
+        }
+    }
+
+    /// The pane tells a new session's start from a note the hook leaves (a session has no
+    /// transcript until its first prompt): the size of what was injected and its source.
+    #[test]
+    fn a_startup_leaves_a_note_of_what_it_injected_for_the_pane() {
+        let run = session_start_compact(serde_json::json!({
+            "source": "startup", "session_id": "fresh-1"
+        }));
+        let note: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(run.dir.path().join("csr-companion/start/fresh-1.json")).unwrap(),
+        )
+        .unwrap();
+        // The hook prints the text and a newline: the note counts the text.
+        assert_eq!(
+            note["chars"].as_u64().unwrap() + 1,
+            run.stdout.chars().count() as u64,
+            "{note} {}",
+            run.stdout
+        );
+        assert_eq!(note["source"], "startup");
+        assert!(note["at"].as_f64().unwrap() > 1.7e9);
+    }
+
+    /// The hook's note write is one small file of its own: with 5000 notes beside it and the
+    /// folder unreadable (a directory listing would be refused), it still lands, and no mode of
+    /// what was there changes.
+    #[test]
+    fn the_hooks_note_write_scans_nothing_and_changes_no_other_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let run = session_start_in(
+            serde_json::json!({"source": "startup", "session_id": "fresh-3"}),
+            |dir| {
+                let folder = dir.join("csr-companion/start");
+                std::fs::create_dir_all(&folder).unwrap();
+                for i in 0..5000 {
+                    let p = folder.join(format!("old-{i}.json"));
+                    std::fs::write(&p, "{}").unwrap();
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o300)).unwrap();
+            },
+        );
+        let folder = run.dir.path().join("csr-companion/start");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(folder.join("fresh-3.json").exists(), "{}", run.stdout);
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 5001);
+        let mode = std::fs::metadata(folder.join("old-0.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644);
+        assert!(!run.dir.path().join("csr-companion/.private").exists());
+    }
+
+    /// /clear prints a handoff (or nothing) and returns before the rest of the hook; it records
+    /// what it injected all the same, so the pane's Context card can size it.
+    #[test]
+    fn a_clear_records_what_it_injected() {
+        let run = session_start_compact(serde_json::json!({
+            "source": "clear", "session_id": "cleared-1"
+        }));
+        let note: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(run.dir.path().join("csr-companion/start/cleared-1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(note["source"], "clear");
+        // The hook prints its text and a newline; nothing printed is a size of 0.
+        let printed = run.stdout.chars().count() as u64;
+        assert_eq!(
+            note["chars"].as_u64().unwrap(),
+            printed.saturating_sub(1),
+            "{note} {:?}",
+            run.stdout
+        );
+    }
+
+    /// A subagent is not a session start: it leaves no note.
+    #[test]
+    fn a_subagent_leaves_no_start_note() {
+        let run = session_start_compact(serde_json::json!({
+            "source": "startup", "session_id": "fresh-2",
+            "agent_id": "ae3f6f60949bd62e0", "agent_type": "general-purpose"
+        }));
+        assert!(!run
+            .dir
+            .path()
+            .join("csr-companion/start/fresh-2.json")
+            .exists());
+    }
+
+    #[test]
+    fn main_session_compact_still_injects_and_spawns_the_story() {
+        let run = session_start_compact(serde_json::json!({}));
+        // The temp db is empty: the header must not promise sessions it lacks.
+        assert!(
+            run.stdout.contains("No history yet. CSR captures"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains("CSR ENDLESS MEMORY ACTIVE"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.timing.contains("spawned:FromCompaction"),
+            "{}",
+            run.timing
+        );
+        assert!(!run.timing.contains("skip:subagent"), "{}", run.timing);
+    }
+
+    /// Made-up session: 1 user, 2 assistant, 3 compact boundary, 4 user, 5 assistant, 6 user.
+    /// The hook of the next compact finds turns 4..6 replaced.
+    fn write_compacted_once(dir: &std::path::Path) {
+        let transcript = dir.join("projects/proj/parent-session.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let user = |n: usize| {
+            format!(
+                r#"{{"type":"user","uuid":"u{n}","message":{{"role":"user","content":"question {n}"}}}}"#
+            )
+        };
+        let assistant = |n: usize| {
+            format!(
+                r#"{{"type":"assistant","uuid":"a{n}","message":{{"role":"assistant","content":[{{"type":"text","text":"answer {n}"}}]}}}}"#
+            )
+        };
+        let boundary =
+            r#"{"type":"system","subtype":"compact_boundary","uuid":"b3","content":"compacted"}"#;
+        let body = [
+            user(1),
+            assistant(2),
+            boundary.to_string(),
+            user(4),
+            assistant(5),
+            user(6),
+        ]
+        .join("\n");
+        std::fs::write(&transcript, format!("{body}\n")).unwrap();
+    }
+
+    const POINTER_4_6: &str = "Before this compact: turns 4..6 of this session. The summary replaced them. Read them with csr_transcript(session=\"parent-session\", view=\"slice\", turns=\"4..6\"). view=\"yourasks\" lists what the person asked. view=\"grep\" finds a word. This works after Claude Code deletes the JSONL.";
+
+    #[test]
+    fn a_main_thread_compact_prints_the_pointer_first() {
+        let run = session_start_in(serde_json::json!({}), write_compacted_once);
+        assert_eq!(
+            run.stdout.lines().next(),
+            Some(POINTER_4_6),
+            "{}",
+            run.stdout
+        );
+        // The rest of the hook is as before: the empty db still gets its note.
+        assert!(
+            run.stdout.contains("No history yet. CSR captures"),
+            "{}",
+            run.stdout
+        );
+        // The pane's start note counts what was printed, pointer included, and still reads
+        // the same recap clause.
+        let note: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                run.dir
+                    .path()
+                    .join("csr-companion/start/parent-session.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(note["source"], "compact");
+        assert_eq!(
+            note["chars"].as_u64().unwrap() + 1,
+            run.stdout.chars().count() as u64,
+            "{note}"
+        );
+        // With no recap line, the pane's row names the compact receipt.
+        assert_eq!(note["recap"], "compact receipt for turns 4..6", "{note}");
+        // The focus file skips the pointer as framing.
+        let focus = std::fs::read_to_string(run.dir.path().join("current-focus.txt")).unwrap();
+        assert!(!focus.contains("Before this compact"), "{focus}");
+    }
+
+    #[test]
+    fn the_pointer_resolves_a_session_id_when_the_path_is_gone() {
+        let run = session_start_with(
+            serde_json::json!({"transcript_path": "/nonexistent/gone.jsonl"}),
+            |dir| {
+                // The hook looks under $HOME/.claude/projects for the id.
+                let projects = dir.join("home/.claude/projects/proj");
+                std::fs::create_dir_all(&projects).unwrap();
+                write_compacted_once(dir);
+                std::fs::copy(
+                    dir.join("projects/proj/parent-session.jsonl"),
+                    projects.join("parent-session.jsonl"),
+                )
+                .unwrap();
+            },
+            &[],
+        );
+        assert_eq!(
+            run.stdout.lines().next(),
+            Some(POINTER_4_6),
+            "{}",
+            run.stdout
+        );
+    }
+
+    #[test]
+    fn a_huge_transcript_gets_the_pointer_without_a_range() {
+        let run = session_start_in(serde_json::json!({}), |dir| {
+            write_compacted_once(dir);
+            let file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("projects/proj/parent-session.jsonl"))
+                .unwrap();
+            // A sparse file past 256 MiB: no disk, and the hook must not parse it.
+            file.set_len(300 * 1024 * 1024).unwrap();
+        });
+        assert_eq!(
+            run.stdout.lines().next(),
+            Some("Before this compact: this session's earlier turns. The summary replaced them. Read them with csr_transcript(session=\"parent-session\", view=\"stats\"), then view=\"slice\" with turns. view=\"yourasks\" lists what the person asked. view=\"grep\" finds a word. This works after Claude Code deletes the JSONL."),
+            "{}",
+            run.stdout
+        );
+    }
+
+    #[test]
+    fn no_pointer_for_startup_resume_the_kill_switch_or_a_subagent() {
+        for source in ["startup", "resume"] {
+            let run = session_start_in(serde_json::json!({"source": source}), write_compacted_once);
+            assert!(
+                !run.stdout.contains("Before this compact"),
+                "{source}: {}",
+                run.stdout
+            );
+        }
+        let run = session_start_with(
+            serde_json::json!({}),
+            write_compacted_once,
+            &[("CSR_NO_COMPACT_POINTER", "1")],
+        );
+        assert!(
+            !run.stdout.contains("Before this compact"),
+            "{}",
+            run.stdout
+        );
+        // The rest of the hook still runs.
+        assert!(run.stdout.contains("No history yet"), "{}", run.stdout);
+        let run = session_start_in(
+            serde_json::json!({"agent_id": "ae3f6f60949bd62e0", "agent_type": "general-purpose"}),
+            write_compacted_once,
+        );
+        assert_eq!(run.stdout, "");
+    }
+
+    #[test]
+    fn agent_id_compact_injects_nothing_and_spawns_no_story() {
+        let run = session_start_compact(
+            serde_json::json!({"agent_id": "ae3f6f60949bd62e0", "agent_type": "general-purpose"}),
+        );
+        assert_eq!(run.stdout, "");
+        assert!(
+            run.timing.contains("skip:subagent(general-purpose)"),
+            "{}",
+            run.timing
+        );
+        assert!(!run.timing.contains("spawned:"), "{}", run.timing);
+    }
+
+    #[test]
+    fn subagents_transcript_path_alone_marks_a_subagent() {
+        let run = session_start_compact(serde_json::json!({
+            "transcript_path": "/tmp/csr-f26/projects/proj/parent-session/subagents/agent-a1.jsonl"
+        }));
+        assert_eq!(run.stdout, "");
+        assert!(
+            run.timing.contains("skip:subagent(unknown)"),
+            "{}",
+            run.timing
+        );
+        assert!(!run.timing.contains("spawned:"), "{}", run.timing);
+    }
+}
+
+/// Code map session scope: every SessionStart, whatever its source, leaves one
+/// `codemap_signals` row naming the session's cwd. Runs the real binary against a
+/// temp db/HOME, never live data.
+#[cfg(unix)]
+mod codemap_session_signal {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn fire(dir: &std::path::Path, hook: &str, payload: serde_json::Value) {
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.join("projects")).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["hook", hook, "--db-path"])
+            .arg(dir.join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.join("projects"))
+            .env("HOME", &home)
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .env_remove("CSR_NO_CODEMAP")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{:?}", output.status);
+    }
+
+    fn signals(dir: &std::path::Path) -> Vec<(String, String, i64)> {
+        let conn = rusqlite::Connection::open(dir.join("csr-engine.db")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT cwd, source, last_at FROM codemap_signals ORDER BY cwd")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    }
+
+    #[test]
+    fn session_start_records_its_cwd_for_every_source() {
+        for source in ["startup", "resume", "compact", "clear"] {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = "/w/signal-probe/repo";
+            fire(
+                dir.path(),
+                "session-start",
+                serde_json::json!({
+                    "session_id": format!("sess-{source}"),
+                    "cwd": cwd,
+                    "source": source,
+                }),
+            );
+            let rows = signals(dir.path());
+            assert_eq!(rows.len(), 1, "{source}: {rows:?}");
+            assert_eq!(rows[0].0, cwd, "{source}");
+            assert_eq!(rows[0].1, "session_start", "{source}");
+            assert!(
+                rows[0].2 > 1_700_000_000,
+                "{source}: seconds, got {}",
+                rows[0].2
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_start_without_a_cwd_records_no_signal_and_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        fire(
+            dir.path(),
+            "session-start",
+            serde_json::json!({ "session_id": "no-cwd", "source": "startup" }),
+        );
+        assert!(signals(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn post_tool_use_records_the_cwd_even_for_a_non_edit_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        fire(
+            dir.path(),
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "sess-ptu",
+                "cwd": "/w/signal-probe/repo",
+                "tool_name": "Read",
+                "tool_input": { "file_path": "/w/signal-probe/repo/a.rs" },
+            }),
+        );
+        let rows = signals(dir.path());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "/w/signal-probe/repo");
+        assert_eq!(rows[0].1, "post_tool_use");
+    }
+
+    #[test]
+    fn the_kill_switch_records_no_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["hook", "session-start", "--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.path().join("projects"))
+            .env("HOME", &home)
+            .env("CSR_NO_CODEMAP", "1")
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"session_id":"s","cwd":"/w/signal-probe/repo","source":"startup"}"#)
+            .unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+        assert!(signals(dir.path()).is_empty());
+    }
+}
+
+#[cfg(unix)]
+mod prompt_process {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// The hook's connection, or None once `within` passes: a peer blocked in `accept` would
+    /// hang the test binary when the hook's own deadline fires before it connects.
+    fn accept_within(
+        listener: &std::os::unix::net::UnixListener,
+        within: Duration,
+    ) -> Option<std::os::unix::net::UnixStream> {
+        listener.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return Some(stream);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= within {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        }
+    }
+
+    /// Launch the binary once, untimed, before any test times a spawn.
+    ///
+    /// The first exec of a newly linked `csr-engine` blocks before `main`
+    /// while macOS evaluates the new image: measured on this harness at
+    /// 0.6 s idle and 1.1–1.8 s under the parallel test load, with zero CPU
+    /// in the child, while every later exec reaches `main` in ~4 ms. Every
+    /// gate run follows a relink, so whichever test spawned first absorbed
+    /// that one-off cost inside its own wall-clock bound, and
+    /// `cold_process_ignores_large_index_and_missing_database`'s 3 s bound
+    /// tripped whenever it was first and the evaluation ran long. Installed
+    /// hooks pay it once per install, not per prompt; the bounds below are
+    /// about the hook process, so the evaluation is taken here, once.
+    fn warm_launch() {
+        static WARM: std::sync::Once = std::sync::Once::new();
+        WARM.call_once(|| {
+            let status = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+                .arg("--version")
+                .env("HOME", std::env::temp_dir().join("csr-warm-launch-home"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        });
+    }
+
+    fn command(dir: &std::path::Path) -> Command {
+        warm_launch();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+        command
+            .args(["hook", "prompt-submit", "--db-path"])
+            .arg(dir.join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.join("projects"))
+            .env("HOME", dir.join("home"))
+            .env("CSR_TIMING_LOG", dir.join("timing.log"))
+            .env("CSR_HOOK_TIMING_PROBE", "1")
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn payload(dir: &std::path::Path) -> Vec<u8> {
+        serde_json::to_vec(
+            &serde_json::json!({"prompt": "fix the authentication timeout regression",
+            "cwd": dir, "session_id": "latency-test"}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cold_process_ignores_large_index_and_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("index-v3");
+        std::fs::create_dir(&index).unwrap();
+        // Sparse poison files: loading even the manifest would fail. The hook
+        // must not create a DB, rebuild the index, or touch any of these files.
+        for (name, size) in [
+            ("chunks.hnsw.data", 956_000_000),
+            ("chunks.hnsw.graph", 296_000_000),
+            ("manifest.json", 26_600_000),
+        ] {
+            std::fs::File::create(index.join(name))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        for _ in 0..5 {
+            let mut command = command(dir.path());
+            let parent_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let started = Instant::now();
+            let mut child = command.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&payload(dir.path()))
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            let wall = started.elapsed();
+            assert!(output.status.success());
+            assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+            // On failure, say where the time went: before `main` (the OS
+            // launch phase `warm_launch` exists for) or inside the hook.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let before_main = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix("CSR timing-probe main_unix_ns="))
+                .and_then(|ns| ns.parse::<u128>().ok())
+                .map(|ns| Duration::from_nanos(ns.saturating_sub(parent_ns) as u64));
+            assert!(
+                wall < Duration::from_secs(3),
+                "wall={wall:?} before_main={before_main:?} stderr={stderr}"
+            );
+        }
+        assert!(!dir.path().join("csr-engine.db").exists());
+        assert_eq!(
+            std::fs::metadata(index.join("manifest.json"))
+                .unwrap()
+                .len(),
+            26_600_000
+        );
+        assert_eq!(std::fs::read_dir(index).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn cold_process_emits_only_complete_validated_reply() {
+        for valid in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = csr_engine::hooks::prompt_transport::socket_path(dir.path());
+            std::fs::create_dir(path.parent().unwrap()).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+            let peer = std::thread::spawn(move || {
+                let mut stream = accept_within(&listener, Duration::from_secs(10))
+                    .expect("the hook never connected");
+                let mut header = [0; 4];
+                stream.read_exact(&mut header).unwrap();
+                let mut request = vec![0; u32::from_be_bytes(header) as usize];
+                stream.read_exact(&mut request).unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                assert_eq!(json["input"]["session_id"], "latency-test");
+                assert_eq!(json["database"], "csr-engine.db");
+                let body =
+                    serde_json::to_vec(&serde_json::json!({"version": if valid {2} else {0},
+                    "injection": "CSR PICKUP — exact bytes\nsecond line\n"}))
+                    .unwrap();
+                stream
+                    .write_all(&(body.len() as u32).to_be_bytes())
+                    .unwrap();
+                stream.write_all(&body).unwrap();
+            });
+            let mut child = command(dir.path()).spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&payload(dir.path()))
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout,
+                if valid {
+                    b"CSR PICKUP \xe2\x80\x94 exact bytes\nsecond line\n".as_slice()
+                } else {
+                    b""
+                }
+            );
+            assert!(!dir.path().join("csr-engine.db").exists());
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn cold_process_deadline_covers_stalled_stdin_and_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep stdin open: the 2s library stdin timeout would exceed the hook
+        // target, so only the independent process watchdog can pass this test.
+        let parent_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let started = Instant::now();
+        let mut child = command(dir.path()).spawn().unwrap();
+        let spawn_elapsed = started.elapsed();
+        let held_stdin = child.stdin.take().unwrap();
+        let output = child.wait_with_output().unwrap();
+        eprintln!(
+            "CSR timing-probe parent_unix_ns={parent_ns} spawn_ms={} wall_ms={} stderr={}",
+            spawn_elapsed.as_millis(),
+            started.elapsed().as_millis(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(held_stdin);
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let probe = |key: &str| -> u128 {
+            stderr
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or_else(|| panic!("missing timing probe {key}: {stderr}"))
+                .parse()
+                .unwrap()
+        };
+        let main_ns = probe("CSR timing-probe main_unix_ns=");
+        let watchdog_ms = probe("CSR timing-probe deadline_total_ms=");
+        let before_main = Duration::from_nanos(main_ns.saturating_sub(parent_ns) as u64);
+        // Repeated macOS launches can spend seconds before main even without
+        // relinking (measured spawn itself takes 1–3ms).
+        // The watchdog cannot preempt that OS phase. Preserve wall diagnostics,
+        // but assert the code-controlled interval rather than claiming a 3s
+        // process-start cap that this executable cannot enforce in-process.
+        assert!(watchdog_ms < 1500, "watchdog={watchdog_ms}ms; {stderr}");
+        assert!(
+            started.elapsed().saturating_sub(before_main) < Duration::from_secs(3),
+            "wall={:?} before_main={before_main:?} spawn={spawn_elapsed:?} stderr={stderr}",
+            started.elapsed()
+        );
+        // Prove the watchdog itself beat the 2s stdin timeout:
+        // that fallback would have created the timing log before returning.
+        assert!(!dir.path().join("timing.log").exists());
+
+        let path = csr_engine::hooks::prompt_transport::socket_path(dir.path());
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let started = Instant::now();
+        let mut child = command(dir.path()).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&payload(dir.path()))
+            .unwrap();
+        let _stream =
+            accept_within(&listener, Duration::from_secs(10)).expect("the hook never connected");
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn watchdog_exits_even_when_stdout_is_full_and_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csr_engine::hooks::prompt_transport::socket_path(dir.path());
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let peer = std::thread::spawn(move || {
+            // Under load the hook's deadline can fire before it connects; it then exits
+            // cleanly, which is the behaviour under test, so a missing peer is not a failure.
+            let Some(mut stream) = accept_within(&listener, Duration::from_secs(10)) else {
+                return;
+            };
+            let mut header = [0; 4];
+            stream.read_exact(&mut header).unwrap();
+            let mut request = vec![0; u32::from_be_bytes(header) as usize];
+            stream.read_exact(&mut request).unwrap();
+            let body = serde_json::to_vec(
+                &serde_json::json!({"version":2,"injection":"x".repeat(240_000)}),
+            )
+            .unwrap();
+            stream
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .unwrap();
+            let _ = stream.write_all(&body);
+        });
+        let parent_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let started = Instant::now();
+        let mut child = command(dir.path()).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&payload(dir.path()))
+            .unwrap();
+        // Intentionally do not drain stdout: wait_with_output would hide the
+        // watchdog's stdio-cleanup deadlock. The 10s bound only catches a real
+        // hang; the deadline itself is asserted below from the probes.
+        let wall = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break started.elapsed();
+            }
+            if started.elapsed() >= Duration::from_secs(10) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("watchdog blocked on stdout cleanup");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let probe = |key: &str| -> u128 {
+            stderr
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or_else(|| panic!("missing timing probe {key}: {stderr}"))
+                .parse()
+                .unwrap()
+        };
+        let main_ns = probe("CSR timing-probe main_unix_ns=");
+        let watchdog_ms = probe("CSR timing-probe deadline_total_ms=");
+        let before_main = Duration::from_nanos(main_ns.saturating_sub(parent_ns) as u64);
+        // Same split as the stalled-stdin test: the OS phase before main is
+        // outside the watchdog's reach, the code-controlled interval is not.
+        assert!(watchdog_ms < 1500, "watchdog={watchdog_ms}ms; {stderr}");
+        assert!(
+            wall.saturating_sub(before_main) < Duration::from_secs(3),
+            "wall={wall:?} before_main={before_main:?} stderr={stderr}"
+        );
+        peer.join().unwrap();
+    }
+}
+
 // ─── HookInput Parsing ───
 
 #[test]
@@ -383,6 +1241,61 @@ fn test_post_tool_use_ignores_non_edit_tools() {
     assert!(!edit_tools.contains(&input.tool_name.as_deref().unwrap()));
 }
 
+/// Code map freshness: PostToolUse only enqueues. An Edit/Write/MultiEdit of an
+/// absolute code path leaves one `codemap_queue` row; Read, a `.md` path and a
+/// protected folder leave none; the hook returns Ok every time.
+#[test]
+fn post_tool_use_enqueues_code_edits_for_the_code_map_and_nothing_else() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("csr-engine.db");
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open(&db_path).unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage,
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
+    );
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let fire = |tool: &str, file: &str| {
+        let input = csr_engine::hooks::HookInput {
+            cwd: Some(tmp.path().to_string_lossy().to_string()),
+            tool_name: Some(tool.into()),
+            tool_input: Some(serde_json::json!({ "file_path": file })),
+            ..Default::default()
+        };
+        rt.block_on(csr_engine::hooks::post_tool_use::handle(
+            &input,
+            &engine,
+            tmp.path(),
+        ))
+        .expect("the hook never fails");
+    };
+    fire("Edit", "/w/repo/src/a.rs");
+    fire("Write", "/w/repo/src/b.py");
+    fire("MultiEdit", "/w/repo/src/c.ts");
+    fire("Read", "/w/repo/src/d.rs");
+    fire("Write", "/w/repo/README.md");
+    fire("Edit", "/Users/nobody/Desktop/p/e.rs");
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT path FROM codemap_queue ORDER BY path")
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec!["/w/repo/src/a.rs", "/w/repo/src/b.py", "/w/repo/src/c.ts"]
+    );
+}
+
 /// Guards against silently missing sidechain/resumed sessions in the reinstatement graph walk.
 #[test]
 fn code_evolution_keys_by_transcript_stem_not_session_id() {
@@ -446,6 +1359,200 @@ fn code_evolution_keys_by_transcript_stem_not_session_id() {
     );
 }
 
+/// D5: a file edited inside a linked git worktree must be recorded under the
+/// canonical main-repo path, not the throwaway worktree path — otherwise a
+/// search against the real repo path returns nothing.
+#[test]
+fn code_evolution_stores_canonical_path_not_worktree_path() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let main = tmp.path().join("main");
+    let wt = tmp.path().join("wt");
+
+    std::fs::create_dir_all(main.join("src")).unwrap();
+    std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt")).unwrap();
+    std::fs::create_dir_all(wt.join("src")).unwrap();
+
+    // Main-repo file the worktree path must canonicalize onto.
+    let main_file = main.join("src").join("evolved.rs");
+    std::fs::write(&main_file, "fn old() {}\n").unwrap();
+
+    // Linked worktree marker: `.git` is a file pointing at the main repo's gitdir.
+    let gitdir_line = format!("gitdir: {}/.git/worktrees/wt\n", main.display());
+    std::fs::write(wt.join(".git"), gitdir_line).unwrap();
+
+    let wt_file = wt.join("src").join("evolved.rs");
+    let wt_file_str = wt_file.to_string_lossy().to_string();
+    // Same resolved spelling `canonical_repo_path` stores (macOS /var → /private/var).
+    let main_file_str = std::fs::canonicalize(&main_file)
+        .unwrap_or(main_file.clone())
+        .to_string_lossy()
+        .to_string();
+
+    let transcript = tmp.path().join("session.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","message":{"content":[{"type":"text","text":"Add a function"}]},"timestamp":"2026-02-22T16:00:00Z"}
+"#,
+    )
+    .unwrap();
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage.clone(),
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
+    );
+
+    let input = csr_engine::hooks::HookInput {
+        transcript_path: Some(transcript.to_string_lossy().to_string()),
+        session_id: Some("33333333-4444-5555-6666-777777777777".into()),
+        cwd: Some(wt.to_string_lossy().to_string()),
+        tool_name: Some("Write".into()),
+        tool_input: Some(serde_json::json!({
+            "file_path": wt_file_str,
+            "content": "fn new_function() { }"
+        })),
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(csr_engine::hooks::post_tool_use::handle(
+        &input,
+        &engine,
+        wt.as_path(),
+    ));
+    assert!(result.is_ok());
+
+    let rows_by_main = storage
+        .get_recent_code_evolution(&main_file_str, "", 10)
+        .unwrap();
+    assert!(
+        !rows_by_main.is_empty(),
+        "code_evolution must be keyed by the canonical main-repo path"
+    );
+
+    let rows_by_worktree = storage
+        .get_recent_code_evolution(&wt_file_str, "", 10)
+        .unwrap();
+    assert!(
+        rows_by_worktree.is_empty(),
+        "no row should remain keyed under the throwaway worktree path: {:?}",
+        rows_by_worktree
+    );
+}
+
+/// A file observed mid-edit parses partially: `parse_clean == false` while some
+/// definitions still extract. Retiring against that truncated view would delete
+/// every symbol it failed to see, along with its attribution provenance. Drives
+/// the real hook so the gate in `update_code_graph` is what is under test.
+#[test]
+fn partial_parse_must_not_retire_previously_stored_nodes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let file = repo.join("src").join("partial.rs");
+    let file_str = file.to_string_lossy().to_string();
+
+    let transcript = tmp.path().join("session.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","message":{"content":[{"type":"text","text":"edit"}]},"timestamp":"2026-02-22T16:00:00Z"}
+"#,
+    )
+    .unwrap();
+
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open_memory().unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage.clone(),
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
+    );
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let fire = |content: &str| {
+        std::fs::write(&file, content).unwrap();
+        let input = csr_engine::hooks::HookInput {
+            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            session_id: Some("88888888-9999-aaaa-bbbb-cccccccccccc".into()),
+            cwd: Some(repo.to_string_lossy().to_string()),
+            tool_name: Some("Write".into()),
+            tool_input: Some(serde_json::json!({ "file_path": file_str, "content": content })),
+            ..Default::default()
+        };
+        rt.block_on(csr_engine::hooks::post_tool_use::handle(
+            &input,
+            &engine,
+            repo.as_path(),
+        ))
+        .unwrap();
+        // The hook only snapshots the edit; the drain extracts it.
+        csr_engine::extraction::graph_drain::extract_all_snapshots_in(&storage).unwrap();
+    };
+
+    // Clean parse: two functions land in the graph.
+    fire("fn alpha() {\n    let _ = 1;\n}\n\nfn beta() {\n    let _ = 2;\n}\n");
+    // Nodes are stored under the resolved spelling (macOS /var → /private/var),
+    // so look them up the same way rather than by the raw fixture path.
+    let stored_str = std::fs::canonicalize(&file)
+        .unwrap_or(file.clone())
+        .to_string_lossy()
+        .to_string();
+    let after_clean = storage.count_code_nodes_for_file(&stored_str).unwrap();
+    assert!(
+        after_clean >= 2,
+        "fixture must seed at least two nodes or the test is vacuous (got {after_clean})"
+    );
+
+    // Same file caught mid-edit: `alpha` survives, `beta` is truncated to an
+    // unclosed body, so the parse is dirty but still yields a definition.
+    let partial_src = "fn alpha() {\n    let _ = 1;\n}\n\nfn beta() {\n    let _ = 2;\n";
+
+    // Pin WHY this fixture exercises the parse_clean gate specifically. If the
+    // partial source extracted zero nodes, the empty-set guard in
+    // `retire_missing_nodes` would be what saves it and the gate under test
+    // would never run — the test would pass for the wrong reason.
+    {
+        let lang = csr_engine::extraction::ast_analysis::lang_from_path_str("partial.rs")
+            .expect("rust is a supported language");
+        let frag = csr_engine::extraction::codegraph::extract_graph_fragment(
+            partial_src,
+            lang,
+            &file_str,
+            "repo",
+            "proj",
+            "c1",
+            "s1",
+        );
+        assert!(
+            !frag.parse_clean,
+            "fixture must produce a DIRTY parse, else the parse_clean gate is not what is under test"
+        );
+        assert!(
+            !frag.nodes.is_empty(),
+            "fixture must still yield nodes, else the empty-set guard is what protects the data, not parse_clean"
+        );
+    }
+
+    fire(partial_src);
+    let after_partial = storage.count_code_nodes_for_file(&stored_str).unwrap();
+
+    assert_eq!(
+        after_partial, after_clean,
+        "a partial parse must retire nothing — {after_clean} nodes before, {after_partial} after"
+    );
+}
+
 // ─── Install Config with All Hooks ───
 
 #[test]
@@ -470,7 +1577,7 @@ fn test_install_config_post_tool_use_has_matcher() {
     let config = serde_json::json!({
         "hooks": {
             "PostToolUse": [{
-                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
                 "hooks": [{"type": "command", "command": "/usr/local/bin/csr-engine hook post-tool-use"}]
             }]
         }
@@ -480,7 +1587,7 @@ fn test_install_config_post_tool_use_has_matcher() {
     let ptu = hooks.get("PostToolUse").unwrap();
     assert_eq!(
         ptu[0]["matcher"].as_str().unwrap(),
-        "Edit|Write|MultiEdit|NotebookEdit"
+        "Edit|Write|MultiEdit|NotebookEdit|Bash"
     );
 }
 
@@ -512,6 +1619,106 @@ fn test_hook_input_stop_hook_active_missing() {
     let json = r#"{"session_id":"test"}"#;
     let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
     assert_eq!(input.stop_hook_active, None);
+}
+
+/// A non-UTF-8 path argument is a valid Unix argv; the pre-parse argv scan must
+/// not panic on it, for the retired hook or any other, probe or no probe.
+#[cfg(unix)]
+#[test]
+fn non_utf8_path_arguments_do_not_panic_startup() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let bad = std::ffi::OsStr::from_bytes(b"/tmp/csr-\xff\xfe-projects");
+    for (hook, probe) in [
+        ("subagent-stop", false),
+        ("subagent-stop", true),
+        ("stop", true),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+        if probe {
+            command.env("CSR_HOOK_TIMING_PROBE", "1");
+        }
+        let output = command
+            .env("HOME", dir.path().join("home"))
+            .args(["hook", hook, "--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(bad)
+            // A live hook name exits at the recursion guard, before any engine
+            // startup, which is as far as this test needs it to get.
+            .env("CSR_DISABLE_RECURSIVE_HOOKS", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{hook} probe={probe}: {stderr}");
+        assert!(
+            !stderr.contains("panicked"),
+            "{hook} probe={probe}: {stderr}"
+        );
+        if hook == "subagent-stop" {
+            assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        } else {
+            // The probe still prints for a live hook name.
+            assert!(stderr.contains("timing-probe"), "{stderr}");
+        }
+    }
+}
+
+/// `hook subagent-stop` is retired but may still sit in an old settings.json
+/// until the user re-installs: it must stay accepted and do nothing — no
+/// output, no database, no engine — whatever Claude Code pipes to it.
+#[cfg(unix)]
+#[test]
+fn retired_subagent_stop_hook_is_a_silent_noop() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let payloads: [&[u8]; 4] = [
+        b"",
+        b"not json at all",
+        br#"{"session_id":"parent-1","agent_id":"child-7","agent_transcript_path":"/nonexistent/agent-child-7.jsonl"}"#,
+        br#"{"session_id":"parent-1","transcript_path":"/nonexistent/parent-1.jsonl"}"#,
+    ];
+    // The timing probe prints to stderr from the top of `main`; it must not
+    // make the retired hook audible.
+    for (payload, probe) in payloads
+        .into_iter()
+        .flat_map(|payload| [(payload, false), (payload, true)])
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+        if probe {
+            command.env("CSR_HOOK_TIMING_PROBE", "1");
+        }
+        let mut child = command
+            .env("HOME", dir.path().join("home"))
+            .args(["hook", "subagent-stop", "--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.path().join("projects"))
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The no-op may exit before reading; a broken pipe here is fine.
+        let _ = child.stdin.take().unwrap().write_all(payload);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{:?}", output.status);
+        assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "the retired hook must not create a database or any other file"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -577,6 +1784,8 @@ fn test_predictor_semantic_only() {
     let results = vec![
         RawResult {
             content: "high".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.9,
             source: "chunk".into(),
             timestamp: None,
@@ -588,6 +1797,8 @@ fn test_predictor_semantic_only() {
         },
         RawResult {
             content: "low".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.4,
             source: "chunk".into(),
             timestamp: None,
@@ -615,6 +1826,8 @@ fn test_predictor_recency_boost() {
     let results = vec![
         RawResult {
             content: "recent".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: Some(now),
@@ -626,6 +1839,8 @@ fn test_predictor_recency_boost() {
         },
         RawResult {
             content: "old".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: Some(old),
@@ -648,6 +1863,8 @@ fn test_predictor_file_overlap() {
     let results = vec![
         RawResult {
             content: "with overlap".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: None,
@@ -659,6 +1876,8 @@ fn test_predictor_file_overlap() {
         },
         RawResult {
             content: "no overlap".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: None,
@@ -681,6 +1900,8 @@ fn test_predictor_cross_project() {
 
     let results = vec![RawResult {
         content: "cross-project insight".into(),
+        author: None,
+        min_trust: csr_engine::provenance::TrustTier::Unknown,
         score: 0.8,
         source: "reflection".into(),
         timestamp: None,
@@ -991,6 +2212,27 @@ fn test_explore_prompt_never_fails() {
         todos: vec![],
         approved_plan: None,
         prev_episode_id: None,
+        error_count: None,
+        top_errors: vec![],
+        steer_count: None,
+        steers: vec![],
+        instrumentation_version: None,
+        correction_count: None,
+        recap_evidence_version: None,
+        anchor_request: None,
+        completions: vec![],
+        completions_untied: false,
+        compact_anchor: None,
+        late_errors: false,
+        closing_success: false,
+        anchor_receipts: None,
+        closing_ended: false,
+        final_failed: false,
+        closing_receipt: false,
+        outcome_version: None,
+        latest_ask: None,
+        watermark: None,
+        recap_extras: Default::default(),
         anchors: vec![],
     };
 
@@ -1174,9 +2416,9 @@ fn test_import_current_transcript_helper() {
     assert!(chunk_count > 0, "transcript should be indexed after import");
 }
 
-/// Test: stop hook imports transcript for all sessions.
+/// Test: stop hook imports transcript even when recursive intent capture is gated.
 #[test]
-fn test_stop_hook_imports_for_all_sessions() {
+fn test_stop_hook_active_still_imports_transcript() {
     let tmp = tempfile::TempDir::new().unwrap();
     let transcript = tmp.path().join("non-ralph-session.jsonl");
     std::fs::write(
@@ -1202,6 +2444,7 @@ fn test_stop_hook_imports_for_all_sessions() {
     let input = csr_engine::hooks::HookInput {
         transcript_path: Some(transcript.to_string_lossy().to_string()),
         cwd: Some(tmp.path().to_string_lossy().to_string()),
+        stop_hook_active: Some(true),
         ..Default::default()
     };
 
@@ -1431,9 +2674,10 @@ fn test_session_end_resets_ratification_enrichment() {
     );
 }
 
-/// Test: precompact hook imports transcript for all sessions.
+/// Test: precompact reads the transcript for the compact snapshot but embeds and
+/// stores no chunks (the watcher and the Stop worker index the file).
 #[test]
-fn test_precompact_imports_for_all_sessions() {
+fn test_precompact_files_snapshot_without_importing_chunks() {
     let tmp = tempfile::TempDir::new().unwrap();
     let transcript = tmp.path().join("precompact-test.jsonl");
     std::fs::write(
@@ -1450,13 +2694,14 @@ fn test_precompact_imports_for_all_sessions() {
         csr_engine::search::SearchEngine::new(100),
     ));
     let engine = csr_engine::engine::Engine::from_parts(
-        storage,
+        storage.clone(),
         embeddings,
         search.clone(),
         std::path::PathBuf::from("/tmp"),
     );
 
     let input = csr_engine::hooks::HookInput {
+        session_id: Some("precompact-test".into()),
         transcript_path: Some(transcript.to_string_lossy().to_string()),
         cwd: Some(tmp.path().to_string_lossy().to_string()),
         ..Default::default()
@@ -1471,9 +2716,23 @@ fn test_precompact_imports_for_all_sessions() {
     assert!(result.is_ok());
 
     let chunk_count = rt.block_on(async { search.read().await.chunk_count() });
+    assert_eq!(
+        chunk_count, 0,
+        "precompact must not add to the search index"
+    );
+    let stored = storage
+        .get_chunk_ids_for_conversation("precompact-test")
+        .unwrap();
     assert!(
-        chunk_count > 0,
-        "precompact should import transcript before compaction"
+        stored.is_empty(),
+        "precompact must not store chunks: {stored:?}"
+    );
+    assert!(
+        storage
+            .get_meta("compact_anchor:precompact-test")
+            .unwrap()
+            .is_some(),
+        "precompact still files the compact snapshot"
     );
 }
 
@@ -1499,6 +2758,27 @@ fn test_episode_struct_serialization() {
         todos: vec![],
         approved_plan: None,
         prev_episode_id: None,
+        error_count: None,
+        top_errors: vec![],
+        steer_count: None,
+        steers: vec![],
+        instrumentation_version: None,
+        correction_count: None,
+        recap_evidence_version: None,
+        anchor_request: None,
+        completions: vec![],
+        completions_untied: false,
+        compact_anchor: None,
+        late_errors: false,
+        closing_success: false,
+        anchor_receipts: None,
+        closing_ended: false,
+        final_failed: false,
+        closing_receipt: false,
+        outcome_version: None,
+        latest_ask: None,
+        watermark: None,
+        recap_extras: Default::default(),
         anchors: vec![],
     };
 
@@ -1570,7 +2850,7 @@ fn import_only_engine_does_not_load_the_disk_cache() {
     let db_path = tmp.path().join("csr-engine.db");
     // Engine derives index_dir from db_path.parent(); seed BOTH the DB and a
     // matching on-disk cache so a normal engine would genuinely load them.
-    let index_dir = tmp.path().join("index");
+    let index_dir = tmp.path().join("index-v3");
     std::fs::create_dir_all(&index_dir).unwrap();
     seed_db(&db_path, 50);
     dump_seed_index(&index_dir, 50);
@@ -1610,7 +2890,7 @@ fn import_only_engine_does_not_load_the_disk_cache() {
 fn import_only_flush_preserves_the_on_disk_cache() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("csr-engine.db");
-    let index_dir = tmp.path().join("index");
+    let index_dir = tmp.path().join("index-v3");
     std::fs::create_dir_all(&index_dir).unwrap();
     dump_seed_index(&index_dir, 50);
     assert_eq!(read_manifest_chunk_count(&index_dir), Some(50));
@@ -1641,7 +2921,7 @@ fn import_only_flush_preserves_the_on_disk_cache() {
 #[test]
 fn full_engine_flush_rewrites_the_manifest() {
     let tmp = TempDir::new().unwrap();
-    let index_dir = tmp.path().join("index");
+    let index_dir = tmp.path().join("index-v3");
     std::fs::create_dir_all(&index_dir).unwrap();
     dump_seed_index(&index_dir, 50);
     assert_eq!(read_manifest_chunk_count(&index_dir), Some(50));
@@ -1651,7 +2931,7 @@ fn full_engine_flush_rewrites_the_manifest() {
     let search = std::sync::Arc::new(tokio::sync::RwLock::new(
         csr_engine::search::SearchEngine::new(100),
     ));
-    // from_parts derives index_dir = projects_dir.join("index"), so point
+    // from_parts derives index_dir = projects_dir.join("index-v3"), so point
     // projects_dir at tmp to reuse the seeded cache dir.
     let eng = csr_engine::engine::Engine::from_parts(
         storage,
@@ -1675,4 +2955,662 @@ fn full_engine_flush_rewrites_the_manifest() {
         Some(50),
         "a normal engine's flush is expected to rewrite the cache (control)"
     );
+}
+
+/// The SessionStart `learnt` line and resume lineage, through the real binary
+/// against a temp store (`--db-path`), temp HOME and temp transcript dir. No live
+/// data is read.
+#[cfg(unix)]
+mod session_start_learnt {
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+
+    const OLD_SID: &str = "aaaa1111-0000-0000-0000-old000000000";
+    const CONCURRENT_SID: &str = "cccc3333-0000-0000-0000-concurrent00";
+    const NEW_SID: &str = "dddd4444-0000-0000-0000-new0000000000";
+    const OLD_REQUEST: &str = "Refactor the billing exporter into a streaming pipeline";
+    const CONCURRENT_REQUEST: &str = "Tune the search ranker recency weighting";
+
+    struct Fixture {
+        dir: tempfile::TempDir,
+    }
+
+    struct Run {
+        stdout: String,
+        success: bool,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let fixture = Fixture {
+                dir: tempfile::tempdir().unwrap(),
+            };
+            std::fs::create_dir_all(fixture.home()).unwrap();
+            std::fs::create_dir_all(fixture.cwd()).unwrap();
+            std::fs::create_dir_all(fixture.transcript_dir()).unwrap();
+            // Open once so the schema exists, then close before the binary runs.
+            drop(csr_engine::storage::Storage::open(&fixture.db()).unwrap());
+            fixture
+        }
+        fn home(&self) -> PathBuf {
+            self.dir.path().join("home")
+        }
+        fn cwd(&self) -> PathBuf {
+            self.dir.path().join("projects").join("lproj")
+        }
+        fn transcript_dir(&self) -> PathBuf {
+            self.dir.path().join("claude-projects").join("lproj")
+        }
+        fn db(&self) -> PathBuf {
+            self.dir.path().join("csr-engine.db")
+        }
+        fn sql(&self, statements: &[(&str, Vec<String>)]) {
+            let conn = rusqlite::Connection::open(self.db()).unwrap();
+            for (sql, args) in statements {
+                conn.execute(sql, rusqlite::params_from_iter(args.iter()))
+                    .unwrap();
+            }
+        }
+        fn episode(&self, session: &str, request: &str, completed: &str, timestamp: &str) {
+            let content = serde_json::json!({
+                "schema": "v2", "session_id": session, "project": "lproj",
+                "timestamp": timestamp, "request": request, "investigated": [],
+                "completed": completed, "outcome": "success", "error_signatures": [],
+                "tools_used": [], "files_modified": [], "message_count": 12,
+                "duration_minutes": 0, "recap_evidence_version": 1,
+                "anchor_request": request,
+                "completions": [{"claim": completed, "receipt": "1a2b3c4"}],
+            })
+            .to_string();
+            let storage = csr_engine::storage::Storage::open(&self.db()).unwrap();
+            storage
+                .insert_reflection(
+                    &format!("ep-{session}"),
+                    &content,
+                    &[
+                        "session_episode".to_string(),
+                        "schema_v2".to_string(),
+                        "project_lproj".to_string(),
+                        format!("conv_{session}"),
+                    ],
+                    &[0.0; 4],
+                )
+                .unwrap();
+            drop(storage);
+            self.sql(&[(
+                "UPDATE reflections SET timestamp = ?1 WHERE id = ?2",
+                vec![timestamp.to_string(), format!("ep-{session}")],
+            )]);
+        }
+        fn note(&self, session: &str, slug: &str) {
+            self.sql(&[(
+                "INSERT INTO memory_registry
+                    (file_path, project, slug, description, mem_type, origin_session_id,
+                     modified_ts, file_mtime, content_hash, links_json, last_seen_scan)
+                 VALUES (?1, 'm', ?2, 'd', 'project', ?3, '2026-10-16T09:00:00Z', 0, 'h', '[]', 1)",
+                vec![
+                    format!("/m/{session}/{slug}.md"),
+                    slug.to_string(),
+                    session.to_string(),
+                ],
+            )]);
+        }
+        fn transcript(&self, session: &str, body: &str) -> PathBuf {
+            let path = self.transcript_dir().join(format!("{session}.jsonl"));
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+        fn run(&self, source: &str, session: &str, env: &[(&str, &str)]) -> Run {
+            let transcript = self.transcript(session, "");
+            let payload = serde_json::json!({
+                "session_id": session, "transcript_path": transcript,
+                "cwd": self.cwd(), "source": source,
+            });
+            let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+            command
+                .args(["hook", "session-start", "--db-path"])
+                .arg(self.db())
+                .arg("--projects-dir")
+                .arg(self.dir.path().join("projects"))
+                .env("HOME", self.home())
+                .env("CSR_TIMING_LOG", self.dir.path().join("timing.log"))
+                .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+                .env_remove("CSR_NO_LEARNT")
+                .env_remove("CSR_NO_RECAP")
+                .env_remove("CSR_DREAM_CONSUMPTION");
+            for (key, value) in env {
+                command.env(key, value);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            Run {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                success: output.status.success(),
+            }
+        }
+    }
+
+    fn learnt_lines(stdout: &str) -> Vec<&str> {
+        stdout
+            .lines()
+            .filter(|l| l.starts_with("learnt ["))
+            .collect()
+    }
+
+    fn recap_line(stdout: &str) -> &str {
+        stdout
+            .lines()
+            .find(|l| l.starts_with("recap ["))
+            .unwrap_or("")
+    }
+
+    fn continued_in(old: &str, new: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{old}\"}}\n{{\"type\":\"continued-in\",\"sessionId\":\"{old}\",\"continuedInSessionId\":\"{new}\"}}\n"
+        )
+    }
+
+    fn seeded() -> Fixture {
+        let f = Fixture::new();
+        f.episode(
+            OLD_SID,
+            OLD_REQUEST,
+            "Streaming exporter merged",
+            "2026-10-15T04:20:30Z",
+        );
+        f.note(OLD_SID, "exporter-batch-size");
+        f.note(OLD_SID, "billing-csv-quirks");
+        f
+    }
+
+    #[test]
+    fn session_start_resume_emits_learnt_line_after_the_recap_block() {
+        let f = seeded();
+        let run = f.run("resume", NEW_SID, &[]);
+        assert!(run.success);
+        let lines = learnt_lines(&run.stdout);
+        assert_eq!(lines.len(), 1, "{}", run.stdout);
+        let line = lines[0];
+        assert!(line.ends_with("[[CSR:LEARNT]]"), "{line}");
+        assert!(line.len() <= 320, "{} bytes", line.len());
+        assert!(line.contains("2 memory notes"), "{line}");
+        assert!(line.contains("(aaaa1111, 2026-10-16)"), "{line}");
+        let at = |needle: &str| {
+            run.stdout
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {}", run.stdout))
+        };
+        assert!(at("Full state:") < at("learnt ["), "{}", run.stdout);
+        assert!(
+            recap_line(&run.stdout).contains("Refactor the billing exporter"),
+            "{}",
+            run.stdout
+        );
+    }
+
+    #[test]
+    fn session_start_startup_new_session_gets_line_for_previous_session() {
+        let f = seeded();
+        let run = f.run("startup", NEW_SID, &[]);
+        assert!(run.success);
+        let lines = learnt_lines(&run.stdout);
+        assert_eq!(lines.len(), 1, "{}", run.stdout);
+        assert!(lines[0].contains("(aaaa1111, "), "{}", lines[0]);
+        assert!(lines[0].contains("exporter-batch-size"), "{}", lines[0]);
+        // A session with no evidence prints no line at all.
+        let bare = Fixture::new();
+        bare.episode(
+            OLD_SID,
+            OLD_REQUEST,
+            "Streaming exporter merged",
+            "2026-10-15T04:20:30Z",
+        );
+        let run = bare.run("startup", NEW_SID, &[]);
+        assert!(run.success);
+        assert!(learnt_lines(&run.stdout).is_empty(), "{}", run.stdout);
+        assert!(!run.stdout.contains("[[CSR:LEARNT]]"));
+        assert!(run.stdout.contains("recap ["), "{}", run.stdout);
+    }
+
+    #[test]
+    fn session_start_learnt_kill_switch_removes_only_the_line() {
+        let f = seeded();
+        let on = f.run("resume", NEW_SID, &[]);
+        let off = f.run("resume", NEW_SID, &[("CSR_NO_LEARNT", "1")]);
+        assert!(on.success && off.success);
+        assert_eq!(learnt_lines(&on.stdout).len(), 1);
+        assert!(learnt_lines(&off.stdout).is_empty(), "{}", off.stdout);
+        assert_eq!(recap_line(&off.stdout), recap_line(&on.stdout));
+        assert!(!recap_line(&off.stdout).is_empty());
+        let without_line: String = on
+            .stdout
+            .lines()
+            .filter(|l| !l.starts_with("learnt ["))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(without_line.trim_end(), off.stdout.trim_end());
+    }
+
+    #[test]
+    fn session_start_learnt_feed_failure_keeps_recap_and_exits_zero() {
+        let f = seeded();
+        f.sql(&[
+            ("DROP TABLE memory_registry", vec![]),
+            ("DROP TABLE session_registry", vec![]),
+        ]);
+        let run = f.run("resume", NEW_SID, &[("CSR_DREAM_CONSUMPTION", "full")]);
+        assert!(run.success);
+        assert!(run.stdout.contains("recap ["), "{}", run.stdout);
+        assert!(learnt_lines(&run.stdout).is_empty(), "{}", run.stdout);
+        assert!(!run.stdout.contains("degraded"), "{}", run.stdout);
+        assert!(!run.stdout.contains("DEGRADED"), "{}", run.stdout);
+    }
+
+    #[test]
+    fn resume_lineage_makes_recap_and_learnt_name_the_predecessor_not_the_concurrent_session() {
+        let f = seeded();
+        // A concurrent session in the same project is newer than the one resumed.
+        f.episode(
+            CONCURRENT_SID,
+            CONCURRENT_REQUEST,
+            "Ranker weights retuned",
+            "2026-10-16T08:00:00Z",
+        );
+        f.note(CONCURRENT_SID, "ranker-recency-knob");
+
+        // Control: with no `continued-in` row the newest episode wins (today's order).
+        let control = f.run("resume", NEW_SID, &[]);
+        assert!(control.success);
+        assert!(
+            recap_line(&control.stdout).contains("Tune the search ranker"),
+            "{}",
+            control.stdout
+        );
+        assert!(
+            learnt_lines(&control.stdout)[0].contains("(cccc3333, "),
+            "{}",
+            control.stdout
+        );
+
+        // The old transcript gains its `continued-in` row naming the new sid.
+        f.transcript(OLD_SID, &continued_in(OLD_SID, NEW_SID));
+        let run = f.run("resume", NEW_SID, &[]);
+        assert!(run.success);
+        let recap = recap_line(&run.stdout);
+        assert!(
+            recap.contains("Refactor the billing exporter"),
+            "{}",
+            run.stdout
+        );
+        assert!(!recap.contains("Tune the search ranker"), "{}", run.stdout);
+        let lines = learnt_lines(&run.stdout);
+        assert_eq!(lines.len(), 1, "{}", run.stdout);
+        assert!(lines[0].contains("(aaaa1111, "), "{}", lines[0]);
+        assert!(!lines[0].contains("ranker-recency-knob"), "{}", lines[0]);
+        // Nothing dropped: the concurrent session is still listed in the index.
+        assert!(
+            run.stdout.contains("Tune the search ranker"),
+            "{}",
+            run.stdout
+        );
+
+        // A `startup` never uses lineage, even with the row present. Use the
+        // very sid the `continued-in` row names: lineage would match it, so only
+        // the `source == "resume"` gate keeps the concurrent episode in front.
+        let startup = f.run("startup", NEW_SID, &[]);
+        assert!(startup.success);
+        let recap = recap_line(&startup.stdout);
+        assert!(
+            recap.contains("Tune the search ranker"),
+            "{}",
+            startup.stdout
+        );
+        assert!(
+            !recap.contains("Refactor the billing exporter"),
+            "{}",
+            startup.stdout
+        );
+        let lines = learnt_lines(&startup.stdout);
+        assert_eq!(lines.len(), 1, "{}", startup.stdout);
+        assert!(lines[0].contains("(cccc3333, "), "{}", lines[0]);
+        assert!(!lines[0].contains("(aaaa1111, "), "{}", lines[0]);
+    }
+}
+
+// ─── hook install: the retired CSR status line wrapper ───
+
+/// `hook install` run for real against a temp HOME, never the live settings.
+mod statusline_unwrap {
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+    use tempfile::TempDir;
+
+    const ORIGINAL: &str = "bash -c 'echo \"a b\" | tr a A'";
+
+    /// What `/csr statusline on` wrote: `wrapCommand` in the TypeScript companion.
+    fn wrapped(home: &Path, original: &str) -> String {
+        let wrapper = home.join(".claude-self-reflect/csr-companion/statusline.cjs");
+        format!(
+            "node \"{}\" --sh '{}'",
+            wrapper.display(),
+            original.replace('\'', "'\\''")
+        )
+    }
+
+    /// A wrapped command whose `--sh` word does not read back (two words).
+    fn unreadable(home: &Path) -> String {
+        format!(
+            "node \"{}/.claude-self-reflect/csr-companion/statusline.cjs\" --sh a b",
+            home.display()
+        )
+    }
+
+    fn install(home: &Path, apply: bool) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+        command.args(["hook", "install"]).env("HOME", home);
+        if apply {
+            command.arg("--apply");
+        }
+        command.output().unwrap()
+    }
+
+    fn settings_file(home: &Path) -> PathBuf {
+        home.join(".claude/settings.json")
+    }
+
+    fn write_settings(home: &Path, settings: &Value) {
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(settings_file(home), settings.to_string()).unwrap();
+    }
+
+    fn read_settings(home: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(settings_file(home)).unwrap()).unwrap()
+    }
+
+    /// The files "on" leaves behind, plus a foreign file in the companion folder.
+    fn leave_on_files(home: &Path) {
+        let base = home.join(".claude-self-reflect");
+        for dir in [
+            base.join("csr-companion/statusline"),
+            base.join("csr-shifts/statusline"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("s1.json"), "{}").unwrap();
+        }
+        std::fs::write(base.join("csr-companion/statusline.cjs"), "// wrapper").unwrap();
+        std::fs::write(
+            base.join("csr-companion/settings.before-statusline.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(base.join("csr-companion/other.txt"), "mine").unwrap();
+    }
+
+    fn stdout(out: &Output) -> String {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn apply_puts_the_original_back_in_one_write_and_deletes_the_leftovers() {
+        let home = TempDir::new().unwrap();
+        write_settings(
+            home.path(),
+            &json!({
+                "model": "opus",
+                "statusLine": {
+                    "type": "command",
+                    "padding": 1,
+                    "command": wrapped(home.path(), ORIGINAL),
+                },
+            }),
+        );
+        leave_on_files(home.path());
+        let before = std::fs::read_to_string(settings_file(home.path())).unwrap();
+
+        let out = install(home.path(), true);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout(&out).contains(&format!(
+                "CSR: status line restored to your own command (the CSR wrapper is retired): {ORIGINAL}"
+            )),
+            "{}",
+            stdout(&out)
+        );
+
+        let after = read_settings(home.path());
+        assert_eq!(
+            after["statusLine"],
+            json!({"type": "command", "padding": 1, "command": ORIGINAL})
+        );
+        assert_eq!(after["model"], "opus");
+        assert!(
+            after["hooks"]["Stop"].is_array(),
+            "hooks merged in the same write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".claude/settings.json.bak")).unwrap(),
+            before,
+            "one .bak, holding the settings as they were"
+        );
+
+        let base = home.path().join(".claude-self-reflect");
+        assert!(!base.join("csr-companion/statusline.cjs").exists());
+        assert!(!base
+            .join("csr-companion/settings.before-statusline.json")
+            .exists());
+        assert!(!base.join("csr-companion/statusline").exists());
+        assert!(!base.join("csr-shifts/statusline").exists());
+        assert!(
+            base.join("csr-companion/other.txt").exists(),
+            "foreign files stay"
+        );
+
+        // Second run: nothing about the status line, settings unchanged.
+        let once = read_settings(home.path());
+        let again = install(home.path(), true);
+        assert!(again.status.success());
+        assert!(
+            !stdout(&again).contains("status line"),
+            "{}",
+            stdout(&again)
+        );
+        assert_eq!(read_settings(home.path()), once);
+    }
+
+    #[test]
+    fn apply_takes_the_kept_settings_when_the_command_does_not_read_back() {
+        let home = TempDir::new().unwrap();
+        write_settings(
+            home.path(),
+            &json!({"statusLine": {"type": "command", "command": unreadable(home.path())}}),
+        );
+        leave_on_files(home.path());
+        let kept = home
+            .path()
+            .join(".claude-self-reflect/csr-companion/settings.before-statusline.json");
+        std::fs::write(
+            &kept,
+            json!({"statusLine": {"command": "my-line"}}).to_string(),
+        )
+        .unwrap();
+
+        let out = install(home.path(), true);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            read_settings(home.path())["statusLine"]["command"],
+            "my-line"
+        );
+        assert!(!kept.exists());
+    }
+
+    #[test]
+    fn apply_without_an_original_changes_and_deletes_nothing_and_says_so() {
+        let home = TempDir::new().unwrap();
+        let odd = unreadable(home.path());
+        write_settings(
+            home.path(),
+            &json!({"statusLine": {"type": "command", "command": odd}}),
+        );
+        leave_on_files(home.path());
+
+        let out = install(home.path(), true);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = stdout(&out);
+        assert!(text.contains("by hand"), "{text}");
+        assert!(text.contains(".claude/settings.json"), "{text}");
+        assert_eq!(
+            read_settings(home.path())["statusLine"]["command"],
+            odd.as_str()
+        );
+        let base = home.path().join(".claude-self-reflect/csr-companion");
+        assert!(base.join("statusline.cjs").exists());
+        assert!(base.join("settings.before-statusline.json").exists());
+        assert!(base.join("statusline/s1.json").exists());
+    }
+
+    #[test]
+    fn an_unwrapped_status_line_is_left_exactly_as_it_is() {
+        let home = TempDir::new().unwrap();
+        write_settings(
+            home.path(),
+            &json!({"statusLine": {"type": "command", "command": "ccstatusline"}}),
+        );
+        leave_on_files(home.path());
+
+        let out = install(home.path(), true);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!stdout(&out).contains("status line"), "{}", stdout(&out));
+        assert_eq!(
+            read_settings(home.path())["statusLine"]["command"],
+            "ccstatusline"
+        );
+        assert!(
+            home.path()
+                .join(".claude-self-reflect/csr-companion/statusline.cjs")
+                .exists(),
+            "nothing is deleted unless a wrapped line was restored"
+        );
+    }
+
+    #[test]
+    fn the_dry_run_says_what_would_change_and_writes_nothing() {
+        let home = TempDir::new().unwrap();
+        write_settings(
+            home.path(),
+            &json!({"statusLine": {"type": "command", "command": wrapped(home.path(), ORIGINAL)}}),
+        );
+        leave_on_files(home.path());
+        let before = std::fs::read_to_string(settings_file(home.path())).unwrap();
+
+        let out = install(home.path(), false);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout(&out).contains("would restore your status line"),
+            "{}",
+            stdout(&out)
+        );
+        assert!(stdout(&out).contains(ORIGINAL), "{}", stdout(&out));
+        assert_eq!(
+            std::fs::read_to_string(settings_file(home.path())).unwrap(),
+            before
+        );
+        assert!(!home.path().join(".claude/settings.json.bak").exists());
+        assert!(home
+            .path()
+            .join(".claude-self-reflect/csr-companion/statusline.cjs")
+            .exists());
+    }
+}
+
+/// C3: SessionEnd re-spawns itself detached; the child's stderr used to go to
+/// /dev/null, so its failures were invisible. It now goes to a log (rotated at open past 1 MiB)
+/// under the CSR data dir. Runs the real binary against a temp db/HOME.
+#[cfg(unix)]
+mod session_end_detached_log {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_detached_child_stderr_lands_in_a_log_under_the_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let timing = dir.path().join("timing.log");
+        let log = dir.path().join("logs/session-end-detached.log");
+        let payload = serde_json::json!({
+            "session_id": "detached-log-session",
+            "transcript_path": dir.path().join("projects/proj/detached-log-session.jsonl"),
+            "cwd": dir.path(),
+            "reason": "other",
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["hook", "session-end", "--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.path().join("projects"))
+            .env("HOME", &home)
+            .env("CSR_TIMING_LOG", &timing)
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .env_remove("CSR_HOOK_DETACHED")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "the hook must stay non-blocking and succeed"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !log.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            text.contains("session-end detached child spawned by hook pid"),
+            "the detached child's log must exist under the data dir: {text:?}"
+        );
+    }
 }

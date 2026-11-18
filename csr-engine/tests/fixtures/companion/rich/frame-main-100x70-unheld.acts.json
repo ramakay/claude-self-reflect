@@ -1,0 +1,82 @@
+{
+  "56": {
+    "key": "instrument:dreams"
+  },
+  "58": {
+    "dream": "arrived",
+    "key": "dream:arrived",
+    "send": "Self-Reflect's dreamer asked this while you worked, quoted: “What if the export queue paged its output?” Its reasoning: “Page the export. - Page the output. - Keep each page small.”",
+    "spans": [
+      [
+        0,
+        25,
+        "helpful"
+      ],
+      [
+        25,
+        50,
+        "thought_of_it"
+      ],
+      [
+        50,
+        75,
+        "not_relevant"
+      ],
+      [
+        75,
+        100,
+        "ask_claude"
+      ]
+    ]
+  },
+  "60": {
+    "key": "observe:3:0"
+  },
+  "61": {
+    "key": "instrument:threads"
+  },
+  "63": {
+    "key": "instrument:changes"
+  },
+  "64": {
+    "key": "instrument:figure"
+  },
+  "68": {
+    "key": "instrument:agents"
+  },
+  "69": {
+    "key": "legend",
+    "keys": [
+      [
+        1,
+        8,
+        "d"
+      ],
+      [
+        10,
+        19,
+        "l"
+      ],
+      [
+        21,
+        32,
+        "t"
+      ],
+      [
+        34,
+        42,
+        "i"
+      ],
+      [
+        44,
+        51,
+        "b"
+      ],
+      [
+        53,
+        60,
+        "q"
+      ]
+    ]
+  }
+}

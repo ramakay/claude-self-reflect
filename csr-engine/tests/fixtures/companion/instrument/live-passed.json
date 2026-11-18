@@ -1,0 +1,11 @@
+{
+  "usage": {"at":1792320000,"context":{"tokens":140000,"window":1000000},"rateLimits":[{"kind":"five_hour","percentUsed":1},{"kind":"seven_day","percentUsed":55}]},
+  "dream_records": [
+    {"kind":"dream","session":"sess-now","at":1792319000,"id":"old-one","title":"The what-if could lead the pane","line":"What if the question led the pane?","confidence":0.9},
+    {"kind":"dream","session":"sess-now","at":1792319100,"id":"old-two","title":"Launch images could come from real sessions","line":"What if launch images came from real sessions?","confidence":0.8},
+    {"kind":"answer","id":"old-one","answer":"ignored","at":1792319200},
+    {"kind":"answer","id":"old-two","answer":"ignored","at":1792319300},
+    {"kind":"look","session":"sess-now","at":1792319400,"outcome":"none"},
+    {"kind":"look","session":"sess-now","at":1792319990,"outcome":"quiet"}
+  ]
+}

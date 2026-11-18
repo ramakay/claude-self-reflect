@@ -96,10 +96,9 @@ function detectTarget() {
 
   // Intel Mac: no prebuilt binaries
   if (archName === 'x86_64' && osName === 'apple-darwin') {
-    console.log('\n  Intel Mac (x86_64) — no prebuilt binaries (ONNX limitation).');
-    console.log('  Build from source:');
-    console.log('    cd csr-engine && cargo build --release');
-    console.log('    cp target/release/csr-engine ~/.local/bin/\n');
+    console.log('\n  Intel Mac (x86_64) is not supported.');
+    console.log('  There is no prebuilt binary, and the ONNX runtime has no x86_64-apple-darwin');
+    console.log('  build, so the engine cannot be built for this platform either.\n');
     process.exit(0);
   }
 
@@ -206,8 +205,9 @@ function findExpectedChecksum(checksumData, filename) {
 // --- Activation ---
 
 // Activation is a separate consent event: setup writes hooks into
-// ~/.claude/settings.json, registers the MCP server, and imports
-// conversation transcripts. Never do that from a package manager
+// ~/.claude/settings.json, registers the MCP server, imports
+// conversation transcripts, and installs the csr-companion plugin through
+// Claude Code's plugin CLI. Never do that from a package manager
 // lifecycle script unless the user explicitly opted in.
 function runOrExplainActivation(destPath, pathBinary) {
   // Bare `csr-engine` is only safe advice when PATH really resolves to the
@@ -216,7 +216,8 @@ function runOrExplainActivation(destPath, pathBinary) {
 
   if (process.env.CSR_AUTO_SETUP !== '1') {
     console.log('\n  \x1b[1mTo activate\x1b[0m (registers the MCP server, installs hooks,');
-    console.log('  and imports your conversations), run:');
+    console.log("  imports your conversations, installs the csr-companion plugin through");
+    console.log("  Claude Code's plugin CLI, and starts the background daemon on macOS), run:");
     console.log(`\n    \x1b[1;32m${command} setup\x1b[0m\n`);
     console.log('  Then restart Claude Code.\n');
     return;
@@ -228,7 +229,9 @@ function runOrExplainActivation(destPath, pathBinary) {
   // found it already there. Running it is the consented action, not a probe.
   console.log('  CSR_AUTO_SETUP=1 — running setup...');
   try {
-    execFileSync(destPath, ['setup'], { stdio: 'inherit', timeout: 60000 });
+    // The first import reads every transcript and the model may download, so a
+    // minute is not enough; a setup killed there never reaches the daemon step.
+    execFileSync(destPath, ['setup'], { stdio: 'inherit', timeout: 30 * 60 * 1000 });
   } catch {
     console.log(`\n  Setup failed. Run manually: ${command} setup\n`);
     process.exitCode = 1;
@@ -248,6 +251,70 @@ function runOrExplainActivation(destPath, pathBinary) {
   }
 
   console.log('\n  \x1b[32mDone. Restart Claude Code to activate.\x1b[0m\n');
+}
+
+// --- Stale-process report + daemon restart (gap-G2 spec 2e) ---
+//
+// FORWARD-PORT NOTE (gap-G2 review finding 5): this branch's base predates
+// #316, which rewrote this file's staging/rename logic and added
+// installer/lib.js on main. `git merge-tree main HEAD` conflicts in this
+// file. When this branch lands on top of that rewrite, move
+// reportStaleAndKickstart (and the matching shell function in
+// scripts/install.sh) into lib.js behind an injectable exec, drop the
+// now-redundant staging duplicate, and add an installer test feeding a
+// fake `status --stale` output.
+
+const DAEMON_LABEL = 'com.ramakay.csr-engine.daemon';
+
+function reportStaleAndKickstart(binaryPath) {
+  try {
+    // `status --stale` is a DB-free fast path (run-registry read + a
+    // liveness check per pid, milliseconds) — NOT the full `status`, whose
+    // SQLite gather measured 8-31s on a 563k-chunk corpus under load, right
+    // after this same install wrote a fresh binary the OS has to
+    // codesign-verify on its first exec. The old 10s timeout around the
+    // full command missed on 2 of 3 timed runs on that machine, so the
+    // stale-process report (spec 2e) silently never printed (gap-G2 review
+    // finding 2). Plain per-line text, not JSON: `pid <n> (<role>, started
+    // <ts>, parent <p>)`, matching `csr_engine::status::format_stale_processes`.
+    const output = execFileSync(binaryPath, ['status', '--stale'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000,
+    });
+    const lines = output.split('\n').map((l) => l.trim()).filter(Boolean);
+    if (lines.length > 0) {
+      console.log(`\n  \x1b[1;33m${lines.length} process(es) are still running the previous csr-engine build:\x1b[0m`);
+      for (const line of lines) {
+        console.log(`    ${line}`);
+      }
+      console.log('  Restart Claude Code sessions (and any other MCP host) using csr-engine to pick up this build.');
+    }
+  } catch {
+    // A fresh install with no prior run registry prints nothing (not an
+    // error) via the same path above — this catch is only reached on an
+    // actual failure (spawn error, non-zero exit, timeout). Report it
+    // rather than staying silent, so a real failure doesn't look identical
+    // to "nothing was stale" (gap-G2 review finding 2).
+    console.log('  could not determine stale processes');
+  }
+
+  if (platform() !== 'darwin') return;
+  try {
+    execFileSync('launchctl', ['print', `gui/${process.getuid()}/${DAEMON_LABEL}`], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+  } catch {
+    return; // daemon label not loaded — nothing to restart
+  }
+  try {
+    console.log(`  Restarting daemon (${DAEMON_LABEL}) to pick up the new build...`);
+    execFileSync('launchctl', ['kickstart', '-k', `gui/${process.getuid()}/${DAEMON_LABEL}`], {
+      stdio: ['ignore', 'ignore', 'inherit'],
+    });
+  } catch {
+    console.log('  launchctl kickstart failed; restart the daemon manually.');
+  }
 }
 
 // --- Shadowed installation detection ---
@@ -296,7 +363,7 @@ async function main() {
 
   if (pythonSignals.length > 0) {
     console.log('\n  \x1b[1;33mUpgrading from Python CSR to v8.0 (Rust)\x1b[0m');
-    console.log('  v8.0 replaces Docker + Python + Qdrant with a single 44MB binary.');
+    console.log('  v8.0 replaces Docker + Python + Qdrant with a single binary (about 135 MB).');
     console.log('  Your conversation data is preserved.\n');
   }
 
@@ -362,6 +429,7 @@ async function main() {
 
     warnAboutStaleCopies(destPath, pathBinary);
     runOrExplainActivation(destPath, pathBinary);
+    reportStaleAndKickstart(destPath);
 
     if (pythonSignals.length > 0) {
       console.log('  Old Python stack can be cleaned up:');

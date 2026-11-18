@@ -1,6 +1,157 @@
 #!/bin/sh
+# Pre-commit gate, scoped to what the commit stages. The full suites run at the
+# release gate, not on every commit.
+#
+#   csr-engine/** (anything)                 cargo fmt --check, clippy on all targets
+#   csr-engine/src/<module>[/...]            + that module's lib tests
+#   csr-engine/src/companion/...             + companion_frame, companion_pages, companion_type, hooks_integration
+#   csr-engine/src/lib.rs, Cargo.toml/.lock,
+#     build.rs                               + the whole lib suite
+#   csr-engine/tests/<target>.rs             + that integration target
+#   csr-engine/tests/fixtures/<name>         + the modules and targets that read it
+#   anything else                            nothing
+#
+# Cargo and the tests run under nice, on half the cores.
+# CSR_PRECOMMIT_FULL=1 runs the whole lib suite.
+# CSR_PRECOMMIT_PLAN=1 prints what would run and runs nothing.
 set -e
+
+top=$(git rev-parse --show-toplevel)
+cd "$top"
+staged=$(git diff --cached --name-only --diff-filter=ACMRD)
+[ -n "$staged" ] || exit 0
+
+# git exports GIT_DIR, GIT_INDEX_FILE and friends to hooks. Tests that run git in their own temp repos
+# would act on this repository's index instead, so nothing below inherits them.
+for var in $(env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p'); do
+  unset "$var"
+done
+
+cpus=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+jobs=$((cpus / 2))
+[ "$jobs" -ge 1 ] || jobs=1
+plan=${CSR_PRECOMMIT_PLAN:-0}
+
+run() {
+  if [ "$plan" = 1 ]; then
+    echo "plan: $*"
+  else
+    nice -n 10 "$@"
+  fi
+}
+
+# The integration targets that include a tests/support helper, by #[path] or include!.
+support_targets() {
+  (cd csr-engine && grep -l 'support/' tests/*.rs 2>/dev/null | sed 's|^tests/||; s|\.rs$||')
+}
+
+module_of() {
+  m=${1#csr-engine/src/}
+  m=${m%%/*}
+  echo "${m%.rs}"
+}
+
+rust=0
+full=${CSR_PRECOMMIT_FULL:-0}
+mods=""
+targets=""
+
+IFS='
+'
+for f in $staged; do
+  case "$f" in
+    csr-engine/Cargo.toml | csr-engine/Cargo.lock | csr-engine/build.rs | csr-engine/src/lib.rs)
+      rust=1
+      full=1
+      ;;
+    csr-engine/src/main.rs) rust=1 ;;
+    csr-engine/src/companion/*)
+      # Fast targets that pin the pane's frames, acts and start note. The slow pane suites
+      # (companion_instrument, pane_contract) stay in the full gate.
+      rust=1
+      mods="$mods companion"
+      targets="$targets companion_frame companion_pages companion_type hooks_integration"
+      ;;
+    csr-engine/src/*)
+      rust=1
+      mods="$mods $(module_of "$f")"
+      ;;
+    csr-engine/tests/fixtures/*)
+      rust=1
+      name=${f#csr-engine/tests/fixtures/}
+      name=${name%%/*}
+      # a path literal, or a bare name joined onto a fixtures dir: join("x.jsonl")
+      readers=$(cd csr-engine && grep -rlF -e "fixtures/$name" -e "\"$name\"" -e "\"$name/" src tests 2>/dev/null | grep '\.rs$' || true)
+      [ -n "$readers" ] || full=1
+      for r in $readers; do
+        case "$r" in
+          src/lib.rs | src/main.rs) full=1 ;;
+          src/*) mods="$mods $(module_of "csr-engine/$r")" ;;
+          tests/support/*) targets="$targets $(support_targets)" ;;
+          tests/*.rs)
+            t=${r#tests/}
+            targets="$targets ${t%.rs}"
+            ;;
+        esac
+      done
+      ;;
+    csr-engine/tests/support/*)
+      # A helper module, not a test target: run the targets that pull it in.
+      rust=1
+      targets="$targets $(support_targets)"
+      ;;
+    csr-engine/tests/*.rs)
+      rust=1
+      t=${f#csr-engine/tests/}
+      targets="$targets ${t%.rs}"
+      ;;
+    csr-engine/*) rust=1 ;;
+  esac
+done
+unset IFS
+
+[ "$rust" = 1 ] || exit 0
+
 cd csr-engine
-cargo fmt -- --check
-cargo clippy -- -D warnings
-cargo test --lib 2>/dev/null
+export CARGO_BUILD_JOBS="$jobs"
+run cargo fmt -- --check
+run cargo clippy --profile gate --all-targets -- -D warnings
+
+# The tests run under a throwaway HOME, so none can read or write the person's real
+# ~/.claude-self-reflect or ~/.claude. Cargo and rustup keep their own homes.
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+test_home=$(mktemp -d /private/tmp/precommit-cargo-home.XXXXXX)
+trap 'rm -rf "$test_home"' EXIT
+
+# Nextest when it is installed: one process a test, so a test that holds a global lock
+# stalls only itself. A contributor without it gets cargo test, the same tests.
+# A filter that matches nothing passes under both.
+if cargo nextest --version >/dev/null 2>&1; then
+  lib_tests() {
+    run env HOME="$test_home" cargo nextest run --cargo-profile gate --no-tests=pass \
+      --test-threads="$jobs" --lib "$@"
+  }
+  target_tests() {
+    run env HOME="$test_home" cargo nextest run --cargo-profile gate --no-tests=pass \
+      --test-threads="$jobs" --test "$1"
+  }
+else
+  lib_tests() {
+    run env HOME="$test_home" cargo test --profile gate --lib -- --test-threads="$jobs" "$@"
+  }
+  target_tests() {
+    run env HOME="$test_home" cargo test --profile gate --test "$1" -- --test-threads="$jobs"
+  }
+fi
+
+if [ "$full" = 1 ]; then
+  lib_tests
+elif [ -n "$mods" ]; then
+  filters=$(printf '%s\n' $mods | sort -u | sed 's/$/::/')
+  # shellcheck disable=SC2086
+  lib_tests $filters
+fi
+
+for t in $(printf '%s\n' $targets | sort -u); do
+  target_tests "$t"
+done

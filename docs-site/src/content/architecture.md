@@ -4,13 +4,13 @@ title: Architecture
 
 ## Overview
 
-CSR is a single 44MB Rust binary. Everything — storage, search, embeddings, MCP server, hooks, and enrichment — runs in one process. No daemons, no database servers, no containers, no network services.
+CSR is a single Rust binary of about 138 MB. Everything — storage, search, embeddings, MCP server, hooks, and enrichment — runs in one process. No database servers, no containers, no network services. The one background process is `csr-engine daemon`, which does enrichment and dreaming. On macOS `csr-engine setup` installs it as a launchd agent and starts it (`CSR_NO_DAEMON=1` skips that; `scripts/launchd/` holds a template for doing it by hand). Hooks and the MCP server run without it.
 
 ![CSR Architecture Diagram](/claude-self-reflect/images/arch-diagram.png)
 
-## Hooks: The Active Memory Loop
+## Hooks: the session loop
 
-Six hooks fire at strategic moments during Claude Code sessions. They run inline as CLI subcommands — no background daemon.
+Eight hooks fire on seven events during Claude Code sessions (SessionStart runs two). They run inline as CLI subcommands — no background daemon.
 
 ![Hooks Lifecycle Diagram](/claude-self-reflect/images/hooks-diagram.png)
 
@@ -19,27 +19,26 @@ All hooks use catch-all error handling — they log and return OK, never blockin
 ## Components
 
 ### JSONL Parser (`src/import/`)
-Parses Claude Code conversations from `~/.claude/projects/**/*.jsonl`. Splits into searchable chunks and extracts tool context from `tool_use` blocks. Since ~74% of Claude Code sessions are tool interactions, this extraction produces 2.8x more searchable content.
+Parses Claude Code conversations from `~/.claude/projects/**/*.jsonl`. Splits into searchable chunks and extracts tool context from `tool_use` blocks.
 
-**Speed**: ~20 conversations/second using batch embedding.
+Conversations are embedded in batches.
 
 ### Embedding Engine (`src/embeddings/`)
 Uses FastEmbed with `all-MiniLM-L6-v2` to generate 384-dimensional vectors locally. No API calls, no cloud service.
 
-| Operation | Latency |
-|-----------|---------|
-| Single embed | 2.5ms |
-| Batch (10 texts) | 7.3ms (0.73ms each) |
-| Model size | ~23MB (cached locally) |
+| Property | Value |
+|----------|-------|
+| Model file | Cached locally after the first download |
+| Batching | Texts are embedded in batches |
 
 ### HNSW Search Index (`src/search/`)
 Hierarchical Navigable Small World graph for approximate nearest neighbor search. Index lives in memory, persisted to disk for fast reload.
 
 | Operation | Latency |
 |-----------|---------|
-| Search (p95) | < 1ms |
-| Cached startup | ~150ms (p50, 54K-chunk index) |
-| Cold startup | ~14s (rebuild from SQLite) |
+| Index lookup (p95) | Timed by `csr-engine eval` on your own index; the target is under 1 ms. It covers the lookup only, not a full recall call. |
+| Cached startup | Loads the saved index; the time grows with index size |
+| Cold startup | Rebuilds the index from SQLite; slower than a cached load |
 
 Staleness detection via `IndexManifest` — rebuilds only when DB has new data.
 
@@ -49,16 +48,16 @@ Single database at `~/.claude-self-reflect/csr-engine.db`. Thread-safe via `Mute
 Stores: conversation chunks, vector embeddings, reflections (stored insights), enrichment state, retrieval events (for TAD scoring), import deduplication state.
 
 ### MCP Server (`src/mcp/`)
-Built on rmcp. Exposes 15 tools via Model Context Protocol. Runs as stdio server — Claude Code starts it on demand. No HTTP, no ports, no long-running daemon.
+Built on rmcp. Exposes 16 tools via Model Context Protocol. Runs as a stdio server that Claude Code starts on demand. The MCP server opens no port. The optional `csr-engine daemon` does background work and hosts the loopback-only dream journal.
 
 ### Enrichment Pipeline (`src/extraction/`)
 Three-layer progressive enrichment. Each layer supersedes the previous in the search index:
 
-| Layer | When | Cost | Quality Score |
-|-------|------|------|---------------|
-| L1 Heuristic | At import | Free | 0.074 |
-| L2 V3 Extract | At session end | Free | 0.345 |
-| L3 AI Narrative | Batch daemon | $0.012/conv | 0.691 |
+| Layer | When | Cost |
+|-------|------|------|
+| L1 Heuristic | At import | Free |
+| L2 V3 Extract | At session end | Free |
+| L3 AI Narrative | Batch daemon | Metered, optional |
 
 ### AST Code Analysis (`src/extraction/ast_analysis.rs`)
 Extracts structural metadata from code found in conversations using tree-sitter grammars via ast-grep. Instead of treating code as opaque text, CSR parses it into an AST and extracts function names, type definitions, and imports — making code searchable by structure.
@@ -89,12 +88,15 @@ source code → language detect → tree-sitter parse → AST → extract nodes 
 AST parsing is wrapped in `catch_unwind` for robustness — malformed code won't crash the engine.
 
 ### Continuity Engine (`src/provenance.rs`, `src/ledger/`, `src/governor/`)
-Provenance-aware retrieval added in v9.2. Every chunk carries speaker attribution, source conversation, and supersession state. The re-ranker demotes assistant scaffold text (proposals, plans) and boosts primary sources (decisions, outcomes), so recall favors what actually happened. A Derivation Ledger tracks where injected context came from, and an Injection Governor applies reuse tracking and an anti-flap budget so repeated prompts don't thrash the same context in and out.
+Retrieval is provenance-aware. Every chunk carries speaker attribution, source conversation, and supersession state. The re-ranker demotes assistant scaffold text (proposals, plans) and boosts primary sources (decisions, outcomes), so recall favors what actually happened. A Derivation Ledger tracks where injected context came from, and an Injection Governor applies reuse tracking and an anti-flap budget so repeated prompts don't thrash the same context in and out.
 
 Verified live: `csr-engine eval --continuity-live` probes the real index (not fixtures) against a grep baseline.
 
 ### Code Graph (`src/storage/codegraph.rs`)
 Conversation-provenance code graph. AST anchors (function-level, body-hashed) link code symbols to the sessions that created or modified them. Queried via the `csr_code_graph` MCP tool.
+
+### Code Map (`src/codemap/`)
+A live map of definitions in supported source files in your repos, per worktree. It is keyed by git blob oid: a worktree is a view of file paths and blob oids, and a blob is parsed once per extractor version however many worktrees hold it. Three signals keep it fresh: a 60 s poll of each active repo, a file watcher with a 5 s debounce, and a queue the PostToolUse hook fills with one insert and no parse. It maps the repos your sessions are in (last 24 hours, at most 16). It only reads repos and stores the map in the same SQLite database. `csr_search_by_file` and `csr_code_graph` answer from it for code no conversation touched.
 
 ### Injection Engine (`src/injection/`)
 Token-budgeted context injection for hooks. Multi-signal scoring model:
@@ -118,10 +120,10 @@ score = raw_score * ((1 - 0.3) + 0.3 * 2^(-age_days / 90))
 
 ## Design Decisions
 
-**Why Rust?** — Single binary distribution, no runtime deps, predictable performance, memory safety, 44MB total including ONNX Runtime.
+**Why Rust?** — Single binary distribution, no runtime deps, predictable performance, memory safety, about 138 MB in total including ONNX Runtime.
 
 **Why SQLite over Qdrant?** — Eliminated Docker dependency entirely. Single-file database is easy to backup, move, inspect. Good enough for single-user workloads.
 
-**Why HNSW in-memory?** — `sqlite-vec` only supports brute-force KNN. HNSW gives sub-millisecond approximate nearest neighbor search at 15K+ vectors.
+**Why HNSW in-memory?** — `sqlite-vec` only supports brute-force KNN. HNSW gives fast in-memory approximate nearest neighbor search.
 
 **Why FastEmbed over Voyage AI?** — No API key required, no network dependency, no per-query cost, privacy-first. Good enough accuracy for conversation search.

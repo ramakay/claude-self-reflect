@@ -1,0 +1,70 @@
+[
+ {
+  "at": null,
+  "prompts": [],
+  "out": false
+ },
+ {
+  "at": null,
+  "prompts": [
+   50.0
+  ],
+  "out": false
+ },
+ {
+  "at": null,
+  "prompts": [
+   100.0
+  ],
+  "out": false
+ },
+ {
+  "at": null,
+  "prompts": [
+   150.0
+  ],
+  "out": false
+ },
+ {
+  "at": null,
+  "prompts": [
+   50.0,
+   150.0
+  ],
+  "out": false
+ },
+ {
+  "at": 100.0,
+  "prompts": [],
+  "out": false
+ },
+ {
+  "at": 100.0,
+  "prompts": [
+   50.0
+  ],
+  "out": false
+ },
+ {
+  "at": 100.0,
+  "prompts": [
+   100.0
+  ],
+  "out": false
+ },
+ {
+  "at": 100.0,
+  "prompts": [
+   150.0
+  ],
+  "out": true
+ },
+ {
+  "at": 100.0,
+  "prompts": [
+   50.0,
+   150.0
+  ],
+  "out": true
+ }
+]

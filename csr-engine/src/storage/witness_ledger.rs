@@ -259,6 +259,28 @@ pub fn count_witnesses_for_file(conn: &Connection, project: &str, file: &str) ->
     .map_err(Into::into)
 }
 
+/// All witness rows recorded for `project`, across every file — the
+/// "witnessed, no verdict" evidence base `dream::threads` (Journal v3 Phase
+/// 1.5) joins against app-side via `dream_items::last_two_segments`, the same
+/// file-identity comparator `dream_items::verdict_rows_for_project` documents
+/// (a thread's evidence files and a witness's absolute repo path rarely share
+/// a root, but the trailing `dir/file.ext` almost always matches).
+pub(crate) fn all_witnesses_for_project(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<WitnessLedgerRow>> {
+    let sql = format!(
+        "SELECT {SELECT_COLUMNS} FROM witness_ledger
+         WHERE project = ?1
+         ORDER BY id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![project], row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Total ledger rows across every project/file/tier — a cheap
 /// "is there anything here at all" check the daemon's dream-cadence
 /// catch-up decision uses (`daemon::dream_cadence::should_catch_up`): a
@@ -271,8 +293,10 @@ pub fn count_all(conn: &Connection) -> Result<i64> {
 }
 
 /// Every `tier = 'committed'` witness row, ordered so that all rows sharing
-/// `(project, file, symbol)` are contiguous (`ORDER BY project, file,
-/// COALESCE(symbol,''), id`) — the grouping order `dream`'s successor join
+/// `(file, symbol)` are contiguous (`ORDER BY file, COALESCE(symbol,''), id`;
+/// project is deliberately not part of anchor identity — the stamp pass
+/// assigns one project per file, so the same file+symbol appears under
+/// several projects over time) — the grouping order `dream`'s successor join
 /// needs to walk each anchor's history without a second sort pass.
 /// `tier = 'worktree'` rows are excluded: only committed history can support
 /// a supersession claim (mirrors `codewitness::Auditor::audit_against_successor`'s
@@ -281,7 +305,7 @@ pub fn all_committed_witnesses(conn: &Connection) -> Result<Vec<WitnessLedgerRow
     let sql = format!(
         "SELECT {SELECT_COLUMNS} FROM witness_ledger
          WHERE tier = 'committed'
-         ORDER BY project, file, COALESCE(symbol,''), id"
+         ORDER BY file, COALESCE(symbol,''), id"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt

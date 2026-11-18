@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 const DEFAULT_DECAY_WEIGHT: f64 = 0.3;
 
 /// Default half-life in days (score halves after this many days).
-const DEFAULT_SCALE_DAYS: f64 = 90.0;
+pub const DEFAULT_SCALE_DAYS: f64 = 90.0;
 
 /// Each shipped release behind increases effective age by 25%.
 pub const ANCESTRY_RELEASE_STEP: f64 = 0.25;

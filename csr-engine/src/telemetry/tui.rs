@@ -63,10 +63,11 @@ fn event_loop(
     window: Window,
 ) -> Result<()> {
     let mut telemetry = collect(db_path, projects_dir, window)?;
+    let mut state = header_state(&telemetry);
     let mut last_tick = Instant::now();
 
     loop {
-        terminal.draw(|f| render(f, &telemetry))?;
+        terminal.draw(|f| render(f, &telemetry, state))?;
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
@@ -78,6 +79,7 @@ fn event_loop(
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('r') => {
                         telemetry = collect(db_path, projects_dir, window)?;
+                        state = header_state(&telemetry);
                         last_tick = Instant::now();
                     }
                     _ => {}
@@ -87,12 +89,13 @@ fn event_loop(
 
         if last_tick.elapsed() >= TICK {
             telemetry = collect(db_path, projects_dir, window)?;
+            state = header_state(&telemetry);
             last_tick = Instant::now();
         }
     }
 }
 
-fn render(f: &mut Frame, t: &Telemetry) {
+fn render(f: &mut Frame, t: &Telemetry, state: &str) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -102,7 +105,7 @@ fn render(f: &mut Frame, t: &Telemetry) {
         ])
         .split(f.area());
 
-    draw_header(f, outer[0], t);
+    draw_header(f, outer[0], t, state);
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -114,20 +117,28 @@ fn render(f: &mut Frame, t: &Telemetry) {
     draw_footer(f, outer[2], t);
 }
 
-fn draw_header(f: &mut Frame, area: Rect, t: &Telemetry) {
-    let health_style = if t.status.healthy {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+/// The same one-word state as `status` JSON (`healthy` is the database verdict only). It reads
+/// the hook-timing log, so the loop computes it once per `collect`, not on every redraw.
+fn header_state(t: &Telemetry) -> &'static str {
+    let signals = crate::telemetry::degraded::signals_for_report(
+        &serde_json::to_value(&t.status).unwrap_or_default(),
+    );
+    crate::telemetry::degraded::state(t.status.healthy, &signals)
+}
+
+fn draw_header(f: &mut Frame, area: Rect, t: &Telemetry, state: &str) {
+    let (color, health_label) = match state {
+        "ok" => (Color::Green, "● ok"),
+        "unhealthy" => (Color::Red, "● UNHEALTHY"),
+        "degraded" => (Color::Yellow, "● degraded"),
+        _ => (Color::Gray, "● integrity unknown"),
     };
-    let health_label = if t.status.healthy {
-        "● healthy"
-    } else {
-        "● UNHEALTHY"
-    };
+    let health_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     let db_mb = t.status.db_size_bytes as f64 / 1_048_576.0;
+    let reason =
+        crate::storage::integrity::unhealthy_reason(t.status.healthy, t.status.fts_dangling_rowids)
+            .map(|reason| format!(" ({reason})"))
+            .unwrap_or_default();
 
     let line = Line::from(vec![
         Span::styled(
@@ -138,6 +149,7 @@ fn draw_header(f: &mut Frame, area: Rect, t: &Telemetry) {
         Span::styled(&t.window, Style::default().fg(Color::Cyan)),
         Span::raw("   "),
         Span::styled(health_label, health_style),
+        Span::styled(reason, Style::default().fg(color)),
         Span::raw(format!(
             "   db={:.1}MB  chunks={}  reflections={}  projects={}",
             db_mb, t.status.chunks, t.status.reflections, t.status.projects
@@ -237,6 +249,31 @@ fn draw_index_panel(f: &mut Frame, area: Rect, t: &Telemetry) {
     if let Some(ref newest) = t.status.newest_chunk {
         lines.push(Line::from(format!("  newest      {}", newest)));
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "Provenance",
+        Style::default().add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(format!(
+        "  spans       {}/{}  ({} unknown)",
+        t.status.provenance_coverage.chunks_with_spans,
+        t.status.provenance_coverage.chunks_total,
+        t.status.provenance_coverage.chunks_unknown,
+    )));
+    lines.push(Line::from(format!(
+        "  missing={} unparsed={} unmatched={}",
+        t.status.provenance_coverage.source_missing,
+        t.status.provenance_coverage.source_unparsed,
+        t.status.provenance_coverage.source_unmatched,
+    )));
+    lines.push(Line::from(format!(
+        "  tool share  {}",
+        t.status
+            .provenance_coverage
+            .tool_result_share_mean
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "unknown".into()),
+    )));
 
     let src = &t.status.aux.sources;
     let miss = &t.status.aux.schema_misses;
@@ -258,8 +295,11 @@ fn draw_index_panel(f: &mut Frame, area: Rect, t: &Telemetry) {
         src.registry_sessions
     )));
     lines.push(Line::from(format!(
-        "  resolve     {} proposals / {} verdicts",
-        src.resolution_proposals, src.resolution_verdicts
+        "  resolve     {} proposals / {} verdicts ({} agent / {} user-confirmed)",
+        src.resolution_proposals,
+        src.resolution_verdicts,
+        src.resolution_verdicts_agent,
+        src.resolution_verdicts_user_confirmed
     )));
     let total_miss = miss.tasks + miss.plans + miss.history;
     if total_miss > 0 {
@@ -398,6 +438,7 @@ mod tests {
             ancestry_cached_conversations: 9,
             last_daemon_run: Some("2026-08-06T10:00:00Z".into()),
             next_due: Some("2026-08-06T18:00:00Z".into()),
+            ..DreamStatus::default()
         };
 
         assert_eq!(

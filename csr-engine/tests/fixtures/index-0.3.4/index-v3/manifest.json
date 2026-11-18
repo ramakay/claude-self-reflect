@@ -1,0 +1,36 @@
+{
+  "version": 3,
+  "created_at": "2026-10-13T04:42:17.848486+00:00",
+  "chunk_id_map": [
+    "8ae51d44-15c3-5340-bde4-e2ddd94c93f6",
+    "96fe16a5-6343-53d6-950f-ecff8af83c57"
+  ],
+  "reflection_id_map": [
+    "heuristic_sample_conversation",
+    "heuristic_sample_conversation2"
+  ],
+  "chunk_embeddings_expected": 2,
+  "reflection_embeddings_expected": 2,
+  "active_reflection_count": 2,
+  "chunk_basename": "chunks-78693-0",
+  "reflection_basename": "reflections-78693-1",
+  "epoch": 1,
+  "files": {
+    "chunks-78693-0.hnsw.data": {
+      "bytes": 3124,
+      "blake3": "2a9912288972ef89f668e84ea979b3abd744c3365acf968d571e1d8789d1b9e7"
+    },
+    "chunks-78693-0.hnsw.graph": {
+      "bytes": 625,
+      "blake3": "14d0cba0d451e96c1a85e1b1d96319c94799e926c3fae28542d7d7158b021c07"
+    },
+    "reflections-78693-1.hnsw.data": {
+      "bytes": 3124,
+      "blake3": "d8d908a9cc71fbde0f3d0643673a1f02a0cba8a38eacc9586fb1f496e0fa7091"
+    },
+    "reflections-78693-1.hnsw.graph": {
+      "bytes": 642,
+      "blake3": "0aba7801fcbf62e55db0aedaa10ca3a0010923a5ecdb2e7746e18626a984d834"
+    }
+  }
+}

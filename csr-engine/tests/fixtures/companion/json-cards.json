@@ -1,0 +1,218 @@
+{
+  "cards": [
+    {
+      "id": "dreamer",
+      "lines": [
+        {
+          "style": "body",
+          "text": "What if a frame failed while the agent was busy?"
+        }
+      ],
+      "title": "The dreamer asks"
+    },
+    {
+      "id": "story",
+      "lines": [
+        {
+          "style": "body",
+          "text": "Text parity is ready for review."
+        },
+        {
+          "style": "code",
+          "text": "~ reader.rs · read  ⌗8e4e3f27"
+        }
+      ],
+      "tag": "refreshed <1m ago",
+      "title": "Where the work stands"
+    },
+    {
+      "id": "limits",
+      "lines": [
+        {
+          "style": "caption",
+          "text": "On pace for about 77% by reset · resets in 2h 20m"
+        },
+        {
+          "style": "caption",
+          "text": "On pace to run out around Tue 7:49 am · resets in 3d 22h"
+        },
+        {
+          "style": "caption",
+          "text": "Codex weekly limit · resets in 3d 22h"
+        }
+      ],
+      "rows": [
+        {
+          "label": "5 Hour",
+          "text": "41%",
+          "tone": "amber",
+          "value": 0.41
+        },
+        {
+          "label": "Weekly",
+          "text": "62%",
+          "tone": "red",
+          "value": 0.62
+        },
+        {
+          "label": "Codex 7D",
+          "text": "41%",
+          "tone": "ok",
+          "value": 0.41
+        }
+      ],
+      "title": "On course to run out: Weekly limit hit around Tue 7:49 am.",
+      "tone": "red"
+    },
+    {
+      "id": "agents",
+      "lines": [
+        {
+          "style": "body",
+          "text": "3 in flight · 1 stalled"
+        },
+        {
+          "style": "dim",
+          "text": "○ Index the export queue · running · 14m · 11 tools"
+        },
+        {
+          "style": "dim",
+          "text": "○ Check retry limits · stalled · 20m · 4 tools"
+        },
+        {
+          "style": "dim",
+          "text": "○ Draft the migration · waiting · 8m · 2 tools"
+        },
+        {
+          "style": "dim",
+          "text": "○ Review the reader · completed · 30m · 3 tools"
+        },
+        {
+          "style": "dim",
+          "text": "○ Port the export test · failed · 25m · 6 tools"
+        },
+        {
+          "style": "dim",
+          "text": "○ Summarize the logs · completed · 22m · 2 tools"
+        },
+        {
+          "style": "dim",
+          "text": "○ Compare two queue clients · completed · 18m · 5 tools"
+        }
+      ],
+      "title": ""
+    }
+  ],
+  "changes": [],
+  "changes_total": 0,
+  "context": {
+    "free": 922000.0,
+    "max": 1000000.0,
+    "mix": {
+      "shares": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "verdict": "context-heavy"
+    },
+    "parts": [
+      {
+        "ink": "setup",
+        "name": "Summary + setup",
+        "tokens": 69738.333333
+      },
+      {
+        "ink": "messages",
+        "name": "Messages",
+        "tokens": 8261.666667
+      }
+    ],
+    "used": 78000.0
+  },
+  "corrections_carried_7d": 0,
+  "csr_row": {
+    "lead": "Self-Reflect this session:",
+    "parts": [
+      "2 compactions",
+      "2 recalls used"
+    ]
+  },
+  "dream_tokens_7d": 0,
+  "dreams": [
+    {
+      "answer": null,
+      "at": 1792319940.0,
+      "id": "newest",
+      "line": "What if a frame failed while the agent was busy?",
+      "title": "Keep the pane alive"
+    },
+    {
+      "answer": "helpful",
+      "at": 1792319500.0,
+      "id": "older",
+      "line": "What if every read stayed bounded?",
+      "title": "A small reader"
+    },
+    {
+      "answer": "dismiss",
+      "at": 1792316400.0,
+      "id": "passed2",
+      "line": "What if exports ran at night only?",
+      "title": "Night-only exports"
+    },
+    {
+      "answer": "not_relevant",
+      "at": 1792315200.0,
+      "id": "passed1",
+      "line": "What if the queue kept every job?",
+      "title": "Keep every job"
+    }
+  ],
+  "dreams_7d": 4,
+  "dreams_on": true,
+  "git": true,
+  "herdr_pane_live": false,
+  "recalled": 4,
+  "reminded_7d": 0,
+  "repo": "<REPO>",
+  "sample": {
+    "answer": "helpful",
+    "at": 1792319500.0,
+    "line": "What if every read stayed bounded?",
+    "project": null
+  },
+  "schema": 1,
+  "shift_map": {
+    "rows": [
+      "shift · reader.rs:read",
+      "Before: The reader loaded a whole",
+      "        transcript.",
+      "After:  The reader streams chunks.",
+      "Haiku's words · names match",
+      "commit 8e4e3f2"
+    ],
+    "title": "Shift Map · as of 21 messages ago"
+  },
+  "shifts": [
+    {
+      "date": "2026-10-18",
+      "file": "csr-engine/src/lib.rs",
+      "oid": "8e4e3f27",
+      "subject": "fix(hooks): a scratch file takes its session's project, not its folder name",
+      "symbol": "",
+      "verb": "removed"
+    },
+    {
+      "date": "2026-10-18",
+      "file": "csr-engine/src/main.rs",
+      "oid": "8e4e3f27",
+      "subject": "fix(hooks): a scratch file takes its session's project, not its folder name",
+      "symbol": "main",
+      "verb": "changed"
+    }
+  ],
+  "shifts_told_7d": 0,
+  "status": "☾ CSR remembered 4× this session · 4 dreams this week",
+  "total": 2
+}

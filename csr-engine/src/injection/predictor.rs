@@ -18,6 +18,14 @@ pub struct ScoredResult {
     pub signals: Vec<Signal>,
     /// Stable storage ID for outcome tracking (carried from RawResult).
     pub memory_id: Option<String>,
+    /// Source conversation for exposure logging and leakage-safe grouping.
+    pub conversation_id: Option<String>,
+    /// Original result timestamp, retained for exposure-time recency features.
+    pub timestamp: Option<String>,
+    /// Authorship resolved from chunk provenance when available.
+    pub author: Option<crate::provenance::Speaker>,
+    /// Cached row-level provenance floor. Unknown for non-chunk artifacts.
+    pub min_trust: crate::provenance::TrustTier,
 }
 
 /// What contributed to a result's score.
@@ -51,6 +59,10 @@ pub struct RawResult {
     pub conversation_id: Option<String>,
     /// Stable storage ID (chunk_id or reflection_id) for outcome tracking.
     pub memory_id: Option<String>,
+    /// Authorship resolved from chunk provenance when available.
+    pub author: Option<crate::provenance::Speaker>,
+    /// Cached row-level provenance floor. Unknown for non-chunk artifacts.
+    pub min_trust: crate::provenance::TrustTier,
 }
 
 /// Score and rank results for injection.
@@ -87,7 +99,7 @@ pub fn rank_results_with_continuity(
 }
 
 /// Prompt-submit ranking with precomputed release ancestry. The map is keyed
-/// by conversation id and is populated only for chunk results; reflections
+/// by chunk id and is populated only for chunk results; reflections
 /// retain their existing recency behavior.
 pub fn rank_results_with_continuity_and_ancestry(
     results: Vec<RawResult>,
@@ -112,7 +124,7 @@ pub fn rank_results_with_continuity_and_ancestry(
             let releases_behind = if crate::search::rerank::is_scaffold_text(&r.content) {
                 None
             } else {
-                r.conversation_id
+                r.memory_id
                     .as_ref()
                     .and_then(|id| ancestry_releases.get(id))
                     .copied()
@@ -155,6 +167,10 @@ fn score_result(
     phase: super::weights::HookPhase,
     ancestry_releases_behind: Option<u32>,
 ) -> ScoredResult {
+    let conversation_id = result.conversation_id.clone();
+    let timestamp = result.timestamp.clone();
+    let author = result.author;
+    let min_trust = result.min_trust;
     let mut signals = Vec::new();
 
     // 1. Semantic match (raw HNSW score, already 0.0-1.0)
@@ -195,6 +211,10 @@ fn score_result(
         source: result.source,
         signals,
         memory_id: result.memory_id,
+        conversation_id,
+        timestamp,
+        author,
+        min_trust,
     }
 }
 
@@ -341,6 +361,8 @@ mod tests {
         let results = vec![
             RawResult {
                 content: "high match".into(),
+                author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.9,
                 source: "chunk".into(),
                 timestamp: None,
@@ -352,6 +374,8 @@ mod tests {
             },
             RawResult {
                 content: "low match".into(),
+                author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.5,
                 source: "chunk".into(),
                 timestamp: None,
@@ -383,7 +407,9 @@ mod tests {
         assert_eq!(current_release.to_bits(), pre_change.to_bits());
 
         let live_timestamp = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
-        let raw = |content: &str, conversation_id: &str| RawResult {
+        let raw = |content: &str, conversation_id: &str, chunk_id: &str| RawResult {
+            author: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
             content: content.into(),
             score: 0.8,
             source: "chunk".into(),
@@ -392,15 +418,18 @@ mod tests {
             error_patterns: vec![],
             tags: vec![],
             conversation_id: Some(conversation_id.into()),
-            memory_id: None,
+            memory_id: Some(chunk_id.into()),
         };
         let ranked = rank_results_with_continuity_and_ancestry(
-            vec![raw("released", "conv-released"), raw("fresh", "conv-fresh")],
+            vec![
+                raw("released", "conv-released", "chunk-released"),
+                raw("fresh", "conv-fresh", "chunk-fresh"),
+            ],
             &[],
             &[],
             None,
             None,
-            &[("conv-released".into(), 5)].into_iter().collect(),
+            &[("chunk-released".into(), 5)].into_iter().collect(),
         );
         let released = ranked.iter().find(|r| r.content == "released").unwrap();
         let fresh = ranked.iter().find(|r| r.content == "fresh").unwrap();
@@ -420,6 +449,8 @@ mod tests {
         let timestamp = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
         let raw = || RawResult {
             content: "<command-message>quoted workflow</command-message>".into(),
+            author: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "chunk".into(),
             timestamp: Some(timestamp.clone()),
@@ -472,6 +503,8 @@ mod tests {
         let timestamp = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
         let raw = || RawResult {
             content: "organic conversation".into(),
+            author: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "chunk".into(),
             timestamp: Some(timestamp.clone()),
@@ -530,6 +563,8 @@ mod tests {
         let results = vec![
             RawResult {
                 content: "recent".into(),
+                author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: Some(now),
@@ -541,6 +576,8 @@ mod tests {
             },
             RawResult {
                 content: "old".into(),
+                author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: Some(old),
@@ -565,6 +602,8 @@ mod tests {
         let results = vec![
             RawResult {
                 content: "with file overlap".into(),
+                author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: None,
@@ -576,6 +615,8 @@ mod tests {
             },
             RawResult {
                 content: "no overlap".into(),
+                author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: None,
@@ -598,6 +639,8 @@ mod tests {
         let results = vec![
             RawResult {
                 content: "matching error".into(),
+                author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "reflection".into(),
                 timestamp: None,
@@ -609,6 +652,8 @@ mod tests {
             },
             RawResult {
                 content: "no error match".into(),
+                author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "reflection".into(),
                 timestamp: None,
@@ -679,6 +724,8 @@ mod tests {
         let results = vec![
             RawResult {
                 content: "from continued session".into(),
+                author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.7,
                 source: "chunk".into(),
                 timestamp: None,
@@ -690,6 +737,8 @@ mod tests {
             },
             RawResult {
                 content: "from older session".into(),
+                author: None,
+                min_trust: crate::provenance::TrustTier::Unknown,
                 score: 0.75,
                 source: "chunk".into(),
                 timestamp: None,
@@ -744,6 +793,8 @@ mod tests {
     fn test_continuity_boost_no_match() {
         let results = vec![RawResult {
             content: "unrelated session".into(),
+            author: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
             score: 0.7,
             source: "chunk".into(),
             timestamp: None,

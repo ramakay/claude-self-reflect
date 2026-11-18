@@ -1,0 +1,3 @@
+{"type": "session_meta", "timestamp": "2026-10-18T10:20:00Z", "payload": {"id": "codex-live-1", "timestamp": "2026-10-18T10:20:00Z", "cwd": "<REPO>/csr-engine/src"}}
+{"type": "turn_context", "timestamp": "2026-10-18T10:20:00Z", "payload": {"model": "gpt-6-astra", "effort": "high", "cwd": "<REPO>/csr-engine/src"}}
+{"type": "event_msg", "timestamp": "2026-10-18T10:39:50Z", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 184200}}, "rate_limits": {"limit_id": "codex", "primary": {"window_minutes": 10080, "used_percent": 43.0, "resets_at": "2026-10-22T09:00:00Z"}}}}

@@ -1,6 +1,7 @@
 import { Link } from 'react-router'
 import { useEffect, useRef, useState } from 'react'
 import { Check, Copy, Github, Moon, Sun } from 'lucide-react'
+import BrandMark from '../components/BrandMark'
 
 function useDelayedReveal(baseDelay = 0) {
   const [ready, setReady] = useState(false)
@@ -60,53 +61,6 @@ function PostIt({ children, className = '', bg = 'var(--color-amber-paper)', rot
   )
 }
 
-function ForgettingChart() {
-  const points = [
-    [48, 32],
-    [68, 62],
-    [90, 80],
-    [112, 93],
-    [136, 108],
-    [162, 124],
-    [186, 136],
-    [212, 148],
-    [236, 157],
-  ]
-  const d = points.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x} ${y}`).join(' ')
-  const area = `${d} L236 168 L48 168 Z`
-
-  return (
-    <figure className="forgetting-chart">
-      <figcaption className="chart-title">Context Lost Per Session</figcaption>
-      <svg viewBox="0 0 268 190" role="img" aria-label="Context retention declines from session 1 through session 20">
-        {[32, 66, 100, 134, 168].map((y) => (
-          <line key={y} x1="48" x2="236" y1={y} y2={y} className="chart-grid" />
-        ))}
-        <line x1="48" x2="48" y1="28" y2="168" className="chart-axis" />
-        <line x1="48" x2="238" y1="168" y2="168" className="chart-axis" />
-        <path d={area} fill="rgba(181,131,141,0.11)" />
-        <path className="chart-path" pathLength="1" d={d} fill="none" stroke="var(--color-rose)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
-        {points.map(([x, y], i) => (
-          <circle key={`${x}-${y}`} cx={x} cy={y} r={i % 2 === 0 ? 2.8 : 2.2} fill="var(--color-rose)" opacity={i % 2 === 0 ? 0.82 : 0.5} />
-        ))}
-        <text x="38" y="36" textAnchor="end" className="chart-label">100</text>
-        <text x="38" y="104" textAnchor="end" className="chart-label">50</text>
-        <text x="38" y="172" textAnchor="end" className="chart-label">0</text>
-        {[
-          ['1', 48],
-          ['5', 92],
-          ['10', 140],
-          ['15', 188],
-          ['20', 236],
-        ].map(([label, x]) => (
-          <text key={label} x={x} y="181" textAnchor="middle" className="chart-label">{label}</text>
-        ))}
-      </svg>
-      <p className="type-caption chart-caption">Average context retention drops below 20% after 10 sessions.</p>
-    </figure>
-  )
-}
-
 function HookTimeline() {
   const nodes = [
     ['Start', 28, '#6b5b95'],
@@ -118,7 +72,7 @@ function HookTimeline() {
   ]
 
   return (
-    <svg className="hook-timeline" viewBox="0 0 418 92" role="img" aria-label="Six active memory lifecycle hooks">
+    <svg className="hook-timeline" viewBox="0 0 418 92" role="img" aria-label="Session hook lifecycle">
       <line x1="28" x2="388" y1="38" y2="38" stroke="rgba(107,91,149,0.32)" strokeWidth="2" />
       {nodes.map(([label, x, color], i) => (
         <g key={`${label}-${i}`} className="hook-node">
@@ -137,7 +91,7 @@ function SearchLatencyBars() {
 
   return (
     <figure className="search-bars">
-      <svg viewBox="0 0 220 132" role="img" aria-label="Latency distribution from zero to twenty five milliseconds">
+      <svg viewBox="0 0 220 132" role="img" aria-label="Illustration of search latency bars">
         {[16, 58, 100].map((y) => (
           <line key={y} x1="34" x2="206" y1={y} y2={y} className="chart-grid" />
         ))}
@@ -161,12 +115,6 @@ function SearchLatencyBars() {
             />
           )
         })}
-        <text x="25" y="104" textAnchor="end" className="chart-label">0ms</text>
-        <text x="25" y="62" textAnchor="end" className="chart-label">12</text>
-        <text x="25" y="20" textAnchor="end" className="chart-label">25</text>
-        <text x="34" y="123" textAnchor="middle" className="chart-label">0ms</text>
-        <text x="120" y="123" textAnchor="middle" className="chart-label">12ms</text>
-        <text x="206" y="123" textAnchor="middle" className="chart-label">25ms</text>
       </svg>
     </figure>
   )
@@ -209,10 +157,10 @@ function ImportBatchChart() {
 
 function BinaryDiagram() {
   return (
-    <svg className="binary-diagram" viewBox="0 0 150 150" role="img" aria-label="Single binary size is forty four megabytes">
+    <svg className="binary-diagram" viewBox="0 0 150 150" role="img" aria-label="Single binary size is about one hundred thirty eight megabytes">
       <circle cx="75" cy="75" r="58" fill="rgba(246,230,169,0.20)" stroke="rgba(26,26,46,0.62)" strokeWidth="2.4" />
       <circle cx="75" cy="75" r="45" fill="none" stroke="rgba(26,26,46,0.13)" strokeDasharray="4 6" />
-      <text x="75" y="72" textAnchor="middle" className="binary-diagram__metric">44MB</text>
+      <text x="75" y="72" textAnchor="middle" className="binary-diagram__metric">~138MB</text>
       <text x="75" y="94" textAnchor="middle" className="binary-diagram__label">local</text>
     </svg>
   )
@@ -220,9 +168,9 @@ function BinaryDiagram() {
 
 function PipelineGraphic() {
   const stages = [
-    { no: '1', score: '0.074', label: 'Chunked text', color: 'var(--color-rose)', pct: '11%' },
-    { no: '2', score: '0.345', label: 'Tools + AST extracted', color: 'var(--color-purple)', pct: '50%' },
-    { no: '3', score: '0.691', label: 'AI narrative', color: 'var(--color-sage)', pct: '100%' },
+    { no: '1', label: 'Chunked text', color: 'var(--color-rose)', pct: '11%' },
+    { no: '2', label: 'Tools + AST extracted', color: 'var(--color-purple)', pct: '50%' },
+    { no: '3', label: 'AI narrative', color: 'var(--color-sage)', pct: '100%' },
   ]
 
   return (
@@ -238,10 +186,6 @@ function PipelineGraphic() {
       {stages.map((stage, index) => (
         <div className="pipeline-stage" key={stage.no} style={{ '--stage-color': stage.color }}>
           <div className="pipeline-stage__circle" style={{ borderColor: stage.color, color: stage.color }}>{stage.no}</div>
-          <p className="type-metric-md">
-            {index > 0 ? <span className="pipeline-arrow-text" aria-hidden="true">-&gt;</span> : null}
-            {stage.score}
-          </p>
           <p className="type-dateline">{stage.label}</p>
           <div className="pipeline-score-bar">
             <span style={{ width: stage.pct, background: stage.color, animationDelay: `${620 + index * 80}ms` }} />
@@ -255,24 +199,19 @@ function PipelineGraphic() {
 function ForgettingCard() {
   return (
     <BentoCard className="card--forgetting" delay={0}>
-      <CardKicker number="01" label="FROM THE DAILY CONTEXT" />
-      <h2 className="type-hl-lg">The Forgetting Problem</h2>
+      <CardKicker number="01" label="WHAT IT DOES" />
+      <h2 className="type-hl-lg">Claude looks back at its own work</h2>
       <div className="rule-double mt-3" />
       <div className="forgetting-layout">
         <div className="forgetting-copy">
-          <p className="type-body news-lede">Claude has amnesia. Every new session starts from zero.</p>
-          <div className="newspaper-lines" aria-hidden="true">
-            <span style={{ width: '92%' }} />
-            <span style={{ width: '74%' }} />
-            <span style={{ width: '86%' }} />
-            <span style={{ width: '63%' }} />
-          </div>
+          <p className="type-body news-lede">Every session starts cold. Self-Reflect lets Claude check what it did, what it settled and what is still open.</p>
+          <ul className="type-body-sm mt-3" style={{ paddingLeft: '1.1em', listStyle: 'disc' }}>
+            <li>A recap at session start, built only from evidence</li>
+            <li>Dreams that check old conclusions against git history</li>
+            <li>Receipts for compactions, commits and verdicts</li>
+          </ul>
+          <p className="type-caption mt-3">A local index of your sessions sits underneath. <Link to="/docs/features" className="type-caption" style={{ color: 'var(--color-purple)' }}>All features →</Link></p>
         </div>
-        <ForgettingChart />
-      </div>
-      <div className="source-row">
-        <span>SOURCE: Claude code analytical core</span>
-        <span>APR 24, 2025</span>
       </div>
     </BentoCard>
   )
@@ -282,12 +221,12 @@ function ActiveMemoryCard() {
   return (
     <BentoCard className="card--active" delay={80}>
       <CardKicker number="02" />
-      <h2 className="type-hl-md">Active Memory</h2>
+      <h2 className="type-hl-md">Context on arrival</h2>
       <p className="type-dateline mt-3">Context appears when you need it</p>
-      <p className="type-body-sm active-copy">Six hooks across the session lifecycle. Context injected at start, on prompt, after edits, on stop, before compaction, and at end. 12 MCP tools for explicit search.</p>
+      <p className="type-body-sm active-copy">Eight hooks on seven session events. Context injected at start, on prompt, after edits, on stop, around compaction, and at end. 16 MCP tools for explicit search.</p>
       <HookTimeline />
       <div className="rule mt-4 pt-4">
-        <p className="active-metric">&lt; 50ms — you never notice</p>
+        <p className="active-metric">Local, inline, no API call</p>
         <p className="type-caption mt-2">Runs locally. Never blocks. <Link to="/docs/hooks" className="type-caption" style={{ color: 'var(--color-purple)' }}>How it works →</Link></p>
       </div>
     </BentoCard>
@@ -299,9 +238,9 @@ function SearchCard() {
     <BentoCard className="card--search" delay={160}>
       <CardKicker number="03" />
       <h2 className="type-hl-sm">The Search</h2>
-      <p className="type-dateline mt-3">From query to relevant memory in</p>
-      <div className="search-metric">&lt;1ms</div>
-      <p className="type-caption">P95 search latency</p>
+      <p className="type-dateline mt-3">From query to relevant context</p>
+      <div className="search-metric">Local</div>
+      <p className="type-caption">Vector index lookup, timed by csr-engine eval</p>
       <SearchLatencyBars />
       <ul className="search-flow">
         <li>natural language query</li>
@@ -342,30 +281,15 @@ function ImportCard() {
 }
 
 function OneBinaryCard() {
-  const dependencies = ['docker', 'compose', 'daemon', 'python', 'pip', 'venv', 'db', 'pgvector']
-
   return (
     <BentoCard className="card--binary" delay={320}>
       <CardKicker number="05" />
       <h2 className="type-hl-sm">One Binary</h2>
       <PostIt className="binary-note" bg="var(--color-amber-paper)" rot="-2deg">
-        44MB CSR<br />(single binary)
+        ~138MB CSR<br />(single binary)
       </PostIt>
       <BinaryDiagram />
-      <div className="competitor-box">
-        <p className="type-dateline">COMPETITOR STACK</p>
-        <div className="competitor-stack" aria-label="Docker plus Python plus database equals about one thousand two hundred sixty eight megabytes">
-          <span>Docker</span>
-          <b>+</b>
-          <span>Python</span>
-          <b>+</b>
-          <span>DB</span>
-        </div>
-        <p className="competitor-total">= ~1,268MB</p>
-        <p className="dependency-list">
-          40+ dependencies: {dependencies.join(', ')}
-        </p>
-      </div>
+      <p className="type-body-sm mt-3">Storage, search, embeddings, the MCP server, hooks and the companion pane run in one process.</p>
     </BentoCard>
   )
 }
@@ -376,7 +300,7 @@ function PipelineCard() {
       <CardKicker number="06" label="ENRICHMENT PIPELINE" />
       <h2 className="type-hl-md">The Pipeline</h2>
       <PipelineGraphic />
-      <p className="pipeline-caption">Search relevance score improves 9.3x from raw chunks to AI-enriched narratives.</p>
+      <p className="pipeline-caption">Each stage adds detail that search can match.</p>
     </BentoCard>
   )
 }
@@ -400,7 +324,7 @@ function PrivacyCard() {
         </svg>
         <p>Local by default.</p>
         <span>127.0.0.1 — search + embed on-device</span>
-        <span className="type-caption mt-2" style={{ display: 'block', maxWidth: 180, color: 'var(--color-muted)' }}>AI narratives optionally use Anthropic Batch API</span>
+        <span className="type-caption mt-2" style={{ display: 'block', maxWidth: 180, color: 'var(--color-muted)' }}>AI narratives optionally run through your own Claude Code login</span>
       </div>
     </BentoCard>
   )
@@ -518,7 +442,7 @@ function InstallCard() {
         <div className="install-left">
           <CardKicker number="08" label="GET STARTED" />
           <h2 className="type-hl-md">Install</h2>
-          <p className="install-classified">Memory is not a feature. It is the foundation.</p>
+          <p className="install-classified">One binary. No Python, no Docker.</p>
         </div>
         <div className="install-right">
           <div className="install-command">
@@ -527,7 +451,7 @@ function InstallCard() {
           </div>
           <p className="type-caption mt-2">One command. Downloads binary, then asks before activating hooks + MCP. Restart Claude Code.</p>
           <div className="install-tabs-inline">
-            {['44MB binary', 'zero deps', '6 hooks', '12 MCP tools'].map((label, index) => (
+            {['~138MB binary', 'zero deps', '8 hooks', '16 MCP tools'].map((label, index) => (
               <span key={label} className="tear-tab" style={{ animationDelay: `${720 + index * 70}ms` }}>{label}</span>
             ))}
           </div>
@@ -540,9 +464,9 @@ function InstallCard() {
               <svg viewBox="0 0 16 16" width="12" height="12"><path d="M8 1C4.7 1 2 3.7 2 7v2.5c0 .8.3 1.5.8 2L4 13v1.5c0 .3.2.5.5.5h2c.3 0 .5-.2.5-.5V13h2v1.5c0 .3.2.5.5.5h2c.3 0 .5-.2.5-.5V13l1.2-1.5c.5-.5.8-1.2.8-2V7c0-3.3-2.7-6-6-6z" fill="none" stroke="currentColor" strokeWidth="1.3"/><circle cx="6" cy="6.5" r="1" fill="currentColor"/><circle cx="10" cy="6.5" r="1" fill="currentColor"/></svg>
               Linux / WSL
             </span>
-            <span className="platform-badge platform-badge--warn" title="Intel Mac requires building from source">
+            <span className="platform-badge platform-badge--warn" title="Intel Mac is not supported: no prebuilt binary, and the ONNX runtime has no x86_64-apple-darwin build">
               <svg viewBox="0 0 16 16" width="12" height="12"><path d="M12.2 5.4c-.1.1-1.8 1-1.8 3.2 0 2.5 2.2 3.3 2.2 3.3 0 .1-.3 1.2-1.1 2.3-.7 1-1.4 2-2.5 2s-1.4-.6-2.7-.6c-1.3 0-1.7.6-2.7.6S2 15.3 1.3 14.2C.5 12.9 0 10.7 0 8.7 0 5.6 2 4 3.9 4c1 0 1.9.7 2.5.7.6 0 1.6-.7 2.8-.7.5 0 2.1 0 3 1.4z" fill="currentColor"/><circle cx="10" cy="1.8" r="1.8" fill="currentColor"/></svg>
-              Mac (Intel) — source
+              Mac (Intel) — unsupported
             </span>
           </div>
         </div>
@@ -586,7 +510,7 @@ function ArchCard() {
           <TechBadge name="Rust" abbr="zero-cost abstractions" color="var(--color-rose)" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.8" /><path d="M8 16l4-10 4 10M9.5 13h5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" /></svg>
           } />
-          <TechBadge name="HNSW" abbr="vector search <1ms" color="var(--color-purple)" icon={
+          <TechBadge name="HNSW" abbr="in-memory vector search" color="var(--color-purple)" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="6" r="2.5" fill="currentColor" opacity="0.6" /><circle cx="6" cy="16" r="2.5" fill="currentColor" opacity="0.6" /><circle cx="18" cy="16" r="2.5" fill="currentColor" opacity="0.6" /><line x1="12" y1="8.5" x2="7" y2="13.5" stroke="currentColor" strokeWidth="1.2" /><line x1="12" y1="8.5" x2="17" y2="13.5" stroke="currentColor" strokeWidth="1.2" /><line x1="8.5" y1="16" x2="15.5" y2="16" stroke="currentColor" strokeWidth="1.2" /></svg>
           } />
           <TechBadge name="FastEmbed" abbr="384-dim local vectors" color="var(--color-sage)" icon={
@@ -598,7 +522,7 @@ function ArchCard() {
           <TechBadge name="ast-grep" abbr="6-language AST parser" color="var(--color-purple)" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 4v4M12 8l-5 4M12 8l5 4M7 12v4M17 12v4M7 16l-2 3M7 16l2 3M17 16l-2 3M17 16l2 3" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></svg>
           } />
-          <TechBadge name="rmcp" abbr="MCP protocol (12 tools)" color="#5b7b95" icon={
+          <TechBadge name="rmcp" abbr="MCP protocol (16 tools)" color="#5b7b95" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><rect x="3" y="9" width="7" height="6" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.3" /><rect x="14" y="9" width="7" height="6" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.3" /><line x1="10" y1="12" x2="14" y2="12" stroke="currentColor" strokeWidth="1.3" /><circle cx="12" cy="12" r="1.2" fill="currentColor" /></svg>
           } />
         </div>
@@ -637,7 +561,7 @@ function RotatingQuestions() {
 function AskPipeline() {
   const steps = [
     { label: 'Install', icon: '↓', sub: 'curl | sh' },
-    { label: 'Hooks inject', icon: '⚡', sub: 'auto, <50ms' },
+    { label: 'Hooks inject', icon: '⚡', sub: 'auto, local' },
     { label: 'You ask', icon: '?', sub: 'natural language' },
     { label: 'Next session', icon: '∞', sub: 'context persists' },
   ]
@@ -674,194 +598,32 @@ function WhatYouAskCard() {
   )
 }
 
-function CeilingChart() {
-  // File size grows linearly until it hits context window, then flatlines with a red danger zone
-  const fileLine = [
-    [32, 140], [58, 128], [84, 112], [110, 92], [136, 68],
-    [162, 44], [178, 34], [188, 30], [198, 28], [216, 27],
-  ]
-  const d = fileLine.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x} ${y}`).join(' ')
-
-  return (
-    <svg className="ceiling-chart" viewBox="0 0 248 168" role="img" aria-label="File size grows until it hits the context window ceiling">
-      {/* Grid */}
-      {[44, 76, 108, 140].map(y => (
-        <line key={y} x1="32" x2="216" y1={y} y2={y} className="chart-grid" />
-      ))}
-      <line x1="32" x2="32" y1="20" y2="148" className="chart-axis" />
-      <line x1="32" x2="218" y1="148" y2="148" className="chart-axis" />
-
-      {/* Danger zone above ceiling */}
-      <rect x="32" y="20" width="184" height="12" fill="rgba(181,131,141,0.12)" rx="0" />
-      <line x1="32" x2="216" y1="32" y2="32" stroke="var(--color-rose)" strokeWidth="1.5" strokeDasharray="4 3" opacity="0.6" />
-      <text x="218" y="36" className="chart-label" fill="var(--color-rose)">limit</text>
-
-      {/* Growth curve */}
-      <path className="chart-path" pathLength="1" d={d} fill="none" stroke="var(--color-rose)" strokeWidth="2.2" strokeLinecap="round" />
-
-      {/* Labels */}
-      <text x="24" y="148" textAnchor="end" className="chart-label">0</text>
-      <text x="24" y="92" textAnchor="end" className="chart-label">64K</text>
-      <text x="24" y="36" textAnchor="end" className="chart-label">128K</text>
-      <text x="48" y="162" className="chart-label">1</text>
-      <text x="124" y="162" textAnchor="middle" className="chart-label">sessions</text>
-      <text x="210" y="162" textAnchor="end" className="chart-label">500</text>
-    </svg>
-  )
-}
-
-function ExtractionLossChart() {
-  // Funnel showing data loss through extraction pipeline
-  const bars = [
-    { label: 'raw', w: 148, color: 'var(--color-muted)', pct: '100%' },
-    { label: 'entities', w: 62, color: 'var(--color-sage)', pct: '42%' },
-    { label: 'recall', w: 28, color: 'var(--color-rose)', pct: '19%' },
-  ]
-
-  return (
-    <svg className="extraction-chart" viewBox="0 0 240 132" role="img" aria-label="Knowledge graph extraction retains only nineteen percent of original context">
-      {bars.map((bar, i) => {
-        const y = 12 + i * 38
-        const x = 72
-        return (
-          <g key={bar.label}>
-            <text x="68" y={y + 14} textAnchor="end" className="chart-label">{bar.label}</text>
-            <rect
-              className="bar-horiz"
-              x={x} y={y}
-              width={bar.w} height="20" rx="3"
-              fill={bar.color} opacity="0.6"
-              style={{ animationDelay: `${880 + i * 80}ms` }}
-            />
-            <text x={x + bar.w + 6} y={y + 14} className="chart-label" style={{ fontWeight: 600 }}>{bar.pct}</text>
-          </g>
-        )
-      })}
-      {/* Loss arrows */}
-      <path d="M146 32 L146 42" stroke="var(--color-rose)" strokeWidth="1.2" opacity="0.4" markerEnd="url(#loss-arrow)" />
-      <path d="M106 70 L106 80" stroke="var(--color-rose)" strokeWidth="1.2" opacity="0.4" markerEnd="url(#loss-arrow)" />
-      <defs>
-        <marker id="loss-arrow" viewBox="0 0 6 6" refX="3" refY="3" markerWidth="4" markerHeight="4" orient="auto">
-          <path d="M0 0 L6 3 L0 6" fill="var(--color-rose)" />
-        </marker>
-      </defs>
-    </svg>
-  )
-}
-
-function LatencyCompareChart() {
-  // Horizontal bar chart: local <1ms vs cloud 100-500ms
-  const rows = [
-    { label: 'CSR local', ms: '0.8ms', w: 4, color: 'var(--color-sage)' },
-    { label: 'cloud API', ms: '~300ms', w: 148, color: 'var(--color-rose)' },
-  ]
-
-  return (
-    <svg className="latency-compare" viewBox="0 0 240 96" role="img" aria-label="Local search zero point eight milliseconds versus cloud three hundred milliseconds">
-      {rows.map((row, i) => {
-        const y = 10 + i * 42
-        return (
-          <g key={row.label}>
-            <text x="66" y={y + 14} textAnchor="end" className="chart-label">{row.label}</text>
-            <rect
-              className="bar-horiz"
-              x={70} y={y}
-              width={row.w} height="22" rx="3"
-              fill={row.color} opacity="0.65"
-              style={{ animationDelay: `${960 + i * 100}ms` }}
-            />
-            <text x={70 + row.w + 6} y={y + 15} className="chart-label" style={{ fontWeight: 700, fontSize: '11px' }}>{row.ms}</text>
-          </g>
-        )
-      })}
-      {/* Scale */}
-      <line x1="70" x2="220" y1="82" y2="82" className="chart-axis" />
-      <text x="70" y="92" className="chart-label">0</text>
-      <text x="144" y="92" textAnchor="middle" className="chart-label">150ms</text>
-      <text x="220" y="92" textAnchor="end" className="chart-label">300ms</text>
-    </svg>
-  )
-}
-
-function FlatFileCard() {
-  return (
-    <BentoCard className="card--flatfile" delay={800}>
-      <CardKicker number="10" label="COMPARED" accent="rose" />
-      <h2 className="type-hl-sm">The Flat File</h2>
-      <p className="type-dateline mt-2">One markdown file. Grows until it hits the context ceiling.</p>
-      <CeilingChart />
-      <PostIt className="flatfile-note" bg="var(--color-rose-paper)" rot="2deg">
-        no search<br />no decay
-      </PostIt>
-      <a className="cite-link" href="https://arxiv.org/abs/2404.07143" target="_blank" rel="noopener noreferrer">Liu et al. 2024 — "Lost in the Middle"</a>
-    </BentoCard>
-  )
-}
-
-function KnowledgeGraphCard() {
-  return (
-    <BentoCard className="card--kgraph" delay={880}>
-      <CardKicker number="11" label="COMPARED" accent="sage" />
-      <h2 className="type-hl-sm">The Knowledge Graph</h2>
-      <p className="type-dateline mt-2">Extracts entities. Loses the rest.</p>
-      <ExtractionLossChart />
-      <div className="kgraph-stat">
-        <span className="type-metric-md" style={{ color: 'var(--color-rose)' }}>81%</span>
-        <span className="type-caption">context lost in extraction</span>
-      </div>
-      <a className="cite-link" href="https://arxiv.org/abs/2306.04136" target="_blank" rel="noopener noreferrer">Pan et al. 2023 — "Unifying Large Language Models and Knowledge Graphs"</a>
-    </BentoCard>
-  )
-}
-
-function PullQuoteCard() {
-  return (
-    <BentoCard className="card--quote" delay={20}>
-      <CardKicker number="—" label="FROM A LIVE SESSION" />
-      <blockquote className="pull-quote">
-        <span className="pull-quote__mark" aria-hidden="true">&ldquo;</span>
-        <p className="pull-quote__text">Retrieval beat curation today.</p>
-        <footer className="pull-quote__footer">
-          <cite className="pull-quote__attribution">— Claude, comparing its own curated MEMORY.md against CSR in a live session</cite>
-        </footer>
-      </blockquote>
-      <p className="pull-quote__support type-caption">A hand-curated memory note answered with stale information; CSR's search over past conversations surfaced the current thread in about 20ms.</p>
-      <div className="pull-quote__receipts">
-        <p className="pull-quote__receipts-label">One session's ledger, misses included — not a benchmark</p>
-        <ul className="pull-quote__receipts-list">
-          <li><span className="pull-quote__receipts-metric">0.728 / ~20ms</span>a pre-compaction turn, retrieved after the session had compacted twice</li>
-          <li><span className="pull-quote__receipts-metric">0.78</span>a minutes-old message, retrieved after compaction</li>
-          <li><span className="pull-quote__receipts-metric">stale</span>MEMORY.md's hand-curated note; retrieval held the current thread</li>
-          <li><span className="pull-quote__receipts-metric">2 / 5</span>queries that session came back weak — flagged uncalibrated by the tool itself</li>
-        </ul>
-      </div>
-    </BentoCard>
-  )
-}
-
 function WhatsNewCard() {
   return (
     <BentoCard className="card--whatsnew" delay={560} id="whats-new">
-      <CardKicker number="—" label="LATEST RELEASE" accent="purple" />
-      <h2 className="type-hl-sm">What's New in v9.4.0</h2>
+      <CardKicker number="—" label="THIS RELEASE" accent="purple" />
+      <h2 className="type-hl-sm">What's New in v10.1.0</h2>
       <ul className="whatsnew-list">
         <li>
-          <strong>Multi-source memory</strong> — CSR now absorbs more of <code>~/.claude</code> than transcripts: task outcomes, plan documents, and a cross-project session registry, each at the lifecycle stage it belongs to
+          <strong>Recap paragraph</strong>: on startup and resume, SessionStart injects one causal paragraph (only when the last session left evidence): intent, what got done, what was settled, what is open now, the next step. Each clause drops when there is no evidence, <code>Next:</code> is never invented, and there is no LLM call. With no evidence to state (no commit, task, next step, verdict, correction or dream finding) a session gets the older <code>CSR CONTINUUM</code> and <code>LAST</code> lines instead
         </li>
         <li>
-          <strong>Task-state regression fixed</strong> — Claude Code renamed TodoWrite → TaskCreate and episode task extraction silently emptied; episodes carry real todos and task-aware outcomes again, with open tasks capping a session at "partial"
+          <strong>Learnt line</strong>: a separate line, at startup or resume only, of what CSR stored for the previous session: memory notes, <code>csr_resolve</code> verdicts you confirmed, anchors retired by a commit. No line when CSR stored none of these
         </li>
         <li>
-          <strong>Plan documents searchable</strong> — <code>~/.claude/plans/*.md</code> imported as decay-aware chunks, correlated to their origin conversation; the origin always outranks its plan restatement in search
+          <strong>Dreaming</strong>: <code>codewitness</code> stamps code spans at commit OIDs and checks old conclusions against git history; search shows <code>[stale anchor]</code> and <code>[evolved]</code> notes with commit receipts
         </li>
         <li>
-          <strong>Honest coverage</strong> — <code>csr-engine status</code> now measures sessions seen vs imported, unindexed transcripts, and per-source schema-miss counters so silent format churn can't rot quality invisibly
+          <strong>More sources</strong>: subagent transcripts, <code>~/.claude/plans</code>, task state and Codex sessions join the corpus; <code>csr_transcript</code> is the 16th MCP tool
         </li>
         <li>
-          <strong>Resolution proposals</strong> — completed tasks matching still-open items generate proposals a human promotes via <code>csr_resolve</code>; never automatic verdicts
+          <strong>Code map</strong>: a per-worktree map of definitions in supported source files in the repos your sessions are in, so <code>csr_search_by_file</code> and <code>csr_code_graph</code> answer for code no conversation touched
+        </li>
+        <li>
+          <strong>Companion plugin</strong>: a pane beside the session (it needs the herdr terminal multiplexer, <code>brew install herdr</code>) shows what Self-Reflect handed Claude and which code changed since your past sessions
         </li>
       </ul>
-      <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/releases/tag/v9.4.0" target="_blank" rel="noopener noreferrer">Full release notes →</a>
+      <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/blob/main/CHANGELOG.md" target="_blank" rel="noopener noreferrer">Full changelog →</a>
     </BentoCard>
   )
 }
@@ -882,7 +644,7 @@ function MultiSourceCard() {
 
   return (
     <BentoCard className="card--multisource" delay={600}>
-      <CardKicker number="—" label="V9.4 — MULTI-SOURCE" accent="sage" />
+      <CardKicker number="—" label="MULTI-SOURCE" accent="sage" />
       <h2 className="type-hl-sm">More Than Transcripts</h2>
       <p className="type-dateline mt-2">Tasks, plans, and session history — absorbed where they belong.</p>
       <div className="multisource-layout">
@@ -945,30 +707,9 @@ function PaperCard() {
   )
 }
 
-function HostedMemoryCard() {
-  return (
-    <BentoCard className="card--hosted" delay={960}>
-      <CardKicker number="12" label="COMPARED" accent="purple" />
-      <h2 className="type-hl-sm">The Cloud Memory</h2>
-      <p className="type-dateline mt-2">Your conversations leave localhost.</p>
-      <LatencyCompareChart />
-      <div className="hosted-footer">
-        <div className="hosted-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="var(--color-rose)" strokeWidth="1.8" strokeLinecap="round">
-            <path d="M12 2v10m0 0l3-3m-3 3l-3-3" />
-            <path d="M4 14c0 3.3 3.6 6 8 6s8-2.7 8-6" opacity="0.5" />
-          </svg>
-        </div>
-        <span className="type-caption">data sent to external servers on every operation</span>
-      </div>
-      <a className="cite-link" href="https://arxiv.org/abs/2310.08560" target="_blank" rel="noopener noreferrer">Zhang et al. 2023 — "A Survey on LLM-based Autonomous Agents"</a>
-    </BentoCard>
-  )
-}
-
 const TRAIL_COUNT = 5
 const TRAIL_COLORS = ['#f6e6a9', '#f3c9c3', '#dce8cf', '#e0d8ee', '#f6e6a9']
-const TRAIL_WORDS = ['remember', 'recall', 'context', 'memory', 'archive']
+const TRAIL_WORDS = ['reflect', 'recall', 'context', 'receipts', 'recap']
 
 function CursorTrail() {
   const canvasRef = useRef(null)
@@ -1183,9 +924,11 @@ function LogoPreviews() {
 function GoDeeper() {
   const links = [
     ['Guide', '/docs/why-csr', 'Learn concepts, workflows, and best practices.'],
+    ['Features', '/docs/features', 'What 10.1 does: sources, recap, dreams, receipts, code map.'],
     ['Reference', '/docs/mcp-tools', 'CLI, hooks, files, and configuration.'],
     ['Architecture', '/docs/architecture', 'Inside CSR system design, pipeline, and data flow.'],
     ['FAQ', '/docs/troubleshooting', 'Common questions and real-world answers.'],
+    ["What we're working on", '/docs/report-card', 'Known gaps in 10.1.0, with measured numbers and targets.'],
   ]
 
   return (
@@ -1206,10 +949,10 @@ function GoDeeper() {
       </div>
       <div className="go-deeper__cta">
         <div>
-          <strong>Built for long-term context.</strong>
-          <p>CSR gives Claude Code a persistent local memory that gets better over time.</p>
+          <strong>Built for reflection.</strong>
+          <p>Self-Reflect gives Claude Code a way to check its own past work, locally.</p>
         </div>
-        <Link to="/docs/installation">Get started in 60 seconds</Link>
+        <Link to="/docs/installation">Get started</Link>
       </div>
     </section>
   )
@@ -1243,17 +986,19 @@ export default function Landing() {
       <header className="site-nav">
         <div className="site-nav__inner">
           <Link className="site-nav__brand" to="/">
-            <img src="/claude-self-reflect/favicon.svg" alt="" width={34} height={34} />
+            <BrandMark size={34} />
             <span>
-              <span className="site-nav__name">Claude Self-Reflect</span>
-              <span className="site-nav__tag">Memory for Claude Code.</span>
+              <span className="site-nav__name">Self-Reflect</span>
+              <span className="site-nav__tag">Claude reflecting on its own work.</span>
             </span>
           </Link>
           <nav className="site-nav__links" aria-label="Primary">
             <Link className="site-nav__link" to="/docs/why-csr">Guide</Link>
+            <Link className="site-nav__link" to="/docs/features">Features</Link>
             <Link className="site-nav__link" to="/docs/mcp-tools">Reference</Link>
             <Link className="site-nav__link" to="/docs/architecture">Architecture</Link>
             <Link className="site-nav__link" to="/docs/troubleshooting">FAQ</Link>
+            <Link className="site-nav__link" to="/docs/report-card">Status</Link>
             <Link className="site-nav__link" to="/docs/upgrading">Changelog</Link>
             <a className="nav-install-cta" href="#install" onClick={e => {
               e.preventDefault()
@@ -1282,32 +1027,17 @@ export default function Landing() {
       </header>
 
       <div className="hero-watermark" aria-hidden="true">
-        <h1 className="hero-watermark__title">You or your agent don't have to remember any of this</h1>
-        <p className="hero-watermark__subtext">because Claude Self-Reflect does.</p>
+        <h1 className="hero-watermark__title">Claude looks back at its own work</h1>
+        <p className="hero-watermark__subtext">so you don't have to re-explain it.</p>
       </div>
 
       <main className="landing-main">
         <p className="type-dateline landing-dateline" style={{ opacity: datelineVisible ? 1 : 0 }}>
-          Claude Self-Reflect / v9.5.2 / Rust Engine / Local Memory Archive
+          Self-Reflect / v10.1.0 / Rust Engine / Local Session Archive
         </p>
 
-        <section className="bento-grid" aria-label="Claude Self-Reflect overview">
+        <section className="bento-grid" aria-label="Self-Reflect overview">
           <ForgettingCard />
-          <PullQuoteCard />
-          <BentoCard className="card--demo" delay={40}>
-            <CardKicker number="—" label="SEE IT IN ACTION" />
-            <h2 className="type-hl-md">The Demo</h2>
-            <p className="type-dateline mt-2">Real queries, real results — from actual sessions</p>
-            <img
-              src="/claude-self-reflect/images/csr-demo.gif"
-              alt="CSR demo showing semantic search, cross-project search, and activity timeline"
-              className="demo-gif"
-              loading="lazy"
-              width={800}
-              height={448}
-              style={{ width: '100%', height: 'auto', borderRadius: 6, marginTop: 12 }}
-            />
-          </BentoCard>
           <ActiveMemoryCard />
           <SearchCard />
           <ImportCard />
@@ -1320,21 +1050,13 @@ export default function Landing() {
           <WhatsNewCard />
           <MultiSourceCard />
           <PaperCard />
-          <div className="bento-section-header">
-            <span />
-            <h2>How others do it</h2>
-            <span />
-          </div>
-          <FlatFileCard />
-          <KnowledgeGraphCard />
-          <HostedMemoryCard />
         </section>
 
         <GoDeeper />
 
         <footer className="landing-footer" style={{ opacity: footerVisible ? 1 : 0 }}>
           <div className="landing-footer__inner">
-            <p className="landing-footer__copy">(c) 2026 Claude Self-Reflect. Built for long-term context. MIT License.</p>
+            <p className="landing-footer__copy">(c) 2026 Self-Reflect. MIT License.</p>
             <nav className="landing-footer__links" aria-label="Footer">
               <a className="landing-footer__link" href="https://github.com/ramakay/claude-self-reflect">GitHub</a>
               <a className="landing-footer__link" href="https://www.npmjs.com/package/claude-self-reflect">npm</a>

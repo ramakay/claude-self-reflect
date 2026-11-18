@@ -1,0 +1,162 @@
+[
+  {
+    "tag": "B1",
+    "note": "rank-1-correct burst (Vidhi sankalp)",
+    "rows": [
+      { "score": 0.849, "kw": false },
+      { "score": 0.585, "kw": false },
+      { "score": 0.574, "kw": false },
+      { "score": 0.563, "kw": false },
+      { "score": 0.581, "kw": false },
+      { "score": 0.561, "kw": false }
+    ]
+  },
+  {
+    "tag": "B2",
+    "note": "rank-1-correct burst (SessionEnd hook)",
+    "rows": [
+      { "score": 0.752, "kw": false },
+      { "score": 0.645, "kw": false },
+      { "score": 0.598, "kw": false },
+      { "score": 0.597, "kw": false },
+      { "score": 0.400, "kw": false },
+      { "score": 0.400, "kw": false }
+    ]
+  },
+  {
+    "tag": "B3",
+    "note": "rank-1-correct burst (narrator startup)",
+    "rows": [
+      { "score": 0.846, "kw": false },
+      { "score": 0.522, "kw": false },
+      { "score": 0.445, "kw": false },
+      { "score": 0.503, "kw": false },
+      { "score": 0.481, "kw": false },
+      { "score": 0.411, "kw": false }
+    ]
+  },
+  {
+    "tag": "B4",
+    "note": "rank-1-correct burst (intent ledger)",
+    "rows": [
+      { "score": 0.473, "kw": false },
+      { "score": 0.491, "kw": false },
+      { "score": 0.450, "kw": true },
+      { "score": 0.491, "kw": false },
+      { "score": 0.429, "kw": true },
+      { "score": 0.438, "kw": false },
+      { "score": 0.446, "kw": true },
+      { "score": 0.517, "kw": false }
+    ]
+  },
+  {
+    "tag": "B5",
+    "note": "rank-1-correct burst (radio auto-advance)",
+    "rows": [
+      { "score": 0.631, "kw": false },
+      { "score": 0.595, "kw": false },
+      { "score": 0.460, "kw": false },
+      { "score": 0.553, "kw": false },
+      { "score": 0.506, "kw": false },
+      { "score": 0.386, "kw": false },
+      { "score": 0.349, "kw": false },
+      { "score": 0.383, "kw": false }
+    ]
+  },
+  {
+    "tag": "F1",
+    "note": "fabricated probe (Kubernetes/Helm)",
+    "rows": [
+      { "score": 0.334, "kw": false },
+      { "score": 0.417, "kw": false },
+      { "score": 0.405, "kw": true },
+      { "score": 0.417, "kw": false },
+      { "score": 0.449, "kw": true },
+      { "score": 0.409, "kw": false }
+    ]
+  },
+  {
+    "tag": "F2",
+    "note": "fabricated probe (SQLite to Postgres) — review finding [high]: false decisive before this fix",
+    "rows": [
+      { "score": 0.526, "kw": false },
+      { "score": 0.414, "kw": false, "reflection": true },
+      { "score": 0.271, "kw": false, "reflection": true },
+      { "score": 0.345, "kw": false, "reflection": true },
+      { "score": 0.256, "kw": false, "reflection": true },
+      { "score": 0.319, "kw": false, "reflection": true }
+    ]
+  },
+  {
+    "tag": "F3",
+    "note": "fabricated probe (Elixir Phoenix rewrite)",
+    "rows": [
+      { "score": 0.601, "kw": false },
+      { "score": 0.405, "kw": true },
+      { "score": 0.595, "kw": false },
+      { "score": 0.448, "kw": true },
+      { "score": 0.591, "kw": false },
+      { "score": 0.581, "kw": false }
+    ]
+  },
+  {
+    "tag": "F4",
+    "note": "fabricated probe (onboarding call payroll)",
+    "rows": [
+      { "score": 0.400, "kw": false },
+      { "score": 0.378, "kw": false },
+      { "score": 0.405, "kw": true },
+      { "score": 0.366, "kw": false, "reflection": true },
+      { "score": 0.361, "kw": false },
+      { "score": 0.356, "kw": false }
+    ]
+  },
+  {
+    "tag": "F5",
+    "note": "fabricated probe (Redis caching layer) — review finding [high]: false decisive before this fix, rank6 outscores rank1",
+    "rows": [
+      { "score": 0.488, "kw": false },
+      { "score": 0.349, "kw": false, "reflection": true },
+      { "score": 0.320, "kw": false, "reflection": true },
+      { "score": 0.287, "kw": false, "reflection": true },
+      { "score": 0.334, "kw": false, "reflection": true },
+      { "score": 0.511, "kw": false }
+    ]
+  },
+  {
+    "tag": "F6",
+    "note": "fabricated probe (GraphQL gateway) — rank1 own score is weak-band even though page max is partial",
+    "rows": [
+      { "score": 0.558, "kw": false },
+      { "score": 0.660, "kw": false },
+      { "score": 0.618, "kw": false },
+      { "score": 0.510, "kw": false },
+      { "score": 0.482, "kw": false },
+      { "score": 0.487, "kw": false }
+    ]
+  },
+  {
+    "tag": "F7",
+    "note": "fabricated probe (React to Svelte) — flat identical scores",
+    "rows": [
+      { "score": 0.368, "kw": false, "reflection": true },
+      { "score": 0.368, "kw": false, "reflection": true },
+      { "score": 0.368, "kw": false, "reflection": true },
+      { "score": 0.368, "kw": false, "reflection": true },
+      { "score": 0.368, "kw": false, "reflection": true },
+      { "score": 0.368, "kw": false, "reflection": true }
+    ]
+  },
+  {
+    "tag": "F8",
+    "note": "fabricated probe (espresso machine)",
+    "rows": [
+      { "score": 0.420, "kw": false },
+      { "score": 0.450, "kw": true },
+      { "score": 0.409, "kw": false },
+      { "score": 0.448, "kw": true },
+      { "score": 0.407, "kw": false },
+      { "score": 0.450, "kw": true }
+    ]
+  }
+]

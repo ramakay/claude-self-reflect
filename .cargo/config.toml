@@ -1,0 +1,5 @@
+# SQLite's memory statistics take one process-wide mutex per allocation; nothing reads them,
+# and with them on, 14 test threads spent 989 s in the kernel waiting on it (lib suite 152 s,
+# 88 s without).
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"

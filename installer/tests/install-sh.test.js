@@ -8,7 +8,8 @@
  *  - direct calls into its functions, by sourcing a copy with the trailing
  *    `main` invocation removed.
  *
- * Nothing here touches the network, the real HOME, or a real csr-engine.
+ * Nothing here touches the network, the real HOME, a real csr-engine, or the
+ * real launchctl (a stub in fakebin answers, so no test restarts the daemon).
  */
 
 import { strict as assert } from 'node:assert';
@@ -134,6 +135,17 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
   );
   chmodSync(join(dirs.fakebin, 'curl'), 0o755);
 
+  // install.sh ends with `launchctl kickstart -k` on the user's daemon. The
+  // real one would restart the live csr-engine daemon of whoever runs these
+  // tests, so a stub first on PATH answers instead: `print` says the label is
+  // loaded (so the kickstart path runs), and every call is written to a log.
+  const launchctlLog = join(root, 'launchctl.calls');
+  writeFileSync(
+    join(dirs.fakebin, 'launchctl'),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> '${launchctlLog}'\nexit 0\n`
+  );
+  chmodSync(join(dirs.fakebin, 'launchctl'), 0o755);
+
   // A pre-existing older copy, to put first on PATH when a test wants one.
   writeFileSync(
     join(dirs.oldbin, 'csr-engine'),
@@ -141,7 +153,15 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
   );
   chmodSync(join(dirs.oldbin, 'csr-engine'), 0o755);
 
-  return { root, dirs, tarball };
+  return { root, dirs, tarball, launchctlLog };
+}
+
+function launchctlCalls(launchctlLog) {
+  try {
+    return readFileSync(launchctlLog, 'utf8').split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 
 function runInstall({ dirs, installDir, extraEnv = {}, pathPrefix = [] }) {
@@ -293,6 +313,12 @@ describe('install.sh: activation', { skip: !HAVE_SH && 'no /bin/sh' }, () => {
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Done\. Restart Claude Code/);
     assert.doesNotMatch(result.stdout, /Not active yet/);
+    // The daemon restart went to the stub, never to the real launchctl.
+    const calls = launchctlCalls(rebuilt.launchctlLog);
+    assert.ok(
+      calls.some((c) => /^kickstart -k gui\/\d+\/com\.ramakay\.csr-engine\.daemon$/.test(c)),
+      `kickstart was requested through the stub: ${JSON.stringify(calls)}`
+    );
   });
 });
 

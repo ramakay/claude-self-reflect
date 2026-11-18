@@ -1,0 +1,39 @@
+{
+ "home": {
+  "title": "Shift Map · as of 2 messages ago",
+  "rows": [
+   "shift · reader.rs:read",
+   "Before: The reader loaded a whole",
+   "        transcript.",
+   "After:  The reader streams chunks.",
+   "Haiku's words · names match",
+   "commit 8e4e3f2"
+  ]
+ },
+ "inherited": {
+  "title": "Shift Map · current · from sess-bef",
+  "rows": [
+   "new shift · …rc/companion/reader.rs:read",
+   "Before: The reader loaded a whole",
+   "        transcript.",
+   "After:  The reader streams chunks and",
+   "        stops at the byte budget.",
+   "Haiku's words · names match",
+   "commit 8e4e3f2 and your edits",
+   "decision · …/src/companion/pane.rs:frame",
+   "New:    Every page reads through the",
+   "        same Storage handle, never a…",
+   "Haiku's words · names match call graph",
+   "risk: The legend row can overflow on a …",
+   "  was removed draw_legend_row",
+   "  now rewrite the row at risk legend.rs",
+   "  Haiku's words · names not checked",
+   "removal · new.rs:go",
+   "Before: Two readers ran.",
+   "After:  One reader runs.",
+   "Haiku's words · names match",
+   "commit abcdef0 and your edits"
+  ]
+ },
+ "none": null
+}

@@ -1,0 +1,1 @@
+{"at": 1792319980.0, "context": {"percent": 8, "tokens": 78000, "window": 1000000}, "rateLimits": [{"kind": "five_hour", "percentUsed": 41.0, "resetsAt": "2026-10-18T13:00:00.000Z"}, {"kind": "seven_day", "percentUsed": 62.0, "resetsAt": "2026-10-22T09:00:00.000Z"}], "cost": {"usd": 3.4}}

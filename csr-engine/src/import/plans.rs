@@ -1,13 +1,13 @@
 //! Aux-source adapter: import `~/.claude/plans/*.md` plan documents into the CSR
 //! corpus as embedded, provenance-linked chunks (`source = "plan"`).
 //!
-//! Plans are user-ratified decisions that often outlive the conversation that
-//! produced them (a plan doc gets revised across many sessions), so they need their
+//! Plans are agent-written local files; observing one is not proof that a user
+//! approved it. They often outlive the conversation that produced them, so they need their
 //! own idempotent import path rather than piggybacking on the JSONL importer:
 //! reimport must replace stale content in place, and correlation to an origin
 //! conversation is a best-effort guess, not a guarantee (see `correlate_project`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -15,7 +15,9 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::engine::Engine;
 use crate::import::ConversationChunk;
-use crate::provenance::{ChunkProvenance, Speaker};
+use crate::provenance::{
+    ChunkEvidence, ChunkProvenance, ChunkSpan, ProvenanceEvent, Speaker, TrustTier,
+};
 use crate::storage::Storage;
 
 /// A single `*.md` plan document discovered on disk, ready for correlation + import.
@@ -207,7 +209,12 @@ fn correlate_via_fts(plan: &PlanDoc, storage: &Storage) -> Option<(String, Optio
     // fts5_search already strips FTS5 syntax characters per word and OR-joins the
     // result, so malformed input (odd leftover punctuation) can't error the query.
     let query = tokens.join(" ");
-    let hits = storage.fts5_search(&query, 5, None).ok()?;
+    let hits: Vec<_> = storage
+        .fts5_search(&query, 5, None)
+        .ok()?
+        .into_iter()
+        .map(|(chunk, _, _)| chunk)
+        .collect();
     if hits.is_empty() {
         return None;
     }
@@ -337,6 +344,7 @@ fn push_plan_chunks(
             end = content.len();
         }
         super::push_chunk(
+            0,
             chunks,
             conversation_id,
             project_name,
@@ -344,11 +352,57 @@ fn push_plan_chunks(
             content[start..end].to_string(),
             1,
             summary,
-            Speaker::User, // plans are user-ratified — never assistant/tool_result
+            Speaker::User, // legacy display aggregate only; trust is cached separately
             false,         // plans are never sidechain transcripts
         );
         start = end;
     }
+}
+
+fn plan_evidence(
+    plan: &PlanDoc,
+    conversation_id: &str,
+    chunks: &[ConversationChunk],
+) -> HashMap<String, ChunkEvidence> {
+    let message_key = crate::provenance::content_hash(&plan.content);
+    let event = ProvenanceEvent {
+        event_id: super::provenance_event_id(conversation_id, &message_key, 0, "plan_file", 0),
+        conversation_id: conversation_id.to_string(),
+        message_key,
+        seq: 0,
+        channel: "plan_file".to_string(),
+        trust_tier: TrustTier::TrustedTool,
+        parent_event_id: None,
+        receipt_kind: "plan_file".to_string(),
+        receipt_ref: Some(format!("{}#byte=0", plan.path.display())),
+        observed_at: plan.mtime.clone(),
+    };
+    let mut byte_start = 0usize;
+    chunks
+        .iter()
+        .map(|chunk| {
+            let byte_end = byte_start + chunk.content.len();
+            let start_char = plan.content[..byte_start].chars().count();
+            let end_char = plan.content[..byte_end].chars().count();
+            byte_start = byte_end;
+            (
+                chunk.id.clone(),
+                ChunkEvidence {
+                    chunk_id: chunk.id.clone(),
+                    events: vec![event.clone()],
+                    spans: vec![ChunkSpan {
+                        chunk_id: chunk.id.clone(),
+                        event_id: event.event_id.clone(),
+                        start_char,
+                        end_char,
+                        content_hash: crate::provenance::content_hash(&chunk.content),
+                    }],
+                    min_trust: TrustTier::TrustedTool,
+                    tool_result_share: Some(0.0),
+                },
+            )
+        })
+        .collect()
 }
 
 /// Import one plan: wipe any existing chunks for `plan:<slug>` (idempotent even
@@ -357,7 +411,26 @@ fn push_plan_chunks(
 /// Returns the number of chunks created.
 pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     let storage = engine.storage();
+    let _operation = storage.operation_lock()?;
     let conv_id = format!("plan:{}", plan.slug);
+
+    // Plans are prose people paste into; no credential becomes chunk text.
+    // Redacting here, ahead of chunking and the evidence offsets, keeps the
+    // chunk spans consistent with the text they were cut from.
+    let mut secrets = crate::redact::SecretCounts::default();
+    let redacted_plan;
+    let plan = match crate::redact::redact_secrets_counted(&plan.content, &mut secrets) {
+        std::borrow::Cow::Borrowed(_) => plan,
+        std::borrow::Cow::Owned(content) => {
+            redacted_plan = PlanDoc {
+                slug: plan.slug.clone(),
+                path: plan.path.clone(),
+                mtime: plan.mtime.clone(),
+                content,
+            };
+            &redacted_plan
+        }
+    };
 
     // Content can shrink between reimports; deterministic chunk ids would only
     // overwrite the chunks that still exist, leaving a stale tail behind. Wipe first,
@@ -365,6 +438,10 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     // The live HNSW index must drop the old ids too (Codex HIGH): deleting only
     // the SQLite rows left old vectors matching, and a reused deterministic id
     // was skipped as a duplicate on re-insert, pinning stale content forever.
+    // Read before the wipe and the commits (see `SearchEngine::defers_to_sync`):
+    // a failed read after the wipe would leave the plan deleted while its
+    // checkpoint already matches, so nothing would import it again.
+    let fence = storage.change_fence()?;
     let old_ids = storage.get_chunk_ids_for_conversation(&conv_id)?;
     storage.delete_chunks_for_conversation(&conv_id)?;
     if !old_ids.is_empty() {
@@ -387,9 +464,11 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
         &plan.content,
         &summary,
     );
+    let evidence = plan_evidence(plan, &conv_id, &new_chunks);
 
     if new_chunks.is_empty() {
         storage.upsert_import_state_explicit(&conv_id, &conv_id, 0, &plan.mtime)?;
+        storage.record_secrets_redacted(&conv_id, &secrets)?;
         return Ok(0);
     }
 
@@ -398,13 +477,12 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     // locking needed here, matching the constraint against locking it directly.
     let embeddings = engine.embeddings().embed(&texts)?;
 
-    {
-        // tokio::sync::RwLock has no plain (non-async) writer; blocking_write is its
-        // supported bridge for a sync call site like this one — import_plan's public
-        // signature is deliberately sync (frozen spec), wiring into an async caller is
-        // the orchestrator's job, not this module's.
-        let mut idx = engine.search().blocking_write();
-        for (chunk, embedding) in new_chunks.iter().zip(embeddings.iter()) {
+    // SQLite first, the index after: the write guard is never held across a
+    // storage call (see `Engine::import_file_with_attribution`).
+    let mut stored_now: Vec<(String, Vec<f32>)> = Vec::with_capacity(new_chunks.len());
+    let mut failure = None;
+    for (chunk, embedding) in new_chunks.iter().zip(embeddings.iter()) {
+        let stored = (|| -> Result<()> {
             storage.insert_chunk_with_source(chunk, embedding, "plan")?;
             if let Some(ref conv) = source_conv {
                 // Non-fatal, mirroring Engine::import_file's provenance persistence:
@@ -421,11 +499,44 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
                     eprintln!("CSR: plan chunk provenance persist error (non-fatal): {e}");
                 }
             }
-            idx.insert_chunk(chunk.id.clone(), embedding.clone());
+            if let Some(chunk_evidence) = evidence.get(&chunk.id) {
+                storage.replace_chunk_evidence(chunk_evidence)?;
+            }
+            Ok(())
+        })();
+        match stored {
+            Ok(()) => stored_now.push((chunk.id.clone(), embedding.clone())),
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
         }
+    }
+    #[cfg(test)]
+    crate::storage::lock_probe::before_index_apply(
+        &stored_now
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+    );
+    {
+        // tokio::sync::RwLock has no plain (non-async) writer; blocking_write is its
+        // supported bridge for a sync call site like this one — import_plan's public
+        // signature is deliberately sync (frozen spec), wiring into an async caller is
+        // the orchestrator's job, not this module's.
+        let mut idx = engine.search().blocking_write();
+        if !idx.defers_to_sync(false, fence) {
+            for (id, embedding) in stored_now {
+                idx.insert_chunk(id, embedding);
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
     }
 
     storage.upsert_import_state_explicit(&conv_id, &conv_id, new_chunks.len(), &plan.mtime)?;
+    storage.record_secrets_redacted(&conv_id, &secrets)?;
 
     Ok(new_chunks.len())
 }
@@ -658,6 +769,11 @@ mod tests {
                 .expect("provenance edge");
             assert_eq!(prov.author, Speaker::User);
             assert_eq!(prov.source_conv_id, "conv-lapi-origin");
+            assert_eq!(
+                storage.get_chunk_min_trust(id).unwrap(),
+                crate::provenance::TrustTier::TrustedTool,
+                "plan correlation must not turn file content into user history"
+            );
         }
 
         // Reimport with shrunk content: old chunks must be gone, new ones present,
@@ -676,6 +792,40 @@ mod tests {
             let content = storage.get_chunk_content(id).unwrap().unwrap();
             assert!(content.contains("Short revised plan"));
         }
+    }
+
+    #[test]
+    fn plan_import_redacts_secrets_and_counts_them_once() {
+        let storage = Storage::open_memory().unwrap();
+        let engine = test_engine(Arc::new(storage));
+        let secret = format!("{}{}", "ghp_", "C".repeat(36));
+        let plan = PlanDoc {
+            slug: "secret-plan".into(),
+            path: PathBuf::from("/dev/null"),
+            mtime: "2026-07-20T12:00:00Z".into(),
+            content: format!(
+                "{}\n\nDeploy with token {secret} today.",
+                distinctive_body("vault")
+            ),
+        };
+
+        import_plan(&engine, &plan).unwrap();
+        import_plan(&engine, &plan).unwrap();
+
+        let storage = engine.storage();
+        let ids = storage
+            .get_chunk_ids_for_conversation("plan:secret-plan")
+            .unwrap();
+        let stored = storage
+            .get_chunks_by_ids(&ids)
+            .unwrap()
+            .into_iter()
+            .map(|chunk| chunk.content)
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(!stored.contains(&secret));
+        assert!(stored.contains("[secret redacted: github_token]"));
+        assert_eq!(storage.get_secrets_redacted().unwrap().0, 1);
     }
 
     #[test]
@@ -705,6 +855,90 @@ mod tests {
         for id in &ids {
             // No correlation -> no provenance edge should have been written.
             assert!(storage.get_chunk_provenance(id).unwrap().is_none());
+            assert_eq!(
+                storage.get_chunk_min_trust(id).unwrap(),
+                crate::provenance::TrustTier::TrustedTool
+            );
         }
+    }
+
+    #[test]
+    fn import_plan_leaves_a_chunk_deleted_after_its_commit_deleted() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone());
+        let _race =
+            crate::storage::lock_probe::delete_then_sync(storage.clone(), engine.search().clone());
+        let plan = PlanDoc {
+            slug: "fence-plan".into(),
+            path: PathBuf::from("/dev/null"),
+            mtime: "2026-07-20T12:00:00Z".into(),
+            content: distinctive_body("fence"),
+        };
+        assert!(import_plan(&engine, &plan).unwrap() > 0);
+        assert_eq!(engine.search().blocking_read().chunk_count(), 0);
+        assert!(storage
+            .get_chunk_ids_for_conversation("plan:fence-plan")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn import_plan_inserts_when_the_sync_has_not_moved() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage);
+        let plan = PlanDoc {
+            slug: "fence-plan-2".into(),
+            path: PathBuf::from("/dev/null"),
+            mtime: "2026-07-20T12:00:00Z".into(),
+            content: distinctive_body("fencetwo"),
+        };
+        let imported = import_plan(&engine, &plan).unwrap();
+        assert!(imported > 0);
+        assert_eq!(engine.search().blocking_read().chunk_count(), imported);
+    }
+
+    #[test]
+    fn a_failed_fence_read_leaves_the_imported_plan_in_place() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone());
+        let mut plan = PlanDoc {
+            slug: "fence-plan-wipe".into(),
+            path: PathBuf::from("/dev/null"),
+            mtime: "2026-07-20T12:00:00Z".into(),
+            content: distinctive_body("wipeone"),
+        };
+        assert!(import_plan(&engine, &plan).unwrap() > 0);
+        let conv_id = format!("plan:{}", plan.slug);
+        let before = storage.get_chunk_ids_for_conversation(&conv_id).unwrap();
+        assert!(!before.is_empty());
+
+        plan.mtime = "2026-07-21T12:00:00Z".into();
+        plan.content = distinctive_body("wipetwo");
+        let _fail = crate::storage::lock_probe::fail_fence_reads();
+        assert!(import_plan(&engine, &plan).is_err());
+        assert_eq!(
+            storage.get_chunk_ids_for_conversation(&conv_id).unwrap(),
+            before,
+            "a failed fence read wiped the plan before it could replace it"
+        );
+    }
+
+    #[test]
+    fn import_plan_takes_no_storage_lock_under_the_index_write_guard() {
+        let engine = test_engine(Arc::new(Storage::open_memory().unwrap()));
+        let (_probe, under_guard) =
+            crate::storage::lock_probe::watch_index(engine.search().clone());
+        let plan = PlanDoc {
+            slug: "guard-plan".into(),
+            path: PathBuf::from("/dev/null"),
+            mtime: "2026-07-20T12:00:00Z".into(),
+            content: distinctive_body("guard"),
+        };
+        assert!(import_plan(&engine, &plan).unwrap() > 0);
+        assert_eq!(
+            under_guard.get(),
+            0,
+            "a storage call waited while the index write guard was held"
+        );
     }
 }

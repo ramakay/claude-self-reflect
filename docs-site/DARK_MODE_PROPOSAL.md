@@ -1,4 +1,4 @@
-# Claude Self-Reflect Dark Mode Design Proposal
+# Self-Reflect Dark Mode Design Proposal
 
 ## Direction
 

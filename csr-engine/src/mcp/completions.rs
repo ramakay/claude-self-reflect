@@ -41,12 +41,15 @@ pub fn handle_complete(
     let current_value = &params.argument.value;
 
     let values = match arg_name.as_str() {
-        "project" => complete_project(storage, current_value),
-        "file_path" => complete_file_path(storage, current_value),
+        "project" => complete_project(storage, current_value)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?,
+        "file_path" => complete_file_path(storage, current_value)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?,
         "time_range" => complete_static(TIME_RANGE_VALUES, current_value),
         "group_by" => complete_static(GROUP_BY_VALUES, current_value),
         "granularity" => complete_static(GRANULARITY_VALUES, current_value),
-        "session_id" => complete_session_id(storage, current_value),
+        "session_id" => complete_session_id(storage, current_value)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?,
         "concept" => complete_static(&[], current_value), // No static suggestions for concepts
         _ => Vec::new(),
     };
@@ -66,24 +69,18 @@ pub fn handle_complete(
 }
 
 /// Complete project names from the database.
-fn complete_project(storage: &Arc<Storage>, prefix: &str) -> Vec<String> {
-    storage
-        .list_project_names(prefix, MAX_COMPLETIONS)
-        .unwrap_or_default()
+fn complete_project(storage: &Arc<Storage>, prefix: &str) -> anyhow::Result<Vec<String>> {
+    storage.list_project_names(prefix, MAX_COMPLETIONS)
 }
 
 /// Complete file paths from the database.
-fn complete_file_path(storage: &Arc<Storage>, prefix: &str) -> Vec<String> {
-    storage
-        .list_file_paths(prefix, MAX_COMPLETIONS)
-        .unwrap_or_default()
+fn complete_file_path(storage: &Arc<Storage>, prefix: &str) -> anyhow::Result<Vec<String>> {
+    storage.list_file_paths(prefix, MAX_COMPLETIONS)
 }
 
 /// Complete session IDs from the database.
-fn complete_session_id(storage: &Arc<Storage>, prefix: &str) -> Vec<String> {
-    storage
-        .list_session_ids(prefix, MAX_COMPLETIONS)
-        .unwrap_or_default()
+fn complete_session_id(storage: &Arc<Storage>, prefix: &str) -> anyhow::Result<Vec<String>> {
+    storage.list_session_ids(prefix, MAX_COMPLETIONS)
 }
 
 /// Complete from a static list of values using prefix filtering.
@@ -102,6 +99,24 @@ fn complete_static(values: &[&str], prefix: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round4_dynamic_completions_report_maintenance_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(&dir.path().join("db")).unwrap());
+        let _owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        for name in ["project", "file_path", "session_id"] {
+            let params: CompleteRequestParams = serde_json::from_value(serde_json::json!({
+                "ref": {"type": "ref/prompt", "name": "csr_reflect_on_past"},
+                "argument": {"name": name, "value": ""}
+            }))
+            .unwrap();
+            assert!(handle_complete(&params, &storage)
+                .unwrap_err()
+                .message
+                .contains("maintenance"));
+        }
+    }
 
     #[test]
     fn test_complete_static_empty_prefix() {
@@ -147,14 +162,14 @@ mod tests {
     fn test_complete_project_with_db() {
         let storage = Arc::new(Storage::open_memory().unwrap());
         // Empty DB should return empty results
-        let values = complete_project(&storage, "");
+        let values = complete_project(&storage, "").unwrap();
         assert!(values.is_empty());
     }
 
     #[test]
     fn test_complete_session_id_with_db() {
         let storage = Arc::new(Storage::open_memory().unwrap());
-        let values = complete_session_id(&storage, "abc");
+        let values = complete_session_id(&storage, "abc").unwrap();
         assert!(values.is_empty());
     }
 }

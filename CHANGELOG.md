@@ -1,11 +1,669 @@
 # Changelog
 
-All notable changes to Claude Self-Reflect will be documented in this file.
+All notable changes to Self-Reflect will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [10.1.0] - 2026-11-18
+
+First public 10.x release. npm `latest` was 9.5.8; this release upgrades from 9.5.8 and replaces it. Self-Reflect stays one Rust binary, `csr-engine`, with no Python, Docker or Qdrant. Install with `scripts/install.sh` or `npm install -g claude-self-reflect`.
+
+**Upgrading from 9.5.8:** with npm, run `npm install -g claude-self-reflect`, then `claude-self-reflect setup`. With the curl installer, run `scripts/install.sh` and answer yes at "Run setup now?"; where it cannot prompt it prints the `csr-engine setup` command to run (`CSR_AUTO_SETUP=1` runs setup without asking). Then restart Claude Code. Setup repoints the MCP registration at the new binary and adds the hooks this release needs. Your data is not touched; the first daemon start rebuilds the vector index once (see Known limitations).
+
+In one line per theme:
+
+- **Recap, learnt line and compact receipts:** a session opens with one evidence-backed paragraph, and a compact leaves pointers to the turns it replaced.
+- **Dreaming and witness anchors:** CSR checks old conclusions against your git history and marks the ones a commit made stale.
+- **Code map:** a live map of definitions in the repos your sessions work in, per worktree.
+- **Sources:** plans, task state, subagent transcripts, Codex sessions and the session registry join the conversation corpus.
+- **Provenance and self-contamination guard:** CSR's own output is labeled and ranks below your words.
+- **Companion plugin:** a pane beside the session; `csr-engine setup` also registers the MCP server with Codex.
+- **Performance and footprint:** hook latency, index rewrites and memory use, with the limits listed under Known limitations.
+- **Installer:** `csr-engine setup` repoints the MCP registration on upgrade, and the installers report when another `csr-engine` is still in use (#316).
+
+### Compact and transcript
+
+- **Keep the evidence when the summary forgets.** CSR's existing transcript mirror can recover old details after the original JSONL is gone. The prior 17-session recovery test scored 96.6% with the installed product and 2.2% without it. This branch does not claim that recovery gain or better summaries.
+- **Compact receipts (prototype).** Before a CSR compact, the companion syncs this session to the mirror and reads it back. A read supplies a bounded source map for the summary only when the backup covers every byte of the transcript at that moment: recent requests, edit attempts with their results, and historical errors (a Bash error only when it shows a failed test, a compile error, a panic or a git `fatal:`; any other Bash error is left out, and its rows go to requests and edits), each with an exact `csr_transcript` slice call. These are historical evidence, not an inferred task list. Missing, disabled, busy, damaged, oversized or unrecognized transcripts omit the receipt; compaction still works. The preflight waits at most three seconds. Summary retention depends on the summarizer; no retention or spontaneous-reach improvement has been proven.
+- **Read a receipt immediately.** `csr-engine transcript <session> receipt` and `csr_transcript(session="<session>", view="receipt")` show sources for the latest compact. The `SessionStart:compact` hook also includes a bounded source map from the available transcript, explicitly marking that its backup was not verified. `CSR_NO_COMPACT_POINTER=1` disables the hook pointer and map. The source map uses stable original turn numbers and quoted data. Indexed chunks cannot supply exact receipts and say so.
+- **Measure reach locally.** `csr-engine transcript-reach --since 2026-11-05T00:00:00Z --json` counts post-compact stretches containing an actual `csr_transcript` call, over all stretches. Replace the timestamp with installation time; omit it for all local history. Each boundary starts a stretch ending at the next boundary or EOF, including the current stretch. Calls before the first compact and text mentions do not count. Live sessions take precedence over mirror copies; subagent files are excluded. Receipt presence is a separate observed-text counter, not proof of causality; it counts a receipt in a summary, a system row or a `SessionStart` hook output. No network or telemetry writes.
+- **Readable transcript evidence.** `grep` labels the speaker for message text, tool inputs and full tool results. `slice` hides queued transport echoes, keeps deliberate repeated requests, and preserves source turn numbers across pagination. `include_system=true` reveals the raw entries. Tool results and inputs retain the existing `result_chars` control.
+- **A 305k ceiling when native is off.** The force line now follows the ceiling when Claude Code's own auto-compact is disabled. Native-on force lines remain unchanged. Earlier compaction at a paying seam still applies. At 305k, `auto` compacts at the next turn end without a countdown; `suggest` offers, and `off` stays off. It cannot interrupt a running turn.
+- **Plugin compacts ignore the compact keys.** `autoCompactEnabled` and `idleCompaction` gate Claude Code's own compaction only. They do not gate CSR's. To stop CSR compacting, set `csr-companion.autoCompact` to `off` or `suggest`.
+- **Warning for native off plus CSR auto.** `autoCompactEnabled:false` also turns off Claude Code's reactive compact, so a long turn has no backstop until the model's limit. The pane says so once a day. For a 305k backstop inside a long turn, set `autoCompactEnabled: true` and `autoCompactWindow: 338000`; tested against Claude Code 2.1.318, native fires at 306k with that window and does not at 304k. When `DISABLE_AUTO_COMPACT` holds it off, the line says to unset it and to set `autoCompactEnabled` true. When `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is set, the line names that variable, because the settings window has no effect then.
+- **The verified receipt now attaches on sessions that hold request copies.** `api-request-blob` rows are counted as `request_blobs`, not as unrecognized entries, so they no longer close the receipt gate or raise the schema-drift hint in `stats`. They still never become turns. A real unknown kind still closes the gate.
+- **Receipts and `yourasks` skip side-agent notes.** A user row that opens with `Here is a note offered by a side agent:` is a harness note, not a request.
+- **`transcript <session> receipt` says when no compact has happened.** The first line says so and that the turns are what the next compact would replace. The pre-compact receipt text is unchanged.
+- **The pane's saved-token figure is marked an estimate.** It is requests saved times the per-request saving, minus the compact's own cost, so the line reads `~N tokens saved (est.)`.
+- **`transcript stats`** stops calling `atis-latch`, `cost-state` and other harness lines schema drift. **`mirror status`** keeps the last error's time and text beside the count.
+
+### Codex
+
+- **Setup registers the MCP server with Codex** when the `codex` CLI is on `PATH`: `codex mcp add claude-self-reflect -- <this binary>`,
+  read back with `codex mcp get --json`. An entry that already names this binary is not rewritten; a bare entry at an older path
+  is repointed; an entry the user disabled or customized (args, env, cwd, timeouts, tool filters, which `codex mcp add` would drop)
+  is left alone with the command to run by hand. `codex mcp add` drops comments in and above `[mcp_servers.*]`, so the
+  config is first copied to a new owner-only `config.toml.csr-backup-<secs>`. The stored path is the stable symlink, not the
+  versioned binary. Never fails setup. `csr-engine setup --codex-only` runs this step alone;
+  `CSR_NO_CODEX_MCP=1` skips it.
+- **CSR's own results no longer come back as Codex history.** Codex code mode calls tools inside one `exec` script, so the
+  importer's by-name check missed CSR calls and stored their results. An `exec` script made only of statements that print
+  one CSR call (`text(await tools.mcp__claude_self_reflect__*({...}))`, or `const r = await ...; text(r)`, with literal
+  argument values) is now suppressed, call and output. A script that calls CSR among other work, the common case, keeps
+  its output minus each printed line that is, whole, the JSON of one CSR search result (bare, or wrapped by
+  `Promise.allSettled` with only an index and status beside it). Every other line stays, including other CSR tools'
+  results, CSR text printed any other way or cut short by Codex's output truncation, and the output of any script whose
+  CSR call the importer cannot read for sure (a regex literal, a template expression, `tools` used any other way). A Codex call or output with no id no longer shares the stand-in id
+  `unknown`, so an id-less CSR call cannot drop another call's output. Results stored before this change stay as they are.
+
+**Already shipped in 9.5.1-9.5.8 and carried here, not new:** the fixes listed under those versions below, and the #316 installer rewrite.
+
+### Learnt line
+
+- **A separate `learnt [<age>]: ... [[CSR:LEARNT]]` line at SessionStart** (`startup`, `resume`) names what CSR stored for
+  the previous session: memory notes by session id, user-confirmed `csr_resolve` verdicts, and anchors
+  retired by a commit inside the session window (counts only, on by default, off with `CSR_DREAM_CONSUMPTION=off`). At most 320 bytes, a receipt
+  on every clause, no line when there is no evidence, `CSR_NO_LEARNT=1` turns it off. Re-import is blocked by a new
+  machine sentinel and an import-scrub formatter. On `resume` a bounded scan of sibling transcripts for the
+  `continued-in` row puts the resumed session's episode first, for the recap as well as the learnt line.
+
+### Recap
+
+- **One causal paragraph at SessionStart** replaces the CONTINUUM / LAST / NEXT / ANCHORS fragments:
+  `recap [<age>]: <intent>: <completed>. Settled: ... Now: ... Next: ...`. No LLM. Each clause drops without
+  evidence; `Next:` is never invented; a feed error falls back to the old fragments byte for byte;
+  `CSR_NO_RECAP=1` turns it off (cc14ca81).
+- **The intent names the session's first task**, not the opening prompt or the latest side request. Hand-written labels
+  matched the first task in 9 of 11 sessions, the most-work segment in 7, the latest task in 2 (01e07088).
+  Whole sentences up to 160 chars, else a clause cut, else a fallback of 6+ words, else abstain (1d23d675,
+  51554e24, a7917b7f, f9b38f67, f83e4f80, 75fa7e4e). A mid-turn follow-up sent within 120 s of the previous
+  prompt joins the task text (f66e6f64, e523644b, bb829e5a, d53f3753, 41d2776d).
+- **`completed` comes only from receipts:** successful `git commit` / `cherry-pick` / `revert` / `merge` output,
+  then TaskUpdate and TodoWrite completions answered by a non-error tool_result. Commits show first; receipts
+  from another task render as `Latest: ...`. Assistant prose is no longer read (0728a16e, 9d5cb55a, 244a13a2,
+  ec240ae1, 3fb030ff).
+- **New `Corrected:` clause:** up to 2 corrections from the last 7 days, 90 chars each, with session:turn
+  receipts. The 700-char budget fills by priority, so a correction cannot evict `Settled:` (b719b2bc, 54389e31).
+- Subagent rows never touch the recap (53e3e5e0, 7bb0b944). Forwarded notes and dreamer what-ifs render as
+  `note: <headline>` (7cbd3660, 691db258, 04810c1c); CSR narrator transcripts have no task (5257ed3b, c81bd23a).
+  A headless run is never your previous session; the live DB held 19 such episodes, newest in 4 projects
+  (e2a28034, ff5c21cf). CONTINUUM and EPISODE INDEX share the intent rule (14e744e8, 1cace860).
+- **After a compaction the intent names the current task.** Inside one long session the first task can be hours
+  stale; the compact recap now anchors on the latest renderable typed task, cached by the Stop hook, so
+  SessionStart reads no transcript (0.58 us selection, 102 us vs 101 us formatting). Notes, short side requests,
+  harness rows and scheduled re-fires (`isMeta`, `promptSource=system`) never count; startup, resume and clear keep
+  the first-task rule (18adccd0). PreCompact refreshes the anchor, so a task typed after the last response counts
+  (16-18 ms on a 65 MB transcript); an interruption ends a turn and is never the anchor (fffa3a8e).
+- **Session stories follow long sessions:** rebuilt free from Claude Code's summary after each compaction; no
+  PreCompact Haiku call (45f718e4). `CSR_STORY_REWRITES=1` has Haiku write from summary plus last 20 messages (a5c6ca73).
+
+### Code map
+
+- **A live map of definitions in supported source files in your repos, per worktree.** The conversation code graph only knows symbols a
+  session touched; the map reads the repos, so CSR answers for code no conversation mentioned and says which worktree
+  holds which version of it. It is keyed by git blob oid: a worktree is a view of file paths and blob oids, and a blob
+  is parsed once per extractor version however many worktrees hold it. On the owner's machine, with the installed
+  binary mapping into an empty database: claude-self-reflect is 9 views, 2,531 view-file pairs, 465 unique blobs (5.4
+  copies each) and 23,553 defs, mapped cold in 7.7 s at 87 MB max RSS; a warm rescan takes 0.13 s at 24 MB and parses
+  0 blobs. 61.0% of the mapped paths in claude-self-reflect were never touched by a conversation. Of the files the
+  conversation code graph knows that are still on disk, 625 of 947 are in the live map; the other 322 are `.mjs` (189,
+  not a mapped extension), git-ignored (119) or untracked under a dot directory (14) (b2f108e8).
+- **Which repos: the ones your sessions are in.** SessionStart and PostToolUse write one row per working directory
+  to `codemap_signals` (one indexed upsert, 100 ms busy timeout, never a parse). The daemon polls and watches the
+  repos with a signal in the last 24 hours (`CSR_CODEMAP_ACTIVE_HOURS`), plus repos you named with `csr-engine
+  codemap add` or `CSR_CODEMAP_REPOS`, at most 16 (`CSR_CODEMAP_MAX_REPOS`; named repos first, then the newest
+  signal). Before, it followed 30 days of Claude Code history and every `code_nodes` project, so it polled repos you
+  had not touched in weeks. A repo that goes idle is no longer polled or watched but keeps its views, blobs and defs:
+  the next signal rescans it warm (parses 0 blobs when nothing changed). Deleting idle repos is not done; garbage
+  collection is unchanged. A cwd that is your home, a temp folder or not a git repo maps nothing. With no daemon
+  running, the session maps an ordinary repo itself (one detached scan at SessionStart, a drain after edits); a live
+  daemon keeps ownership. Sessions and the daemon both skip temp folders, the home folder and a repo rooted at the
+  home folder; `CSR_CODEMAP_ALLOW_TEMP=1` maps temp-folder repos on purpose. The map only reads
+  repos: no git command that writes, no index refresh. Caps: 5000 files per view, 512 KiB per file (5d718598,
+  005bef70, 7d3a78b6).
+- **Repos in Desktop, Documents and Downloads are mapped by the session, never by the daemon.** The daemon still
+  never opens anything under `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive or `/Volumes`, so the macOS
+  privacy prompt never fires for it; the protected-folder test is lexical (case-folded, the `/System/Volumes/Data`
+  firmlink included) and runs before any filesystem call (ff464b68). A session already working in such a folder has
+  opened it, so SessionStart there starts one detached `csr-engine codemap scan --repo <cwd> --session`, and
+  PostToolUse queues the edited file and starts one detached `codemap drain --repo <cwd>` unless one is running.
+  The drain waits out a 5 s debounce, rescans the queued files (the whole repo when HEAD or the index moved),
+  repeats while new edits arrive and exits (after nine minutes it hands off like an idle drain: it releases its lock and looks at the queue once more, so a late edit is never dropped). Both children have no stdio and are never waited on, so the hook returns
+  at once; one spawn per hook call, no retries, and the in-flight check is a lock file next to the database. `--session`
+  opens only the one protected folder the cwd is in, only in those two processes. **Lag:** nothing watches a
+  protected folder, so an edit made outside Claude in a protected repo is not seen until the next session event in
+  that repo (36ad2718).
+- **One scan per repo at a time, across processes.** A per-repo file lock (heavy-scan permit first, then the lock)
+  keeps the daemon, `codemap scan` and a session drain from scanning the same repo together (a748e4d4).
+- **`codemap status` says what it skips.** Text and JSON list `skipped: [{ path, reason }]` with `protected-folder:
+  mapped by session only`, `idle > <N>h`, `cap <N>` or `CSR_NO_CODEMAP`; a protected repo a session mapped shows its
+  views and the protected reason together. `csr-engine status` carries the same list in its `codemap` block. It is
+  built from stored rows and signals with no filesystem call (04f65045).
+- **CLI:** `csr-engine codemap add | remove | scan | drain | status | query | watch`. `status` and `query` take
+  `--json`; `query` shows, per definition, which worktrees hold the same blob and which differ (b2f108e8, 1a175565).
+  `scan --session` and `drain` are what the hooks start for protected folders; you rarely run them by hand.
+- **Three freshness signals** (1a175565): a 60 s poll of every active repo (`CSR_CODEMAP_POLL_SECS`), a file watcher
+  with a 5 s debounce (`CSR_CODEMAP_NO_WATCH=1` turns it off), and a queue the PostToolUse hook fills with one insert
+  and no parse. Installed, on the owner's machine: a dirty edit in a worktree showed in 6 s and left the map 7 s after
+  it was undone; `git worktree add` showed in 59 s and `remove` in 62 s; a repo registered with `codemap add` was
+  mapped by the next poll in 49 s. In a sandbox, a commit showed in 5.1 s with the watcher and in 36-54 s by the poll
+  alone, and 2,000 files written under `target/` caused 0 rescans.
+- **Cost, installed, on the owner's machine under real load (load average 9-15 from other sessions' builds):** the
+  live daemon maps 4 repos, 20 views, 6,204 view-file pairs, 1,744 unique blobs and 34,125 defs. The map's own
+  freshness loop (`codemap watch` over the two repos above, 12 views, warm) used 0.43 s CPU (0.11 s user + 0.32 s sys)
+  in 131 s at 28.9 MB max RSS and parsed 0 blobs. The whole daemon's CPU is not a measure of the map: it used 62.9 s
+  in 120 s at 3.84 GB RSS ten minutes after a restart, while it reloaded its search index. Hook cost, 10 runs each,
+  codemap on against `CSR_NO_CODEMAP=1` on a sandbox database: SessionStart median 304 ms against 303 ms
+  (second pass 428 against 392), PostToolUse median 4,820 ms against 4,529 ms (second pass 4,191 against 4,152);
+  the 4 s is the existing hook, the codemap share is inside the run-to-run noise.
+- **Two tools and `status` use it, with no new MCP tool (still 16).** `csr_search_by_file` appends a `<code_map>`
+  section after the ledger: for each matching path (an absolute path by its worktree, else an exact repo-relative
+  path, else a suffix on a `/` boundary, at most 10) the views holding it grouped by blob, such as `same blob in main,
+  a; differs in b (dirty)`, plus the definitions of the blob most views share. When no conversation touched the file
+  it says so and the map is the answer. `csr_code_graph` appends the map's definitions of the exact symbol name, and
+  answers from the map when the conversation graph does not know the symbol, saying these are definitions, not call
+  edges (callers and callees are not in the map). Each section is at most 1,500 bytes and read-only. `csr-engine
+  status` gains a `codemap` block: repos, views, view-file pairs, unique blobs, defs, queue depth, truncated and
+  errored views, and freshness lag (oldest poll and oldest scan). `--compact` does not read it.
+- **`CSR_NO_CODEMAP=1` turns it all off:** the daemon job, the watcher, the hook enqueue, the CLI and the two
+  sections.
+- **Not in this release:** `witness_ledger` worktree-tier stamps from the map. The map answers "where does this
+  definition live, and does each worktree hold the same bytes"; it does not feed the dream verdicts.
+
+### Dreaming / witness
+
+- **Evidence-grounded forgetting** (b721a745, 834fa704). `codewitness` stamps spans with BLAKE3 at commit OIDs and
+  orders verdicts by git ancestry, no LLM. Adds `witness_ledger`, `witness_generations`, deterministic
+  supersession verdicts, and `[stale anchor]` / `[evolved]` notes with commit receipts. The daemon dreams every
+  6 h (`CSR_DREAM_INTERVAL_SECS`; `CSR_NO_DREAMING=1`). `codewitness labels|bench`: 1.000 / 1.000 over 13,626
+  beliefs; recall is 1.0 by construction and the corpus has zero reverts. The GraphOrdered / ContentOnly receipt
+  basis is crate API only; no production path emits it (19f2ac5d).
+- **`CSR_DREAM_CONSUMPTION` has three modes** (66569088; replaces the default-off gate of ff4ad3fe). Unset =
+  annotate: notes with receipts in search, status counters and the journal, no rank change. `full`/`1` adds the
+  rank sink and the recap `Learnt-then-retired while away:` clause (2c32256f). `off`/`0` hides notes and counters.
+- **Verdicts bind to chunks, not conversations:** one stale anchor no longer demotes a conversation's live chunks
+  (1991235c, a3a5f2ab, 17f2af2f). Verdicts on older witnesses show as annotations; before, all 545 superseded
+  verdicts were invisible in search (8154d514).
+- **Verdict engine pass (2026-10-08).** Anchors keyed by (file, symbol), not project (fe5878bc). Judgment only from
+  a HEAD at or after the last one (7ed6eff4). One event per verdict kind: 62k of 74k live events were re-draws
+  (680bca4e). v1 events retired behind an epoch floor, kept append-only (c92d4be3, 19b2cee1). Receipts name the
+  changing commit, dated by the committer's local day; git search capped at 20 s (8334daee, 319e9645, 5f0f866c,
+  6bcd21f7).
+- **Dream journal:** `dream --report`, and `csr-engine journal serve` on loopback 127.0.0.1:7373
+  (`CSR_NO_JOURNAL_SERVER=1`) (70d9e763). Report 3.6 MB -> 746,149 bytes without vendored mermaid (83219ec9).
+  One verb-first sentence per session, checked against its outcome and cached; reruns make zero new `claude -p`
+  calls; upgrading re-curates once, +5 batches on the maintainer corpus (5b3637ba, be136791). "SINCE THEN": 43 of
+  50 sessions, 454 rows (eb8a8f49). Also TOUCH NEXT, week home `/`, board `/board`, `/corrections`, and
+  resolve/dismiss behind same-origin + CSRF checks (45b768f2, 2ec0b8f5, 698668bc, b719b2bc, b14811c2).
+- **`csr-engine dreams`:** zero or one dream per project; strategy dreams need 3+ sessions and abstain on a
+  receipt missing from the evidence; `--as-of`, `--no-llm` (289ecc37, 450dbe57, 6daadb83, 0abfaf75).
+- **Night-pass threads** (off by default; `CSR_DREAM_THREADS=1`): propose-verify over unfinished episodes with a
+  verbatim-quote gate (fd1cb675). Dropping session scaffolding cut a call from 52,024 to 12,082 tokens (a3771388).
+- PreCompact starts a marked dream cycle (`CSR_NO_DREAM_ON_COMPACT=1`) (2ca7931e). Statusline: `☾ N dreams`,
+  `☾ due`, `☾ dreaming` (59b2b1a5, 519cafb6). The unread badge counts journal dreams; it had read "12326 unread"
+  while the journal listed 6 (1155af00).
+- **Intent channel and lessons.** Corrections, redirects and abandonments land in append-only `intent_events`
+  with byte receipts; `csr-engine backfill intent`, `CSR_NO_INTENT_CAPTURE=1` (e18920ad, 1cffba26, 71f4624b,
+  05172115). Only typed words count: 1 of 107 recorded corrections passes the new rules (40095521).
+  e18920ad added a `SubagentStop` hook; 4adf32ee dropped it. It captured nothing by design (sidechain transcripts
+  are foreign to `intent_events`) and cost a process spawn per finished subagent. `hook install` no longer
+  registers it, and `merge_hook_config` sweeps CSR entries out of event groups the new config does not register.
+  `hook subagent-stop` stays accepted as a no-op for older settings (06af27e2, 34f5648c). `csr-engine lessons
+  --project <p>` prints CLAUDE.md candidates with receipts and never writes CLAUDE.md (b719b2bc, 54389e31).
+
+### Provenance and self-contamination guard
+
+- **Self-contamination: label, never delete.** Stored user and assistant text imports byte-identical whatever a CSR
+  grammar says. `contamination.rs` is a read-only detector; a match is a label (12bf1582).
+  - **Search.** A result holding CSR text carries `[CSR text]` and sinks below clean results in every search mode
+    and kill-switch state (4683b8b3, 15380ed4). Every chunk-returning MCP tool labels (dc6fc501). The file-search
+    fallback and `csr_why` sink CSR-text rows too (16a0e34f, 8db3295d). A chunk with no provenance row has an
+    unknown author and is labeled; 48,497 of 246,072 conversation chunks of one real corpus had no row (9040c7aa).
+    A failed dream-verdict read keeps the labels (dd05a223).
+  - **Hook injection skips CSR text:** predictive context (it reads the whole chunk), episodes and lineage pickup,
+    completion claims, compact anchors, recap corrections, continuity titles (f42d6dea, 1458b79a, bf80df99,
+    0784872f, 38b37bc5, 23f2538f). Selection only; no stored row changes.
+  - **Import.** An assistant text block that looks like a tool marker is kept (a74fa974). Detection runs once per
+    line (5c8acc52, 7fba01ea). Detected forms include the companion's agents envelope, as one hit covering marker,
+    JSON line and marker, also stripped from prompt search and derived text (34abe39f, ff479896), and a pasted dream
+    card's judgment spans (51a9ebbb).
+  - **Derived artifacts** (learnings, episodes, narratives) may still strip CSR text; stored conversation never.
+  - **Status** shows `N CSR-text chunks labeled` only when N is above 0. On a clone of the maintainer database
+    (733,388 chunks): 64 CSR-text chunks labeled in 20 of 4,048 conversations.
+  - **Still structural, as before:** CSR MCP tool call and result suppression by tool name, narrator transcripts
+    skipped by first-prompt signature, and a complete hook-labelled system-reminder wrapper in the person's turn.
+- CSR no longer embeds its own MCP tool calls, their results, or hook-injected blocks; one sanitizer serves every
+  pipeline (b721a745). Recaps carry a machine sentinel; all 5 call sites reject a recap carrying it, quoted or
+  not (43b3bdd5, a1e9cd9b, 19f2ac5d).
+- **Trust tiers.** Every chunk and artifact caches a floor (Unknown < External < TrustedTool < UserHistory <
+  UserConfirmed < System). Missing evidence stays Unknown; ranking reads only the cached column (8d7d2c7d,
+  787becb7, 48950790, e8547791, ba845bca). Results carry `<trust>`, csr_why prints `trust=`, prompt lines read
+  `[source|tier]` (5c082939). `csr-engine provenance backfill` (also an idle daemon pass,
+  `CSR_NO_PROVENANCE_BACKFILL=1`) rebuilt 94,752 of 235,392 chunks in 68 s; the rest belong to deleted
+  transcripts (76834169, e6c37fdd). An `insert_reflection` that took over a minute takes 0 ms (ba4889c2).
+- **`csr_resolve` needs your confirmation:** it elicits the exact payload and its SHA-256; only a matching Accept
+  writes `user_confirmed`, and `Settled:`, the rank sink and proposals read only those rows (75f43f30).
+- **`csr-engine backfill scrub` is a plan.** `--dry-run` reads the stored conversations and reports what a re-parse
+  of their source transcripts would change, and writes nothing. A real run refuses before it takes a lock: "scrub
+  deletes nothing in this release: CSR text is labeled in search instead" (12bf1582). The plan leaves out
+  conversations whose source file or newest chunk changed in the last 15 minutes unless `--include-active`, reports
+  a re-parse that would rebuild no chunks, or lose most of what is stored, as refused (ab204258, 5a2fff74,
+  d4987749), and stops while `lsof` shows another process holding the database unless `--force` (230f11c3).
+- **Maintenance lock.** `backfill scrub --dry-run` holds an OS lock on `<data_dir>/maintenance.lock` exclusively
+  (30 s of non-blocking tries, before preflight); it is the only exclusive holder left. Every writable storage
+  operation, hook, importer, daemon sync batch, index publication and remap holds it shared for the operation; a
+  nested acquire reuses the thread's token (0.07 us vs 24 us; a 20,000-row storage bench 4.12 s -> 2.99 s). Hooks
+  exit silently during maintenance, the daemon and watcher skip the cycle, `store_reflection` waits 10 s; `status`
+  probes the lock and renders read-only. A 16-process exclusive acquisition test gets one owner (7303b148,
+  a793857e).
+- **CSR's own headless children are skipped, not purged.** From 2026-09-01 to 09-19, 19,841 entered the corpus:
+  231,481 of 486,936 chunks, 42,159 of 52,541 reflections. Import reads the opening prompt raw and skips a
+  transcript whose first prompt is a CSR agent prompt (9e440d00). Children already stored stay; `backfill scrub
+  --dry-run --agent-transcripts` lists the conversations a purge would remove, and removes none (12bf1582).
+- **Forward grammar v2** (`.plans/release-10.1/forward-grammar.md`; 93ca27b2). New pane-dream, compaction-card
+  and story-draft forwards carry `quoted` and end at their closing quote inside the 700- or 1,200-char limit.
+  Legacy v1 forwards end at the known cut or end of line. Where a forward is cut (prompt search, derived text) the
+  words around it stay; in stored chunks it is labeled and nothing is cut (12bf1582). Extraction and
+  `strip_csr_emissions` share the grammar. Probe: a 700-char legacy send plus a reply went from dropped to the reply
+  kept. Earlier rounds: 17b9a30c, 26c8e417, f6f65bdf. Story feedback ("CSR's story of this session, rev 3 is
+  wrong; ...") is the person's; only the story forward's grammar cuts it (149e494e).
+- **One prefix rule before a forward**, shared by extraction and `strip_csr_emissions`. The text before the header
+  splits into prose, then a run of spaces, tabs and `>`, then one ASCII digit touching the header. With no prose,
+  the markers and digit go with the forward; prose keeps any digit ("I vote 2 <card>" keeps "I vote 2"; "42"
+  stays). A 45-case table pins it for compaction cards, stories and dreamer questions (481df725; replaces the rules
+  of 149e494e, 7303b148 and a793857e). Kept prose earlier on the line protects a later forward's digit ("I vote
+  <card> 2<card> Keep..." keeps the 2) (43a446ad).
+- Read as CSR's, never the person's: dreamer prompts, "Lost and found" sends, compaction keep lists, forwarded
+  notes, pasted `dreams` cards, harness-written user rows (85c0536f, 19e7d467, 7cd81a8e, b1d7de23, 6369e6b9,
+  6daadb83, 044662f3).
+- Headless `claude -p` children run with `--tools ""`, `--setting-sources ""` and `--no-session-persistence`.
+  Before, one plugin hook fired 21,116 times in a month, and 19,852 of 20,159 re-ranker harvest sources were
+  CSR's own children; a Haiku call fell from 7.1 s to 1.5 s (7ad3514f, bcea4a8a). See Known limitations.
+
+### Memory health
+
+- **`eval --full` adds three results:** Emitter Contamination Canary (compiled-in fixtures: every CSR formatter is
+  generated and detected, a protected corpus stays unlabeled), Duplicate Rate (report only, changes nothing) and
+  Known-Item Recall (55272cc6). The CSR-text census prints as its own line, not as a result. Full eval now has 24
+  results.
+- **Known-item recall.** A frozen sample of the person's own chunks whose query matches exactly one conversation
+  family (86fa9c8f), searched through the production recall pipeline with telemetry off (3220b365). Fewer than 10
+  eligible cases abstains; 85% or more in the top 5 is green, 70% or more amber, else red.
+- **Exit code.** `eval --full` exits nonzero on a gating failure (a red recall, a canary failure, any failed
+  test); abstentions, amber and report-only results never fail it (55272cc6, 9ff730e4).
+- **The two timing checks warn instead of failing.** Search Latency P95 (target <1 ms) and Batch Embed Speed
+  (target <5 ms/text) now pass with an `AMBER (non-gating):` detail when over target, with the measured number,
+  the target, and for search the timed-search and chunk counts. Before, `eval --full` exited 1 on every run
+  against a 760,078-chunk store (p95 4.13 ms quiet, 311.95 ms under load; embed 5.1 ms/text under load). A
+  broken engine still fails: an embed error, no query vectors, or no timed searches. The latency now runs one
+  untimed warm-up pass, then 50 timed searches (10 queries x 5 rounds), p95 by nearest rank, not the slowest
+  of 10.
+- **`status` reads the cached result.** It never runs the probe or loads embeddings. `status --json` is the default
+  output spelled out. `eval --full --refresh-recall-sample` starts a new sample and keeps the history (7fb4e91c).
+- **The `⚠ mem` chip** in `status --compact` shows for two causes only: the canary fails now, or the latest
+  completed recall result is red on at least 10 cases and is under 12 hours old. Amber, abstain, stale and
+  duplicates never raise it (7fb4e91c, 4c50c8c3).
+- **Daemon cadence.** The daemon measures every 6 hours on the shared heavy-work permit, restart-safe, yields to a
+  due dream pass, and stops on shutdown (0463a3c9, 913ced17). A measurement commits against the stored sample in
+  one write transaction (694333fe); only a missing row invalidates a case (4d82446e). `CSR_NO_HEALTH=1` turns the
+  daemon loop off; `eval --full` still measures when you run it (4c50c8c3).
+- **Maintainer database clone:** duplicate rate 24.93% (182,830 duplicate rows of 733,388 chunks), report only.
+  Known-item recall: amber, 13 of 18 sampled chunks found in the top 5 (72%), the same on two runs; no chip.
+  One miss returned that conversation's own narrative summary at rank 1; the probe counts chunk hits only.
+  An empty database abstains and `eval --full` passes 24 of 24.
+
+### Search and hooks performance
+
+- **Hybrid retrieval always on:** FTS5 every call, RRF k=60, `CSR_SEARCH_MODE=hybrid|vector|fts`; identifier probe
+  vector 0 hits, hybrid 7, old fallback 4 (d0b97cb4, 12a9acae). New `csr-engine bench`: coding-agent-life-v1, K=5,
+  R@5 1.000 every mode, MRR@20 vector 0.917 / fts 0.897 / hybrid 0.867 (056f13fb, 230447c5, 41d8fb13).
+- **Stored memories come back** at rank 1, 0.997, via `reflections_fts` and their own trust floor (994c5f3d).
+  Standing needs cosine >= 0.45, never for derived rows; weak out-of-family rows sink under a project filter: 67
+  queries, 65 pages identical, 0 rank-1 changes, out-of-family rows 3 -> 0 (9d5ad90a, 0d9265be, af171cc6).
+- **Scope:** an omitted `project` resolves from `CLAUDE_PROJECT_DIR`, checked against stored names, else `all`
+  (f9fd4288, dac585b6; 9.5.7 shipped a narrower version). Search covers the repo family; `all` boosts it 1.15x
+  (9768bd0a). `csr_get_more` keeps page one's order (17be7ca0).
+- **Weak-band wording:** rank-1 hits are not called "spurious" (that wording drew 42% immediate re-queries vs 18%,
+  38f69789); the search path makes no decisive-margin claim, 0 of 13 fixtures (49781817, e22ef9b4, e09326b5,
+  3cfdf041). quick_check measures margin against the runner-up (b219dcbe, 96094d65).
+- **`get_recent_work`:** repo family, last-activity order, no subagent or `sdk-*` rows, Codex bursts fold into
+  `[+N parallel]`. Unscoped: up to 9.43 s cold -> 32 ms (c06804e4, 5c38d820, 96ea2d93, bf7ca8d9, 4dbae46c).
+- **`csr_why` walks for real:** it reported 0 seeds and 0 hops; now 10 of 10 ground-truth queries engage, finding
+  23 ground-truth sessions against 11 for plain kNN, in score order, plus a `distilled into memory` hop (730b81fa,
+  b9caa709, 17f2af2f, 6e0d3d73, 43a635ab, f18f4dae, 55ba91f9).
+- Opt-in trained re-ranker (`CSR_TRAINED_RERANK=1`, NDCG@5-gated) (d5d82909); daemon-only reaction shadow (44e9f4ba).
+- **What the prompt hook hands over.** Lines from the asking session: 8 of 32 -> 0 of 9 over 10 prompts (044662f3);
+  its subagents and derived rows too (22c79047, 1d0431d8). Harness turns: 2,174 bytes -> 0 (ee04254b). Pasted CSR
+  output no longer drives the search: 9 fixtures, 51 items and 8 PICKUPs -> 0 (cd92ab7b). Over 95 replayed
+  prompts: frame-only rows 18 -> 1 (6609b46f); derived rows past 21 days need cosine >= 0.62 unless they record a
+  finding within 90 days, weak old items 42 -> 12 (189a6132, e96ea545); duplicates 6 -> 0 (90f235bf); PICKUPs
+  18 -> 8, precision 33% -> 62% (49fcb33d). Each line names its session (cd5ee0cf).
+- **Hooks that never search skip the index** (259k chunks): notification 879 -> 10 ms, `continue` 860 -> 13 ms,
+  subagent-stop 869 -> 19 ms (a60ef867; that hook is gone, see Dreaming / witness). Precompact, session-end, stop,
+  post-tool-use only import; precompact 21 ms vs a 346,570 ms rebuild (a4453aa1, 58953b81, bcad285b). Hooks never dump the index (~1 GB/prompt before; a7dfb889).
+- A Stop hook asked the daemon to apply the index once per imported chunk, and under load each ask ran to its
+  3 s wait: one live Stop hook took 25.8 s (earlier ones 10 s to 253 s), 6,382 of 6,398 samples waiting on the
+  socket. An import now asks once per file, a busy answer pauses chunk asks for 15 s, and the episode and heuristic
+  summary stores no longer wait for an answer they ignore. In a test with the daemon's index held, a 22-chunk import
+  went from 69.3 s to 3.3 s and the next import made no ask. Stored reflections still wait for their ack.
+- After that fix a live Stop hook still took 10.9 s: 2,112 of 2,580 samples were the task-resolution probe, an FTS5
+  search over all 101,418 project chunks for each completed task on every Stop, while the ledger held 0 confirmed
+  still-open verdicts, so none of those searches could produce a proposal. The probe now reads the project's confirmed
+  still-open chunks first (one indexed query, at most 500) and returns when there are none. In a test with 100,000
+  chunks and 10 completed tasks it went from 443 ms to 0.09 ms (20,000 chunks: 81 ms to 0.11 ms). A still-open chunk
+  that bm25 ranked below the top 3 is now proposed.
+- A Stop hook still held Claude Code for every pass over the transcript: 8.9 s on this repo's 163.5 MB transcript
+  (4.8 s on EnhanceMe), and since Oct 19 a mean of 46 s and a max of 399 s over 102 Stops here. The hook now writes
+  its input to `stop-work/<session>.json`, starts a detached `hook stop-work` worker and exits; it prints nothing
+  before or after. On that transcript (168 MB by now, worker lock held so no worker ran) the hook returns in 6 ms,
+  median of 7 runs (max 8.6 ms); on a 50 MB conversation transcript the old inline hook was still running when it
+  was killed at 565 s, the new one returned in 6 ms. The worker runs the same handler, at most one per session; a
+  Stop that lands while it runs is processed after it, so the last input always is. `CSR_STOP_INLINE=1`, or a spool
+  or spawn failure, runs it inline as before. The episode and the `source=compact` task anchor now appear when the
+  worker finishes, not before the Stop returns.
+- prompt-submit asks the daemon over a private socket within a deadline and fails open (3651e549, 8e473f5e). The daemon index takes rows other
+  processes write (a9f252f5, 1414dc1b).
+- Render path: indexed lookups, 64 MiB cache plus mmap, cached ancestry. Warm p50/p95 over 104 prompts 155/354 ->
+  92/236 ms (7474c333); p95 200 -> 183 ms (c878bf59); also 7c22b88d, 76458478. Migrations write nothing on an
+  up-to-date DB; failed concurrent opens 7 of 60 -> 0 (4edb8a95).
+- Cold start never blocks on a full rebuild; the daemon compacts on a marker. MCP spawn to `tools/list`: 5.02 s on
+  550,944 chunks (c95b344b, e23aa54c, a5a68e72, e793cd6c, 8691ef54). The tombstone over-fetch loop (860-880 ms
+  per thresholded query) is gone (e10f2fff).
+- Daemon: the watcher dumps at most every 5 min (0a369d5e); generations publish under a read lock, where 2.7-8.1 s
+  flushes had blocked renders (d82b15bc); imports, V3 extraction and the re-ranker run off the async workers
+  (8653af6d, 80a5372a); the FTS update trigger fires only on content changes (23dd336d).
+
+### Resource footprint
+
+In-flight resource round on rc2 after b1d7de23. Amend at the marker.
+
+- **One index owner (G1).** With a live daemon, MCP servers proxy query embedding and kNN to it over a private
+  socket: no index, no model, no loops, no dumps. Nine servers had held 1.33-2.18 GB each, 15.2 GB together.
+  Answers match in-process (ids, order, scores within 1e-5). `CSR_NO_DAEMON_PROXY=1` opts out (c97c166c).
+- **Restarts, without a second engine.** A server of a configured daemon never loads the index or the model, even
+  while the daemon is down (6b1e378b replaces the in-process fallback of 0f33ba59, which went 60 -> 2,022 MB and
+  gave back only to 1,094 MB). Vector tools re-ping for up to 20 s (one try within 15 s of a failure), then answer
+  from SQLite's keyword index, marked `[keyword]` with no cosine scores, keeping each tool's dates, scope,
+  pagination and format; the recency window and project apply inside the FTS query before its 500-candidate limit
+  (6b1e378b, 22f231a4, 8578f22f). `status` lists each server's path under `mcp_servers`: unknown until the daemon
+  first answers, then daemon, keyword-only or in-process (0f33ba59, 481df725). Review fixes: 7b5b3238, daa9f444,
+  6adae6e4.
+- **What "configured" means.** `CSR_NO_DAEMON_PROXY=1` wins. Otherwise `CSR_DAEMON_PROXY=1`, the launchd plist for
+  the database it serves (its `--db-path`, else the default DB), a fresh or future-dated heartbeat, or any typed
+  Ping/Busy reply; heartbeats and replies carry the daemon's database identity, and a mismatch does not count
+  (8578f22f, 481df725). CLI commands (`rebuild-index`, `eval`, `status`, `backfill`) stay local.
+- **Daemon socket bounds.** A connection waits for a slot before anything is read; at most 8 frames buffered or
+  computing, 32 waiting connections, embeds capped before dispatch; every call has one absolute deadline covering
+  connect, write and read, and runs off the Tokio workers (290c8af4, 1dfca84b, 22f231a4).
+- **Stores are indexed on return.** A proxied `store_reflection` returns once the daemon's change cursor reaches the
+  write, or after 3 s says "semantic indexing is pending" with the id; reflection FTS finds it at once
+  (52decdf2, 22f231a4). With the daemon unreachable it says the reflection was not stored.
+- **Verified index dumps in `<data_dir>/index-v3/`.** Manifest v3 records each graph and data file's length and
+  BLAKE3 hash, checked before hnsw_rs reads anything (1.5 GiB hashes in 813 ms); no hashes or a mismatch is a cache
+  miss. Older binaries keep `index/`, which `status` only sizes. A damaged generation is rebuilt from SQLite
+  instead of hnsw_rs exiting the process; a short data file had stopped the MCP server before its first answer
+  (e88c17bd, 22f231a4). Hooks proxy through the daemon and never build HNSW (22f231a4).
+- **Dump budget (G2).** The daemon wrote ~20 GB/h, each MCP server 2.8-3.9 GB/h. An extraction tick wrote 65.7 MB
+  of temp B-tree; now 0 MB, 0.29 s instead of 0.50-0.92 s. The daemon dumps after 30 min only when min(2,000,
+  0.5%) vectors changed. A per-manifest change cursor stops 42,634 replayed ids and the 17-min rebuilds they
+  caused (2bb98088).
+- **Vectors from the map (G3).** The daemon's 1.1 GB of heap vector copies are replaced by the mapped generation;
+  engines own their maps, so unlinked generations are freed (10 processes had held 9, ~1.1 GB each). ORT embeds
+  one text per run: 82.4 -> 106.6 vectors/s, 1,382 -> 261 MB (76e390d6).
+- **hnsw_rs 0.3.5:** ~1.9 GB less reserved address space per chunk index; recall@10 0.9070 / 0.9010 / 0.8997 ->
+  0.9243 for graphs built after upgrade; dumps load both ways, 18 of 18 tool outputs identical (82d9f837).
+- **Test timing (G4):** a fresh binary's 1.1-1.8 s first exec is paid untimed; 56/56 over 10 relinks (eaa9518e).
+- **Bounded children and restartable batches.** One helper kills and reaps a child past its deadline: `claude
+  --help` 3 s (timeout means the option is unsupported), git calls inside guarded callbacks 10 s. The daemon resumes
+  narrative batches left `processing` with a batch id and requeues the rest, without duplicate reflections; a
+  completed batch whose storage maintenance refused stays pending (481df725, a793857e). Provider errors are
+  classified: transient ones retry in the running daemon (backoff capped at 300 s); a batch the provider no longer
+  knows, or an ended batch that omits a result, requeues its rows; three failed batches leave them `failed`
+  (new `enrichment_state.batch_failures` column) (43a446ad). Transient errors have their own durable budget
+  (`batch_transient_failures`): 296 polls of 503s had left a row `processing` forever. A returned batch id is never
+  dropped, and two import paths for one conversation submit one request (fffa3a8e).
+- **`status` never scans by default.** Without a cached integrity verdict it reports `healthy: null` (unknown); only
+  `status --deep` runs the scan, storing the verdict when maintenance allows (481df725). SwiftBar shows null as
+  "Integrity unknown", not red (43a446ad).
+<!-- amend: add later resource-round commits above this line -->
+
+### Corpus sources
+
+- **Sidechains:** project from the transcript path (985 files had landed under `subagents`); the parent wins
+  dedupe (b721a745). Mis-tagged rows repaired at daemon start (9d5ad90a). Busy imports retry at 5/15/45/120/300 s;
+  a 30-min sweep re-imports stale files from the last 14 days (940592d6, 85388bc1).
+- **Codex rollouts** (optional, auto-detected, `source='codex_rollout'`) (b721a745). `CSR_NO_CODEX_IMPORT=1`
+  skips them (e34ac07a); a busy file no longer ends a pass (f5bf6eec). Per-message timestamps: 1,399 of 1,399
+  conversations shared one timestamp, now 56 (a5b3283e, 2deb8e77, 7eefc5e4, 77426b14). Harness boilerplate is
+  stripped; 1,327 polluted conversations re-import in idle batches, ~81 chunks/s (96ea2d93, 7eefc5e4).
+  `thread_spawn` children count as sidechains (bf7ca8d9).
+- **Memory registry (new):** `~/.claude/projects/*/memory/*.md` metadata, never embedded or injected; 30-min scan
+  (`CSR_NO_MEMORY_REGISTRY=1`) (f2c728a5, 1b0440fe, 54fa5c99, 9671c15b, 1fca7c0a, fd924ec4).
+- **History registry, plans, tasks** (shipped 9.4.0): import records each conversation's entrypoint, so recent work
+  hides only `sdk-*` runs (4dbae46c); plans are TrustedTool, and plans and task files bind to episodes as
+  observations, never confirmations (8d7d2c7d, e8547791).
+- Assistant chunks holding only tool markers are dropped; a typed `[TODO]` stays (e69e424c, f18f4dae).
+
+### MCP protocol
+
+- rmcp 1.6 -> 3.1; tools, schemas and annotation hints unchanged (b721a745).
+- Negotiation capped at 2025-11-25: Claude Code >= 2.1.234 had shown "Connected - tools fetch failed" (fd9e5879,
+  bc52c9dd). The `server/discover` probe is answered before the handshake so `tools/list` works on Claude Code
+  >= 2.1.286 (79fafe41).
+- **New tool `csr_transcript`** and `csr-engine transcript`: stats, prompts, tools, files, errors, slice, grep. A
+  65 MB transcript's stats take 0.067 s; the prompts view hides harness rows unless `include_system` (02196644,
+  cf6903e7, 4bc27558, 3987f9d3, d7ddd7b4).
+- A server whose binary was replaced appends `<notice>` to tool results and stops writing the index; `status`
+  reports `stale_processes`, `status --stale` reads no database (8f0ec174, 32730957). The statusline "reconnect
+  mcp" marker is gone (b4a1708c).
+
+### Companion plugin
+
+- **The companion runs inside the engine, and the TypeScript plugin is gone.** The pane, the band above the
+  prompt, the dreamer, the compaction coach, the git guard, the agents and Codex runs, the Shift Map refresh and the
+  first-run walkthrough are Rust in `csr-engine` (`csr-engine companion serve`). What Claude Code loads is one generated relay,
+  `hooks/register.js`, with its `plugin.json` and `hooks.json`, written by the binary at the engine's own version
+  (`csr-engine companion plugin emit`); the relay holds no logic and starts only `csr-engine companion serve`. No
+  Node, TypeScript or Python runs at run time. `plugins/csr-companion/`, the repo's `.claude-plugin/` marketplace
+  and the pre-commit pytest branch are removed; the CI plugin job now runs `claude plugin test` on the relay
+  fixture and `claude plugin validate` on what the binary installs. The status line wrapper (`/csr statusline on`)
+  is retired: `csr-engine hook install --apply` puts the original `statusLine.command` back and deletes the
+  wrapper files. At this change (private HOME): lib 4420, `companion` 96, `companion_plugin` 5,
+  `hooks_integration` 75, `integration` 75, and the relay's 22 `claude plugin test` cases, all passing.
+- **`csr-engine setup` installs the generated relay.** It writes a local marketplace under
+  `~/.claude-self-reflect/csr-companion/marketplace` and installs the plugin from it through `claude plugin` (the same
+  steps as `csr-engine companion plugin install`: register the marketplace, install, or update when the engine's
+  version or relay text changed; a plugin the user switched off stays off and its options are kept: they are read
+  before any step that deletes the plugin, an option read that fails stops that step with nothing removed, and a
+  migration that fails half-way saves the options and the enabled state in
+  `~/.claude-self-reflect/csr-companion/plugin-migration.json` for the rerun; the rerun switches the plugin off again
+  when only the disable had failed, keeps the file when that fails too, and stops before installing when the file
+  cannot be read). `--no-companion`
+  skips it, and a missing `claude`, a failed step or a 120 s timeout prints the reason plus
+  `csr-engine companion plugin install` and still exits 0. The GitHub marketplace source,
+  `CSR_COMPANION_MARKETPLACE`, the `/plugin marketplace add` lines and the `setup --relay` flag are gone; a machine
+  that registered the GitHub marketplace is moved to the local one.
+- **Pane** beside the session: what the memory handed Claude, code that changed since your past sessions,
+  "Lost and found" (threads a compaction summary carried once and then dropped), and the session story as csr-engine
+  last told it. It reads the csr-engine database read-only
+  and makes no model call. When the main page has room left, it closes with what CSR can do there, leaving out what the page
+  already shows (acba87b9).
+- **Cards in pixel terminals** (herdr, kitty, Ghostty, WezTerm). The info view (`i`, or a click on the masthead) is a
+  stack of cards in the pane's own colours, each with its section's icon: context as a moon with 5H and 7D bars and
+  the `»` pace mark, tokens per request (cached, fresh, growth per turn), agents, cache time left, the Story with its
+  commit receipt, the open "what if" and recall in / notes out. The masthead becomes a two-row pill that keeps every
+  fact the text masthead shows. A card with no data is not drawn; nothing is sampled or made up. Fonts are read from
+  the system at run time (macOS system font, then Inter, Noto Sans, DejaVu Sans or Liberation Sans), none are
+  bundled, and without one the pane stays in text. Text mode is unchanged. Each card draws in 1.0-1.6 ms (fff25dfd).
+- **Dreamer** (on by default; turn it off in `/config`): asks one "what if...?" when your past sessions give it a
+  reason and slows down when it finds nothing. Before each look it checks that its spend, plus the last look's cost,
+  stays within 1 token for every 10 Claude spends. That is a check, not a cap: a fork takes no token ceiling, so one
+  look can cost more than guessed. The real cost is recorded the moment the fork returns, whatever becomes of the
+  look, and anything over the share is owed: no look runs until Claude's own spending covers it. What you forward
+  from it is matched by the engine's provenance guard, so it is not read back as your words.
+- **Compaction coach:** `suggest` (default) offers to compact at a quiet turn end between 181k and 269k tokens,
+  `auto` compacts on its own, `off` never does.
+- **Git guard** is off unless a `csr-guard.json` exists.
+- **Private by default:** the plugin's folder `~/.claude-self-reflect/csr-companion/` is `0700` and its files `0600`
+  under any umask (looser ones are tightened on first write), and API keys, bearer tokens, `password=`/`token=`
+  values and PEM blocks are redacted from the transcript text it keeps.
+- **Agents, Codex and handoffs** (merge 65d4f56d). The pane tracks a session's agents from typed events and shows
+  them In flight (a1f386fb, 01c1c611). A finished agent with a report gets one look (a644eb87). Subagent tokens are
+  not added to the Claude spend that the dreamer's share is measured against (f53ea3cc). Codex runs and the Codex
+  week show in the pane, read from `~/.codex/sessions` rollout metadata with no model call, and the part is hidden
+  without a `~/.codex` (d4a48448). A Lost-and-found thread handed to a subagent carries a machine envelope
+  (`[[CSR:AGENTS:v1]]`) and returns to the list when that agent fails (5857f922, 3d85b0bd). A multi-line draft is
+  typed only where herdr says Claude is in the foreground (1e9bbfba).
+
+### Installer
+
+- Installers report stale csr-engine processes and `launchctl kickstart -k` the daemon (8f0ec174, 32730957).
+- launchd agent `com.ramakay.csr-engine.daemon`: `claude` on PATH, working directory off `/`; TCC prompts 49 in 7
+  min -> 0 in 8 min (e34ac07a, 2c32256f, 8f8278ff). On binary replacement the daemon exits 75 within 43-46 s for
+  launchd to restart (8f0ec174, 32730957); SIGTERM now stops it (e793cd6c).
+- `setup` scans the memory registry, restamps Codex timestamps, strips harness text (fd924ec4, 23dd336d,
+  bf7ca8d9). `hook install` no longer registers SubagentStop and removes CSR's entry from an older
+  `settings.json`; `csr-engine setup` runs that same install step, so re-running `csr-engine setup` or
+  `csr-engine hook install --apply` after upgrading clears it (4adf32ee, 06af27e2, 34f5648c). Setup ends by
+  installing the companion plugin through `claude plugin`, or with the command that retries it when it cannot (7e697466,
+  4ecae9c5).
+- Windows (unpublished until now): hook commands use forward slashes (86afb4a3, #273); three Windows-only
+  prompt-submit failures fixed, stdin reads bounded to 2 s (2c9bdb3b, #285).
+- Releases trigger on tags only, and publishing waits for a required reviewer (53afe9b2, 774d1b75).
+- Experimental, not installed by setup: `mods/csr-recall` (4fec9f18), `mods/csr-decide` (9bf7757e, f7cb1b48).
+
+### Fixed
+
+- **Daemon dreams stalled for two days on a busy machine.** The nightly floor pass waited for 30 quiet minutes, and
+  parallel agents kept the machine busy, so the pass owed since 2026-10-19 03:00 never ran (last run 2026-10-18
+  13:05Z). An owed floor pass now runs after a grace (default 6 h past the 03:00 boundary,
+  `CSR_DREAM_FLOOR_GRACE_HOURS`, 1-23) even without a quiet window, and status no longer reports a deferral that will
+  not happen (80b661fd).
+- `history.jsonl` rows from the old Claude Code format (no `sessionId`, 575 rows from 2025-09/10) are skipped, not
+  counted as schema misses (763374fe). A counter an older build raised stays as it was.
+- The detached SessionEnd child wrote its errors to `/dev/null`. It now appends them to
+  `~/.claude-self-reflect/logs/session-end-detached.log` (`0600`, rotated at open once it reaches 1 MiB) and stays non-blocking
+  (093d1417). In-process hook tests no longer spawn the test binary as a detached engine child (a85afa8b).
+- `companion pane --json` printed `"dream_tokens_7d": -0.0` on an empty week; whole values print as integers (0a815888).
+- Code-graph worktree paths are canonical; 132 code_evolution and 384 code_nodes rows had throwaway keys
+  (e0fe86f5). Re-extraction retires dropped symbols, never on an empty or partial parse (b939bac0, e64775ee,
+  51ed42cb). csr_why's episode hop had resolved 0 of 665 links (43a635ab). `reflect_on_past` sinks resolved
+  chunks before the limit cut (b721a745).
+- The herdr pane beside `claude attach <id>` took the attach client's own session id, which has no transcript and no
+  status line, so every gauge was blank. It now asks herdr what runs beside it and follows the attached job's session.
+  A failed narrative call stored with model `unknown` and no tokens hid the week's cost figure; a call with no tokens
+  now costs $0 whatever model it names.
+- **The Rust pane had lost pages and keys the Python pane had.** A click on the masthead did nothing, and `i`, `s`,
+  `f`, `m` and `z` were missing. A click on the masthead's first two rows opens the info page again, and a click on
+  its title goes back. `i` shows the info page (the session, CSR's week and how it is wired, with the infinite-session
+  plan and CSR's own compactions), `s` the summary and `f` the threads; each key toggles, and Escape returns to
+  the main page. `m` opens the Shift Map at full size or folds it, with its refresh and cost. `z`, or a tap on a phone's
+  narrow split, fills the screen. `csr-engine companion pane --page info|summary|threads` draws one page. Frames
+  are byte-equal to pane.py at a93a568d^ at 46x30 and 100x40, text and pixels. Five main-page goldens gained the
+  Shift Map block the fixture database already carried, which the earlier oracle never drew. In flight (the
+  session's agents, the Codex week and live Codex runs, read by a Rust port of `codex_runs.py`: incremental, at most
+  every 2 s, 8 days back), "How Claude read you", the six-second "kept: <answer>" echo on an answered dream, and an
+  opened earlier dream's first two reasons are back too, as are the value row above the legend (a click opens the info
+  page), the window a page taller than the pane scrolls in, the legend's read countdown, and column mode below 24
+  columns with the CTX, 7D, 5H and cache tapes down its edge. After CSR compacts, the main page shows the compaction
+  card again (sizes before and after, its payback picture, what it kept and learnt), and the masthead says "this
+  session: N compactions by CSR". Lost and found is back on the main page ("Left over" on a fresh session), with its
+  side task, subagent, drop and later asks; the session before this one is read on a worker thread and kept under
+  `keep/carried/` and `keep/previous/`, so a frame never waits for it. On a phone, rules, Handed and Lost and found
+  show twice their items and the story twice its rows, as pane.py did. All 56 frame and section goldens drawn by
+  pane.py's whole frame over the rich fixture now match, text, clicks and picture placements.
+- **A file written through Bash now reaches file history** (`csr_search_by_file`, `csr_code_graph`, the `csr_why`
+  file hop), as an Edit or Write does. The PostToolUse matcher named only the edit tools: over 14 days of the owner's
+  corpus, `csr_search_by_file` found the editing session for 1 of 574 Bash-only (file, session) pairs, against 390 of
+  408 edit-tool pairs. One parser (`hooks/bash_writes.rs`) reads `sed -i`, `perl -pi`, redirects, `tee`, Python
+  `open`/`write_text` and the read-replace-write idiom; `$`, glob, `/dev/*`, directory and computed paths are skipped,
+  and a literal `W=/abs/path; cd $W && ...` resolves. The matcher gains `Bash` (`hook install --apply` upgrades the
+  entry in place); a Bash call that wrote nothing exits before the engine opens (p95 7.1 ms). Rows carry
+  `tool_name='Bash'` and empty symbol lists. A one-time replay (`coedit_bash_backfill_v2`, daemon and `setup`) covers
+  existing transcripts, subagent ones under their parent session, skips what the live hook already recorded and keeps
+  only what the hook would keep, and it is marked done only when every project folder was listed and every transcript
+  read. It waits until `~/.claude/settings.json` has the PostToolUse hook recording Bash (Claude Code's matcher
+  rules: `*`, empty or missing; an exact name in a `|` or `,` list; otherwise a regex tested unanchored; a pattern
+  that only JavaScript can read, such as lookaround, which Rust's `regex` cannot, counts as not recording Bash), so
+  a daemon restarted on the new binary before `hook install --apply` cannot mark the replay done while the live hook
+  still skips Bash (`csr-engine status` shows `aux.bash_file_history: waiting_on_hook` until then; the daemon looks
+  again every 10 minutes). Checked against git, not command text, on a copy of the owner's DB: of 189 (session,
+  file) pairs committed during a session and touched by no edit tool, CSR held 0 before and 131 after (83 at the
+  worktree path, 48 under the main checkout path every worktree edit is stored at). The full-text fallback of
+  `csr_search_by_file` matches a path as a phrase of its tokens; it had recovered 0 of 441.
+- **The engine's own files follow its database.** The classifier probe caches, the session summary files,
+  `current-focus.txt` and the Shift Map likes log resolve beside the database, not under `~/.claude-self-reflect`
+  whatever `--db-path` says; for the default database they are the same files. A probe cache is replaced in one
+  rename, so a hook reading it while another process writes it never sees half a file. The test suites no longer read
+  or write the home folder they run under: lib, hooks_integration, integration and five more suites pass with a decoy
+  home whose files were neither read nor written.
+
+### Known limitations
+
+- **Stop hook memory on a catch-up import.** The Stop worker now streams the transcript and builds only the
+  provenance document it reads: 351 MB max RSS on a 244 MB transcript, was 1.28 GB, with byte-identical output
+  (2,599 of 2,599 derivations; release build, 2026-10-20, fe5e6928). A Stop that also has to import a long
+  unimported tail still peaks near 1.03 GB, because the import holds that tail's chunks. Stop runs detached, so the
+  session does not wait; a streaming import is planned.
+- **Headless settings.** `claude -p` children drop user settings unless those settings carry auth: `apiKeyHelper` or
+  an `env` key such as `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK` or `..._VERTEX` keeps
+  them. `CSR_HEADLESS_USER_SETTINGS=1` always keeps, `=0` always drops (bcea4a8a, 64e24d1e). Only key names are
+  logged, never values.
+- **Upgrade rebuilds the index once.** Dumps move to `index-v3/`, so the first daemon start builds from SQLite;
+  until it publishes, MCP tools answer keyword-only. On the maintainer's 9.26 GB database (732,917 chunks, 12,052
+  reflections) `rebuild-index` took 834 s with 3,965 MB max RSS and wrote 1.5 GB; the daemon then loaded the
+  verified cache in 9.6 s. The legacy `index/` (2.2 GB here) can be deleted once no older binary runs.
+- **Concurrent first opens.** ADD COLUMN migrations accept a column another opener just added, and the busy wait is set
+  before the WAL switch: 8 concurrent openers of an old-schema copy, 0 failures in 2,400 opens (12 of 80 failed
+  before) (fffa3a8e). Several processes creating a brand-new database at the same instant can still see one
+  "database is locked"; hooks fail open.
+- **`status --compact` is slow on large databases:** 2.9-12.7 s on an 8.70 GB copy (711,622 chunks; 12.9-26.7 s
+  before this release), nearly all in the provenance failure-count join and coverage scan (43a446ad timings). On a
+  cold clone of the maintainer database on 2026-10-13 it took 45-67 s wall for the installed binary and 45-64 s for
+  the release binary (2.3-3.8 s user). Not a regression, and not fixed in this release.
+- **Fleet memory gate missed.** Target was <= 3 GB for the daemon plus all MCP servers; the median measured
+  4,058 MB before an outage and 3,575 MB at the end, the daemon alone 3,210 MB (4ad029d3 build, 9 servers, 30 min,
+  daemon stopped 78 s; 2,272 calls, 0 failed). Outage p95 was 20,136 ms: the first call waits out the re-ping
+  backoff before keyword results; the backoff is a post-10.1 item.
+- **Batch submit is at-least-once across a crash.** If the daemon dies after the batch API accepts a submission
+  and before it stores the batch id, those conversations can be submitted again; each duplicate costs one more
+  narrative call. A failed id write without a crash is retried and never resubmits (fffa3a8e).
+- Verdict accuracy is unproven: "482 anchors at 2 HEAD commits" is existence evidence; the T4 corpus
+  has zero reverts; the demote channel (`full`) is unmeasured; CRLF/Windows stamping is untested; the ledger does
+  not record a witness's repo (447994c4). Strategy dreams are below their kill bar.
+- Contamination figures depend on corpus, date and detector: 58 of 1,330 embedded conversations (4.4%) on
+  2026-08-08 (1f9e4c74) and 674 of 2,077 (32.5%) on a 2026-09-01 copy (d90c2ebc) were counted by earlier detectors
+  that fed a scrub which no longer runs. The label-only count is under Provenance and self-contamination guard.
+- **CSR text is labeled, never removed, and the label is a pattern match.** A person's text that matches a CSR
+  format's grammar is labeled `[CSR text]` and sinks below clean results; it stays stored and searchable. The earlier `backfill scrub`
+  that cut such text (552 chunks dropped and 233,686 characters cut on a clone of the maintainer database, 4753d717)
+  no longer runs: it refuses (12bf1582). Limits of the labeling:
+  Codex rollout, plan and tool-result chunks are not labeled or counted, since they quote CSR formats as code; the
+  middle chunk of an agents-envelope JSON line longer than one chunk is unlabeled; a dream card pasted without its
+  `PROJECT` line is not labeled; `get_recent_work` hides a conversation with no recorded entrypoint whose chunk is
+  an engine emission, until an entrypoint is recorded; a demoted result can fall off a short page; narrator
+  transcripts are identified by a first-prompt signature; a pasted complete hook-labelled system-reminder wrapper is
+  still removed on import; the plain-line recap fallback and a standing rule with a free-text date are not labeled
+  (12bf1582).
+- **Not in this release:** removing CSR text from stored chunks (the "phase B" scrub), and the plugin's send ledger
+  that would prove a pasted text was CSR's. This release labels and never deletes, so neither is needed.
+- `CSR_DREAM_CONSUMPTION=off` does not gate the static report, live journal feeds or badge; `status` has no field
+  for `CSR_NO_CODEX_IMPORT` (2c32256f; both still true at rc2 HEAD by code check).
+- hnsw_rs 0.3.5 still calls `process::exit(1)` on load errors (2c32256f; checked in the crate source).
+  Since 9ff730e4, `eval --full` prints `ABSTAIN` and passes when the re-ranker gate is `never_run` or
+  `insufficient_data`; a real gate failure still fails it. Search p95 against its 1 ms target depends on load:
+  0.82 ms idle, 1.35 ms and 2.27 ms under load, measured around the hnsw_rs 0.3.5 bump of 2026-10-12 (82d9f837). On 2026-11-18 the installed 10.1.0 binary read 18.47 ms p95 on the live 1,083,965-chunk index (`eval --full`, 50 timed lookups); see "What we're working on" in the README. The cache check read `index_manifest.json` and always
+  reported cold; it reads `manifest.json` now (fffa3a8e).
+- Codex recall trails Claude, hit@6 12/40 vs 22/40, mostly at the HNSW fetch (9d5ad90a). 1 of 8 fabricated probes
+  scores "partial" (0.629) with no caveat (49781817). `csr_get_more` does not re-run decay or provenance rerank
+  (17be7ca0). Ablation examples pass `TrustTier::Unknown` (2c32256f).
+- `intent_events` is append-only: corrections recorded before 40095521 stay. The installers' stale-process report
+  has no installer test and is not in `installer/lib.js` (note at `installer/postinstall.js:254`, 32730957).
+
+## [9.5.8] - 2026-09-21
 
 ### Fixed: setup repoints the MCP registration, and the installers say when a different csr-engine is still in use
 
@@ -90,101 +748,265 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of `status`, which opened the user's live database. It also refuses
   to guess an install directory when `HOME` is unset.
 
-## [10.1.0] - 2026-08-08
+## [9.5.7] - 2026-09-20
 
-### Dreaming and recap: memory that forgets on evidence and hands back one paragraph
+### Fixed
 
-v10 folds into a single release. Two halves: the engine now retires its own
-claims when the code they described moves, and the session opens with one
-causal paragraph instead of a pile of fragments. 10.0.0 was never published —
-everything below ships together as 10.1.0.
+- **Hooks that only read no longer rewrite the whole HNSW index.** Every hook
+  ended with `flush_index()`, and one dirty flag covered both the chunk and the
+  reflection index, so a read-only hook could rewrite about a gigabyte of index
+  files. In `hook-timing.log` that showed as prompt-submit `flush=868ms` through
+  `19601ms`, worst case 25,557 ms against Claude Code's 30 s hook budget; a hook
+  killed at the budget loses its injection silently. The dirty flag is now split
+  per index, and persisting the index is a hook role: only `stop` does it;
+  prompt-submit, post-tool-use and the session hooks never do. Measured for
+  the same change on `main` (#309), on a 445,748-chunk index with 400
+  reflections missing from the cache: prompt-submit
+  `flush=1203ms total=1996ms` before, `flush=0ms total=729ms` after, with all
+  four index files and the manifest untouched by mtime.
+  On this line, with a 2,577-chunk corpus whose on-disk cache trailed SQLite by
+  297 chunks, the published 9.5.6 rewrote all nine index files on the first
+  prompt-submit and this build rewrote none across eight, with byte-identical
+  injections. The trade: until the next `stop` persists, each prompt-submit
+  re-inserts the missing vectors in memory (211 ms against 84 ms p50 on that
+  corpus, 60 ms after `stop`).
+- **One large embed call no longer parks gigabytes in the ONNX arena.**
+  `embed()` let fastembed batch 256 documents at a time, each batch padded to
+  its longest sequence, and the ONNX CPU arena never returns that allocation.
+  Batches are capped at 16 for every call site. Measured with
+  `examples/embed_batch_rss.rs` at 256 documents: 12.45 GB max RSS before,
+  1.44 GB after, and no slower (4.9 to 5.3 s before, 4.7 to 4.8 s after).
+  Output order is preserved; values match single-document embeddings within
+  1e-5 in the regression test, so a near-tied pair of results can swap.
+  Ordinary imports already embedded 10 documents at a time and are unaffected:
+  importing 160 transcripts (2,280 chunks) peaked at 1.05 GB on both versions.
+- **Library prints stay off the channels Claude Code reads.** `hnsw_rs` prints
+  to stdout from library code (a point counter every 50,000 inserts, and a
+  "could not open file" line when a cache file is missing). On the MCP server
+  that corrupted the JSON-RPC stream; in hooks it reached the model as if it
+  were retrieved memory. The MCP server now claims fd 1 for JSON-RPC before the
+  engine is built, and hooks quarantine stdout across engine construction and
+  after their injection is written. Unix only; other platforms are unchanged.
+- **Headless `claude -p` children get no built-in tools, stop firing the
+  user's hooks and leave no transcript.** Narration, ratification and briefing
+  children now run with `--tools ""`, `--settings '{"disableAllHooks":true}'`
+  and `--no-session-persistence`. Before, a print-mode child inherited every
+  built-in tool (Bash, Edit, Write, Agent) under the user's permission mode;
+  the empty MCP config only removed MCP tools. On Claude Code 2.1.278 the
+  child's init lists 27 tools without the option and none with it. MCP tools
+  are still removed by the empty `--strict-mcp-config` from earlier releases;
+  if that config file cannot be written, narration and ratification run
+  without it, as before. All three call sites now build their argv in one
+  place, prompt first, so neither variadic option can swallow it. A
+  narrative call also no longer runs every plugin's SessionStart hook and no
+  longer adds its own session to the corpus. User, project and local settings stay
+  loaded, so credentials, provider switches, proxies, client certificates and
+  telemetry opt-outs configured there keep working. Each option is passed only
+  when `claude --help` lists it, checked once per narrative call, so an older
+  CLI behaves as before and a CLI upgrade is picked up without a daemon
+  restart. Hooks and plugins set by managed policy are outside the reach of
+  these options. `CSR_HEADLESS_USER_SETTINGS=0` goes further and drops user,
+  project and local settings with `--setting-sources ""`, for installs whose
+  children need nothing from them.
+- **A session started in a subdirectory recalls its own history.** The prompt
+  hook kept a recalled chunk only when its stored project label equalled the
+  project resolved from the asking cwd. The label comes from the folder Claude
+  Code files a transcript under, so a session started in `repo/sub` is stored
+  as `repo-sub` while the hook asks for `repo`, and none of it ever came back.
+  A chunk under another label now also passes when every transcript file
+  recorded for its conversation sits in a folder of the projects directory
+  that decodes, on the filesystem as it is now, to exactly one existing
+  directory inside the asker's working tree, git reports the same repository
+  for that directory, and the chunk carries that folder's label. Nothing is
+  stored: no migration, no re-import, history is visible on the first prompt
+  after upgrading. A directory that is gone, a name that decodes two ways
+  (`repo/sub` next to a sibling `repo-sub`), a directory that cannot be read,
+  a nested repository, a missing or pre-2.31 git: all keep the exact match.
+  The check runs only when a candidate's label differs, under one budget of
+  64 directory listings, 4 `git` calls and 250 ms. Known limit: the filesystem
+  is read as it is now, so a deleted sibling `repo-sub` whose name now decodes
+  to an existing `repo/sub` is taken for the subdirectory. Measured against
+  the published 9.5.6 on real transcripts, 30 prompts per frame, five runs:
+  subdirectory sessions 0 -> 23 to 27 source chunks injected; a sibling
+  repository 0 and 0; 0 again once a sibling directory with the same encoded
+  name exists. Root sessions asked from the subdirectory went 24 to 27 ->
+  21 to 26: the subdirectory's history now competes for the same five slots.
+- **An unscoped MCP search covers the current project again.** The search
+  tools document "current project" as the default scope, resolved from
+  `MCP_CLIENT_CWD`. Claude Code has never set that variable, so from Claude
+  Code every search without a `project` argument ran across all projects.
+  `csr_reflect_on_past`, `csr_search_insights`, `csr_search_by_concept` and
+  `csr_get_more` now fall back to `CLAUDE_PROJECT_DIR`, which Claude Code
+  exports to the stdio servers it starts. The scope is the project label plus
+  the subdirectory sessions the rule above places in the same repository, so
+  turning the scope on does not hide them. The keyword fallback asks the index
+  for the project's own label, then for up to eight further labels in the
+  scope, alphabetically, adding at most `limit` results from them; each query
+  is filtered by label before its limit, so matches under other labels cannot
+  crowd these out. `project: "all"` still searches everything, a client that sets
+  neither variable is unchanged, and the code-graph, file and provenance tools
+  resolve their project as before. A session stored under another label whose
+  starting directory no longer exists (a removed worktree, a deleted scratch
+  directory) cannot be placed by the rule above, so it is outside the default
+  scope and reachable with `project: "all"`.
+- **Search overfetches past deleted index points.** `hnsw_rs` cannot delete,
+  so a removed chunk or reflection only loses its id and the dead point still
+  wins neighbour slots. Search asked for exactly `limit` neighbours and
+  filtered afterwards: on the parent commit the regression test, a chunk
+  rewritten ten times, came back with 1 live result for a limit of 5. Search
+  now fetches `limit` plus the number of dead points, capped at 256, and
+  truncates. The cap bounds the cost and the promise alike: a query with more
+  than 256 dead points nearer than its live results can still come back short.
+  With no dead points the index call is unchanged. Indexes of 256 points or
+  fewer use the exact scan and were never affected.
+- **The crate builds on Windows.** `file_identity()` called the Unix-only
+  `MetadataExt::ino()` unconditionally. Unix keeps the inode; Windows uses the
+  file's creation time (#271).
 
-#### Recap at SessionStart (headline)
+### Changed
 
-Session start used to inject CONTINUUM, LAST, NEXT and ANCHORS as separate
-fragments and leave the model to guess how they related. It now composes one
-paragraph from evidence already in the database:
+- The prompt-submit hook caps its code-graph symbol probes at 12 per prompt and
+  fetches chunk rows in one batch instead of one query per hit. New opt-outs
+  `CSR_NO_GRAPH_SLICES=1` and `CSR_NO_ANTI_PATTERNS=1` trade that recall for
+  latency (#299).
 
-```
-recap [<age>]: <intent>: <completed>. Settled: <claim> (<receipt>).
-Now: <blockers | still-open | proposals | todos>.
-Learnt-then-retired while away: <label> (superseded <date>, <oid>).
-Next: <evidenced next step>.
-```
+### Security
 
-- No LLM on this path — pure composition over SQL feeds.
-- Abstention-first: every clause drops independently when its evidence is
-  missing. `Next:` is never invented. Punctuation-only sentinels never become
-  claims.
-- Receipts mandatory: a settled claim without a commit receipt is not emitted.
-- No self-contamination: emitted recaps re-enter the corpus through the
-  transcript, so the extraction sanitizer recognises the exact emitted grammar.
-- Feed errors fail open to the previous fragment output, byte for byte.
-- Kill switch: `CSR_NO_RECAP=1`.
+- Lockfile-only dependency bumps that clear `cargo audit` on the 9.5 line:
+  rustls 0.23.45 and rustls-webpki 0.103.15 (RUSTSEC-2026-0285), h2 0.4.19
+  (RUSTSEC-2026-0258), rkyv 0.8.18 (RUSTSEC-2026-0233, -0234, -0235).
 
-Claude Code's own `recap:` is human-facing and is not injected into model
-context on resume; this fills the model-facing half.
+## [9.5.6] - 2026-09-09
 
-#### Dreaming: evidence-grounded forgetting
+### Changed
 
-- **`codewitness` crate.** A deterministic evidence kernel: span-level BLAKE3
-  stamps pinned to commit OIDs, audited as intact, drifted, vanished, or
-  explicitly superseded. Causal ordering via git ancestry, no LLM and no
-  timestamps on the verdict path. Operational failures stay errors and never
-  collapse into verdicts. Every supersession receipt now records whether its
-  basis was graph ordering (`GraphOrdered`) or content re-derivation alone
-  (`ContentOnly`), so a squash/rebase successor is never mistaken for a
-  graph-proven one.
-- **Witness ledger.** Append-only `witness_ledger` plus `witness_generations`
-  publication manifests; `codegraph stamp-spans --at <rev>` mints witnesses at
-  historical revisions.
-- **Deterministic supersession verdicts.** Successor join, event ledger, and
-  two-channel consumption — demote and annotate rather than delete, with
-  `[stale anchor]` / `[evolved]` markers carrying commit receipts into search
-  results.
-- **Validity partition in rerank**, consuming dream verdicts; active forgetting
-  applies accelerated decay to demoted symbols.
-- **Daemon dream cadence** (6h, `CSR_DREAM_INTERVAL_SECS`, kill switch
-  `CSR_NO_DREAMING=1`), dream summary in the telemetry dashboard, and
-  `--report` HTML journal.
-- **T4 benchmark**, ported into `codewitness labels` / `codewitness bench` —
-  deterministic and provenance-stamped. H1 rematch on the corrected extractor:
-  1.000 / 1.000 over 13,626 beliefs.
+- **HNSW vectors are memory-mapped from the on-disk index instead of read into
+  every process's heap.** Previously each `csr-engine` process — one per MCP
+  client, plus every hook fire — held its own ~370 MB private, dirty copy of the
+  vector table. They are now clean, reclaimable file-backed pages, and processes
+  that map the same on-disk generation share one physical copy. Live-measured on
+  the maintainer's machine, per-process physical footprint drops from ~982 MB to
+  ~557 MB (about 425 MB/process), and the mapped pages are evictable under memory
+  pressure instead of pinned as dirty heap.
 
-#### Search and corpus
+  mmap turns on only when provably safe (`should_mmap_generation`): a numbered
+  generation (never the legacy canonical file a pre-9.5.4 process could truncate
+  in place and `SIGBUS` a mapper), the shared load lock held, and a pre-flight
+  probe passing. `RLIMIT_NOFILE` is raised at startup to remove the one
+  reproducible `EMFILE` crash trigger, and macOS `malloc_zone_pressure_relief`
+  after load tightens allocator slack. A canonical index still loads heap-backed
+  exactly as before; the win arrives once any dump migrates it to a numbered
+  generation.
 
-- **TAD v2**: temporal decay driven by release ancestry rather than wall-clock
-  age, with an hourly ancestry cache that fails open to neutral.
-- **Self-contamination closed**: the importer no longer indexes CSR's own tool
-  output. Counters for suppressed blocks and scrubbed hook wrappers appear in
-  `status`.
-- **Corpus expansion**: sidechain attribution (real project and parent session
-  recovered from provenance) and an optional Codex rollout adapter.
-- `reflect_on_past` sinks resolved chunks before the limit cut, so stale chunks
-  no longer occupy top-k slots ahead of live ones.
+  Cross-process sharing is generation-scoped: long-lived processes that dump
+  their own generation on import fragment across generations, so full single-copy
+  sharing holds right after a simultaneous restart and degrades with uptime. The
+  durable win is the per-process footprint drop and reclaimability; cross-process
+  dedup is an additional, uptime-dependent bonus.
 
-#### Codegraph correctness
+## [9.5.5] - 2026-09-09
 
-- Type-qualified symbol identity for witness joins.
-- `#N`-collision abstention: occurrence keys, a complete-generation protocol,
-  and fail-closed lineage selection.
+### Fixed
 
-#### Protocol
+- **Every engine process no longer pays for the embedding model and the
+  whole vector table at startup.** The MCP server and every hook fire
+  (prompt-submit, stop, post-tool-use for edits, session hooks) build the same
+  `Engine`; three of its startup costs were unconditional and are now not:
+  - The ONNX model (fp32 all-MiniLM-L6-v2) loaded eagerly whether or not the
+    process ever embedded. It now loads on the first `embed` behind a fallible
+    once-cell, with the existing retry loop. Paths that embed immediately
+    (`daemon`, `--import`/`--enrich`, `setup`, `eval`) still warm it up front;
+    `setup` does so before writing any MCP or hook config, so a failed
+    first-run download never leaves setup half-applied.
+  - Reconciling the HNSW cache against SQLite fetched the entire
+    `chunk_embeddings` table to backfill one missing vector (+380 MB
+    transient on a 237k-chunk corpus). It now fetches only the missing ids in
+    2,000-id batches (`get_chunk_vectors_by_ids` and the new
+    `get_reflection_vectors_by_ids`), and a cache-miss rebuild streams the
+    corpus in the same batches instead of materialising and cloning it.
+  - The MCP server started its extraction, narration and consolidation loops
+    at t=0. They now wait `CSR_ENRICH_INITIAL_DELAY_SECS` (default 120) so an
+    idle server does not start embedding before its first tool call. The
+    standalone `daemon` is unchanged.
+  - ORT intra-op threads and tokio workers are capped at `min(4, cores)`;
+    `CSR_EMBED_THREADS` / `CSR_TOKIO_WORKERS` override (1..=64). A server
+    now runs 6 threads instead of 37-55.
 
-- **rmcp 1.6 → 3.1** (MCP spec 2026-07-28): elicitation types renamed, tasks on
-  the SEP-2663 TaskManager with prior poll/TTL behaviour preserved, hand-written
-  `call_tool`/`list_tools`. All 15 tools, schemas and annotation hints unchanged.
+  Measured with the new `csr-engine/scripts/profile-memory.sh` (macOS,
+  isolated scratch HOME, fresh db+index snapshots, medians of 3) on a
+  237,412-chunk corpus, 9.5.4 vs 9.5.5: bare MCP initialize 1253 → 1104 MB
+  peak RSS (1209 → 1039 MB private footprint, 0.86 → 0.74 s); a long-lived
+  server's live heap 898 → 798 MiB; one chunk of index drift on startup
+  +382 → +4 MB. prompt-submit's peak RSS rises 26 MB because the model now
+  loads after the index is resident, while its private footprint drops
+  170 MB. Every hook fire still costs the index load (~1.1 GB peak); that
+  needs a resident engine and is not in this release.
+  (9.5 port of #300; reviewed by Codex and CodeRabbit on the 10.x branch.)
+- Example `quick_check_floor` no longer trips clippy 1.98's
+  `chunks_exact_to_as_chunks`, which the release workflow runs with
+  `-D warnings`.
 
-#### CI and tests
+## [9.5.4] - 2026-08-20
 
-- `codewitness` has its own scoped workflow with a mutation gate and a
-  determinism harness; all 31 missed mutants killed. `cargo-semver-checks` now
-  probes the crates.io index for a baseline, so it turns enforcing by itself at
-  first publish instead of relying on a flag someone must remember to remove.
-- `chunk_binding` tests clear `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE` before
-  spawning git — git exports those to hook subprocesses, which hijacked the
-  tests' temp repositories and made seven of them fail only when run from inside
-  `git commit`.
+### Fixed
+
+- **HNSW cache no longer maps fresh ids onto stale vectors after a
+  no-generation dump.** Dump and load disagreed on the "is this index empty"
+  signal: `dump_to_disk` writes a generation pair (and records its basename)
+  only when the in-memory id map is non-empty, but `load_from_disk` decided
+  whether to load from `chunk_embeddings_expected` — a DB row count captured
+  independently. Under concurrent ingestion a dump can commit a positive count
+  while its id map is still empty, writing no generation; the loader then saw
+  the positive count, opened the manifest basename, and loaded whatever legacy
+  canonical `chunks.hnsw.*` files a prior generation left on disk — mapping
+  fresh ids onto stale vectors. The load now gates on the persisted id map (the
+  same signal dump keys the generation write on) for both the chunk and
+  reflection indexes, so a manifest with no generation loads empty and is
+  rebuilt from the DB. v1 manifests always carried a non-empty id map, so their
+  canonical-file loads are unaffected. Regression test: a manifest that claims a
+  positive count with an empty id map and only stale canonical files on disk
+  loads an empty index (`get_nb_point() == 0`), never the stale vectors.
+  (#296, 623f8de)
+
+## [9.5.3] - 2026-08-18
+
+### Fixed
+
+- **Background AI pipelines no longer fail on every call with `prompt_too_long`.**
+  Only `hooks::session_briefing` passed `--strict-mcp-config` to its headless
+  `claude -p` subprocess; `daemon::ratification` and `summarizer` inherited the
+  user's full MCP configuration and serialised every tool schema into the
+  request. On a machine with a normal plugin set that is ~180k tokens of tool
+  definitions before the prompt is considered, so the request overran the
+  context window and failed with HTTP 400 before any inference — identically on
+  every retry. Reported and fixed by @Devin345458, who measured a daemon frozen
+  at 68% ratification coverage for ~20 hours, retrying ~105 calls/hour at a 0%
+  success rate; with the fix, coverage reached 773/773 and the backlog drained.
+  The empty-config helper now lives in `narrative::minimal_mcp_config`, writes
+  atomically (all three call sites can run concurrently), and logs when it is
+  unavailable instead of degrading silently.
+
+## [9.5.2] - 2026-08-17
+
+### Fixed
+
+- **HNSW index load no longer aborts every hook on a torn cache.** `hnsw_rs`'s
+  `load_hnsw` panics (it does not return `Err`) when the `.hnsw.graph` /
+  `.hnsw.data` pair on disk comes from two different dump generations — a
+  window the old promote-to-canonical double rename could leave behind after a
+  crash. Two layers: both load sites are wrapped in `catch_unwind` and fall
+  back to the documented full-rebuild path, and promotion itself is now
+  crash-atomic — the index manifest records the dumped basenames and its
+  existing tmp-write + rename is the single commit point, so a mismatched
+  canonical pair can no longer be manufactured. Regression test loads a
+  deliberately mismatched pair and asserts `None` instead of a panic.
+
+## [9.5.1] - 2026-08-12
+
+### Fixed
+
+- **FTS index no longer grows without bound** (backport of the 65x
+  `chunks_fts` bloat fix to the 9.5 line).
 
 ## [9.5.0] - 2026-08-03
 
@@ -217,9 +1039,17 @@ has none. No scalar confidence scores anywhere — ordinal evidence labels only.
   0.45–0.62 carry an explicit may-be-spurious warning quoting the measured
   fabricated-probe range. Floor re-derivable via `examples/quick_check_floor.rs`.
 - **NEW: repo-identity labels.** `code_nodes.repo_root` records the git
-  toplevel at write time, stable across cwd/session boundaries; linked
-  worktree paths canonicalize onto the main checkout so one logical file has
-  one key.
+  toplevel at write time, stable across cwd/session boundaries. Linked worktree
+  paths canonicalize onto the main checkout *going forward*, so newly recorded
+  edits converge on one key per logical file. Two limits, both deliberate:
+  canonicalization needs the worktree's `.git` marker still on disk, so rows
+  whose worktree was already pruned keep their original path rather than being
+  guessed at; and the one-shot backfill rewrites `code_evolution` only. It does
+  **not** rewrite `code_nodes.file`, because a node's id is derived from its
+  path — rewriting the path alone would desynchronize a row from its own
+  identity and make it a deletion target for node retirement. Pre-existing
+  worktree-keyed nodes therefore remain, and one logical file can still have
+  more than one key in historical data.
 - **NEW: `csr-engine backfill-coedit`** — rebuilds the session↔file co-edit
   ledger from the historical JSONL corpus (idempotent).
 - **FIX (review round): witness tables survived only until the next process
@@ -592,7 +1422,7 @@ v7.0.0 introduces AI-powered conversation narratives that transform raw conversa
 ### Documentation
 - Added docs/SECURITY.md with standalone vs shared deployment security model
 - Updated .env.example with batch automation configuration
-- All documentation sanitized (replaced /Users/ramakrishnanannaswamy with /Users/username)
+- All documentation sanitized (replaced a maintainer home path with /Users/username)
 - UTF-8 encoding documented for all file operations
 
 ### Fixed
@@ -874,7 +1704,7 @@ python scripts/migrate-to-unified-state.py --rollback
 - **Container Compatibility**: Docker path normalization working correctly
 
 #### Quality Assurance
-- **Code Review**: 95/100 confidence rating from automated code analysis
+- **Code Review**: automated code analysis
 - **Security Review**: All security vulnerabilities addressed
 - **Performance Review**: Meets all sub-20ms response time requirements
 - **Documentation Review**: Migration guides and technical documentation complete

@@ -19,6 +19,187 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
+// ─── Trained re-ranker persistence ───
+
+#[test]
+fn trained_rerank_persistence_is_auditable_and_batched() {
+    use csr_engine::storage::trained_rerank::{
+        ExposureImpression, ExposureItem, GateClusterReceipt, ModelAttempt, ReactionLabel,
+    };
+
+    let storage = Storage::open_memory().unwrap();
+    storage
+        .record_rerank_exposure(&ExposureImpression {
+            impression_id: "imp-1".into(),
+            session_id: "session-1".into(),
+            project: "project-1".into(),
+            surface: "prompt_submit".into(),
+            query_hash: Some("query-hash".into()),
+            query_embedding: Some(vec![1.0, 0.0]),
+            intent: "explore".into(),
+            shown_at: "2026-08-01T10:00:00Z".into(),
+            feature_schema: csr_engine::search::trained_rerank::FEATURE_SCHEMA,
+            legacy: false,
+            items: vec![ExposureItem {
+                rank: 0,
+                memory_id: "memory-1".into(),
+                conversation_id: Some("source-1".into()),
+                source_type: "chunk".into(),
+                baseline_score: Some(0.8),
+                cosine: Some(0.7),
+                recency: Some(0.6),
+                graph_proximity: Some(0.0),
+                author: Some("user".into()),
+                is_scaffold: false,
+                is_mechanic: false,
+                supersedes: false,
+            }],
+        })
+        .unwrap();
+
+    storage
+        .upsert_rerank_reaction_label(&ReactionLabel {
+            session_id: "session-1".into(),
+            assistant_turn: 2,
+            next_user_turn: 3,
+            assistant_ts: Some("2026-08-01T10:00:01Z".into()),
+            next_user_ts: Some("2026-08-01T10:00:02Z".into()),
+            reaction: "acceptance".into(),
+            proposed_reaction: Some("acceptance".into()),
+            confidence: 0.91,
+            runner_up_score: 0.20,
+            margin: 0.71,
+            pickup_similarity: Some(0.30),
+            next_user_text: "Yes, that is exactly right.".into(),
+            near_miss: false,
+            classifier_hash: "classifier-1".into(),
+            transcript_mtime: 42,
+            harvested_at: "2026-08-01T11:00:00Z".into(),
+        })
+        .unwrap();
+    storage
+        .upsert_rerank_reaction_label(&ReactionLabel {
+            session_id: "session-2".into(),
+            assistant_turn: 4,
+            next_user_turn: 5,
+            assistant_ts: Some("2026-08-02T10:00:01Z".into()),
+            next_user_ts: Some("2026-08-02T10:00:02Z".into()),
+            reaction: "abstain".into(),
+            proposed_reaction: Some("correction".into()),
+            confidence: 0.69,
+            runner_up_score: 0.64,
+            margin: 0.05,
+            pickup_similarity: Some(0.40),
+            next_user_text: "Maybe, but let us inspect one more file.".into(),
+            near_miss: true,
+            classifier_hash: "classifier-1".into(),
+            transcript_mtime: 43,
+            harvested_at: "2026-08-02T11:00:00Z".into(),
+        })
+        .unwrap();
+
+    let counts = storage
+        .rerank_reaction_label_counts("classifier-1")
+        .unwrap();
+    assert_eq!(counts.acceptance, 1);
+    assert_eq!(counts.abstain, 1);
+    assert_eq!(counts.near_miss, 1);
+
+    let audit = storage
+        .audit_rerank_reaction_labels("classifier-1", 1, 1)
+        .unwrap();
+    assert_eq!(audit.len(), 2);
+    assert!(audit
+        .iter()
+        .any(|row| row.next_user_text == "Yes, that is exactly right."));
+    assert!(audit.iter().any(|row| row.near_miss));
+
+    let stats = storage
+        .get_rerank_reaction_stats_batch("classifier-1", &["memory-1", "missing"])
+        .unwrap();
+    assert_eq!(stats.get("memory-1").unwrap().acceptance, 1);
+    assert!(!stats.contains_key("missing"));
+    let labeled = storage
+        .load_labeled_rerank_exposures("classifier-1")
+        .unwrap();
+    assert_eq!(labeled.len(), 1);
+    assert_eq!(labeled[0].items.len(), 1);
+    assert_eq!(labeled[0].reaction, "acceptance");
+
+    let attempt = ModelAttempt {
+        model_id: "model-1".into(),
+        feature_schema: csr_engine::search::trained_rerank::FEATURE_SCHEMA,
+        classifier_hash: "classifier-1".into(),
+        seed: 7,
+        cutoff_ts: Some("2026-08-02T00:00:00Z".into()),
+        train_start_ts: Some("2026-08-01T00:00:00Z".into()),
+        train_end_ts: Some("2026-08-01T23:59:59Z".into()),
+        eval_start_ts: Some("2026-08-02T00:00:00Z".into()),
+        eval_end_ts: Some("2026-08-03T00:00:00Z".into()),
+        train_impressions: 200,
+        train_rows: 500,
+        eval_impressions: 50,
+        eval_rows: 120,
+        eval_clusters: 3,
+        cluster_wins: 2,
+        cluster_losses: 1,
+        cluster_ties: 0,
+        excluded_contaminated: 58,
+        abstained_reactions: 10,
+        acceptance_labels: 100,
+        correction_labels: 20,
+        reask_labels: 15,
+        redirect_labels: 5,
+        near_miss_labels: 4,
+        baseline_ndcg5: Some(0.40),
+        trained_ndcg5: Some(0.45),
+        baseline_mrr: Some(0.50),
+        trained_mrr: Some(0.55),
+        curated_baseline_score: Some(0.60),
+        curated_trained_score: Some(0.61),
+        curated_case_count: 5,
+        curated_veto_epsilon: 1e-9,
+        gate_status: "passed".into(),
+        gate_reason: "strict mean and cluster win".into(),
+        weights_json: Some("[0.1]".into()),
+        normalization_json: Some("{\"means\":[0.0],\"scales\":[1.0]}".into()),
+        trained_at: "2026-08-03T01:00:00Z".into(),
+    };
+    storage
+        .insert_rerank_model_attempt(
+            &attempt,
+            &[GateClusterReceipt {
+                model_id: "model-1".into(),
+                cluster_id: "cluster-1".into(),
+                impression_count: 4,
+                distinct_session_count: 3,
+                candidate_count: 7,
+                baseline_ndcg5: 0.40,
+                trained_ndcg5: 0.50,
+                outcome: "win".into(),
+            }],
+        )
+        .unwrap();
+
+    let latest = storage.latest_rerank_model_attempt().unwrap().unwrap();
+    assert_eq!(latest.model_id, "model-1");
+    assert_eq!(latest.cluster_wins, 2);
+    assert_eq!(latest.curated_baseline_score, Some(0.60));
+    assert_eq!(latest.curated_trained_score, Some(0.61));
+    assert_eq!(latest.curated_case_count, 5);
+    assert_eq!(latest.curated_veto_epsilon, 1e-9);
+    let receipts = storage.rerank_gate_clusters("model-1").unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].distinct_session_count, 3);
+    assert_eq!(receipts[0].trained_ndcg5, 0.50);
+    let eval = csr_engine::eval::trained_rerank::latest_gate_result(&storage);
+    assert!(!eval.passed);
+    assert!(eval.detail.contains("model load failed"));
+    assert!(eval.detail.contains("curated_baseline=0.6000"));
+    assert!(eval.detail.contains("curated_trained=0.6100"));
+    assert!(eval.detail.contains("curated_epsilon=0.000000001"));
+}
+
 // ─── Test 1: JSONL parsing ───
 
 #[test]
@@ -196,12 +377,12 @@ fn test_fts5_search() {
     // Search for docker-compose
     let results = storage.fts5_search("docker-compose", 10, None).unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].id, "fts-1");
+    assert_eq!(results[0].0.id, "fts-1");
 
     // Search for JWT
     let results = storage.fts5_search("JWT", 10, None).unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].id, "fts-2");
+    assert_eq!(results[0].0.id, "fts-2");
 }
 
 // ─── Test 6: Reflection store + retrieve ───
@@ -387,6 +568,7 @@ fn test_format_search_results_structure() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -421,6 +603,7 @@ fn test_format_recency_results_includes_age_stamp() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -430,6 +613,674 @@ fn test_format_recency_results_includes_age_stamp() {
         "should render age stamp in recency results"
     );
     assert!(xml.contains("Recency search hit content"));
+}
+
+// ─── WP-B: weak-band label contract (burst-study regression fixture) ───
+
+/// One row of `tests/fixtures/recall_bursts.json` — numeric/structural fields
+/// only, mechanically extracted from real burst-study captures on
+/// 2026-09-22 (`/tmp/csr_bursts.json`). No prompts, previews, session ids or
+/// project names: this is a public repo. `rank_used` is a best-effort
+/// substring-overlap heuristic against the session's own next turn (see the
+/// extraction note below), not a hand-labelled ground truth, so tests only
+/// lean on it where it says rank 1 was used — a false negative there just
+/// means the row is skipped, not misread.
+///
+/// `label` is the band of the PAGE's max raw score (what the original burst
+/// capture recorded as the search summary's `relevance` attribute), not
+/// necessarily rank 1's own band — rank 1 is chosen by rerank, which can
+/// promote a lower-raw-score result above a higher-raw-score one elsewhere
+/// on the page (row with `top=0.596, runner_up=0.722` labels `"partial"`
+/// because 0.722 is the page max, even though rank 1 itself is `"weak"`).
+/// `rank1_band` is `relevance_label(top)` computed at fixture-build time —
+/// use it, not `label`, whenever a test needs rank 1's actual band.
+///
+/// The 8 `fabricated: true` rows are real measurements (not the earlier
+/// lone-candidate synthesis): `examples/quick_check_floor_margin.rs` run
+/// read-only against the live DB (552,314 chunk vectors) on 2026-09-22,
+/// using the same 8 fabricated-probe texts as `examples/quick_check_floor.rs`
+/// (2026-08-03 baseline) — `top`/`runner_up` are that probe's real top-1 and
+/// top-2 exact-cosine scores, so `top - runner_up` is a genuine margin, not
+/// a synthesized one.
+///
+/// `runner_up_synthetic` (review finding [medium] #3): true exactly for the
+/// one row (top=0.563, runner_up=0.450) whose `runner_up` is
+/// `score_fts_candidate`'s synthetic `[keyword] ` FTS-fallback floor, not a
+/// cosine measurement — the live burst confirmed this row's real rank-2 by
+/// score is 0.583, not 0.450. Absent/false for every other row, where
+/// `runner_up` is a genuine cosine measurement.
+#[derive(serde::Deserialize)]
+struct BurstFixtureRow {
+    top: f32,
+    runner_up: Option<f32>,
+    #[allow(dead_code)]
+    list_len: usize,
+    #[allow(dead_code)]
+    label: String,
+    rank1_band: String,
+    rank_used: Option<u32>,
+    #[allow(dead_code)]
+    requeried: Option<bool>,
+    fabricated: bool,
+    #[serde(default)]
+    runner_up_synthetic: bool,
+}
+
+fn load_burst_fixture() -> Vec<BurstFixtureRow> {
+    let path = fixtures_dir().join("recall_bursts.json");
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    serde_json::from_str(&raw).unwrap()
+}
+
+fn fixture_chunk(id: &str, score: f32) -> EnrichedResult {
+    EnrichedResult {
+        score,
+        chunk: ConversationChunk {
+            id: id.into(),
+            conversation_id: format!("conv-{id}"),
+            project_name: "fixture-project".into(),
+            timestamp: "2026-09-22T10:00:00Z".into(),
+            content: format!("fixture content for {id}"),
+            message_count: 1,
+            summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        },
+        resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
+        validity_demoted: false,
+    }
+}
+
+/// The exact `format_quick_check` weak-band warning text at 8396ace (the
+/// commit this branch is based on, `git show 8396ace:csr-engine/src/format/mod.rs`),
+/// kept as a literal so the "before" side of this test is a real comparison,
+/// not an invented count. `format_search_results_with_rank_scores` at 8396ace
+/// had no caveat/warning of any kind in its `<summary>` — only `quick_check`
+/// carried this wording — so the true "before" state for the SEARCH path is
+/// 0 caveats, not a borrowed quick_check count.
+const OLD_QUICK_CHECK_SPURIOUS_WORDING: &str = "may be spurious";
+
+#[test]
+fn weak_band_wording_never_calls_a_rank1_correct_hit_spurious() {
+    // Contract: for every burst where the session's next turn actually used
+    // the rank-1 result, the new search-result wording must not call it
+    // spurious or indistinguishable from noise — that is exactly the
+    // mislabeling the 42% vs 18% immediate-re-query gap traces to.
+    //
+    // Receipt correction (WP-B review): `format_search_results_with_rank_scores`
+    // at 8396ace never emitted `OLD_QUICK_CHECK_SPURIOUS_WORDING` at all — that
+    // wording only ever existed in `format_quick_check`. So the honest "before"
+    // count for THIS renderer is 0/N, not N/N; what actually changed is that
+    // the renderer gained a `<caveat>` at all (previously none), and this test
+    // asserts the caveat it gained is never worded as a verdict against a hit
+    // that the session's own next turn proved correct.
+    // Review finding [high] #1 receipt: the ceiling-decisive branch (and the
+    // "clears the highest fabricated-probe score" wording it produced) was
+    // removed from `relevance_assessment` entirely — it is falsified by
+    // corpus growth (fabricated probes now measure up to 0.629; see
+    // `format::WEAK_BAND_DECISIVE_MARGIN` docs). So this text can no longer
+    // appear for ANY row, not just ones below the old 0.605 constant — the
+    // gate on `row.top < FABRICATED_PROBE_CEILING` that used to scope this
+    // assertion is gone along with the constant.
+    let fixture = load_burst_fixture();
+    let mut checked = 0;
+    let mut caveated_after = 0;
+    let mut decisive_after = 0;
+    let mut low_margin_after = 0;
+    for row in &fixture {
+        if row.fabricated || row.rank_used != Some(1) || row.rank1_band != "weak" {
+            continue;
+        }
+        checked += 1;
+
+        let mut results = vec![fixture_chunk("rank1", row.top)];
+        if let Some(second) = row.runner_up {
+            // Review finding [medium] #3: the 0.563/0.450 row's runner-up is
+            // `score_fts_candidate`'s synthetic `[keyword] ` FTS-fallback
+            // floor, not a cosine measurement (the live burst's real rank-2
+            // by score is 0.583). Building it as a plain cosine row here
+            // exercised the exact cosine-vs-floor comparison this item
+            // closes — tag it with the same `[keyword] ` prefix the real
+            // renderer would see, so `comparable_runner_up` correctly skips
+            // it.
+            let mut rank2 = fixture_chunk("rank2", second);
+            if row.runner_up_synthetic {
+                rank2.chunk.content = format!("[keyword] {}", rank2.chunk.content);
+            }
+            results.push(rank2);
+        }
+        let xml = format::format_search_results(&results, "fixture query", "fixture-project", 1, 1);
+        assert!(
+            !xml.contains(OLD_QUICK_CHECK_SPURIOUS_WORDING) && !xml.contains("indistinguishable"),
+            "row top={} runner_up={:?}: rank-1-correct weak result still reads as spurious: {xml}",
+            row.top,
+            row.runner_up
+        );
+        assert!(
+            !xml.contains("clears the highest fabricated-probe score"),
+            "row top={}: the ceiling-decisive branch was removed, this text must never appear: {xml}",
+            row.top
+        );
+        if xml.contains("<caveat>") {
+            caveated_after += 1;
+            if xml.contains("leads the field") || xml.contains("leads the list") {
+                decisive_after += 1;
+            } else {
+                low_margin_after += 1;
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "fixture must contain at least one rank-1-correct weak-band burst to regress against"
+    );
+    // Review finding [medium] #3 / [high] #1 combined receipt: with the
+    // decisive branch disabled on the search path (its margin scale is not
+    // validated the way quick_check's is) AND the synthetic runner-up
+    // correctly tagged above, every rank-1-correct weak-band burst must
+    // render the honest low-margin hedge — never a decisive "leads" claim,
+    // which would have been the cosine-vs-synthetic-floor artifact this
+    // fixture used to hide. Expected receipt: 0 decisive, 5 low-margin.
+    assert_eq!(
+        decisive_after, 0,
+        "reflect_on_past-path decisive wording is not validated on this scale — no rank-1-correct \
+         burst should ever render it: {decisive_after} of {checked} did"
+    );
+    assert_eq!(
+        low_margin_after, caveated_after,
+        "every caveated rank-1-correct burst must be the low-margin hedge, not decisive"
+    );
+    // Review finding [medium] #3: report this honestly rather than as an
+    // unqualified win. The objective ("stop calling rank-1-correct hits
+    // spurious") is met on the search path, but every one of these bursts
+    // now gains a NEW caveat it never had before (the pre-WP-B search
+    // renderer emitted none at all) — most of them worded as a
+    // low-confidence hedge, not as the positive "leads the field" framing.
+    // Whether an added hedge on a correct hit reduces or increases the 42%
+    // re-query rate this work item was meant to address is unverified here —
+    // it needs the same burst-consumption instrumentation the original study
+    // used, not asserted from this fixture. The weak-band LABEL and header
+    // ("weak relevance") are unchanged by this work item; if the re-query
+    // behaviour traces to the label/header rather than the old "may be
+    // spurious" wording specifically, this fix does not address it — that is
+    // the escalation this receipt is for, not a claim of success.
+    println!(
+        "WP-B receipt (honest, not a success claim): rank-1-correct weak-band bursts checked={checked}, \
+         spurious-phrased under old quick_check wording (search path never had it)=0/{checked}, \
+         gained a NEW <caveat> under the new search-path wording={caveated_after}/{checked} \
+         ({decisive_after} decisive \"leads\", {low_margin_after} low-margin hedge) — \
+         re-query-rate impact of this NEW caveat is unmeasured; label/header text unchanged"
+    );
+}
+
+#[test]
+fn weak_band_fabricated_probes_still_carry_a_caveat() {
+    // Contract: fabricated-probe scores that are still in the WEAK band must
+    // still carry SOME caveat even though the literal wording changed.
+    //
+    // Review finding [medium]: testing fabricated probes as a lone candidate
+    // (no runner-up) is not what `quick_check` does once 2+ results exist —
+    // it always fetches a runner-up, so a fabricated probe with a real
+    // runner-up margin >= WEAK_BAND_DECISIVE_MARGIN would take the decisive
+    // branch. This fixture's fabricated rows now carry REAL runner-up scores
+    // (`examples/quick_check_floor_margin.rs`, read-only against the live DB,
+    // 2026-09-22, same 8 probe texts as `examples/quick_check_floor.rs`), so
+    // this test exercises the real margin, not a synthesized absence of one.
+    //
+    // Re-measuring surfaced a finding beyond what the review asked for: one
+    // of the 8 probes ("the team decision to rewrite anukriti in Elixir
+    // Phoenix LiveView") now scores 0.629 — that is corpus growth pushing a
+    // fabricated topic's nearest neighbour PAST WEAK_BAND_TOP (0.62)
+    // entirely, into the "partial" band, which carries no caveat at all by
+    // design. `WEAK_BAND_TOP` (0.62) is a fixed constant measured 2026-08-03
+    // against a smaller corpus; it is not recomputed as the corpus grows.
+    // That staleness is a real, live gap in the abstention system, but
+    // redefining the band constants is a different, larger work item than
+    // this wording-only fix (spec: "Bands are unchanged") — flagged here as
+    // a printed receipt (review finding [low]: NOT a hard assertion, since
+    // asserting the drift would turn a known gap into a required invariant
+    // that a future abstention fix would have to break to pass).
+    //
+    // The 0.606 probe (still weak-band, one thousandth above the OLD 0.605
+    // `FABRICATED_PROBE_CEILING` constant) is exactly why that constant and
+    // its decisive branch were removed from `relevance_assessment` (review
+    // finding [high] #1): under the old logic this probe would have rendered
+    // "clears the highest fabricated-probe score measured on this corpus"
+    // for a fabricated topic. The loop below asserts directly that no
+    // still-weak-band fabricated probe ever renders that claim, or a "leads"
+    // claim — not just that a caveat of some kind exists.
+    let fixture = load_burst_fixture();
+    let fabricated: Vec<_> = fixture.iter().filter(|r| r.fabricated).collect();
+    assert_eq!(
+        fabricated.len(),
+        8,
+        "expected the 8 known fabricated probes"
+    );
+
+    let still_weak: Vec<_> = fabricated
+        .iter()
+        .filter(|r| r.rank1_band == "weak")
+        .collect();
+    let drifted_out_of_weak: Vec<_> = fabricated
+        .iter()
+        .filter(|r| r.rank1_band != "weak")
+        .collect();
+
+    let mut caveated = 0;
+    let mut max_margin = f32::MIN;
+    for row in &still_weak {
+        let runner_up = row.runner_up.unwrap_or_else(|| {
+            panic!(
+                "fabricated probe top={} has no runner-up in fixture",
+                row.top
+            )
+        });
+        max_margin = max_margin.max(row.top - runner_up);
+
+        let mut results = vec![fixture_chunk("only", row.top)];
+        if let Some(second) = row.runner_up {
+            results.push(fixture_chunk("second", second));
+        }
+        let xml = format::format_quick_check(&results, "fabricated probe");
+        assert!(
+            xml.contains("<warning>"),
+            "fabricated probe top={}: expected a caveat, got: {xml}",
+            row.top
+        );
+        assert!(
+            xml.contains("weakly calibrated"),
+            "fabricated probe top={}: got: {xml}",
+            row.top
+        );
+        // Review finding [high] #1's literal ask: a fabricated probe's
+        // output must never contain the decisive-wording phrases, not just
+        // "some caveat" — checking only for "weakly calibrated" was not
+        // enough, because the (now-removed) ceiling-decisive branch's text
+        // also contained that phrase.
+        assert!(
+            !xml.contains("clears the highest") && !xml.contains("leads"),
+            "fabricated probe top={}: must never read as decisive: {xml}",
+            row.top
+        );
+        caveated += 1;
+    }
+
+    // The margin half of the review finding, checked directly: every real
+    // fabricated-probe runner-up margin measured against the live corpus is
+    // below WEAK_BAND_DECISIVE_MARGIN, so none of the still-weak-band probes
+    // takes the decisive "leads the field" branch on margin alone.
+    assert!(
+        max_margin < format::WEAK_BAND_DECISIVE_MARGIN,
+        "a fabricated probe's real runner-up margin ({max_margin:.3}) reached \
+         WEAK_BAND_DECISIVE_MARGIN ({}) — it would now read as decisive",
+        format::WEAK_BAND_DECISIVE_MARGIN
+    );
+
+    // Review finding [low]: this used to be a hard `assert!(!xml.contains(
+    // "<warning>"))`, which turns a known abstention gap (a fabricated probe
+    // that drifted into "partial" gets zero caveat) into a passing invariant
+    // — a later fix that adds a caveat here would then fail THIS test. Print
+    // the receipt instead of asserting the defective behaviour, so the gap
+    // stays visible without blocking a fix for it.
+    for row in &drifted_out_of_weak {
+        let results = vec![fixture_chunk("only", row.top)];
+        let xml = format::format_quick_check(&results, "fabricated probe");
+        println!(
+            "WP-B known gap (not asserted): fabricated probe top={} drifted to band={} \
+             (corpus growth past WEAK_BAND_TOP), carries a caveat = {}",
+            row.top,
+            row.rank1_band,
+            xml.contains("<warning>")
+        );
+    }
+
+    println!(
+        "WP-B receipt: fabricated probes still caveated = {caveated}/{} (still weak-band), \
+         max real runner-up margin = {max_margin:.3} (threshold {}), \
+         drifted out of weak band with zero caveat = {}/8 (corpus-growth staleness, not this fix)",
+        still_weak.len(),
+        format::WEAK_BAND_DECISIVE_MARGIN,
+        drifted_out_of_weak.len()
+    );
+}
+
+#[test]
+fn weak_band_margin_skips_synthetic_keyword_runner_up() {
+    // Review finding [high] #2, live receipt: the fabricated probe "the team
+    // decision to rewrite anukriti in Elixir Phoenix LiveView" scored 0.601
+    // against `reflect_on_past` with a `[keyword] `-prefixed rank-2 at 0.405
+    // (that prefix marks `score_fts_candidate`'s synthetic FTS/keyword-
+    // fallback floor, not a cosine measurement — see `mcp::tools`). The raw
+    // margin (0.196) clears `WEAK_BAND_DECISIVE_MARGIN`, but it is comparing
+    // a cosine score to a fixed floor on a different scale, not to another
+    // cosine score — under the pre-fix logic this rendered as decisive
+    // ("leads the list by a 0.196 margin") for a fabricated topic.
+    //
+    // `format_search_results_with_rank_scores` must skip a `[keyword] `
+    // rank-2 row and treat the margin as absent (no further comparable
+    // result exists on this 2-row page), falling back to the honest
+    // low-confidence caveat.
+    let mut rank2 = fixture_chunk("rank2", 0.405);
+    rank2.chunk.content = "[keyword] some fallback match".into();
+    let results = vec![fixture_chunk("rank1", 0.601), rank2];
+    let xml = format::format_search_results(&results, "fixture query", "fixture-project", 1, 1);
+    assert!(
+        !xml.contains("leads the field") && !xml.contains("leads the list"),
+        "margin against a synthetic [keyword] runner-up must not be read as decisive: {xml}"
+    );
+    assert!(
+        xml.contains("<caveat>"),
+        "weak band must still carry a caveat: {xml}"
+    );
+    assert!(
+        xml.contains("weakly calibrated"),
+        "must fall back to the honest low-margin caveat: {xml}"
+    );
+
+    // W3-W (review finding [high] #1) superseded the old "control" case
+    // here: a genuinely comparable (cosine-vs-cosine) runner-up used to be
+    // treated as decisive on this path, but the review found that basis
+    // false on live data (F2, F5 — see `weak_band_search_path_never_renders_
+    // decisive_for_f2_and_f5_shaped_pages`) — the reflect_on_past page mixes
+    // chunks, reflections, TAD-decayed and scope-multiplied rows on a scale
+    // `WEAK_BAND_DECISIVE_MARGIN` was never validated against. So the
+    // comparable case must ALSO hedge now — proving the fix disables
+    // decisive wording for this path across the board, not just for the
+    // synthetic-runner-up case above.
+    let comparable_results = vec![fixture_chunk("rank1", 0.601), fixture_chunk("rank2", 0.405)];
+    let xml_comparable = format::format_search_results(
+        &comparable_results,
+        "fixture query",
+        "fixture-project",
+        1,
+        1,
+    );
+    assert!(
+        !xml_comparable.contains("leads the field") && !xml_comparable.contains("leads the list"),
+        "a comparable runner-up must still hedge on the search path — margin-decisive wording is \
+         quick_check-only until this path gets its own validated threshold: {xml_comparable}"
+    );
+    assert!(
+        xml_comparable.contains("weakly calibrated"),
+        "must fall back to the honest low-margin caveat: {xml_comparable}"
+    );
+}
+
+// ─── W3-W: reflect_on_past-path decisive wording is falsified by its own data (review [high]) ───
+
+/// Numeric-only shape from review finding [high] #1's live receipt: F2
+/// (`migrating csr-engine storage from SQLite to PostgreSQL`) rendered
+/// "leads the list" comparing rank 1 (0.526, a real chunk) against its
+/// immediate rank-2 by POSITION (0.414, a `[reflection]` row) while a lower
+/// row on the same page never entered the comparison at all. Margin 0.112
+/// clears `WEAK_BAND_DECISIVE_MARGIN` (0.10) even after skipping `[keyword]`
+/// rows, because none of these six rows is `[keyword]`-prefixed — the bug is
+/// the *position* of the comparison, not the keyword-skip.
+const F2_SHAPED_PAGE: [f32; 6] = [0.526, 0.414, 0.271, 0.345, 0.256, 0.319];
+
+/// F5 (`adding a Redis caching layer in front of the csr-engine search
+/// path`): rank 1 is 0.488, its immediate rank-2 (0.349) yields a 0.139
+/// margin — but rank 6 on the same page scores 0.511, ABOVE rank 1. A
+/// runner-up computed by position can never see this; a runner-up computed
+/// as the max of the rest of the page always does, and correctly reports a
+/// negative margin (no lead at all).
+const F5_SHAPED_PAGE: [f32; 6] = [0.488, 0.349, 0.320, 0.287, 0.334, 0.511];
+
+fn results_from_scores(scores: &[f32]) -> Vec<EnrichedResult> {
+    scores
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| fixture_chunk(&format!("r{i}"), s))
+        .collect()
+}
+
+#[test]
+fn weak_band_search_path_never_renders_decisive_for_f2_and_f5_shaped_pages() {
+    // Review finding [high] #1, spec item (1)+(2)+(3): fix the runner-up to
+    // be the max of the rest of the page (not the next row by position), AND
+    // disable the decisive branch entirely on the reflect_on_past/search
+    // path (its margin scale is not validated the way quick_check's
+    // exact-cosine top1-top2 margin is — this page mixes chunks, reflections,
+    // TAD-decayed and scope-multiplied rows). Either fix alone closes these
+    // two cases; both are required in general (fixing only the runner-up
+    // position still leaves a page where the best-of-rest genuinely trails
+    // rank 1 by >= 0.10 on this uncalibrated scale).
+    for (tag, page) in [("F2", F2_SHAPED_PAGE), ("F5", F5_SHAPED_PAGE)] {
+        let results = results_from_scores(&page);
+        let xml = format::format_search_results(&results, "probe", "fixture-project", 1, 1);
+        assert!(
+            !xml.contains("leads the field") && !xml.contains("leads the list"),
+            "{tag}-shaped page must never render a decisive lead on the search path: {xml}"
+        );
+        assert!(
+            !xml.contains("margin over the rest of the list is real")
+                && !xml.contains("margin over the rest of the field is real"),
+            "{tag}-shaped page must never claim the margin over the rest of the list is real: {xml}"
+        );
+    }
+}
+
+/// Pulls the `margin="..."` attribute value out of the `<summary ...>` tag.
+/// Panics if the tag or attribute is missing — every non-empty result set
+/// renders exactly one `<summary>` line.
+fn extract_summary_margin_attr(xml: &str) -> String {
+    let summary_line = xml
+        .lines()
+        .find(|l| l.trim_start().starts_with("<summary "))
+        .unwrap_or_else(|| panic!("no <summary> line in: {xml}"));
+    let after = summary_line
+        .split("margin=\"")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no margin attribute in: {summary_line}"));
+    after.split('"').next().unwrap().to_string()
+}
+
+#[test]
+fn summary_margin_attribute_uses_comparable_runner_up_not_position() {
+    // Review finding [medium] (W3-W follow-up on review [high] #1): the
+    // `<summary margin="...">` machine-readable attribute was fixed for the
+    // `<caveat>` wording but NOT for itself — it was still computed as
+    // `rank1_score - results.get(1).score`, the next row by DISPLAY
+    // POSITION, and a `[keyword]` synthetic-floor row counted as a valid
+    // runner-up there too. Same defect, different output field.
+    //
+    // Live receipt (HEAD build, VACUUM INTO clone of the live DB): F2
+    // ("migrating csr-engine storage from SQLite to PostgreSQL") rendered
+    // `rank1-score="0.526" margin="0.270"` (against rank 2's 0.256) while
+    // ranks 4 and 5 on the SAME page scored 0.579 and 0.554 — rank 1 does
+    // not lead the page at all. The `<caveat>` right next to it correctly
+    // says "low margin over the rest of the list", so the machine-readable
+    // attribute directly contradicted its own neighboring text.
+    //
+    // Page shape below is the HEAD F2 page: [0.526, 0.256, 0.293, 0.579,
+    // 0.554, 0.407-as-[keyword]]. The comparable runner-up is
+    // max(0.256, 0.293, 0.579, 0.554) = 0.579 (the [keyword] row is
+    // excluded, same rule `comparable_runner_up` already applies to the
+    // caveat) — correct margin = 0.526 - 0.579 = -0.053, NOT the by-position
+    // 0.526 - 0.256 = 0.270 the pre-fix attribute rendered.
+    let mut kw_row = fixture_chunk("kw", 0.407);
+    kw_row.chunk.content = format!("[keyword] {}", kw_row.chunk.content);
+    let results = vec![
+        fixture_chunk("r0", 0.526),
+        fixture_chunk("r1", 0.256),
+        fixture_chunk("r2", 0.293),
+        fixture_chunk("r3", 0.579),
+        fixture_chunk("r4", 0.554),
+        kw_row,
+    ];
+    let xml = format::format_search_results(&results, "probe", "fixture-project", 1, 1);
+    assert_eq!(
+        extract_summary_margin_attr(&xml),
+        "-0.053",
+        "margin attribute must use the max-of-rest comparable runner-up, not rank 2 by position: {xml}"
+    );
+
+    // A page whose only non-rank-1 rows are all [keyword]: no comparable
+    // runner-up exists at all, so the attribute must render "n/a", not a
+    // cosine-vs-synthetic-floor number.
+    let mut only_kw = fixture_chunk("kw-only", 0.40);
+    only_kw.chunk.content = format!("[keyword] {}", only_kw.chunk.content);
+    let na_results = vec![fixture_chunk("r0", 0.55), only_kw];
+    let xml_na = format::format_search_results(&na_results, "probe", "fixture-project", 1, 1);
+    assert_eq!(
+        extract_summary_margin_attr(&xml_na),
+        "n/a",
+        "no comparable runner-up means the attribute must be n/a, not a cosine-vs-keyword-floor \
+         number: {xml_na}"
+    );
+}
+
+/// One row of `tests/fixtures/reflect_path_pages.json` — a full
+/// reflect_on_past-style page (numeric scores + the `[keyword] ` synthetic
+/// flag) captured 2026-09-22 for the 5 rank-1-correct bursts (B1-B5) and the
+/// 8 fabricated probes (F1-F8) against the live corpus (`/tmp/w3w/after.json`
+/// at HEAD 64ef0d4). No prompts, previews, session ids or project names —
+/// this is a public repo.
+#[derive(serde::Deserialize)]
+struct ReflectPathRow {
+    score: f32,
+    kw: bool,
+    #[allow(dead_code)]
+    #[serde(default)]
+    reflection: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct ReflectPathPage {
+    tag: String,
+    #[allow(dead_code)]
+    note: String,
+    rows: Vec<ReflectPathRow>,
+}
+
+fn load_reflect_path_pages() -> Vec<ReflectPathPage> {
+    let path = fixtures_dir().join("reflect_path_pages.json");
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    serde_json::from_str(&raw).unwrap()
+}
+
+#[test]
+fn weak_band_reflect_on_past_path_receipt_for_bursts_and_fabricated_probes() {
+    // Review finding [medium] #2: `weak_band_fabricated_probes_still_carry_a_
+    // caveat` only ever exercises `format_quick_check`, so it stays green
+    // while the live reflect_on_past renderer calls 2 of 8 fabricated probes
+    // decisive (F2, F5). This test drives the actual page-shaped renderer
+    // (`format_search_results`, what `reflect_on_past` uses) over all 13
+    // captured pages and is the receipt table the item spec asks for.
+    let pages = load_reflect_path_pages();
+    assert_eq!(pages.len(), 13, "expected 5 bursts + 8 fabricated probes");
+
+    let mut none_count = 0;
+    let mut decisive_count = 0;
+    let mut hedge_count = 0;
+    println!("W3-W receipt: reflect_on_past-path wording per captured page (HEAD, post-fix)");
+    for page in &pages {
+        let scores: Vec<f32> = page.rows.iter().map(|r| r.score).collect();
+        let results: Vec<EnrichedResult> = page
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut chunk = fixture_chunk(&format!("{}-r{i}", page.tag), r.score);
+                if r.kw {
+                    chunk.chunk.content = format!("[keyword] {}", chunk.chunk.content);
+                }
+                chunk
+            })
+            .collect();
+        let xml = format::format_search_results(&results, "probe", "fixture-project", 1, 1);
+        let wording = if !xml.contains("<caveat>") {
+            none_count += 1;
+            "none (not weak band)"
+        } else if xml.contains("leads the field") || xml.contains("leads the list") {
+            decisive_count += 1;
+            "DECISIVE leads"
+        } else {
+            hedge_count += 1;
+            "low-margin hedge"
+        };
+        println!(
+            "  {:<3} rank1={:.3} rows={scores:?} -> {wording}",
+            page.tag,
+            scores.first().copied().unwrap_or(0.0)
+        );
+        assert!(
+            !xml.contains("leads the field") && !xml.contains("leads the list"),
+            "{}: reflect_on_past-path decisive wording is not validated on this path — every \
+             page must render the honest low-margin hedge (or no caveat, outside the weak band): {xml}",
+            page.tag
+        );
+    }
+    println!(
+        "W3-W receipt totals: none={none_count} decisive={decisive_count} hedge={hedge_count} \
+         (of {} pages) — decisive must be 0 until the margin threshold is re-derived against \
+         this path's own scale",
+        pages.len()
+    );
+}
+
+#[test]
+fn format_search_results_preserves_input_order_and_scores() {
+    // CONSTRAINT: the label/banner rewrite must never touch ranking order or
+    // the rendered score values. Render a fixed slice and assert the exact
+    // rank/score sequence — this is the "before vs after" proof required by
+    // the spec, made concrete as an invariant on the current renderer rather
+    // than a diff against deleted code.
+    //
+    // Review finding [low]: the previous version of this test (`..._byte_
+    // identical_across_the_wording_change`) fed a MONOTONE descending slice
+    // (0.900, 0.700, 0.500) — input order and score order were identical, so
+    // even a formatter that silently re-sorted by score would still pass.
+    // Rerank pages are non-monotone in practice (live receipt: F6 scored
+    // 0.558, 0.660, 0.618, 0.510 in that rank order — rank 2 and 3 outscore
+    // rank 1). Feed a non-monotone slice so a hypothetical re-sort-by-score
+    // inside the formatter is actually caught (verified live: reverting to
+    // `.sort_by(|a, b| b.score.total_cmp(&a.score))` before rendering flips
+    // this assertion).
+    //
+    // Ownership note: this test's job is narrower than the name might
+    // suggest — it only guards against an accidental reorder introduced
+    // INSIDE the formatter. `format_search_results` never sorts its input
+    // (verified: no `.sort` call in `src/format/mod.rs`'s render path), so
+    // upstream ranking correctness (rerank order, W3-K's territory) is not
+    // this test's responsibility — that lives in `src/search/rerank.rs` and
+    // `src/mcp/tools.rs`'s own tests.
+    let results = vec![
+        fixture_chunk("a", 0.558),
+        fixture_chunk("b", 0.660),
+        fixture_chunk("c", 0.618),
+        fixture_chunk("d", 0.510),
+    ];
+    let xml = format::format_search_results(&results, "fixture query", "fixture-project", 1, 1);
+
+    let rank_score_pairs = extract_rank_scores(&xml);
+    assert_eq!(
+        rank_score_pairs,
+        vec![
+            (1, "0.558".to_string()),
+            (2, "0.660".to_string()),
+            (3, "0.618".to_string()),
+            (4, "0.510".to_string()),
+        ],
+        "rank/score sequence must stay exactly input order, even when it is not score-descending: {xml}"
+    );
+}
+
+/// Minimal `<r rank="N">...<s ...>SCORE</s>` extractor — avoids pulling in a
+/// regex dependency just for this one invariance assertion. The rendered
+/// score is always the text immediately after the last `>` before the first
+/// `</s>` in a rank block, whether or not an `adj="..."` attribute is present.
+fn extract_rank_scores(xml: &str) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    for r_block in xml.split("<r rank=\"").skip(1) {
+        let rank: u32 = r_block.split('"').next().unwrap().parse().unwrap();
+        let before_close = r_block.split("</s>").next().unwrap();
+        let score = before_close.rsplit('>').next().unwrap().to_string();
+        out.push((rank, score));
+    }
+    out
 }
 
 #[test]
@@ -451,6 +1302,7 @@ fn test_dedupe_results_collapses_same_conversation_duplicate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
         EnrichedResult {
@@ -468,6 +1320,7 @@ fn test_dedupe_results_collapses_same_conversation_duplicate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
     ];
@@ -506,6 +1359,7 @@ fn test_format_quick_check_structure() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -543,6 +1397,7 @@ fn test_xml_escaping_in_output() {
             is_sidechain: false,
         },
         resolution: None,
+        trust: csr_engine::provenance::TrustTier::Unknown,
         validity_demoted: false,
     }];
 
@@ -564,7 +1419,7 @@ fn test_resolve_and_annotate() {
             "resolved",
             "shipped and verified",
             None,
-            "agent",
+            "user_confirmed",
         )
         .unwrap();
 
@@ -584,6 +1439,7 @@ fn test_resolve_and_annotate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
         EnrichedResult {
@@ -601,6 +1457,7 @@ fn test_resolve_and_annotate() {
                 is_sidechain: false,
             },
             resolution: None,
+            trust: csr_engine::provenance::TrustTier::Unknown,
             validity_demoted: false,
         },
     ];
@@ -634,6 +1491,7 @@ fn test_resolve_chunks_invalid_status_errors() {
         "bogus".to_string(),
         "some evidence".to_string(),
         None,
+        None,
     ));
     assert!(result.is_err());
 }
@@ -659,22 +1517,26 @@ fn test_temporal_iso_date() {
 
 #[test]
 fn test_cross_project_scope_all() {
-    let (project, label) = cross_project::normalize_project_scope(Some("all"));
+    let storage = Storage::open_memory().unwrap();
+    let (project, label) = cross_project::normalize_project_scope(&storage, Some("all")).unwrap();
     assert!(project.is_none());
     assert_eq!(label, "all");
 }
 
 #[test]
 fn test_cross_project_scope_all_case_insensitive() {
-    let (project, _) = cross_project::normalize_project_scope(Some("ALL"));
+    let storage = Storage::open_memory().unwrap();
+    let (project, _) = cross_project::normalize_project_scope(&storage, Some("ALL")).unwrap();
     assert!(project.is_none());
-    let (project, _) = cross_project::normalize_project_scope(Some("All"));
+    let (project, _) = cross_project::normalize_project_scope(&storage, Some("All")).unwrap();
     assert!(project.is_none());
 }
 
 #[test]
 fn test_cross_project_scope_specific() {
-    let (project, label) = cross_project::normalize_project_scope(Some("my-project"));
+    let storage = Storage::open_memory().unwrap();
+    let (project, label) =
+        cross_project::normalize_project_scope(&storage, Some("my-project")).unwrap();
     assert_eq!(project, Some("my-project".to_string()));
     assert_eq!(label, "my-project");
 }
@@ -846,6 +1708,7 @@ fn test_full_pipeline_storage_search_format() {
                     score: r.score,
                     chunk: c.clone(),
                     resolution: None,
+                    trust: csr_engine::provenance::TrustTier::Unknown,
                     validity_demoted: false,
                 })
         })
@@ -1235,7 +2098,7 @@ fn test_hnsw_dedup_insert() {
 #[test]
 fn test_hnsw_persistence_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
+    let index_dir = dir.path().join("index-v3");
 
     // Build index with 50 chunks + 5 reflections
     let mut engine = SearchEngine::new(100);
@@ -1260,7 +2123,9 @@ fn test_hnsw_persistence_roundtrip() {
     let results_before = engine.search_chunks(&query, 3, 0.0);
 
     // Load from disk
-    let loaded = SearchEngine::load_from_disk(&index_dir, 50, 5).unwrap();
+    let loaded = SearchEngine::load_from_disk(&index_dir, 50, 5)
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.chunk_count(), 50);
     assert_eq!(loaded.reflection_count(), 5);
 
@@ -1276,7 +2141,7 @@ fn test_hnsw_persistence_roundtrip() {
 #[test]
 fn test_hnsw_stale_index_detection() {
     let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
+    let index_dir = dir.path().join("index-v3");
 
     // Build and dump with 10 chunks
     let mut engine = SearchEngine::new(100);
@@ -1288,18 +2153,26 @@ fn test_hnsw_stale_index_detection() {
 
     // DB grew since the dump (additive drift) — cache loads so Engine::new can
     // incrementally backfill the new rows instead of doing a full rebuild.
-    let result = SearchEngine::load_from_disk(&index_dir, 15, 0);
+    let result = SearchEngine::load_from_disk(&index_dir, 15, 0).unwrap();
     assert!(
         result.is_some(),
         "additive drift should load the cache (backfill), not rebuild"
     );
 
-    // DB shrank (rows deleted) — must reject so the rebuild drops orphan vectors.
-    let result = SearchEngine::load_from_disk(&index_dir, 5, 0);
-    assert!(result.is_none(), "deletion should reject the stale cache");
+    // DB shrank (rows deleted, negative drift) — WP-D: loads the cache instead
+    // of rejecting it. A synchronous full rebuild on every negative-drift
+    // cache load was the cold-start stall this fix removes; `Engine::new`'s
+    // cached-load branch reconciles the vanished ids via
+    // `blank_orphan_chunks`/`blank_orphan_reflections`, and `search_index`
+    // overfetches past the resulting tombstones.
+    let result = SearchEngine::load_from_disk(&index_dir, 5, 0).unwrap();
+    assert!(
+        result.is_some(),
+        "negative drift should load the cache, not force an inline rebuild"
+    );
 
     // Exact match should work
-    let result = SearchEngine::load_from_disk(&index_dir, 10, 0);
+    let result = SearchEngine::load_from_disk(&index_dir, 10, 0).unwrap();
     assert!(result.is_some(), "should accept matching cache");
 }
 
@@ -1310,7 +2183,7 @@ fn test_hnsw_missing_files_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let nonexistent = dir.path().join("nonexistent_index");
 
-    let result = SearchEngine::load_from_disk(&nonexistent, 100, 10);
+    let result = SearchEngine::load_from_disk(&nonexistent, 100, 10).unwrap();
     assert!(result.is_none(), "should return None for missing directory");
 }
 
@@ -1319,7 +2192,7 @@ fn test_hnsw_missing_files_fallback() {
 #[test]
 fn test_hnsw_persistence_soft_delete() {
     let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
+    let index_dir = dir.path().join("index-v3");
 
     // Insert 5 reflections, remove 1
     let mut engine = SearchEngine::new(100);
@@ -1337,7 +2210,9 @@ fn test_hnsw_persistence_soft_delete() {
     engine.dump_to_disk(&index_dir, 0, 5).unwrap();
 
     // Load expects DB counts to match manifest
-    let loaded = SearchEngine::load_from_disk(&index_dir, 0, 5).unwrap();
+    let loaded = SearchEngine::load_from_disk(&index_dir, 0, 5)
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.reflection_count(), 4);
 
     // Searching should not return the removed reflection
@@ -1357,7 +2232,7 @@ fn test_hnsw_persistence_soft_delete() {
 #[test]
 fn test_hnsw_cached_load_timing() {
     let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
+    let index_dir = dir.path().join("index-v3");
 
     // Build a 1000-vector index
     let mut engine = SearchEngine::new(2000);
@@ -1370,7 +2245,7 @@ fn test_hnsw_cached_load_timing() {
 
     // Time the cached load
     let start = std::time::Instant::now();
-    let loaded = SearchEngine::load_from_disk(&index_dir, 1000, 0);
+    let loaded = SearchEngine::load_from_disk(&index_dir, 1000, 0).unwrap();
     let elapsed = start.elapsed();
 
     assert!(loaded.is_some(), "cached load should succeed");
@@ -1392,6 +2267,8 @@ fn test_lapi_phase_aware_scoring() {
     let results = vec![
         RawResult {
             content: "docker container fix".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "chunk".into(),
             timestamp: None,
@@ -1403,6 +2280,8 @@ fn test_lapi_phase_aware_scoring() {
         },
         RawResult {
             content: "session strategy for docker".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "reflection".into(),
             timestamp: None,
@@ -1443,6 +2322,8 @@ fn test_lapi_stop_phase_prefers_anti_patterns() {
     let results = vec![
         RawResult {
             content: "regular chunk content".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "chunk".into(),
             timestamp: None,
@@ -1454,6 +2335,8 @@ fn test_lapi_stop_phase_prefers_anti_patterns() {
         },
         RawResult {
             content: "failed approach for this problem".into(),
+            author: None,
+            min_trust: csr_engine::provenance::TrustTier::Unknown,
             score: 0.8,
             source: "anti_pattern".into(),
             timestamp: None,
@@ -1719,6 +2602,190 @@ fn episode_v2_full_cycle_with_anchors() {
     );
 }
 
+/// Regression: memory-registry file bodies are metadata-only.
+///
+/// `scan_memory_dirs` must upsert rows into `memory_registry` and never write
+/// file bodies into `chunks`, `chunks_fts`, or the vector/HNSW index. This
+/// locks the cross-table isolation invariant found in code review — unit tests
+/// cover frontmatter/upsert lifecycle, but not that chunks/FTS stay untouched.
+#[test]
+fn test_memory_registry_bodies_never_reach_chunks_or_fts() {
+    const MARKER: &str = "MEMORY_BODY_SENTINEL_9f3a";
+
+    let dir = tempfile::tempdir().unwrap();
+    let mem_dir = dir.path().join("demo-project").join("memory");
+    std::fs::create_dir_all(&mem_dir).unwrap();
+
+    let reference_body = format!(
+        r#"---
+name: reference-marker-isolation
+description: "Memory registry body isolation probe"
+metadata:
+  node_type: memory
+  type: reference
+  originSessionId: 00000000-0000-4000-8000-000000000001
+  modified: 2026-08-19T15:05:51.330Z
+---
+Body paragraph carrying the unique marker {MARKER} so we can prove it never
+lands in chunks or chunks_fts.
+"#
+    );
+    std::fs::write(mem_dir.join("reference_marker.md"), reference_body).unwrap();
+    std::fs::write(mem_dir.join("MEMORY.md"), "# index\n").unwrap();
+
+    let storage = Storage::open_memory().unwrap();
+    let stats =
+        csr_engine::import::memory_registry::scan_memory_dirs(&storage, dir.path()).unwrap();
+    assert_eq!(
+        stats.files_seen, 1,
+        "only the real memory file should count; MEMORY.md is skipped"
+    );
+    assert_eq!(
+        stats.upserted, 1,
+        "exactly one memory_registry upsert expected"
+    );
+
+    let (
+        registry_count,
+        memory_md_count,
+        chunks_count,
+        fts_count,
+        marker_in_chunks,
+        fts_match_count,
+    ) = storage
+        .with_transaction(|tx| {
+            let registry_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE project = ?1",
+                ["demo-project"],
+                |r| r.get(0),
+            )?;
+            let memory_md_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM memory_registry WHERE file_path LIKE '%MEMORY.md'",
+                [],
+                |r| r.get(0),
+            )?;
+            let chunks_count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+            let fts_count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))?;
+            let marker_in_chunks: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM chunks WHERE content LIKE ?1",
+                [format!("%{MARKER}%")],
+                |r| r.get(0),
+            )?;
+            let fts_match_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+                [format!("\"{MARKER}\"")],
+                |r| r.get(0),
+            )?;
+            Ok((
+                registry_count,
+                memory_md_count,
+                chunks_count,
+                fts_count,
+                marker_in_chunks,
+                fts_match_count,
+            ))
+        })
+        .unwrap();
+
+    assert_eq!(
+        registry_count, 1,
+        "exactly one memory_registry row for demo-project"
+    );
+    assert_eq!(
+        memory_md_count, 0,
+        "MEMORY.md must not produce a memory_registry row"
+    );
+    assert_eq!(
+        chunks_count, 0,
+        "scan_memory_dirs must not insert any chunks rows"
+    );
+    assert_eq!(fts_count, 0, "scan_memory_dirs must leave chunks_fts empty");
+    assert_eq!(
+        marker_in_chunks, 0,
+        "marker must not appear in any chunks.content value"
+    );
+    assert_eq!(
+        fts_match_count, 0,
+        "FTS5 MATCH for body marker must return zero rows"
+    );
+}
+
+// ─── WP-D low: `rebuild-index` must fail loudly on a persistence failure ───
+
+// Reviewer finding (WP-D low, `RebuildIndex`'s freshly-rebuilt branch,
+// `main.rs`): `Engine::new`'s cache-miss path only WARNS on a failed
+// `dump_to_disk` — it must, foreground processes cannot block startup on
+// persistence. Without a follow-up `flush_index_checked().await?` in the
+// `rebuild-index` command, that non-fatal warning is the only trace: the
+// command still prints "rebuilt index" and exits 0 while the on-disk cache
+// is stale or absent. This drives the actual compiled binary (not the
+// library) with an index directory that cannot be created — a regular file
+// where the directory should be, standing in for ENOSPC — and asserts a
+// non-zero exit with no false "rebuilt index" success line.
+#[test]
+fn rebuild_index_command_fails_loudly_when_the_index_directory_cannot_be_created() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_dir = tmp.path().join("db_dir");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("test.db");
+
+    // Seed one real chunk BEFORE the index directory is sabotaged below, so
+    // the freshly-rebuilt index actually has content to dump (an empty
+    // index is never marked dirty, so `flush_index_checked` would be a
+    // silent no-op either way — that would not exercise the fix at all).
+    {
+        let storage = Storage::open(&db_path).unwrap();
+        let chunk = ConversationChunk {
+            id: "chunk-0".into(),
+            conversation_id: "conv".into(),
+            project_name: "proj".into(),
+            timestamp: "2026-09-22T00:00:00Z".into(),
+            content: "x".into(),
+            message_count: 1,
+            summary: None,
+            author: csr_engine::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let embedding: Vec<f32> = vec![0.1; 384];
+        storage.insert_chunk(&chunk, &embedding).unwrap();
+    }
+
+    // `Engine::new` derives `index_dir` as `db_path.parent().join("index-v3")`
+    // — put a REGULAR FILE there so `create_dir_all` inside `dump_to_disk`
+    // fails (not a directory), instead of an actual directory.
+    std::fs::write(db_dir.join("index-v3"), b"not a directory").unwrap();
+
+    let projects_dir = tmp.path().join("projects");
+    std::fs::create_dir_all(&projects_dir).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        .arg("--db-path")
+        .arg(&db_path)
+        .arg("--projects-dir")
+        .arg(&projects_dir)
+        .arg("rebuild-index")
+        .env("HOME", tmp.path().join("home"))
+        .output()
+        .expect("failed to run the csr-engine binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "rebuild-index must exit non-zero when the index directory cannot \
+         be created; status={:?} stdout={stdout} stderr={stderr}",
+        output.status
+    );
+    assert!(
+        !stdout.contains("rebuilt index"),
+        "must never print the success line when the flush failed; \
+         stdout={stdout} stderr={stderr}"
+    );
+}
+
 // ─── v9.4 code property graph: LIVE round-trip (gate) ───
 
 mod codegraph_roundtrip {
@@ -1870,5 +2937,323 @@ fn test_version_flag_is_side_effect_free() {
             leftovers.is_empty(),
             "`csr-engine {flag}` wrote into HOME: {leftovers:?}"
         );
+    }
+}
+
+/// Review finding #5: a proxied MCP server's vector IPC must not freeze its
+/// runtime. With one Tokio worker and a daemon that answers pings and
+/// embeddings but stalls every search, an MCP `ping` sent while a search is
+/// stuck — and again after cancelling it — is answered at once.
+#[cfg(unix)]
+mod proxied_server_stays_responsive {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn fake_daemon(dir: &std::path::Path) -> std::thread::JoinHandle<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        let ipc = dir.join("hook-ipc-v1");
+        std::fs::DirBuilder::new().mode(0o700).create(&ipc).unwrap();
+        std::fs::write(ipc.join("daemon.alive"), "1 now\n").unwrap();
+        let listener = UnixListener::bind(ipc.join("vector.sock")).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut header = [0u8; 4];
+                    if stream.read_exact(&mut header).is_err() {
+                        return;
+                    }
+                    let mut body = vec![0; u32::from_be_bytes(header) as usize];
+                    if stream.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let reply = match request["op"]["op"].as_str().unwrap_or_default() {
+                        "ping" => serde_json::json!({"reply": "pong"}),
+                        "embed" => {
+                            let n = request["op"]["texts"].as_array().map_or(0, Vec::len);
+                            serde_json::json!({"reply": "vectors", "vectors": vec![vec![0.1f32; 384]; n]})
+                        }
+                        // Searches hang: the server must stay responsive anyway.
+                        _ => {
+                            std::thread::sleep(Duration::from_secs(60));
+                            return;
+                        }
+                    };
+                    let bytes =
+                        serde_json::to_vec(&serde_json::json!({"version": 1, "reply": reply}))
+                            .unwrap();
+                    let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes());
+                    let _ = stream.write_all(&bytes);
+                });
+            }
+        })
+    }
+
+    #[test]
+    fn mcp_ping_and_cancel_stay_responsive_while_a_daemon_search_stalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let _daemon = fake_daemon(dir.path());
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.path().join("projects"))
+            .env("HOME", dir.path().join("home"))
+            .env("CSR_TOKIO_WORKERS", "1")
+            .env("CSR_ENRICH_INITIAL_DELAY_SECS", "3600")
+            .env_remove("CSR_NO_DAEMON_PROXY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                // Every stdout line is a JSON-RPC message.
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if tx.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut send = |message: serde_json::Value| {
+            writeln!(stdin, "{message}").unwrap();
+            stdin.flush().unwrap();
+        };
+        let wait_for = |id: i64, within: Duration| -> Option<Duration> {
+            let started = Instant::now();
+            while started.elapsed() < within {
+                if let Ok(message) = rx.recv_timeout(Duration::from_millis(50)) {
+                    if message["id"] == id {
+                        return Some(started.elapsed());
+                    }
+                }
+            }
+            None
+        };
+        send(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}),
+        );
+        assert!(wait_for(1, Duration::from_secs(30)).is_some(), "initialize");
+        send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        send(
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "csr_reflect_on_past", "arguments": {"query": "anything", "project": "all"}}}),
+        );
+        // Give the call time to reach the stalled search.
+        std::thread::sleep(Duration::from_millis(1500));
+        send(serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}));
+        let pinged = wait_for(3, Duration::from_secs(5));
+        send(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": 2, "reason": "test"}}),
+        );
+        send(serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}));
+        let pinged_again = wait_for(4, Duration::from_secs(5));
+        let _ = child.kill();
+        let _ = child.wait();
+        let ping = pinged.expect("ping answered while the search stalls");
+        assert!(ping < Duration::from_secs(1), "ping took {ping:?}");
+        let ping = pinged_again.expect("ping answered after cancelling");
+        assert!(ping < Duration::from_secs(1), "ping took {ping:?}");
+    }
+}
+
+/// Review item 8: a generation dumped by the hnsw_rs 0.3.4 build (the
+/// format every installed index is in) loads in this binary, and a damaged
+/// generation is rebuilt from SQLite instead of killing the server — with
+/// stdout carrying nothing but JSON-RPC either way. The fixture was written
+/// by the b1d7de23 build (`csr-engine --import` of two sample transcripts).
+#[cfg(unix)]
+mod index_compatibility_and_damage {
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+
+    fn fixture_copy() -> tempfile::TempDir {
+        let from = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/index-0.3.4");
+        let to = tempfile::tempdir().unwrap();
+        std::fs::copy(from.join("csr-engine.db"), to.path().join("csr-engine.db")).unwrap();
+        std::fs::create_dir(to.path().join("index-v3")).unwrap();
+        for entry in std::fs::read_dir(from.join("index-v3")).unwrap().flatten() {
+            std::fs::copy(
+                entry.path(),
+                to.path().join("index-v3").join(entry.file_name()),
+            )
+            .unwrap();
+        }
+        // Present in a live index dir; its absence forces the heap load path.
+        std::fs::write(to.path().join("index-v3/index.lock"), b"").unwrap();
+        to
+    }
+
+    fn generation(dir: &Path, side: &str, extension: &str) -> PathBuf {
+        std::fs::read_dir(dir.join("index-v3"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.starts_with(&format!("{side}-")) && name.ends_with(extension)
+            })
+            .unwrap()
+    }
+
+    /// A home folder for the server under test, holding a clone of the model
+    /// cache this test process resolves: the binary finds its model under its
+    /// own `$HOME`, and a search embeds the query.
+    fn server_home(dir: &Path) -> std::path::PathBuf {
+        let home = dir.join("home");
+        let real_home = dirs::home_dir().expect("a home dir");
+        let source = dirs::cache_dir()
+            .expect("a cache dir")
+            .join("csr-engine")
+            .join("fastembed");
+        let target = home.join(source.strip_prefix(&real_home).unwrap());
+        if source.exists() && !target.exists() {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let cloned = Command::new("cp")
+                .arg("-Rc")
+                .arg(&source)
+                .arg(&target)
+                .status()
+                .is_ok_and(|status| status.success());
+            if !cloned {
+                let _ = std::fs::remove_dir_all(&target);
+                let copied = Command::new("cp")
+                    .arg("-R")
+                    .arg(&source)
+                    .arg(&target)
+                    .status();
+                assert!(copied.unwrap().success(), "could not copy the model cache");
+            }
+        }
+        home
+    }
+
+    /// One in-process MCP session (no daemon): initialize, then a search.
+    /// Returns (exit success, every stdout line, stderr).
+    fn serve_once(dir: &Path) -> (bool, Vec<serde_json::Value>, String) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .arg("--db-path")
+            .arg(dir.join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.join("projects"))
+            .env("HOME", server_home(dir))
+            .env("CSR_NO_DAEMON_PROXY", "1")
+            .env("CSR_ENRICH_INITIAL_DELAY_SECS", "3600")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let requests = [
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "csr_reflect_on_past", "arguments": {"query": "hello", "project": "all", "min_score": 0.0}}}),
+        ];
+        let mut stdin = child.stdin.take().unwrap();
+        for request in requests {
+            writeln!(stdin, "{request}").unwrap();
+        }
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        let lines = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("stdout carries only JSON-RPC"))
+            .collect();
+        (
+            output.status.success(),
+            lines,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    fn assert_served(case: &str, dir: &Path, startup: &str) {
+        let (ok, lines, stderr) = serve_once(dir);
+        assert!(
+            ok,
+            "{case}: the server must not exit on a damaged cache: {stderr}"
+        );
+        let ids: Vec<_> = lines.iter().map(|line| line["id"].clone()).collect();
+        assert_eq!(
+            ids,
+            vec![serde_json::json!(1), serde_json::json!(2)],
+            "{case}"
+        );
+        assert!(lines.iter().all(|line| line["jsonrpc"] == "2.0"), "{case}");
+        assert!(
+            lines[1]["result"]["content"].is_array(),
+            "{case}: {}",
+            lines[1]
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.contains("CSR startup") && line.contains(startup)),
+            "{case}: expected a {startup} startup: {stderr}"
+        );
+    }
+
+    #[test]
+    fn a_0_3_4_generation_loads_from_cache() {
+        let dir = fixture_copy();
+        assert_served("intact 0.3.4 dump", dir.path(), "cached");
+    }
+
+    #[test]
+    fn damaged_generations_are_rebuilt_not_fatal() {
+        type Damage = fn(&Path);
+        let cases: [(&str, Damage); 4] = [
+            ("truncated data, heap load", |dir| {
+                std::fs::remove_file(dir.join("index-v3/index.lock")).unwrap();
+                let data = generation(dir, "chunks", ".hnsw.data");
+                let len = std::fs::metadata(&data).unwrap().len();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&data)
+                    .unwrap()
+                    .set_len(len - 100)
+                    .unwrap();
+            }),
+            ("truncated data, mapped load", |dir| {
+                let data = generation(dir, "chunks", ".hnsw.data");
+                let len = std::fs::metadata(&data).unwrap().len();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&data)
+                    .unwrap()
+                    .set_len(len / 2)
+                    .unwrap();
+            }),
+            ("unsupported graph header (format 2)", |dir| {
+                let graph = generation(dir, "chunks", ".hnsw.graph");
+                let mut bytes = std::fs::read(&graph).unwrap();
+                bytes[..4].copy_from_slice(&0x002a_677f_u32.to_ne_bytes());
+                std::fs::write(&graph, bytes).unwrap();
+            }),
+            ("garbage graph header", |dir| {
+                let graph = generation(dir, "reflections", ".hnsw.graph");
+                let mut bytes = std::fs::read(&graph).unwrap();
+                bytes[..4].copy_from_slice(&[0, 0, 0, 0]);
+                std::fs::write(&graph, bytes).unwrap();
+            }),
+        ];
+        for (case, damage) in cases {
+            let dir = fixture_copy();
+            damage(dir.path());
+            assert_served(case, dir.path(), "rebuilt");
+        }
     }
 }

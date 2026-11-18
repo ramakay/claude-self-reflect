@@ -66,4 +66,4 @@ No candidates were dropped for LEAKAGE (criterion 1) or vague KEY VERIFICATION (
 the only leakage issue found (orig #30, a directly-quoted task ID) was fixed by rewording rather
 than dropped; it is kept as final #11.
 
-File: /private/tmp/claude-501/-Users-ramakrishnanannaswamy-projects-claude-self-reflect-csr-engine/efab2eb0-47e7-4b91-bb78-a962261c4214/scratchpad/t3-eval/drops.md
+File: /private/tmp/claude-501/-Users-<you>-projects-claude-self-reflect-csr-engine/efab2eb0-47e7-4b91-bb78-a962261c4214/scratchpad/t3-eval/drops.md

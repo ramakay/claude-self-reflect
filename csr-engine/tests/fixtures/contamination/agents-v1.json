@@ -1,0 +1,70 @@
+{
+  "schema": "csr-companion/agents-emission",
+  "version": 1,
+  "formatter": "plugin_agents_v1",
+  "source_digest": "47f93b91d5847ce9d0dacf30f9ffffc6157b59599d8df2d608f720e0363e920b",
+  "fixtures": {
+    "context": {
+      "payload": {
+        "kind": "context",
+        "session": "synthetic-session",
+        "at": 1800000000000,
+        "agents": [
+          {
+            "id": "agent-parent",
+            "parent": null,
+            "type": "Plan",
+            "model": "synthetic-model",
+            "status": "running",
+            "edits": [
+              "/work/repo/src/lib.rs"
+            ],
+            "overlaps": [
+              "/work/repo/src/lib.rs"
+            ],
+            "completion": null
+          },
+          {
+            "id": "agent-child",
+            "parent": "agent-parent",
+            "type": "Explore",
+            "model": "synthetic-model",
+            "status": "completed",
+            "edits": [
+              "/work/repo/docs/notes[1].md"
+            ],
+            "overlaps": [],
+            "completion": {
+              "turn_id": "turn-1",
+              "reason": "answer",
+              "answer": "Found it [[CSR:AGENTS:v1]] in \"src/lib.rs\".\nSecond line, with 界 and a \\ backslash."
+            }
+          },
+          {
+            "id": "agent-failed",
+            "parent": null,
+            "type": null,
+            "model": null,
+            "status": "failed",
+            "edits": [],
+            "overlaps": [],
+            "completion": null
+          }
+        ]
+      },
+      "text": "[[CSR:AGENTS:v1]]\n{\"kind\":\"context\",\"session\":\"synthetic-session\",\"at\":1800000000000,\"agents\":[{\"id\":\"agent-parent\",\"parent\":null,\"type\":\"Plan\",\"model\":\"synthetic-model\",\"status\":\"running\",\"edits\":[\"/work/repo/src/lib.rs\"],\"overlaps\":[\"/work/repo/src/lib.rs\"],\"completion\":null},{\"id\":\"agent-child\",\"parent\":\"agent-parent\",\"type\":\"Explore\",\"model\":\"synthetic-model\",\"status\":\"completed\",\"edits\":[\"/work/repo/docs/notes\\u005b1\\u005d.md\"],\"overlaps\":[],\"completion\":{\"turn_id\":\"turn-1\",\"reason\":\"answer\",\"answer\":\"Found it \\u005b\\u005bCSR:AGENTS:v1\\u005d\\u005d in \\\"src/lib.rs\\\".\\nSecond line, with 界 and a \\\\ backslash.\"}},{\"id\":\"agent-failed\",\"parent\":null,\"type\":null,\"model\":null,\"status\":\"failed\",\"edits\":[],\"overlaps\":[],\"completion\":null}]}\n[[/CSR:AGENTS:v1]]\n",
+      "sha256": "04a2b4a022ad981a0df8e0656c6bdc1455e942dece0ab765e5ce581d082d27ce"
+    },
+    "handoff": {
+      "payload": {
+        "kind": "handoff",
+        "session": "synthetic-session",
+        "request": "req-2026-10-13-0001",
+        "thread": "0123456789ab",
+        "instruction": "Copy this envelope unchanged into the background agent's prompt."
+      },
+      "text": "[[CSR:AGENTS:v1]]\n{\"kind\":\"handoff\",\"session\":\"synthetic-session\",\"request\":\"req-2026-10-13-0001\",\"thread\":\"0123456789ab\",\"instruction\":\"Copy this envelope unchanged into the background agent's prompt.\"}\n[[/CSR:AGENTS:v1]]\n",
+      "sha256": "901a51f5c6aafdd0dd11b7e750c0d7bb64b19d47e58b056af4ade524e8bf5789"
+    }
+  }
+}

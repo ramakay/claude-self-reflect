@@ -9,7 +9,11 @@
 //! `StatusReport` (DB-backed).
 
 pub mod aggregator;
+pub mod degraded;
 pub mod parser;
+pub mod prompt_delivery;
+pub(crate) mod timing_scrub;
+pub use prompt_delivery::status_json;
 pub mod render;
 pub mod tui;
 
@@ -83,11 +87,22 @@ impl Window {
 #[derive(Serialize)]
 pub struct Telemetry {
     pub window: String,
+    #[serde(serialize_with = "status_with_health_reason")]
     pub status: StatusReport,
     pub report: TelemetryReport,
     pub log_path: String,
     pub log_lines_scanned: usize,
     pub log_lines_in_window: usize,
+}
+
+/// `telemetry --json` carries the same `health_reason` as `status`.
+fn status_with_health_reason<S: serde::Serializer>(
+    status: &StatusReport,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    let mut value = serde_json::to_value(status).map_err(serde::ser::Error::custom)?;
+    crate::storage::integrity::add_health_reason(&mut value);
+    value.serialize(serializer)
 }
 
 /// Explicit override for the timing log location. Must be an absolute path — a
@@ -172,6 +187,18 @@ const MAX_TIMING_LOG_BYTES: u64 = 10 * 1024 * 1024;
 /// concurrent rotation races lose a rename harmlessly, IO errors are swallowed
 /// (logging must never fail a hook).
 pub fn append_timing_line(line: &str) {
+    append_stamped_timing_line(&stamp_timing_line(line));
+}
+
+/// `line` as the timing log stores it: `<UTC second> <line>`.
+pub fn stamp_timing_line(line: &str) -> String {
+    format!("{} {}", Utc::now().format("%Y-%m-%dT%H:%M:%SZ"), line)
+}
+
+/// [`append_timing_line`] for a line already stamped by [`stamp_timing_line`], so a caller
+/// can print the very same text elsewhere (a hook's stderr, which Claude Code keeps in the
+/// transcript) and the two can be joined byte for byte.
+pub fn append_stamped_timing_line(stamped: &str) {
     let Some(log_path) = default_log_path() else {
         return;
     };
@@ -180,13 +207,62 @@ pub fn append_timing_line(line: &str) {
             let _ = std::fs::rename(&log_path, &old);
         }
     }
-    let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-    let entry = format!("{} {}\n", ts, line);
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
+    let entry = format!("{stamped}\n");
+    let _ = crate::private_files::append_private(&log_path)
         .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
+}
+
+/// The detached SessionEnd child's stderr log is rotated at open when it is
+/// already at least this large (one generation, `.1`). This is not a hard cap:
+/// the open fd the child holds can grow past it during that child's own run.
+const MAX_DETACHED_LOG_BYTES: u64 = 1024 * 1024;
+
+/// Where the detached SessionEnd child's stderr goes:
+/// `<csr data dir>/logs/session-end-detached.log`, next to the timing log (so
+/// it follows `CSR_TIMING_LOG` and the test-harness redirect).
+pub fn detached_session_end_log_path() -> Option<PathBuf> {
+    default_log_path()
+        .and_then(|p| p.parent().map(|d| d.join("logs")))
+        .map(|d| d.join("session-end-detached.log"))
+}
+
+/// Open `path` for a detached child's stderr: rotate at open when it is at
+/// least `max_bytes` (the size is checked here only, not while the child writes),
+/// create the directory, append, owner-only. `None` on any IO error — the
+/// caller falls back to discarding stderr, because a log problem must never
+/// stop the hook from running.
+fn open_rotated_log(path: &Path, max_bytes: u64) -> Option<std::fs::File> {
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    if std::fs::metadata(path).is_ok_and(|md| md.len() >= max_bytes) {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).ok()?;
+    let _ = std::io::Write::write_all(
+        &mut file,
+        format!(
+            "{} session-end detached child spawned by hook pid {}\n",
+            Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            std::process::id()
+        )
+        .as_bytes(),
+    );
+    Some(file)
+}
+
+/// Stderr for the detached SessionEnd child: the rotated log file, or
+/// discarded when it cannot be opened.
+pub fn detached_session_end_stderr() -> std::process::Stdio {
+    detached_session_end_log_path()
+        .and_then(|p| open_rotated_log(&p, MAX_DETACHED_LOG_BYTES))
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(std::process::Stdio::null)
 }
 
 /// CLI entry point.
@@ -199,7 +275,10 @@ pub fn handle(
 ) -> Result<()> {
     let window = match since {
         Some(s) => Window::parse(&s)?,
-        None => Window::Since(Utc::now() - Duration::hours(24)),
+        None => Window::Since(default_since(
+            Utc::now(),
+            prompt_delivery::running_binary_installed_at(),
+        )),
     };
 
     if tui {
@@ -240,9 +319,33 @@ pub fn collect(db_path: &Path, projects_dir: &Path, window: Window) -> Result<Te
     })
 }
 
+/// The default report window: the last 24 h, or since the running binary was installed when
+/// that is newer (as the prompt-delivery report does), so a fresh build is not judged on the
+/// lines the build before it wrote.
+fn default_since(now: DateTime<Utc>, installed_at: Option<DateTime<Utc>>) -> DateTime<Utc> {
+    let day = now - Duration::hours(24);
+    installed_at.map_or(day, |at| at.clamp(day, now))
+}
+
 #[cfg(test)]
 mod log_path_tests {
     use super::*;
+
+    #[test]
+    fn the_default_window_starts_at_install_when_that_is_inside_the_day() {
+        let now = DateTime::parse_from_rfc3339("2026-11-17T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let day = now - Duration::hours(24);
+        assert_eq!(default_since(now, None), day);
+        assert_eq!(
+            default_since(now, Some(now - Duration::hours(2))),
+            now - Duration::hours(2)
+        );
+        assert_eq!(default_since(now, Some(now - Duration::days(9))), day);
+        // a clock-skewed future install time never empties the window past now
+        assert_eq!(default_since(now, Some(now + Duration::hours(1))), now);
+    }
 
     /// The bug this guards: `cargo test` used to append to
     /// `~/.claude-self-reflect/hook-timing.log` — the developer's live log —
@@ -318,5 +421,40 @@ mod log_path_tests {
     fn without_an_override_or_harness_it_is_the_installed_path() {
         assert_eq!(resolve_log_path(None, false, home()), live());
         assert_eq!(resolve_log_path(None, false, None), None);
+    }
+
+    #[test]
+    fn detached_log_rotates_once_and_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs/session-end-detached.log");
+        // Creates the directory and appends across opens.
+        drop(open_rotated_log(&path, 1024).unwrap());
+        drop(open_rotated_log(&path, 1024).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        // Past the cap the old generation is kept as .1 and a fresh file starts.
+        std::fs::write(&path, vec![b'x'; 2048]).unwrap();
+        drop(open_rotated_log(&path, 1024).unwrap());
+        assert_eq!(
+            std::fs::metadata(path.with_extension("log.1"))
+                .unwrap()
+                .len(),
+            2048
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn detached_log_open_failure_is_none_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("logs");
+        std::fs::write(&blocker, "a file where the directory should be").unwrap();
+        assert!(open_rotated_log(&blocker.join("session-end-detached.log"), 1024).is_none());
+    }
+
+    #[test]
+    fn detached_log_path_sits_beside_the_timing_log() {
+        let path = detached_session_end_log_path().unwrap();
+        assert!(path.ends_with("logs/session-end-detached.log"), "{path:?}");
     }
 }

@@ -1,0 +1,144 @@
+[
+ {
+  "kind": "look",
+  "session": "sess-confused",
+  "at": 1793818881,
+  "confusing_claude": [
+   {
+    "evidence": "\"4 GB looks reachable with 13 sessions\", later \"I said earlier it looked reachable; that was too strong.\"",
+    "line": "Claude first told the person 4 GB looked reachable, then had to retract it after testing."
+   }
+  ]
+ },
+ {
+  "kind": "look",
+  "session": "sess-confused",
+  "at": 1793816634,
+  "confusing_claude": [
+   {
+    "evidence": "\"4 GB looks reachable with 13 sessions\" later became \"I said earlier it looked reachable; that was too strong.\"",
+    "line": "Claude told the person 4 GB looked reachable, then took it back once the checks were done."
+   }
+  ],
+  "should_be": [
+   {
+    "evidence": "Handoff note: \"Install: scp ... codesign ... launchctl bootstrap the plist\" and \".plans/release-10.1/install.sh is stale\"; backups pre-80f80d97 and pre-1306bf03.",
+    "kind": "skill",
+    "line": "The hand install of a release build keeps being carried as notes because the install script is stale."
+   }
+  ]
+ },
+ {
+  "kind": "look",
+  "session": "sess-confused",
+  "at": 1793814384,
+  "confusing_claude": [
+   {
+    "evidence": "\"4 GB looks reachable with 13 sessions\" later became \"I said earlier it looked reachable; that was too strong.\"",
+    "line": "Claude told the owner 4 GB looked reachable, then retracted it after testing Fable's plan."
+   }
+  ]
+ },
+ {
+  "kind": "look",
+  "session": "sess-confused",
+  "at": 1793812862,
+  "confusing_claude": [
+   {
+    "evidence": "Session summary: \"My first brief had the import guard backwards\" and \"I then copied only half the precedent (no marker), which the side agent caught\"",
+    "line": "Claude twice got the handoff draft's import handling wrong, first the guard's direction and then by leaving out the source marker."
+   }
+  ]
+ },
+ {
+  "kind": "look",
+  "session": "sess-confused",
+  "at": 1793811506,
+  "confusing_claude": [
+   {
+    "evidence": "\"my brief to the worker had the import rule backwards\"; later \"I followed the journal precedent only halfway\"",
+    "line": "Claude first ordered the handoff draft under CSR's own-output guard, then reversed it and copied only half the journal's approach."
+   }
+  ],
+  "should_be": [
+   {
+    "evidence": "\"I'll do that by hand, because the install script still points at an old rc2 worktree\"; the same steps ran for 80f80d97 and 1306bf03",
+    "kind": "skill",
+    "line": "Installing a Studio-built engine by hand: backup, stop daemon, signed swap, restart, inode check on panes."
+   }
+  ]
+ },
+ {
+  "kind": "look",
+  "session": "sess-confused",
+  "at": 1793738372,
+  "confusing_claude": [
+   {
+    "evidence": "Claude: \"The bug: I told the worker the full handoff draft must pass CSR's own-output guard. That's wrong.\"",
+    "line": "Claude's first worker brief had the import rule backwards for the full handoff draft"
+   }
+  ],
+  "should_be": [
+   {
+    "evidence": "Claude: \"Live panes are 35×30, wider than the 26-column cutoff.\" and \"The golden sizes are 38×30 and up.\"",
+    "kind": "memory",
+    "line": "Live CSR panes on this machine are 35×30, so pane goldens and renders must include that size"
+   }
+  ]
+ },
+ {
+  "kind": "look",
+  "session": "sess-confused",
+  "at": 1793735345,
+  "confusing_claude": [
+   {
+    "evidence": "Claude: \"my brief to the worker had the import rule backwards. Sending the correction now.\"",
+    "line": "Claude's first worker brief required the full handoff draft to trip CSR's own-output guard, then reversed that rule."
+   }
+  ]
+ },
+ {
+  "kind": "look",
+  "session": "sess-confused",
+  "at": 1793733975,
+  "confusing_claude": [
+   {
+    "evidence": "\"The dreamer is right, and my brief to the worker had the import rule backwards. Sending the correction now.\"",
+    "line": "Claude told the worker the full handoff draft must trip CSR's own-output guard, then had to reverse it after the dreamer's note."
+   }
+  ]
+ },
+ {
+  "kind": "look",
+  "session": "sess-confused",
+  "at": 1793729274,
+  "confusing_claude": [
+   {
+    "evidence": "Brief: \"Any new text you emit (asks, handoff draft) MUST still be recognised as CSR's own emission\"; later: \"Correction to your brief… I had it backwards for the full handoff draft.\"",
+    "line": "Claude's first worker brief said the full handoff draft must be flagged as CSR's own output, which was backwards."
+   }
+  ]
+ },
+ {
+  "kind": "look",
+  "session": "sess-confused",
+  "at": 1793727072,
+  "confusing_claude": [
+   {
+    "evidence": "Claude to the worker: \"Correction to your brief… I had it backwards for the full handoff draft.\"",
+    "line": "Claude's first brief told the worker to have CSR treat the full handoff draft as its own output, which would drop it from import"
+   }
+  ]
+ },
+ {
+  "kind": "look",
+  "session": "sess-confused",
+  "at": 1793722422,
+  "confusing_claude": [
+   {
+    "evidence": "Correction sent to the worker: \"I had it backwards for the full handoff draft.\"",
+    "line": "Claude first briefed the worker to put the full handoff draft under CSR's own-output guard, then reversed that."
+   }
+  ]
+ }
+]

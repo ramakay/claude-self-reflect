@@ -1,13 +1,22 @@
 //! Evaluation framework for csr-engine.
 //!
-//! Quick mode: 5 core tests (<30s)
-//! Full mode: 20 tests (~2 min)
+//! Quick mode: 5 core tests plus the persisted trained-reranker gate (<30s)
+//! Full mode: 24 results — 20 tests, the persisted trained-reranker gate, the
+//! emitter contamination canary, the report-only duplicate rate and the
+//! known-item recall probe (~2 min). Any failing result is a nonzero exit.
 //! Continuity mode: the North Star gate — CSR must recall its own vision with
 //! provenance, beating a grep baseline (`csr-engine eval --continuity`).
 
+pub mod bench;
 pub mod codegraph;
+pub mod contamination;
 pub mod continuity;
+pub mod embed_sample;
+pub mod health;
+pub mod lessons;
+pub mod probe;
 pub mod provenance;
+pub mod trained_rerank;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -24,18 +33,70 @@ pub struct EvalResult {
     pub name: String,
     pub category: String,
     pub passed: bool,
+    pub no_verdict: bool,
+    /// Over a soft target: prints `[AMBER]` and counts apart from a pass, but
+    /// `passed` stays true, so it never fails the run.
+    pub amber: bool,
+    /// Too little data to judge: prints `[ABSTAIN]` and counts apart from a
+    /// pass. `passed` stays true, so it never fails the run either.
+    pub abstain: bool,
     pub duration_ms: f64,
     pub detail: String,
 }
 
+/// A graded check: a plain pass, an amber (over a soft target, non-gating), or a fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Grade {
+    Pass,
+    Amber,
+    Fail,
+}
+
 impl EvalResult {
+    pub fn format_line(&self) -> String {
+        let status = if self.no_verdict {
+            "NO VERDICT"
+        } else if self.amber {
+            "AMBER"
+        } else if self.abstain {
+            "ABSTAIN"
+        } else if self.passed {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        format!(
+            "  [{status}] {:<30} ({:.0}ms) {}\n",
+            self.name, self.duration_ms, self.detail
+        )
+    }
+
     pub(crate) fn pass(name: &str, category: &str, duration_ms: f64, detail: String) -> Self {
         Self {
             name: name.to_string(),
             category: category.to_string(),
             passed: true,
+            no_verdict: false,
+            amber: false,
+            abstain: false,
             duration_ms,
             detail,
+        }
+    }
+
+    /// Over a soft target. Never gates: `passed` stays true.
+    pub(crate) fn amber(name: &str, category: &str, duration_ms: f64, detail: String) -> Self {
+        Self {
+            amber: true,
+            ..Self::pass(name, category, duration_ms, detail)
+        }
+    }
+
+    /// Too little data to judge. Never gates: `passed` stays true.
+    pub(crate) fn abstain(name: &str, category: &str, duration_ms: f64, detail: String) -> Self {
+        Self {
+            abstain: true,
+            ..Self::pass(name, category, duration_ms, detail)
         }
     }
 
@@ -44,8 +105,31 @@ impl EvalResult {
             name: name.to_string(),
             category: category.to_string(),
             passed: false,
+            no_verdict: false,
+            amber: false,
+            abstain: false,
             duration_ms,
             detail,
+        }
+    }
+
+    pub(crate) fn graded(
+        grade: Grade,
+        name: &str,
+        category: &str,
+        duration_ms: f64,
+        detail: String,
+    ) -> Self {
+        match grade {
+            Grade::Pass => Self::pass(name, category, duration_ms, detail),
+            Grade::Amber => Self::amber(name, category, duration_ms, detail),
+            Grade::Fail => Self::fail(name, category, duration_ms, detail),
+        }
+    }
+    pub(crate) fn no_verdict(name: &str, category: &str, detail: String) -> Self {
+        Self {
+            no_verdict: true,
+            ..Self::fail(name, category, 0.0, detail)
         }
     }
 }
@@ -57,12 +141,48 @@ pub struct EvalReport {
 }
 
 impl EvalReport {
+    /// Plain passes: not amber, not abstain, not no-verdict.
     pub fn passed(&self) -> usize {
-        self.results.iter().filter(|r| r.passed).count()
+        self.results
+            .iter()
+            .filter(|r| r.passed && !r.no_verdict && !r.amber && !r.abstain)
+            .count()
+    }
+
+    pub fn amber(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|r| r.amber && !r.no_verdict)
+            .count()
+    }
+
+    pub fn abstained(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|r| r.abstain && !r.amber && !r.no_verdict)
+            .count()
+    }
+
+    pub fn no_verdict(&self) -> usize {
+        self.results.iter().filter(|r| r.no_verdict).count()
+    }
+
+    pub fn failed(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|r| !r.passed && !r.no_verdict)
+            .count()
     }
 
     pub fn total(&self) -> usize {
         self.results.len()
+    }
+
+    /// True when any result failed. Amber, abstain and the report-only
+    /// duplicate rate pass, so only a real failure gates: an amber result
+    /// prints `[AMBER]` and `eval --full` still exits 0.
+    pub fn has_gating_failure(&self) -> bool {
+        self.failed() > 0
     }
 
     pub fn format_text(&self) -> String {
@@ -72,16 +192,16 @@ impl EvalReport {
         out.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
 
         for r in &self.results {
-            let status = if r.passed { "PASS" } else { "FAIL" };
-            out.push_str(&format!(
-                "  [{status}] {:<30} ({:.0}ms) {}\n",
-                r.name, r.duration_ms, r.detail
-            ));
+            out.push_str(&r.format_line());
         }
 
         out.push_str(&format!(
-            "\nResult: {}/{} passed in {:.0}ms\n",
+            "\nResult: {} pass, {} amber, {} abstain, {} no verdict, {} fail ({} results) in {:.0}ms\n",
             self.passed(),
+            self.amber(),
+            self.abstained(),
+            self.no_verdict(),
+            self.failed(),
             self.total(),
             self.total_ms
         ));
@@ -90,7 +210,7 @@ impl EvalReport {
     }
 }
 
-/// Run quick evaluation (5 tests).
+/// Run quick evaluation (5 core tests plus the trained-reranker gate).
 pub async fn run_quick(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
@@ -105,6 +225,7 @@ pub async fn run_quick(
     results.push(test_performance(embeddings, search).await);
     results.push(test_cache_status(index_dir));
     results.push(test_tool_count());
+    results.push(trained_rerank::latest_gate_result(storage));
 
     EvalReport {
         results,
@@ -112,22 +233,36 @@ pub async fn run_quick(
     }
 }
 
-/// Run full evaluation (20 tests).
+/// Run full evaluation (24 results). Equivalent to [`run_full_with`] keeping
+/// the frozen recall sample.
 pub async fn run_full(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
     index_dir: &Path,
 ) -> EvalReport {
+    run_full_with(storage, embeddings, search, index_dir, false).await
+}
+
+/// Run full evaluation. `refresh_recall_sample` deliberately starts a new
+/// recall sample (`eval --full --refresh-recall-sample`); history is kept.
+pub async fn run_full_with(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    index_dir: &Path,
+    refresh_recall_sample: bool,
+) -> EvalReport {
     let start = Instant::now();
     let mut results = Vec::new();
 
-    // Quick tests (5)
+    // Quick tests (5 core + trained-reranker gate)
     results.push(test_db_connectivity(storage));
     results.push(test_search_accuracy(storage, embeddings, search).await);
     results.push(test_performance(embeddings, search).await);
     results.push(test_cache_status(index_dir));
     results.push(test_tool_count());
+    results.push(trained_rerank::latest_gate_result(storage));
 
     // Semantic search tests (5)
     results.push(
@@ -191,6 +326,34 @@ pub async fn run_full(
     // Performance deep tests (2)
     results.push(test_batch_embedding_speed(embeddings));
     results.push(test_search_latency_p95(embeddings, search).await);
+
+    // Contamination: every emitter output detected, every mention kept (no DB).
+    results.push(contamination::emitter_canary());
+
+    // Memory health: measured now and persisted, then reported as two results.
+    let backend = crate::health::probe::EngineBackend {
+        storage: storage.clone(),
+        embeddings: embeddings.clone(),
+        search: search.clone(),
+        pages: Default::default(),
+    };
+    let run = crate::health::run_health(
+        storage,
+        search,
+        &backend,
+        refresh_recall_sample,
+        chrono::Utc::now(),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|run| run.ok_or_else(|| "the measurement was cancelled".to_string()));
+    let pages = *backend.pages.lock().unwrap_or_else(|e| e.into_inner());
+    results.push(health::duplicate_rate(&run, &pages));
+    results.push(health::known_item_recall(&run));
+
+    // Hook delivery: the prompt-submit share per project, from hook-timing.log.
+    results.push(crate::telemetry::prompt_delivery::eval_result());
 
     EvalReport {
         results,
@@ -287,7 +450,7 @@ async fn test_performance(
         Ok(v) => v,
         Err(e) => {
             return EvalResult::fail(
-                "Performance Target",
+                "Embed + Index Lookup",
                 "performance",
                 t.elapsed().as_secs_f64() * 1000.0,
                 format!("Embed error: {e}"),
@@ -302,24 +465,26 @@ async fn test_performance(
 
     if total_ms < 500.0 {
         EvalResult::pass(
-            "Performance Target",
+            "Embed + Index Lookup",
             "performance",
             total_ms,
-            format!("embed+search: {total_ms:.1}ms (search: {search_ms:.1}ms)"),
+            format!(
+                "embed + vector index lookup: {total_ms:.1}ms (index lookup alone: {search_ms:.1}ms; not a recall call)"
+            ),
         )
     } else {
         EvalResult::fail(
-            "Performance Target",
+            "Embed + Index Lookup",
             "performance",
             total_ms,
-            format!("too slow: {total_ms:.1}ms (target <500ms)"),
+            format!("too slow: {total_ms:.1}ms for embed + vector index lookup (target <500ms)"),
         )
     }
 }
 
 fn test_cache_status(index_dir: &Path) -> EvalResult {
     let t = Instant::now();
-    let manifest_path = index_dir.join("index_manifest.json");
+    let manifest_path = index_dir.join("manifest.json");
 
     if manifest_path.exists() {
         let metadata = std::fs::metadata(&manifest_path);
@@ -353,11 +518,21 @@ fn test_tool_count() -> EvalResult {
     let t = Instant::now();
     // Counted from the live rmcp router, not a constant — a hardcoded expectation
     // sat at 14 while the server shipped 15 tools (silently-inert eval).
-    let actual = crate::mcp::CsrServer::tool_count();
-    let expected = 15;
-    let detail = format!("{actual} MCP tools defined (expected {expected})");
+    // 16 as of csr_transcript (transcript-query-tool-design.md phase 3).
+    //
+    // A bare count only proves *some* 16 tools exist — it would still pass
+    // if csr_transcript were silently dropped and replaced by a duplicate
+    // of another tool. Assert the specific named tool is present too
+    // (adversarial review finding 6).
+    let names = crate::mcp::CsrServer::tool_names();
+    let actual = names.len();
+    let expected = 16;
+    let has_transcript = names.iter().any(|n| n == "csr_transcript");
+    let detail = format!(
+        "{actual} MCP tools defined (expected {expected}); csr_transcript present={has_transcript}"
+    );
     let ms = t.elapsed().as_secs_f64() * 1000.0;
-    if actual == expected {
+    if actual == expected && has_transcript {
         EvalResult::pass("Tool Count", "infrastructure", ms, detail)
     } else {
         EvalResult::fail("Tool Count", "infrastructure", ms, detail)
@@ -476,6 +651,13 @@ fn test_embedding_dimensions(embeddings: &Arc<EmbeddingEngine>) -> EvalResult {
     }
 }
 
+/// A side is consistent when its gap between SQLite and the index is no
+/// larger than the changes written after the index's cursor. Those rows are
+/// in flight (the index was loaded before they landed), not drift.
+fn index_gap_in_flight(db: usize, idx: usize, pending: usize) -> bool {
+    db.abs_diff(idx) <= pending
+}
+
 async fn test_search_index_consistency(
     storage: &Arc<Storage>,
     search: &Arc<RwLock<SearchEngine>>,
@@ -487,18 +669,35 @@ async fn test_search_index_consistency(
     let se = search.read().await;
     let idx_chunks = se.chunk_count();
     let idx_reflections = se.reflection_count();
+    let chunk_cursor = se.side_cursor(false);
+    let reflection_cursor = se.side_cursor(true);
     drop(se);
 
-    let ms = t.elapsed().as_secs_f64() * 1000.0;
-    let chunks_match = db_chunks == idx_chunks;
-    let reflections_match = db_reflections == idx_reflections;
+    // Read after the DB counts, so a row landing in between can only widen
+    // the allowance, never fail a consistent index.
+    let pending_chunks = storage
+        .count_embedding_changes_after(false, chunk_cursor)
+        .unwrap_or(0);
+    let pending_reflections = storage
+        .count_embedding_changes_after(true, reflection_cursor)
+        .unwrap_or(0);
 
-    if chunks_match && reflections_match {
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let counts =
+        format!("DB={db_chunks}c/{db_reflections}r, HNSW={idx_chunks}c/{idx_reflections}r");
+
+    if db_chunks == idx_chunks && db_reflections == idx_reflections {
+        EvalResult::pass("Index Consistency", "data", ms, counts)
+    } else if index_gap_in_flight(db_chunks, idx_chunks, pending_chunks)
+        && index_gap_in_flight(db_reflections, idx_reflections, pending_reflections)
+    {
         EvalResult::pass(
             "Index Consistency",
             "data",
             ms,
-            format!("DB={db_chunks}c/{db_reflections}r, HNSW={idx_chunks}c/{idx_reflections}r"),
+            format!(
+                "{counts}; gap covered by {pending_chunks}c/{pending_reflections}r changes written after the index was loaded (in flight)"
+            ),
         )
     } else {
         EvalResult::fail(
@@ -506,7 +705,7 @@ async fn test_search_index_consistency(
             "data",
             ms,
             format!(
-                "MISMATCH: DB={db_chunks}c/{db_reflections}r, HNSW={idx_chunks}c/{idx_reflections}r"
+                "MISMATCH: {counts}; only {pending_chunks}c/{pending_reflections}r changes in flight"
             ),
         )
     }
@@ -658,6 +857,40 @@ fn main() {
 
 // --- Performance deep tests ---
 
+/// Batch embedding target, ms per text. Over it the check warns, never fails.
+const BATCH_EMBED_TARGET_MS_PER_TEXT: f64 = 5.0;
+/// Vector index lookup p95 target, ms. Over it the check warns, never fails.
+/// It times the index lookup only: not embedding, full-text search, ranking or
+/// formatting, so it is not the latency of a recall call.
+const SEARCH_P95_TARGET_MS: f64 = 1.0;
+/// Timed passes over the query set, after one untimed warm-up pass.
+const SEARCH_TIMED_ROUNDS: usize = 5;
+
+/// Grade a batch embed. A timing miss is AMBER and does not gate (wall-clock
+/// noise, not a break); no vectors at all is a broken engine and fails.
+fn grade_batch_embed(texts: usize, total_ms: f64) -> (Grade, String) {
+    if texts == 0 || !total_ms.is_finite() {
+        return (
+            Grade::Fail,
+            format!("embed returned no vectors ({texts} texts, {total_ms}ms)"),
+        );
+    }
+    let per_text = total_ms / texts as f64;
+    if per_text < BATCH_EMBED_TARGET_MS_PER_TEXT {
+        (
+            Grade::Pass,
+            format!("{per_text:.1}ms/text ({texts} texts in {total_ms:.0}ms)"),
+        )
+    } else {
+        (
+            Grade::Amber,
+            format!(
+                "AMBER (non-gating): {per_text:.1}ms/text, target <{BATCH_EMBED_TARGET_MS_PER_TEXT:.0}ms/text ({texts} texts in {total_ms:.0}ms)"
+            ),
+        )
+    }
+}
+
 fn test_batch_embedding_speed(embeddings: &Arc<EmbeddingEngine>) -> EvalResult {
     let t = Instant::now();
     let texts: Vec<String> = (0..10)
@@ -668,27 +901,8 @@ fn test_batch_embedding_speed(embeddings: &Arc<EmbeddingEngine>) -> EvalResult {
     match embeddings.embed(&text_refs) {
         Ok(vecs) => {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
-            let per_text = ms / vecs.len() as f64;
-            if per_text < 5.0 {
-                EvalResult::pass(
-                    "Batch Embed Speed",
-                    "performance",
-                    ms,
-                    format!(
-                        "{:.1}ms/text ({} texts in {:.0}ms)",
-                        per_text,
-                        vecs.len(),
-                        ms
-                    ),
-                )
-            } else {
-                EvalResult::fail(
-                    "Batch Embed Speed",
-                    "performance",
-                    ms,
-                    format!("slow: {per_text:.1}ms/text (target <5ms)"),
-                )
-            }
+            let (grade, detail) = grade_batch_embed(vecs.len(), ms);
+            EvalResult::graded(grade, "Batch Embed Speed", "performance", ms, detail)
         }
         Err(e) => EvalResult::fail(
             "Batch Embed Speed",
@@ -696,6 +910,47 @@ fn test_batch_embedding_speed(embeddings: &Arc<EmbeddingEngine>) -> EvalResult {
             t.elapsed().as_secs_f64() * 1000.0,
             format!("Error: {e}"),
         ),
+    }
+}
+
+/// p95 by nearest rank: the value at rank ceil(0.95 * n) of the sorted
+/// samples. `None` for no samples (never an underflow).
+fn nearest_rank_p95(samples: &mut [f64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(|a, b| a.total_cmp(b));
+    let rank = (95 * samples.len()).div_ceil(100);
+    samples.get(rank.max(1) - 1).copied()
+}
+
+/// Grade the vector index lookup latency. `p95` is `None` when nothing was timed. Over the
+/// target is AMBER and does not gate; zero timed lookups (or a non-finite p95)
+/// is a broken engine and fails.
+fn grade_search_latency(p95: Option<f64>, timed: usize, chunks: usize) -> (Grade, String) {
+    let p95 = match p95 {
+        Some(p) if timed > 0 && p.is_finite() => p,
+        _ => {
+            return (
+                Grade::Fail,
+                format!(
+                    "no timed index lookups completed ({timed} timed, {chunks} chunks indexed)"
+                ),
+            )
+        }
+    };
+    if p95 < SEARCH_P95_TARGET_MS {
+        (
+            Grade::Pass,
+            format!("index lookup p95: {p95:.2}ms ({timed} timed lookups, {chunks} chunks)"),
+        )
+    } else {
+        (
+            Grade::Amber,
+            format!(
+                "AMBER (non-gating): index lookup p95 {p95:.2}ms, target <{SEARCH_P95_TARGET_MS:.0}ms ({timed} timed lookups, {chunks} chunks indexed)"
+            ),
+        )
     }
 }
 
@@ -722,43 +977,288 @@ async fn test_search_latency_p95(
         .filter_map(|q| embeddings.embed_single(q).ok())
         .collect();
 
-    let mut latencies = Vec::new();
+    let mut latencies = Vec::with_capacity(vecs.len() * SEARCH_TIMED_ROUNDS);
     let se = search.read().await;
+    // One untimed pass over every query warms caches and pages, so the
+    // timed searches measure steady state, not the first touch.
     for v in &vecs {
-        let qt = Instant::now();
         let _r = se.search_chunks(v, 5, 0.0);
-        latencies.push(qt.elapsed().as_secs_f64() * 1000.0);
     }
+    for _ in 0..SEARCH_TIMED_ROUNDS {
+        for v in &vecs {
+            let qt = Instant::now();
+            let _r = se.search_chunks(v, 5, 0.0);
+            latencies.push(qt.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    let chunks = se.chunk_count();
     drop(se);
 
-    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p95_idx = (latencies.len() as f64 * 0.95).ceil() as usize - 1;
-    let p95 = latencies
-        .get(p95_idx.min(latencies.len() - 1))
-        .copied()
-        .unwrap_or(0.0);
+    let timed = latencies.len();
+    let p95 = nearest_rank_p95(&mut latencies);
     let ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    if p95 < 10.0 {
-        EvalResult::pass(
-            "Search Latency P95",
-            "performance",
-            ms,
-            format!("p95: {p95:.2}ms ({} queries)", latencies.len()),
-        )
-    } else {
-        EvalResult::fail(
-            "Search Latency P95",
-            "performance",
-            ms,
-            format!("p95: {p95:.2}ms (target <10ms)"),
-        )
-    }
+    let (grade, detail) = grade_search_latency(p95, timed, chunks);
+    EvalResult::graded(grade, "Index Lookup P95", "performance", ms, detail)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_verdict_is_neither_a_pass_nor_a_gating_failure() {
+        let report = EvalReport {
+            results: vec![EvalResult::no_verdict(
+                "Prompt Delivery",
+                "hooks",
+                "n=29".into(),
+            )],
+            total_ms: 0.0,
+        };
+        assert_eq!(report.passed(), 0);
+        assert!(!report.has_gating_failure());
+        let text = report.format_text();
+        assert!(text.contains("[NO VERDICT]"));
+        assert!(!text.contains("[PASS]"));
+        assert!(
+            text.contains("Result: 0 pass, 0 amber, 0 abstain, 1 no verdict, 0 fail (1 results)")
+        );
+    }
+
+    #[tokio::test]
+    async fn index_lag_from_changes_after_the_cursor_passes_and_drift_fails() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        storage
+            .with_connection(|conn| {
+                conn.execute("INSERT INTO chunks(id,conversation_id,project_name,timestamp,content,message_count) VALUES('c','conv','project','2026-10-22','content',1)", [])?;
+                conn.execute("INSERT INTO chunk_embeddings(chunk_id,embedding) VALUES('c',?1)", [vec![0u8; 1536]])?;
+                Ok(())
+            })
+            .unwrap();
+        let search = Arc::new(RwLock::new(SearchEngine::new(EmbeddingEngine::dimension())));
+
+        // The index predates the row: one change after its cursor covers the gap.
+        let lag = test_search_index_consistency(&storage, &search).await;
+        assert!(lag.passed, "{}", lag.detail);
+        assert!(lag.detail.contains("in flight"), "{}", lag.detail);
+
+        // The index claims to have applied that change yet lacks the row: drift.
+        let seq = storage.latest_embedding_change_seq().unwrap();
+        search.write().await.set_change_cursor(seq);
+        let drift = test_search_index_consistency(&storage, &search).await;
+        assert!(!drift.passed, "{}", drift.detail);
+        assert!(drift.detail.starts_with("MISMATCH"), "{}", drift.detail);
+    }
+
+    #[test]
+    fn index_gap_is_in_flight_only_within_the_pending_changes() {
+        assert!(index_gap_in_flight(10, 10, 0));
+        assert!(index_gap_in_flight(12, 10, 2));
+        assert!(index_gap_in_flight(10, 12, 2));
+        assert!(!index_gap_in_flight(13, 10, 2));
+    }
+
+    #[tokio::test]
+    async fn full_eval_has_twenty_four_named_results() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(EmbeddingEngine::dimension())));
+        let dir = tempfile::tempdir().unwrap();
+        let report = run_full(&storage, &embeddings, &search, dir.path()).await;
+        let names: Vec<&str> = report.results.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "DB Connectivity",
+                "Search Accuracy",
+                "Embed + Index Lookup",
+                "Cache Status",
+                "Tool Count",
+                "Trained Re-ranker Gate",
+                "semantic_docker",
+                "semantic_mcp",
+                "semantic_errors",
+                "semantic_perf",
+                "semantic_auth",
+                "Chunk Data Quality",
+                "Reflection Data Quality",
+                "Embedding Dimensions",
+                "Index Consistency",
+                "DB Integrity",
+                "V3 Extraction",
+                "AST Analysis",
+                "Quality Analysis",
+                "Batch Embed Speed",
+                "Index Lookup P95",
+                "Emitter Contamination Canary",
+                "Duplicate Rate (Report Only)",
+                "Known-Item Recall",
+                "Prompt Delivery",
+            ]
+        );
+        assert_eq!(report.total(), 25);
+        // a fresh store: nothing to measure, so the probe abstains and no
+        // memory result fails the gate
+        let recall = &report.results[23];
+        assert!(recall.passed, "{}", recall.detail);
+        assert!(recall.detail.starts_with("ABSTAIN:"), "{}", recall.detail);
+        let duplicates = &report.results[22];
+        assert!(duplicates.passed && duplicates.detail.starts_with("REPORT ONLY:"));
+    }
+
+    #[test]
+    fn only_failing_results_gate_the_full_eval() {
+        let report = |results: Vec<EvalResult>| EvalReport {
+            results,
+            total_ms: 0.0,
+        };
+        // report-only, abstaining and amber results pass and never gate
+        let quiet = report(vec![
+            EvalResult::pass("a", "c", 0.0, "REPORT ONLY: 29 duplicate rows".into()),
+            EvalResult::abstain("b", "c", 0.0, "ABSTAIN: 4 eligible cases".into()),
+            EvalResult::amber("c", "c", 0.0, "AMBER (non-gating): 15/20".into()),
+        ]);
+        assert!(!quiet.has_gating_failure());
+        // The abstention is counted apart from the passes.
+        assert_eq!(
+            (
+                quiet.passed(),
+                quiet.amber(),
+                quiet.abstained(),
+                quiet.failed()
+            ),
+            (1, 1, 1, 0)
+        );
+        let text = quiet.format_text();
+        assert!(text.contains("  [AMBER] c"), "{text}");
+        assert!(text.contains("  [ABSTAIN] b"), "{text}");
+        assert!(!text.contains("[PASS] b"), "{text}");
+        assert!(
+            text.contains("Result: 1 pass, 1 amber, 1 abstain, 0 no verdict, 0 fail (3 results)"),
+            "{text}"
+        );
+        // a red recall result is a FAIL result, and it gates
+        let red = report(vec![
+            EvalResult::pass("a", "c", 0.0, "ok".into()),
+            EvalResult::fail("Known-Item Recall", "c", 0.0, "RED: 6/20".into()),
+        ]);
+        assert!(red.has_gating_failure());
+    }
+
+    #[test]
+    fn search_latency_under_target_is_a_plain_pass() {
+        let (grade, detail) = grade_search_latency(Some(0.42), 50, 760_078);
+        assert_eq!(grade, Grade::Pass);
+        assert_eq!(
+            detail,
+            "index lookup p95: 0.42ms (50 timed lookups, 760078 chunks)"
+        );
+        assert!(!detail.contains("AMBER"));
+    }
+
+    #[test]
+    fn search_latency_over_target_is_amber_and_passes() {
+        // the owner's quiet measurement, then the loaded one, then the boundary
+        for p95 in [4.13, 311.95, 1.0] {
+            let (grade, detail) = grade_search_latency(Some(p95), 50, 760_078);
+            assert_eq!(grade, Grade::Amber, "{detail}");
+            assert!(detail.starts_with("AMBER (non-gating): "), "{detail}");
+            assert!(detail.contains(&format!("{p95:.2}ms")), "{detail}");
+            assert!(detail.contains("target <1ms"), "{detail}");
+            assert!(detail.contains("50 timed lookups"), "{detail}");
+            assert!(detail.contains("760078 chunks"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn search_latency_with_nothing_timed_fails() {
+        for (p95, timed) in [(None, 0), (Some(0.5), 0), (Some(f64::NAN), 10), (None, 10)] {
+            let (grade, detail) = grade_search_latency(p95, timed, 12);
+            assert_eq!(grade, Grade::Fail, "{detail}");
+            assert!(detail.starts_with("no timed index lookups"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn nearest_rank_p95_matches_the_definition_and_never_panics() {
+        assert_eq!(nearest_rank_p95(&mut []), None);
+        assert_eq!(nearest_rank_p95(&mut [7.0]), Some(7.0));
+        // 50 samples: rank ceil(47.5) = 48, so the 48th smallest, not the max
+        let mut fifty: Vec<f64> = (1..=50).rev().map(f64::from).collect();
+        assert_eq!(nearest_rank_p95(&mut fifty), Some(48.0));
+        // 10 samples: rank ceil(9.5) = 10, the max
+        let mut ten: Vec<f64> = (1..=10).map(f64::from).collect();
+        assert_eq!(nearest_rank_p95(&mut ten), Some(10.0));
+        // one slow outlier among 50 does not decide the p95
+        let mut outlier = vec![0.4; 49];
+        outlier.push(300.0);
+        assert_eq!(nearest_rank_p95(&mut outlier), Some(0.4));
+    }
+
+    #[test]
+    fn batch_embed_under_target_is_a_plain_pass() {
+        let (grade, detail) = grade_batch_embed(10, 23.0);
+        assert_eq!(grade, Grade::Pass);
+        assert_eq!(detail, "2.3ms/text (10 texts in 23ms)");
+    }
+
+    #[test]
+    fn batch_embed_over_target_is_amber_and_passes() {
+        for total_ms in [51.0, 5000.0, 50.0] {
+            let (grade, detail) = grade_batch_embed(10, total_ms);
+            assert_eq!(grade, Grade::Amber, "{detail}");
+            assert!(detail.starts_with("AMBER (non-gating): "), "{detail}");
+            assert!(detail.contains("target <5ms/text"), "{detail}");
+            assert!(detail.contains("10 texts"), "{detail}");
+        }
+        let (_, detail) = grade_batch_embed(10, 51.0);
+        assert!(detail.contains("5.1ms/text"), "{detail}");
+    }
+
+    #[test]
+    fn batch_embed_with_no_vectors_fails() {
+        let (grade, detail) = grade_batch_embed(0, 3.0);
+        assert_eq!(grade, Grade::Fail, "{detail}");
+        assert!(detail.contains("no vectors"), "{detail}");
+    }
+
+    #[test]
+    fn amber_timing_results_never_gate_the_full_eval() {
+        let (p_grade, p_detail) = grade_search_latency(Some(311.95), 50, 760_078);
+        let (b_grade, b_detail) = grade_batch_embed(10, 51.0);
+        let mk = |grade: Grade, name: &str, detail: String| {
+            EvalResult::graded(grade, name, "performance", 0.0, detail)
+        };
+        let amber = EvalReport {
+            results: vec![
+                mk(p_grade, "Index Lookup P95", p_detail),
+                mk(b_grade, "Batch Embed Speed", b_detail),
+            ],
+            total_ms: 0.0,
+        };
+        // amber does not fail the run: `eval --full` exits 0 on it
+        assert!(!amber.has_gating_failure());
+        let text = amber.format_text();
+        assert!(
+            !text.contains("[FAIL]") && !text.contains("[PASS]"),
+            "{text}"
+        );
+        assert!(text.contains("  [AMBER] Index Lookup P95"), "{text}");
+        assert!(text.contains("  [AMBER] Batch Embed Speed"), "{text}");
+        assert!(
+            text.contains("Result: 0 pass, 2 amber, 0 abstain, 0 no verdict, 0 fail (2 results)"),
+            "{text}"
+        );
+        // a broken engine still gates
+        let (p_grade, p_detail) = grade_search_latency(None, 0, 0);
+        let broken = EvalReport {
+            results: vec![mk(p_grade, "Index Lookup P95", p_detail)],
+            total_ms: 0.0,
+        };
+        assert!(broken.has_gating_failure());
+        assert!(broken.format_text().contains("[FAIL]"));
+    }
 
     #[test]
     fn test_eval_result_formatting() {
@@ -774,7 +1274,9 @@ mod tests {
         let text = report.format_text();
         assert!(text.contains("PASS"));
         assert!(text.contains("FAIL"));
-        assert!(text.contains("1/2"));
+        assert!(
+            text.contains("Result: 1 pass, 0 amber, 0 abstain, 0 no verdict, 1 fail (2 results)")
+        );
     }
 
     #[test]
@@ -801,5 +1303,49 @@ mod tests {
             "Quality analysis should pass: {}",
             result.detail
         );
+    }
+
+    // ─── adversarial review finding 6: tool-count gate must name csr_transcript ───
+
+    #[test]
+    fn test_tool_count_gate_asserts_csr_transcript_present() {
+        let result = test_tool_count();
+        assert!(
+            result.passed,
+            "tool count gate should pass: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("csr_transcript present=true"),
+            "gate detail must name csr_transcript explicitly, got: {}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn test_csr_transcript_tool_schema_and_annotations() {
+        let tool = crate::mcp::CsrServer::find_tool("csr_transcript")
+            .expect("csr_transcript must be registered in the rmcp tool router");
+
+        // Schema generation actually ran (not a degenerate/empty schema):
+        // the two required params show up as real object-schema properties.
+        let props = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("csr_transcript input_schema must have a properties object");
+        assert!(
+            props.contains_key("session"),
+            "schema missing 'session' property"
+        );
+        assert!(props.contains_key("view"), "schema missing 'view' property");
+
+        let annotations = tool
+            .annotations
+            .as_ref()
+            .expect("csr_transcript must declare tool annotations");
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.idempotent_hint, Some(true));
     }
 }

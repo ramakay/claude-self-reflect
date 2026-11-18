@@ -646,11 +646,23 @@ describe('choosing a binary to run', () => {
   });
 });
 
+// postinstall.js ends a fresh install with `launchctl kickstart -k` on the
+// user's daemon. These cases take the "already installed" branch, which never
+// gets there, but a stub first on PATH keeps any future case from restarting
+// the real daemon of whoever runs the tests.
+function launchctlStubDir() {
+  const dir = tempDir('fake-launchctl');
+  writeFileSync(join(dir, 'launchctl'), '#!/bin/sh\nexit 0\n');
+  chmodSync(join(dir, 'launchctl'), 0o755);
+  return dir;
+}
+
 function runPostinstall({ home, installDir, pathPrefix, autoSetup }) {
+  const stub = launchctlStubDir();
   const env = {
     ...process.env,
     HOME: home,
-    PATH: pathPrefix ? `${pathPrefix}:${process.env.PATH}` : process.env.PATH,
+    PATH: [stub, ...(pathPrefix ? [pathPrefix] : []), process.env.PATH].join(':'),
     CSR_INSTALL_DIR: installDir,
     CSR_FORCE_POSTINSTALL: '1',
   };

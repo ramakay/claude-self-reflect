@@ -1,0 +1,5 @@
+{"type": "system", "subtype": "compact_boundary", "timestamp": "2026-10-18T09:40:00+00:00", "compactMetadata": {"trigger": "manual", "preTokens": 200000, "durationMs": 80000}}
+{"type": "system", "subtype": "compact_boundary", "timestamp": "2026-10-18T08:40:00+00:00", "compactMetadata": {"trigger": "manual", "preTokens": 150000, "durationMs": 60000}}
+{"type": "system", "subtype": "compact_boundary", "timestamp": "2026-10-18T08:10:00+00:00", "compactMetadata": {"trigger": "auto", "preTokens": 250000, "durationMs": 70000}}
+{"type": "system", "subtype": "compact_boundary", "timestamp": "2026-10-17T10:40:00+00:00", "compactMetadata": {"trigger": "manual", "preTokens": 300000, "durationMs": 100000}}
+{"type": "system", "subtype": "compact_boundary", "timestamp": "2026-10-15T10:40:00+00:00", "compactMetadata": {"trigger": "manual", "preTokens": 190000, "durationMs": 95000}}

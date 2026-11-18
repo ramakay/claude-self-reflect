@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { Outlet, Link, useLocation, useNavigate } from 'react-router'
 import { Github, ChevronDown, ChevronRight, Menu, X, ArrowLeft, Sun, Moon, Search } from 'lucide-react'
 import { navigation, pages } from '../content'
+import BrandMark from './BrandMark'
 
 function SidebarGroup({ group, location }) {
   const active = group.items.some(i => location.pathname === i.href)
@@ -194,9 +195,9 @@ export default function Layout() {
             {sidebarOpen ? <X size={20} aria-hidden="true" /> : <Menu size={20} aria-hidden="true" />}
           </button>
           <Link className="site-nav__brand" to="/">
-            <img src="/claude-self-reflect/favicon.svg" alt="" width={28} height={28} />
+            <BrandMark size={28} />
             <span>
-              <span className="site-nav__name" style={{ fontSize: 18 }}>Claude Self-Reflect</span>
+              <span className="site-nav__name" style={{ fontSize: 18 }}>Self-Reflect</span>
               <span className="site-nav__tag">Documentation</span>
             </span>
           </Link>
@@ -207,8 +208,10 @@ export default function Layout() {
               <kbd>/</kbd>
             </button>
             <Link className="site-nav__link" to="/docs/why-csr">Guide</Link>
+            <Link className="site-nav__link" to="/docs/features">Features</Link>
             <Link className="site-nav__link" to="/docs/mcp-tools">Reference</Link>
             <Link className="site-nav__link" to="/docs/architecture">Architecture</Link>
+            <Link className="site-nav__link" to="/docs/report-card">Status</Link>
             <button className="theme-toggle" onClick={() => { const n = theme === 'dark' ? 'light' : 'dark'; localStorage.setItem('csr-theme', n); setTheme(n) }} aria-label="Toggle theme">
               {theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
             </button>

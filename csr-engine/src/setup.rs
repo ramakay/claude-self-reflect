@@ -6,34 +6,62 @@
 //! 1. Creates DB
 //! 2. Discovers + imports all conversations
 //! 3. Runs heuristic enrichment
-//! 4. Registers as MCP server (claude mcp add)
+//! 4. Registers as MCP server (claude mcp add, and codex mcp add when Codex is installed)
 //! 5. Installs hooks
 //! 6. Optionally saves Anthropic API key
 //! 7. Prints summary
+//!
+//! After those steps succeed, setup installs the csr-companion plugin. The binary writes it as
+//! a local marketplace under `~/.claude-self-reflect/csr-companion/marketplace` and Claude
+//! Code's own plugin CLI installs it from there (`install_relay`, also `csr-engine companion
+//! plugin install`), so the plugin's version is always the engine's. `--no-companion` skips
+//! it. A failure there is reported with the one command that retries it and never fails setup.
 
+use std::io::{BufRead, IsTerminal, Read};
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::companion::relay::emit;
+use crate::daemon::dream_cadence;
+use crate::dream::policy::{self, EffortTier, NightEstimate};
 use crate::engine::Engine;
 use crate::hooks;
 use crate::import;
+use crate::storage::Storage;
+
+/// One line in the setup output: what calls `claude -p`, under whose account,
+/// and the switch that stops it. The README and the docs-site installation page
+/// carry the full text; keep the three in step.
+const CLAUDE_P_NOTICE: &str = "  Note: session briefings, narratives, ratification and dreams run `claude -p` on your own Claude account (your plan's usage). CSR_NO_AI_NARRATIVES=1 turns them all off; CSR_NO_DREAMING=1 stops dreams only.";
 
 /// Run the full setup flow.
 pub async fn handle(
     db_path: &Path,
     projects_dir: &Path,
     anthropic_key: Option<String>,
+    companion: bool,
 ) -> Result<()> {
-    eprintln!("\n=== Claude Self-Reflect Setup ===\n");
+    eprintln!("\n=== Self-Reflect Setup ===\n");
 
-    // Step 1: Ensure DB directory exists
+    // Step 1: Ensure DB directory exists, open the engine, and load the
+    // embedding model. The model loads lazily on first embed everywhere else;
+    // here a first-run download belongs in front of the user (with progress),
+    // and it has to succeed BEFORE the MCP server and hooks are written into
+    // Claude's config, so a failed download never leaves setup half-applied.
     let csr_dir = db_path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(csr_dir)?;
-    eprintln!("[1/6] Database directory ready: {}", csr_dir.display());
+    crate::private_files::create_data_dir(csr_dir)?;
+    eprintln!("[1/8] Database directory ready: {}", csr_dir.display());
+    // Before the engine writes its first index or model file, so the skip is already in place.
+    eprint!("{}", time_machine_step(csr_dir));
+    let eng = Engine::new(db_path, projects_dir)?;
+    eng.embeddings().warm()?;
+    eprintln!("  Embedding model ready");
 
-    // Step 2: Register as MCP server (before Engine::new — works without DB)
-    eprintln!("[2/6] Registering MCP server...");
+    // Step 2: Register as MCP server
+    eprintln!("[2/8] Registering MCP server...");
     // A registration failure must not cost the user hooks and import, but it
     // must not be reported as success either: note it here, finish the rest,
     // and print the details once at the end. The returned error is deliberately
@@ -42,17 +70,17 @@ pub async fn handle(
     if mcp_error.is_some() {
         eprintln!("  MCP registration failed; details at the end of setup.");
     }
+    // The same server for Codex, when its CLI is installed. Never fails setup.
+    eprint!("{}", codex_step());
 
     // Step 3: Install hooks
-    eprintln!("[3/6] Installing hooks...");
-    if let Err(e) = hooks::install::handle(true) {
-        eprintln!("  Warning: hook installation failed: {e}");
-        eprintln!("  You can run `csr-engine hook install --apply` later.");
-    }
+    eprintln!("[3/8] Installing hooks...");
+    // Like the MCP step: a failure does not cost the user the import, but it
+    // is carried to the summary instead of being dropped after this warning.
+    let hook_error = hook_install_step(|| hooks::install::handle(true));
 
-    // Step 4: Create engine, import conversations
-    eprintln!("[4/6] Importing conversations...");
-    let eng = Engine::new(db_path, projects_dir)?;
+    // Step 4: Import conversations
+    eprintln!("[4/8] Importing conversations...");
 
     // Count JSONL files for progress
     let total_files = count_total_files(projects_dir);
@@ -61,9 +89,13 @@ pub async fn handle(
     let imported = eng.import_conversations(None).await?;
     eprintln!("  Imported {} chunks", imported);
 
-    // Optional vendor corpus: absence is intentionally silent/inert.
-    if let Some(codex_root) = dirs::home_dir().map(|home| home.join(".codex/sessions")) {
+    // Optional vendor corpus: absence is intentionally silent/inert, and
+    // CSR_NO_CODEX_IMPORT=1 skips it on purpose (first import can take hours).
+    if crate::daemon::codex_import_disabled() {
+        eprintln!("  Codex rollout import skipped (CSR_NO_CODEX_IMPORT is set)");
+    } else if let Some(codex_root) = dirs::home_dir().map(|home| home.join(".codex/sessions")) {
         if codex_root.exists() {
+            let harness_strip_root = codex_root.clone();
             let adapter_engine = eng.clone();
             let stats = tokio::task::spawn_blocking(move || {
                 crate::import::codex_rollout::import_changed_rollouts(&adapter_engine, &codex_root)
@@ -73,11 +105,177 @@ pub async fn handle(
                 "  Imported {} Codex rollout chunks from {} changed files",
                 stats.chunks_imported, stats.files_imported
             );
+
+            // One-time, meta-guarded backfill for rollouts imported before
+            // the chunk-timestamp-collapse fix (see
+            // `restamp_codex_chunk_timestamps`'s doc). Runs under this same
+            // binary, so it always applies the fixed chunker — cheap on a
+            // no-op second run (single meta lookup).
+            let restamp_storage = eng.storage().clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::import::codex_rollout::restamp_codex_chunk_timestamps(&restamp_storage)
+            })
+            .await
+            {
+                Ok(Ok(restamp_stats)) if !restamp_stats.already_applied => {
+                    eprintln!(
+                        "  Restamped {} Codex rollout chunks across {} conversations ({} missing file, {} unmatched)",
+                        restamp_stats.chunks_updated,
+                        restamp_stats.conversations_updated,
+                        restamp_stats.conversations_missing_file,
+                        restamp_stats.conversations_unmatched,
+                    );
+                }
+                Ok(Ok(_)) => {} // already_applied — silent, nothing to report
+                Ok(Err(e)) => eprintln!("  Warning: Codex timestamp backfill failed: {e}"),
+                Err(e) => eprintln!("  Warning: Codex timestamp backfill failed: {e}"),
+            }
+
+            // One-time, meta-guarded backfill for rollouts imported before the
+            // harness-marker-stripping adapter fix: invalidate their stored
+            // mtime so the `import_changed_rollouts` pass just above (this
+            // same run doesn't re-run it, so do it explicitly here) picks
+            // them up through the fixed adapter. Daemon-owned installs get
+            // the stronger, self-resuming `harness_strip_batch` path instead
+            // (`daemon::mod`); this covers a one-shot `setup` run that never
+            // starts the daemon at all.
+            let strip_engine = eng.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::import::codex_rollout::invalidate_polluted_codex_rollouts(&strip_engine)
+            })
+            .await
+            {
+                Ok(Ok(strip_stats)) if !strip_stats.already_applied => {
+                    if strip_stats.conversations_invalidated > 0 {
+                        eprintln!(
+                            "  Flagged {} harness-polluted Codex rollouts for re-import",
+                            strip_stats.conversations_invalidated
+                        );
+                        let reimport_engine = eng.clone();
+                        let reimport_root = harness_strip_root.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            crate::import::codex_rollout::import_changed_rollouts(
+                                &reimport_engine,
+                                &reimport_root,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(reimport_stats)) => eprintln!(
+                                "  Re-imported {} Codex rollout chunks across {} files (harness strip)",
+                                reimport_stats.chunks_imported, reimport_stats.files_imported
+                            ),
+                            Ok(Err(e)) => {
+                                eprintln!("  Warning: Codex harness-strip re-import failed: {e}")
+                            }
+                            Err(e) => {
+                                eprintln!("  Warning: Codex harness-strip re-import failed: {e}")
+                            }
+                        }
+                    }
+                }
+                Ok(Ok(_)) => {} // already_applied — silent, nothing to report
+                Ok(Err(e)) => eprintln!("  Warning: Codex harness-strip backfill failed: {e}"),
+                Err(e) => eprintln!("  Warning: Codex harness-strip backfill failed: {e}"),
+            }
+
+            // One-time, meta-guarded backfill: flip already-imported Codex
+            // subagent (`thread_spawn`) rollouts to `is_sidechain = 1` so
+            // they don't take their own recent-work slot next to their
+            // parent (see `RolloutMetadata::is_subagent`'s doc).
+            let sidechain_storage = eng.storage().clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::import::codex_rollout::backfill_codex_subagent_sidechain(&sidechain_storage)
+            })
+            .await
+            {
+                Ok(Ok(sidechain_stats)) if !sidechain_stats.already_applied => {
+                    if sidechain_stats.conversations_subagent > 0 {
+                        eprintln!(
+                            "  Marked {} Codex subagent rollouts as sidechains ({} chunks)",
+                            sidechain_stats.conversations_subagent, sidechain_stats.chunks_updated
+                        );
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("  Warning: Codex subagent sidechain backfill failed: {e}"),
+                Err(e) => eprintln!("  Warning: Codex subagent sidechain backfill failed: {e}"),
+            }
+        }
+    }
+
+    // Memory registry spine: one initial scan so setup doesn't leave the table empty
+    // until the daemon's first 30-min tick. Kill switch matches the daemon loop.
+    if !crate::daemon::memory_registry_disabled() {
+        let storage = eng.storage().clone();
+        let projects_root = projects_dir.to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            crate::import::memory_registry::scan_memory_dirs(&storage, &projects_root)
+        })
+        .await
+        {
+            Ok(Ok(stats)) => {
+                eprintln!(
+                    "  Memory registry: {} files scanned, {} upserted, {} schema misses",
+                    stats.files_seen, stats.upserted, stats.schema_misses
+                );
+            }
+            Ok(Err(e)) => {
+                eprintln!("  Warning: memory registry scan failed: {e}");
+            }
+            Err(e) => {
+                eprintln!("  Warning: memory registry scan failed: {e}");
+            }
+        }
+    }
+
+    // File history for the files Bash calls wrote (`sed -i`, heredocs, short
+    // scripts), replayed once from the transcripts just imported; the daemon
+    // does the same for an install that never reruns setup. Meta-guarded, and
+    // gated on the same hook check as the daemon: step 3 just installed the
+    // hooks, but if that failed the replay waits rather than mark itself done
+    // while the live hook still skips Bash.
+    {
+        use crate::import::coedit_backfill::BashReplay;
+        let storage = eng.storage().clone();
+        let projects_root = projects_dir.to_path_buf();
+        let settings = crate::hooks::install::default_settings_path().unwrap_or_default();
+        match tokio::task::spawn_blocking(move || {
+            crate::import::coedit_backfill::backfill_coedit_once(
+                &storage,
+                &projects_root,
+                &settings,
+            )
+        })
+        .await
+        {
+            Ok(Ok(BashReplay::Ran(stats))) => {
+                let (_, inserted, _) = stats.totals();
+                eprintln!(
+                    "  File history: {} edits recorded from {} transcripts ({} already live)",
+                    inserted,
+                    stats.files_scanned,
+                    stats.already_live_total()
+                );
+                if !stats.complete() {
+                    eprintln!(
+                        "  File history: incomplete ({} unread, {} failed inserts); \
+                         the daemon runs it again at its next start",
+                        stats.read_errors, stats.insert_errors
+                    );
+                }
+            }
+            Ok(Ok(BashReplay::WaitingOnHook)) => eprintln!(
+                "  File history: waiting for the Bash hook (run: csr-engine hook install --apply)"
+            ),
+            Ok(Ok(BashReplay::Done)) => {}
+            Ok(Err(e)) => eprintln!("  Warning: file-history backfill failed: {e}"),
+            Err(e) => eprintln!("  Warning: file-history backfill failed: {e}"),
         }
     }
 
     // Step 5: Run enrichment
-    eprintln!("[5/6] Running heuristic enrichment...");
+    eprintln!("[5/8] Running heuristic enrichment...");
     let (backfilled, enriched) = eng.backfill_and_enrich().await?;
     if backfilled > 0 {
         eprintln!("  Backfilled {} import_state rows", backfilled);
@@ -86,47 +284,1021 @@ pub async fn handle(
 
     // Step 6: Save Anthropic API key if provided
     if let Some(key) = &anthropic_key {
-        eprintln!("[6/6] Saving Anthropic API key...");
+        eprintln!("[6/8] Saving Anthropic API key...");
         save_anthropic_key(csr_dir, key)?;
         eprintln!("  Saved to {}", csr_dir.join(".env").display());
     } else {
-        eprintln!("[6/6] Skipping AI narratives (no --anthropic-key provided)");
+        eprintln!("[6/8] No --anthropic-key provided (optional)");
     }
+    eprintln!("{CLAUDE_P_NOTICE}");
+
+    // Step 7: Dreaming consent (Journal v4 P5, locked decision 15). Presented
+    // ON by default, with a per-night token estimate computed from the corpus
+    // that was just imported — i.e. from real numbers, shown BEFORE the
+    // question is asked.
+    dreaming_consent_step(eng.storage())?;
+
+    // Step 8: the background daemon. Last, so it never races the import above
+    // for the database. Dreams are on by default and only the daemon runs them.
+    eprintln!("[8/8] Starting the background daemon...");
+    let daemon_text = {
+        let (db, projects) = (db_path.to_path_buf(), projects_dir.to_path_buf());
+        tokio::task::spawn_blocking(move || daemon_step_live(&db, &projects))
+            .await
+            .unwrap_or_else(|e| format!("  The daemon step did not finish: {e}\n"))
+    };
+    eprint!("{daemon_text}");
 
     // Summary
     let conversations = eng.storage().count_conversations().unwrap_or(0);
     let reflections = eng.storage().count_reflection_embeddings().unwrap_or(0);
     let projects = eng.storage().count_projects().unwrap_or(0);
 
-    if let Some(failure) = mcp_error {
+    if mcp_error.is_some() || hook_error.is_some() {
         eprintln!("\n=== Setup Incomplete ===\n");
         eprintln!("  Conversations: {}", conversations);
         eprintln!("  Reflections:   {}", reflections);
         eprintln!("  Projects:      {}", projects);
         eprintln!();
-        eprintln!("  Hooks and import are done. {}", failure.summary);
-        eprintln!("  {}", failure.detail);
+        eprint!(
+            "{}",
+            incomplete_report(mcp_error.as_ref(), hook_error.as_deref())
+        );
         eprintln!();
         // Short on purpose: the detail above is the only copy the user reads.
-        return Err(anyhow::anyhow!("MCP server not registered"));
+        return Err(anyhow::anyhow!(incomplete_error(
+            mcp_error.is_some(),
+            hook_error.is_some()
+        )));
     }
+
+    // The engine steps all succeeded: now the companion. Not part of the numbered
+    // steps above because it is the one that can fail without failing setup.
+    let report = tokio::task::spawn_blocking(move || {
+        let home = dirs::home_dir().unwrap_or_default();
+        let engine = std::env::current_exe().unwrap_or_default();
+        companion_step(
+            companion,
+            Path::new("claude"),
+            &home,
+            &engine,
+            COMPANION_TIMEOUT,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Some(RelayReport {
+            outcome: CompanionOutcome::Failed {
+                reason: format!("the install task did not finish: {e}"),
+            },
+            changed: false,
+            steps: Vec::new(),
+        })
+    });
 
     eprintln!("\n=== Setup Complete ===\n");
     eprintln!("  Conversations: {}", conversations);
     eprintln!("  Reflections:   {}", reflections);
     eprintln!("  Projects:      {}", projects);
-    eprintln!();
-    eprintln!("Next steps:");
-    eprintln!("  1. Restart Claude Code to activate MCP tools");
-    eprintln!("  2. Try: reflect_on_past(\"what did we work on?\")");
-    if anthropic_key.is_some() {
-        eprintln!("  3. Run `csr-engine daemon` for AI-powered narrative enrichment");
-    } else {
-        eprintln!("  3. Optional: `csr-engine setup --anthropic-key=sk-ant-...` for AI narratives");
-    }
-    eprintln!();
+    eprint!("\n{}", crate::stale_report::section().trim_start());
+    eprint!("{}", next_steps(report.as_ref()));
 
     Ok(())
+}
+
+/// Data-dir folders Self-Reflect can rebuild or re-download: the search index, the downloaded
+/// embedding models and a cache. Setup asks Time Machine to skip exactly these. The database
+/// (`csr-engine.db`, `-wal`, `-shm`) and `mirror/` are not here and must never be: the mirror is
+/// the only copy of transcripts Claude Code has deleted, and the database holds your verdicts
+/// and notes.
+const TM_SKIP_DIRS: [&str; 3] = ["index-v3", "models", "cache"];
+
+/// The skipped folders setup creates when they are missing, so the exclusion is already on the
+/// folder before the first index or model write lands in it. `cache` is not created: nothing in
+/// the engine writes there today, so an empty one would only be clutter. An empty `index-v3` is
+/// read as "no index yet", the same as a missing one.
+const TM_CREATE_FIRST: [&str; 2] = ["index-v3", "models"];
+
+const TMUTIL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `CSR_NO_TM_EXCLUDE=1` (or `true`) is the opt-out.
+fn tm_exclude_opted_out() -> bool {
+    std::env::var("CSR_NO_TM_EXCLUDE").is_ok_and(|v| matches!(v.trim(), "1" | "true"))
+}
+
+/// Run `tmutil <args>`; the stdout on success, or one line saying what failed.
+fn real_tmutil(args: &[&str]) -> std::result::Result<String, String> {
+    let sub = args.first().copied().unwrap_or("").to_owned();
+    let owned: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // `Builder::spawn`, not `thread::spawn`: a refused thread is an error to report, never a panic.
+    std::thread::Builder::new()
+        .name("tmutil".to_owned())
+        .spawn(move || {
+            let _ = tx.send(
+                Command::new("tmutil")
+                    .args(&owned)
+                    .stdin(Stdio::null())
+                    .output(),
+            );
+        })
+        .map_err(|e| format!("could not start `tmutil {sub}`: {e}"))?;
+    match rx.recv_timeout(TMUTIL_TIMEOUT) {
+        Err(_) => Err(format!(
+            "`tmutil {sub}` did not finish within {} s",
+            TMUTIL_TIMEOUT.as_secs()
+        )),
+        Ok(Err(e)) => Err(format!("could not run tmutil: {e}")),
+        Ok(Ok(out)) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+        Ok(Ok(out)) => {
+            let said = String::from_utf8_lossy(&out.stderr).into_owned();
+            let said = if said.trim().is_empty() {
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            } else {
+                said
+            };
+            let said = said
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("no detail");
+            Err(format!(
+                "`tmutil {sub}` failed: {}",
+                said.trim().chars().take(200).collect::<String>()
+            ))
+        }
+    }
+}
+
+/// Ask Time Machine to skip the rebuildable folders under `csr_dir`; the lines setup prints.
+///
+/// `tmutil addexclusion <path>` without `-p` is the sticky form: it sets a flag on the folder
+/// itself, needs no sudo, and follows the folder if the data dir is moved. Already-excluded
+/// folders are left alone, so a second setup run changes nothing. This never fails setup: a
+/// missing or erroring `tmutil` costs one line, and the folders simply stay in backups.
+///
+/// `macos` and `opted_out` are parameters, and `tmutil` is a closure, so tests drive every path
+/// without the real tool.
+fn time_machine_exclusion(
+    csr_dir: &Path,
+    macos: bool,
+    opted_out: bool,
+    tmutil: &mut dyn FnMut(&[&str]) -> std::result::Result<String, String>,
+) -> String {
+    if !macos {
+        return String::new();
+    }
+    if opted_out {
+        return "  Time Machine exclusion skipped (CSR_NO_TM_EXCLUDE is set).\n".to_owned();
+    }
+    for name in TM_CREATE_FIRST {
+        // Best effort: a folder that cannot be made is skipped below, not reported.
+        let _ = std::fs::create_dir_all(csr_dir.join(name));
+    }
+
+    let (mut added, mut already) = (Vec::new(), Vec::new());
+    let mut failure = None;
+    for name in TM_SKIP_DIRS {
+        let path = csr_dir.join(name);
+        // A real folder only: a symlink would get the flag, not the folder it points to.
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let shown = path.to_string_lossy().into_owned();
+        let step = tmutil(&["isexcluded", &shown]).and_then(|said| {
+            if said.contains("[Excluded]") {
+                Ok(true)
+            } else {
+                tmutil(&["addexclusion", &shown]).map(|_| false)
+            }
+        });
+        match step {
+            Ok(true) => already.push(name),
+            Ok(false) => added.push(name),
+            Err(why) => {
+                failure = Some((name, why));
+                break;
+            }
+        }
+    }
+
+    let mut text = String::new();
+    if !added.is_empty() {
+        text.push_str(&format!(
+            "  Time Machine now skips {} (Self-Reflect can rebuild them). The database and mirror stay in your backups.\n",
+            added.join(", ")
+        ));
+    }
+    if !already.is_empty() {
+        text.push_str(&format!(
+            "  Time Machine already skips {}.\n",
+            already.join(", ")
+        ));
+    }
+    if let Some((name, why)) = failure {
+        text.push_str(&format!(
+            "  Time Machine: could not mark {name} as skipped ({why}). Setup continues; it stays in backups.\n"
+        ));
+    }
+    text
+}
+
+fn time_machine_step(csr_dir: &Path) -> String {
+    time_machine_exclusion(
+        csr_dir,
+        cfg!(target_os = "macos"),
+        tm_exclude_opted_out(),
+        &mut real_tmutil,
+    )
+}
+
+/// Run the hook install and keep its failure for the summary. The error is
+/// flattened to one line; the remedy is printed once, by `incomplete_report`.
+fn hook_install_step(install: impl FnOnce() -> Result<()>) -> Option<String> {
+    match install() {
+        Ok(()) => None,
+        Err(e) => {
+            eprintln!("  Warning: hook installation failed: {e}");
+            Some(e.to_string())
+        }
+    }
+}
+
+/// The body of the "Setup Incomplete" summary: what failed, what still works,
+/// and the commands that fix it. At least one of the two must have failed.
+fn incomplete_report(mcp: Option<&McpFailure>, hook_error: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(error) = hook_error {
+        out.push_str(&format!(
+            "  Hook install failed: {error}\n  Hooks from an earlier install, if any, are unchanged. Run: csr-engine hook install --apply\n"
+        ));
+    }
+    if let Some(failure) = mcp {
+        let done = if hook_error.is_some() {
+            "The import is done."
+        } else {
+            "Hooks and import are done."
+        };
+        out.push_str(&format!(
+            "  {done} {}\n  {}\n",
+            failure.summary, failure.detail
+        ));
+    } else {
+        out.push_str("  The import and the MCP registration are done.\n");
+    }
+    out
+}
+
+/// The short error `handle` returns for an incomplete setup (non-zero exit).
+fn incomplete_error(mcp_failed: bool, hooks_failed: bool) -> &'static str {
+    match (mcp_failed, hooks_failed) {
+        (true, true) => "MCP server not registered and hook install failed",
+        (true, false) => "MCP server not registered",
+        _ => "hook install failed",
+    }
+}
+
+/// Hard stop for each `claude plugin` call. Only that child is killed.
+const COMPANION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// What `claude plugin` reports about the installed plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionInfo {
+    pub plugin: String,
+    pub version: String,
+    pub marketplace: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompanionOutcome {
+    Installed(CompanionInfo),
+    AlreadyInstalled(CompanionInfo),
+    Failed { reason: String },
+}
+
+/// Captured result of one `claude` call.
+struct ClaudeRun {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run `claude <args>` with stdin closed, output captured and a hard timeout.
+/// On timeout only the child we spawned is killed (and reaped); a grandchild that
+/// keeps the pipes open is left alone and its output abandoned.
+fn run_with_timeout(claude: &Path, args: &[&str], timeout: Duration) -> Result<ClaudeRun, String> {
+    // "claude plugin list", "codex mcp get": the program's name and the first two args.
+    let program = claude
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| claude.display().to_string());
+    let shown = std::iter::once(program.as_str())
+        .chain(args.iter().take(2).copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut child = Command::new(claude)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run `{}`: {e}", claude.display()))?;
+
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
+    }
+    let out_rx = drain(child.stdout.take());
+    let err_rx = drain(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "`{shown}` did not finish within {} s and was stopped",
+                    timeout.as_secs_f32().round()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not wait for `{shown}`: {e}"));
+            }
+        }
+    };
+
+    let grace = Duration::from_secs(2);
+    let stdout = out_rx.recv_timeout(grace).unwrap_or_default();
+    let stderr = err_rx.recv_timeout(grace).unwrap_or_default();
+    Ok(ClaudeRun {
+        success: status.success(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+/// The first JSON value in `text`: the whole text if it parses (`plugin list
+/// --json` pretty-prints an array), else the first line that does.
+fn first_json(
+    text: &str,
+    accept: impl Fn(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+        if accept(&v) {
+            return Some(v);
+        }
+    }
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .find(|v| accept(v))
+}
+
+/// `csr-companion@claude-self-reflect` -> ("csr-companion", "claude-self-reflect").
+fn split_plugin_id(id: &str) -> (String, String) {
+    match id.split_once('@') {
+        Some((p, m)) => (p.to_string(), m.to_string()),
+        None => (id.to_string(), "unknown".to_string()),
+    }
+}
+
+fn info_from(entry: &serde_json::Value) -> Option<CompanionInfo> {
+    let id = entry
+        .get("id")
+        .or_else(|| entry.get("pluginId"))
+        .or_else(|| entry.get("plugin"))?
+        .as_str()?;
+    let (plugin, marketplace) = split_plugin_id(id);
+    let text = |key: &str| entry.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    Some(CompanionInfo {
+        plugin,
+        version: text("version").unwrap_or_else(|| "unknown".to_string()),
+        marketplace,
+        scope: text("scope").unwrap_or_else(|| "unknown".to_string()),
+    })
+}
+
+// ── the companion plugin: written by this binary, installed from a local marketplace ──
+
+/// The plugin id Claude Code lists: `csr-companion@claude-self-reflect`.
+fn relay_plugin_id() -> String {
+    format!("{}@{}", emit::PLUGIN_NAME, emit::MARKETPLACE_NAME)
+}
+
+/// What `companion plugin install` and `setup` did, step by step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayReport {
+    pub outcome: CompanionOutcome,
+    /// The marketplace registration or the plugin changed, so open Claude Code sessions
+    /// need `/reload-plugins`.
+    pub changed: bool,
+    /// One line per step that ran, in order.
+    pub steps: Vec<String>,
+}
+
+pub const RELOAD_LINE: &str = "run /reload-plugins in open Claude Code sessions";
+
+/// Where the marketplace Claude Code knows as `claude-self-reflect` stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarketState {
+    Absent,
+    Here,
+    /// Registered with another source: a GitHub repo, or some other folder.
+    Elsewhere(String),
+}
+
+fn same_folder(a: &str, b: &Path) -> bool {
+    let a = Path::new(a);
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Read `claude plugin marketplace list --json`.
+fn market_state(list: &serde_json::Value, dir: &Path) -> MarketState {
+    let Some(entry) = list
+        .as_array()
+        .and_then(|l| l.iter().find(|e| e["name"] == emit::MARKETPLACE_NAME))
+    else {
+        return MarketState::Absent;
+    };
+    let text = |key: &str| entry.get(key).and_then(|v| v.as_str());
+    let path = text("path");
+    if text("source") == Some("directory") && path.is_some_and(|p| same_folder(p, dir)) {
+        return MarketState::Here;
+    }
+    let was = [text("source"), text("repo"), text("url"), path]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    MarketState::Elsewhere(was)
+}
+
+/// `claude <args>` that must exit 0. The error names the step and the first line of detail.
+fn run_ok(
+    claude: &Path,
+    args: &[&str],
+    timeout: Duration,
+    what: &str,
+) -> Result<ClaudeRun, String> {
+    let run = run_with_timeout(claude, args, timeout)?;
+    if run.success {
+        return Ok(run);
+    }
+    let detail = first_json(&run.stdout, |v| v.is_object())
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| run.stderr.trim().to_string());
+    Err(format!(
+        "`claude plugin {what}` failed: {}",
+        one_line(&detail)
+    ))
+}
+
+/// `run_ok`, and a `--json` result that says `outcome: ok`.
+fn run_outcome_ok(
+    claude: &Path,
+    args: &[&str],
+    timeout: Duration,
+    what: &str,
+) -> Result<ClaudeRun, String> {
+    let run = run_ok(claude, args, timeout, what)?;
+    let Some(result) = first_json(&run.stdout, |v| v.is_object()) else {
+        return Err(format!("`claude plugin {what}` returned no JSON result"));
+    };
+    if result.get("outcome").and_then(|o| o.as_str()) != Some("ok") {
+        let message = result
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("outcome was not ok");
+        return Err(format!(
+            "`claude plugin {what}` did not succeed: {}",
+            one_line(message)
+        ));
+    }
+    Ok(run)
+}
+
+/// `claude plugin list --json` as entries.
+fn list_plugins(claude: &Path, timeout: Duration) -> Result<Vec<serde_json::Value>, String> {
+    let run = run_ok(claude, &["plugin", "list", "--json"], timeout, "list")?;
+    first_json(&run.stdout, |v| v.is_array())
+        .and_then(|v| v.as_array().cloned())
+        .ok_or_else(|| "`claude plugin list` returned no JSON list".to_string())
+}
+
+fn relay_entry(list: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    let id = relay_plugin_id();
+    list.iter()
+        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+}
+
+/// The cache holds this engine's version and the `register.js` this engine emits. A moved
+/// binary changes `register.js` without a version bump, so the text counts as well.
+fn relay_is_current(entry: &serde_json::Value, relay: &str) -> bool {
+    let text = |key: &str| entry.get(key).and_then(|v| v.as_str());
+    text("version") == Some(env!("CARGO_PKG_VERSION"))
+        && text("installPath").is_some_and(|dir| {
+            std::fs::read_to_string(Path::new(dir).join("hooks/register.js"))
+                .is_ok_and(|cached| cached == relay)
+        })
+}
+
+/// The options the user set on the plugin, as `(key, value)`. Removing a marketplace or
+/// uninstalling a plugin deletes them, so they are read first and given back at install.
+/// A read that fails, times out or prints no JSON object is an error, never an empty list:
+/// an empty list would reinstall the plugin with the defaults over the user's choices. A
+/// successful read of a plugin with nothing set is an empty list.
+fn configured_options(claude: &Path, timeout: Duration) -> Result<Vec<(String, String)>, String> {
+    let id = relay_plugin_id();
+    let args = ["plugin", "configure", id.as_str(), "--json"];
+    let run = run_ok(claude, &args, timeout, "configure")?;
+    let info = first_json(&run.stdout, |v| v.is_object())
+        .ok_or_else(|| "`claude plugin configure` returned no JSON result".to_string())?;
+    Ok(info["configured"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|key| {
+            let key = key.as_str()?;
+            Some((key.to_string(), info["inputs"][key].as_str()?.to_string()))
+        })
+        .collect())
+}
+
+/// What the user had on the plugin before a step that deletes it: the options, and whether
+/// it was switched on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    options: Vec<(String, String)>,
+    enabled: bool,
+}
+
+impl Default for Snapshot {
+    /// A plugin that was never there: no options, enabled (what an install gives).
+    fn default() -> Self {
+        Snapshot {
+            options: Vec::new(),
+            enabled: true,
+        }
+    }
+}
+
+/// Where a snapshot waits while the plugin is gone: it survives a migration that fails
+/// half-way, so the rerun installs with the user's options and enabled state.
+fn pending_snapshot_path(home: &Path) -> std::path::PathBuf {
+    crate::companion::paths::Paths::new(home.to_path_buf())
+        .keep
+        .join("plugin-migration.json")
+}
+
+fn save_snapshot(home: &Path, snapshot: &Snapshot) -> Result<(), String> {
+    let path = pending_snapshot_path(home);
+    let options: Vec<[&str; 2]> = snapshot
+        .options
+        .iter()
+        .map(|(k, v)| [k.as_str(), v.as_str()])
+        .collect();
+    let text = serde_json::json!({"options": options, "enabled": snapshot.enabled}).to_string();
+    let root = path.parent().unwrap_or(home).to_path_buf();
+    crate::companion::private::write_atomic(&path, &text, &root).map_err(|e| {
+        format!(
+            "could not save the plugin options to {}: {e}",
+            path.display()
+        )
+    })
+}
+
+/// The snapshot a failed migration left. No file is `Ok(None)`. A file that cannot be read,
+/// is not JSON or has a malformed `options` list is an error naming it: reading it as "no
+/// snapshot" would install with the defaults and then delete the user's saved choices.
+fn load_snapshot(home: &Path) -> Result<Option<Snapshot>, String> {
+    let path = pending_snapshot_path(home);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable_snapshot(&path, &e.to_string())),
+    };
+    let bad = |why: &str| unreadable_snapshot(&path, why);
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| bad(&e.to_string()))?;
+    let options = value["options"]
+        .as_array()
+        .ok_or_else(|| bad("`options` is not a list"))?
+        .iter()
+        .map(|pair| Some((pair[0].as_str()?.to_string(), pair[1].as_str()?.to_string())))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| bad("`options` holds an entry that is not a [key, value] pair"))?;
+    let enabled = match &value["enabled"] {
+        serde_json::Value::Null => true,
+        serde_json::Value::Bool(b) => *b,
+        _ => return Err(bad("`enabled` is not true or false")),
+    };
+    Ok(Some(Snapshot { options, enabled }))
+}
+
+fn unreadable_snapshot(path: &Path, why: &str) -> String {
+    format!(
+        "the saved plugin options in {} cannot be read ({}); fix the file or delete it, then \
+         run `csr-engine companion plugin install` again",
+        path.display(),
+        one_line(why)
+    )
+}
+
+fn clear_snapshot(home: &Path) {
+    let _ = std::fs::remove_file(pending_snapshot_path(home));
+}
+
+/// Read the options and the enabled state of the installed plugin `entry`, and save them
+/// where a rerun finds them, before the caller deletes the plugin. Any failure stops the
+/// caller: nothing has been removed yet, and the error says how to retry.
+fn snapshot_plugin(
+    claude: &Path,
+    home: &Path,
+    entry: &serde_json::Value,
+    timeout: Duration,
+) -> Result<Snapshot, String> {
+    let retry = "nothing was removed; run `csr-engine companion plugin install` to retry";
+    let options = configured_options(claude, timeout)
+        .map_err(|e| format!("could not read the plugin's options ({e}); {retry}"))?;
+    let snapshot = Snapshot {
+        options,
+        enabled: relay_enabled(Some(entry)),
+    };
+    save_snapshot(home, &snapshot).map_err(|e| format!("{e}; {retry}"))?;
+    Ok(snapshot)
+}
+
+/// `claude plugin install` with the saved options. An install enables the plugin, so one
+/// the user had switched off (`enabled == false`) is disabled again.
+fn install_relay_plugin(
+    claude: &Path,
+    options: &[(String, String)],
+    enabled: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let id = relay_plugin_id();
+    let pairs: Vec<String> = options.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut args = vec!["plugin", "install", id.as_str(), "--json"];
+    for pair in &pairs {
+        args.extend(["--config", pair.as_str()]);
+    }
+    run_outcome_ok(claude, &args, timeout, "install")?;
+    if !enabled {
+        disable_relay_plugin(claude, timeout)?;
+    }
+    Ok(())
+}
+
+/// `claude plugin disable`; a failure says how to finish by hand.
+fn disable_relay_plugin(claude: &Path, timeout: Duration) -> Result<(), String> {
+    let id = relay_plugin_id();
+    let disable = ["plugin", "disable", id.as_str(), "--json"];
+    run_outcome_ok(claude, &disable, timeout, "disable").map_err(|e| {
+        format!("{e}; the plugin is installed and enabled, run `claude plugin disable {id}`")
+    })?;
+    Ok(())
+}
+
+/// Is the plugin listed as switched on? Unknown counts as on.
+fn relay_enabled(entry: Option<&serde_json::Value>) -> bool {
+    entry.and_then(|e| e["enabled"].as_bool()).unwrap_or(true)
+}
+
+struct RelayState {
+    steps: Vec<String>,
+    changed: bool,
+    /// The plugin step installed, updated or reinstalled something.
+    plugin_changed: bool,
+}
+
+fn relay_steps(
+    claude: &Path,
+    home: &Path,
+    engine: &Path,
+    timeout: Duration,
+    st: &mut RelayState,
+) -> Result<CompanionInfo, String> {
+    // a. the marketplace, written from this binary
+    let market = emit::write_marketplace(home, Some(engine))
+        .map_err(|e| format!("could not write the marketplace: {e:#}"))?;
+    st.steps
+        .push(format!("marketplace written: {}", market.dir.display()));
+    let dir = market
+        .dir
+        .to_str()
+        .ok_or_else(|| "the marketplace folder is not UTF-8".to_string())?;
+
+    // b. the registration
+    let run = run_ok(
+        claude,
+        &["plugin", "marketplace", "list", "--json"],
+        timeout,
+        "marketplace list",
+    )?;
+    let list = first_json(&run.stdout, |v| v.is_array())
+        .ok_or_else(|| "`claude plugin marketplace list` returned no JSON list".to_string())?;
+    let add = ["plugin", "marketplace", "add", dir];
+    match market_state(&list, &market.dir) {
+        MarketState::Here => st.steps.push("marketplace already registered".into()),
+        MarketState::Absent => {
+            run_ok(claude, &add, timeout, "marketplace add")?;
+            st.changed = true;
+            st.steps.push("marketplace registered".into());
+        }
+        MarketState::Elsewhere(was) => {
+            // `add` over the same name repoints it and keeps the plugin and its options.
+            // Older Claude Code may refuse; then remove, add and give the options back.
+            if let Err(refused) = run_ok(claude, &add, timeout, "marketplace add") {
+                // Removing the marketplace uninstalls the plugin and drops its options, so
+                // they are read and saved first. A plugin that is not installed has none.
+                let listed = list_plugins(claude, timeout)?;
+                if let Some(entry) = relay_entry(&listed) {
+                    snapshot_plugin(claude, home, entry, timeout)
+                        .map_err(|e| format!("{refused}; {e}"))?;
+                }
+                st.changed = true;
+                let remove = ["plugin", "marketplace", "remove", emit::MARKETPLACE_NAME];
+                run_ok(claude, &remove, timeout, "marketplace remove")
+                    .map_err(|e| format!("{refused}; {e}"))?;
+                run_ok(claude, &add, timeout, "marketplace add")?;
+            }
+            st.changed = true;
+            st.steps
+                .push(format!("marketplace moved here (was: {was})"));
+        }
+    }
+
+    // c. the plugin
+    let id = relay_plugin_id();
+    let version = env!("CARGO_PKG_VERSION");
+    // A migration that failed half-way left the user's options here. A file that cannot be
+    // read stops the step before anything is installed or deleted.
+    let pending = load_snapshot(home)?;
+    let listed = list_plugins(claude, timeout)?;
+    match relay_entry(&listed) {
+        None => {
+            let Snapshot { options, enabled } = pending.clone().unwrap_or_default();
+            install_relay_plugin(claude, &options, enabled, timeout)?;
+            st.changed = true;
+            st.plugin_changed = true;
+            st.steps.push(format!("plugin installed: {version}"));
+        }
+        Some(entry) if relay_is_current(entry, &market.relay) => {
+            st.steps.push(format!("plugin already current: {version}"));
+        }
+        Some(entry) => {
+            let was = entry["version"].as_str().unwrap_or("unknown").to_string();
+            let update = ["plugin", "update", id.as_str(), "--json"];
+            run_outcome_ok(claude, &update, timeout, "update")?;
+            st.changed = true;
+            st.plugin_changed = true;
+            let refreshed = list_plugins(claude, timeout)?;
+            if relay_entry(&refreshed).is_some_and(|e| relay_is_current(e, &market.relay)) {
+                st.steps.push(format!("plugin updated: {was} -> {version}"));
+            } else {
+                // The update kept the old cache. Uninstall and install put the new one in.
+                let Snapshot { options, enabled } = snapshot_plugin(claude, home, entry, timeout)?;
+                let uninstall = ["plugin", "uninstall", id.as_str(), "--keep-data", "--json"];
+                run_outcome_ok(claude, &uninstall, timeout, "uninstall")?;
+                install_relay_plugin(claude, &options, enabled, timeout)?;
+                st.steps
+                    .push(format!("plugin reinstalled: {was} -> {version}"));
+            }
+        }
+    }
+
+    let mut listed = list_plugins(claude, timeout)?;
+    let after = || format!("`claude plugin list` does not show {id} after the install");
+    let entry = relay_entry(&listed).ok_or_else(after)?;
+    if !relay_is_current(entry, &market.relay) {
+        return Err(format!(
+            "{id} is installed but its cache is not this engine's plugin; \
+             run `claude plugin uninstall {id}` and then this again"
+        ));
+    }
+    // A migration that failed after its install but before the disable left the plugin
+    // current and enabled, with the user's "off" still in the file. The saved options need
+    // no such step: the install that ran with `--config` applied them.
+    if pending.is_some_and(|s| !s.enabled) && relay_enabled(Some(entry)) {
+        disable_relay_plugin(claude, timeout)?;
+        st.changed = true;
+        st.plugin_changed = true;
+        st.steps
+            .push("plugin disabled again (as it was before)".into());
+        listed = list_plugins(claude, timeout)?;
+        if relay_entry(&listed).is_none_or(|e| relay_enabled(Some(e))) {
+            return Err(format!(
+                "`claude plugin disable` ran but {id} is still listed as enabled; \
+                 run `claude plugin disable {id}`"
+            ));
+        }
+    }
+    let entry = relay_entry(&listed).ok_or_else(after)?;
+    // The install is confirmed: the saved state has done its job.
+    clear_snapshot(home);
+    info_from(entry).ok_or_else(|| "`claude plugin list` named no plugin".to_string())
+}
+
+/// Write the local marketplace and install the plugin from it through Claude Code's plugin
+/// CLI. `engine` is the binary the relay will start. Never panics and never returns an
+/// error: a failure is a `Failed` outcome with the steps that ran before it.
+pub fn install_relay(claude: &Path, home: &Path, engine: &Path, timeout: Duration) -> RelayReport {
+    let mut st = RelayState {
+        steps: Vec::new(),
+        changed: false,
+        plugin_changed: false,
+    };
+    let outcome = match relay_steps(claude, home, engine, timeout, &mut st) {
+        Ok(info) if st.plugin_changed => CompanionOutcome::Installed(info),
+        Ok(info) => CompanionOutcome::AlreadyInstalled(info),
+        Err(reason) => CompanionOutcome::Failed { reason },
+    };
+    RelayReport {
+        outcome,
+        changed: st.changed,
+        steps: st.steps,
+    }
+}
+
+/// The companion step of setup. `enabled == false` (`--no-companion`) makes no `claude`
+/// call and writes nothing.
+fn companion_step(
+    enabled: bool,
+    claude: &Path,
+    home: &Path,
+    engine: &Path,
+    timeout: Duration,
+) -> Option<RelayReport> {
+    if !enabled {
+        return None;
+    }
+    eprintln!("Installing the csr-companion plugin from this binary through `claude plugin`...");
+    let report = install_relay(claude, home, engine, timeout);
+    for step in &report.steps {
+        eprintln!("  {step}");
+    }
+    Some(report)
+}
+
+/// What `csr-engine companion plugin install` prints; the exit code is non-zero on failure.
+pub fn relay_install_command() -> i32 {
+    let (Some(home), Ok(engine)) = (dirs::home_dir(), std::env::current_exe()) else {
+        eprintln!("companion: cannot find the home folder or this binary");
+        return 1;
+    };
+    let report = install_relay(Path::new("claude"), &home, &engine, COMPANION_TIMEOUT);
+    for step in &report.steps {
+        println!("{step}");
+    }
+    if report.changed {
+        println!("{RELOAD_LINE}");
+    }
+    if let CompanionOutcome::Failed { reason } = &report.outcome {
+        eprintln!("companion: not installed: {reason}");
+        return 1;
+    }
+    0
+}
+
+fn one_line(text: &str) -> String {
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let line = line.trim();
+    if line.is_empty() {
+        "no detail from claude".to_string()
+    } else {
+        line.chars().take(240).collect()
+    }
+}
+
+fn next_steps_text(companion_text: &str) -> String {
+    format!(
+        "Next steps:\n  1. Restart Claude Code to activate MCP tools\n  2. Open Claude Code in a project you have worked in; its first line recaps where you left off\n  3. Ask in plain words, e.g. \"what did we work on last week?\"\n\n{companion_text}"
+    )
+}
+
+/// What a successful setup ends with: the next steps, then the companion's receipt,
+/// `/reload-plugins` when something changed, and the one command that retries the install. `None`
+/// is `--no-companion`.
+fn next_steps(report: Option<&RelayReport>) -> String {
+    let retry = "To install it, run: csr-engine companion plugin install\n";
+    let companion_text = match report.map(|r| (&r.outcome, r.changed)) {
+        Some((CompanionOutcome::Installed(i) | CompanionOutcome::AlreadyInstalled(i), changed)) => {
+            let reload = if changed {
+                format!("{RELOAD_LINE}\n")
+            } else {
+                String::new()
+            };
+            format!(
+                "companion: {} {} from {}, scope {}\n{reload}",
+                i.plugin, i.version, i.marketplace, i.scope
+            )
+        }
+        Some((CompanionOutcome::Failed { reason }, changed)) => {
+            // A step that failed after something was removed still changed what is loaded.
+            let reload = if changed {
+                format!("{RELOAD_LINE}\n")
+            } else {
+                String::new()
+            };
+            format!("companion: not installed: {reason}\n{retry}{reload}")
+        }
+        None => format!("companion: skipped (--no-companion)\n{retry}"),
+    };
+    next_steps_text(&companion_text)
+}
+
+/// Is this run allowed to ask an interactive question? `CSR_AUTO_SETUP=1`
+/// (the installer's automation path) and a non-tty stdin both mean "take the
+/// default without prompting". `CSR_SKIP_SETUP` belongs to `install.sh` and
+/// is never reached here — if it were set, setup would not be running.
+fn interactive() -> bool {
+    if std::env::var("CSR_AUTO_SETUP")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    std::io::stdin().is_terminal()
+}
+
+/// The estimate + toggle screen. Returns the recorded decision.
+///
+/// Honesty rules: the number shown is computed from the measured candidate
+/// count in the corpus and the configured tier, it is labelled an estimate
+/// and states its assumptions, and it is printed BEFORE the question. A
+/// non-interactive run takes the documented default (ON) and says so rather
+/// than silently assuming consent.
+fn dreaming_consent_step(storage: &Storage) -> Result<bool> {
+    let tier = policy::effort_tier();
+    let estimate = night_estimate(storage, tier);
+
+    eprintln!("[7/8] Dreaming (overnight review of your open work)");
+    eprintln!("  While Claude Code is idle, CSR re-checks open todos and blockers");
+    eprintln!("  against the code as it stands now, and writes what it can prove.");
+    eprintln!("  Cost: {}", estimate.label(tier));
+    eprintln!(
+        "  Effort tier '{}' ({} reasoning, up to {} episodes per pass) — change with CSR_DREAM_EFFORT=less|balanced|max.",
+        tier.as_str(),
+        tier.reasoning_effort(),
+        tier.episodes_per_pass(),
+    );
+
+    let granted = if interactive() {
+        ask_yes_default_yes("  Enable dreaming? [Y/n] ")
+    } else {
+        eprintln!("  Non-interactive run — keeping the default (enabled).");
+        true
+    };
+
+    dream_cadence::record_consent(storage, granted)?;
+    if granted {
+        eprintln!("  Dreaming enabled. Turn it off any time with CSR_NO_DREAMING=1.");
+    } else {
+        eprintln!("  Dreaming declined; the daemon will not run night passes.");
+    }
+    Ok(granted)
+}
+
+/// The per-night estimate for `tier`, from the corpus's measured candidate
+/// count and the configured cadence/budget.
+fn night_estimate(storage: &Storage, tier: EffortTier) -> NightEstimate {
+    policy::estimate_night(
+        crate::dream::threads::count_candidate_episodes(storage),
+        tier,
+        policy::budget_cap(tier),
+        dream_cadence::interval_secs(),
+    )
+}
+
+/// Read one line; anything but an explicit "n"/"no" keeps the default (yes).
+fn ask_yes_default_yes(prompt: &str) -> bool {
+    eprint!("{prompt}");
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer).is_err() {
+        return true;
+    }
+    !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no")
 }
 
 /// The MCP server name we own in Claude Code's user-scope config.
@@ -609,9 +1781,1860 @@ fn count_total_files(projects_dir: &Path) -> usize {
     count
 }
 
+// ---------------------------------------------------------------------------
+// The background daemon (launchd agent)
+// ---------------------------------------------------------------------------
+
+/// The launchd label the daemon runs under. `scripts/launchd/`, the installers
+/// (`kickstart`) and `vector_ipc::launchd_database` all name this file.
+pub const DAEMON_LABEL: &str = "com.ramakay.csr-engine.daemon";
+
+/// First line of a plist this module wrote. A plist without it was written by a
+/// person (the manual steps older docs describe) and is left alone while its
+/// binary still exists.
+pub(crate) const DAEMON_PLIST_MARKER: &str = "<!-- Written by `csr-engine setup`; setup rewrites this file when the install changes. Hand edits belong in a plist without this line. -->";
+
+/// Everything the agent plist depends on. Plain data, so the rendering is a pure
+/// function and a test never touches the real `~/Library/LaunchAgents`.
+#[derive(Debug, Clone)]
+struct DaemonAgentSpec {
+    /// Absolute path of the running engine binary.
+    engine: std::path::PathBuf,
+    home: std::path::PathBuf,
+    db_path: std::path::PathBuf,
+    projects_dir: std::path::PathBuf,
+    /// Where `claude` resolved when setup ran, if anywhere. The daemon's
+    /// narratives and dream passes run it, and launchd starts with a bare PATH.
+    claude_dir: Option<std::path::PathBuf>,
+    /// Environment the agent carries besides PATH: the `CSR_*` choices of the
+    /// setup process, merged with what an existing agent already had. launchd
+    /// does not inherit the shell, so a switch that is not written here is off.
+    env: std::collections::BTreeMap<String, String>,
+    /// Pid recorded in `daemon.lock` while something holds it, else `None`. A
+    /// daemon nobody asked launchd to run (a terminal, another label) is seen
+    /// through this, so setup does not start a second one beside it.
+    lock_holder: Option<u32>,
+}
+
+impl DaemonAgentSpec {
+    fn plist_path(&self) -> std::path::PathBuf {
+        self.home
+            .join("Library/LaunchAgents")
+            .join(format!("{DAEMON_LABEL}.plist"))
+    }
+
+    fn data_dir(&self) -> std::path::PathBuf {
+        self.home.join(".claude-self-reflect")
+    }
+
+    /// PATH for the daemon: where `claude` is, where this binary is, then the
+    /// usual places. Setup owns PATH; every other key comes from `env`.
+    fn path_env(&self) -> String {
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        dirs.extend(self.claude_dir.clone());
+        dirs.extend(self.engine.parent().map(Path::to_path_buf));
+        dirs.push(self.home.join(".local/bin"));
+        for fixed in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+            dirs.push(fixed.into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        dirs.retain(|d| seen.insert(d.clone()));
+        dirs.iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+}
+
+#[path = "setup_daemon_plist.rs"]
+mod daemon_plist;
+pub use daemon_plist::DAEMON_EXIT_TIMEOUT;
+use daemon_plist::{render_daemon_plist, xml_escape};
+
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// A value in an XML property list, as far as the daemon agent needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlistValue {
+    Text(String),
+    List(Vec<PlistValue>),
+    Dict(Vec<(String, PlistValue)>),
+    /// `<true/>`, `<integer>`, ...: present, not needed.
+    Other,
+}
+
+impl PlistValue {
+    fn get(&self, key: &str) -> Option<&PlistValue> {
+        match self {
+            PlistValue::Dict(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn text(&self) -> Option<&str> {
+        match self {
+            PlistValue::Text(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// Split XML into tags and text. Comments, the XML declaration and the doctype
+/// are dropped.
+fn plist_tokens(xml: &str) -> Vec<(bool, &str)> {
+    // (is_tag, content)
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while !rest.is_empty() {
+        if let Some(stripped) = rest.strip_prefix("<!--") {
+            rest = stripped.find("-->").map_or("", |i| &stripped[i + 3..]);
+        } else if rest.starts_with("<?") || rest.starts_with("<!") {
+            rest = rest.find('>').map_or("", |i| &rest[i + 1..]);
+        } else if let Some(stripped) = rest.strip_prefix('<') {
+            let Some(end) = stripped.find('>') else { break };
+            out.push((true, &stripped[..end]));
+            rest = &stripped[end + 1..];
+        } else {
+            let end = rest.find('<').unwrap_or(rest.len());
+            out.push((false, &rest[..end]));
+            rest = &rest[end..];
+        }
+    }
+    out
+}
+
+fn plist_value(tokens: &[(bool, &str)], at: &mut usize) -> Option<PlistValue> {
+    while *at < tokens.len() && !tokens[*at].0 {
+        *at += 1; // whitespace between elements
+    }
+    let (_, tag) = *tokens.get(*at)?;
+    *at += 1;
+    if tag.ends_with('/') {
+        return Some(PlistValue::Other);
+    }
+    match tag {
+        "string" => {
+            let mut text = String::new();
+            while let Some(&(is_tag, content)) = tokens.get(*at) {
+                *at += 1;
+                if is_tag {
+                    break; // </string>
+                }
+                text.push_str(content);
+            }
+            Some(PlistValue::Text(xml_unescape(&text)))
+        }
+        "array" => {
+            let mut items = Vec::new();
+            loop {
+                while *at < tokens.len() && !tokens[*at].0 {
+                    *at += 1;
+                }
+                match tokens.get(*at) {
+                    Some((true, "/array")) => {
+                        *at += 1;
+                        return Some(PlistValue::List(items));
+                    }
+                    Some(_) => items.push(plist_value(tokens, at)?),
+                    None => return None,
+                }
+            }
+        }
+        "dict" => {
+            let mut pairs = Vec::new();
+            loop {
+                while *at < tokens.len() && !tokens[*at].0 {
+                    *at += 1;
+                }
+                match tokens.get(*at) {
+                    Some((true, "/dict")) => {
+                        *at += 1;
+                        return Some(PlistValue::Dict(pairs));
+                    }
+                    Some((true, "key")) => {
+                        *at += 1;
+                        let key = match tokens.get(*at) {
+                            Some((false, text)) => {
+                                *at += 1;
+                                xml_unescape(text)
+                            }
+                            _ => String::new(),
+                        };
+                        *at += 1; // </key>
+                        pairs.push((key, plist_value(tokens, at)?));
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        _ => {
+            // <integer>, <real>, <date>, <data>: skip to the closing tag.
+            while let Some(&(is_tag, content)) = tokens.get(*at) {
+                *at += 1;
+                if is_tag && content.starts_with('/') {
+                    break;
+                }
+            }
+            Some(PlistValue::Other)
+        }
+    }
+}
+
+/// The top-level dictionary of an XML property list. `None` for anything else
+/// (a binary plist, a truncated file).
+fn parse_plist(xml: &str) -> Option<PlistValue> {
+    let tokens = plist_tokens(xml);
+    let mut at = 0;
+    while at < tokens.len() && !(tokens[at].0 && tokens[at].1.starts_with("plist")) {
+        at += 1;
+    }
+    at += 1;
+    plist_value(&tokens, &mut at).filter(|v| matches!(v, PlistValue::Dict(_)))
+}
+
+/// The parts of a launchd agent that setup compares and carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AgentFacts {
+    program_args: Vec<String>,
+    env: std::collections::BTreeMap<String, String>,
+}
+
+fn agent_facts(plist: &PlistValue) -> AgentFacts {
+    let strings = |value: Option<&PlistValue>| -> Vec<String> {
+        match value {
+            Some(PlistValue::List(items)) => items
+                .iter()
+                .filter_map(|i| i.text().map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let env = match plist.get("EnvironmentVariables") {
+        Some(PlistValue::Dict(pairs)) => pairs
+            .iter()
+            .filter_map(|(k, v)| v.text().map(|t| (k.clone(), t.to_owned())))
+            .collect(),
+        _ => Default::default(),
+    };
+    AgentFacts {
+        program_args: strings(plist.get("ProgramArguments")),
+        env,
+    }
+}
+
+/// One of the strings launchd reads to find the executable.
+#[derive(Clone)]
+enum ProgramString {
+    /// Plain text in one run: decoded value and the byte range to splice.
+    Plain(String, std::ops::Range<usize>),
+    /// Empty, self-closing, or holding a comment, CDATA or other markup. It
+    /// cannot be spliced without parsing XML in full, so it is never edited.
+    /// The value is what it reads as, when that can be told.
+    Opaque(Option<String>),
+}
+
+impl ProgramString {
+    fn value(&self) -> Option<&str> {
+        match self {
+            ProgramString::Plain(value, _) => Some(value),
+            ProgramString::Opaque(value) => value.as_deref(),
+        }
+    }
+
+    /// Setup cannot tell what it names, or it names nothing that exists.
+    fn is_dead(&self) -> bool {
+        self.value().is_none_or(|v| !Path::new(v).exists())
+    }
+}
+
+/// What a string with markup in it reads as: comments dropped, CDATA taken
+/// literally, entities decoded. `None` for any other markup.
+fn read_marked_up(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(at) = rest.find('<') {
+        out.push_str(&xml_unescape(&rest[..at]));
+        rest = &rest[at..];
+        if let Some(body) = rest.strip_prefix("<!--") {
+            rest = &body[body.find("-->")? + 3..];
+        } else {
+            let body = rest.strip_prefix("<![CDATA[")?;
+            let end = body.find("]]>")?;
+            out.push_str(&body[..end]);
+            rest = &body[end + 3..];
+        }
+    }
+    out.push_str(&xml_unescape(rest));
+    Some(out)
+}
+
+/// The two strings launchd reads to find the executable.
+#[derive(Default)]
+struct ProgramSpans {
+    /// The top-level `Program` string: the file launchd executes when present.
+    program: Option<ProgramString>,
+    /// The first string of the top-level `ProgramArguments` array.
+    first_arg: Option<ProgramString>,
+}
+
+/// Find `Program` and `ProgramArguments[0]` structurally: only keys that are
+/// direct children of the plist's top-level dict count, so a same-named key or
+/// an equal string inside EnvironmentVariables or any nested dict is never
+/// mistaken for them. A string that is not plain text in one run is reported as
+/// opaque rather than parsed.
+fn plist_program_spans(text: &str) -> ProgramSpans {
+    let tokens = plist_tokens(text);
+    let offset = |s: &str| s.as_ptr() as usize - text.as_ptr() as usize;
+    // a `<string>` element at `at` (after whitespace)
+    let string_at = |mut at: usize| -> Option<ProgramString> {
+        while tokens.get(at).is_some_and(|t| !t.0) {
+            at += 1;
+        }
+        let &(true, tag) = tokens.get(at)? else {
+            return None;
+        };
+        match tag {
+            "string/" => Some(ProgramString::Opaque(Some(String::new()))),
+            "string" => {
+                let start = offset(tag) + tag.len() + 1; // past the '>'
+                let len = text[start..].find("</string>")?;
+                let raw = &text[start..start + len];
+                Some(if raw.is_empty() {
+                    ProgramString::Opaque(Some(String::new()))
+                } else if raw.contains('<') {
+                    ProgramString::Opaque(read_marked_up(raw))
+                } else {
+                    ProgramString::Plain(xml_unescape(raw), start..start + len)
+                })
+            }
+            _ => None,
+        }
+    };
+    let mut found = ProgramSpans::default();
+    let mut at = 0;
+    while at < tokens.len() && !(tokens[at].0 && tokens[at].1.starts_with("plist")) {
+        at += 1;
+    }
+    at += 1;
+    while tokens.get(at).is_some_and(|t| !t.0) {
+        at += 1;
+    }
+    if tokens.get(at) != Some(&(true, "dict")) {
+        return found;
+    }
+    at += 1;
+    loop {
+        while tokens.get(at).is_some_and(|t| !t.0) {
+            at += 1;
+        }
+        let Some((true, "key")) = tokens.get(at).copied() else {
+            return found;
+        };
+        at += 1;
+        let key = match tokens.get(at) {
+            Some((false, name)) => {
+                at += 1;
+                xml_unescape(name)
+            }
+            _ => String::new(),
+        };
+        at += 1; // </key>
+        let value_start = at;
+        match key.as_str() {
+            "Program" if found.program.is_none() => found.program = string_at(value_start),
+            "ProgramArguments" if found.first_arg.is_none() => {
+                let mut inner = value_start;
+                while tokens.get(inner).is_some_and(|t| !t.0) {
+                    inner += 1;
+                }
+                if tokens.get(inner) == Some(&(true, "array")) {
+                    found.first_arg = string_at(inner + 1);
+                }
+            }
+            _ => {}
+        }
+        // step over the whole value, nested or not
+        if plist_value(&tokens, &mut at).is_none() {
+            return found;
+        }
+    }
+}
+
+/// Does the loaded job run what the agent file asks for? Same arguments, every
+/// environment entry of the file present with the same value, and nothing extra
+/// in the job beyond launchd's own keys and PATH.
+fn loaded_job_matches(wanted: &AgentFacts, loaded: &LoadedJob) -> bool {
+    wanted.program_args == loaded.arguments
+        && wanted
+            .env
+            .iter()
+            .all(|(key, value)| loaded.env.get(key) == Some(value))
+        // A key the loaded job still has but the file no longer does is a
+        // difference too: only launchd's own keys and PATH may be extra.
+        && loaded.env.keys().all(|key| {
+            key == "PATH"
+                || LAUNCHD_INJECTED_ENV.contains(&key.as_str())
+                || wanted.env.contains_key(key)
+        })
+}
+
+/// A launchd agent file that runs `csr-engine daemon`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonAgentFile {
+    pub label: String,
+    pub path: std::path::PathBuf,
+}
+
+/// Every `*.plist` under `<home>/Library/LaunchAgents` whose arguments run
+/// `csr-engine daemon`, whatever it is called.
+pub(crate) fn daemon_agents_on_disk(home: &Path) -> Vec<DaemonAgentFile> {
+    let Ok(entries) = std::fs::read_dir(home.join("Library/LaunchAgents")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<DaemonAgentFile> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        // exactly `.plist`: `x.plist.bak-2026` is a saved copy launchd never loads
+        .filter(|path| path.extension().is_some_and(|ext| ext == "plist"))
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(&path).ok()?;
+            if text.len() > 1 << 20 {
+                return None;
+            }
+            let plist = parse_plist(&text)?;
+            let args = agent_facts(&plist).program_args;
+            let program = Path::new(args.first()?).file_name()?.to_str()?.to_owned();
+            if program != "csr-engine" || !args.iter().skip(1).any(|a| a == "daemon") {
+                return None;
+            }
+            let label = plist
+                .get("Label")
+                .and_then(PlistValue::text)
+                .map(str::to_owned)
+                .or_else(|| path.file_stem()?.to_str().map(str::to_owned))?;
+            Some(DaemonAgentFile { label, path })
+        })
+        .collect();
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found
+}
+
+/// The pid in `daemon.lock` while something holds the lock.
+fn daemon_lock_holder(home: &Path) -> Option<u32> {
+    let lock = home.join(".claude-self-reflect/daemon.lock");
+    crate::daemon::lock_file_held(&lock)
+        .then(|| std::fs::read_to_string(&lock).ok())
+        .flatten()
+        .and_then(|text| text.trim().parse().ok())
+}
+
+/// Keys launchd adds to a loaded job's environment. They are not the agent's
+/// own configuration and must never be written back into a plist.
+const LAUNCHD_INJECTED_ENV: [&str; 2] = ["XPC_SERVICE_NAME", "OSLogRateLimit"];
+
+/// `CSR_*` variables that describe the setup run, not the daemon.
+const SETUP_ONLY_ENV: [&str; 3] = ["CSR_AUTO_SETUP", "CSR_SKIP_SETUP", "CSR_NO_DAEMON"];
+
+/// The `CSR_*` choices of the setup process that the daemon should keep.
+fn carried_process_env(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> std::collections::BTreeMap<String, String> {
+    vars.into_iter()
+        .filter(|(key, _)| {
+            key.starts_with("CSR_")
+                && !SETUP_ONLY_ENV.contains(&key.as_str())
+                && !key.starts_with("CSR_BUILD_")
+        })
+        .collect()
+}
+
+/// What `launchctl print gui/<uid>/<label>` says about a loaded job.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LoadedJob {
+    pid: Option<u32>,
+    arguments: Vec<String>,
+    env: std::collections::BTreeMap<String, String>,
+}
+
+/// Parse `launchctl print` output. Only the top-level `arguments`,
+/// `environment` and `pid` entries count: `inherited environment` and `default
+/// environment` blocks sit beside them and are not the job's own.
+fn parse_launchctl_print(text: &str) -> LoadedJob {
+    let mut job = LoadedJob::default();
+    let mut block: Option<&str> = None;
+    for line in text.lines() {
+        let depth = line.len() - line.trim_start_matches('\t').len();
+        let body = line.trim();
+        if let Some(open) = block {
+            if depth <= 1 {
+                block = None; // the closing brace, or the next top-level entry
+            } else {
+                match open {
+                    "arguments" => job.arguments.push(body.to_owned()),
+                    _ => {
+                        if let Some((key, value)) = body.split_once(" => ") {
+                            job.env.insert(key.to_owned(), value.to_owned());
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        if depth != 1 {
+            continue;
+        }
+        if body == "arguments = {" {
+            block = Some("arguments");
+        } else if body == "environment = {" {
+            block = Some("environment");
+        } else if let Some(pid) = body.strip_prefix("pid = ") {
+            job.pid = pid.trim().parse().ok();
+        }
+    }
+    job.env
+        .retain(|key, _| !LAUNCHD_INJECTED_ENV.contains(&key.as_str()));
+    job
+}
+
+/// The agent's environment after setup. The file on disk is what the user can
+/// read and edit, so when it exists and parses it is the whole truth about
+/// which keys the agent has: a key deleted from it while the job is still
+/// loaded stays deleted. The loaded job's environment is the fallback only when
+/// there is no readable file. Then what this run was given overrides. PATH is
+/// setup's alone. The second value says where each came from.
+fn merge_agent_env(
+    loaded: &std::collections::BTreeMap<String, String>,
+    on_disk: Option<&std::collections::BTreeMap<String, String>>,
+    this_run: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, (String, &'static str)> {
+    let mut merged = std::collections::BTreeMap::new();
+    let earlier = match on_disk {
+        Some(file) => (file, "the existing agent"),
+        None => (loaded, "the loaded agent"),
+    };
+    for (source, label) in [earlier, (this_run, "this run")] {
+        for (key, value) in source {
+            if key != "PATH" && !LAUNCHD_INJECTED_ENV.contains(&key.as_str()) {
+                merged.insert(key.clone(), (value.clone(), label));
+            }
+        }
+    }
+    merged
+}
+
+/// The sentences setup prints about what it carried into the agent.
+fn carried_notes(
+    merged: &std::collections::BTreeMap<String, (String, &'static str)>,
+    old_path: Option<&str>,
+    new_path: &str,
+    plist: &Path,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !merged.is_empty() {
+        let items: Vec<String> = merged
+            .iter()
+            .map(|(key, (value, source))| {
+                if key.starts_with("CSR_") {
+                    format!("{key}={value} (from {source})")
+                } else {
+                    format!("{key} (from {source})")
+                }
+            })
+            .collect();
+        notes.push(format!(
+            "Carried into the daemon agent: {}.",
+            items.join(", ")
+        ));
+    }
+    if let Some(old) = old_path.filter(|old| *old != new_path) {
+        notes.push(format!(
+            "PATH in the agent was replaced (setup owns it): {old} -> {new_path}"
+        ));
+    }
+    if merged
+        .get("CSR_NO_DREAMING")
+        .is_some_and(|(v, _)| matches!(v.trim(), "1" | "true"))
+    {
+        notes.push(format!(
+            "CSR_NO_DREAMING is set, so the daemon will not dream whatever you answered at step 7. Remove that key from {} to turn dreaming on.",
+            plist.display()
+        ));
+    }
+    notes
+}
+
+/// What the daemon step did, for the one summary line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonOutcome {
+    /// `CSR_NO_DAEMON` is set: nothing was written or started.
+    OptedOut,
+    /// Not macOS: nothing was written; the run command is printed.
+    Manual,
+    /// The agent is installed and launchd was told to run it.
+    Running { rewritten: bool },
+    /// An agent somebody wrote by hand was kept and started.
+    KeptExisting,
+    /// A daemon is running that launchd does not own under any label setup
+    /// knows. Setup added no second one.
+    AlreadyRunning { pid: u32 },
+    /// A step failed; the text is the exact reason.
+    Failed(String),
+}
+
+/// One `launchctl` call: its stdout when it exited 0, otherwise its stderr.
+type LaunchctlRun<'a> = dyn FnMut(&[&str]) -> std::result::Result<String, String> + 'a;
+
+/// What the daemon step did, and what it has to tell the user besides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonRun {
+    pub outcome: DaemonOutcome,
+    /// The launchd label the daemon job runs under: ours, or one found.
+    pub label: String,
+    /// Pid of the job before this run touched it, if it was running. A pid
+    /// that is still the same afterwards is the old process, not a start.
+    pub previous_pid: Option<u32>,
+    /// Extra lines for the summary (what was carried, what was replaced).
+    pub notes: Vec<String>,
+}
+
+/// `CSR_NO_DAEMON=1` (or `true`) is the opt-out.
+fn daemon_opted_out() -> bool {
+    std::env::var("CSR_NO_DAEMON").is_ok_and(|v| matches!(v.trim(), "1" | "true"))
+}
+
+fn real_launchctl(args: &[&str]) -> std::result::Result<String, String> {
+    let out = Command::new("launchctl")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run launchctl: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let detail = String::from_utf8_lossy(&out.stderr);
+        Err(format!(
+            "launchctl {} failed ({}): {}",
+            args.join(" "),
+            out.status,
+            detail.trim()
+        ))
+    }
+}
+
+/// Write the agent plist when it differs, load it, and make sure the daemon runs.
+///
+/// Idempotent: an identical plist is not rewritten. A changed one is booted out
+/// first, because `kickstart` does not re-read the file. `bootstrap` right after
+/// `bootout` can fail while launchd tears the old job down, so it is retried.
+/// A job that is already loaded and unchanged is restarted with `kickstart -k`
+/// so a new binary build is the one running. A fresh `bootstrap` starts the job
+/// itself (`RunAtLoad`), so it gets no second start.
+fn install_daemon_agent(
+    spec: &DaemonAgentSpec,
+    uid: u32,
+    launchctl: &mut LaunchctlRun,
+    pause: &dyn Fn(Duration),
+) -> DaemonRun {
+    // Which job is the daemon? Ours by default. A hand-installed agent under
+    // another label is the daemon already: adopt it rather than add a second
+    // job that would fight it for the lock.
+    let canonical = AgentTarget {
+        label: DAEMON_LABEL.to_owned(),
+        plist: spec.plist_path(),
+    };
+    let canonical_text = std::fs::read_to_string(&canonical.plist).ok();
+    let canonical_loaded = launchctl(&["print", &canonical.job(uid)]);
+    let others: Vec<DaemonAgentFile> = daemon_agents_on_disk(&spec.home)
+        .into_iter()
+        .filter(|agent| agent.path != canonical.plist)
+        .collect();
+    let mut notes = Vec::new();
+    let (target, adopted) = if canonical_text.is_none() && canonical_loaded.is_err() {
+        match others.first() {
+            Some(agent) => (
+                AgentTarget {
+                    label: agent.label.clone(),
+                    plist: agent.path.clone(),
+                },
+                true,
+            ),
+            None => {
+                if let Some(pid) = spec.lock_holder {
+                    return DaemonRun {
+                        outcome: DaemonOutcome::AlreadyRunning { pid },
+                        label: canonical.label,
+                        previous_pid: None,
+                        notes,
+                    };
+                }
+                (canonical, false)
+            }
+        }
+    } else {
+        (canonical, false)
+    };
+    for other in others.iter().filter(|o| o.path != target.plist) {
+        notes.push(format!(
+            "Another agent also runs the daemon: {} ({}). Two jobs compete for the one daemon lock; keep one: launchctl bootout gui/{uid}/{}",
+            other.label,
+            other.path.display(),
+            other.label
+        ));
+    }
+    let plist = target.plist.clone();
+    let existing = if adopted {
+        std::fs::read_to_string(&plist).ok()
+    } else {
+        canonical_text
+    };
+    let loaded_text = if adopted {
+        launchctl(&["print", &target.job(uid)]).ok()
+    } else {
+        canonical_loaded.ok()
+    };
+
+    // What an existing agent already carries must survive: launchd does not
+    // inherit the shell, so a dropped kill switch silently turns the work on.
+    let loaded_job = loaded_text
+        .as_deref()
+        .map(parse_launchctl_print)
+        .unwrap_or_default();
+    let on_disk = existing
+        .as_deref()
+        .and_then(parse_plist)
+        .map(|p| agent_facts(&p));
+    let merged = merge_agent_env(
+        &loaded_job.env,
+        on_disk.as_ref().map(|facts| &facts.env),
+        &spec.env,
+    );
+    let mut spec = spec.clone();
+    spec.env = merged
+        .iter()
+        .map(|(key, (value, _))| (key.clone(), value.clone()))
+        .collect();
+    let old_path = on_disk
+        .as_ref()
+        .and_then(|facts| facts.env.get("PATH"))
+        .or_else(|| loaded_job.env.get("PATH"))
+        .cloned();
+    notes.extend(carried_notes(
+        &merged,
+        old_path.as_deref(),
+        &spec.path_env(),
+        &plist,
+    ));
+
+    let previous_pid = loaded_job.pid;
+    let outcome = apply_daemon_agent(
+        &spec,
+        &target,
+        adopted,
+        existing,
+        loaded_text.as_ref().map(|_| loaded_job),
+        uid,
+        launchctl,
+        pause,
+        &mut notes,
+    );
+    DaemonRun {
+        outcome,
+        label: target.label,
+        previous_pid,
+        notes,
+    }
+}
+
+/// The launchd job a run installs or adopts.
+struct AgentTarget {
+    label: String,
+    plist: std::path::PathBuf,
+}
+
+impl AgentTarget {
+    fn job(&self, uid: u32) -> String {
+        format!("gui/{uid}/{}", self.label)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_daemon_agent(
+    spec: &DaemonAgentSpec,
+    agent: &AgentTarget,
+    adopted: bool,
+    existing: Option<String>,
+    loaded_job: Option<LoadedJob>,
+    uid: u32,
+    launchctl: &mut LaunchctlRun,
+    pause: &dyn Fn(Duration),
+    notes: &mut Vec<String>,
+) -> DaemonOutcome {
+    let plist = agent.plist.clone();
+    // A plist without our marker is the user's. It is never regenerated: while
+    // its binary exists (or setup cannot read it) it is only started; when the
+    // binary is gone, that one path is repaired and nothing else is touched.
+    let (foreign, wanted) = match existing.as_deref() {
+        Some(text) if adopted || !text.contains(DAEMON_PLIST_MARKER) => {
+            // nothing was merged into a file we do not write
+            notes.retain(|n| n.starts_with("Another agent"));
+            let found = plist_program_spans(text);
+            // launchd executes Program when there is one; otherwise argv[0].
+            // Whatever it would run, if gone, is repaired in place, and a dead
+            // argv[0] next to it is repaired with it. A live Program leaves a
+            // stale argv[0] label alone: it does not stop the daemon starting.
+            let runs_dead = found
+                .program
+                .as_ref()
+                .or(found.first_arg.as_ref())
+                .is_some_and(ProgramString::is_dead);
+            if !runs_dead {
+                (true, text.to_owned())
+            } else {
+                let engine = xml_escape(&spec.engine.to_string_lossy());
+                let mut targets: Vec<&ProgramString> = Vec::new();
+                targets.extend(found.program.as_ref());
+                targets.extend(found.first_arg.as_ref().filter(|a| a.is_dead()));
+                let mut spans = Vec::new();
+                let mut gone: Vec<String> = Vec::new();
+                let mut opaque = false;
+                for target in targets {
+                    match target {
+                        ProgramString::Plain(value, span) => {
+                            spans.push(span.clone());
+                            if !gone.contains(value) {
+                                gone.push(value.clone());
+                            }
+                        }
+                        ProgramString::Opaque(_) => opaque = true,
+                    }
+                }
+                if opaque {
+                    notes.push(format!(
+                        "Your agent {} ({}) points at a program that is gone, in a string setup will not edit in place (empty, a comment or CDATA). It is left untouched. Fix it by hand: set Program or the first ProgramArguments string to {}.",
+                        agent.label,
+                        plist.display(),
+                        spec.engine.display()
+                    ));
+                    (true, text.to_owned())
+                } else {
+                    notes.push(format!(
+                        "Your agent pointed at {}, which is gone. Repaired {} to {}; the rest of {} is unchanged.",
+                        gone.join(" and "),
+                        if spans.len() == 1 { "that one path" } else { "those paths" },
+                        spec.engine.display(),
+                        plist.display()
+                    ));
+                    spans.sort_by_key(|span| std::cmp::Reverse(span.start));
+                    let mut repaired = text.to_owned();
+                    for span in spans {
+                        repaired.replace_range(span, &engine);
+                    }
+                    (true, repaired)
+                }
+            }
+        }
+        _ => (false, render_daemon_plist(spec)),
+    };
+    let rewrite = existing.as_deref() != Some(wanted.as_str());
+    let loaded = loaded_job.is_some();
+    // The file can say one thing while launchd runs another (an earlier run
+    // wrote it and could not unload the old job). What counts is the job.
+    let current = loaded_job.as_ref().is_some_and(|job| {
+        parse_plist(&wanted).is_some_and(|p| loaded_job_matches(&agent_facts(&p), job))
+    });
+
+    let domain = format!("gui/{uid}");
+    let target = agent.job(uid);
+    let plist_arg = plist.to_string_lossy().into_owned();
+
+    if loaded && (rewrite || !current) {
+        // kickstart does not re-read the file: unload, and check it happened
+        // before anything is written, so the file never gets ahead of the job.
+        let _ = launchctl(&["bootout", &target]);
+        let mut unloaded = false;
+        for attempt in 0..10 {
+            pause(Duration::from_millis(if attempt == 0 { 500 } else { 300 }));
+            if launchctl(&["print", &target]).is_err() {
+                unloaded = true;
+                break;
+            }
+        }
+        if !unloaded {
+            return DaemonOutcome::Failed(format!(
+                "launchd still loaded {} after bootout, so the new settings were not applied. Run: launchctl bootout {target}",
+                agent.label
+            ));
+        }
+    }
+    if rewrite {
+        if let Err(e) = std::fs::create_dir_all(spec.data_dir().join("logs")) {
+            return DaemonOutcome::Failed(format!("could not create the log folder: {e}"));
+        }
+        if let Some(dir) = plist.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                return DaemonOutcome::Failed(format!("could not create {}: {e}", dir.display()));
+            }
+        }
+        let tmp = plist.with_extension("plist.tmp");
+        if let Err(e) = std::fs::write(&tmp, &wanted).and_then(|()| std::fs::rename(&tmp, &plist)) {
+            let _ = std::fs::remove_file(&tmp);
+            return DaemonOutcome::Failed(format!("could not write {}: {e}", plist.display()));
+        }
+    } else if loaded && current {
+        // Unchanged and loaded: restart onto the current build.
+        return match launchctl(&["kickstart", "-k", &target]) {
+            Ok(_) if foreign => DaemonOutcome::KeptExisting,
+            Ok(_) => DaemonOutcome::Running { rewritten: false },
+            Err(e) => DaemonOutcome::Failed(e),
+        };
+    }
+
+    // Not loaded (fresh, or just booted out): load it, which starts it.
+    let mut last = String::new();
+    for attempt in 0..6 {
+        if attempt > 0 {
+            pause(Duration::from_millis(500));
+        }
+        match launchctl(&["bootstrap", &domain, &plist_arg]) {
+            Ok(_) => {
+                return if foreign {
+                    DaemonOutcome::KeptExisting
+                } else {
+                    DaemonOutcome::Running { rewritten: rewrite }
+                };
+            }
+            Err(e) => last = e,
+        }
+    }
+    DaemonOutcome::Failed(last)
+}
+
+/// The daemon step of setup. Never fails setup: the daemon is what keeps dreams
+/// and enrichment going, but every other part of the install works without it.
+fn daemon_step(
+    spec: &DaemonAgentSpec,
+    opted_out: bool,
+    macos: bool,
+    uid: u32,
+    launchctl: &mut LaunchctlRun,
+    pause: &dyn Fn(Duration),
+) -> DaemonRun {
+    let bare = |outcome| DaemonRun {
+        outcome,
+        label: DAEMON_LABEL.to_owned(),
+        previous_pid: None,
+        notes: Vec::new(),
+    };
+    if opted_out {
+        bare(DaemonOutcome::OptedOut)
+    } else if !macos {
+        bare(DaemonOutcome::Manual)
+    } else {
+        install_daemon_agent(spec, uid, launchctl, pause)
+    }
+}
+
+/// [`daemon_step`] against the real machine, returning the text to print.
+fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
+    let home = dirs::home_dir().unwrap_or_default();
+    let engine = stable_engine_path(
+        std::env::args_os().next().as_deref(),
+        &std::env::current_dir().unwrap_or_default(),
+        std::env::var_os("PATH").as_deref(),
+        &std::env::current_exe().unwrap_or_default(),
+    );
+    let spec = DaemonAgentSpec {
+        engine: engine.clone(),
+        home: home.clone(),
+        db_path: absolute(db_path),
+        projects_dir: absolute(projects_dir),
+        claude_dir: find_on_path("claude").and_then(|p| p.parent().map(Path::to_path_buf)),
+        env: carried_process_env(std::env::vars()),
+        lock_holder: daemon_lock_holder(&home),
+    };
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let run = daemon_step(
+        &spec,
+        daemon_opted_out(),
+        cfg!(target_os = "macos"),
+        uid,
+        &mut real_launchctl,
+        &std::thread::sleep,
+    );
+    let mut text = daemon_report(&run, &engine);
+    for note in &run.notes {
+        text.push_str(&format!("  {note}\n"));
+    }
+    if matches!(
+        run.outcome,
+        DaemonOutcome::Running { .. } | DaemonOutcome::KeptExisting
+    ) {
+        let job = format!("gui/{uid}/{}", run.label);
+        let lock = home.join(".claude-self-reflect/daemon.lock");
+        let confirmed = wait_for_daemon(
+            run.previous_pid,
+            80,
+            &mut || DaemonProbe {
+                job_pid: real_launchctl(&["print", &job])
+                    .ok()
+                    .and_then(|text| parse_launchctl_print(&text).pid),
+                lock_held: crate::daemon::lock_file_held(&lock),
+                lock_pid: std::fs::read_to_string(&lock)
+                    .ok()
+                    .and_then(|t| t.trim().parse().ok()),
+            },
+            &|| std::thread::sleep(Duration::from_millis(250)),
+        );
+        text.push_str(if confirmed {
+            "  Daemon is running.\n"
+        } else {
+            "  launchd has the daemon job, but the process it started has not taken the lock yet (a large corpus loads slowly). Check: csr-engine status\n"
+        });
+    }
+    text
+}
+
+/// `path` made absolute against `cwd` (the directory the user ran setup from).
+fn absolute_in(cwd: &Path, path: &Path) -> std::path::PathBuf {
+    let joined = cwd.join(path);
+    std::path::absolute(&joined).unwrap_or(joined)
+}
+
+/// The path to store for this binary. Not the canonical one: a symlink such as
+/// `~/.local/bin/csr-engine` that an upgrade repoints keeps working, while the
+/// versioned file it pointed at may be deleted. The name setup was invoked by
+/// (found on PATH, or given as a path) is used when it is the very file that is
+/// running; a shim that only leads somewhere else (an npm bin entry) is not.
+fn stable_engine_path(
+    argv0: Option<&std::ffi::OsStr>,
+    cwd: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+    current_exe: &Path,
+) -> std::path::PathBuf {
+    let same_file = |candidate: &Path| match (candidate.canonicalize(), current_exe.canonicalize())
+    {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    let candidate = argv0.and_then(|name| {
+        let name = Path::new(name);
+        if name.components().count() > 1 {
+            Some(absolute_in(cwd, name))
+        } else {
+            let path_var = path_var?;
+            std::env::split_paths(path_var)
+                .map(|dir| absolute_in(cwd, &dir.join(name)))
+                .find(|p| p.is_file())
+        }
+    });
+    match candidate {
+        Some(path) if path.is_absolute() && same_file(&path) => path,
+        _ => current_exe.to_path_buf(),
+    }
+}
+
+fn absolute(path: &Path) -> std::path::PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The first executable called `name` on PATH.
+fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|p| {
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// The lines setup prints for each outcome (stderr, like every other step).
+fn daemon_report(run: &DaemonRun, engine: &Path) -> String {
+    let label = &run.label;
+    let manual = format!(
+        "  To run it by hand: {} daemon   (keep it running; it does the overnight dreams)\n",
+        engine.display()
+    );
+    match &run.outcome {
+        DaemonOutcome::OptedOut => {
+            "  Daemon skipped (CSR_NO_DAEMON is set). Dreams and background enrichment need it.\n"
+                .to_owned()
+                + &manual
+        }
+        DaemonOutcome::Manual => {
+            "  No launchd on this system, so setup does not start the daemon.\n".to_owned() + &manual
+        }
+        DaemonOutcome::Running { rewritten } => format!(
+            "  Daemon agent {} and started: {label}\n  Stop it with: launchctl bootout gui/$(id -u)/{label}\n",
+            if *rewritten { "installed" } else { "already installed" },
+        ),
+        DaemonOutcome::KeptExisting => {
+            format!("  Kept your existing {label} agent and started it.\n")
+        }
+        DaemonOutcome::AlreadyRunning { pid } => format!(
+            "  A daemon is already running (pid {pid}) and launchd does not manage it, so setup added no second one.\n  To have launchd run it: stop that process (kill {pid}), then run: csr-engine setup\n"
+        ),
+        DaemonOutcome::Failed(why) => format!(
+            "  The daemon did not start: {why}\n  Setup is otherwise complete. Retry with: csr-engine setup\n{manual}"
+        ),
+    }
+}
+
+/// What one look at the daemon shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DaemonProbe {
+    /// `pid` in `launchctl print` for the job.
+    job_pid: Option<u32>,
+    /// Something holds `daemon.lock`.
+    lock_held: bool,
+    /// The pid written in `daemon.lock`.
+    lock_pid: Option<u32>,
+}
+
+/// Is this the process setup started? The lock is held by a pid, that pid is
+/// the job's, and it is not the pid the job had before setup touched it. A held
+/// lock alone proves nothing: an older daemon, or a daemon under another label,
+/// holds it too while the job setup started is still loading or failing.
+fn daemon_confirmed(probe: &DaemonProbe, previous_pid: Option<u32>) -> bool {
+    probe.lock_held
+        && probe.job_pid.is_some()
+        && probe.job_pid == probe.lock_pid
+        && probe.job_pid != previous_pid
+}
+
+/// Look until the daemon setup started is confirmed, or the polls run out.
+fn wait_for_daemon(
+    previous_pid: Option<u32>,
+    polls: u32,
+    probe: &mut dyn FnMut() -> DaemonProbe,
+    pause: &dyn Fn(),
+) -> bool {
+    for poll in 0..polls {
+        if poll > 0 {
+            pause();
+        }
+        if daemon_confirmed(&probe(), previous_pid) {
+            return true;
+        }
+    }
+    false
+}
+
+// ---- Codex: the same MCP server, registered with the Codex CLI ----
+//
+// Codex reads MCP servers from `$CODEX_HOME/config.toml` (default `~/.codex`). Its own CLI
+// writes that file, so setup calls `codex mcp add` rather than editing TOML. `codex mcp add`
+// is an upsert that rewrites the whole entry: it drops `args`, `env`, `cwd`, timeouts and tool
+// filters from the entry it replaces, so an entry with any of those, or one the user disabled,
+// is left alone and the user is told why. It also drops comments in and above the
+// `[mcp_servers.*]` tables (codex-cli 0.163.0), so the file is copied to a new backup before the add.
+
+/// Hard stop for each `codex mcp` call. Only that child is killed.
+const CODEX_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What the Codex step did. None of these fails setup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexMcpOutcome {
+    /// Added, or repointed from an older binary path. `backup` is the copy of the config
+    /// taken before the add, when there was a config to copy.
+    Registered {
+        repointed_from: Option<String>,
+        backup: Option<std::path::PathBuf>,
+    },
+    /// Already points at this binary; nothing was written.
+    AlreadyCurrent,
+    /// An entry exists that setup must not rewrite. `command` is the manual fix.
+    LeftAlone { reason: String, command: String },
+    /// The add ran but the read-back did not confirm it. The config may already be
+    /// rewritten, so the backup is still reported.
+    Unverified {
+        reason: String,
+        backup: Option<std::path::PathBuf>,
+        command: String,
+    },
+    /// A `codex` call failed. `command` is the manual fix.
+    Failed { reason: String, command: String },
+}
+
+/// `CSR_NO_CODEX_MCP=1` skips the Codex registration.
+fn codex_mcp_disabled() -> bool {
+    std::env::var_os("CSR_NO_CODEX_MCP").is_some_and(|v| v == "1")
+}
+
+/// The command a user runs to register by hand.
+fn codex_add_command(binary: &str) -> String {
+    format!(
+        "codex mcp add {MCP_SERVER_NAME} -- {}",
+        crate::shell::shell_quote(binary)
+    )
+}
+
+/// The stdio command of a `codex mcp get --json` entry.
+fn codex_entry_command(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("transport")?
+        .get("command")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// True when the entry holds nothing but a stdio command, so `codex mcp add` loses nothing.
+fn codex_entry_is_bare(entry: &serde_json::Value) -> bool {
+    let empty = |v: Option<&serde_json::Value>| match v {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Array(a)) => a.is_empty(),
+        Some(serde_json::Value::Object(o)) => o.is_empty(),
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        Some(_) => false,
+    };
+    let Some(transport) = entry.get("transport") else {
+        return false;
+    };
+    transport.get("type").and_then(|t| t.as_str()) == Some("stdio")
+        && ["args", "env", "env_vars", "cwd"]
+            .iter()
+            .all(|k| empty(transport.get(*k)))
+        // An allowlist, even an empty one, is a restriction; the add would drop it.
+        && entry.get("enabled_tools").is_none_or(|v| v.is_null())
+        && [
+            "disabled_tools",
+            "startup_timeout_sec",
+            "tool_timeout_sec",
+        ]
+        .iter()
+        .all(|k| empty(entry.get(*k)))
+}
+
+/// First non-empty line of a `codex` call's output, for an error message.
+fn codex_detail(run: &ClaudeRun) -> String {
+    let text = if run.stderr.trim().is_empty() {
+        &run.stdout
+    } else {
+        &run.stderr
+    };
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let line: String = line.trim().chars().take(240).collect();
+    if line.is_empty() {
+        "no detail from codex".to_string()
+    } else {
+        line
+    }
+}
+
+/// Codex's config file: `$CODEX_HOME/config.toml`, else `~/.codex/config.toml`.
+fn codex_config_path() -> Option<std::path::PathBuf> {
+    match std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        Some(home) => Some(std::path::PathBuf::from(home).join("config.toml")),
+        None => dirs::home_dir().map(|h| h.join(".codex/config.toml")),
+    }
+}
+
+/// Copy `config` to a new `config.toml.csr-backup-<unix secs>[-n]` beside it, owner-only.
+/// The file is created exclusively, so an earlier backup is never overwritten and a link
+/// planted at the name is never followed. None when there is no file to copy.
+fn backup_codex_config(config: &Path) -> Result<Option<std::path::PathBuf>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !config.is_file() {
+        return Ok(None);
+    }
+    let fail = |e: std::io::Error| format!("could not back up {}: {e}", config.display());
+    let mut source = std::fs::File::open(config).map_err(fail)?;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for n in 0..100 {
+        let name = match n {
+            0 => format!("config.toml.csr-backup-{secs}"),
+            n => format!("config.toml.csr-backup-{secs}-{n}"),
+        };
+        let backup = config.with_file_name(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backup)
+        {
+            Ok(mut out) => {
+                std::io::copy(&mut source, &mut out).map_err(fail)?;
+                out.sync_all().map_err(fail)?;
+                return Ok(Some(backup));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(fail(e)),
+        }
+    }
+    Err(format!(
+        "could not back up {}: no free backup name",
+        config.display()
+    ))
+}
+
+/// Register `binary` as the `claude-self-reflect` MCP server with the Codex CLI at `codex`.
+/// `config` is Codex's config file, copied aside before the add.
+fn register_codex_mcp(
+    codex: &Path,
+    config: Option<&Path>,
+    binary: &str,
+    timeout: Duration,
+) -> CodexMcpOutcome {
+    let command = codex_add_command(binary);
+    let failed = |reason: String| CodexMcpOutcome::Failed {
+        reason,
+        command: command.clone(),
+    };
+    let get_args = ["mcp", "get", MCP_SERVER_NAME, "--json"];
+
+    let get = match run_with_timeout(codex, &get_args, timeout) {
+        Ok(run) => run,
+        Err(reason) => return failed(reason),
+    };
+    let mut repointed_from = None;
+    if get.success {
+        let Some(entry) = first_json(&get.stdout, |v| v.is_object()) else {
+            return failed("`codex mcp get` returned no JSON entry".to_string());
+        };
+        let current = codex_entry_command(&entry);
+        if entry.get("enabled").and_then(|e| e.as_bool()) == Some(false) {
+            return CodexMcpOutcome::LeftAlone {
+                reason: "it is disabled in Codex's config".to_string(),
+                command,
+            };
+        }
+        if current.as_deref() == Some(binary) {
+            return CodexMcpOutcome::AlreadyCurrent;
+        }
+        if !codex_entry_is_bare(&entry) {
+            let at = current
+                .map(|c| format!(" points at {c} and"))
+                .unwrap_or_default();
+            return CodexMcpOutcome::LeftAlone {
+                reason: format!("it{at} has settings that `codex mcp add` would drop"),
+                command,
+            };
+        }
+        repointed_from = current;
+    } else {
+        let detail = format!("{}\n{}", get.stderr, get.stdout);
+        if !detail.contains("No MCP server named") {
+            return failed(format!("`codex mcp get` failed: {}", codex_detail(&get)));
+        }
+    }
+
+    // No backup, no write: the add can drop the user's comments.
+    let backup = match config.map(backup_codex_config).transpose() {
+        Ok(backup) => backup.flatten(),
+        Err(reason) => return failed(reason),
+    };
+    match run_with_timeout(
+        codex,
+        &["mcp", "add", MCP_SERVER_NAME, "--", binary],
+        timeout,
+    ) {
+        Ok(run) if run.success => {}
+        Ok(run) => return failed(format!("`codex mcp add` failed: {}", codex_detail(&run))),
+        Err(reason) => return failed(reason),
+    }
+
+    // Read it back: "Added" on stdout is not proof the entry names this binary. From here
+    // on the config may already be rewritten, so a failure keeps the backup receipt.
+    let unverified = |reason: String| CodexMcpOutcome::Unverified {
+        reason,
+        backup: backup.clone(),
+        command: command.clone(),
+    };
+    let check = match run_with_timeout(codex, &get_args, timeout) {
+        Ok(run) if run.success => run,
+        Ok(run) => {
+            return unverified(format!(
+                "`codex mcp get` after the add failed: {}",
+                codex_detail(&run)
+            ))
+        }
+        Err(reason) => return unverified(reason),
+    };
+    let kept =
+        first_json(&check.stdout, |v| v.is_object()).and_then(|entry| codex_entry_command(&entry));
+    if kept.as_deref() != Some(binary) {
+        return unverified(format!(
+            "Codex's config names {} after the add, not this binary",
+            kept.unwrap_or_else(|| "no command".to_string())
+        ));
+    }
+    CodexMcpOutcome::Registered {
+        repointed_from,
+        backup,
+    }
+}
+
+/// The lines the Codex step prints.
+fn codex_step_text(outcome: &CodexMcpOutcome) -> String {
+    match outcome {
+        CodexMcpOutcome::Registered {
+            repointed_from,
+            backup,
+        } => {
+            let was = repointed_from
+                .as_ref()
+                .map(|old| format!(" (was {old})"))
+                .unwrap_or_default();
+            let kept = backup
+                .as_ref()
+                .map(|b| format!("\n  Codex: previous config saved to {}", b.display()))
+                .unwrap_or_default();
+            format!("  Codex: registered via `codex mcp add`{was}{kept}\n")
+        }
+        CodexMcpOutcome::AlreadyCurrent => "  Codex: already registered\n".to_string(),
+        CodexMcpOutcome::LeftAlone { reason, command } => {
+            format!("  Codex: existing entry left alone; {reason}. To repoint it:\n    {command}\n")
+        }
+        CodexMcpOutcome::Unverified {
+            reason,
+            backup,
+            command,
+        } => {
+            let kept = backup
+                .as_ref()
+                .map(|b| format!("\n  Codex: previous config saved to {}", b.display()))
+                .unwrap_or_default();
+            format!(
+                "  Codex: added, but not confirmed ({reason}). Check with `codex mcp get {MCP_SERVER_NAME}`, or run:\n    {command}{kept}\n"
+            )
+        }
+        CodexMcpOutcome::Failed { reason, command } => {
+            format!("  Codex: not registered ({reason}). Run it yourself:\n    {command}\n")
+        }
+    }
+}
+
+/// `csr-engine setup --codex-only`: the Codex step alone, for an install that is already set up.
+/// Exits non-zero only when Codex is installed and the entry does not name this binary.
+pub fn codex_only() -> Result<()> {
+    let (text, ok) = codex_step_checked();
+    eprint!("{text}");
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Codex MCP server not registered"))
+    }
+}
+
+/// Setup's Codex step text. Never fails setup.
+fn codex_step() -> String {
+    codex_step_checked().0
+}
+
+/// The Codex step: its text, and false when Codex is installed but not pointed at this
+/// binary. Switched off or no Codex on `PATH` count as fine.
+fn codex_step_checked() -> (String, bool) {
+    if codex_mcp_disabled() {
+        return (
+            "  Codex: skipped (CSR_NO_CODEX_MCP is set)\n".to_string(),
+            true,
+        );
+    }
+    let Some(codex) = find_on_path("codex") else {
+        return ("  Codex: not installed, skipped\n".to_string(), true);
+    };
+    // The stable name (a symlink an upgrade repoints), as the daemon step stores it.
+    let binary = match std::env::current_exe() {
+        Ok(exe) => stable_engine_path(
+            std::env::args_os().next().as_deref(),
+            &std::env::current_dir().unwrap_or_default(),
+            std::env::var_os("PATH").as_deref(),
+            &exe,
+        )
+        .to_string_lossy()
+        .into_owned(),
+        Err(e) => {
+            return (
+                format!("  Codex: not registered (cannot determine our own path: {e})\n"),
+                false,
+            )
+        }
+    };
+    let config = codex_config_path();
+    let outcome = register_codex_mcp(&codex, config.as_deref(), &binary, CODEX_TIMEOUT);
+    let ok = matches!(
+        outcome,
+        CodexMcpOutcome::Registered { .. } | CodexMcpOutcome::AlreadyCurrent
+    );
+    (codex_step_text(&outcome), ok)
+}
+
+#[cfg(test)]
+#[path = "setup_plist_tests.rs"]
+mod plist_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Codex registration, against a fake `codex` that keeps its entry in a file ----
+
+    fn fake_codex(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir.display();
+        let script = format!(
+            r#"#!/bin/sh
+D='{d}'
+echo "$@" >> "$D/argv.log"
+case "$2" in
+  get)
+    if [ -f "$D/get_fails" ]; then echo "Error: config.toml: invalid TOML" >&2; exit 1; fi
+    if [ -f "$D/get_fails_after_add" ] && [ -f "$D/entry.json" ]; then echo "Error: config.toml: locked" >&2; exit 1; fi
+    if [ -f "$D/entry.json" ]; then cat "$D/entry.json"; else echo "Error: No MCP server named '$3' found." >&2; exit 1; fi ;;
+  add)
+    if [ -f "$D/add_fails" ]; then echo "Error: permission denied" >&2; exit 1; fi
+    if [ -f "$D/add_ignored" ]; then echo "Added global MCP server '$3'."; exit 0; fi
+    printf '{{"name":"%s","enabled":true,"transport":{{"type":"stdio","command":"%s","args":[],"env":null,"env_vars":[],"cwd":null}},"enabled_tools":null,"disabled_tools":null,"startup_timeout_sec":null,"tool_timeout_sec":null}}' "$3" "$5" > "$D/entry.json"
+    echo "Added global MCP server '$3'." ;;
+esac
+"#
+        );
+        let path = dir.join("codex");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn codex_entry(command: &str, extra: &str) -> String {
+        format!(
+            r#"{{"name":"claude-self-reflect","enabled":true,"transport":{{"type":"stdio","command":"{command}","args":[],"env":null,"env_vars":[],"cwd":null}},"enabled_tools":null,"disabled_tools":null,"startup_timeout_sec":null,"tool_timeout_sec":null{extra}}}"#
+        )
+    }
+
+    fn adds(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("argv.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("mcp add"))
+            .count()
+    }
+
+    const NEW_BIN: &str = "/usr/local/bin/csr-engine";
+
+    #[test]
+    fn codex_missing_entry_is_added_and_read_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = fake_codex(tmp.path());
+        let outcome = register_codex_mcp(&codex, None, NEW_BIN, Duration::from_secs(10));
+        assert_eq!(
+            outcome,
+            CodexMcpOutcome::Registered {
+                repointed_from: None,
+                backup: None
+            }
+        );
+        assert_eq!(adds(tmp.path()), 1);
+        let log = std::fs::read_to_string(tmp.path().join("argv.log")).unwrap();
+        assert!(
+            log.contains("mcp add claude-self-reflect -- /usr/local/bin/csr-engine"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn codex_config_is_copied_aside_before_the_add() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = fake_codex(tmp.path());
+        let config = tmp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "# mine\n[mcp_servers.other]\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let outcome = register_codex_mcp(&codex, Some(&config), NEW_BIN, Duration::from_secs(10));
+        let CodexMcpOutcome::Registered {
+            backup: Some(backup),
+            ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert!(std::fs::read_to_string(backup)
+            .unwrap()
+            .starts_with("# mine"));
+        assert_eq!(
+            std::fs::metadata(backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(codex_step_text(&outcome).contains("previous config saved to"));
+
+        let backups = || {
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("config.toml.csr-backup-")
+                })
+                .count()
+        };
+        // Already current: nothing is written, so no new backup either.
+        let again = register_codex_mcp(&codex, Some(&config), NEW_BIN, Duration::from_secs(10));
+        assert_eq!(again, CodexMcpOutcome::AlreadyCurrent);
+        assert_eq!(backups(), 1);
+
+        // A second backup in the same second takes a new name; the first is kept as it was.
+        let first = std::fs::read(backup).unwrap();
+        let second = backup_codex_config(&config).unwrap().unwrap();
+        assert_ne!(&second, backup);
+        assert_eq!(std::fs::read(backup).unwrap(), first);
+        assert_eq!(backups(), 2);
+    }
+
+    #[test]
+    fn codex_failed_read_back_is_unverified_and_keeps_the_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = fake_codex(tmp.path());
+        let config = tmp.path().join("config.toml");
+        std::fs::write(&config, "[mcp_servers.other]\ncommand = \"/bin/echo\"\n").unwrap();
+        std::fs::write(tmp.path().join("get_fails_after_add"), "").unwrap();
+        let outcome = register_codex_mcp(&codex, Some(&config), NEW_BIN, Duration::from_secs(10));
+        let CodexMcpOutcome::Unverified {
+            backup: Some(_),
+            reason,
+            ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert!(reason.contains("after the add"), "{reason}");
+        let text = codex_step_text(&outcome);
+        assert!(text.contains("added, but not confirmed"), "{text}");
+        assert!(text.contains("previous config saved to"), "{text}");
+    }
+
+    #[test]
+    fn codex_current_entry_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = fake_codex(tmp.path());
+        std::fs::write(tmp.path().join("entry.json"), codex_entry(NEW_BIN, "")).unwrap();
+        let outcome = register_codex_mcp(&codex, None, NEW_BIN, Duration::from_secs(10));
+        assert_eq!(outcome, CodexMcpOutcome::AlreadyCurrent);
+        assert_eq!(adds(tmp.path()), 0);
+    }
+
+    #[test]
+    fn codex_bare_entry_at_old_path_is_repointed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = fake_codex(tmp.path());
+        std::fs::write(
+            tmp.path().join("entry.json"),
+            codex_entry("/old/csr-engine", ""),
+        )
+        .unwrap();
+        let outcome = register_codex_mcp(&codex, None, NEW_BIN, Duration::from_secs(10));
+        assert_eq!(
+            outcome,
+            CodexMcpOutcome::Registered {
+                repointed_from: Some("/old/csr-engine".to_string()),
+                backup: None
+            }
+        );
+        assert!(codex_step_text(&outcome).contains("(was /old/csr-engine)"));
+    }
+
+    #[test]
+    fn codex_customized_entry_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = fake_codex(tmp.path());
+        let custom = codex_entry("/old/csr-engine", "")
+            .replace(r#""tool_timeout_sec":null"#, r#""tool_timeout_sec":90.0"#);
+        std::fs::write(tmp.path().join("entry.json"), &custom).unwrap();
+        let outcome = register_codex_mcp(&codex, None, NEW_BIN, Duration::from_secs(10));
+        let CodexMcpOutcome::LeftAlone { reason, command } = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(reason.contains("/old/csr-engine"), "{reason}");
+        assert_eq!(
+            command,
+            "codex mcp add claude-self-reflect -- /usr/local/bin/csr-engine"
+        );
+        assert_eq!(adds(tmp.path()), 0);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("entry.json")).unwrap(),
+            custom
+        );
+    }
+
+    #[test]
+    fn codex_disabled_entry_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = fake_codex(tmp.path());
+        let disabled =
+            codex_entry("/old/csr-engine", "").replace(r#""enabled":true"#, r#""enabled":false"#);
+        std::fs::write(tmp.path().join("entry.json"), disabled).unwrap();
+        let outcome = register_codex_mcp(&codex, None, NEW_BIN, Duration::from_secs(10));
+        assert!(
+            matches!(&outcome, CodexMcpOutcome::LeftAlone { reason, .. } if reason.contains("disabled")),
+            "{outcome:?}"
+        );
+        assert_eq!(adds(tmp.path()), 0);
+    }
+
+    #[test]
+    fn codex_unreadable_config_is_reported_not_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = fake_codex(tmp.path());
+        std::fs::write(tmp.path().join("get_fails"), "").unwrap();
+        let outcome = register_codex_mcp(&codex, None, NEW_BIN, Duration::from_secs(10));
+        let CodexMcpOutcome::Failed { reason, .. } = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(reason.contains("invalid TOML"), "{reason}");
+        assert_eq!(adds(tmp.path()), 0);
+        assert!(codex_step_text(&outcome)
+            .contains("Run it yourself:\n    codex mcp add claude-self-reflect --"));
+    }
+
+    #[test]
+    fn codex_add_failure_fails_and_silent_add_is_unverified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = fake_codex(tmp.path());
+        std::fs::write(tmp.path().join("add_fails"), "").unwrap();
+        let outcome = register_codex_mcp(&codex, None, NEW_BIN, Duration::from_secs(10));
+        assert!(
+            matches!(&outcome, CodexMcpOutcome::Failed { reason, .. } if reason.contains("permission denied")),
+            "{outcome:?}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = fake_codex(tmp.path());
+        std::fs::write(tmp.path().join("add_ignored"), "").unwrap();
+        let outcome = register_codex_mcp(&codex, None, NEW_BIN, Duration::from_secs(10));
+        assert!(
+            matches!(&outcome, CodexMcpOutcome::Unverified { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn codex_hang_is_stopped_and_named() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = tmp.path().join("codex");
+        std::fs::write(&codex, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let outcome = register_codex_mcp(&codex, None, NEW_BIN, Duration::from_millis(300));
+        let CodexMcpOutcome::Failed { reason, .. } = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            reason.contains("`codex mcp get` did not finish within"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn codex_bare_check_covers_every_dropped_field() {
+        let bare: serde_json::Value = serde_json::from_str(&codex_entry("/x", "")).unwrap();
+        assert!(codex_entry_is_bare(&bare));
+        for (field, value) in [
+            ("args", r#"["--serve"]"#),
+            ("env", r#"{"A":"1"}"#),
+            ("env_vars", r#"["A"]"#),
+            ("cwd", r#""/tmp""#),
+        ] {
+            let mut e = bare.clone();
+            e["transport"][field] = serde_json::from_str(value).unwrap();
+            assert!(!codex_entry_is_bare(&e), "{field}");
+        }
+        for (field, value) in [
+            ("enabled_tools", r#"["csr_why"]"#),
+            ("disabled_tools", r#"["store_reflection"]"#),
+            ("startup_timeout_sec", "20"),
+            ("tool_timeout_sec", "90"),
+        ] {
+            let mut e = bare.clone();
+            e[field] = serde_json::from_str(value).unwrap();
+            assert!(!codex_entry_is_bare(&e), "{field}");
+        }
+        let mut allow_none = bare.clone();
+        allow_none["enabled_tools"] = serde_json::json!([]);
+        assert!(!codex_entry_is_bare(&allow_none), "empty allowlist");
+        let mut deny_none = bare.clone();
+        deny_none["disabled_tools"] = serde_json::json!([]);
+        assert!(codex_entry_is_bare(&deny_none), "empty denylist");
+
+        let mut http = bare.clone();
+        http["transport"]["type"] = "streamable_http".into();
+        assert!(!codex_entry_is_bare(&http));
+    }
+
+    #[test]
+    fn hook_install_failure_is_carried_not_dropped() {
+        let carried = hook_install_step(|| Err(anyhow::anyhow!("settings.json is not valid JSON")));
+        assert_eq!(carried.as_deref(), Some("settings.json is not valid JSON"));
+        assert_eq!(hook_install_step(|| Ok(())), None);
+
+        let report = incomplete_report(None, carried.as_deref());
+        assert!(report.contains("Hook install failed: settings.json is not valid JSON"));
+        assert!(report.contains("Hooks from an earlier install, if any, are unchanged."));
+        assert!(!report.contains("NOT installed"), "{report}");
+        assert!(!report.contains("inactive"), "{report}");
+        assert!(report.contains("csr-engine hook install --apply"));
+        assert!(report.contains("MCP registration are done"), "{report}");
+        // the same non-zero status the MCP failure path returns
+        assert_eq!(incomplete_error(false, true), "hook install failed");
+        assert_eq!(incomplete_error(true, false), "MCP server not registered");
+    }
+
+    #[test]
+    fn incomplete_report_keeps_the_mcp_wording_and_adds_the_hooks() {
+        let mcp = mcp_registration_error("/bin/csr-engine", "boom", &PriorEntry::None);
+        let only_mcp = incomplete_report(Some(&mcp), None);
+        assert!(
+            only_mcp.starts_with("  Hooks and import are done. The MCP server is NOT registered:")
+        );
+        assert!(!only_mcp.contains("Hook install failed"));
+
+        let both = incomplete_report(Some(&mcp), Some("disk full"));
+        assert!(both.contains("Hook install failed: disk full"));
+        assert!(both.contains("  The import is done. The MCP server is NOT registered:"));
+        assert!(!both.contains("Hooks and import are done"));
+        assert_eq!(
+            incomplete_error(true, true),
+            "MCP server not registered and hook install failed"
+        );
+    }
+
+    #[test]
+    fn setup_discloses_the_claude_p_spend_and_its_switches() {
+        assert!(CLAUDE_P_NOTICE.contains("`claude -p`"));
+        assert!(CLAUDE_P_NOTICE.contains("your own Claude account"));
+        assert!(CLAUDE_P_NOTICE.contains("CSR_NO_AI_NARRATIVES=1"));
+        assert!(CLAUDE_P_NOTICE.contains("CSR_NO_DREAMING=1"));
+        // one line, so it sits beside the other step notices
+        assert!(!CLAUDE_P_NOTICE.contains('\n'));
+    }
+
+    #[test]
+    fn setup_next_steps_name_the_binarys_own_retry_command() {
+        let text = next_steps(None);
+        assert!(text.starts_with("Next steps:\n  1. Restart Claude Code"));
+        assert!(text.ends_with("To install it, run: csr-engine companion plugin install\n"));
+        // the steps name a recap and a plain-words question, not a tool or a key
+        assert!(text.contains("its first line recaps where you left off"));
+        assert!(text.contains("\"what did we work on last week?\""));
+        assert!(!text.contains("reflect_on_past"), "{text}");
+        assert!(!text.contains("--anthropic-key"), "{text}");
+        assert!(!text.contains("csr-engine daemon"), "{text}");
+        // no path ends with the GitHub marketplace's lines
+        assert!(!text.contains("/plugin marketplace add"), "{text}");
+        assert!(!text.contains("/plugin install"), "{text}");
+    }
 
     #[test]
     fn test_save_anthropic_key_new_file() {
@@ -638,6 +3661,93 @@ mod tests {
     fn test_count_total_files_nonexistent() {
         let count = count_total_files(Path::new("/tmp/nonexistent-csr-setup-test"));
         assert_eq!(count, 0);
+    }
+
+    // ── dreaming consent (locked decision 15) ──
+
+    /// Seed one candidate episode: a v2 reflection with a partial outcome and
+    /// at least one touched file — exactly what a night pass would consider.
+    fn seed_candidate(storage: &Storage, session: &str) {
+        let content = serde_json::json!({
+            "schema": "v2",
+            "session_id": session,
+            "project": "proj",
+            "timestamp": "2026-08-11T10:00:00Z",
+            "request": "do the thing",
+            "outcome": "partial",
+            "completed": "half of it",
+            "files_modified": ["src/a.rs"],
+        })
+        .to_string();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp)
+                     VALUES (?1, ?2, '[]', '2026-08-11T10:00:00Z')",
+                    rusqlite::params![session, content],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn the_estimate_is_computed_from_the_real_corpus_and_labelled_an_estimate() {
+        let storage = Storage::open_memory().unwrap();
+        let empty = night_estimate(&storage, EffortTier::Balanced);
+        assert_eq!(empty.candidates, 0, "an empty corpus estimates from zero");
+        assert_eq!(empty.total_tokens(), 0);
+
+        for index in 0..3 {
+            seed_candidate(&storage, &format!("session-{index}"));
+        }
+        let seeded = night_estimate(&storage, EffortTier::Balanced);
+        assert_eq!(
+            seeded.candidates, 3,
+            "the estimate must count the corpus, not a constant"
+        );
+        assert!(seeded.total_tokens() > 0);
+        let label = seeded.label(EffortTier::Balanced);
+        assert!(label.contains("estimate"), "not labelled: {label}");
+        assert!(label.contains("3 candidate episodes"), "no basis: {label}");
+    }
+
+    #[test]
+    fn a_non_interactive_run_keeps_dreaming_on_and_records_the_decision() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let storage = Storage::open_memory().unwrap();
+        std::env::set_var("CSR_AUTO_SETUP", "1");
+        let granted = dreaming_consent_step(&storage);
+        std::env::remove_var("CSR_AUTO_SETUP");
+        assert!(granted.unwrap(), "the default is ON");
+        assert!(!dream_cadence::consent_declined(&storage));
+        assert_eq!(
+            storage.get_meta(dream_cadence::META_CONSENT).unwrap(),
+            Some(dream_cadence::CONSENT_GRANTED.to_string()),
+            "a taken default is still recorded, not left ambiguous"
+        );
+    }
+
+    #[test]
+    fn auto_setup_makes_the_run_non_interactive() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::set_var("CSR_AUTO_SETUP", "1");
+        let auto = interactive();
+        std::env::remove_var("CSR_AUTO_SETUP");
+        assert!(!auto, "CSR_AUTO_SETUP=1 must never prompt");
+    }
+
+    #[test]
+    fn a_declined_consent_stops_the_daemon_dreaming() {
+        let storage = Storage::open_memory().unwrap();
+        assert!(
+            !dream_cadence::consent_declined(&storage),
+            "never asked is not declined"
+        );
+        dream_cadence::record_consent(&storage, false).unwrap();
+        assert!(dream_cadence::consent_declined(&storage));
+        dream_cadence::record_consent(&storage, true).unwrap();
+        assert!(!dream_cadence::consent_declined(&storage));
     }
 
     /// The exact stderr Claude Code 2.1.x emits when the name is taken. Only
@@ -985,5 +4095,2208 @@ mod tests {
         });
         assert_eq!(entry_command(&entry), Some("/old/csr-engine".to_string()));
         assert_eq!(entry_command(&serde_json::json!({})), None);
+    }
+
+    // ── the relay plugin (fake `claude` with a little state; a temp HOME) ──
+
+    const ENGINE: &str = "/opt/csr/bin/csr-engine";
+
+    /// A fake `claude plugin` that keeps the marketplace listing and the plugin's state in
+    /// files next to it. Every call appends its argv to `argv.log`.
+    struct RelayFake {
+        dir: tempfile::TempDir,
+        home: tempfile::TempDir,
+        bin: std::path::PathBuf,
+    }
+
+    impl RelayFake {
+        /// `market` is what `marketplace list --json` prints; `plugin` is `absent`, `stale`
+        /// (an older version, cached text that is not the relay) or `current`.
+        fn new(market: &str, plugin: &str, update_refreshes: bool, refuses_add: bool) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let d = dir.path();
+            let built = emit::write_marketplace(home.path(), Some(Path::new(ENGINE))).unwrap();
+            let fresh = d.join("cache-current");
+            std::fs::create_dir_all(fresh.join("hooks")).unwrap();
+            std::fs::write(fresh.join("hooks/register.js"), &built.relay).unwrap();
+            let old = d.join("cache-stale");
+            std::fs::create_dir_all(old.join("hooks")).unwrap();
+            std::fs::write(old.join("hooks/register.js"), "// an older relay\n").unwrap();
+            std::fs::write(
+                d.join("market"),
+                market.replace("DIR", built.dir.to_str().unwrap()),
+            )
+            .unwrap();
+            std::fs::write(d.join("plugin"), plugin).unwrap();
+            std::fs::write(d.join("update_refreshes"), update_refreshes.to_string()).unwrap();
+            std::fs::write(d.join("refuses_add"), refuses_add.to_string()).unwrap();
+            std::fs::write(d.join("enabled"), "true").unwrap();
+            let id = "csr-companion@claude-self-reflect";
+            let version = env!("CARGO_PKG_VERSION");
+            let script = format!(
+                r#"#!/bin/sh
+D='{d}'
+echo "$@" >> "$D/argv.log"
+case "$2" in
+  marketplace)
+    case "$3" in
+      list) cat "$D/market" ;;
+      add)
+        if grep -q github "$D/market" && [ "$(cat "$D/refuses_add")" = true ]; then
+          echo "already exists" >&2; exit 1
+        fi
+        if [ -f "$D/add_fails_once" ] && ! grep -q github "$D/market"; then
+          rm "$D/add_fails_once"; echo "network down" >&2; exit 1
+        fi ;;
+      remove) echo '[]' > "$D/market"; echo absent > "$D/plugin" ;;
+    esac ;;
+  list)
+    E=$(cat "$D/enabled")
+    case "$(cat "$D/plugin")" in
+      absent) echo '[]' ;;
+      stale) echo '[{{"id":"{id}","version":"0.5.0","scope":"user","enabled":'$E',"installPath":"{d}/cache-stale"}}]' ;;
+      current) echo '[{{"id":"{id}","version":"{version}","scope":"user","enabled":'$E',"installPath":"{d}/cache-current"}}]' ;;
+    esac ;;
+  disable)
+    if [ -f "$D/disable_fails" ]; then echo "settings are read-only" >&2; exit 1; fi
+    if [ -f "$D/disable_fails_once" ]; then rm "$D/disable_fails_once"; echo "settings are read-only" >&2; exit 1; fi
+    echo false > "$D/enabled"
+    echo '{{"command":"disable","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
+  install)
+    if [ -f "$D/install_fails_once" ]; then rm "$D/install_fails_once"; echo "disk full" >&2; exit 1; fi
+    echo current > "$D/plugin"; echo true > "$D/enabled"
+    echo '{{"command":"install","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
+  update)
+    if [ "$(cat "$D/update_refreshes")" = true ]; then echo current > "$D/plugin"; fi
+    echo '{{"command":"update","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
+  uninstall) echo absent > "$D/plugin"
+    echo '{{"command":"uninstall","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
+  configure)
+    if [ -f "$D/configure_fails" ]; then echo "keychain locked" >&2; exit 1; fi
+    if [ -f "$D/configure_silent" ]; then exit 0; fi
+    if [ -f "$D/configure_none" ]; then echo '{{"configured":[],"inputs":{{}}}}'; exit 0; fi
+    echo '{{"configured":["dreams"],"inputs":{{"dreams":"false","autoCompact":"suggest"}}}}' ;;
+esac
+"#,
+                d = d.display()
+            );
+            let bin = d.join("claude");
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            RelayFake { dir, home, bin }
+        }
+
+        /// The user had switched the plugin off.
+        fn disabled(self) -> Self {
+            std::fs::write(self.dir.path().join("enabled"), "false").unwrap();
+            self
+        }
+
+        /// Make the fake's `configure` (the option read) behave in a way: `configure_fails`
+        /// (exit 1), `configure_silent` (exit 0, no output) or `configure_none` (no options).
+        fn with(self, flag: &str) -> Self {
+            std::fs::write(self.dir.path().join(flag), "").unwrap();
+            self
+        }
+
+        /// Where a half-finished migration keeps the user's options.
+        fn pending(&self) -> std::path::PathBuf {
+            self.home
+                .path()
+                .join(".claude-self-reflect/csr-companion/plugin-migration.json")
+        }
+
+        fn enabled(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("enabled")).unwrap()
+        }
+
+        fn run(&self) -> RelayReport {
+            install_relay(
+                &self.bin,
+                self.home.path(),
+                Path::new(ENGINE),
+                Duration::from_secs(10),
+            )
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("argv.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    const NONE_REGISTERED: &str = "[]";
+    const HERE: &str = r#"[{"name":"claude-self-reflect","source":"directory","path":"DIR"}]"#;
+    const ON_GITHUB: &str = r#"[{"name":"claude-self-reflect","source":"github","repo":"ramakay/claude-self-reflect"}]"#;
+
+    #[test]
+    fn market_state_reads_the_listing() {
+        let dir = Path::new("/private/tmp/csr-checkout");
+        let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        assert_eq!(market_state(&json("[]"), dir), MarketState::Absent);
+        assert_eq!(
+            market_state(&json(r#"[{"name":"other","source":"github"}]"#), dir),
+            MarketState::Absent
+        );
+        assert_eq!(
+            market_state(
+                &json(
+                    r#"[{"name":"claude-self-reflect","source":"directory","path":"/private/tmp/csr-checkout"}]"#
+                ),
+                dir
+            ),
+            MarketState::Here
+        );
+        assert_eq!(
+            market_state(&json(ON_GITHUB), dir),
+            MarketState::Elsewhere("github ramakay/claude-self-reflect".into())
+        );
+        assert!(matches!(
+            market_state(
+                &json(
+                    r#"[{"name":"claude-self-reflect","source":"directory","path":"/elsewhere"}]"#
+                ),
+                dir
+            ),
+            MarketState::Elsewhere(_)
+        ));
+    }
+
+    #[test]
+    fn relay_install_on_a_fresh_machine_adds_the_marketplace_and_installs() {
+        let fake = RelayFake::new(NONE_REGISTERED, "absent", true, false);
+        let report = fake.run();
+        let CompanionOutcome::Installed(info) = &report.outcome else {
+            panic!("{report:?}");
+        };
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        assert!(report.changed);
+        let dir = emit::marketplace_dir(fake.home.path());
+        let calls = fake.calls();
+        assert_eq!(calls[0], "plugin marketplace list --json");
+        assert_eq!(
+            calls[1],
+            format!("plugin marketplace add {}", dir.display())
+        );
+        assert_eq!(calls[2], "plugin list --json");
+        assert_eq!(
+            calls[3],
+            "plugin install csr-companion@claude-self-reflect --json"
+        );
+        assert!(!calls
+            .iter()
+            .any(|c| c.contains("remove") || c.contains("update")));
+        let text = next_steps(Some(&report));
+        assert!(text.contains(RELOAD_LINE), "{text}");
+    }
+
+    #[test]
+    fn relay_install_changes_nothing_when_it_is_current() {
+        let fake = RelayFake::new(HERE, "current", true, false);
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::AlreadyInstalled(_)),
+            "{report:?}"
+        );
+        assert!(!report.changed);
+        let calls = fake.calls();
+        assert!(
+            calls.iter().all(|c| c.ends_with("list --json")),
+            "something other than a listing ran: {calls:?}"
+        );
+        assert!(!next_steps(Some(&report)).contains("/reload-plugins"));
+    }
+
+    #[test]
+    fn relay_install_moves_a_github_marketplace_and_updates_the_plugin() {
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, false);
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        assert!(report.changed);
+        let calls = fake.calls();
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("plugin marketplace add ")));
+        assert!(!calls.iter().any(|c| c.contains("marketplace remove")));
+        assert!(calls.contains(&"plugin update csr-companion@claude-self-reflect --json".into()));
+        assert!(!calls.iter().any(|c| c.contains("uninstall")));
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| s.starts_with("marketplace moved here (was: github")));
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| s.starts_with("plugin updated: 0.5.0 -> ")));
+    }
+
+    #[test]
+    fn relay_install_reinstalls_when_the_update_keeps_the_old_cache() {
+        let fake = RelayFake::new(HERE, "stale", false, false);
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(at("plugin update") < at("plugin uninstall"));
+        assert!(calls.iter().any(|c| c.ends_with("--keep-data --json")));
+        assert!(at("plugin uninstall") < at("plugin install"));
+        // the option the user had set goes back in at install
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("plugin install ") && c.ends_with("--config dreams=false")));
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| s.starts_with("plugin reinstalled")));
+    }
+
+    #[test]
+    fn a_reinstall_keeps_a_plugin_the_user_had_disabled_disabled() {
+        let fake = RelayFake::new(HERE, "stale", false, false).disabled();
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(at("plugin install") < at("plugin disable"));
+        assert!(calls.contains(&"plugin disable csr-companion@claude-self-reflect --json".into()));
+        assert_eq!(fake.enabled().trim(), "false");
+        // an enabled plugin is never disabled
+        let on = RelayFake::new(HERE, "stale", false, false);
+        on.run();
+        assert!(!on.calls().iter().any(|c| c.contains("plugin disable")));
+        assert_eq!(on.enabled().trim(), "true");
+    }
+
+    #[test]
+    fn a_removed_marketplace_also_keeps_a_disabled_plugin_disabled() {
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, true).disabled();
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(at("marketplace remove") < at("plugin install"));
+        assert!(at("plugin install") < at("plugin disable"));
+        assert_eq!(fake.enabled().trim(), "false");
+    }
+
+    #[test]
+    fn a_failed_disable_is_reported_in_setups_style() {
+        let fake = RelayFake::new(HERE, "stale", false, false).disabled();
+        std::fs::write(fake.dir.path().join("disable_fails"), "").unwrap();
+        let report = fake.run();
+        let CompanionOutcome::Failed { reason } = &report.outcome else {
+            panic!("{report:?}");
+        };
+        assert!(
+            reason.contains("`claude plugin disable` failed"),
+            "{reason}"
+        );
+        assert!(reason.contains("settings are read-only"), "{reason}");
+        assert!(reason.contains("claude plugin disable csr-companion@claude-self-reflect"));
+        let text = next_steps(Some(&report));
+        assert!(text.contains("companion: not installed:"), "{text}");
+    }
+
+    #[test]
+    fn relay_install_removes_and_adds_when_add_over_the_name_is_refused() {
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, true);
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(at("plugin configure") < at("marketplace remove"));
+        assert!(at("marketplace remove") < at("plugin install"));
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("plugin install ") && c.ends_with("--config dreams=false")));
+        // a run that finishes leaves nothing behind
+        assert!(!fake.pending().exists());
+    }
+
+    #[test]
+    fn an_absent_plugin_has_no_options_to_read_before_the_marketplace_moves() {
+        // `configure` would fail for a plugin that is not installed; nothing to lose then
+        let fake = RelayFake::new(ON_GITHUB, "absent", true, true).with("configure_fails");
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        assert!(!calls.iter().any(|c| c.contains("plugin configure")));
+        assert!(calls.iter().any(|c| c.contains("marketplace remove")));
+        assert!(!calls.iter().any(|c| c.contains("--config")));
+    }
+
+    /// S3: a failed read of the options stops the step that would delete them.
+    /// `updated`: the step before it (`plugin update`) already changed the plugin.
+    fn failed_option_read_stops(fake: &RelayFake, what: &str, updated: bool) {
+        let report = fake.run();
+        let CompanionOutcome::Failed { reason } = &report.outcome else {
+            panic!("{what}: {report:?}");
+        };
+        assert!(
+            reason.contains("csr-engine companion plugin install"),
+            "{what}: {reason}"
+        );
+        assert!(reason.contains("options"), "{what}: {reason}");
+        assert_eq!(report.changed, updated, "{what}");
+        assert_eq!(
+            next_steps(Some(&report)).contains(RELOAD_LINE),
+            updated,
+            "{what}"
+        );
+        let calls = fake.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("marketplace remove") || c.contains("plugin uninstall")),
+            "{what}: a destructive step ran: {calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("plugin install ")));
+        assert!(!fake.pending().exists(), "{what}");
+    }
+
+    #[test]
+    fn a_failed_option_read_stops_the_marketplace_move() {
+        for flag in ["configure_fails", "configure_silent"] {
+            let fake = RelayFake::new(ON_GITHUB, "stale", true, true).with(flag);
+            failed_option_read_stops(&fake, flag, false);
+        }
+    }
+
+    #[test]
+    fn a_failed_option_read_stops_the_cache_repair() {
+        for flag in ["configure_fails", "configure_silent"] {
+            let fake = RelayFake::new(HERE, "stale", false, false).with(flag);
+            failed_option_read_stops(&fake, flag, true);
+        }
+    }
+
+    #[test]
+    fn an_empty_but_successful_option_read_goes_on_with_no_options() {
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, true).with("configure_none");
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        assert!(calls.iter().any(|c| c.contains("marketplace remove")));
+        assert!(!calls.iter().any(|c| c.contains("--config")));
+    }
+
+    /// S4: the marketplace is removed, the add fails, and the options survive for the rerun.
+    #[test]
+    fn a_migration_that_fails_half_way_keeps_the_options_for_the_rerun() {
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, true)
+            .disabled()
+            .with("add_fails_once");
+        let first = fake.run();
+        let CompanionOutcome::Failed { reason } = &first.outcome else {
+            panic!("{first:?}");
+        };
+        assert!(reason.contains("network down"), "{reason}");
+        // a plugin was uninstalled: the failure's report still says to reload
+        assert!(first.changed);
+        assert!(next_steps(Some(&first)).contains(RELOAD_LINE));
+        assert!(fake.pending().is_file(), "the options were not saved");
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(fake.pending())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode, 0o600);
+
+        // the plugin is gone now; the rerun installs with what the user had
+        let before = fake.calls().len();
+        let second = fake.run();
+        assert!(
+            matches!(second.outcome, CompanionOutcome::Installed(_)),
+            "{second:?}"
+        );
+        let calls = fake.calls()[before..].to_vec();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("plugin install ") && c.ends_with("--config dreams=false")),
+            "{calls:?}"
+        );
+        assert!(calls.contains(&"plugin disable csr-companion@claude-self-reflect --json".into()));
+        assert_eq!(fake.enabled().trim(), "false");
+        assert!(
+            !fake.pending().exists(),
+            "the file outlived a confirmed install"
+        );
+    }
+
+    #[test]
+    fn a_failed_cache_repair_install_keeps_the_options_for_the_rerun() {
+        let fake = RelayFake::new(HERE, "stale", false, false)
+            .disabled()
+            .with("install_fails_once");
+        let first = fake.run();
+        let CompanionOutcome::Failed { reason } = &first.outcome else {
+            panic!("{first:?}");
+        };
+        assert!(reason.contains("disk full"), "{reason}");
+        assert!(first.changed);
+        assert!(next_steps(Some(&first)).contains(RELOAD_LINE));
+        assert!(fake.pending().is_file(), "the options were not saved");
+
+        let before = fake.calls().len();
+        let second = fake.run();
+        assert!(
+            matches!(second.outcome, CompanionOutcome::Installed(_)),
+            "{second:?}"
+        );
+        let calls = fake.calls()[before..].to_vec();
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("plugin install ") && c.ends_with("--config dreams=false")));
+        assert_eq!(fake.enabled().trim(), "false");
+        assert!(!fake.pending().exists());
+    }
+
+    /// A migration of a switched-off plugin whose install worked but whose disable failed:
+    /// the rerun finds the plugin current and enabled, and the saved "off" still holds.
+    fn failed_disable_after_a_migration() -> RelayFake {
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, true)
+            .disabled()
+            .with("disable_fails_once");
+        let first = fake.run();
+        let CompanionOutcome::Failed { reason } = &first.outcome else {
+            panic!("{first:?}");
+        };
+        assert!(reason.contains("settings are read-only"), "{reason}");
+        assert!(fake.pending().is_file(), "the saved state was dropped");
+        assert_eq!(
+            fake.enabled().trim(),
+            "true",
+            "the failed disable changed it"
+        );
+        fake
+    }
+
+    #[test]
+    fn a_rerun_disables_a_current_plugin_the_user_had_switched_off() {
+        let fake = failed_disable_after_a_migration();
+        let before = fake.calls().len();
+        let second = fake.run();
+        assert!(
+            matches!(second.outcome, CompanionOutcome::Installed(_)),
+            "{second:?}"
+        );
+        assert!(second.changed);
+        let calls = fake.calls()[before..].to_vec();
+        assert!(
+            calls.contains(&"plugin disable csr-companion@claude-self-reflect --json".into()),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("plugin install ")));
+        assert_eq!(fake.enabled().trim(), "false");
+        assert!(!fake.pending().exists(), "the file outlived the disable");
+        // a third run has nothing left to do
+        let before = fake.calls().len();
+        let third = fake.run();
+        assert!(
+            matches!(third.outcome, CompanionOutcome::AlreadyInstalled(_)),
+            "{third:?}"
+        );
+        assert!(!fake.calls()[before..].iter().any(|c| c.contains("disable")));
+    }
+
+    #[test]
+    fn a_rerun_whose_disable_fails_again_keeps_the_file() {
+        let fake = failed_disable_after_a_migration();
+        std::fs::write(fake.dir.path().join("disable_fails"), "").unwrap();
+        let second = fake.run();
+        let CompanionOutcome::Failed { reason } = &second.outcome else {
+            panic!("{second:?}");
+        };
+        assert!(reason.contains("settings are read-only"), "{reason}");
+        assert!(fake.pending().is_file(), "the saved state was dropped");
+        assert_eq!(fake.enabled().trim(), "true");
+    }
+
+    #[test]
+    fn a_plugin_that_was_on_is_not_disabled_by_a_stale_file() {
+        let fake = RelayFake::new(HERE, "current", true, false);
+        let path = fake.pending();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"options":[],"enabled":true}"#).unwrap();
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::AlreadyInstalled(_)),
+            "{report:?}"
+        );
+        assert!(!fake.calls().iter().any(|c| c.contains("disable")));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_unreadable_snapshot_stops_setup_before_it_installs() {
+        for (text, why) in [
+            ("{ not json", "not JSON"),
+            (
+                r#"{"options":"dreams=false","enabled":false}"#,
+                "options not a list",
+            ),
+            (
+                r#"{"options":[["dreams"]],"enabled":false}"#,
+                "pair without a value",
+            ),
+            (r#"{"options":[],"enabled":"no"}"#, "enabled not a bool"),
+        ] {
+            let fake = RelayFake::new(NONE_REGISTERED, "absent", true, false);
+            let path = fake.pending();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            let report = fake.run();
+            let CompanionOutcome::Failed { reason } = &report.outcome else {
+                panic!("{why}: {report:?}");
+            };
+            assert!(
+                reason.contains(&path.display().to_string()),
+                "{why}: {reason}"
+            );
+            assert!(
+                reason.contains("fix the file or delete it"),
+                "{why}: {reason}"
+            );
+            let calls = fake.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("plugin install ")),
+                "{why}: installed over an unreadable snapshot: {calls:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{why}");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_that_cannot_be_opened_is_an_error_not_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(load_snapshot(home.path()), Ok(None));
+        let path = pending_snapshot_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"options":[["a","b"]],"enabled":false}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root reads anything; then there is nothing to show
+        if std::fs::read_to_string(&path).is_err() {
+            let err = load_snapshot(home.path()).unwrap_err();
+            assert!(err.contains(&path.display().to_string()), "{err}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let snap = load_snapshot(home.path()).unwrap().unwrap();
+        assert_eq!(snap.options, vec![("a".to_string(), "b".to_string())]);
+        assert!(!snap.enabled);
+    }
+
+    #[test]
+    fn a_normal_run_leaves_no_migration_file_behind() {
+        for fake in [
+            RelayFake::new(NONE_REGISTERED, "absent", true, false),
+            RelayFake::new(ON_GITHUB, "stale", true, false),
+            RelayFake::new(HERE, "stale", false, false),
+            RelayFake::new(HERE, "current", true, false),
+        ] {
+            let report = fake.run();
+            assert!(
+                !matches!(report.outcome, CompanionOutcome::Failed { .. }),
+                "{report:?}"
+            );
+            assert!(!fake.pending().exists());
+        }
+    }
+
+    #[test]
+    fn relay_install_reports_a_failed_step_and_stops() {
+        let fake = RelayFake::new(ON_GITHUB, "absent", true, true);
+        // `remove` also fails: make the fake's market file unwritable by replacing it with a dir
+        let market = fake.dir.path().join("market");
+        std::fs::remove_file(&market).unwrap();
+        std::fs::create_dir(&market).unwrap();
+        let report = fake.run();
+        let CompanionOutcome::Failed { reason } = &report.outcome else {
+            panic!("{report:?}");
+        };
+        assert!(reason.contains("marketplace list"), "{reason}");
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let text = next_steps(Some(&report));
+        assert!(text.contains("companion: not installed:"), "{text}");
+        assert!(
+            text.contains("csr-engine companion plugin install"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn relay_install_with_no_claude_on_hand_fails_with_one_line() {
+        let home = tempfile::tempdir().unwrap();
+        let report = install_relay(
+            Path::new("/nonexistent/claude"),
+            home.path(),
+            Path::new(ENGINE),
+            Duration::from_secs(5),
+        );
+        let CompanionOutcome::Failed { reason } = &report.outcome else {
+            panic!("{report:?}");
+        };
+        assert!(reason.contains("could not run"), "{reason}");
+        assert!(!report.changed);
+    }
+
+    #[test]
+    fn a_hanging_claude_is_stopped_at_the_timeout_and_only_that_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        let pid = dir.path().join("pid");
+        // `exec sleep` keeps the recorded pid equal to the process we spawned. The timeout
+        // leaves a fresh script time to start and write its pid on a loaded machine.
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pid.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let report = install_relay(&bin, home.path(), Path::new(ENGINE), Duration::from_secs(3));
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(10),
+            "did not stop at the timeout: {waited:?}"
+        );
+        let CompanionOutcome::Failed { reason } = &report.outcome else {
+            panic!("{report:?}");
+        };
+        assert!(reason.contains("did not finish within"), "{reason}");
+        assert_eq!(reason.lines().count(), 1, "one line: {reason}");
+        let text = next_steps(Some(&report));
+        assert!(text.contains(&format!("companion: not installed: {reason}\n")));
+        assert!(
+            text.ends_with("csr-engine companion plugin install\n"),
+            "{text}"
+        );
+        // On a loaded machine the limit can pass before the shell runs its first line:
+        // then the kill hit the shell itself, and `wait` reaped it.
+        let pid: i32 = match std::fs::read_to_string(&pid) {
+            Ok(s) => s.trim().parse().unwrap(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => panic!("{e}"),
+        };
+        // SAFETY: signal 0 only probes for the pid's existence.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "child {pid} is still running after the timeout");
+    }
+
+    #[test]
+    fn no_companion_writes_nothing_and_calls_nothing() {
+        let fake = RelayFake::new(NONE_REGISTERED, "absent", true, false);
+        let before = std::fs::read_dir(fake.home.path()).unwrap().count();
+        let report = companion_step(
+            false,
+            &fake.bin,
+            fake.home.path(),
+            Path::new(ENGINE),
+            Duration::from_secs(5),
+        );
+        assert_eq!(report, None);
+        assert!(fake.calls().is_empty());
+        assert_eq!(std::fs::read_dir(fake.home.path()).unwrap().count(), before);
+        assert!(next_steps(None).contains("companion: skipped (--no-companion)"));
+    }
+
+    // ----- daemon agent -----
+
+    fn agent_spec(home: &Path) -> DaemonAgentSpec {
+        DaemonAgentSpec {
+            engine: "/opt/csr/bin/csr-engine".into(),
+            home: home.to_path_buf(),
+            db_path: home.join(".claude-self-reflect/csr-engine.db"),
+            projects_dir: home.join(".claude/projects"),
+            claude_dir: Some("/opt/claude/bin".into()),
+            env: Default::default(),
+            lock_holder: None,
+        }
+    }
+
+    /// A launchctl stand-in: `loaded` answers `print`, `bootstrap_fails` the
+    /// first N bootstraps. Records every call.
+    struct FakeLaunchctl {
+        loaded: bool,
+        /// What `print` answers while the job is loaded.
+        print_text: String,
+        bootstrap_fails: usize,
+        /// `bootout` exits 0 but the job stays loaded.
+        bootout_unloads: bool,
+        /// When set, only this label is loaded; any other `print` fails.
+        only_label: Option<String>,
+        calls: Vec<String>,
+        /// Every call with all its arguments.
+        full: Vec<String>,
+    }
+
+    impl FakeLaunchctl {
+        fn new(loaded: bool) -> Self {
+            Self {
+                loaded,
+                print_text: String::new(),
+                bootstrap_fails: 0,
+                bootout_unloads: true,
+                only_label: None,
+                calls: Vec::new(),
+                full: Vec::new(),
+            }
+        }
+        fn run(&mut self, args: &[&str]) -> std::result::Result<String, String> {
+            self.calls.push(args[..args.len().min(2)].join(" "));
+            self.full.push(args.join(" "));
+            let wrong_label = self
+                .only_label
+                .as_ref()
+                .is_some_and(|label| !args.last().is_some_and(|a| a.ends_with(label.as_str())));
+            match args[0] {
+                "print" if self.loaded && !wrong_label => Ok(self.print_text.clone()),
+                "print" => Err("not loaded".into()),
+                "bootstrap" if self.bootstrap_fails > 0 => {
+                    self.bootstrap_fails -= 1;
+                    Err("Bootstrap failed: 5: Input/output error".into())
+                }
+                "bootstrap" => {
+                    self.loaded = true;
+                    Ok(String::new())
+                }
+                "bootout" => {
+                    self.loaded = !self.bootout_unloads;
+                    Ok(String::new())
+                }
+                _ => Ok(String::new()),
+            }
+        }
+    }
+
+    /// What `launchctl print` would say for a job loaded from `spec`'s own plist.
+    fn print_for(spec: &DaemonAgentSpec, pid: u32) -> String {
+        print_of(&render_daemon_plist(spec), pid)
+    }
+
+    fn print_of(plist_text: &str, pid: u32) -> String {
+        let facts = agent_facts(&parse_plist(plist_text).unwrap());
+        let mut text = String::from("gui/501/x = {\n\tstate = running\n\n\targuments = {\n");
+        for arg in &facts.program_args {
+            text.push_str(&format!("\t\t{arg}\n"));
+        }
+        text.push_str("\t}\n\n\tenvironment = {\n\t\tOSLogRateLimit => 64\n");
+        for (key, value) in &facts.env {
+            text.push_str(&format!("\t\t{key} => {value}\n"));
+        }
+        text.push_str(&format!(
+            "\t\tXPC_SERVICE_NAME => {DAEMON_LABEL}\n\t}}\n\n\tpid = {pid}\n}}\n"
+        ));
+        text
+    }
+
+    fn install_run(spec: &DaemonAgentSpec, fake: &mut FakeLaunchctl) -> DaemonRun {
+        install_daemon_agent(spec, 501, &mut |args| fake.run(args), &|_| {})
+    }
+
+    fn install(spec: &DaemonAgentSpec, fake: &mut FakeLaunchctl) -> DaemonOutcome {
+        install_run(spec, fake).outcome
+    }
+
+    #[test]
+    fn the_daemon_plist_uses_absolute_paths_and_the_real_binary() {
+        let spec = agent_spec(Path::new("/Users/someone"));
+        let text = render_daemon_plist(&spec);
+        assert!(
+            text.contains("<string>/opt/csr/bin/csr-engine</string>"),
+            "{text}"
+        );
+        assert!(text.contains("<string>--db-path</string>"), "{text}");
+        assert!(
+            text.contains("<string>/Users/someone/.claude-self-reflect/csr-engine.db</string>"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "<string>/Users/someone/.claude-self-reflect/logs/daemon.out.log</string>"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("<string>~"), "no tilde paths: {text}");
+        assert!(
+            text.matches("/Users/").count() == text.matches("/Users/someone/").count(),
+            "no owner paths: {text}"
+        );
+        // claude's folder first, then the binary's, then the fixed places.
+        assert!(
+            text.contains("<string>/opt/claude/bin:/opt/csr/bin:/Users/someone/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>"),
+            "{text}"
+        );
+        // A CSR_NO_* key reads as an inhibited feature in the pane, so none
+        // appears unless somebody set one.
+        assert!(!text.contains("CSR_NO_"), "{text}");
+        let mut spec = spec;
+        spec.env.insert("CSR_NO_CODEX_IMPORT".into(), "1".into());
+        assert!(render_daemon_plist(&spec).contains("<key>CSR_NO_CODEX_IMPORT</key>"));
+    }
+
+    #[test]
+    fn the_plist_names_the_database_the_daemon_serves() {
+        // `vector_ipc::launchd_database` is what ties a client to this daemon.
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(false);
+        install(&spec, &mut fake);
+        assert!(crate::search::vector_ipc::daemon_configured_for_database(
+            &spec.db_path,
+            Some(home.path()),
+        ));
+    }
+
+    #[test]
+    fn a_fresh_install_writes_the_plist_and_bootstraps_it_once() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(false);
+        let outcome = install(&spec, &mut fake);
+        assert_eq!(outcome, DaemonOutcome::Running { rewritten: true });
+        assert_eq!(
+            std::fs::read_to_string(spec.plist_path()).unwrap(),
+            render_daemon_plist(&spec)
+        );
+        assert!(home.path().join(".claude-self-reflect/logs").is_dir());
+        // bootstrap runs the job (RunAtLoad); a kickstart on top would restart it.
+        assert_eq!(
+            fake.calls,
+            vec![
+                "print gui/501/com.ramakay.csr-engine.daemon",
+                "bootstrap gui/501"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_run_leaves_the_file_alone_and_restarts_the_job() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let first = std::fs::metadata(spec.plist_path())
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&spec, 100);
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: false }
+        );
+        let second = std::fs::metadata(spec.plist_path())
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(first, second, "an identical plist must not be rewritten");
+        assert_eq!(
+            fake.calls,
+            vec![
+                "print gui/501/com.ramakay.csr-engine.daemon",
+                "kickstart -k"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_changed_install_reloads_the_job_because_kickstart_does_not_reread_it() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        spec.engine = "/opt/csr/new/csr-engine".into();
+
+        let mut fake = FakeLaunchctl::new(true);
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: true }
+        );
+        assert!(std::fs::read_to_string(spec.plist_path())
+            .unwrap()
+            .contains("/opt/csr/new/csr-engine"));
+        assert_eq!(
+            fake.calls,
+            vec![
+                "print gui/501/com.ramakay.csr-engine.daemon",
+                "bootout gui/501/com.ramakay.csr-engine.daemon",
+                // the unload is checked, not assumed
+                "print gui/501/com.ramakay.csr-engine.daemon",
+                "bootstrap gui/501"
+            ]
+        );
+    }
+
+    #[test]
+    fn bootstrap_is_retried_while_launchd_tears_the_old_job_down() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(false);
+        fake.bootstrap_fails = 2;
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: true }
+        );
+        assert_eq!(
+            fake.calls
+                .iter()
+                .filter(|c| c.starts_with("bootstrap"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_bootstrap_that_keeps_failing_reports_the_launchctl_error() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(false);
+        fake.bootstrap_fails = 99;
+        let outcome = install(&spec, &mut fake);
+        assert_eq!(
+            outcome,
+            DaemonOutcome::Failed("Bootstrap failed: 5: Input/output error".into())
+        );
+        let report = daemon_report(
+            &DaemonRun {
+                outcome,
+                label: DAEMON_LABEL.into(),
+                previous_pid: None,
+                notes: vec![],
+            },
+            Path::new("/opt/csr/bin/csr-engine"),
+        );
+        assert!(report.contains("Bootstrap failed: 5"), "{report}");
+        assert!(
+            report.contains("/opt/csr/bin/csr-engine daemon"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_hand_written_agent_with_a_live_binary_is_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let exe = std::env::current_exe().unwrap();
+        let theirs = format!(
+            "<plist><dict><key>ProgramArguments</key><array><string>{}</string><string>daemon</string></array><key>EnvironmentVariables</key><dict><key>CSR_NO_RECAP</key><string>1</string></dict></dict></plist>",
+            exe.display()
+        );
+        std::fs::create_dir_all(spec.plist_path().parent().unwrap()).unwrap();
+        std::fs::write(spec.plist_path(), &theirs).unwrap();
+
+        let mut fake = FakeLaunchctl::new(true);
+        assert_eq!(install(&spec, &mut fake), DaemonOutcome::KeptExisting);
+        assert_eq!(std::fs::read_to_string(spec.plist_path()).unwrap(), theirs);
+
+        // The same file pointing at a binary that is gone gets that one path
+        // repaired. Everything else in it is the user's and stays byte for byte.
+        let dead = theirs.replace(&exe.display().to_string(), "/nowhere/csr-engine");
+        std::fs::write(spec.plist_path(), &dead).unwrap();
+        let run = install_run(&spec, &mut FakeLaunchctl::new(false));
+        assert_eq!(run.outcome, DaemonOutcome::KeptExisting);
+        assert_eq!(
+            std::fs::read_to_string(spec.plist_path()).unwrap(),
+            dead.replace("/nowhere/csr-engine", "/opt/csr/bin/csr-engine")
+        );
+        assert!(
+            run.notes.iter().any(|n| n.contains("/nowhere/csr-engine")),
+            "{:?}",
+            run.notes
+        );
+    }
+
+    #[test]
+    fn repairing_a_dead_binary_keeps_every_other_choice_in_a_hand_written_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let theirs = "<?xml version=\"1.0\"?>
+<!-- mine -->
+<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+  <key>ProgramArguments</key><array>
+    <string>/old/place/csr-engine</string>
+    <string>--db-path</string><string>/data/mine.db</string>
+    <string>--projects-dir</string><string>/data/projects</string>
+    <string>daemon</string><string>--no-ai</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>CSR_NO_DREAMING</key><string>1</string>
+    <key>CSR_NARRATIVE_MODEL</key><string>haiku</string>
+  </dict>
+  <key>StartInterval</key><integer>77</integer>
+</dict></plist>
+";
+        std::fs::create_dir_all(spec.plist_path().parent().unwrap()).unwrap();
+        std::fs::write(spec.plist_path(), theirs).unwrap();
+        let mut fake = FakeLaunchctl::new(false);
+        assert_eq!(install(&spec, &mut fake), DaemonOutcome::KeptExisting);
+        let after = std::fs::read_to_string(spec.plist_path()).unwrap();
+        assert_eq!(
+            after,
+            theirs.replace("/old/place/csr-engine", "/opt/csr/bin/csr-engine")
+        );
+        assert!(fake.calls.iter().any(|c| c.starts_with("bootstrap")));
+
+        // A plist setup cannot read is the user's too: it is never overwritten.
+        std::fs::write(spec.plist_path(), "bplist00\u{1}binary").unwrap();
+        install(&spec, &mut FakeLaunchctl::new(false));
+        assert_eq!(
+            std::fs::read_to_string(spec.plist_path()).unwrap(),
+            "bplist00\u{1}binary"
+        );
+    }
+
+    #[test]
+    fn a_dead_program_key_is_repaired_where_launchd_reads_it() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let theirs = |program: &str, first: &str| {
+            format!(
+                "<?xml version=\"1.0\"?>
+<!-- mine -->
+<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+  <key>Program</key>
+  <string>{program}</string>
+  <key>ProgramArguments</key><array>
+    <string>{first}</string>
+    <string>--db-path</string><string>/data/mine.db</string>
+    <string>daemon</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>CSR_NO_DREAMING</key><string>1</string>
+  </dict>
+  <key>StartInterval</key><integer>77</integer>
+</dict></plist>
+"
+            )
+        };
+        let run = |text: &str| {
+            std::fs::create_dir_all(spec.plist_path().parent().unwrap()).unwrap();
+            std::fs::write(spec.plist_path(), text).unwrap();
+            let mut fake = FakeLaunchctl::new(false);
+            assert_eq!(install(&spec, &mut fake), DaemonOutcome::KeptExisting);
+            std::fs::read_to_string(spec.plist_path()).unwrap()
+        };
+        let engine = "/opt/csr/bin/csr-engine";
+
+        // Program and argv[0] both dead: launchd runs Program, so Program is
+        // repaired, and the argument with it.
+        let both = theirs("/old/place/csr-engine", "/old/place/csr-engine");
+        assert_eq!(run(&both), both.replace("/old/place/csr-engine", engine));
+
+        // Program dead, argv[0] a live name: launchd still runs Program.
+        let live = std::env::current_exe().unwrap();
+        let live = live.to_string_lossy();
+        let only_program = theirs("/old/place/csr-engine", &live);
+        assert_eq!(
+            run(&only_program),
+            only_program.replace("/old/place/csr-engine", engine)
+        );
+
+        // Program live: it is what runs, so a dead argv[0] label is left alone.
+        let fine = theirs(&live, "/old/place/csr-engine");
+        assert_eq!(run(&fine), fine);
+
+        // Program and no ProgramArguments at all.
+        let bare = "<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+  <key>Program</key><string>/old/place/csr-engine</string>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+";
+        assert_eq!(run(bare), bare.replace("/old/place/csr-engine", engine));
+    }
+
+    #[test]
+    fn a_decoy_with_the_same_dead_path_is_not_repaired_in_place_of_the_real_key() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let dead = "/old/place/csr-engine";
+        let engine = "/opt/csr/bin/csr-engine";
+        // `{top}` is where the real top-level strings sit; the decoys carry the
+        // very same text earlier in the file and must keep it.
+        let template = |decoy: &str| {
+            format!(
+                "<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+{decoy}
+  <key>Program</key><string>{{top}}</string>
+  <key>ProgramArguments</key><array>
+    <string>{{top}}</string>
+    <string>daemon</string>
+  </array>
+</dict></plist>
+"
+            )
+        };
+        let decoys = [
+            // in EnvironmentVariables: a key named Program, a key named
+            // ProgramArguments, and a plain value equal to the path
+            format!(
+                "  <key>EnvironmentVariables</key><dict>
+    <key>Program</key><string>{dead}</string>
+    <key>ProgramArguments</key><string>{dead}</string>
+    <key>WHERE</key><string>{dead}</string>
+  </dict>"
+            ),
+            // in a nested dict of another key
+            format!(
+                "  <key>Other</key><dict>
+    <key>Program</key><string>{dead}</string>
+    <key>ProgramArguments</key><array><string>{dead}</string></array>
+    <key>Inner</key><dict><key>Program</key><string>{dead}</string></dict>
+  </dict>"
+            ),
+        ];
+        for decoy in decoys {
+            let theirs = template(&decoy).replace("{top}", dead);
+            std::fs::create_dir_all(spec.plist_path().parent().unwrap()).unwrap();
+            std::fs::write(spec.plist_path(), &theirs).unwrap();
+            let mut fake = FakeLaunchctl::new(false);
+            assert_eq!(install(&spec, &mut fake), DaemonOutcome::KeptExisting);
+            assert_eq!(
+                std::fs::read_to_string(spec.plist_path()).unwrap(),
+                template(&decoy).replace("{top}", engine),
+                "decoy:\n{decoy}"
+            );
+        }
+    }
+
+    #[test]
+    fn markup_inside_the_program_string_is_never_spliced() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let body = |program: &str, args0: &str| {
+            format!(
+                "<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+{program}
+  <key>ProgramArguments</key><array>
+    {args0}
+    <string>daemon</string>
+  </array>
+</dict></plist>
+"
+            )
+        };
+        let program = |inner: &str| format!("  <key>Program</key>{inner}");
+        let cases = [
+            body(
+                &program("<string>/missing/<!--c-->csr-engine</string>"),
+                "<string>/x</string>",
+            ),
+            body(
+                &program("<string><![CDATA[/old/place/csr-engine]]></string>"),
+                "<string>/x</string>",
+            ),
+            body(&program("<string></string>"), "<string>/x</string>"),
+            body(&program("<string/>"), "<string>/x</string>"),
+            // no Program: argv[0] is what launchd runs
+            body("", "<string>/missing/<!--c-->csr-engine</string>"),
+            body("", "<string><![CDATA[/old/place/csr-engine]]></string>"),
+            body("", "<string></string>"),
+            body("", "<string/>"),
+        ];
+        for theirs in cases {
+            std::fs::create_dir_all(spec.plist_path().parent().unwrap()).unwrap();
+            std::fs::write(spec.plist_path(), &theirs).unwrap();
+            let run = install_run(&spec, &mut FakeLaunchctl::new(false));
+            assert_eq!(run.outcome, DaemonOutcome::KeptExisting, "{theirs}");
+            assert_eq!(
+                std::fs::read_to_string(spec.plist_path()).unwrap(),
+                theirs,
+                "the file must be left untouched"
+            );
+            let said = run.notes.join("\n");
+            assert!(said.contains(DAEMON_LABEL), "{said}");
+            assert!(
+                said.contains(&spec.plist_path().display().to_string()),
+                "{said}"
+            );
+            assert!(said.contains("/opt/csr/bin/csr-engine"), "{said}");
+            assert!(said.contains("by hand"), "{said}");
+        }
+    }
+
+    #[test]
+    fn an_escaped_program_path_is_decoded_to_compare_and_encoded_on_write() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        let file = spec.plist_path();
+        let write = |text: &str| {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, text).unwrap();
+        };
+        let plist = |path: &str| {
+            format!(
+                "<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.ramakay.csr-engine.daemon</string>
+  <key>Program</key><string>{path}</string>
+  <key>ProgramArguments</key><array><string>{path}</string><string>daemon</string></array>
+</dict></plist>
+"
+            )
+        };
+        // A live binary whose directory has an ampersand: decoded, it exists,
+        // so nothing is repaired.
+        let live = home.path().join("a&b");
+        std::fs::create_dir_all(&live).unwrap();
+        let exe = live.join("csr-engine");
+        std::fs::write(&exe, "x").unwrap();
+        let escaped = exe.to_string_lossy().replace('&', "&amp;");
+        let fine = plist(&escaped);
+        write(&fine);
+        install(&spec, &mut FakeLaunchctl::new(false));
+        assert_eq!(std::fs::read_to_string(spec.plist_path()).unwrap(), fine);
+
+        // A dead escaped path is repaired, and the new path is written encoded.
+        spec.engine = std::path::PathBuf::from("/opt/c&c/csr-engine");
+        write(&plist("/old/a&amp;b/csr-engine"));
+        let run = install_run(&spec, &mut FakeLaunchctl::new(false));
+        assert_eq!(
+            std::fs::read_to_string(spec.plist_path()).unwrap(),
+            plist("/opt/c&amp;c/csr-engine")
+        );
+        assert!(run.notes.join("\n").contains("/old/a&b/csr-engine"));
+    }
+
+    #[test]
+    fn a_key_deleted_from_a_matching_file_reloads_the_job_that_still_has_it() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1")]);
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let before = std::fs::read_to_string(spec.plist_path()).unwrap();
+        // The file is edited to a valid generated plist without the switch;
+        // the job loaded earlier still has it.
+        let edited = before.replace(
+            "    <key>CSR_NO_DREAMING</key>\n    <string>1</string>\n",
+            "",
+        );
+        assert_ne!(edited, before);
+        std::fs::write(spec.plist_path(), &edited).unwrap();
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_of(&before, 77);
+
+        spec.env = Default::default();
+        install(&spec, &mut fake);
+        assert_eq!(std::fs::read_to_string(spec.plist_path()).unwrap(), edited);
+        assert!(
+            fake.calls.iter().any(|c| c.starts_with("bootout")),
+            "the loaded job kept the deleted switch: {:?}",
+            fake.calls
+        );
+        assert!(fake.calls.iter().any(|c| c.starts_with("bootstrap")));
+    }
+
+    #[test]
+    fn the_opt_out_and_other_platforms_touch_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut calls = 0;
+        let mut count = |_: &[&str]| {
+            calls += 1;
+            Ok(String::new())
+        };
+        assert_eq!(
+            daemon_step(&spec, true, true, 501, &mut count, &|_| {}).outcome,
+            DaemonOutcome::OptedOut
+        );
+        assert_eq!(
+            daemon_step(&spec, false, false, 501, &mut count, &|_| {}).outcome,
+            DaemonOutcome::Manual
+        );
+        assert_eq!(calls, 0, "no launchctl call");
+        assert!(!spec.plist_path().exists());
+
+        let run_of = |outcome| DaemonRun {
+            outcome,
+            label: DAEMON_LABEL.into(),
+            previous_pid: None,
+            notes: vec![],
+        };
+        let out = daemon_report(&run_of(DaemonOutcome::OptedOut), Path::new("/x/csr-engine"));
+        assert!(
+            out.contains("CSR_NO_DAEMON") && out.contains("/x/csr-engine daemon"),
+            "{out}"
+        );
+        let manual = daemon_report(&run_of(DaemonOutcome::Manual), Path::new("/x/csr-engine"));
+        assert!(manual.contains("/x/csr-engine daemon"), "{manual}");
+    }
+
+    #[test]
+    fn csr_no_daemon_is_read_from_the_environment() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_DAEMON");
+        assert!(!daemon_opted_out());
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("", false)] {
+            std::env::set_var("CSR_NO_DAEMON", value);
+            assert_eq!(daemon_opted_out(), expected, "CSR_NO_DAEMON={value:?}");
+        }
+        std::env::remove_var("CSR_NO_DAEMON");
+    }
+
+    // ----- what the agent carries -----
+
+    /// `launchctl print` of the live agent (trimmed), the shape launchd emits.
+    const LAUNCHCTL_PRINT: &str = "gui/501/com.ramakay.csr-engine.daemon = {
+\tactive count = 1
+\tpath = /Users/someone/Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist
+\ttype = LaunchAgent
+\tstate = running
+
+\tprogram = /usr/local/bin/csr-engine
+\targuments = {
+\t\t/usr/local/bin/csr-engine
+\t\t--db-path
+\t\t/Users/someone/.claude-self-reflect/csr-engine.db
+\t\tdaemon
+\t}
+
+\tworking directory = /Users/someone/.claude-self-reflect
+
+\tinherited environment = {
+\t\tSSH_AUTH_SOCK => /var/run/com.apple.launchd.QpoyKfCwZJ/Listeners
+\t}
+
+\tdefault environment = {
+\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin
+\t}
+
+\tenvironment = {
+\t\tOSLogRateLimit => 64
+\t\tPATH => /Users/someone/.local/bin:/usr/bin:/bin
+\t\tCSR_NO_RATIFICATION => 1
+\t\tXPC_SERVICE_NAME => com.ramakay.csr-engine.daemon
+\t}
+
+\tdomain = gui/501 [100026]
+\tminimum runtime = 30
+\tpid = 24453
+\timmediate reason = semaphore
+}
+";
+
+    fn env_of(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn launchctl_print_is_read_from_the_top_level_blocks_only() {
+        let job = parse_launchctl_print(LAUNCHCTL_PRINT);
+        assert_eq!(job.pid, Some(24453));
+        assert_eq!(
+            job.arguments,
+            vec![
+                "/usr/local/bin/csr-engine",
+                "--db-path",
+                "/Users/someone/.claude-self-reflect/csr-engine.db",
+                "daemon"
+            ]
+        );
+        // not SSH_AUTH_SOCK (inherited), not the default PATH, not launchd's own keys
+        assert_eq!(
+            job.env,
+            env_of(&[
+                ("PATH", "/Users/someone/.local/bin:/usr/bin:/bin"),
+                ("CSR_NO_RATIFICATION", "1"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_plist_is_read_back_into_its_arguments_and_environment() {
+        let mut spec = agent_spec(Path::new("/Users/a&b"));
+        spec.env
+            .insert("CSR_NARRATIVE_MODEL".into(), "a<b&c".into());
+        let facts = agent_facts(&parse_plist(&render_daemon_plist(&spec)).unwrap());
+        assert_eq!(facts.program_args[0], "/opt/csr/bin/csr-engine");
+        assert_eq!(
+            facts.program_args.last().map(String::as_str),
+            Some("daemon")
+        );
+        assert_eq!(facts.env["CSR_NARRATIVE_MODEL"], "a<b&c");
+        assert_eq!(facts.env["PATH"], spec.path_env());
+        assert!(parse_plist("bplist00garbage").is_none());
+    }
+
+    #[test]
+    fn the_kill_switches_a_run_was_given_reach_the_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.env = carried_process_env(
+            [
+                ("CSR_NO_DREAMING", "1"),
+                ("CSR_NO_AI_NARRATIVES", "1"),
+                ("CSR_NARRATIVE_MODEL", "haiku"),
+                ("CSR_DREAM_INTERVAL_SECS", "7200"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+        let run = install_run(&spec, &mut FakeLaunchctl::new(false));
+        let facts = agent_facts(
+            &parse_plist(&std::fs::read_to_string(spec.plist_path()).unwrap()).unwrap(),
+        );
+        assert_eq!(facts.env["CSR_NO_DREAMING"], "1");
+        assert_eq!(facts.env["CSR_NO_AI_NARRATIVES"], "1");
+        assert_eq!(facts.env["CSR_NARRATIVE_MODEL"], "haiku");
+        assert_eq!(facts.env["CSR_DREAM_INTERVAL_SECS"], "7200");
+        let said = run.notes.join("\n");
+        assert!(said.contains("CSR_NO_DREAMING=1 (from this run)"), "{said}");
+        // an accepted consent does not outrank a kill switch, and the user is told
+        assert!(said.contains("will not dream"), "{said}");
+    }
+
+    #[test]
+    fn setup_only_variables_are_not_written_into_the_agent() {
+        let carried = carried_process_env(
+            [
+                ("CSR_AUTO_SETUP", "1"),
+                ("CSR_SKIP_SETUP", "1"),
+                ("CSR_NO_DAEMON", "0"),
+                ("CSR_BUILD_GIT_SHA", "abc"),
+                ("HOME", "/Users/x"),
+                ("CSR_NO_RECAP", "1"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+        assert_eq!(carried, env_of(&[("CSR_NO_RECAP", "1")]));
+    }
+
+    #[test]
+    fn a_rerun_without_the_variables_keeps_what_the_agent_had() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1"), ("ANTHROPIC_BASE_URL", "http://x")]);
+        install(&spec, &mut FakeLaunchctl::new(false));
+
+        // The next run has a clean shell. Nothing that was there may disappear.
+        spec.env = Default::default();
+        let run = install_run(&spec, &mut FakeLaunchctl::new(true));
+        let facts = agent_facts(
+            &parse_plist(&std::fs::read_to_string(spec.plist_path()).unwrap()).unwrap(),
+        );
+        assert_eq!(facts.env["CSR_NO_DREAMING"], "1");
+        assert_eq!(facts.env["ANTHROPIC_BASE_URL"], "http://x");
+        let said = run.notes.join("\n");
+        assert!(
+            said.contains("CSR_NO_DREAMING=1 (from the existing agent)"),
+            "{said}"
+        );
+        // a non-CSR value is named, never printed
+        assert!(said.contains("ANTHROPIC_BASE_URL (from"), "{said}");
+        assert!(!said.contains("http://x"), "{said}");
+    }
+
+    #[test]
+    fn a_key_removed_from_the_file_is_not_brought_back_by_the_loaded_job() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1"), ("CSR_NARRATIVE_MODEL", "haiku")]);
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let before = std::fs::read_to_string(spec.plist_path()).unwrap();
+
+        // The user deletes the switch from the file; the job is still loaded
+        // with it, because nothing reloaded it yet.
+        let edited = before.replace(
+            "    <key>CSR_NO_DREAMING</key>\n    <string>1</string>\n",
+            "",
+        );
+        assert_ne!(edited, before, "the fixture must have changed");
+        std::fs::write(spec.plist_path(), &edited).unwrap();
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_of(&before, 77);
+
+        spec.env = Default::default();
+        install(&spec, &mut fake);
+        let facts = agent_facts(
+            &parse_plist(&std::fs::read_to_string(spec.plist_path()).unwrap()).unwrap(),
+        );
+        assert!(
+            !facts.env.contains_key("CSR_NO_DREAMING"),
+            "the deleted key came back: {:?}",
+            facts.env
+        );
+        assert_eq!(facts.env["CSR_NARRATIVE_MODEL"], "haiku");
+
+        // This run's own value still wins over the file.
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1")]);
+        install(&spec, &mut FakeLaunchctl::new(true));
+        let facts = agent_facts(
+            &parse_plist(&std::fs::read_to_string(spec.plist_path()).unwrap()).unwrap(),
+        );
+        assert_eq!(facts.env["CSR_NO_DREAMING"], "1");
+    }
+
+    #[test]
+    fn a_loaded_job_with_no_file_still_gives_up_its_environment() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = LAUNCHCTL_PRINT.to_owned();
+        install(&spec, &mut fake);
+        let facts = agent_facts(
+            &parse_plist(&std::fs::read_to_string(spec.plist_path()).unwrap()).unwrap(),
+        );
+        assert_eq!(facts.env["CSR_NO_RATIFICATION"], "1");
+        // launchd's own keys are not configuration
+        assert!(!facts.env.contains_key("XPC_SERVICE_NAME"));
+        assert!(!facts.env.contains_key("OSLogRateLimit"));
+        // PATH is setup's: replaced, and said so
+        assert_eq!(facts.env["PATH"], spec.path_env());
+    }
+
+    #[test]
+    fn a_replaced_path_is_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = LAUNCHCTL_PRINT.to_owned();
+        let said = install_run(&spec, &mut fake).notes.join("\n");
+        assert!(said.contains("PATH in the agent was replaced"), "{said}");
+        assert!(
+            said.contains("/Users/someone/.local/bin:/usr/bin:/bin"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn carried_keys_do_not_make_the_next_run_rewrite_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1"), ("CSR_DREAM_THREADS", "2")]);
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let before = std::fs::read(spec.plist_path()).unwrap();
+        let mut fake = FakeLaunchctl::new(true);
+        spec.env = Default::default();
+        let mut as_loaded = spec.clone();
+        as_loaded.env = env_of(&[("CSR_NO_DREAMING", "1"), ("CSR_DREAM_THREADS", "2")]);
+        fake.print_text = print_for(&as_loaded, 100);
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: false }
+        );
+        assert_eq!(std::fs::read(spec.plist_path()).unwrap(), before);
+    }
+
+    // ----- reconciling the loaded job -----
+
+    #[test]
+    fn a_stale_loaded_job_is_reloaded_even_when_the_file_already_matches() {
+        // The previous run wrote the file but the old job stayed loaded. The
+        // file now looks right, so only the loaded arguments can show it.
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let mut stale = spec.clone();
+        stale.engine = "/opt/csr/old/csr-engine".into();
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&stale, 100);
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: false }
+        );
+        assert!(
+            fake.calls.iter().any(|c| c.starts_with("bootout")),
+            "{:?}",
+            fake.calls
+        );
+        assert!(!fake.calls.iter().any(|c| c.starts_with("kickstart")));
+        assert!(fake.calls.last().unwrap().starts_with("bootstrap"));
+
+        // The environment is compared too: a switch the job was loaded without.
+        spec.env = env_of(&[("CSR_NO_DREAMING", "1")]);
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let mut without = spec.clone();
+        without.env = Default::default();
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&without, 100);
+        install(&spec, &mut fake);
+        assert!(
+            fake.calls.iter().any(|c| c.starts_with("bootout")),
+            "{:?}",
+            fake.calls
+        );
+    }
+
+    #[test]
+    fn a_job_that_will_not_unload_stops_the_install_and_leaves_the_file_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let before = std::fs::read_to_string(spec.plist_path()).unwrap();
+        let loaded_as = spec.clone();
+        spec.engine = "/opt/csr/new/csr-engine".into();
+
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&loaded_as, 100);
+        fake.bootout_unloads = false;
+        let outcome = install(&spec, &mut fake);
+        assert!(
+            matches!(&outcome, DaemonOutcome::Failed(why) if why.contains("still loaded")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(spec.plist_path()).unwrap(),
+            before,
+            "the file must keep describing the job that is loaded"
+        );
+        assert!(!fake.calls.iter().any(|c| c.starts_with("bootstrap")));
+    }
+
+    #[test]
+    fn the_stored_binary_path_is_the_stable_name_not_the_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let versioned = dir.path().join("versions/1/csr-engine");
+        std::fs::create_dir_all(versioned.parent().unwrap()).unwrap();
+        std::fs::write(&versioned, "#!/bin/sh\n").unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(&versioned, bin.join("csr-engine")).unwrap();
+        let running = versioned.canonicalize().unwrap();
+        let cwd = dir.path();
+
+        // invoked by name from PATH
+        let by_name = stable_engine_path(
+            Some("csr-engine".as_ref()),
+            cwd,
+            Some(bin.as_os_str()),
+            &running,
+        );
+        assert_eq!(by_name, bin.join("csr-engine"));
+        // invoked by an absolute path
+        let by_path = stable_engine_path(
+            Some(bin.join("csr-engine").as_os_str()),
+            cwd,
+            None,
+            &running,
+        );
+        assert_eq!(by_path, bin.join("csr-engine"));
+        // invoked by a relative path
+        let relative = stable_engine_path(Some("bin/csr-engine".as_ref()), cwd, None, &running);
+        assert_eq!(relative, bin.join("csr-engine"));
+
+        // A relative PATH entry means "relative to where the user stood": launchd
+        // cannot resolve that, so the stored path is made absolute against cwd.
+        let relative_entry = stable_engine_path(
+            Some("csr-engine".as_ref()),
+            cwd,
+            Some(std::ffi::OsStr::new("bin")),
+            &running,
+        );
+        assert_eq!(relative_entry, bin.join("csr-engine"));
+        let dotted_entry = stable_engine_path(
+            Some("csr-engine".as_ref()),
+            cwd,
+            Some(std::ffi::OsStr::new("./bin")),
+            &running,
+        );
+        assert_eq!(dotted_entry, bin.join("csr-engine"));
+        // never a relative path in the plist, whatever the inputs
+        let from_relative_cwd = stable_engine_path(
+            Some("csr-engine".as_ref()),
+            Path::new("."),
+            Some(std::ffi::OsStr::new("bin")),
+            &running,
+        );
+        assert!(from_relative_cwd.is_absolute(), "{from_relative_cwd:?}");
+
+        // A different file on PATH (a shim) is not this binary: the running one wins.
+        let shim_dir = dir.path().join("shim");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::write(shim_dir.join("csr-engine"), "#!/usr/bin/env node\n").unwrap();
+        let shim = stable_engine_path(
+            Some("csr-engine".as_ref()),
+            cwd,
+            Some(shim_dir.as_os_str()),
+            &running,
+        );
+        assert_eq!(shim, running);
+        // nothing to go on
+        assert_eq!(stable_engine_path(None, cwd, None, &running), running);
+    }
+
+    // ----- agents under another label -----
+
+    /// An executable named `csr-engine` that exists, for an agent to point at.
+    fn live_engine(home: &Path) -> std::path::PathBuf {
+        let path = home.join("bin/csr-engine");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        path
+    }
+
+    fn write_agent(home: &Path, file: &str, label: &str, args: &[&str]) -> std::path::PathBuf {
+        let dir = home.join("Library/LaunchAgents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let items: String = args
+            .iter()
+            .map(|a| format!("<string>{a}</string>"))
+            .collect();
+        let path = dir.join(file);
+        std::fs::write(
+            &path,
+            format!("<plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array>{items}</array></dict></plist>"),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn only_a_plist_that_runs_csr_engine_daemon_counts_as_a_daemon_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let csr = "/usr/local/bin/csr-engine";
+        write_agent(
+            home.path(),
+            "mine.plist",
+            "me.csr",
+            &[csr, "--db-path", "/x.db", "daemon"],
+        );
+        write_agent(
+            home.path(),
+            "other.plist",
+            "other",
+            &["/usr/bin/other", "daemon"],
+        );
+        write_agent(home.path(), "serve.plist", "serve", &[csr, "serve"]);
+        // a saved copy is not an agent launchd loads
+        write_agent(
+            home.path(),
+            "mine.plist.bak-20260921",
+            "me.csr.bak",
+            &[csr, "daemon"],
+        );
+        write_agent(home.path(), "mine.plist~", "me.csr.tilde", &[csr, "daemon"]);
+        let found = daemon_agents_on_disk(home.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].label, "me.csr");
+    }
+
+    #[test]
+    fn a_daemon_agent_under_another_label_is_adopted_not_duplicated() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let theirs = write_agent(
+            home.path(),
+            "me.csr.plist",
+            "me.csr",
+            &[live_engine(home.path()).to_str().unwrap(), "daemon"],
+        );
+        let before = std::fs::read_to_string(&theirs).unwrap();
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_of(&before, 77);
+        fake.only_label = Some("me.csr".into());
+        let run = install_run(&spec, &mut fake);
+        assert_eq!(run.outcome, DaemonOutcome::KeptExisting);
+        assert_eq!(run.label, "me.csr");
+        assert!(!spec.plist_path().exists(), "no second job");
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), before);
+        assert!(
+            fake.full.iter().any(|c| c == "kickstart -k gui/501/me.csr"),
+            "{:?}",
+            fake.full
+        );
+        assert!(!fake.full.iter().any(|c| c.starts_with("bootstrap")));
+        let report = daemon_report(&run, Path::new("/opt/csr/bin/csr-engine"));
+        assert!(report.contains("me.csr"), "{report}");
+    }
+
+    #[test]
+    fn an_adopted_agent_that_is_not_loaded_is_loaded_from_its_own_file() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        let theirs = write_agent(
+            home.path(),
+            "me.csr.plist",
+            "me.csr",
+            &[live_engine(home.path()).to_str().unwrap(), "daemon"],
+        );
+        let mut fake = FakeLaunchctl::new(false);
+        let run = install_run(&spec, &mut fake);
+        assert_eq!(run.outcome, DaemonOutcome::KeptExisting);
+        assert!(!spec.plist_path().exists());
+        let want = format!("bootstrap gui/501 {}", theirs.display());
+        assert!(fake.full.contains(&want), "{:?}", fake.full);
+    }
+
+    #[test]
+    fn a_daemon_launchd_does_not_own_is_not_doubled() {
+        let home = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(home.path());
+        spec.lock_holder = Some(4242);
+        let mut fake = FakeLaunchctl::new(false);
+        let run = install_run(&spec, &mut fake);
+        assert_eq!(run.outcome, DaemonOutcome::AlreadyRunning { pid: 4242 });
+        assert!(!spec.plist_path().exists());
+        assert!(!fake.calls.iter().any(|c| c.starts_with("bootstrap")));
+        let report = daemon_report(&run, Path::new("/opt/csr/bin/csr-engine"));
+        assert!(
+            report.contains("4242") && report.contains("no second one"),
+            "{report}"
+        );
+
+        // ... but our own agent being loaded is the normal case, lock or not.
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&spec, 4242);
+        install(&agent_spec(home.path()), &mut FakeLaunchctl::new(false));
+        assert_eq!(
+            install(&spec, &mut fake),
+            DaemonOutcome::Running { rewritten: false }
+        );
+    }
+
+    #[test]
+    fn a_second_agent_beside_ours_is_named_not_adopted() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        write_agent(
+            home.path(),
+            "me.csr.plist",
+            "me.csr",
+            &["/usr/local/bin/csr-engine", "daemon"],
+        );
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&spec, 1);
+        let run = install_run(&spec, &mut fake);
+        assert_eq!(run.outcome, DaemonOutcome::Running { rewritten: false });
+        assert_eq!(run.label, DAEMON_LABEL);
+        let said = run.notes.join("\n");
+        assert!(
+            said.contains("me.csr") && said.contains("bootout"),
+            "{said}"
+        );
+    }
+
+    // ----- confirming the daemon setup started -----
+
+    fn probe(job: Option<u32>, held: bool, lock_pid: Option<u32>) -> DaemonProbe {
+        DaemonProbe {
+            job_pid: job,
+            lock_held: held,
+            lock_pid,
+        }
+    }
+
+    #[test]
+    fn a_lock_held_by_someone_else_does_not_confirm_the_new_daemon() {
+        // An older daemon holds the lock while the new job is still starting.
+        assert!(!daemon_confirmed(
+            &probe(Some(200), true, Some(100)),
+            Some(100)
+        ));
+        assert!(!daemon_confirmed(&probe(None, true, Some(100)), None));
+        // The job is still the pid it had before: nothing was restarted.
+        assert!(!daemon_confirmed(
+            &probe(Some(100), true, Some(100)),
+            Some(100)
+        ));
+        // The lock is free: the job is not running yet.
+        assert!(!daemon_confirmed(
+            &probe(Some(200), false, Some(200)),
+            Some(100)
+        ));
+        // A held lock with no readable pid proves nothing.
+        assert!(!daemon_confirmed(&probe(Some(200), true, None), Some(100)));
+        // The process launchd started holds the lock.
+        assert!(daemon_confirmed(
+            &probe(Some(200), true, Some(200)),
+            Some(100)
+        ));
+        assert!(daemon_confirmed(&probe(Some(200), true, Some(200)), None));
+    }
+
+    #[test]
+    fn waiting_gives_up_on_a_lock_that_is_not_ours_and_stops_when_ours_arrives() {
+        let polls = std::cell::Cell::new(0);
+        let loser = wait_for_daemon(
+            Some(100),
+            5,
+            &mut || {
+                polls.set(polls.get() + 1);
+                probe(Some(200), true, Some(100))
+            },
+            &|| {},
+        );
+        assert!(!loser);
+        assert_eq!(polls.get(), 5);
+
+        let mut seen = 0;
+        let started = wait_for_daemon(
+            Some(100),
+            5,
+            &mut || {
+                seen += 1;
+                match seen {
+                    1 => probe(Some(100), true, Some(100)), // the old process, not yet gone
+                    2 => probe(None, false, None),          // between processes
+                    _ => probe(Some(300), true, Some(300)),
+                }
+            },
+            &|| {},
+        );
+        assert!(started);
+        assert_eq!(seen, 3);
+    }
+
+    #[test]
+    fn the_job_pid_before_setup_is_remembered() {
+        let home = tempfile::tempdir().unwrap();
+        let spec = agent_spec(home.path());
+        install(&spec, &mut FakeLaunchctl::new(false));
+        let mut fake = FakeLaunchctl::new(true);
+        fake.print_text = print_for(&spec, 4321);
+        assert_eq!(install_run(&spec, &mut fake).previous_pid, Some(4321));
+        assert_eq!(
+            install_run(&spec, &mut FakeLaunchctl::new(false)).previous_pid,
+            None
+        );
+    }
+
+    /// A fake `tmutil` over a recorded call list. `excluded` names the folders (by last path
+    /// component) that already read `[Excluded]`; `fail_on` makes that subcommand error.
+    struct FakeTmutil {
+        calls: Vec<Vec<String>>,
+        excluded: Vec<&'static str>,
+        fail_on: Option<&'static str>,
+    }
+
+    impl FakeTmutil {
+        fn new() -> Self {
+            Self {
+                calls: Vec::new(),
+                excluded: Vec::new(),
+                fail_on: None,
+            }
+        }
+        fn run(&mut self, args: &[&str]) -> std::result::Result<String, String> {
+            self.calls
+                .push(args.iter().map(|a| (*a).to_owned()).collect());
+            if self.fail_on == Some("*") || self.fail_on == args.first().copied() {
+                return Err(format!("`tmutil {}` failed: boom", args[0]));
+            }
+            let path = args.get(1).copied().unwrap_or("");
+            if args[0] == "isexcluded" {
+                let on = self.excluded.iter().any(|n| path.ends_with(n));
+                return Ok(format!(
+                    "{}  {path}\n",
+                    if on { "[Excluded]" } else { "[Included]" }
+                ));
+            }
+            Ok(String::new())
+        }
+        fn added(&self) -> Vec<String> {
+            self.calls
+                .iter()
+                .filter(|c| c[0] == "addexclusion")
+                .map(|c| c[1].clone())
+                .collect()
+        }
+    }
+
+    /// A data dir shaped like a real one: the database trio, the mirror, and the three folders.
+    fn tm_data_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["csr-engine.db", "csr-engine.db-wal", "csr-engine.db-shm"] {
+            std::fs::write(dir.path().join(file), b"x").unwrap();
+        }
+        for sub in ["mirror", "index-v3", "models", "cache"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn time_machine_excludes_only_the_three_rebuildable_dirs() {
+        let dir = tm_data_dir();
+        let mut fake = FakeTmutil::new();
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+
+        let mut want: Vec<String> = ["index-v3", "models", "cache"]
+            .iter()
+            .map(|n| dir.path().join(n).to_string_lossy().into_owned())
+            .collect();
+        let mut got = fake.added();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want);
+
+        // The sticky per-item form only: `addexclusion <path>`, never `-p`, never anything else.
+        for call in &fake.calls {
+            assert!(
+                matches!(call[0].as_str(), "isexcluded" | "addexclusion"),
+                "{call:?}"
+            );
+            assert_eq!(call.len(), 2, "{call:?}");
+            assert!(!call.iter().any(|a| a == "-p"), "{call:?}");
+            // never the database trio, the mirror, or the data dir itself
+            let leaf = Path::new(&call[1]).file_name().unwrap().to_string_lossy();
+            assert!(
+                matches!(leaf.as_ref(), "index-v3" | "models" | "cache"),
+                "{call:?}"
+            );
+            assert!(!call[1].contains("csr-engine.db"), "{call:?}");
+            assert!(!call[1].contains("mirror"), "{call:?}");
+        }
+        assert_eq!(
+            said,
+            "  Time Machine now skips index-v3, models, cache (Self-Reflect can rebuild them). The database and mirror stay in your backups.\n"
+        );
+    }
+
+    #[test]
+    fn time_machine_never_touches_db_wal_shm_or_mirror_even_when_they_are_the_only_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["csr-engine.db", "csr-engine.db-wal", "csr-engine.db-shm"] {
+            std::fs::write(dir.path().join(file), b"x").unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("mirror")).unwrap();
+        let mut fake = FakeTmutil::new();
+        time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+        let all = fake.calls.concat().join(" ");
+        for protected in ["csr-engine.db", "-wal", "-shm", "mirror"] {
+            assert!(!all.contains(protected), "{protected} in {all}");
+        }
+        // index-v3 and models were created and excluded; cache does not exist, so is skipped
+        assert_eq!(fake.added().len(), 2, "{all}");
+        assert!(dir.path().join("index-v3").is_dir());
+        assert!(dir.path().join("models").is_dir());
+        assert!(!dir.path().join("cache").exists());
+    }
+
+    #[test]
+    fn time_machine_skips_dirs_that_are_already_excluded() {
+        let dir = tm_data_dir();
+        let mut fake = FakeTmutil::new();
+        fake.excluded = vec!["models", "cache"];
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+        assert_eq!(
+            fake.added(),
+            vec![dir.path().join("index-v3").to_string_lossy().into_owned()]
+        );
+        assert!(said.contains("now skips index-v3 (Self-Reflect"), "{said}");
+        assert!(said.contains("already skips models, cache."), "{said}");
+
+        // A second run with everything excluded changes nothing.
+        let mut again = FakeTmutil::new();
+        again.excluded = vec!["index-v3", "models", "cache"];
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| again.run(a));
+        assert!(again.added().is_empty());
+        assert_eq!(
+            said,
+            "  Time Machine already skips index-v3, models, cache.\n"
+        );
+    }
+
+    #[test]
+    fn time_machine_failure_is_one_line_and_never_an_error() {
+        // tmutil missing or failing on the very first call
+        let dir = tm_data_dir();
+        let mut fake = FakeTmutil::new();
+        fake.fail_on = Some("*");
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+        assert_eq!(said.lines().count(), 1, "{said}");
+        assert!(
+            said.contains("could not mark index-v3 as skipped"),
+            "{said}"
+        );
+        assert!(said.contains("Setup continues"), "{said}");
+        assert!(fake.added().is_empty());
+        // it stopped at the first failure instead of retrying each folder
+        assert_eq!(fake.calls.len(), 1);
+
+        // addexclusion failing after a clean isexcluded
+        let dir = tm_data_dir();
+        let mut fake = FakeTmutil::new();
+        fake.fail_on = Some("addexclusion");
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+        assert_eq!(said.lines().count(), 1, "{said}");
+        assert!(said.contains("boom"), "{said}");
+
+        // a failure after a success reports both
+        let dir = tm_data_dir();
+        let mut n = 0;
+        let said = time_machine_exclusion(dir.path(), true, false, &mut |a| {
+            n += 1;
+            if n > 2 {
+                Err("`tmutil isexcluded` failed: nope".to_owned())
+            } else if a[0] == "isexcluded" {
+                Ok("[Included]".to_owned())
+            } else {
+                Ok(String::new())
+            }
+        });
+        assert!(said.contains("now skips index-v3 ("), "{said}");
+        assert!(said.contains("could not mark models as skipped"), "{said}");
+    }
+
+    #[test]
+    fn time_machine_is_a_no_op_off_macos_and_when_opted_out() {
+        for (macos, opted_out) in [(false, false), (false, true), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut fake = FakeTmutil::new();
+            let said = time_machine_exclusion(dir.path(), macos, opted_out, &mut |a| fake.run(a));
+            assert!(fake.calls.is_empty(), "macos={macos} opted_out={opted_out}");
+            assert!(
+                !dir.path().join("index-v3").exists() && !dir.path().join("models").exists(),
+                "no folders are created when nothing is excluded"
+            );
+            if macos {
+                assert!(said.contains("CSR_NO_TM_EXCLUDE"), "{said}");
+            } else {
+                assert_eq!(said, "");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn time_machine_leaves_a_symlinked_dir_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("index-v3")).unwrap();
+        let mut fake = FakeTmutil::new();
+        time_machine_exclusion(dir.path(), true, false, &mut |a| fake.run(a));
+        let all = fake.calls.concat().join(" ");
+        assert!(!all.contains("index-v3"), "{all}");
     }
 }

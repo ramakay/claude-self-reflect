@@ -21,8 +21,17 @@ pub struct RankStats {
     pub nodes_ranked: usize,
 }
 
-/// Recompute and persist degree ranks for every node in `project` (empty = all).
-pub fn compute_code_rank(conn: &Connection, project: &str) -> Result<RankStats> {
+/// One node's degree rank as `code_node_rank` stores it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankRow {
+    pub node_id: String,
+    pub rank: f64,
+    pub in_degree: i64,
+    pub out_degree: i64,
+}
+
+/// The rank of every node in `project` (empty = all), sorted by id. Reads only.
+pub fn rank_rows(conn: &Connection, project: &str) -> Result<Vec<RankRow>> {
     // out_degree: outbound calls/references per src node.
     let mut out_degree: BTreeMap<String, i64> = BTreeMap::new();
     {
@@ -68,26 +77,71 @@ pub fn compute_code_rank(conn: &Connection, project: &str) -> Result<RankStats> 
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    let mut ranked = 0usize;
-    for id in &node_ids {
-        let ind = *in_degree.get(id).unwrap_or(&0);
-        let outd = *out_degree.get(id).unwrap_or(&0);
-        let rank = ind as f64 + 0.5 * outd as f64;
-        conn.execute(
-            "INSERT INTO code_node_rank (node_id, rank, in_degree, out_degree, computed_at)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'))
-             ON CONFLICT(node_id) DO UPDATE SET
-                 rank = excluded.rank,
-                 in_degree = excluded.in_degree,
-                 out_degree = excluded.out_degree,
-                 computed_at = datetime('now')",
-            params![id, rank, ind, outd],
-        )?;
-        ranked += 1;
-    }
+    Ok(node_ids
+        .into_iter()
+        .map(|node_id| {
+            let in_degree = *in_degree.get(&node_id).unwrap_or(&0);
+            let out_degree = *out_degree.get(&node_id).unwrap_or(&0);
+            RankRow {
+                rank: in_degree as f64 + 0.5 * out_degree as f64,
+                node_id,
+                in_degree,
+                out_degree,
+            }
+        })
+        .collect())
+}
 
+/// `rows` that differ from what `code_node_rank` holds (or that it lacks).
+/// Reads only. A drain writes these, so a pass that changed few edges writes
+/// few rank rows.
+pub fn changed_rank_rows(conn: &Connection, rows: Vec<RankRow>) -> Result<Vec<RankRow>> {
+    let mut stored: BTreeMap<String, (f64, i64, i64)> = BTreeMap::new();
+    let mut stmt =
+        conn.prepare("SELECT node_id, rank, in_degree, out_degree FROM code_node_rank")?;
+    let iter = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            (
+                row.get::<_, f64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ),
+        ))
+    })?;
+    for r in iter {
+        let (id, v) = r?;
+        stored.insert(id, v);
+    }
+    Ok(rows
+        .into_iter()
+        .filter(|r| stored.get(&r.node_id) != Some(&(r.rank, r.in_degree, r.out_degree)))
+        .collect())
+}
+
+/// Upsert `rows` into `code_node_rank`.
+pub fn write_rank_rows(conn: &Connection, rows: &[RankRow]) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO code_node_rank (node_id, rank, in_degree, out_degree, computed_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))
+         ON CONFLICT(node_id) DO UPDATE SET
+             rank = excluded.rank,
+             in_degree = excluded.in_degree,
+             out_degree = excluded.out_degree,
+             computed_at = datetime('now')",
+    )?;
+    for r in rows {
+        stmt.execute(params![r.node_id, r.rank, r.in_degree, r.out_degree])?;
+    }
+    Ok(())
+}
+
+/// Recompute and persist degree ranks for every node in `project` (empty = all).
+pub fn compute_code_rank(conn: &Connection, project: &str) -> Result<RankStats> {
+    let rows = rank_rows(conn, project)?;
+    write_rank_rows(conn, &rows)?;
     Ok(RankStats {
-        nodes_ranked: ranked,
+        nodes_ranked: rows.len(),
     })
 }
 

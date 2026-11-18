@@ -1,7 +1,7 @@
 {
   "name": "claude-self-reflect",
   "version": "10.1.0",
-  "description": "Give Claude perfect memory of all your conversations. Single binary, zero dependencies.",
+  "description": "Claude Code reflects on its own work: recaps, receipts and dreams, built on a searchable index of your past sessions. Single binary, zero dependencies.",
   "keywords": [
     "claude",
     "mcp",

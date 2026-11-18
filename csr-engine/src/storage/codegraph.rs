@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 
 /// A graph node row (a symbol seen in code). Used for both writes and reads.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -149,6 +150,134 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<NodeRow> {
     })
 }
 
+/// The project's co-edit counter (`code_graph_project_coedit`, 0 before any
+/// co-edit row for one of its files).
+fn coedit_gen(conn: &Connection, project: &str) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT gen FROM code_graph_project_coedit WHERE project = ?1",
+            params![project],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// The project's resolve-input counter (0 before any write): its own row, the
+/// every-project row (`'*'`, which no trigger bumps now) and its co-edit row.
+pub fn project_gen(conn: &Connection, project: &str) -> Result<i64> {
+    let rows: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(gen), 0) FROM code_graph_project_gen
+         WHERE project = ?1 OR project = '*'",
+        params![project],
+        |r| r.get(0),
+    )?;
+    Ok(rows + coedit_gen(conn, project)?)
+}
+
+/// Unix seconds now.
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// A project's resolve-input counter, split: its own row, and the rows that
+/// only ask for a pass after a cooldown (the every-project row `'*'` and the
+/// project's co-edit row), added together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GenParts {
+    pub own: i64,
+    pub star: i64,
+}
+
+fn gen_row(conn: &Connection, project: &str) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT gen FROM code_graph_project_gen WHERE project = ?1",
+            params![project],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// [`project_gen`] as its two parts.
+pub fn project_gen_parts(conn: &Connection, project: &str) -> Result<GenParts> {
+    Ok(GenParts {
+        own: gen_row(conn, project)?,
+        star: gen_row(conn, "*")? + coedit_gen(conn, project)?,
+    })
+}
+
+/// Record that a resolve pass covered the project's inputs as of `covered`.
+/// Only ever moves forward.
+pub fn mark_project_settled(conn: &Connection, project: &str, covered: GenParts) -> Result<()> {
+    conn.execute(
+        "INSERT INTO code_graph_project_settled (project, own, star, settled_at)
+         VALUES (?1, ?2, ?3, CAST(strftime('%s', 'now') AS INTEGER))
+         ON CONFLICT(project) DO UPDATE SET
+             own = MAX(own, excluded.own),
+             star = MAX(star, excluded.star),
+             settled_at = excluded.settled_at",
+        params![project, covered.own, covered.star],
+    )?;
+    Ok(())
+}
+
+/// How long a project must have been settled before a change only its co-edit
+/// counter saw (a `code_evolution` row for one of its files) asks for another
+/// pass.
+///
+/// Chosen over a shorter wait because the only reader of that evidence is the
+/// resolver's B3 tier (`coedit_weight`), which decides between definitions the
+/// graph alone cannot tell apart and needs a 2x margin to bind: one more session
+/// seldom moves it, and a project being edited gets passes for its own edits
+/// anyway. An in-flight plan is not affected by this wait: the co-edit counter is
+/// part of `project_gen`, so a plan made before such a row is dropped and made
+/// again. At 60 s, the previous value, an actively edited project was re-resolved
+/// every minute for evidence that rarely changed an answer.
+pub const STAR_ONLY_COOLDOWN_SECS: i64 = 900;
+
+/// Projects whose resolve inputs changed since the last pass that covered them
+/// and that no pending file or queued snapshot accounts for: the counter of the
+/// project's own row is ahead of the settled one, or its co-edit/every-project
+/// counter is and `STAR_ONLY_COOLDOWN_SECS` have passed since the project last
+/// settled.
+pub fn dirty_projects(conn: &Connection, now_secs: i64) -> Result<Vec<String>> {
+    let star = gen_row(conn, "*")?;
+    let mut stmt = conn.prepare(
+        "SELECT g.project, g.gen, COALESCE(s.own, 0), COALESCE(s.star, 0), COALESCE(s.settled_at, 0),
+                COALESCE(c.gen, 0)
+         FROM code_graph_project_gen g
+         LEFT JOIN code_graph_project_settled s ON s.project = g.project
+         LEFT JOIN code_graph_project_coedit c ON c.project = g.project
+         WHERE g.project != '*' AND g.project != ''
+         ORDER BY g.project",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, i64>(5)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (project, own, settled_own, settled_star, settled_at, coedit) = row?;
+        let own_moved = own > settled_own;
+        let star_moved =
+            star + coedit > settled_star && now_secs - settled_at >= STAR_ONLY_COOLDOWN_SECS;
+        if own_moved || star_moved {
+            out.push(project);
+        }
+    }
+    Ok(out)
+}
+
 /// Upsert a node. `first_conv_id` is preserved on an existing row (immutable
 /// history); `last_conv_id` / `last_session_id` / `body_hash` / span / timestamps
 /// are refreshed to the latest sighting.
@@ -204,8 +333,20 @@ pub fn upsert_node(conn: &Connection, n: &NodeRow) -> Result<()> {
     Ok(())
 }
 
-/// Per-file edge replace (Codex #3): delete every edge extracted from `src_file`,
-/// then bulk-insert the fresh set. Single transaction — no stale fan-out.
+/// Record the exact transcript chunk containing the latest tool edit that
+/// produced this node. Kept outside [`NodeRow`] so historical/backfill graph
+/// writers cannot accidentally overwrite live transcript attribution.
+pub fn set_last_chunk_id(conn: &Connection, node_id: &str, chunk_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE code_nodes SET last_chunk_id = ?2 WHERE id = ?1",
+        params![node_id, chunk_id],
+    )?;
+    Ok(())
+}
+
+/// Replace edges from `src_file` whose source nodes belong to `project`, then
+/// insert the fresh set. Sweep source-less edges on the file as before. An
+/// empty project replaces the entire file for the eval snapshot copy.
 ///
 /// Codex round 7 adversarial review (WCR truth pass): this transaction is
 /// what makes `EdgeRow::src_content_hash` a sound re-point-eligibility
@@ -225,14 +366,42 @@ pub fn upsert_node(conn: &Connection, n: &NodeRow) -> Result<()> {
 /// longer produce a false positive regardless of ordering.
 pub fn replace_file_edges(
     conn: &Connection,
-    _project: &str,
+    project: &str,
     src_file: &str,
     edges: &[EdgeRow],
 ) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
+    in_tx(conn, |tx| {
+        replace_file_edges_in(tx, project, src_file, edges)
+    })
+}
+
+/// Run `f` in a transaction of its own, or inside the caller's when `conn`
+/// already has one open (so a caller can make several of these writes atomic).
+fn in_tx<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    if !conn.is_autocommit() {
+        return f(conn);
+    }
+    // IMMEDIATE: several of these start with a read, and a deferred transaction
+    // that reads and then writes fails outright when another writer committed in
+    // between instead of waiting for the lock.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let out = f(&tx)?;
+    tx.commit()?;
+    Ok(out)
+}
+
+fn replace_file_edges_in(
+    tx: &Connection,
+    project: &str,
+    src_file: &str,
+    edges: &[EdgeRow],
+) -> Result<()> {
     tx.execute(
-        "DELETE FROM code_edges WHERE src_file = ?1",
-        params![src_file],
+        "DELETE FROM code_edges
+         WHERE src_file = ?1 AND (?2 = '' OR NOT EXISTS (
+             SELECT 1 FROM code_nodes n WHERE n.id = code_edges.src_id AND n.project != ?2
+         ))",
+        params![src_file, project],
     )?;
     {
         let mut stmt = tx.prepare(
@@ -258,7 +427,6 @@ pub fn replace_file_edges(
             ])?;
         }
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -271,22 +439,93 @@ pub fn upsert_repo_defs(
     file: &str,
     defs: &[(String, String, String)],
 ) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM repo_defs WHERE project = ?1 AND file = ?2",
-        params![project, file],
-    )?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO repo_defs (project, file, name, kind, lang, scanned_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+    in_tx(conn, |tx| {
+        tx.execute(
+            "DELETE FROM repo_defs WHERE project = ?1 AND file = ?2",
+            params![project, file],
         )?;
-        for (name, kind, lang) in defs {
-            stmt.execute(params![project, file, name, kind, lang])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO repo_defs (project, file, name, kind, lang, scanned_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            )?;
+            for (name, kind, lang) in defs {
+                stmt.execute(params![project, file, name, kind, lang])?;
+            }
         }
+        Ok(())
+    })
+}
+
+/// Retire `code_nodes` rows for `(project, file)` whose id is not in
+/// `seen_ids` after a fresh extraction. Extraction has REPLACE
+/// semantics per file (D6): a node absent from the current fragment
+/// (renamed, deleted, or its `kind` changed) must not survive as a
+/// stale row with a stale span. No retired/tombstone column exists on
+/// `code_nodes` (checked `migrations.rs`), so this hard-deletes — but
+/// ONLY rows scoped to this exact (project, file), and ONLY ids absent
+/// from `seen_ids`. `code_node_rank` FK-references `code_nodes.id`
+/// with no cascade, so its row for each retired id is deleted first,
+/// in the same transaction; `code_node_attribution` has no FK but is
+/// cleaned up too so it never dangles.
+pub fn retire_missing_nodes(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    seen_ids: &[String],
+) -> Result<usize> {
+    // Fail-open on an empty observation. A re-extraction that yielded no nodes
+    // is far more likely a parse failure — a file caught mid-edit in a
+    // syntactically broken state, an unsupported construct, an ast-grep miss —
+    // than a file that genuinely lost every symbol it had. Retiring against an
+    // empty set would treat every existing node as stale and hard-delete the
+    // whole file's `code_node_attribution` provenance, which is the memory this
+    // system exists to keep. A stale span is a far cheaper failure than erased
+    // provenance, so an empty extraction retires nothing.
+    if seen_ids.is_empty() {
+        return Ok(0);
     }
-    tx.commit()?;
-    Ok(())
+
+    let seen: std::collections::HashSet<&str> = seen_ids.iter().map(String::as_str).collect();
+
+    let mut stmt = conn.prepare("SELECT id FROM code_nodes WHERE project = ?1 AND file = ?2")?;
+    let existing: Vec<String> = stmt
+        .query_map(params![project, file], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let stale_ids: Vec<String> = existing
+        .into_iter()
+        .filter(|id| !seen.contains(id.as_str()))
+        .collect();
+
+    if stale_ids.is_empty() {
+        return Ok(0);
+    }
+
+    in_tx(conn, |tx| {
+        for id in &stale_ids {
+            tx.execute("DELETE FROM code_node_rank WHERE node_id = ?1", params![id])?;
+            tx.execute(
+                "DELETE FROM code_node_attribution WHERE node_id = ?1",
+                params![id],
+            )?;
+            let gone = tx.execute(
+                "DELETE FROM code_nodes WHERE id = ?1 AND project = ?2 AND file = ?3",
+                params![id, project, file],
+            )?;
+            if gone > 0 {
+                // The node's edges go with it: left behind they dangle (nothing
+                // resolves them, and a resolved one still counts toward its
+                // destination's in-degree) until the file is extracted again.
+                tx.execute(
+                    "DELETE FROM code_edges WHERE src_id = ?1
+                       AND NOT EXISTS (SELECT 1 FROM code_nodes WHERE id = ?1)",
+                    params![id],
+                )?;
+            }
+        }
+        Ok(stale_ids.len())
+    })
 }
 
 /// Definition sites for `name` within `project`: `(file, kind)`, deterministic order.
@@ -328,6 +567,386 @@ pub fn upsert_file_state(
         params![project, file, content_hash, dirty as i64],
     )?;
     Ok(())
+}
+
+/// `upsert_file_state(.., dirty = false)` that also bumps the file's
+/// `graph_gen`, in the same statement: the file's edges changed, so the
+/// project-wide resolve has work for it. The last write of an extraction.
+pub fn upsert_file_state_pending(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    content_hash: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO code_graph_file_state
+            (project, file, content_hash, dirty, extracted_at, ast_status, graph_gen)
+         VALUES (?1, ?2, ?3, 0, datetime('now'), 'supported', 1)
+         ON CONFLICT(project, file) DO UPDATE SET
+             content_hash = excluded.content_hash,
+             dirty = 0,
+             extracted_at = datetime('now'),
+             ast_status = 'supported',
+             graph_gen = graph_gen + 1",
+        params![project, file, content_hash],
+    )?;
+    Ok(())
+}
+
+/// One file's extraction, to be stored as a unit by [`store_extraction`].
+pub struct Extraction<'a> {
+    pub project: &'a str,
+    pub file: &'a str,
+    pub content_hash: &'a str,
+    /// Nodes the file defines now, already stamped with their repo root.
+    pub nodes: &'a [NodeRow],
+    /// The transcript chunk of the edit, to attribute changed nodes to.
+    pub source_chunk_id: Option<&'a str>,
+    /// Only a clean parse may retire nodes and replace edges; `None` for a
+    /// partial parse, which must leave both alone.
+    pub edges: Option<&'a [EdgeRow]>,
+    /// The snapshot (`seq`) this extraction answers: consumed in the same
+    /// transaction, and the extraction is not stored at all when a newer
+    /// snapshot of the file has been consumed already.
+    pub claim: i64,
+}
+
+/// The most snapshots one file may have waiting. A drain that is not running
+/// must not let a hammered file pile up 256 KB per edit. Past this, an arrival
+/// older than the newest queued is dropped and a newer one replaces the newest,
+/// so the queue always ends on the file's newest version; only an intermediate
+/// edit loses its attribution (`last_chunk_id` credit), never the end state.
+pub const MAX_SNAPSHOTS_PER_FILE: i64 = 64;
+
+/// `kind` of a snapshot of a file the extractor cannot parse: the drain records
+/// the file-level `ast_status = 'unsupported'` row, the hook writes no graph row.
+pub const SNAPSHOT_UNSUPPORTED: &str = "unsupported";
+/// `kind` of a snapshot to extract.
+pub const SNAPSHOT_EXTRACT: &str = "extract";
+
+/// An edit as a hook saw it, before the drain extracts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Capture time in unix nanoseconds (the order the drain extracts in).
+    pub seq: i64,
+    pub project: String,
+    /// Canonical stored path.
+    pub file: String,
+    /// The path the tool saw; read from disk only for a legacy row without content.
+    pub read_path: String,
+    pub kind: String,
+    pub content: Option<String>,
+    pub conv_id: String,
+    pub session_id: String,
+    pub source_chunk_id: Option<String>,
+    /// The spool file this came from, if it came through the spool.
+    pub origin: Option<String>,
+}
+
+/// Unix nanoseconds now: the clock `Snapshot::seq` is on. Strictly increasing
+/// within a process, so two snapshots one hook takes in a row (a Bash call's
+/// files) never share a number, or a spool file name.
+pub fn now_ns() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let clock = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64);
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = clock.max(last + 1);
+        match LAST.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => last = seen,
+        }
+    }
+}
+
+/// Add `s` to the snapshot queue. It takes `s.seq`, or the next free number
+/// when another snapshot holds it, and returns the `seq` it got (`s.seq` for a
+/// snapshot that was dropped on arrival, see below). Writes no graph row: this
+/// is the hook's only graph write.
+///
+/// Dropped on arrival: a snapshot at or below the file's high-water mark, and,
+/// when the file already has [`MAX_SNAPSHOTS_PER_FILE`] queued, one older than
+/// the newest queued.
+pub fn insert_snapshot(conn: &Connection, s: &Snapshot) -> Result<i64> {
+    in_tx(conn, |tx| {
+        if let Some(origin) = &s.origin {
+            let known: Option<i64> = tx
+                .query_row(
+                    "SELECT seq FROM code_graph_snapshots WHERE origin = ?1",
+                    params![origin],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(seq) = known {
+                return Ok(seq);
+            }
+        }
+        // Superseded before it arrived: the file's consumed high-water mark is
+        // at or past it (a delayed hook, a spool record replayed after its
+        // snapshot was extracted). The extractor would drop it; so does the queue,
+        // before anything is evicted for it.
+        if s.seq <= snapshot_high_water(tx, &s.project, &s.file)? {
+            return Ok(s.seq);
+        }
+        let (depth, newest): (i64, Option<i64>) = tx.query_row(
+            "SELECT COUNT(*), MAX(seq) FROM code_graph_snapshots WHERE project = ?1 AND file = ?2",
+            params![s.project, s.file],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if depth >= MAX_SNAPSHOTS_PER_FILE {
+            // Full. The cap exists to bound a pile-up behind a dead drain, and
+            // what survives it must still end on the file's newest version, so:
+            // an arrival older than the newest queued is dropped (a delayed
+            // intermediate version; the newest decides the end state), and an
+            // arrival newer than it replaces the newest (the one version the
+            // drain skips is an intermediate one). The newest is never evicted
+            // for anything older.
+            if newest.is_some_and(|n| s.seq < n) {
+                return Ok(s.seq);
+            }
+            tx.execute(
+                "DELETE FROM code_graph_snapshots WHERE seq =
+                     (SELECT MAX(seq) FROM code_graph_snapshots WHERE project = ?1 AND file = ?2)",
+                params![s.project, s.file],
+            )?;
+        }
+        let mut seq = s.seq;
+        while tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM code_graph_snapshots WHERE seq = ?1)",
+            params![seq],
+            |r| r.get::<_, bool>(0),
+        )? {
+            seq += 1;
+        }
+        tx.execute(
+            "INSERT INTO code_graph_snapshots
+                (seq, project, file, read_path, kind, content, conv_id, session_id,
+                 source_chunk_id, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                seq,
+                s.project,
+                s.file,
+                s.read_path,
+                s.kind,
+                s.content,
+                s.conv_id,
+                s.session_id,
+                s.source_chunk_id,
+                s.origin
+            ],
+        )?;
+        Ok(seq)
+    })
+}
+
+/// The transcript chunk a conversation's newest edit belongs to: its latest
+/// chunk. `None` before the transcript has been imported.
+pub fn latest_chunk_id(conn: &Connection, conv_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM chunks WHERE conversation_id = ?1
+             ORDER BY COALESCE(seq, -1) DESC, rowid DESC LIMIT 1",
+            params![conv_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Every queued snapshot, in the order to extract them.
+pub fn queued_snapshots(conn: &Connection) -> Result<Vec<Snapshot>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, project, file, read_path, kind, content, conv_id, session_id,
+                source_chunk_id, origin
+         FROM code_graph_snapshots ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Snapshot {
+            seq: r.get(0)?,
+            project: r.get(1)?,
+            file: r.get(2)?,
+            read_path: r.get(3)?,
+            kind: r.get(4)?,
+            content: r.get(5)?,
+            conv_id: r.get(6)?,
+            session_id: r.get(7)?,
+            source_chunk_id: r.get(8)?,
+            origin: r.get(9)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Whether any snapshot waits for the drain.
+pub fn has_queued_snapshots(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM code_graph_snapshots)",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// Whether a snapshot of a file in `project` waits for the drain.
+pub fn has_queued_snapshots_for(conn: &Connection, project: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM code_graph_snapshots WHERE project = ?1)",
+        params![project],
+        |r| r.get(0),
+    )?)
+}
+
+/// The highest snapshot `seq` consumed for the file (0 before any).
+pub fn snapshot_high_water(conn: &Connection, project: &str, file: &str) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT seq FROM code_graph_snap_hw WHERE project = ?1 AND file = ?2",
+            params![project, file],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// Whether the live hook path has touched `file` since `since_ns`: a snapshot
+/// of it is waiting, or one captured after that time has been consumed. A
+/// historical replay that read the file earlier must not write over it.
+pub fn live_since(conn: &Connection, project: &str, file: &str, since_ns: i64) -> Result<bool> {
+    if snapshot_high_water(conn, project, file)? > since_ns {
+        return Ok(true);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM code_graph_snapshots WHERE project = ?1 AND file = ?2)",
+        params![project, file],
+        |r| r.get(0),
+    )?)
+}
+
+/// Take snapshot `seq` off the queue and advance the file's high-water mark.
+/// `true` when it is fresh, i.e. nothing at or after it has been consumed for
+/// this file: a `false` snapshot arrived late (or is a replay) and must not be
+/// stored.
+pub fn consume_snapshot(conn: &Connection, project: &str, file: &str, seq: i64) -> Result<bool> {
+    in_tx(conn, |tx| {
+        let seen = snapshot_high_water(tx, project, file)?;
+        tx.execute(
+            "DELETE FROM code_graph_snapshots WHERE seq = ?1 AND project = ?2 AND file = ?3",
+            params![seq, project, file],
+        )?;
+        if seq <= seen {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO code_graph_snap_hw (project, file, seq) VALUES (?1, ?2, ?3)
+             ON CONFLICT(project, file) DO UPDATE SET seq = excluded.seq",
+            params![project, file, seq],
+        )?;
+        Ok(true)
+    })
+}
+
+/// Store an extraction in ONE transaction: the snapshot it answers is consumed,
+/// then node upserts, retirement of the symbols the file lost, the file's edge
+/// replacement, and the `graph_gen` bump that queues the project-wide resolve.
+/// A process killed anywhere in it leaves the graph and the queue as they were;
+/// there is no state with new edges and an unchanged generation.
+///
+/// Returns `false`, storing nothing, when a snapshot of the file at or after
+/// `x.claim` was consumed already.
+pub fn store_extraction(conn: &Connection, x: &Extraction<'_>) -> Result<bool> {
+    in_tx(conn, |tx| {
+        if !consume_snapshot(tx, x.project, x.file, x.claim)? {
+            return Ok(false);
+        }
+        for node in x.nodes {
+            let changed =
+                get_node(tx, &node.id)?.is_none_or(|stored| stored.body_hash != node.body_hash);
+            upsert_node(tx, node)?;
+            if changed {
+                match x.source_chunk_id {
+                    Some(chunk_id) => set_last_chunk_id(tx, &node.id, chunk_id)?,
+                    // This edit changed the body and its chunk is unknown (the
+                    // hook spooled it without a database, or the transcript is
+                    // not imported yet). The credit left on the node is an
+                    // earlier edit's, which no longer describes the body: unknown
+                    // is NULL, not that chunk.
+                    None => tx
+                        .execute(
+                            "UPDATE code_nodes SET last_chunk_id = NULL WHERE id = ?1",
+                            params![node.id],
+                        )
+                        .map(drop)?,
+                }
+            }
+        }
+        if let Some(edges) = x.edges {
+            let seen: Vec<String> = x.nodes.iter().map(|n| n.id.clone()).collect();
+            retire_missing_nodes(tx, x.project, x.file, &seen)?;
+            replace_file_edges(tx, x.project, x.file, edges)?;
+        }
+        upsert_file_state_pending(tx, x.project, x.file, x.content_hash)?;
+        Ok(true)
+    })
+}
+
+/// Consume an `unsupported` snapshot: record the file-level provenance row.
+pub fn store_unsupported(conn: &Connection, s: &Snapshot) -> Result<()> {
+    in_tx(conn, |tx| {
+        if consume_snapshot(tx, &s.project, &s.file, s.seq)? {
+            mark_file_unsupported(tx, &s.project, &s.file)?;
+        }
+        Ok(())
+    })
+}
+
+/// Files whose edges changed since the last resolve that covered them:
+/// `(project, file, graph_gen)`, oldest extraction first.
+pub fn pending_resolve_files(conn: &Connection) -> Result<Vec<(String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT project, file, graph_gen FROM code_graph_file_state
+         WHERE graph_gen > resolved_gen
+         ORDER BY project, extracted_at",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// [`pending_resolve_files`] for one project.
+pub fn pending_resolve_files_for(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<(String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT project, file, graph_gen FROM code_graph_file_state
+         WHERE project = ?1 AND graph_gen > resolved_gen
+         ORDER BY extracted_at",
+    )?;
+    let rows = stmt.query_map(params![project], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Record that a resolve covered `file` as of generation `seen`. Compare and
+/// set: a file extracted again since `seen` keeps its newer `graph_gen` and
+/// stays pending. Returns whether the file was settled.
+pub fn settle_resolved_gen(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    seen: i64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE code_graph_file_state SET resolved_gen = ?3
+         WHERE project = ?1 AND file = ?2 AND graph_gen = ?3 AND resolved_gen < ?3",
+        params![project, file, seen],
+    )?;
+    Ok(changed == 1)
 }
 
 /// Mark a file dirty (needs re-extraction) without touching its hash.
@@ -399,15 +1018,60 @@ pub fn nodes_by_name(
         .map_err(Into::into)
 }
 
+/// Distinct stored code-graph project namespaces, ordered for determinism.
+pub fn project_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT project FROM code_nodes ORDER BY project")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Resolve a `symbol or id` to candidate node ids: exact id match first, else by name.
-fn resolve_target_ids(conn: &Connection, name_or_id: &str, project: &str) -> Result<Vec<String>> {
+fn family_projects(conn: &Connection, project: &str) -> Result<Vec<String>> {
+    let mut projects = project_names(conn)?;
+    if !project.is_empty() {
+        projects.retain(|candidate| {
+            crate::search::cross_project::same_project_family(project, candidate)
+        });
+        if !projects.iter().any(|candidate| candidate == project) {
+            projects.push(project.to_string());
+        }
+    }
+    Ok(projects)
+}
+
+fn project_is_in(projects: &[String], candidate: &str) -> bool {
+    projects.is_empty() || projects.iter().any(|project| project == candidate)
+}
+
+fn nodes_by_name_in_projects(
+    conn: &Connection,
+    name: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<NodeRow>> {
+    let nodes = nodes_by_name(conn, name, "", i64::MAX as usize)?;
+    Ok(nodes
+        .into_iter()
+        .filter(|node| project_is_in(projects, &node.project))
+        .take(limit)
+        .collect())
+}
+
+fn resolve_target_ids_in_projects(
+    conn: &Connection,
+    name_or_id: &str,
+    projects: &[String],
+) -> Result<Vec<String>> {
     if get_node(conn, name_or_id)?.is_some() {
         return Ok(vec![name_or_id.to_string()]);
     }
-    Ok(nodes_by_name(conn, name_or_id, project, 50)?
-        .into_iter()
-        .map(|n| n.id)
-        .collect())
+    Ok(
+        nodes_by_name_in_projects(conn, name_or_id, projects, i64::MAX as usize)?
+            .into_iter()
+            .map(|n| n.id)
+            .collect(),
+    )
 }
 
 /// Who calls `name_or_id` — inbound `calls` edges (resolved id match OR the
@@ -423,7 +1087,21 @@ pub fn query_callers(
     project: &str,
     limit: usize,
 ) -> Result<Vec<NodeRow>> {
-    let mut targets = resolve_target_ids(conn, name_or_id, project)?;
+    let projects = family_projects(conn, project)?;
+    query_callers_in_projects(conn, name_or_id, &projects, limit)
+}
+
+/// Family-scoped variant used by code-graph queries and regression fixtures.
+pub fn query_callers_in_projects(
+    conn: &Connection,
+    name_or_id: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<NodeRow>> {
+    if get_node(conn, name_or_id)?.is_some_and(|node| !project_is_in(projects, &node.project)) {
+        return Ok(Vec::new());
+    }
+    let mut targets = resolve_target_ids_in_projects(conn, name_or_id, projects)?;
     // Also match the unresolved placeholder form keyed on the bare name.
     let bare = name_or_id.rsplit("::").next().unwrap_or(name_or_id);
     let placeholder = format!("name:{bare}");
@@ -434,8 +1112,7 @@ pub fn query_callers(
         targets.push(placeholder);
     }
 
-    let placeholders: Vec<String> = (0..targets.len()).map(|i| format!("?{}", i + 2)).collect();
-    let project_idx = targets.len() + 2;
+    let placeholders: Vec<String> = (0..targets.len()).map(|i| format!("?{}", i + 1)).collect();
     let cols = NODE_COLS
         .split(", ")
         .map(|c| format!("s.{c}"))
@@ -446,32 +1123,54 @@ pub fn query_callers(
         "SELECT {cols}, MAX(e.resolved) AS any_resolved FROM code_edges e
          JOIN code_nodes s ON s.id = e.src_id
          WHERE e.kind = 'calls' AND e.dst_id IN ({})
-           AND (?{project_idx} = '' OR s.project = ?{project_idx})
          GROUP BY s.id
-         ORDER BY s.id LIMIT ?1",
+         ORDER BY s.id",
         placeholders.join(", ")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut p: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(targets.len() + 2);
-    let lim = limit as i64;
-    p.push(&lim);
-    for t in &targets {
-        p.push(t);
-    }
-    p.push(&project);
+    let p: Vec<&dyn rusqlite::types::ToSql> = targets
+        .iter()
+        .map(|target| target as &dyn rusqlite::types::ToSql)
+        .collect();
     let rows = stmt.query_map(p.as_slice(), |row| {
         let mut node = row_to_node(row)?;
         let any_resolved: i64 = row.get(node_col_count)?;
         node.name_only = any_resolved == 0;
         Ok(node)
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|node| project_is_in(projects, &node.project))
+        .take(limit)
+        .collect())
 }
 
 /// What `node_id` calls — outbound `calls` edges. Resolved edges return the real
 /// dst node; unresolved `name:<x>` placeholders return a synthetic node.
 pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<Vec<NodeRow>> {
+    let projects = match get_node(conn, node_id)? {
+        Some(node) => family_projects(conn, &node.project)?,
+        None => Vec::new(),
+    };
+    query_callees_in_projects(conn, node_id, &projects, limit)
+}
+
+/// Return callees of the selected definition, filtering resolved destinations
+/// to the supplied project family.
+pub fn query_callees_in_projects(
+    conn: &Connection,
+    node_id: &str,
+    projects: &[String],
+    limit: usize,
+) -> Result<Vec<NodeRow>> {
+    if get_node(conn, node_id)?.is_some_and(|node| !project_is_in(projects, &node.project)) {
+        return Ok(Vec::new());
+    }
+    let source_ids = [node_id.to_string()];
+    let placeholders: Vec<String> = (0..source_ids.len())
+        .map(|index| format!("?{}", index + 1))
+        .collect();
     let cols = NODE_COLS
         .split(", ")
         .map(|c| format!("d.{c}"))
@@ -480,11 +1179,16 @@ pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<V
     let sql = format!(
         "SELECT e.dst_id, e.resolved, {cols} FROM code_edges e
          LEFT JOIN code_nodes d ON d.id = e.dst_id
-         WHERE e.kind = 'calls' AND e.src_id = ?1
-         ORDER BY e.dst_id LIMIT ?2"
+         WHERE e.kind = 'calls' AND e.src_id IN ({})
+         ORDER BY e.dst_id",
+        placeholders.join(", ")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![node_id, limit as i64], |row| {
+    let params: Vec<&dyn rusqlite::types::ToSql> = source_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
         let dst_id: String = row.get(0)?;
         let resolved: i64 = row.get(1)?;
         // Columns 2.. are the joined node (may be all NULL if unresolved).
@@ -524,8 +1228,16 @@ pub fn query_callees(conn: &Connection, node_id: &str, limit: usize) -> Result<V
             })
         }
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut seen = HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|node| {
+            (node.kind == "unresolved" || project_is_in(projects, &node.project))
+                && seen.insert(node.id.clone())
+        })
+        .take(limit)
+        .collect())
 }
 
 /// 1-hop neighbours (both directions) of `node_id`, optional edge-kind filter.
@@ -535,8 +1247,46 @@ pub fn query_neighbors(
     kind_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<NeighborEdge>> {
+    let projects = match get_node(conn, node_id)? {
+        Some(node) => family_projects(conn, &node.project)?,
+        None => Vec::new(),
+    };
+    query_neighbors_in_projects(conn, node_id, &projects, kind_filter, limit)
+}
+
+/// Return one-hop edges for a selected definition within a project family.
+/// Outbound edges stay anchored to that exact definition. Inbound edges also
+/// include same-named definitions from alias namespaces, but never other
+/// same-named definitions from the selected definition's own project.
+pub fn query_neighbors_in_projects(
+    conn: &Connection,
+    node_id: &str,
+    projects: &[String],
+    kind_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<NeighborEdge>> {
+    if get_node(conn, node_id)?.is_some_and(|node| !project_is_in(projects, &node.project)) {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     let kf = kind_filter.unwrap_or("");
+    let selected = get_node(conn, node_id)?;
+    let inbound_target_ids = match selected.as_ref() {
+        Some(node) => {
+            let mut ids = vec![node.id.clone()];
+            ids.extend(
+                nodes_by_name_in_projects(conn, &node.name, projects, i64::MAX as usize)?
+                    .into_iter()
+                    .filter(|candidate| candidate.project != node.project)
+                    .map(|candidate| candidate.id),
+            );
+            ids
+        }
+        None => vec![node_id.to_string()],
+    };
+    let inbound_placeholders: Vec<String> = (0..inbound_target_ids.len())
+        .map(|index| format!("?{}", index + 2))
+        .collect();
 
     // Outbound: node_id -> other (only resolved edges have a real other node).
     let out_cols = NODE_COLS
@@ -547,12 +1297,12 @@ pub fn query_neighbors(
     let out_sql = format!(
         "SELECT e.kind, e.resolved, {out_cols} FROM code_edges e
          JOIN code_nodes d ON d.id = e.dst_id
-         WHERE e.src_id = ?1 AND (?2 = '' OR e.kind = ?2)
-         ORDER BY e.kind, d.id LIMIT ?3"
+         WHERE (?1 = '' OR e.kind = ?1) AND e.src_id = ?2
+         ORDER BY e.kind, d.id",
     );
     {
         let mut stmt = conn.prepare(&out_sql)?;
-        let rows = stmt.query_map(params![node_id, kf, limit as i64], |row| {
+        let rows = stmt.query_map(params![kf, node_id], |row| {
             let edge_kind: String = row.get(0)?;
             let resolved: i64 = row.get(1)?;
             let node = shift2_node(row)?;
@@ -564,7 +1314,13 @@ pub fn query_neighbors(
             })
         })?;
         for r in rows {
-            out.push(r?);
+            let edge = r?;
+            if project_is_in(projects, &edge.node.project) {
+                out.push(edge);
+            }
+            if out.len() == limit {
+                break;
+            }
         }
     }
 
@@ -577,12 +1333,21 @@ pub fn query_neighbors(
     let in_sql = format!(
         "SELECT e.kind, e.resolved, {in_cols} FROM code_edges e
          JOIN code_nodes s ON s.id = e.src_id
-         WHERE e.dst_id = ?1 AND (?2 = '' OR e.kind = ?2)
-         ORDER BY e.kind, s.id LIMIT ?3"
+         WHERE (?1 = '' OR e.kind = ?1) AND e.dst_id IN ({})
+         ORDER BY e.kind, s.id",
+        inbound_placeholders.join(", ")
     );
     {
         let mut stmt = conn.prepare(&in_sql)?;
-        let rows = stmt.query_map(params![node_id, kf, limit as i64], |row| {
+        let mut params: Vec<&dyn rusqlite::types::ToSql> =
+            Vec::with_capacity(inbound_target_ids.len() + 1);
+        params.push(&kf);
+        params.extend(
+            inbound_target_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql),
+        );
+        let rows = stmt.query_map(params.as_slice(), |row| {
             let edge_kind: String = row.get(0)?;
             let resolved: i64 = row.get(1)?;
             let node = shift2_node(row)?;
@@ -593,11 +1358,27 @@ pub fn query_neighbors(
                 node,
             })
         })?;
+        let mut inbound = 0;
         for r in rows {
-            out.push(r?);
+            let edge = r?;
+            if project_is_in(projects, &edge.node.project) {
+                out.push(edge);
+                inbound += 1;
+            }
+            if inbound == limit {
+                break;
+            }
         }
     }
 
+    let mut seen = HashSet::new();
+    out.retain(|edge| {
+        seen.insert((
+            edge.direction.clone(),
+            edge.edge_kind.clone(),
+            edge.node.id.clone(),
+        ))
+    });
     Ok(out)
 }
 
@@ -707,6 +1488,64 @@ pub fn file_ledger(conn: &Connection, project: &str, file: &str) -> Result<FileL
     })
 }
 
+/// What the prompt hook shows for a file the prompt names: the first symbols
+/// and callers of [`file_ledger`], nothing else.
+#[derive(Debug, Clone, Default)]
+pub struct FileSlice {
+    pub symbols: Vec<NodeRow>,
+    /// (caller_name, caller_file), resolved `calls` edges only.
+    pub callers: Vec<(String, String)>,
+}
+
+/// The two statements of [`file_slice`]: symbols, then callers. Parameters:
+/// `?1` the file as named, `?2` its `%`-suffix pattern, `?3` the project or
+/// `''`, `?4` its last path component, `?5` the row limit. `?4` is matched
+/// against the key of `idx_code_nodes_basename`, so a statement reads only
+/// the nodes of files with that name; the `LIKE '%…'` test alone cannot use
+/// an index and read every node and every `calls` edge on each prompt.
+pub(crate) fn file_slice_sql() -> (String, String) {
+    let base = super::migrations::basename_sql("file");
+    let symbols = format!(
+        "SELECT {NODE_COLS} FROM code_nodes
+         WHERE {base} = ?4 AND (file = ?1 OR file LIKE ?2) AND (?3 = '' OR project = ?3)
+           AND kind != 'module'
+         ORDER BY kind, name, id LIMIT ?5"
+    );
+    let base = super::migrations::basename_sql("d.file");
+    let callers = format!(
+        "SELECT DISTINCT s.name, s.file FROM code_nodes d
+         CROSS JOIN code_edges e ON e.dst_id = d.id
+         CROSS JOIN code_nodes s ON s.id = e.src_id
+         WHERE {base} = ?4 AND (d.file = ?1 OR d.file LIKE ?2) AND (?3 = '' OR d.project = ?3)
+           AND e.kind = 'calls' AND e.resolved = 1
+         ORDER BY s.file, s.name LIMIT ?5"
+    );
+    (symbols, callers)
+}
+
+/// The first `limit` symbols and callers of `file`, in [`file_ledger`]'s
+/// order, read through the file-name index. A stored file matches when its
+/// last path component is the named file's and it ends with the named path:
+/// `stop.rs` and `hooks/stop.rs` find `/repo/src/hooks/stop.rs`, but
+/// `nonstop.rs` is another file, and the name is compared case for case.
+pub fn file_slice(conn: &Connection, project: &str, file: &str, limit: usize) -> Result<FileSlice> {
+    let suffix = format!("%{file}");
+    let base = file.rsplit('/').next().unwrap_or(file);
+    let limit = limit as i64;
+    let (symbols_sql, callers_sql) = file_slice_sql();
+    let symbols = conn
+        .prepare(&symbols_sql)?
+        .query_map(params![file, suffix, project, base, limit], row_to_node)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let callers = conn
+        .prepare(&callers_sql)?
+        .query_map(params![file, suffix, project, base, limit], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(FileSlice { symbols, callers })
+}
+
 /// Distinct `code_nodes.file` values still missing `repo_root` — feeds the
 /// WP2 Stage 1 backfill (`import::backfill::backfill_repo_root`).
 pub fn code_node_files_missing_repo_root(conn: &Connection) -> Result<Vec<String>> {
@@ -796,6 +1635,59 @@ pub fn nodes_for_conversations(
             .collect();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params.as_slice(), row_to_node)?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
+/// The five `code_nodes` columns witness binding reads: where a symbol lives,
+/// its bare name and the two conversations it is attributed to.
+pub struct WitnessNode {
+    pub project: String,
+    pub file: String,
+    pub name: String,
+    pub first_conv_id: String,
+    pub last_conv_id: String,
+}
+
+/// [`nodes_for_conversations`] narrowed to [`WitnessNode`]: the same rows in the
+/// same order (`ORDER BY id`), without the eight columns the binding never
+/// reads. One busy conversation holds tens of thousands of nodes, and building
+/// a whole `NodeRow` for each cost more than the lookup that found them.
+pub fn witness_nodes_for_conversations(
+    conn: &Connection,
+    conversation_ids: &[String],
+) -> Result<Vec<WitnessNode>> {
+    if conversation_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    const BATCH: usize = 400;
+    let mut out = Vec::new();
+    for batch in conversation_ids.chunks(BATCH) {
+        let placeholders: Vec<String> = (1..=batch.len()).map(|i| format!("?{i}")).collect();
+        let in_list = placeholders.join(", ");
+        let sql = format!(
+            "SELECT project, file, name, first_conv_id, last_conv_id FROM code_nodes
+             WHERE kind != 'module'
+               AND (first_conv_id IN ({in_list}) OR last_conv_id IN ({in_list}))
+             ORDER BY id"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = batch
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(WitnessNode {
+                project: row.get(0)?,
+                file: row.get(1)?,
+                name: row.get(2)?,
+                first_conv_id: row.get(3)?,
+                last_conv_id: row.get(4)?,
+            })
+        })?;
         for row in rows {
             out.push(row?);
         }
@@ -947,417 +1839,5 @@ pub fn get_node_rank(conn: &Connection, id: &str) -> Result<Option<(f64, i64, i6
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::migrations;
-
-    fn mem() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        migrations::run(&conn).unwrap();
-        conn
-    }
-
-    fn node(id: &str, file: &str, kind: &str, name: &str, conv: &str) -> NodeRow {
-        NodeRow {
-            id: id.into(),
-            repo: "repo".into(),
-            project: "proj".into(),
-            file: file.into(),
-            lang: "rust".into(),
-            kind: kind.into(),
-            name: name.into(),
-            body_hash: "h".into(),
-            first_conv_id: conv.into(),
-            last_conv_id: conv.into(),
-            last_session_id: "sess".into(),
-            ..NodeRow::default()
-        }
-    }
-
-    #[test]
-    fn upsert_preserves_first_conv_id() {
-        let conn = mem();
-        upsert_node(&conn, &node("n1", "a.rs", "function", "foo", "conv_A")).unwrap();
-        // Re-upsert with a new conv and body — first_conv_id must stay conv_A.
-        let mut n = node("n1", "a.rs", "function", "foo", "conv_B");
-        n.body_hash = "h2".into();
-        upsert_node(&conn, &n).unwrap();
-        let got = get_node(&conn, "n1").unwrap().unwrap();
-        assert_eq!(got.first_conv_id, "conv_A", "first conv is immutable");
-        assert_eq!(got.last_conv_id, "conv_B", "last conv updates");
-        assert_eq!(got.body_hash, "h2");
-    }
-
-    #[test]
-    fn replace_file_edges_is_per_file() {
-        let conn = mem();
-        let e1 = EdgeRow {
-            src_id: "n1".into(),
-            dst_id: "name:bar".into(),
-            kind: "calls".into(),
-            src_file: "a.rs".into(),
-            weight: 1.0,
-            ..EdgeRow::default()
-        };
-        replace_file_edges(&conn, "proj", "a.rs", std::slice::from_ref(&e1)).unwrap();
-        // Replacing a.rs's edges with an empty set wipes only a.rs.
-        let e_other = EdgeRow {
-            src_id: "n2".into(),
-            dst_id: "name:baz".into(),
-            kind: "calls".into(),
-            src_file: "b.rs".into(),
-            weight: 1.0,
-            ..EdgeRow::default()
-        };
-        replace_file_edges(&conn, "proj", "b.rs", std::slice::from_ref(&e_other)).unwrap();
-        replace_file_edges(&conn, "proj", "a.rs", &[]).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM code_edges", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1, "only b.rs edge remains");
-    }
-
-    #[test]
-    fn file_ledger_holds_symbols_and_history() {
-        let conn = mem();
-        upsert_node(&conn, &node("n1", "a.rs", "function", "foo", "conv_A")).unwrap();
-        crate::storage::queries::insert_code_evolution(
-            &conn,
-            "sess",
-            "proj",
-            "a.rs",
-            "rust",
-            "Edit",
-            "[\"foo\"]",
-            "[]",
-            "[]",
-            "[]",
-            "[]",
-            "[]",
-            None,
-        )
-        .unwrap();
-        let ledger = file_ledger(&conn, "proj", "a.rs").unwrap();
-        assert_eq!(ledger.symbols.len(), 1);
-        assert_eq!(ledger.symbols[0].name, "foo");
-        assert_eq!(ledger.symbols[0].first_conv_id, "conv_A");
-        assert_eq!(ledger.timeline.len(), 1);
-        assert_eq!(ledger.timeline[0].tool_name, "Edit");
-    }
-
-    #[test]
-    fn query_callers_classifies_name_only_vs_definition() {
-        let conn = mem();
-        upsert_node(
-            &conn,
-            &node("target1", "t.rs", "function", "target_fn", "conv_T"),
-        )
-        .unwrap();
-        // Caller that resolved directly to the real id.
-        upsert_node(
-            &conn,
-            &node("caller_resolved", "a.rs", "function", "caller_a", "conv_A"),
-        )
-        .unwrap();
-        replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[EdgeRow {
-                src_id: "caller_resolved".into(),
-                dst_id: "target1".into(),
-                kind: "calls".into(),
-                src_file: "a.rs".into(),
-                resolved: 1,
-                weight: 1.0,
-                ..EdgeRow::default()
-            }],
-        )
-        .unwrap();
-        // Caller that only matched via the bare-name placeholder.
-        upsert_node(
-            &conn,
-            &node(
-                "caller_placeholder",
-                "b.rs",
-                "function",
-                "caller_b",
-                "conv_B",
-            ),
-        )
-        .unwrap();
-        replace_file_edges(
-            &conn,
-            "proj",
-            "b.rs",
-            &[EdgeRow {
-                src_id: "caller_placeholder".into(),
-                dst_id: "name:target_fn".into(),
-                kind: "calls".into(),
-                src_file: "b.rs".into(),
-                resolved: 0,
-                weight: 1.0,
-                ..EdgeRow::default()
-            }],
-        )
-        .unwrap();
-
-        let callers = query_callers(&conn, "target_fn", "proj", 20).unwrap();
-        let resolved_caller = callers.iter().find(|n| n.id == "caller_resolved").unwrap();
-        assert!(
-            !resolved_caller.name_only,
-            "definition-backed match must not be name_only"
-        );
-        let placeholder_caller = callers
-            .iter()
-            .find(|n| n.id == "caller_placeholder")
-            .unwrap();
-        assert!(
-            placeholder_caller.name_only,
-            "placeholder-only match must be name_only"
-        );
-    }
-
-    #[test]
-    fn query_callers_scopes_caller_by_project() {
-        let conn = mem();
-        upsert_node(
-            &conn,
-            &node("target1", "t.rs", "function", "target_fn", "conv_T"),
-        )
-        .unwrap();
-        // Caller in a DIFFERENT project — must not leak into a "proj"-scoped query.
-        let mut other = node("caller_other", "x.rs", "function", "caller_x", "conv_X");
-        other.project = "other".into();
-        upsert_node(&conn, &other).unwrap();
-        replace_file_edges(
-            &conn,
-            "other",
-            "x.rs",
-            &[EdgeRow {
-                src_id: "caller_other".into(),
-                dst_id: "name:target_fn".into(),
-                kind: "calls".into(),
-                src_file: "x.rs".into(),
-                resolved: 0,
-                weight: 1.0,
-                ..EdgeRow::default()
-            }],
-        )
-        .unwrap();
-
-        let callers = query_callers(&conn, "target_fn", "proj", 20).unwrap();
-        assert!(
-            callers.iter().all(|n| n.id != "caller_other"),
-            "caller from another project must not leak: {:?}",
-            callers.iter().map(|n| &n.id).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn query_callees_marks_unresolved_name_only() {
-        let conn = mem();
-        upsert_node(
-            &conn,
-            &node("caller1", "a.rs", "function", "caller_fn", "conv_A"),
-        )
-        .unwrap();
-        upsert_node(
-            &conn,
-            &node("callee1", "b.rs", "function", "callee_fn", "conv_B"),
-        )
-        .unwrap();
-        replace_file_edges(
-            &conn,
-            "proj",
-            "a.rs",
-            &[
-                EdgeRow {
-                    src_id: "caller1".into(),
-                    dst_id: "callee1".into(),
-                    kind: "calls".into(),
-                    src_file: "a.rs".into(),
-                    resolved: 1,
-                    weight: 1.0,
-                    ..EdgeRow::default()
-                },
-                EdgeRow {
-                    src_id: "caller1".into(),
-                    dst_id: "name:ghost_fn".into(),
-                    kind: "calls".into(),
-                    src_file: "a.rs".into(),
-                    resolved: 0,
-                    weight: 1.0,
-                    ..EdgeRow::default()
-                },
-            ],
-        )
-        .unwrap();
-
-        let callees = query_callees(&conn, "caller1", 20).unwrap();
-        let resolved = callees.iter().find(|n| n.id == "callee1").unwrap();
-        assert!(!resolved.name_only, "resolved callee must not be name_only");
-        let unresolved = callees.iter().find(|n| n.kind == "unresolved").unwrap();
-        assert!(
-            unresolved.name_only,
-            "unresolved placeholder callee must be name_only"
-        );
-        assert_eq!(unresolved.name, "ghost_fn");
-    }
-
-    #[test]
-    fn repo_defs_upsert_lookup_and_per_file_replace() {
-        let conn = mem();
-        upsert_repo_defs(
-            &conn,
-            "proj",
-            "a.rs",
-            &[
-                ("foo".into(), "function".into(), "rust".into()),
-                ("Bar".into(), "type".into(), "rust".into()),
-            ],
-        )
-        .unwrap();
-        upsert_repo_defs(
-            &conn,
-            "proj",
-            "b.rs",
-            &[("foo".into(), "function".into(), "rust".into())],
-        )
-        .unwrap();
-
-        let hits = lookup_repo_defs(&conn, "proj", "foo").unwrap();
-        assert_eq!(hits.len(), 2, "foo defined in both files: {hits:?}");
-        assert!(hits.contains(&("a.rs".to_string(), "function".to_string())));
-        assert!(hits.contains(&("b.rs".to_string(), "function".to_string())));
-
-        // Replacing a.rs's defs with a set that drops `foo` must not leave a stale row.
-        upsert_repo_defs(
-            &conn,
-            "proj",
-            "a.rs",
-            &[("Baz".into(), "type".into(), "rust".into())],
-        )
-        .unwrap();
-        let hits = lookup_repo_defs(&conn, "proj", "foo").unwrap();
-        assert_eq!(
-            hits,
-            vec![("b.rs".to_string(), "function".to_string())],
-            "a.rs's foo def must be gone after replace: {hits:?}"
-        );
-    }
-
-    // ─── WP2 Stage 2: two-channel attribution ───
-
-    fn attr(node_id: &str, channel: &str, source_id: &str, ts: Option<&str>) -> AttributionRow {
-        AttributionRow {
-            node_id: node_id.into(),
-            channel: channel.into(),
-            source_id: source_id.into(),
-            observed_ts: ts.map(|s| s.into()),
-            evidence: "test".into(),
-        }
-    }
-
-    #[test]
-    fn format_attribution_neither_channel_is_unattributed() {
-        assert_eq!(format_attribution(&[]), "unattributed");
-    }
-
-    #[test]
-    fn format_attribution_transcript_only() {
-        let rows = vec![attr("n1", "transcript", "70690eeb12345678", None)];
-        assert_eq!(format_attribution(&rows), "transcript:70690eeb");
-    }
-
-    #[test]
-    fn format_attribution_git_only() {
-        let rows = vec![attr("n1", "git", "624e7229abcdef", None)];
-        assert_eq!(format_attribution(&rows), "git:624e7229");
-    }
-
-    #[test]
-    fn format_attribution_both_channels_agree_no_disagreement_label() {
-        let rows = vec![
-            attr(
-                "n1",
-                "transcript",
-                "70690eeb12345678",
-                Some("2026-07-27T10:00:00Z"),
-            ),
-            attr("n1", "git", "624e7229abcdef", Some("2026-07-27T11:00:00Z")),
-        ];
-        let out = format_attribution(&rows);
-        assert_eq!(out, "transcript:70690eeb + git:624e7229");
-        assert!(!out.contains("disagreement"));
-    }
-
-    #[test]
-    fn format_attribution_both_channels_over_48h_apart_is_disagreement() {
-        // R8 example: git `624e7229` vs transcript 2026-07-27, labeled
-        // disagreement per the plan's acceptance spot-check.
-        let rows = vec![
-            attr(
-                "n1",
-                "transcript",
-                "70690eeb12345678",
-                Some("2026-07-27T10:00:00Z"),
-            ),
-            attr("n1", "git", "624e7229abcdef", Some("2026-08-01T10:00:00Z")),
-        ];
-        let out = format_attribution(&rows);
-        assert!(out.contains("transcript:70690eeb"), "got: {out}");
-        assert!(out.contains("git:624e7229"), "got: {out}");
-        assert!(out.contains("disagreement"), "got: {out}");
-        // Never merge into a single collapsed value — both must be visible.
-        assert!(out.contains('+') || out.contains("vs"), "got: {out}");
-    }
-
-    #[test]
-    fn format_attribution_both_channels_unparseable_timestamps_no_false_disagreement() {
-        // Missing/garbage timestamps must never be silently treated as a
-        // >48h gap — we can't prove disagreement we can't measure.
-        let rows = vec![
-            attr("n1", "transcript", "abc12345", None),
-            attr("n1", "git", "def67890", Some("not-a-timestamp")),
-        ];
-        let out = format_attribution(&rows);
-        assert_eq!(out, "transcript:abc12345 + git:def67890");
-    }
-
-    #[test]
-    fn upsert_and_get_attribution_round_trips_and_is_idempotent() {
-        let conn = mem();
-        upsert_node(&conn, &node("n1", "a.rs", "function", "foo", "conv_A")).unwrap();
-        let row = attr("n1", "transcript", "sess-1", Some("2026-07-27T10:00:00Z"));
-        upsert_attribution(&conn, &row).unwrap();
-        // Re-run with a different source_id for the same (node_id, channel):
-        // must replace, never duplicate (PK is node_id+channel).
-        let row2 = attr("n1", "transcript", "sess-2", Some("2026-07-28T10:00:00Z"));
-        upsert_attribution(&conn, &row2).unwrap();
-
-        let got = get_attribution(&conn, "n1").unwrap();
-        assert_eq!(got.len(), 1, "one row per channel: {got:?}");
-        assert_eq!(got[0].source_id, "sess-2");
-    }
-
-    #[test]
-    fn code_node_attribution_check_constraint_rejects_bad_channel() {
-        let conn = mem();
-        let bad = conn.execute(
-            "INSERT INTO code_node_attribution (node_id, channel, source_id) VALUES ('n1', 'guess', 's1')",
-            [],
-        );
-        assert!(
-            bad.is_err(),
-            "CHECK(channel IN ('transcript','git')) must reject 'guess'"
-        );
-    }
-
-    #[test]
-    fn attribution_for_node_unattributed_when_neither_channel_present() {
-        let conn = mem();
-        upsert_node(&conn, &node("n1", "a.rs", "function", "foo", "conv_A")).unwrap();
-        assert_eq!(attribution_for_node(&conn, "n1").unwrap(), "unattributed");
-    }
-}
+#[path = "codegraph_tests.rs"]
+mod tests;

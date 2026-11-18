@@ -1,0 +1,156 @@
+{
+ "schema": "csr-probes/1",
+ "limit": 5,
+ "probes": [
+  {
+   "id": 1,
+   "query": "fork PR admin merge squash despite BLOCKED status CodeQL ruleset",
+   "must": [
+    "gh pr merge 295 --admin --squash",
+    "fork PRs CAN be merged",
+    "admin bypass on [^\\n]{0,12}main[^\\n]{0,12} works for fork PRs",
+    "merged (it )?cleanly"
+   ],
+   "must_not": [
+    "not even with --admin",
+    "unmergeable",
+    "cannot merge normally"
+   ],
+   "answer_source": "fork_pr_admin_merge_works.md"
+  },
+  {
+   "id": 2,
+   "query": "rmcp advertises MCP protocol version Claude Code rejects tools/list ttlMs",
+   "must": [
+    "rmcp[^\\n]{0,30}advertises[^\\n]{0,30}2026-07-28",
+    "supported_protocol_versions",
+    "ttlMs/cacheScope",
+    "ttlMs[^\\n]{0,20}expected number"
+   ],
+   "must_not": [],
+   "answer_source": "rmcp_protocol_overadvertise_ttlms.md"
+  },
+  {
+   "id": 3,
+   "query": "codex exec hangs reading additional input from stdin in background",
+   "must": [
+    "Reading additional input from stdin",
+    "codex exec[^\\n]{0,160}hangs?[^\\n]{0,80}stdin",
+    "background shell.s stdin never reaches EOF",
+    "always end the command with[^\\n]{0,10}< ?/dev/null"
+   ],
+   "must_not": [],
+   "answer_source": "codex_exec_stdin_hang.md"
+  },
+  {
+   "id": 4,
+   "query": "HNSW tombstones overfetch search_index fetches exactly limit then filters dead ids",
+   "must": [
+    "5/4/3/2/1 live results",
+    "5.{1,3}1 results after 10 rewrites",
+    "eats a result slot",
+    "crowd(s|ing)? out live results"
+   ],
+   "must_not": [],
+   "answer_source": "hnsw_tombstones_no_overfetch.md"
+  },
+  {
+   "id": 5,
+   "query": "Bash edits invisible to search_by_file matcher skips Bash tool",
+   "must": [
+    "edited a file only through Bash are essentially invisible",
+    "Bash-only[^\\n]{0,30}(file )?edits",
+    "\\b1/574\\b",
+    "PostToolUse matcher is[^\\n]{0,10}Edit\\|Write\\|MultiEdit\\|NotebookEdit"
+   ],
+   "must_not": [],
+   "answer_source": "bash_edit_blind_spot.md"
+  },
+  {
+   "id": 6,
+   "query": "Warp terminal kitty graphics picture layer eats clicks z-index",
+   "must": [
+    "z\\s*(>=|\u2265)\\s*0[^\\n]{0,40}pictures?",
+    "pictures?[^\\n]{0,40}z\\s*(>=|\u2265)\\s*0",
+    "\\bz=-1\\b",
+    "layer above the (alt screen|terminal)"
+   ],
+   "must_not": [],
+   "answer_source": "herdr_093_pixel_mouse_warp.md"
+  },
+  {
+   "id": 7,
+   "query": "transcript mirror zstd compressed copies installed",
+   "must": [
+    "zstd-compressed cop(y|ies) of every transcript",
+    "mirror/transcripts/",
+    "\\b1\\.94 GB\\b",
+    "\\b20,015 files\\b",
+    "\\b226e8118\\b"
+   ],
+   "must_not": [],
+   "answer_source": "transcript_mirror_lost_sessions.md"
+  },
+  {
+   "id": 8,
+   "query": "MCP_CLIENT_CWD scoping dead Claude Code never sets it",
+   "must": [
+    "falls? through to .?all",
+    "\\bproject=all\\b",
+    "59 env vars",
+    "ps eww",
+    "scoping (is )?dead"
+   ],
+   "must_not": [],
+   "answer_source": "mcp_client_cwd_scoping_dead.md"
+  },
+  {
+   "id": 9,
+   "query": "npm OIDC trusted publisher workflow yaml",
+   "must": [
+    "id-token:\\s*write",
+    "registry-url:\\s*https?://registry\\.npmjs\\.org",
+    "npm publish --provenance",
+    "NODE_AUTH_TOKEN[^\\n]{0,60}(overrides?|stale|placeholder|OIDC)"
+   ],
+   "must_not": [],
+   "answer_source": "npm_oidc_trusted_publisher.md"
+  },
+  {
+   "id": 10,
+   "query": "Opus 5 decision punts your call goal-seeking CLAUDE.md three layer fix",
+   "must": [
+    "goal-seeking-no-decision-punts",
+    "never end turns with decision punts",
+    "incredibly noisy",
+    "traces to Opus 4\\.8"
+   ],
+   "must_not": [],
+   "answer_source": "goal_seeking_no_decision_punts.md"
+  },
+  {
+   "id": 11,
+   "query": "why did we pin rmcp and defer ast-grep upgrade",
+   "must": [
+    "1\\.7\\+ moved",
+    "0\\.43 broke",
+    "non-exhaustive structs",
+    "Deferred migrations"
+   ],
+   "must_not": [],
+   "answer_source": "dependency_triage_2026_07_10.md"
+  },
+  {
+   "id": 12,
+   "query": "what did the burst failure study find about re-query bursts",
+   "must": [
+    "ranking is not the bottleneck",
+    "premise was wrong",
+    "weak 125 / partial 38",
+    "answer was in the corpus AND in the results"
+   ],
+   "must_not": [],
+   "answer_source": "burst_failure_study_2026_09_22.md"
+  }
+ ]
+}
