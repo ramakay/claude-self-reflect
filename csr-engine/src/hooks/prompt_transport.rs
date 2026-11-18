@@ -212,13 +212,10 @@ fn pre_dispatch(
     session_id: Option<&str>,
 ) -> bool {
     record_turn_start(db_path, session_id);
-    if matches!(
+    !matches!(
         super::prompt_submit::early_exit_for(source, prompt),
         Some(super::prompt_submit::EarlyExit::Silent)
-    ) {
-        return false;
-    }
-    true
+    )
 }
 
 /// The timing row for a prompt the client answered silently because a person

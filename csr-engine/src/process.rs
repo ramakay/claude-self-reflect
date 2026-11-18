@@ -111,11 +111,21 @@ pub(crate) fn detached_child_exe() -> io::Result<Option<std::path::PathBuf>> {
 }
 
 fn exe_if_engine(exe: std::path::PathBuf) -> Option<std::path::PathBuf> {
-    let in_test_deps = exe
-        .parent()
-        .and_then(|dir| dir.file_name())
-        .is_some_and(|name| name == "deps");
-    (!in_test_deps).then_some(exe)
+    (!is_cargo_harness_exe(&exe)).then_some(exe)
+}
+
+/// True when `exe` is a cargo test or bench harness. Two layouts exist: the
+/// classic `target/<profile>/deps/<bin>` and the newer build-dir layout's
+/// `<profile>/build/<pkg>/<hash>/out/<bin>` (what cargo 1.100 writes). An installed
+/// `csr-engine` lives in neither.
+pub(crate) fn is_cargo_harness_exe(exe: &std::path::Path) -> bool {
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    let named = |p: Option<&std::path::Path>, want: &str| {
+        p.and_then(|p| p.file_name()).is_some_and(|n| n == want)
+    };
+    named(Some(dir), "deps") || (named(Some(dir), "out") && named(dir.ancestors().nth(3), "build"))
 }
 
 pub(crate) trait CommandDeadline {
@@ -379,10 +389,22 @@ mod detached_child_exe_tests {
     }
 
     #[test]
+    fn a_test_binary_in_the_newer_build_dir_layout_is_never_a_detached_child() {
+        for path in [
+            "/w/target/debug/build/csr-engine/8d64c12c204e6d9e/out/csr_engine-8d64c12c204e6d9e",
+            "/w/target/release/build/csr-engine/0123abcd/out/hooks_integration-0123abcd",
+        ] {
+            assert_eq!(exe_if_engine(PathBuf::from(path)), None, "{path}");
+        }
+    }
+
+    #[test]
     fn the_installed_engine_is_a_detached_child() {
         for path in [
             "/usr/local/bin/csr-engine",
             "/w/csr-engine/target/release/csr-engine",
+            // The bin cargo builds sits at the top of the profile dir, not under build/.
+            "/w/csr-engine/target/debug/csr-engine",
         ] {
             assert_eq!(
                 exe_if_engine(PathBuf::from(path)),

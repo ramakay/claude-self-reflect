@@ -159,19 +159,17 @@ fn resolve_log_path(
 ///
 /// Two signals, both required: Cargo exports `CARGO_MANIFEST_DIR` into the
 /// processes it launches, and it runs test/bench harnesses out of
-/// `target/<profile>/deps/`. An installed `csr-engine` has neither; `cargo run`
+/// `target/<profile>/deps/` or, in the newer build-dir layout, `<profile>/build/<pkg>/<hash>/out/`.
+/// An installed `csr-engine` has neither; `cargo run`
 /// has the first but not the second, so a hook run by hand still writes where the
 /// developer expects.
 fn running_under_test_harness() -> bool {
     if std::env::var_os("CARGO_MANIFEST_DIR").is_none() {
         return false;
     }
-    std::env::args_os().next().is_some_and(|arg0| {
-        Path::new(&arg0)
-            .parent()
-            .and_then(|d| d.file_name())
-            .is_some_and(|d| d == std::ffi::OsStr::new("deps"))
-    })
+    std::env::args_os()
+        .next()
+        .is_some_and(|arg0| crate::process::is_cargo_harness_exe(Path::new(&arg0)))
 }
 
 /// The previous log generation kept after rotation: `hook-timing.log.1`.

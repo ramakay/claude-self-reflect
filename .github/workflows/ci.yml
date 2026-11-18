@@ -14,6 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The companion pane goldens (tests/companion.rs, companion_cards_json.rs) render the
+          # subject of commit 8e4e3f27 from this repo's git history. That commit is on a public
+          # branch, not in the squashed release history, so a depth-1 checkout cannot show it.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

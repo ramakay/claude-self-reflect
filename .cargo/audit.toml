@@ -1,0 +1,18 @@
+# cargo-audit config, read from the repo root (CI runs `cargo audit --file csr-engine/Cargo.lock` there).
+#
+# These three advisories name code in rmcp 3.1.0 that this build does not compile. The binary enables
+# rmcp with `server`, `transport-io`, `macros` and `elicitation` only: no `transport-streamable-http-*`
+# and no `auth` feature, and rmcp's resolved dependencies in csr-engine/Cargo.lock hold no reqwest,
+# axum, hyper, tower or oauth2. Check with:
+#   cargo tree --locked --target all --all-features -e features -i rmcp
+# The MCP server speaks stdio only. Drop these entries when rmcp moves to >= 3.9.0; that bump also
+# changes the handshake that mcp::opener_guard's pinning test asserts, so it needs its own pass.
+[advisories]
+ignore = [
+    # Unbounded tool schema cache in the Streamable HTTP server transport (fixed in 3.6.0).
+    "RUSTSEC-2026-0461",
+    # OAuth client SSRF filter (fixed in 3.7.0). The `auth` feature is off.
+    "RUSTSEC-2026-0457",
+    # Unbounded response buffering in the Streamable HTTP clients (fixed in 3.9.0).
+    "RUSTSEC-2026-0462",
+]
