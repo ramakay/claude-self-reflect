@@ -233,9 +233,12 @@ jobs:
             for t in ./*.tar.gz; do echo "== $t"; tar -tzf "$t"; done
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+          # List first, then grep the list: piping tar into `grep -q` lets grep exit
+          # early, tar dies on SIGPIPE, and pipefail reports a present file missing.
           for t in ./*.tar.gz; do
+            listing=$(tar -tzf "$t")
             for f in csr-engine LICENSE THIRD_PARTY_LICENSES.txt; do
-              tar -tzf "$t" | grep -qx "$f" || { echo "::error::${f} missing from ${t}"; exit 1; }
+              grep -qx "$f" <<< "$listing" || { echo "::error::${f} missing from ${t}"; exit 1; }
             done
           done
 
