@@ -50,10 +50,11 @@ Everything else falls through to multi-signal scoring:
 
 | Signal | Weight |
 |--------|--------|
-| Semantic similarity | 50% |
-| Recency | 20% |
+| Semantic similarity | 30% |
+| Recency | 25% |
 | File overlap | 20% |
 | Error pattern match | 10% |
+| Phase boost (how well the result type fits the hook phase) | 15% |
 
 500-token budget. Skips trivial prompts and slash commands.
 

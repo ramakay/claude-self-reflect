@@ -25,7 +25,7 @@ cargo fmt -- --check
 cargo test               # All tests
 cargo test --lib          # Unit only
 cargo test --test hooks_integration  # Hooks
-cargo test test_reflect_on_past      # Specific
+cargo test --test integration weak_band   # Specific
 ```
 
 ## Workflow

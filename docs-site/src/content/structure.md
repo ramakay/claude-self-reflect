@@ -7,12 +7,12 @@ title: Project Structure
 ## Key Patterns
 
 ### Engine Orchestrator
-`Engine` owns `Storage`, `EmbeddingEngine`, and `SearchIndex`.
+`Engine` owns `Storage`, `EmbeddingEngine`, and `SearchEngine`.
 
 ### Thread Safety
 - `Storage`: `Mutex<Connection>` (rusqlite isn't Send)
 - `EmbeddingEngine`: `Mutex` (embed needs `&mut self`)
-- `SearchIndex`: `tokio::sync::RwLock` for async access
+- `SearchEngine`: `tokio::sync::RwLock` for async access
 
 ### Hook Error Handling
 Every hook wraps inner logic in catch-all — never blocks Claude Code.

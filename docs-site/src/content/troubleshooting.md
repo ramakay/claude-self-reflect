@@ -69,5 +69,5 @@ Type `/csr` in Claude Code. Without herdr the panel does not open by itself. Mor
 
 ## Help
 
-- `csr-engine eval --full` — 25 results plus a census line
+- `csr-engine eval --full` — 24 results plus a census line
 - [GitHub Issues](https://github.com/ramakay/claude-self-reflect/issues)
