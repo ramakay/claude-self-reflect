@@ -422,6 +422,7 @@ body.iso[data-theme="light"] {
 .chapter-text h2, .sr h2 { margin: 0; font-family: var(--display); font-weight: 400; font-size: clamp(39px, 4.35vw, 70px); line-height: 1.01; letter-spacing: -.053em; text-wrap: balance; }
 .chapter-text h2 { font-size: clamp(34px, 3.6vw, 54px); }
 .chapter-body { margin: 22px 0 0; max-width: 45ch; color: #48433e; font-size: clamp(16px, 1.25vw, 18px); line-height: 1.58; }
+mark.sr-hl { color: var(--tl-ink); background: linear-gradient(transparent 55%, var(--tl-lit-shade) 55%, var(--tl-lit-shade) 92%, transparent 92%); padding: 0 .12em; box-decoration-break: clone; -webkit-box-decoration-break: clone; font-weight: 500; }
 .tl-read { margin: 25px 0 0; display: grid; gap: 9px; font-size: 14px; }
 .tl-read > div { display: grid; grid-template-columns: minmax(104px, .78fr) minmax(0, 1.22fr); align-items: baseline; gap: 12px; }
 .tl-read dt { color: var(--paper-muted); }
@@ -904,7 +905,7 @@ body.iso[data-theme="light"] {
       <div class="chapter-text">
         <p class="chapter-kicker">Read back</p>
         <h2 id="ch-label-recall">Read the turns a compaction replaced.</h2>
-        <p class="chapter-body">Compaction is one moment in a session, and Self-Reflect covers it too. After a compaction, a receipt points Claude to the original turns. Claude can use csr_transcript to read a slice of the exchange and check exactly what you asked.</p>
+        <p class="chapter-body">Compaction is one moment in a session, and Self-Reflect covers it too. After a compaction, a receipt points Claude to the original turns. Claude can use csr_transcript to read a slice of the exchange and check exactly what you asked. <mark class="sr-hl">It even keeps the copies Claude Code deletes.</mark></p>
         <dl class="tl-read"><div><dt>Example receipt</dt><dd><code>csr_transcript(session="&lt;id&gt;",
   view="slice", turns="&lt;a&gt;..&lt;b&gt;")</code></dd></div><div><dt>Other views</dt><dd><code>receipt, stats, prompts, yourasks, tools, files, errors, grep</code></dd></div><div><dt>CLI</dt><dd><code>csr-engine transcript</code></dd></div></dl>
       </div>
