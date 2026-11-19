@@ -193,13 +193,13 @@ fn all_nine_states_and_both_themes_have_honest_top_frame_goldens() {
                 if std::env::var_os("CSR_INSTRUMENT_UPDATE").is_some() {
                     write_json(&golden, &value);
                 }
-                let expected: Value = serde_json::from_slice(&fs::read(&golden).unwrap()).unwrap();
-                assert_eq!(value, expected, "{name}/{state} {cols}x{rows}");
                 if let Some(dir) = std::env::var_os("CSR_INSTRUMENT_PNG") {
                     let dir = PathBuf::from(dir).join(format!("{cols}x{rows}")).join(name);
                     fs::create_dir_all(&dir).unwrap();
                     fs::write(dir.join(format!("{state}.png")), png).unwrap();
                 }
+                let expected: Value = serde_json::from_slice(&fs::read(&golden).unwrap()).unwrap();
+                assert_eq!(value, expected, "{name}/{state} {cols}x{rows}");
             }
         }
     }
