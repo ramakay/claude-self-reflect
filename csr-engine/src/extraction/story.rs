@@ -81,7 +81,18 @@ pub fn synthesize_story_from_v3(v3_content: &str, project: &str) -> Option<Strin
     }
 
     // Join and cap at 500 chars
-    let story: String = parts.join(". ");
+    // ". " between parts, or a space after a part that already ends a sentence ("lately?").
+    let story = parts.iter().fold(String::new(), |mut story, part| {
+        if !story.is_empty() {
+            story.push_str(if story.ends_with(['.', '?', '!']) {
+                " "
+            } else {
+                ". "
+            });
+        }
+        story.push_str(part);
+        story
+    });
     let capped: String = story.chars().take(500).collect();
     Some(capped)
 }
@@ -125,7 +136,9 @@ fn extract_section(content: &str, header: &str) -> Option<String> {
     let start = lines.iter().position(|l| l.starts_with(header))?;
     let mut result = String::new();
     for line in &lines[start + 1..] {
-        if line.starts_with("## ") {
+        // `---` opens the extraction's signature block (`Signature: {json}`), never a section's
+        // words: a story that read through it showed the raw JSON in the pane.
+        if line.starts_with("## ") || line.trim() == "---" {
             break;
         }
         if !line.trim().is_empty() {
@@ -190,6 +203,20 @@ fn extract_heuristic_field<'a>(heuristic: &'a str, field: &str) -> Option<&'a st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The V3 reflection as the daemon writes it (`{search_index}\n\n---\nSignature: {json}\n
+    /// Context:\n…`): the story takes the request, never the signature after `---`
+    /// (2026-11-19 clean install: the pane showed `--- Signature: {"completion_status":…`).
+    #[test]
+    fn the_signature_block_never_reaches_the_story() {
+        let v3 = "## User Request\nwhat did we work on lately?\n\n---\nSignature: \
+                  {\"completion_status\":\"partial\",\"confidence\":\"MEDIUM\",\"frameworks\":[],\
+                  \"pattern_reusability\":\"medium\",\"error_recovery\":false,\"total_edits\":0,\
+                  \"iteration_count\":2}\nContext:\nnone";
+        let story = synthesize_story_from_v3(v3, "this-ai-life").unwrap();
+        assert_eq!(story, "what did we work on lately? Partially completed");
+        assert!(!story.contains("Signature") && !story.contains('{'));
+    }
 
     #[test]
     fn test_synthesize_from_v3_with_user_request() {
