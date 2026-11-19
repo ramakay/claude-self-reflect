@@ -6,13 +6,13 @@ title: Architecture
 
 CSR is a single Rust binary of about 138 MB. Everything — storage, search, embeddings, MCP server, hooks, and enrichment — runs in one process. No database servers, no containers, no network services. The one background process is `csr-engine daemon`, which does enrichment and dreaming. On macOS `csr-engine setup` installs it as a launchd agent and starts it (`CSR_NO_DAEMON=1` skips that; `scripts/launchd/` holds a template for doing it by hand). Hooks and the MCP server run without it.
 
-![CSR Architecture Diagram](/claude-self-reflect/images/arch-diagram.png)
+![CSR architecture: JSONL transcripts are imported, embedded locally and stored in SQLite with an HNSW index; the daemon enriches, the MCP server (16 tools) serves searches, and eight hooks on seven events inject and record context](/claude-self-reflect/images/system-map-10.svg)
 
 ## Hooks: the session loop
 
 Eight hooks fire on seven events during Claude Code sessions (SessionStart runs two). They run inline as CLI subcommands — no background daemon.
 
-![Hooks Lifecycle Diagram](/claude-self-reflect/images/hooks-diagram.png)
+![Eight hooks on seven events: three inject context into Claude Code, three record the session into the store, two handle compaction](/claude-self-reflect/images/hook-flow-10.svg)
 
 All hooks use catch-all error handling — they log and return OK, never blocking Claude Code.
 

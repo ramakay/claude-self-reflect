@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 831" width="1000" height="831" role="img" aria-labelledby="t d">
+<title id="t">Session hook lifecycle: 8 hooks on 7 events</title><desc id="d">SessionStart (two hooks), UserPromptSubmit, PostToolUse, Stop, PreCompact, PostCompact and SessionEnd, each with its csr-engine command and what it does.</desc>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,1 L10,5 L0,9 z" fill="#c8442a"/></marker></defs>
+<rect width="1000" height="831" fill="#f5f2eb"/>
+<text x="40" y="52" font-family="Georgia, 'Times New Roman', serif" font-size="26" font-weight="normal" fill="#24211e" text-anchor="start">Eight hooks on seven events</text>
+<text x="40" y="76" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#6b645b" text-anchor="start">Every hook is catch-all wrapped and never blocks Claude Code.</text>
+<text x="40" y="126" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="bold" fill="#a0432f" text-anchor="start">START</text>
+<line x1="150" y1="122" x2="960" y2="122" stroke="#d8d2c8" stroke-width="1"/>
+<rect x="40" y="138" width="920" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="60" y="160" font-family="Georgia, 'Times New Roman', serif" font-size="15" font-weight="bold" fill="#24211e" text-anchor="start">SessionStart</text>
+<text x="60" y="178" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#6b645b" text-anchor="start">startup | resume | compact | clear</text>
+<text x="330" y="160" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook session-start</text>
+<text x="940" y="160" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="normal" fill="#6b645b" text-anchor="end">sync</text>
+<text x="330" y="180" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">One recap paragraph, a learnt line and the episode index.</text>
+<text x="330" y="195" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">After a compact: a receipt with csr_transcript pointers. No LLM.</text>
+<rect x="40" y="210" width="920" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="60" y="232" font-family="Georgia, 'Times New Roman', serif" font-size="15" font-weight="bold" fill="#24211e" text-anchor="start">SessionStart</text>
+<text x="60" y="250" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#6b645b" text-anchor="start">startup | resume</text>
+<text x="330" y="232" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook session-briefing</text>
+<text x="940" y="232" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="bold" fill="#c8442a" text-anchor="end">async, 150 s</text>
+<text x="330" y="252" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">Claude Code does not wait for it.</text>
+<text x="330" y="267" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">One claude -p call.</text>
+<text x="40" y="304" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="bold" fill="#a0432f" text-anchor="start">EACH TURN</text>
+<line x1="150" y1="300" x2="960" y2="300" stroke="#d8d2c8" stroke-width="1"/>
+<rect x="40" y="316" width="920" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="60" y="338" font-family="Georgia, 'Times New Roman', serif" font-size="15" font-weight="bold" fill="#24211e" text-anchor="start">UserPromptSubmit</text>
+<text x="60" y="356" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#6b645b" text-anchor="start">every prompt</text>
+<text x="330" y="338" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook prompt-submit</text>
+<text x="940" y="338" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="normal" fill="#6b645b" text-anchor="end">sync</text>
+<text x="330" y="358" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">Intent routing (continue, state recall, explore -&gt; code map),</text>
+<text x="330" y="373" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">then multi-signal scoring. 500-token predictive injection.</text>
+<rect x="40" y="388" width="920" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="60" y="410" font-family="Georgia, 'Times New Roman', serif" font-size="15" font-weight="bold" fill="#24211e" text-anchor="start">PostToolUse</text>
+<text x="60" y="428" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#6b645b" text-anchor="start">Edit | Write | MultiEdit | NotebookEdit | Bash</text>
+<text x="330" y="410" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook post-tool-use</text>
+<text x="940" y="410" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="normal" fill="#6b645b" text-anchor="end">sync</text>
+<text x="330" y="430" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">File-edit tracking (csr_search_by_file) and the code-map queue.</text>
+<text x="330" y="445" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">No embedding.</text>
+<rect x="40" y="460" width="920" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="60" y="482" font-family="Georgia, 'Times New Roman', serif" font-size="15" font-weight="bold" fill="#24211e" text-anchor="start">Stop</text>
+<text x="60" y="500" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#6b645b" text-anchor="start">end of each response</text>
+<text x="330" y="482" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook stop</text>
+<text x="940" y="482" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="normal" fill="#6b645b" text-anchor="end">sync</text>
+<text x="330" y="502" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">Imports the growing transcript (searchable now), writes session_latest,</text>
+<text x="330" y="517" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">extracts the structured episode.</text>
+<text x="40" y="554" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="bold" fill="#a0432f" text-anchor="start">COMPACTION</text>
+<line x1="150" y1="550" x2="960" y2="550" stroke="#d8d2c8" stroke-width="1"/>
+<rect x="40" y="566" width="920" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="60" y="588" font-family="Georgia, 'Times New Roman', serif" font-size="15" font-weight="bold" fill="#24211e" text-anchor="start">PreCompact</text>
+<text x="60" y="606" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#6b645b" text-anchor="start">before a compaction</text>
+<text x="330" y="588" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook precompact</text>
+<text x="940" y="588" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="normal" fill="#6b645b" text-anchor="end">sync</text>
+<text x="330" y="608" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">Refreshes the saved task anchor.</text>
+<text x="330" y="623" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">Starts one detached dream cycle.</text>
+<rect x="40" y="638" width="920" height="49" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="60" y="660" font-family="Georgia, 'Times New Roman', serif" font-size="15" font-weight="bold" fill="#24211e" text-anchor="start">PostCompact</text>
+<text x="60" y="678" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#6b645b" text-anchor="start">after a compaction</text>
+<text x="330" y="660" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook post-compact</text>
+<text x="940" y="660" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="normal" fill="#6b645b" text-anchor="end">sync</text>
+<text x="330" y="680" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">Stores Claude Code's compaction summary once, as derived context.</text>
+<text x="40" y="717" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="bold" fill="#a0432f" text-anchor="start">END</text>
+<line x1="150" y1="713" x2="960" y2="713" stroke="#d8d2c8" stroke-width="1"/>
+<rect x="40" y="729" width="920" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="60" y="751" font-family="Georgia, 'Times New Roman', serif" font-size="15" font-weight="bold" fill="#24211e" text-anchor="start">SessionEnd</text>
+<text x="60" y="769" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#6b645b" text-anchor="start">session closes</text>
+<text x="330" y="751" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook session-end</text>
+<text x="940" y="751" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="normal" fill="#6b645b" text-anchor="end">sync</text>
+<text x="330" y="771" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">Imports the final transcript, extraction, session story.</text>
+<text x="330" y="786" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#24211e" text-anchor="start">AI narrative via claude -p only as a fallback (CSR_NO_AI_NARRATIVES=1 disables).</text>
+
+</svg>

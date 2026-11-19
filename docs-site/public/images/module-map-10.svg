@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 656" width="1000" height="656" role="img" aria-labelledby="t d">
+<title id="t">csr-engine source modules</title><desc id="d">The 26 module folders under csr-engine/src, with a short role where the module documents one.</desc>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,1 L10,5 L0,9 z" fill="#c8442a"/></marker></defs>
+<rect width="1000" height="656" fill="#f5f2eb"/>
+<text x="40" y="48" font-family="Georgia, 'Times New Roman', serif" font-size="26" font-weight="normal" fill="#24211e" text-anchor="start">Project structure</text>
+<text x="40" y="72" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#6b645b" text-anchor="start">csr-engine/src has 26 module folders. Tests live in tests/; the crate is described by Cargo.toml.</text>
+<rect x="40" y="96" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="54" y="118" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">api/</text>
+<text x="54" y="136" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">Anthropic client, layer-3 narratives</text>
+<rect x="350" y="96" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="364" y="118" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">codemap/</text>
+<text x="364" y="136" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">live per-worktree code map</text>
+<rect x="660" y="96" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="674" y="127" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">companion/</text>
+<rect x="40" y="156" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="54" y="178" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">daemon/</text>
+<text x="54" y="196" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">background enrichment</text>
+<rect x="350" y="156" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="364" y="178" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">dream/</text>
+<text x="364" y="196" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">supersession verdicts</text>
+<rect x="660" y="156" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="674" y="178" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">embeddings/</text>
+<text x="674" y="196" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">FastEmbed, local</text>
+<rect x="40" y="216" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="54" y="238" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">episodes/</text>
+<text x="54" y="256" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">episodes + session cards</text>
+<rect x="350" y="216" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="364" y="238" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">eval/</text>
+<text x="364" y="256" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">evaluation framework</text>
+<rect x="660" y="216" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="674" y="238" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">extraction/</text>
+<text x="674" y="256" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">V3 event extraction</text>
+<rect x="40" y="276" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="54" y="307" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">format/</text>
+<rect x="350" y="276" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="364" y="298" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">governor/</text>
+<text x="364" y="316" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">injection budget loop</text>
+<rect x="660" y="276" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="674" y="298" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">health/</text>
+<text x="674" y="316" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">recall probe, duplicate rate</text>
+<rect x="40" y="336" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="54" y="358" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">hooks/</text>
+<text x="54" y="376" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">8 hook subcommands</text>
+<rect x="350" y="336" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="364" y="358" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">import/</text>
+<text x="364" y="376" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">JSONL parser</text>
+<rect x="660" y="336" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="674" y="358" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">index_gen/</text>
+<text x="674" y="376" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">USearch chunk-vector index</text>
+<rect x="40" y="396" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="54" y="418" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">injection/</text>
+<text x="54" y="436" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">context assembly</text>
+<rect x="350" y="396" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="364" y="418" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">journal/</text>
+<text x="364" y="436" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">live dream surface</text>
+<rect x="660" y="396" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="674" y="418" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">ledger/</text>
+<text x="674" y="436" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">derivation ledger</text>
+<rect x="40" y="456" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="54" y="478" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">mcp/</text>
+<text x="54" y="496" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">MCP server, 16 tools</text>
+<rect x="350" y="456" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="364" y="478" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">search/</text>
+<text x="364" y="496" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">hybrid search, decay, rerank</text>
+<rect x="660" y="456" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="674" y="478" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">status/</text>
+<text x="674" y="496" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">status and coverage</text>
+<rect x="40" y="516" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="54" y="538" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">storage/</text>
+<text x="54" y="556" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">SQLite</text>
+<rect x="350" y="516" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="364" y="547" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">story_map/</text>
+<rect x="660" y="516" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="674" y="538" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">telemetry/</text>
+<text x="674" y="556" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">hook timing ops view</text>
+<rect x="40" y="576" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="54" y="607" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">temporal/</text>
+<rect x="350" y="576" width="300" height="52" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="364" y="598" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13.5" font-weight="bold" fill="#c8442a" text-anchor="start">transcript/</text>
+<text x="364" y="616" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">structured transcript queries</text>
+
+</svg>

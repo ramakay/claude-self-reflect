@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 670" width="1200" height="670" role="img" aria-labelledby="t d">
+<title id="t">Three-Trace Sagas</title><desc id="d">Intent (what was asked), deliberation (how it was decided) and artifact (what got built). Similarity retrieves the echo; reinstatement walks back to the decision.</desc>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,1 L10,5 L0,9 z" fill="#ec7557"/></marker></defs>
+<rect width="1200" height="670" fill="#17140f"/>
+<rect x="30" y="30" width="1140" height="610" rx="2" fill="#211d18" stroke="#3a352d"/>
+<text x="80" y="98" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="bold" fill="#a79f92" text-anchor="start">04</text>
+<line x1="122" y1="92" x2="182" y2="92" stroke="#3a352d" stroke-width="1"/>
+<text x="80" y="178" font-family="Georgia, 'Times New Roman', serif" font-size="66" font-weight="bold" fill="#f3eee4" text-anchor="start">Three-Trace Sagas</text>
+<text x="80" y="222" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="22" font-weight="normal" fill="#a79f92" text-anchor="start">Every decision leaves three traces.</text>
+<rect x="80" y="262" width="312" height="278" rx="2" fill="#17140f" stroke="#3a352d" stroke-width="1"/>
+<text x="106" y="300" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#a79f92" text-anchor="start">Trace 1</text>
+<text x="106" y="344" font-family="Georgia, 'Times New Roman', serif" font-size="34" font-weight="bold" fill="#f3eee4" text-anchor="start">Intent</text>
+<text x="106" y="372" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" font-weight="normal" fill="#a79f92" text-anchor="start">what was asked</text>
+<line x1="106" y1="392" x2="366" y2="392" stroke="#3a352d" stroke-width="1"/>
+<polyline points="160,470 200,435 250,458 300,428 340,462" fill="none" stroke="#a79f92" stroke-width="1.5"/>
+<circle cx="160" cy="470" r="5" fill="#a79f92"/>
+<circle cx="200" cy="435" r="5" fill="#a79f92"/>
+<circle cx="250" cy="458" r="5" fill="#a79f92"/>
+<circle cx="300" cy="428" r="5" fill="#a79f92"/>
+<circle cx="340" cy="462" r="5" fill="#a79f92"/>
+<line x1="402" y1="401" x2="429" y2="401" stroke="#a79f92" stroke-width="1.5" marker-end="url(#ar)"/>
+<rect x="443" y="262" width="312" height="278" rx="2" fill="#17140f" stroke="#3a352d" stroke-width="1"/>
+<text x="469" y="300" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#a79f92" text-anchor="start">Trace 2</text>
+<text x="469" y="344" font-family="Georgia, 'Times New Roman', serif" font-size="34" font-weight="bold" fill="#f3eee4" text-anchor="start">Deliberation</text>
+<text x="469" y="372" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" font-weight="normal" fill="#d9806a" text-anchor="start">how it was decided</text>
+<line x1="469" y1="392" x2="729" y2="392" stroke="#3a352d" stroke-width="1"/>
+<polyline points="503,460 543,430 578,452 613,470 648,422 688,440 713,466" fill="none" stroke="#d9806a" stroke-width="1.5"/>
+<circle cx="503" cy="460" r="5" fill="#d9806a"/>
+<circle cx="543" cy="430" r="5" fill="#d9806a"/>
+<circle cx="578" cy="452" r="5" fill="#d9806a"/>
+<circle cx="613" cy="470" r="5" fill="#d9806a"/>
+<circle cx="648" cy="422" r="5" fill="#d9806a"/>
+<circle cx="688" cy="440" r="5" fill="#d9806a"/>
+<circle cx="713" cy="466" r="5" fill="#d9806a"/>
+<line x1="765" y1="401" x2="792" y2="401" stroke="#a79f92" stroke-width="1.5" marker-end="url(#ar)"/>
+<rect x="806" y="262" width="312" height="278" rx="2" fill="#17140f" stroke="#3a352d" stroke-width="1"/>
+<text x="832" y="300" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#a79f92" text-anchor="start">Trace 3</text>
+<text x="832" y="344" font-family="Georgia, 'Times New Roman', serif" font-size="34" font-weight="bold" fill="#f3eee4" text-anchor="start">Artifact</text>
+<text x="832" y="372" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" font-weight="normal" fill="#ec7557" text-anchor="start">what got built</text>
+<line x1="832" y1="392" x2="1092" y2="392" stroke="#3a352d" stroke-width="1"/>
+<polyline points="856,455 896,428 931,462 971,444 1011,422 1046,454 1081,440 1098,472" fill="none" stroke="#ec7557" stroke-width="1.5"/>
+<circle cx="856" cy="455" r="5" fill="#ec7557"/>
+<circle cx="896" cy="428" r="5" fill="#ec7557"/>
+<circle cx="931" cy="462" r="5" fill="#ec7557"/>
+<circle cx="971" cy="444" r="5" fill="#ec7557"/>
+<circle cx="1011" cy="422" r="5" fill="#ec7557"/>
+<circle cx="1046" cy="454" r="5" fill="#ec7557"/>
+<circle cx="1081" cy="440" r="5" fill="#ec7557"/>
+<circle cx="1098" cy="472" r="5" fill="#ec7557"/>
+<rect x="80" y="560" width="1040" height="56" rx="2" fill="#17140f" stroke="#3a352d" stroke-width="1"/>
+<text x="600" y="595" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="normal" fill="#f3eee4" text-anchor="middle">Similarity retrieves the echo. Reinstatement walks back to the decision.</text>
+
+</svg>

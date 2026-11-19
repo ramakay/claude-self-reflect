@@ -2,7 +2,7 @@
 title: Project Structure
 ---
 
-![csr-engine project structure — src/ modules for mcp, hooks, search, storage, import, embeddings, extraction, injection, format, temporal, daemon, eval, and api alongside tests/ and Cargo.toml](/claude-self-reflect/images/project-structure-2.png)
+![csr-engine source modules: the 26 module folders under csr-engine/src](/claude-self-reflect/images/module-map-10.svg)
 
 ## Key Patterns
 

@@ -87,8 +87,8 @@ Higher quality context. Better decisions. Fewer tokens.
 
 <a href="docs/plans/annaswamy-2026-similarity-drowns-intent.pdf">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-04-paper-dark.png" />
-  <img align="right" src="docs-site/public/images/card-04-paper-light.png" alt="Three-Trace Sagas — intent, deliberation, artifact" width="420" />
+  <source media="(prefers-color-scheme: dark)" srcset="docs-site/public/images/card-04-paper-dark.svg" />
+  <img align="right" src="docs-site/public/images/card-04-paper-light.svg" alt="Three-Trace Sagas — intent, deliberation, artifact" width="420" />
 </picture>
 </a>
 
@@ -432,7 +432,7 @@ Two numbers in this README have no recount command here because they need a buil
 <details>
 <summary><strong>MCP Tools</strong> — 16 annotated tools available to Claude</summary>
 
-All tools include [MCP tool annotations](https://spec.modelcontextprotocol.io/specification/2025-11-05/server/tools/#annotations) so Claude Code understands their safety characteristics.
+All tools include [MCP tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) so Claude Code understands their safety characteristics.
 
 | Tool | Description | Safety |
 |------|-------------|--------|
