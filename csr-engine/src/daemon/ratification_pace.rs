@@ -194,14 +194,42 @@ mod tests {
             .unwrap();
     }
 
-    /// The burst a clean install made: with a backlog waiting, the loop asks every 20 s. Paced,
-    /// the first hour makes `PER_HOUR` calls and then nothing until an hour has passed.
+    /// An imported, unratified conversation whose newest chunk was written at `at`.
+    fn imported(storage: &Storage, id: &str, at: DateTime<Utc>) {
+        let chunk = crate::import::ConversationChunk {
+            id: format!("{id}-0"),
+            conversation_id: id.into(),
+            project_name: "project".into(),
+            timestamp: stamp(at),
+            content: "work".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.1; 4]).unwrap();
+        storage
+            .upsert_import_state_explicit(&format!("/p/{id}.jsonl"), id, 1, "x")
+            .unwrap();
+    }
+
+    /// The burst a clean install made: forty conversations waiting, the loop asking every 20 s.
+    /// Paced, the first hour makes `PER_HOUR` calls and then nothing until an hour has passed,
+    /// and a conversation older than the window is never handed out.
     #[test]
     fn a_fresh_install_with_a_backlog_makes_at_most_the_hours_budget_of_calls() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("csr-engine.db")).unwrap();
         let pace = Pace::from_values(None, None);
         let now = Utc::now();
+        for n in 0..40 {
+            imported(
+                &storage,
+                &format!("conv-{n:02}"),
+                now - Duration::minutes(n),
+            );
+        }
         // Other callers' rows do not spend ratification's budget.
         storage
             .with_connection(|c| {
@@ -212,25 +240,43 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(calls_since(&storage, now - Duration::hours(1)).unwrap(), 0);
-        // 45 loop passes, one every 20 s: fifteen minutes of the old burst.
-        let mut made = 0;
+        // 45 loop passes, one every 20 s: fifteen minutes of the old burst. Each conversation the
+        // pass hands out is called on (and ratified), as the daemon loop does.
+        let mut made = vec![];
         for _ in 0..45 {
-            let used = calls_since(&storage, now - Duration::hours(1)).unwrap();
-            if may_call(pace, used, Some(now), now) {
+            for (conv, _) in next_due_at(&storage, pace, now).unwrap() {
                 call(&storage);
-                made += 1;
+                storage
+                    .mark_enrichment_completed(&conv, "ratification", &conv)
+                    .unwrap();
+                made.push(conv);
             }
         }
-        assert_eq!(made, PER_HOUR);
-        // With nothing unratified the pass asks for nothing, and a spent hour asks for nothing.
-        assert!(next_due_at(&storage, pace, now).unwrap().is_empty());
-        // An hour on, the calls have aged out of the window and the budget is back.
+        assert_eq!(made, ["conv-00", "conv-01", "conv-02", "conv-03"]);
+        assert_eq!(made.len(), PER_HOUR);
+        // An hour on, the calls have aged out of the window and the next one is due.
         let later = now + Duration::minutes(61);
         assert_eq!(
             calls_since(&storage, later - Duration::hours(1)).unwrap(),
             0
         );
-        assert!(may_call(pace, 0, Some(now), later));
+        assert_eq!(next_due_at(&storage, pace, later).unwrap()[0].0, "conv-04");
+    }
+
+    #[test]
+    fn a_conversation_older_than_the_window_waits_for_a_manual_ratify() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("csr-engine.db")).unwrap();
+        let now = Utc::now();
+        imported(&storage, "old", now - Duration::days(8));
+        let pace = Pace::from_values(None, None);
+        assert!(next_due_at(&storage, pace, now).unwrap().is_empty());
+        let all = Pace {
+            recent_days: 0,
+            ..pace
+        };
+        assert_eq!(next_due_at(&storage, all, now).unwrap()[0].0, "old");
+        let none = Pace { per_hour: 0, ..all };
+        assert!(next_due_at(&storage, none, now).unwrap().is_empty());
     }
 }
