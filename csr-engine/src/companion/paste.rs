@@ -32,6 +32,12 @@ fn unspaced_run(token: &str) -> bool {
     UNSPACED.find_iter(token).count() * 2 > token.chars().count()
 }
 
+/// True when `token` reads as a file path: two or more `/`, every part between them short. A
+/// base64 blob holds a `/` now and then, but with long runs between.
+fn file_path(token: &str) -> bool {
+    token.matches('/').count() >= 2 && token.split('/').all(|part| part.chars().count() <= 30)
+}
+
 /// True when `text` reads as pasted data, not as something a person asked.
 pub fn is_paste(text: &str) -> bool {
     let text = text.trim();
@@ -62,12 +68,14 @@ pub fn is_paste(text: &str) -> bool {
     if pairs >= 3 && pairs * 2 >= count {
         return true;
     }
-    // Long tokens without spaces (hashes, base64, minified code) make up most of it. A link is
-    // something people type around their question, and a Japanese, Chinese or Thai sentence is
-    // one token because those scripts put no spaces between words.
+    // Long tokens without spaces (hashes, base64, minified code) make up most of it. A link or a
+    // file path is something people type around their question, and a Japanese, Chinese or Thai
+    // sentence is one token because those scripts put no spaces between words.
     let long: usize = tokens
         .iter()
-        .filter(|t| t.chars().count() > 40 && !t.contains("://") && !unspaced_run(t))
+        .filter(|t| {
+            t.chars().count() > 40 && !t.contains("://") && !file_path(t) && !unspaced_run(t)
+        })
         .map(|t| t.len())
         .sum();
     if long * 2 > text.len() {
@@ -120,6 +128,27 @@ mod tests {
             "rename the field to snake_case and update the three callers",
         ] {
             assert!(!is_paste(asked), "{asked}");
+        }
+    }
+
+    /// A short question around one long absolute path read as a blob, so every card that skips
+    /// pastes dropped it, and a stored story lost a first sentence that listed its files.
+    #[test]
+    fn a_prompt_around_a_file_path_is_not_a_paste() {
+        for asked in [
+            "fix the padding in /Users/rama/projects/app/src/components/Header.tsx",
+            "Modified /Users/x/projects/claude-self-reflect/csr-engine/src/companion/recall.rs, \
+             /Users/x/projects/claude-self-reflect/csr-engine/src/companion/pages.rs.",
+        ] {
+            assert!(!is_paste(asked), "{asked}");
+        }
+        // A blob with a slash or two in it is still a blob.
+        for paste in [
+            "sha512-3b96d46672ac15dc9fbc62ac7ec4d12431706e8dc5e294ac31abf7ce0ca57f7c/Zm9vYmFyYmF6\
+             cXV4eHl6enl4d3Z1dHNycXBvbm1sa2pp/aGdmZWRjYmE",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9/eyJzdWIiOiIxMjM0NTY3ODkwIn0/dozjgNryP4J3jVmNHl0w5N",
+        ] {
+            assert!(is_paste(paste), "{paste}");
         }
     }
 
