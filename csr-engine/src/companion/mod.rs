@@ -38,6 +38,7 @@ pub mod note;
 pub mod pages;
 pub mod pane;
 mod pane_keys;
+pub mod paste;
 pub mod paths;
 pub mod phone;
 pub mod png;
