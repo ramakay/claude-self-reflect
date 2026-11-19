@@ -116,16 +116,24 @@ fn exe_if_engine(exe: std::path::PathBuf) -> Option<std::path::PathBuf> {
 
 /// True when `exe` is a cargo test or bench harness. Two layouts exist: the
 /// classic `target/<profile>/deps/<bin>` and the newer build-dir layout's
-/// `<profile>/build/<pkg>/<hash>/out/<bin>` (what cargo 1.100 writes). An installed
-/// `csr-engine` lives in neither.
+/// `<profile>/build/<pkg>/<hash>/out/<bin>` (what cargo 1.100 writes). Cargo names a
+/// harness `<crate>-<hex hash>`; an installed `csr-engine` has no hash, so a folder
+/// that happens to be called `deps` or `.../build/x/y/out` never makes it a harness.
 pub(crate) fn is_cargo_harness_exe(exe: &std::path::Path) -> bool {
     let Some(dir) = exe.parent() else {
         return false;
     };
+    let hashed = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.rsplit_once('-'))
+        .is_some_and(|(_, h)| h.len() >= 4 && h.bytes().all(|b| b.is_ascii_hexdigit()));
     let named = |p: Option<&std::path::Path>, want: &str| {
         p.and_then(|p| p.file_name()).is_some_and(|n| n == want)
     };
-    named(Some(dir), "deps") || (named(Some(dir), "out") && named(dir.ancestors().nth(3), "build"))
+    hashed
+        && (named(Some(dir), "deps")
+            || (named(Some(dir), "out") && named(dir.ancestors().nth(3), "build")))
 }
 
 pub(crate) trait CommandDeadline {
@@ -405,6 +413,9 @@ mod detached_child_exe_tests {
             "/w/csr-engine/target/release/csr-engine",
             // The bin cargo builds sits at the top of the profile dir, not under build/.
             "/w/csr-engine/target/debug/csr-engine",
+            // Installed under folders that look like cargo's: no hash, so not a harness.
+            "/opt/build/acme/prod/out/csr-engine",
+            "/srv/tools/deps/csr-engine",
         ] {
             assert_eq!(
                 exe_if_engine(PathBuf::from(path)),

@@ -368,10 +368,15 @@ thread_local! {
 /// contamination canary builds its checked-in fixture rows this way, so the same bytes come out
 /// in every time zone: the shipped health check compares them with the stored rows.
 pub fn with_utc_dates<T>(f: impl FnOnce() -> T) -> T {
-    let before = UTC_DATES.with(|cell| cell.replace(true));
-    let out = f();
-    UTC_DATES.with(|cell| cell.set(before));
-    out
+    // Restore on unwind too, so a panicking formatter cannot leave this thread on UTC.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UTC_DATES.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(UTC_DATES.with(|cell| cell.replace(true)));
+    f()
 }
 
 pub fn quoted(text: &str, width: usize) -> String {
