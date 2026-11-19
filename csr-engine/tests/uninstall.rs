@@ -1,7 +1,8 @@
 //! `csr-engine uninstall` runs the real binary against a scratch HOME with shims for `claude`,
-//! `codex` and `launchctl` first (and only) on PATH. The real home, the real Claude config, the
-//! real Codex config and the real launch agent are never reachable from here. The shims use shell
-//! builtins only, because nothing else is on PATH.
+//! `codex`, `launchctl`, `npm` and `ps` first (and only) on PATH. The real home, the real Claude
+//! config, the real Codex config, the real launch agent, the real npm and the real process table
+//! are never reachable from here. The shims use shell builtins only, because nothing else is on
+//! PATH.
 #![cfg(unix)]
 
 #[path = "support/temp_home.rs"]
@@ -23,15 +24,21 @@ const CSR_MCP: &str = r#"{"type":"stdio","command":"/opt/csr/csr-engine","args":
 /// nothing (the CLI "left it"), `removes` (a good CLI), `corrupt` (leaves unparseable text) or
 /// `bump` (Claude Code rewrote the file meanwhile and the entry is still there).
 /// `PLUGIN_STICKS` makes the plugin survive `plugin uninstall`; `MARKET_STICKS` keeps the
-/// marketplace listed.
+/// marketplace listed. `mcp remove ... -s local` logs the folder it ran in and, when
+/// `LOCAL_AFTER_JSON` is set, writes that text to `~/.claude.json` (a CLI that removed the entry).
 const CLAUDE_SHIM: &str = r#"echo "claude $*" >> "$CALLS"
 case "$1 $2" in
 "mcp remove")
+  if [ "$5" = local ]; then
+    echo "local-remove cwd=$PWD" >> "$CALLS"
+    if [ -n "$LOCAL_AFTER_JSON" ]; then printf '%s\n' "$LOCAL_AFTER_JSON" > "$HOME/.claude.json"; fi
+  else
   case "$CLAUDE_MODE" in
     removes) echo '{"numStartups":3,"mcpServers":{"other":{"type":"stdio","command":"/usr/bin/other","args":[]}}}' > "$HOME/.claude.json";;
     corrupt) echo '{ not json' > "$HOME/.claude.json";;
     bump) echo '{"numStartups":99,"newKey":true,"mcpServers":{"claude-self-reflect":{"type":"stdio","command":"/opt/csr/csr-engine","args":[]},"other":{"type":"stdio","command":"/usr/bin/other","args":[]}}}' > "$HOME/.claude.json";;
-  esac;;
+  esac
+  fi;;
 "plugin uninstall") if [ -n "$PLUGIN_STICKS" ]; then echo "Error: busy" >&2; exit 1; fi;;
 "plugin list") if [ -n "$PLUGIN_STICKS" ]; then echo '[{"id":"csr-companion@claude-self-reflect"}]'; fi;;
 "plugin marketplace") if [ "$3" = list ] && [ -n "$MARKET_STICKS" ]; then echo "claude-self-reflect"; fi;;
@@ -77,6 +84,26 @@ case "$1 $2" in
 esac
 exit 0"#;
 
+/// `npm`: `ls -g` lists claude-self-reflect at `$NPM_VERSION` (nothing when unset or after an
+/// `uninstall`) and, like npm, exits 1 when it is absent; `NPM_STICKS` makes `uninstall` do nothing.
+const NPM_SHIM: &str = r#"echo "npm $*" >> "$CALLS"
+case "$1" in
+ls)
+  if [ -n "$NPM_VERSION" ] && [ ! -f "$STATE/npm_removed" ]; then
+    echo "{\"name\":\"lib\",\"dependencies\":{\"claude-self-reflect\":{\"version\":\"$NPM_VERSION\"}}}"
+  else
+    echo '{}'; exit 1
+  fi;;
+uninstall)
+  if [ -z "$NPM_STICKS" ]; then : > "$STATE/npm_removed"; fi;;
+esac
+exit 0"#;
+
+/// `ps`: prints `$FAKE_PS` (lines of `pid ppid args`); logs the call.
+const PS_SHIM: &str = r#"echo "ps $*" >> "$CALLS"
+if [ -n "$FAKE_PS" ]; then printf '%s\n' "$FAKE_PS"; fi
+exit 0"#;
+
 struct Scratch {
     _root: tempfile::TempDir,
     root: PathBuf,
@@ -86,8 +113,12 @@ struct Scratch {
 }
 
 fn plist(label: &str, marked: bool) -> String {
+    plist_running(label, marked, "/opt/csr/csr-engine")
+}
+
+fn plist_running(label: &str, marked: bool, program: &str) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n{}\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{label}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>/opt/csr/csr-engine</string>\n    <string>daemon</string>\n  </array>\n</dict>\n</plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n{}\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{label}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{program}</string>\n    <string>daemon</string>\n  </array>\n</dict>\n</plist>\n",
         if marked { MARKER } else { "" }
     )
 }
@@ -148,6 +179,8 @@ impl Scratch {
         shim(&bin.join("claude"), CLAUDE_SHIM);
         shim(&bin.join("launchctl"), LAUNCHCTL_SHIM);
         shim(&bin.join("codex"), CODEX_SHIM);
+        shim(&bin.join("npm"), NPM_SHIM);
+        shim(&bin.join("ps"), PS_SHIM);
         write(
             &home.join(".claude/settings.json"),
             &serde_json::to_string_pretty(&settings_json()).unwrap(),
@@ -268,11 +301,28 @@ fn stdout(out: &Output) -> String {
 fn a_plan_changes_nothing_and_names_every_artifact() {
     let s = Scratch::new();
     let before = s.snapshot();
-    for args in [&["--dry-run"][..], &["--dry-run", "--yes"][..], &[][..]] {
+    for args in [
+        &["--dry-run"][..],
+        &["--dry-run", "--yes"][..],
+        &[][..],
+        &["--dry-run", "--purge"][..],
+    ] {
         let out = s.run(args);
         assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stdout(&out));
         assert_eq!(s.snapshot(), before, "{args:?} changed the scratch home");
-        assert_eq!(s.calls(), "", "{args:?} ran a command");
+        // A plan runs read-only probes (npm ls, ps) and nothing that changes anything.
+        let mutating: Vec<String> = s
+            .calls()
+            .lines()
+            .filter(|l| !l.starts_with("npm ls ") && !l.starts_with("ps "))
+            .map(str::to_owned)
+            .collect();
+        assert!(mutating.is_empty(), "{args:?} ran {mutating:?}");
+        let data_want = if args.contains(&"--purge") {
+            "data: would delete"
+        } else {
+            "--purge deletes it"
+        };
         let text = stdout(&out);
         let n = csr_hooks_in_fixture();
         assert!(n >= 8, "the fixture holds CSR hooks: {n}");
@@ -284,7 +334,7 @@ fn a_plan_changes_nothing_and_names_every_artifact() {
             "would run `claude plugin marketplace remove claude-self-reflect`".to_string(),
             format!("would stop {LABEL}"),
             "com.example.mine.plist was not written by setup; left in place".to_string(),
-            "would delete".to_string(),
+            data_want.to_string(),
             "transcript mirror".to_string(),
         ] {
             assert!(text.contains(&want), "{args:?} lacks {want:?} in:\n{text}");
@@ -384,9 +434,9 @@ fn yes_and_purge_mirror_leave_no_csr_artifact_and_keep_everything_else() {
 }
 
 #[test]
-fn the_mirror_stays_without_purge_and_its_path_is_printed() {
+fn the_mirror_stays_with_purge_and_its_path_is_printed() {
     let s = Scratch::new();
-    let out = s.run(&["--yes"]);
+    let out = s.run(&["--yes", "--purge"]);
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
     let data = s.data();
     assert!(data.join("mirror/transcripts/a.zst").exists());
@@ -397,33 +447,79 @@ fn the_mirror_stays_without_purge_and_its_path_is_printed() {
 }
 
 #[test]
-fn keep_data_removes_the_integrations_and_nothing_in_the_data_folder() {
+fn by_default_and_with_the_old_keep_data_flag_the_data_folder_is_kept_whole() {
+    // `--keep-data` is a hidden no-op now: it must give exactly what no flag gives.
+    for args in [&["--yes"][..], &["--yes", "--keep-data"][..]] {
+        let s = Scratch::new();
+        let data_before: Vec<_> = s
+            .snapshot()
+            .into_iter()
+            .filter(|(p, _)| p.starts_with(s.data()))
+            .collect();
+        let out = s.run(args);
+        let text = stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {text}");
+        let data_after: Vec<_> = s
+            .snapshot()
+            .into_iter()
+            .filter(|(p, _)| p.starts_with(s.data()))
+            .collect();
+        assert_eq!(data_before, data_after, "{args:?}");
+        assert!(!s.plist().exists(), "{args:?}: the integrations still go");
+        assert!(
+            text.contains(&format!("data: {} (", s.data().display()))
+                && text.contains("MiB): kept; --purge deletes it"),
+            "{args:?}: the data path, its size and the way to delete it are printed: {text}"
+        );
+        assert!(
+            text.contains(&format!("kept at {}", s.data().join("mirror").display())),
+            "{args:?}: the mirror path and size are printed: {text}"
+        );
+    }
+}
+
+#[test]
+fn purge_deletes_the_data_except_the_mirror_and_purge_mirror_implies_purge() {
     let s = Scratch::new();
-    let data_before: Vec<_> = s
-        .snapshot()
-        .into_iter()
-        .filter(|(p, _)| p.starts_with(s.data()))
-        .collect();
-    let out = s.run(&["--yes", "--keep-data"]);
+    let out = s.run(&["--yes", "--purge"]);
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
-    let data_after: Vec<_> = s
-        .snapshot()
-        .into_iter()
-        .filter(|(p, _)| p.starts_with(s.data()))
-        .collect();
-    assert_eq!(data_before, data_after);
-    assert!(!s.plist().exists());
+    assert!(!s.data().join("csr-engine.db").exists());
+    assert!(!s.data().join(".env").exists());
+    assert!(s.data().join("mirror/transcripts/a.zst").exists());
+    // `--purge-mirror` alone is a purge that also takes the mirror.
+    let s = Scratch::new();
+    let out = s.run(&["--yes", "--purge-mirror"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(!s.data().exists(), "{}", stdout(&out));
+}
+
+#[test]
+fn the_old_keep_data_flag_still_parses_and_never_beats_a_purge() {
+    let s = Scratch::new();
+    let before = s.snapshot();
+    for conflicting in [&["--purge"][..], &["--purge-mirror"][..]] {
+        let mut args = vec!["--yes", "--keep-data"];
+        args.extend_from_slice(conflicting);
+        let out = s.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stdout(&out));
+        assert_eq!(s.snapshot(), before, "{args:?} changed the scratch home");
+    }
+    let help = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        .args(["uninstall", "--help"])
+        .output()
+        .unwrap();
+    let help = stdout(&help);
     assert!(
-        stdout(&out).contains(&format!("kept at {}", s.data().join("mirror").display())),
-        "the mirror path and size are printed with --keep-data too: {}",
-        stdout(&out)
+        help.contains("--purge") && help.contains("--purge-mirror"),
+        "{help}"
     );
+    assert!(!help.contains("--keep-data"), "hidden from --help: {help}");
 }
 
 #[test]
 fn a_job_with_no_loaded_instance_is_not_stopped_and_the_files_go() {
     let s = Scratch::new();
-    let out = s.run_env(&["--yes"], &[("FAKE_LOADED", "")]);
+    let out = s.run_env(&["--yes", "--purge"], &[("FAKE_LOADED", "")]);
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
     assert!(!s.calls().contains("bootout"), "{}", s.calls());
     assert!(!s.plist().exists());
@@ -433,7 +529,10 @@ fn a_job_with_no_loaded_instance_is_not_stopped_and_the_files_go() {
 #[test]
 fn a_job_loaded_from_another_file_is_not_stopped_and_the_data_stays() {
     let s = Scratch::new();
-    let out = s.run_env(&["--yes"], &[("FAKE_LOADED", "/elsewhere/other.plist")]);
+    let out = s.run_env(
+        &["--yes", "--purge"],
+        &[("FAKE_LOADED", "/elsewhere/other.plist")],
+    );
     assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
     assert!(!s.calls().contains("bootout"), "{}", s.calls());
     assert!(!s.plist().exists(), "the file setup wrote is still removed");
@@ -476,7 +575,7 @@ fn a_launchd_that_cannot_be_asked_is_not_read_as_not_running() {
     let s = Scratch::new();
     let loaded = s.plist();
     let out = s.run_env(
-        &["--yes"],
+        &["--yes", "--purge"],
         &[
             ("FAKE_LOADED", loaded.to_str().unwrap()),
             ("PRINT_FAIL", "1"),
@@ -664,7 +763,7 @@ fn a_plugin_that_is_still_installed_is_reported_and_exits_nonzero() {
 fn a_second_run_does_not_delete_data_under_a_daemon_the_first_run_could_not_stop() {
     let s = Scratch::new();
     let elsewhere = [("FAKE_LOADED", "/elsewhere/other.plist")];
-    let first = s.run_env(&["--yes"], &elsewhere);
+    let first = s.run_env(&["--yes", "--purge"], &elsewhere);
     assert_eq!(first.status.code(), Some(1), "{}", stdout(&first));
     assert!(!s.plist().exists());
     // The plist is gone now, so a second run has no file to find the daemon by.
@@ -683,7 +782,10 @@ fn a_second_run_does_not_delete_data_under_a_daemon_the_first_run_could_not_stop
 fn a_running_job_with_no_plist_on_disk_keeps_the_data() {
     let s = Scratch::new();
     std::fs::remove_file(s.plist()).unwrap();
-    let out = s.run_env(&["--yes"], &[("FAKE_LOADED", "/elsewhere/other.plist")]);
+    let out = s.run_env(
+        &["--yes", "--purge"],
+        &[("FAKE_LOADED", "/elsewhere/other.plist")],
+    );
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(1), "{text}");
     assert!(s.data().join("csr-engine.db").exists(), "{text}");
@@ -695,7 +797,10 @@ fn a_running_job_behind_a_plist_setup_did_not_write_keeps_the_data() {
     let s = Scratch::new();
     write(&s.plist(), &plist(LABEL, false));
     let loaded = s.plist();
-    let out = s.run_env(&["--yes"], &[("FAKE_LOADED", loaded.to_str().unwrap())]);
+    let out = s.run_env(
+        &["--yes", "--purge"],
+        &[("FAKE_LOADED", loaded.to_str().unwrap())],
+    );
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(1), "{text}");
     assert!(s.plist().exists(), "a plist that is not ours stays: {text}");
@@ -825,7 +930,7 @@ fn a_link_inside_the_data_folder_loses_the_link_and_never_the_target() {
 }
 
 #[test]
-fn the_model_cache_is_planned_with_its_size_and_goes_even_with_keep_data() {
+fn the_model_cache_is_planned_with_its_size_and_goes_without_purge() {
     let s = Scratch::new();
     let cache = temp_home::model_cache(&s.home);
     write(
@@ -841,12 +946,12 @@ fn the_model_cache_is_planned_with_its_size_and_goes_even_with_keep_data() {
         "{plan}"
     );
     assert!(cache.exists(), "a plan deletes nothing");
-    let out = s.run(&["--yes", "--keep-data"]);
+    let out = s.run(&["--yes"]);
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
     assert!(!cache.exists(), "{}", stdout(&out));
     assert!(
         s.data().join("csr-engine.db").exists(),
-        "--keep-data kept the data"
+        "without --purge the data is kept"
     );
     assert!(stdout(&out).contains(&format!("model cache: deleted {}", cache.display())));
 }
@@ -892,4 +997,393 @@ fn a_binary_in_local_bin_is_deleted_last_and_any_other_gets_its_rm_line() {
         .rfind(|l| l.trim_start().starts_with(|c: char| c.is_ascii_lowercase()) && l.contains(": "))
         .unwrap_or_default();
     assert!(last_step.contains("binary: deleted"), "{text}");
+}
+
+/// A binary stand-in: any file will do, nothing here runs it.
+fn fake_binary(path: &Path) {
+    write(path, "#!/bin/sh\n");
+}
+
+#[test]
+fn every_binary_the_install_registered_is_found_not_only_the_one_running() {
+    let s = Scratch::new();
+    let built = Path::new(env!("CARGO_BIN_EXE_csr-engine"));
+    let local = s.home.join(".local/bin/csr-engine");
+    let via_mcp = s.root.join("npm-lib/csr-engine");
+    let via_codex = s.root.join("codex-bin/csr-engine");
+    let via_plist = s.root.join("agent-bin/csr-engine");
+    let gone = s.root.join("gone/csr-engine");
+    for p in [&local, &via_mcp, &via_codex, &via_plist] {
+        fake_binary(p);
+    }
+    // Hooks name the `~/.local/bin` copy (twice over, the dedupe is part of the test) and a
+    // copy that no longer exists; the MCP entry, Codex and the launch agent each name another.
+    let mut hooks =
+        csr_engine::hooks::install::generate_hook_config_for_test(local.to_str().unwrap());
+    let extra = json!({"type": "command", "command": format!("{} hook stop", gone.display())});
+    hooks["hooks"]["Stop"][0]["hooks"]
+        .as_array_mut()
+        .unwrap()
+        .push(extra);
+    write(
+        &s.home.join(".claude/settings.json"),
+        &serde_json::to_string_pretty(&hooks).unwrap(),
+    );
+    let mcp = format!(
+        r#"{{"type":"stdio","command":"{}","args":[]}}"#,
+        via_mcp.display()
+    );
+    write(
+        &s.home.join(".claude.json"),
+        &claude_json(&[("claude-self-reflect", &mcp), ("other", OTHER_MCP)]),
+    );
+    write(
+        &s.home.join(".codex/config.toml"),
+        &format!(
+            "[mcp_servers.claude-self-reflect]\ncommand = \"{}\"\n",
+            via_codex.display()
+        ),
+    );
+    write(
+        &s.plist(),
+        &plist_running(LABEL, true, via_plist.to_str().unwrap()),
+    );
+
+    let before = s.snapshot();
+    let plan = stdout(&s.run(&["--dry-run"]));
+    assert_eq!(s.snapshot(), before, "a plan changed the scratch home");
+    assert!(
+        plan.contains(&format!("binary: would delete {} last", local.display())),
+        "{plan}"
+    );
+    for other in [built, &via_mcp, &via_codex, &via_plist] {
+        let line = format!("rm \"{}\"", other.display());
+        assert_eq!(plan.matches(&line).count(), 1, "{line} once in:\n{plan}");
+    }
+    assert!(!plan.contains(&gone.display().to_string()), "{plan}");
+
+    let loaded = s.plist();
+    let out = s.run_env(&["--yes"], &[("FAKE_LOADED", loaded.to_str().unwrap())]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        !local.exists(),
+        "the registered copy in ~/.local/bin goes: {text}"
+    );
+    assert!(
+        text.contains(&format!("binary: deleted {}", local.display())),
+        "{text}"
+    );
+    for kept in [built, &via_mcp, &via_codex, &via_plist] {
+        assert!(kept.exists(), "{} is not ours to delete", kept.display());
+    }
+
+    // A daemon launchd still runs: the registered copy stays.
+    let s = Scratch::new();
+    fake_binary(&s.home.join(".local/bin/csr-engine"));
+    write(
+        &s.home.join(".claude/settings.json"),
+        &serde_json::to_string_pretty(&csr_engine::hooks::install::generate_hook_config_for_test(
+            s.home.join(".local/bin/csr-engine").to_str().unwrap(),
+        ))
+        .unwrap(),
+    );
+    let out = s.run_env(&["--yes"], &[("FAKE_LOADED", "/elsewhere/other.plist")]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(s.home.join(".local/bin/csr-engine").exists(), "{text}");
+    assert!(text.contains("binary: kept"), "{text}");
+}
+
+#[test]
+fn the_npm_global_package_is_planned_removed_and_checked() {
+    let cmd = "npm uninstall -g claude-self-reflect";
+    let s = Scratch::new();
+    let before = s.snapshot();
+    let plan = stdout(&s.run_env(&["--dry-run"], &[("NPM_VERSION", "9.5.8")]));
+    assert_eq!(s.snapshot(), before);
+    assert!(
+        plan.contains(&format!(
+            "npm: would run `{cmd}` (claude-self-reflect@9.5.8"
+        )),
+        "{plan}"
+    );
+    assert!(s
+        .calls()
+        .contains("npm ls -g claude-self-reflect --json --depth=0"));
+    assert!(
+        !s.calls().contains(cmd),
+        "a plan removes nothing: {}",
+        s.calls()
+    );
+
+    let out = s.run_env(
+        &["--yes"],
+        &[
+            ("NPM_VERSION", "9.5.8"),
+            ("FAKE_LOADED", s.plist().to_str().unwrap()),
+        ],
+    );
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(s.calls().contains(cmd), "{}", s.calls());
+    assert!(
+        text.contains("npm: removed claude-self-reflect@9.5.8"),
+        "{text}"
+    );
+
+    // npm that does not remove it: reported, exit 1.
+    let s = Scratch::new();
+    let out = s.run_env(
+        &["--yes"],
+        &[
+            ("NPM_VERSION", "9.5.8"),
+            ("NPM_STICKS", "1"),
+            ("FAKE_LOADED", s.plist().to_str().unwrap()),
+        ],
+    );
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("did not remove claude-self-reflect@9.5.8"),
+        "{text}"
+    );
+
+    // A daemon that may still run keeps the package.
+    let s = Scratch::new();
+    let out = s.run_env(
+        &["--yes"],
+        &[
+            ("NPM_VERSION", "9.5.8"),
+            ("FAKE_LOADED", "/elsewhere/other.plist"),
+        ],
+    );
+    let text = stdout(&out);
+    assert!(!s.calls().contains(cmd), "{}", s.calls());
+    assert!(
+        text.contains("npm: kept claude-self-reflect@9.5.8"),
+        "{text}"
+    );
+
+    // Not installed through npm, or no npm at all: no npm line, no failure.
+    let s = Scratch::new();
+    let text = stdout(&s.run_env(&["--dry-run"], &[]));
+    assert!(!text.contains("npm:"), "{text}");
+    std::fs::remove_file(s.bin.join("npm")).unwrap();
+    let out = s.run_env(&["--yes"], &[("FAKE_LOADED", s.plist().to_str().unwrap())]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(!stdout(&out).contains("npm:"), "{}", stdout(&out));
+}
+
+#[test]
+fn the_plugin_cache_goes_after_the_plugin_and_only_that_marketplace_folder() {
+    let s = Scratch::new();
+    let cache = s.home.join(".claude/plugins/cache/claude-self-reflect");
+    let other = s.home.join(".claude/plugins/cache/someone-elses");
+    write(&cache.join("csr-companion/10.1.0/plugin.json"), "{}");
+    write(&other.join("p/1.0.0/plugin.json"), "{}");
+    let before = s.snapshot();
+    let plan = stdout(&s.run(&["--dry-run"]));
+    assert_eq!(s.snapshot(), before);
+    assert!(
+        plan.contains(&format!("plugin cache: would delete {}", cache.display())),
+        "{plan}"
+    );
+    let out = s.run(&["--yes"]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!cache.exists(), "{text}");
+    assert!(other.join("p/1.0.0/plugin.json").exists());
+    assert!(
+        text.contains(&format!("plugin cache: removed {}", cache.display())),
+        "{text}"
+    );
+
+    // The plugin is still installed: its cache stays and the run fails.
+    let s = Scratch::new();
+    write(
+        &s.home
+            .join(".claude/plugins/cache/claude-self-reflect/csr-companion/x"),
+        "{}",
+    );
+    let out = s.run_env(
+        &["--yes"],
+        &[
+            ("PLUGIN_STICKS", "1"),
+            ("FAKE_LOADED", s.plist().to_str().unwrap()),
+        ],
+    );
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        s.home
+            .join(".claude/plugins/cache/claude-self-reflect/csr-companion/x")
+            .exists(),
+        "{text}"
+    );
+    assert!(text.contains("plugin cache: kept"), "{text}");
+}
+
+/// A `~/.claude.json` with a project-scoped `claude-self-reflect` entry from an old install, a
+/// second server and a setting in the same project, another project that must not change, and
+/// (when `with_user`) the user-scope entry too.
+fn config_with_local_entry(dir: &Path, with_user: bool, local_entry: bool) -> Value {
+    let mut project_servers =
+        json!({"keep": {"type": "stdio", "command": "/usr/bin/keep", "args": []}});
+    if local_entry {
+        project_servers["claude-self-reflect"] = json!({
+            "type": "stdio",
+            "command": format!("{}/mcp-server/run-mcp.sh", dir.display()),
+            "args": []
+        });
+    }
+    let mut config = json!({
+        "numStartups": 3,
+        "mcpServers": {"other": {"type": "stdio", "command": "/usr/bin/other", "args": []}},
+        "projects": {
+            dir.to_str().unwrap(): {"allowedTools": ["x"], "mcpServers": project_servers},
+            "/untouched": {"mcpServers": {"other": {"command": "/usr/bin/other"}}}
+        }
+    });
+    if with_user {
+        config["mcpServers"]["claude-self-reflect"] = serde_json::from_str(CSR_MCP).unwrap();
+    }
+    config
+}
+
+fn assert_only_the_local_key_went(s: &Scratch, dir: &Path) {
+    let now: Value = serde_json::from_str(&s.claude_json_text()).unwrap();
+    let want = config_with_local_entry(dir, false, false);
+    assert_eq!(
+        now, want,
+        "only projects.<dir>.mcpServers.claude-self-reflect may change"
+    );
+}
+
+#[test]
+fn a_project_scoped_entry_is_removed_through_the_cli_run_from_its_folder() {
+    let s = Scratch::new();
+    let dir = s.root.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = |c: &Value| serde_json::to_string(c).unwrap();
+    write(
+        &s.home.join(".claude.json"),
+        &text(&config_with_local_entry(&dir, true, true)),
+    );
+    let before = s.snapshot();
+    let plan = stdout(&s.run(&["--dry-run"]));
+    assert_eq!(s.snapshot(), before);
+    assert!(
+        plan.contains(&format!(
+            "mcp (local): would run `claude mcp remove claude-self-reflect -s local` in {} \
+             (the entry runs {}/mcp-server/run-mcp.sh)",
+            dir.display(),
+            dir.display()
+        )),
+        "{plan}"
+    );
+    assert!(!s.calls().contains("local-remove"));
+
+    let after = text(&config_with_local_entry(&dir, false, false));
+    let out = s.run_env(
+        &["--yes"],
+        &[
+            ("FAKE_LOADED", s.plist().to_str().unwrap()),
+            ("LOCAL_AFTER_JSON", &after),
+        ],
+    );
+    let out_text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{out_text}");
+    assert!(
+        s.calls()
+            .contains(&format!("local-remove cwd={}", dir.display())),
+        "run from the project folder: {}",
+        s.calls()
+    );
+    assert!(
+        out_text.contains(&format!(
+            "mcp (local): removed the 'claude-self-reflect' entry for {} (claude mcp remove -s local)",
+            dir.display()
+        )),
+        "{out_text}"
+    );
+    assert_only_the_local_key_went(&s, &dir);
+}
+
+#[test]
+fn a_project_scoped_entry_the_cli_cannot_remove_is_edited_out_by_hand_and_nothing_else() {
+    // The CLI runs and leaves it; the user scope has no entry at all (the state a clean install
+    // test found), so the scan must not hang off the user-scope step.
+    let s = Scratch::new();
+    let dir = s.root.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    write(
+        &s.home.join(".claude.json"),
+        &serde_json::to_string(&config_with_local_entry(&dir, false, true)).unwrap(),
+    );
+    let out = s.run(&["--yes"]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(s.calls().contains("local-remove"), "{}", s.calls());
+    assert!(text.contains("by hand (the CLI left it; backup "), "{text}");
+    assert_only_the_local_key_went(&s, &dir);
+    assert_eq!(
+        Scratch::named(&s.home, ".claude.json.csr-uninstall-").len(),
+        1
+    );
+
+    // A project folder that no longer exists: the CLI cannot even start there.
+    let s = Scratch::new();
+    let dir = s.root.join("deleted-project");
+    write(
+        &s.home.join(".claude.json"),
+        &serde_json::to_string(&config_with_local_entry(&dir, false, true)).unwrap(),
+    );
+    let out = s.run(&["--yes"]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!s.calls().contains("local-remove"), "{}", s.calls());
+    assert!(text.contains("by hand"), "{text}");
+    assert_only_the_local_key_went(&s, &dir);
+}
+
+#[test]
+fn running_csr_engine_processes_are_named_after_the_plan_and_never_signalled() {
+    let ps = "424242 1 /opt/csr/csr-engine companion serve --sock /x/abc12345-77.sock\n\
+              424243 1 /opt/csr/csr-engine\n\
+              424244 1 /usr/bin/something-else --flag";
+    let s = Scratch::new();
+    let text = stdout(&s.run_env(&["--dry-run"], &[("FAKE_PS", ps)]));
+    assert!(
+        text.contains("csr-engine is still running in 2 process(es); none was signalled:"),
+        "{text}"
+    );
+    assert!(
+        text.contains("pid 424242  relay  session abc12345"),
+        "{text}"
+    );
+    assert!(text.contains("pid 424243  mcp"), "{text}");
+    assert!(!text.contains("424244"), "{text}");
+    assert!(
+        text.contains("restart these sessions; they keep running the removed csr-engine"),
+        "{text}"
+    );
+    // Deleting the data folder: these processes will write it again.
+    let out = s.run_env(&["--yes", "--purge"], &[("FAKE_PS", ps)]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(&format!(
+            "restart these sessions; they will recreate {}",
+            s.data().display()
+        )),
+        "{text}"
+    );
+    // The names come last, after every step line.
+    let steps_end = text.rfind("binary:").expect("the binary line is printed");
+    assert!(text.find("pid 424242").unwrap() > steps_end, "{text}");
+    // Nothing running: no block.
+    let s = Scratch::new();
+    let text = stdout(&s.run(&["--dry-run"]));
+    assert!(!text.contains("still running"), "{text}");
 }

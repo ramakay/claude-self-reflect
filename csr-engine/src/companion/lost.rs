@@ -569,7 +569,10 @@ pub fn lost_json(paths: &Paths, sid: &str) -> Vec<Thread> {
         .kept_file("carried", sid)
         .map(|p| paths::read_json(&p))
         .and_then(|v| serde_json::from_value::<Vec<Thread>>(v).ok())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| !quotes_a_paste(t))
+        .collect::<Vec<_>>();
     let project = session
         .path
         .as_deref()
@@ -614,15 +617,27 @@ pub fn last_ask(text: &str) -> Option<String> {
     }
     out
 }
+/// A thread `stopped_at` made from a prompt that was a paste: kept before pastes were skipped,
+/// it is dropped wherever kept threads are read back.
+pub fn quotes_a_paste(thread: &Thread) -> bool {
+    let quoted = [
+        "Last asked before it ended: “",
+        "Cut off before Claude finished answering: “",
+    ]
+    .iter()
+    .find_map(|lead| thread.text.strip_prefix(lead));
+    quoted.is_some_and(|q| super::paste::is_paste(q.trim_end_matches('”').trim_end_matches('…')))
+}
 pub fn stopped_at(prev: &Session) -> Option<Thread> {
     let p = &prev.data;
     let since = array(&p["summaries"])
         .last()
         .map(|r| num(&r[0]))
         .unwrap_or(0.);
+    // A paste (a status page, JSON, a log) is never quoted back as what was asked.
     let typed: Vec<_> = pairs(&p["typed"])
         .into_iter()
-        .filter(|(_, words)| !HANDED_OFF.is_match(words))
+        .filter(|(_, words)| !HANDED_OFF.is_match(words) && !super::paste::is_paste(words))
         .collect();
     let after: Vec<_> = typed
         .iter()
@@ -724,8 +739,11 @@ pub fn carried_threads(paths: &Paths, prev: &Session) -> Vec<Thread> {
     let carried: Vec<Thread> = paths
         .kept_file("carried", &prev.id)
         .map(|p| paths::read_json(&p))
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default();
+        .and_then(|v| serde_json::from_value::<Vec<Thread>>(v).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| !quotes_a_paste(t))
+        .collect();
     let mut out = vec![];
     for mut t in lost_found(
         paths,
@@ -768,6 +786,46 @@ pub fn carried_threads(paths: &Paths, prev: &Session) -> Vec<Thread> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The clean Studio install (2026-11-19) quoted a pasted router status page back as the last
+    /// question. A paste is skipped: the last real question shows, or nothing does.
+    #[test]
+    fn a_pasted_blob_is_never_the_last_question_asked() {
+        use serde_json::json;
+        let blob = "Firmware=V7.2.8.8_5.1.24 RegionTag=RBRE960_NA Region=us Model=RBRE960 \
+                    InternetConnectionStatus=Up SOAPVersion=3.46 XCloudSupported=1 \
+                    LoginMethod=2.0 DeviceMode=0 isBlankState=0 SOAP_HTTPs_Port=443";
+        let ended = |typed: Value| {
+            let mut prev = Session::new("prev");
+            prev.data["typed"] = typed;
+            prev.data["turn_end"] = json!(500.);
+            stopped_at(&prev).map(|t| t.text)
+        };
+        let shown = ended(json!([[100., "what did we work on lately?"], [200., blob]])).unwrap();
+        assert_eq!(
+            shown,
+            "Last asked before it ended: “what did we work on lately?”"
+        );
+        for paste in [
+            blob,
+            r#"{"completion_status":"partial","confidence":"MEDIUM"}"#,
+            "2026-11-19 10:01:33 INFO daemon started\n2026-11-19 10:01:34 ERROR socket closed",
+        ] {
+            assert_eq!(ended(json!([[200., paste]])), None, "{paste}");
+        }
+        // A thread kept before this fix (the Studio's carried file held exactly this, cut by
+        // `text::fit`) is dropped when it is read back; a real question is kept.
+        let kept = |text: String| Thread {
+            text,
+            ..Thread::default()
+        };
+        let cut = text::fit(blob, 200);
+        assert!(quotes_a_paste(&kept(format!(
+            "Last asked before it ended: “{cut}”"
+        ))));
+        assert!(!quotes_a_paste(&kept(shown)));
+        assert!(!quotes_a_paste(&kept("Install the queue dashboard".into())));
+    }
 
     #[test]
     fn the_compaction_summary_footer_is_never_a_thread() {

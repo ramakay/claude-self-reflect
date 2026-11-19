@@ -1,13 +1,13 @@
-[48;2;18;20;23m[38;2;242;244;246m                                              [0m
-[48;2;18;20;23m[38;2;242;244;246m                                              [0m
 [48;2;18;20;23m[38;2;242;244;246m☾ The dreamer looks as you work.              [0m
-[48;2;18;20;23m[38;2;242;244;246mLost and found                                [0m
+[48;2;18;20;23m[38;2;242;244;246m                                              [0m
+[48;2;18;20;23m[38;2;242;244;246m[1mLost and found[22m                                [0m
 [48;2;18;20;23m[38;2;242;244;246mInstall the radio queue cache.                [0m
 [48;2;18;20;23m[38;2;242;244;246mIt asks a what-if from your past sessions.    [0m
 [48;2;18;20;23m[38;2;242;244;246mAsk about past work. CSR finds it.            [0m
 [48;2;18;20;23m[38;2;242;244;246mCode changed? CSR warns Claude.               [0m
 [48;2;18;20;23m[38;2;242;244;246mCSR keeps the threads you dropped.            [0m
-[48;2;18;20;23m[38;2;242;244;246mTry a question                                [0m
+[48;2;18;20;23m[38;2;242;244;246m                                              [0m
+[48;2;18;20;23m[38;2;242;244;246m[1mTry a question[22m                                [0m
 [48;2;18;20;23m[38;2;242;244;246mWhat did we decide about this repo? Find a    [0m
 [48;2;18;20;23m[38;2;242;244;246mdecision and its source session.              [0m
 [48;2;18;20;23m[38;2;242;244;246mWhat was unfinished last time? Recover the    [0m

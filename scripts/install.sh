@@ -4,11 +4,35 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
+#   curl -fsSL .../install.sh | sh -s -- --version v10.1.0     # pin a release
+#
+# Arguments:
+#   --version <tag>, --version=<tag>
+#                      — Install this release instead of the latest.
+#                        `10.1.0` and `v10.1.0` both mean the tag v10.1.0.
 #
 # Environment variables:
 #   CSR_INSTALL_DIR    — Binary install directory (default: ~/.local/bin)
+#   CSR_VERSION        — Same as --version (the argument wins). Unset: latest.
+#   CSR_RELEASE_BASE_URL
+#                      — Directory (https:// URL, file:// URL or absolute path)
+#                        that holds csr-engine-<target>.tar.gz and checksums.txt.
+#                        Used as is: no <version>/ is appended and the GitHub
+#                        API is never asked for a version.
+#   CSR_TARBALL        — Absolute path of a local csr-engine-<target>.tar.gz.
+#                        No network at all. checksums.txt must sit beside it, or
+#                        be named by CSR_CHECKSUMS. Cannot be combined with
+#                        CSR_RELEASE_BASE_URL.
+#   CSR_CHECKSUMS      — Path or URL of the checksums file, overriding the
+#                        default location. Verification always runs; with no
+#                        checksums file the install stops.
 #   CSR_SKIP_SETUP=1   — Download only; never run `csr-engine setup`
 #   CSR_AUTO_SETUP=1   — Run setup without prompting (automation)
+#   CSR_TTY            — Terminal device for the setup prompt (default /dev/tty;
+#                        for tests and automation)
+#
+# Answering yes at the "Run setup now?" prompt also gives setup its consent for
+# dreams (CSR_DREAMS_CONSENT=yes), so setup does not ask a second time.
 
 set -e
 
@@ -106,27 +130,134 @@ get_latest_version() {
     fi
 }
 
+# --- Pinned version and local sources ---
+
+# Sets NORMALIZED_VERSION to the v-prefixed tag. A global rather than a printed
+# value: `err` inside $(...) would only end the subshell. The tag ends up in a
+# URL, so anything but digits, letters and . + - is refused.
+normalize_version() {
+    _v="${1#[vV]}"
+    case "$_v" in
+        [0-9]*) ;;
+        *) err "Invalid version '$1'. Use a release tag such as v10.1.0 or 10.1.0." ;;
+    esac
+    case "$_v" in
+        *[!0-9A-Za-z.+-]*) err "Invalid version '$1'. Use a release tag such as v10.1.0 or 10.1.0." ;;
+    esac
+    NORMALIZED_VERSION="v${_v}"
+}
+
+# Reads --version / --version=. Sets PIN_VERSION (empty when not given).
+parse_args() {
+    PIN_VERSION=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --version)
+                [ $# -ge 2 ] && [ -n "$2" ] || err "--version needs a value, for example --version v10.1.0"
+                PIN_VERSION="$2"
+                shift 2
+                ;;
+            --version=*)
+                PIN_VERSION="${1#--version=}"
+                [ -n "$PIN_VERSION" ] || err "--version needs a value, for example --version v10.1.0"
+                shift
+                ;;
+            *)
+                err "Unknown argument: $1. Supported: --version <tag>."
+                ;;
+        esac
+    done
+}
+
+# Chooses VERSION and SOURCE_DESC, and the base location of the release files.
+# Order: --version, then CSR_VERSION, then the latest release. A local source
+# (CSR_TARBALL or CSR_RELEASE_BASE_URL) never asks the GitHub API for a version.
+resolve_source() {
+    [ -n "$PIN_VERSION" ] || PIN_VERSION="${CSR_VERSION:-}"
+
+    if [ -n "${CSR_TARBALL:-}" ] && [ -n "${CSR_RELEASE_BASE_URL:-}" ]; then
+        err "CSR_TARBALL and CSR_RELEASE_BASE_URL are both set. Use one."
+    fi
+
+    if [ -n "$PIN_VERSION" ]; then
+        normalize_version "$PIN_VERSION"
+        VERSION="$NORMALIZED_VERSION"
+    elif [ -n "${CSR_TARBALL:-}" ] || [ -n "${CSR_RELEASE_BASE_URL:-}" ]; then
+        VERSION="(unpinned)"
+    else
+        get_latest_version
+    fi
+
+    if [ -n "${CSR_TARBALL:-}" ]; then
+        BASE_URL=""
+        SOURCE_DESC="local tarball ${CSR_TARBALL}"
+    elif [ -n "${CSR_RELEASE_BASE_URL:-}" ]; then
+        BASE_URL="${CSR_RELEASE_BASE_URL%/}"
+        SOURCE_DESC="$BASE_URL"
+    else
+        BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+        SOURCE_DESC="github.com/${REPO} releases"
+    fi
+}
+
+# fetch <https URL | file:// URL | absolute path> <destination>
+# Local sources are copied, so no curl or wget runs for them. Plain http is
+# refused: the checksums would come from the same unauthenticated channel.
+fetch() {
+    case "$1" in
+        file://*) _src="${1#file://}" ;;
+        /*)       _src="$1" ;;
+        https://*)
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL "$1" -o "$2" 2>/dev/null
+            elif command -v wget >/dev/null 2>&1; then
+                wget -q "$1" -O "$2" 2>/dev/null
+            else
+                err "Neither curl nor wget found. Please install one."
+            fi
+            return
+            ;;
+        *) err "Unsupported location '$1'. Use an https:// URL, a file:// URL or an absolute path." ;;
+    esac
+    case "$_src" in
+        /*) ;;
+        *) err "Unsupported location '$1'. Use an https:// URL, a file:// URL or an absolute path." ;;
+    esac
+    [ -f "$_src" ] || return 1
+    cp "$_src" "$2"
+}
+
 # --- Download and install ---
 
 download_and_install() {
-    TARBALL="csr-engine-${TARGET}.tar.gz"
     CHECKSUM_FILE="checksums.txt"
-    URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
-    CHECKSUM_URL="https://github.com/${REPO}/releases/download/${VERSION}/${CHECKSUM_FILE}"
+    if [ -n "${CSR_TARBALL:-}" ]; then
+        TARBALL="$(basename "$CSR_TARBALL")"
+        URL="$CSR_TARBALL"
+    else
+        TARBALL="csr-engine-${TARGET}.tar.gz"
+        URL="${BASE_URL}/${TARBALL}"
+    fi
+
+    if [ -n "${CSR_CHECKSUMS:-}" ]; then
+        CHECKSUM_URL="$CSR_CHECKSUMS"
+    elif [ -n "${CSR_TARBALL:-}" ]; then
+        CHECKSUM_URL="$(dirname "$CSR_TARBALL")/${CHECKSUM_FILE}"
+    else
+        CHECKSUM_URL="${BASE_URL}/${CHECKSUM_FILE}"
+    fi
 
     TMPDIR="$(mktemp -d)"
     STAGE_DIR=""
     trap 'rm -rf "$TMPDIR"; [ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"' EXIT
 
-    info "Downloading" "${BINARY_NAME} ${VERSION} for ${TARGET}..."
+    info "Installing" "${BINARY_NAME} ${VERSION} (${TARGET}) from ${SOURCE_DESC}"
 
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$URL" -o "${TMPDIR}/${TARBALL}" || err "Download failed. Is ${VERSION} released for ${TARGET}?"
-        curl -fsSL "$CHECKSUM_URL" -o "${TMPDIR}/${CHECKSUM_FILE}" 2>/dev/null || err "Checksum file not available for ${VERSION}; refusing to install unverified binary."
-    else
-        wget -q "$URL" -O "${TMPDIR}/${TARBALL}" || err "Download failed. Is ${VERSION} released for ${TARGET}?"
-        wget -q "$CHECKSUM_URL" -O "${TMPDIR}/${CHECKSUM_FILE}" 2>/dev/null || err "Checksum file not available for ${VERSION}; refusing to install unverified binary."
-    fi
+    # Everything below hashes and extracts the copy in TMPDIR, so the bytes
+    # that were verified are the bytes that get installed.
+    fetch "$URL" "${TMPDIR}/${TARBALL}" || err "Could not get ${URL}. Is ${VERSION} released for ${TARGET}?"
+    fetch "$CHECKSUM_URL" "${TMPDIR}/${CHECKSUM_FILE}" ||
+        err "No checksums file found at ${CHECKSUM_URL}. Put checksums.txt beside the tarball or set CSR_CHECKSUMS=/path/to/checksums.txt. Refusing to install an unverified binary."
 
     # Verify checksum from the release's published checksums.txt.
     EXPECTED="$(awk -v file="$TARBALL" '
@@ -646,6 +777,8 @@ check_shadow() {
 # --- Main ---
 
 main() {
+    parse_args "$@"
+
     printf '\n  \033[1mSelf-Reflect Installer\033[0m\n\n'
 
     detect_platform
@@ -657,7 +790,7 @@ There is no prebuilt binary, and the ONNX runtime has no x86_64-apple-darwin
 build, so the engine cannot be built for this platform either."
     fi
 
-    get_latest_version
+    resolve_source
     download_and_install
     verify
     report_stale_and_kickstart
@@ -670,31 +803,40 @@ build, so the engine cannot be built for this platform either."
     # consent. Prompt when a terminal is available; otherwise (CI, piped
     # non-interactive shells) leave activation to the user.
     RUN_SETUP=no
+    # Set only when the user answered yes at the prompt below. That answer
+    # covers the dreams and `claude -p` disclosure printed with it, so setup is
+    # told not to ask again. CSR_AUTO_SETUP never sets it.
+    PROMPTED_YES=no
+    TTY_DEV="${CSR_TTY:-/dev/tty}"
     if [ "${CSR_SKIP_SETUP:-}" = "1" ]; then
         RUN_SETUP=no
     elif [ "${CSR_AUTO_SETUP:-}" = "1" ]; then
         RUN_SETUP=yes
     # `-w /dev/tty` can pass while the process has no controlling terminal, and
-    # the first `> /dev/tty` would then abort the install under `set -e`. Open
+    # the first write to it would then abort the install under `set -e`. Open
     # it for real in a subshell: a failure there is just a false condition.
-    elif [ -r /dev/tty ] && ( : > /dev/tty ) 2>/dev/null; then
-        printf '\n  Setup registers the MCP server, installs 8 Claude Code hooks\n' > /dev/tty
-        printf '  (on 7 events) into ~/.claude/settings.json, imports your conversations\n' > /dev/tty
-        printf '  from ~/.claude/projects/ into a local index, and installs the\n' > /dev/tty
-        printf "  csr-companion plugin through Claude Code's plugin CLI. On macOS it\n" > /dev/tty
-        printf '  also installs and starts the background daemon (a launchd agent;\n' > /dev/tty
-        printf '  CSR_NO_DAEMON=1 skips it).\n\n' > /dev/tty
-        printf '  Setup also turns on background `claude -p` calls on your Claude plan\n' > /dev/tty
-        printf '  (narratives, briefing, dreams). CSR_NO_AI_NARRATIVES=1 and\n' > /dev/tty
-        printf '  CSR_NO_DREAMING=1 switch them off.\n\n' > /dev/tty
-        printf '  \033[1mRun setup now? [Y/n]\033[0m ' > /dev/tty
+    # Appends (`>>`), so a regular file standing in for the terminal keeps the
+    # answer that is waiting in it.
+    elif [ -r "$TTY_DEV" ] && ( : >> "$TTY_DEV" ) 2>/dev/null; then
+        {
+            printf '\n  Setup registers the MCP server, installs 8 Claude Code hooks\n'
+            printf '  (on 7 events) into ~/.claude/settings.json, imports your conversations\n'
+            printf '  from ~/.claude/projects/ into a local index, and installs the\n'
+            printf "  csr-companion plugin through Claude Code's plugin CLI. On macOS it\n"
+            printf '  also installs and starts the background daemon (a launchd agent;\n'
+            printf '  CSR_NO_DAEMON=1 skips it).\n\n'
+            printf '  Answering yes also turns on dreams and background `claude -p` calls\n'
+            printf '  on your Claude plan (narratives, briefing, dreams).\n'
+            printf '  CSR_NO_AI_NARRATIVES=1 and CSR_NO_DREAMING=1 switch them off.\n\n'
+            printf '  \033[1mRun setup now? [Y/n]\033[0m '
+        } >> "$TTY_DEV"
         answer=""
         # A failed read is not consent — only a successful (possibly empty)
         # response may select the yes-default.
-        if read -r answer < /dev/tty; then
+        if read -r answer < "$TTY_DEV"; then
             case "$answer" in
                 [Nn]*) RUN_SETUP=no ;;
-                *)     RUN_SETUP=yes ;;
+                *)     RUN_SETUP=yes; PROMPTED_YES=yes ;;
             esac
         else
             RUN_SETUP=no
@@ -703,7 +845,7 @@ build, so the engine cannot be built for this platform either."
 
     if [ "$RUN_SETUP" = "yes" ]; then
         printf '\n  \033[1mRunning setup...\033[0m\n\n'
-        if "${INSTALL_DIR}/${BINARY_NAME}" setup 2>&1; then
+        if run_setup 2>&1; then
             # Setup exiting 0 is not evidence that the registrations moved.
             # Re-read them: a hook or MCP entry still naming another binary
             # means Claude Code keeps launching that one.
@@ -736,4 +878,18 @@ build, so the engine cannot be built for this platform either."
     fi
 }
 
-main
+# `csr-engine setup`, with the consent variable only when the prompt was
+# answered yes. The assignment applies to this one command and is not exported
+# to the rest of the script. The installer's own variables are dropped in a
+# subshell first: setup copies every CSR_* variable into the daemon's launch
+# agent, and these describe this install, not the daemon.
+run_setup() (
+    unset CSR_VERSION CSR_TARBALL CSR_RELEASE_BASE_URL CSR_CHECKSUMS CSR_TTY
+    if [ "$PROMPTED_YES" = "yes" ]; then
+        CSR_DREAMS_CONSENT=yes "${INSTALL_DIR}/${BINARY_NAME}" setup
+    else
+        "${INSTALL_DIR}/${BINARY_NAME}" setup
+    fi
+)
+
+main "$@"

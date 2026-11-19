@@ -9,6 +9,7 @@ pub mod pictures;
 pub mod raster;
 pub(super) mod resample;
 pub mod text;
+pub mod text_cards;
 pub mod theme;
 
 /// How long a pane paints no picture before its frame caches go.

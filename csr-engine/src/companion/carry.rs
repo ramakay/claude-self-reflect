@@ -112,7 +112,14 @@ pub fn read_carried(paths: &Paths, sid: &str) -> Option<Vec<Thread>> {
     if !value.is_array() {
         return None;
     }
-    serde_json::from_value(value).ok()
+    let threads: Vec<Thread> = serde_json::from_value(value).ok()?;
+    // A thread kept before pastes were skipped never comes back.
+    Some(
+        threads
+            .into_iter()
+            .filter(|t| !lost::quotes_a_paste(t))
+            .collect(),
+    )
 }
 
 /// The facts kept for a session, or None when none were kept.

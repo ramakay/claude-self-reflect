@@ -57,7 +57,7 @@ Open `http://127.0.0.1:7373/`. `CSR_JOURNAL_PORT` moves the port and `CSR_NO_JOU
 
 ## Companion pane, beyond the five axes
 
-The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew install herdr`).
+The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew install herdr`). Its picture cards need a terminal that draws kitty graphics (Ghostty, kitty, WezTerm, Warp). In macOS Terminal.app the pane shows the same cards as text, also inside herdr; `CSR_COMPANION_PIXELS=0` asks for text anywhere, and `CSR_COMPANION_PIXELS=1` forces pictures on (for a herdr server started in Terminal.app and attached from another terminal). Without herdr, the cards show in a panel inside Claude Code.
 
 - **How Claude read you:** spots shorthand Claude misread, such as "dknr" read as "done".
 - **Your rules:** corrections you typed, kept in your own words, never Claude's.

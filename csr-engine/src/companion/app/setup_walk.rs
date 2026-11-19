@@ -683,6 +683,22 @@ mod tests {
         assert!(view_of(&w.fx.cx).is_none());
     }
 
+    /// `csr-engine setup` writes the dreams answer where the card reads it, so the first session
+    /// after setup opens on the next step and does not ask about dreams again.
+    #[tokio::test]
+    async fn a_dreams_answer_written_by_setup_is_not_asked_again() {
+        let w = first_run("after-setup", false);
+        assert!(crate::setup::consent::record_dreams_answer(&w.fx.cx.store, true, 1).unwrap());
+        w.start(start()).await;
+        assert_eq!(view_of(&w.fx.cx).unwrap().steps, ["autoCompact"]);
+        assert_eq!(w.heading().await.as_deref(), Some("CSR setup 2/2"));
+        assert_eq!(
+            w.machine("setup:seen:dreams"),
+            None,
+            "never shown, never counted"
+        );
+    }
+
     // Not in the TypeScript's tests by name: the rest of what the module does.
 
     #[test]

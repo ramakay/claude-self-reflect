@@ -60,7 +60,7 @@ before(() => {
   const lines = readFileSync(INSTALL_SH, 'utf8').split('\n');
   let last = lines.length - 1;
   while (last >= 0 && lines[last].trim() === '') last -= 1;
-  assert.equal(lines[last].trim(), 'main', 'install.sh should end by calling main');
+  assert.equal(lines[last].trim(), 'main "$@"', 'install.sh should end by calling main "$@"');
   lines.splice(last, 1);
   SOURCEABLE = join(tempDir('lib'), 'install-lib.sh');
   writeFileSync(SOURCEABLE, lines.join('\n'));
@@ -81,7 +81,7 @@ function drive(snippet, env) {
  * Everything a full offline run needs: a tarball holding a stand-in csr-engine,
  * its checksums file, and a `curl` that serves them from disk.
  */
-function buildRelease({ setupWrites } = {}) {
+function buildRelease({ setupWrites, setupRecordsEnv } = {}) {
   const root = tempDir('release');
   const dirs = {};
   for (const name of ['fixtures', 'fakebin', 'pkg', 'home', 'installdir', 'outside', 'oldbin']) {
@@ -99,6 +99,16 @@ function buildRelease({ setupWrites } = {}) {
       `    printf '{"mcpServers":{"claude-self-reflect":{"type":"stdio","command":"%s"}}}' '${setupWrites}' > "$HOME/.claude.json"\n` +
       '    echo "=== Setup Complete ===" ;;\n';
   }
+  if (setupRecordsEnv) {
+    // Records whether CSR_DREAMS_CONSENT reached setup; `-` distinguishes
+    // unset from empty.
+    body +=
+      '  setup)\n' +
+      '    printf "consent=%s\\n" "${CSR_DREAMS_CONSENT-<unset>}" > "$HOME/setup-env.txt"\n' +
+      // The installer's own variables, which setup would copy into the launch agent.
+      '    env | grep -E "^CSR_(VERSION|TARBALL|RELEASE_BASE_URL|CHECKSUMS|TTY)=" > "$HOME/setup-installer-env.txt"\n' +
+      '    echo "=== Setup Complete ===" ;;\n';
+  }
   body += '  *) echo "unexpected: $*" >&2; exit 2 ;;\nesac\n';
   writeFileSync(join(dirs.pkg, 'csr-engine'), body);
   chmodSync(join(dirs.pkg, 'csr-engine'), 0o755);
@@ -114,6 +124,9 @@ function buildRelease({ setupWrites } = {}) {
   const sum = createHash('sha256').update(readFileSync(join(dirs.fixtures, tarball))).digest('hex');
   writeFileSync(join(dirs.fixtures, 'checksums.txt'), `${sum}  ${tarball}\n`);
 
+  // Every URL the stub is asked for goes to this log, so a test can prove
+  // which requests were (and were not) made.
+  const curlLog = join(root, 'curl.calls');
   writeFileSync(
     join(dirs.fakebin, 'curl'),
     `#!/bin/sh
@@ -125,6 +138,7 @@ while [ $# -gt 0 ]; do
     *)  url="$1"; shift ;;
   esac
 done
+printf '%s\\n' "$url" >> '${curlLog}'
 case "$url" in
   *api.github.com*) printf '{"tag_name": "v10.1.0"}\\n'; exit 0 ;;
 esac
@@ -153,7 +167,15 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
   );
   chmodSync(join(dirs.oldbin, 'csr-engine'), 0o755);
 
-  return { root, dirs, tarball, launchctlLog };
+  return { root, dirs, tarball, launchctlLog, curlLog };
+}
+
+function curlCalls(curlLog) {
+  try {
+    return readFileSync(curlLog, 'utf8').split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 
 function launchctlCalls(launchctlLog) {
@@ -164,7 +186,7 @@ function launchctlCalls(launchctlLog) {
   }
 }
 
-function runInstall({ dirs, installDir, extraEnv = {}, pathPrefix = [] }) {
+function runInstall({ dirs, installDir, extraEnv = {}, pathPrefix = [], args = [] }) {
   const env = {
     ...process.env,
     HOME: dirs.home,
@@ -172,10 +194,21 @@ function runInstall({ dirs, installDir, extraEnv = {}, pathPrefix = [] }) {
     PATH: [...pathPrefix, dirs.fakebin, process.env.PATH].join(':'),
     ...extraEnv,
   };
-  delete env.CSR_AUTO_SETUP;
-  delete env.CSR_SKIP_SETUP;
+  // Nothing from the developer's own shell may steer a run.
+  for (const name of [
+    'CSR_AUTO_SETUP',
+    'CSR_SKIP_SETUP',
+    'CSR_VERSION',
+    'CSR_TARBALL',
+    'CSR_RELEASE_BASE_URL',
+    'CSR_CHECKSUMS',
+    'CSR_DREAMS_CONSENT',
+    'CSR_TTY',
+  ]) {
+    delete env[name];
+  }
   for (const [k, v] of Object.entries(extraEnv)) env[k] = v;
-  return spawnSync(SH, [INSTALL_SH], { encoding: 'utf8', timeout: 120000, env });
+  return spawnSync(SH, [INSTALL_SH, ...args], { encoding: 'utf8', timeout: 120000, env });
 }
 
 function stageLeftovers(dir) {
@@ -487,5 +520,386 @@ describe('install.sh: install directory', { skip: !HAVE_SH && 'no /bin/sh' }, ()
     // macOS), so assert the property that matters rather than the exact prefix.
     assert.match(resolved, /^\//, 'must be absolute');
     assert.ok(resolved.endsWith('/rel/bin'), resolved);
+  });
+});
+
+describe('install.sh: pinned version', { skip: !HAVE_SH && 'no /bin/sh' }, () => {
+  function plainEnv() {
+    const home = tempDir('pin-home');
+    return { ...process.env, HOME: home, CSR_INSTALL_DIR: join(home, 'bin') };
+  }
+
+  for (const [given, tag] of [
+    ['10.1.0', 'v10.1.0'],
+    ['v10.1.0', 'v10.1.0'],
+    ['V10.1.0', 'v10.1.0'],
+    ['10.2.0-rc.1', 'v10.2.0-rc.1'],
+  ]) {
+    test(`normalises ${given} to ${tag}`, () => {
+      const result = drive(`normalize_version '${given}'\nprintf '%s\\n' "$NORMALIZED_VERSION"`, plainEnv());
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout.trim(), tag);
+    });
+  }
+
+  for (const bad of ['latest', '../x', 'v10.1.0/../../y', '10.1.0 --foo', 'v', '$(id)']) {
+    test(`refuses the version ${JSON.stringify(bad)}`, () => {
+      const result = drive(`normalize_version '${bad}'\necho reached`, plainEnv());
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /Invalid version/);
+      assert.equal(result.stdout.includes('reached'), false);
+    });
+  }
+
+  test('parses --version <tag> and --version=<tag>', () => {
+    const spaced = drive('parse_args --version 10.1.0\nprintf "[%s]\\n" "$PIN_VERSION"', plainEnv());
+    assert.equal(spaced.status, 0, spaced.stderr);
+    assert.equal(spaced.stdout.trim(), '[10.1.0]');
+
+    const equals = drive('parse_args --version=v10.1.0\nprintf "[%s]\\n" "$PIN_VERSION"', plainEnv());
+    assert.equal(equals.status, 0, equals.stderr);
+    assert.equal(equals.stdout.trim(), '[v10.1.0]');
+
+    const none = drive('parse_args\nprintf "[%s]\\n" "$PIN_VERSION"', plainEnv());
+    assert.equal(none.stdout.trim(), '[]');
+  });
+
+  test('a missing --version value and an unknown argument both fail', () => {
+    for (const args of ['--version', '--version=', '--frobnicate']) {
+      const result = drive(`parse_args ${args}\necho reached`, plainEnv());
+      assert.equal(result.status, 1, args);
+      assert.equal(result.stdout.includes('reached'), false, args);
+    }
+  });
+
+  test('without a pin it asks the GitHub API for the latest release', () => {
+    const { dirs, tarball, curlLog } = buildRelease();
+    const result = runInstall({ dirs, extraEnv: { CSR_SKIP_SETUP: '1' } });
+
+    assert.equal(result.status, 0, result.stderr);
+    const calls = curlCalls(curlLog);
+    assert.ok(calls.some((c) => c.includes('api.github.com/repos/ramakay/claude-self-reflect/releases/latest')), JSON.stringify(calls));
+    assert.ok(calls.includes(`https://github.com/ramakay/claude-self-reflect/releases/download/v10.1.0/${tarball}`), JSON.stringify(calls));
+  });
+
+  test('CSR_VERSION skips the GitHub API and downloads that tag', () => {
+    const { dirs, tarball, curlLog } = buildRelease();
+    const result = runInstall({ dirs, extraEnv: { CSR_SKIP_SETUP: '1', CSR_VERSION: '10.0.9' } });
+
+    assert.equal(result.status, 0, result.stderr);
+    const calls = curlCalls(curlLog);
+    assert.equal(calls.some((c) => c.includes('api.github.com')), false, JSON.stringify(calls));
+    assert.ok(calls.includes(`https://github.com/ramakay/claude-self-reflect/releases/download/v10.0.9/${tarball}`), JSON.stringify(calls));
+    assert.ok(calls.includes('https://github.com/ramakay/claude-self-reflect/releases/download/v10.0.9/checksums.txt'));
+    assert.match(result.stdout, /Installing.* csr-engine v10\.0\.9 \(.*\) from github\.com\/ramakay\/claude-self-reflect releases/);
+  });
+
+  test('--version works through sh -s style arguments, and beats CSR_VERSION', () => {
+    const { dirs, tarball, curlLog } = buildRelease();
+    const result = runInstall({
+      dirs,
+      args: ['--version', 'v10.0.8'],
+      extraEnv: { CSR_SKIP_SETUP: '1', CSR_VERSION: '10.0.1' },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const calls = curlCalls(curlLog);
+    assert.equal(calls.some((c) => c.includes('api.github.com')), false);
+    assert.ok(calls.includes(`https://github.com/ramakay/claude-self-reflect/releases/download/v10.0.8/${tarball}`), JSON.stringify(calls));
+    assert.equal(calls.some((c) => c.includes('v10.0.1')), false);
+  });
+
+  test('an invalid CSR_VERSION stops before any network call or install', () => {
+    const { dirs, curlLog } = buildRelease();
+    const result = runInstall({ dirs, extraEnv: { CSR_SKIP_SETUP: '1', CSR_VERSION: '../evil' } });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Invalid version/);
+    assert.deepEqual(curlCalls(curlLog), []);
+    assert.deepEqual(readdirSync(dirs.installdir), []);
+  });
+});
+
+describe('install.sh: local tarball and release base', { skip: !HAVE_SH && 'no /bin/sh' }, () => {
+  const SKIP = { CSR_SKIP_SETUP: '1' };
+
+  /** A copy of the fixtures, so a test can break them without touching the shared ones. */
+  function copyFixtures(rel, { checksums } = {}) {
+    const dir = tempDir('local-src');
+    writeFileSync(join(dir, rel.tarball), readFileSync(join(rel.dirs.fixtures, rel.tarball)));
+    if (checksums !== null) {
+      writeFileSync(
+        join(dir, 'checksums.txt'),
+        checksums ?? readFileSync(join(rel.dirs.fixtures, 'checksums.txt'), 'utf8')
+      );
+    }
+    return dir;
+  }
+
+  test('installs from CSR_TARBALL with checksums.txt beside it, with no network call', () => {
+    const rel = buildRelease();
+    const src = copyFixtures(rel);
+    const tarball = join(src, rel.tarball);
+
+    const result = runInstall({ dirs: rel.dirs, extraEnv: { ...SKIP, CSR_TARBALL: tarball } });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(curlCalls(rel.curlLog), [], 'curl was never run');
+    assert.match(result.stdout, /Checksum.* verified/);
+    assert.match(result.stdout, new RegExp(`Installing.* csr-engine \\(unpinned\\) \\(.*\\) from local tarball ${src.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    const dest = join(rel.dirs.installdir, 'csr-engine');
+    assert.match(readFileSync(dest, 'utf8'), /csr-engine 10\.1\.0/);
+    assert.equal(statSync(dest).mode & 0o111 ? true : false, true, 'installed binary is executable');
+    assert.deepEqual(stageLeftovers(rel.dirs.installdir), []);
+  });
+
+  test('CSR_TARBALL with a pinned CSR_VERSION shows that version and still makes no call', () => {
+    const rel = buildRelease();
+    const src = copyFixtures(rel);
+
+    const result = runInstall({
+      dirs: rel.dirs,
+      extraEnv: { ...SKIP, CSR_TARBALL: join(src, rel.tarball), CSR_VERSION: '10.1.0' },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Installing.* csr-engine v10\.1\.0 /);
+    assert.deepEqual(curlCalls(rel.curlLog), []);
+  });
+
+  test('a wrong checksum is refused and nothing is installed', () => {
+    const rel = buildRelease();
+    const src = copyFixtures(rel, { checksums: `${'0'.repeat(64)}  ${rel.tarball}\n` });
+
+    const result = runInstall({ dirs: rel.dirs, extraEnv: { ...SKIP, CSR_TARBALL: join(src, rel.tarball) } });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Checksum mismatch/);
+    assert.deepEqual(readdirSync(rel.dirs.installdir), [], 'no binary installed');
+  });
+
+  test('a missing checksums file is refused with a message naming CSR_CHECKSUMS', () => {
+    const rel = buildRelease();
+    const src = copyFixtures(rel, { checksums: null });
+
+    const result = runInstall({ dirs: rel.dirs, extraEnv: { ...SKIP, CSR_TARBALL: join(src, rel.tarball) } });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /No checksums file found/);
+    assert.match(result.stderr, /CSR_CHECKSUMS/);
+    assert.match(result.stderr, /unverified/);
+    assert.deepEqual(readdirSync(rel.dirs.installdir), [], 'no binary installed');
+  });
+
+  test('a checksums file with no entry for the tarball is refused', () => {
+    const rel = buildRelease();
+    const src = copyFixtures(rel, { checksums: `${'a'.repeat(64)}  some-other-file.tar.gz\n` });
+
+    const result = runInstall({ dirs: rel.dirs, extraEnv: { ...SKIP, CSR_TARBALL: join(src, rel.tarball) } });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Checksum entry not found/);
+    assert.deepEqual(readdirSync(rel.dirs.installdir), []);
+  });
+
+  test('CSR_CHECKSUMS names a checksums file kept elsewhere', () => {
+    const rel = buildRelease();
+    const src = copyFixtures(rel, { checksums: null });
+    const elsewhere = join(tempDir('sums'), 'SHA256SUMS');
+    writeFileSync(elsewhere, readFileSync(join(rel.dirs.fixtures, 'checksums.txt')));
+
+    const result = runInstall({
+      dirs: rel.dirs,
+      extraEnv: { ...SKIP, CSR_TARBALL: join(src, rel.tarball), CSR_CHECKSUMS: elsewhere },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Checksum.* verified/);
+  });
+
+  test('CSR_CHECKSUMS that does not exist is refused', () => {
+    const rel = buildRelease();
+    const src = copyFixtures(rel);
+
+    const result = runInstall({
+      dirs: rel.dirs,
+      extraEnv: { ...SKIP, CSR_TARBALL: join(src, rel.tarball), CSR_CHECKSUMS: join(src, 'nope.txt') },
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /No checksums file found/);
+    assert.deepEqual(readdirSync(rel.dirs.installdir), []);
+  });
+
+  test('a CSR_TARBALL that does not exist is refused', () => {
+    const rel = buildRelease();
+    const result = runInstall({
+      dirs: rel.dirs,
+      extraEnv: { ...SKIP, CSR_TARBALL: join(rel.root, 'missing.tar.gz') },
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Could not get/);
+    assert.deepEqual(readdirSync(rel.dirs.installdir), []);
+  });
+
+  for (const [label, wrap] of [
+    ['a file:// URL', (dir) => `file://${dir}`],
+    ['a plain absolute directory', (dir) => dir],
+    ['a directory with a trailing slash', (dir) => `${dir}/`],
+  ]) {
+    test(`CSR_RELEASE_BASE_URL as ${label} installs with no network call`, () => {
+      const rel = buildRelease();
+      const src = copyFixtures(rel);
+
+      const result = runInstall({ dirs: rel.dirs, extraEnv: { ...SKIP, CSR_RELEASE_BASE_URL: wrap(src) } });
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(curlCalls(rel.curlLog), [], 'no GitHub API call, no download');
+      assert.match(result.stdout, /Checksum.* verified/);
+      assert.match(result.stdout, /Installing.* csr-engine \(unpinned\)/);
+      assert.match(readFileSync(join(rel.dirs.installdir, 'csr-engine'), 'utf8'), /csr-engine 10\.1\.0/);
+    });
+  }
+
+  test('CSR_RELEASE_BASE_URL with a wrong checksum is refused', () => {
+    const rel = buildRelease();
+    const src = copyFixtures(rel, { checksums: `${'1'.repeat(64)}  ${rel.tarball}\n` });
+
+    const result = runInstall({ dirs: rel.dirs, extraEnv: { ...SKIP, CSR_RELEASE_BASE_URL: src } });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Checksum mismatch/);
+    assert.deepEqual(readdirSync(rel.dirs.installdir), []);
+  });
+
+  test('CSR_RELEASE_BASE_URL with no checksums file is refused', () => {
+    const rel = buildRelease();
+    const src = copyFixtures(rel, { checksums: null });
+
+    const result = runInstall({ dirs: rel.dirs, extraEnv: { ...SKIP, CSR_RELEASE_BASE_URL: `file://${src}` } });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /No checksums file found/);
+    assert.deepEqual(readdirSync(rel.dirs.installdir), []);
+  });
+
+  test('an https CSR_RELEASE_BASE_URL is used as given, without a version directory or the API', () => {
+    const rel = buildRelease();
+
+    const result = runInstall({
+      dirs: rel.dirs,
+      extraEnv: { ...SKIP, CSR_RELEASE_BASE_URL: 'https://mirror.example/csr/' },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(curlCalls(rel.curlLog), [
+      `https://mirror.example/csr/${rel.tarball}`,
+      'https://mirror.example/csr/checksums.txt',
+    ]);
+  });
+
+  test('a plain http base and a relative path are refused', () => {
+    for (const base of ['http://mirror.example/csr', 'relative/dir']) {
+      const rel = buildRelease();
+      const result = runInstall({ dirs: rel.dirs, extraEnv: { ...SKIP, CSR_RELEASE_BASE_URL: base } });
+
+      assert.equal(result.status, 1, base);
+      assert.match(result.stderr, /Unsupported location/, base);
+      assert.deepEqual(readdirSync(rel.dirs.installdir), [], base);
+    }
+  });
+
+  test('CSR_TARBALL together with CSR_RELEASE_BASE_URL is refused', () => {
+    const rel = buildRelease();
+    const src = copyFixtures(rel);
+
+    const result = runInstall({
+      dirs: rel.dirs,
+      extraEnv: { ...SKIP, CSR_TARBALL: join(src, rel.tarball), CSR_RELEASE_BASE_URL: src },
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /both set/);
+    assert.deepEqual(readdirSync(rel.dirs.installdir), []);
+  });
+});
+
+describe('install.sh: consent pass-through to setup', { skip: !HAVE_SH && 'no /bin/sh' }, () => {
+  /** A regular file stands in for the terminal: the answer waiting in it is what `read` gets. */
+  function answerFile(answer) {
+    const file = join(tempDir('tty'), 'tty');
+    writeFileSync(file, answer);
+    return file;
+  }
+
+  function recorded(dirs) {
+    try {
+      return readFileSync(join(dirs.home, 'setup-env.txt'), 'utf8').trim();
+    } catch {
+      return null;
+    }
+  }
+
+  for (const [label, answer] of [
+    ['y', 'y\n'],
+    ['an empty answer (the yes default)', '\n'],
+  ]) {
+    test(`answering ${label} at the prompt sets CSR_DREAMS_CONSENT=yes for setup`, () => {
+      const { dirs } = buildRelease({ setupRecordsEnv: true });
+
+      const tty = answerFile(answer);
+      const result = runInstall({ dirs, extraEnv: { CSR_TTY: tty } });
+
+      assert.equal(result.status, 0, result.stderr + result.stdout);
+      // The prompt went to the stand-in terminal, so the prompt branch ran.
+      assert.match(readFileSync(tty, 'utf8'), /Run setup now\? \[Y\/n\]/);
+      assert.equal(recorded(dirs), 'consent=yes');
+      // CSR_TTY was set for the installer; setup (and so the launch agent) never sees it.
+      assert.equal(readFileSync(join(dirs.home, 'setup-installer-env.txt'), 'utf8'), '');
+    });
+  }
+
+  test('answering n runs no setup at all', () => {
+    const { dirs } = buildRelease({ setupRecordsEnv: true });
+
+    const result = runInstall({ dirs, extraEnv: { CSR_TTY: answerFile('n\n') } });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(recorded(dirs), null, 'setup must not have run');
+    assert.match(result.stdout, /Not yet active/);
+  });
+
+  test('a terminal that gives no answer (EOF) runs no setup', () => {
+    const { dirs } = buildRelease({ setupRecordsEnv: true });
+
+    // /dev/null accepts the prompt and reads as end-of-file at once.
+    const result = runInstall({ dirs, extraEnv: { CSR_TTY: '/dev/null' } });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(recorded(dirs), null, 'EOF is not consent');
+    assert.match(result.stdout, /Not yet active/);
+  });
+
+  test('CSR_AUTO_SETUP=1 runs setup without setting CSR_DREAMS_CONSENT', () => {
+    const { dirs } = buildRelease({ setupRecordsEnv: true });
+
+    const result = runInstall({ dirs, extraEnv: { CSR_AUTO_SETUP: '1', CSR_TTY: answerFile('y\n') } });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /Run setup now/, 'no prompt under CSR_AUTO_SETUP');
+    assert.equal(recorded(dirs), 'consent=<unset>');
+  });
+
+  test('the prompt text says that yes also turns on dreams', () => {
+    const { dirs } = buildRelease({ setupRecordsEnv: true });
+    const tty = answerFile('n\n');
+
+    const result = runInstall({ dirs, extraEnv: { CSR_TTY: tty } });
+
+    assert.equal(result.status, 0, result.stderr);
+    const prompt = readFileSync(tty, 'utf8');
+    assert.match(prompt, /Answering yes also turns on dreams/);
+    assert.match(prompt, /Run setup now\? \[Y\/n\]/);
   });
 });

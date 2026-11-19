@@ -35,6 +35,34 @@ pub fn where_it_stands(text: &str) -> String {
         .unwrap_or(sentences.len().saturating_sub(2));
     sentences[first..].join(" ")
 }
+/// The prose of a stored session story, or None when it is not prose. A story synthesized from an
+/// extraction before the fix in `extraction::story` carries the extraction's signature block
+/// (`--- Signature: {"completion_status":…`), often cut mid-JSON by the story's length cap: the
+/// block goes, and so does what follows a cut one, as nothing marks where it ends. Whatever still
+/// holds raw JSON after that is dropped whole, never shown.
+pub fn story_prose(text: &str) -> Option<String> {
+    static SIGNATURE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:-{3,}\s*)?Signature:\s*[\{\[]").unwrap()
+    });
+    let mut prose = text.trim().to_owned();
+    if let Some(found) = SIGNATURE.find(&prose) {
+        let before = prose[..found.start()].trim_end().to_owned();
+        let json = &prose[found.end() - 1..];
+        let mut values = serde_json::Deserializer::from_str(json).into_iter::<Value>();
+        let after = match values.next() {
+            Some(Ok(_)) => json[values.byte_offset()..].trim_start().to_owned(),
+            _ => String::new(),
+        };
+        prose = match after.trim_start_matches(['.', ',', ';', ' ']) {
+            "" => before,
+            rest if before.is_empty() => rest.to_owned(),
+            rest if before.ends_with(['.', '?', '!']) => format!("{before} {rest}"),
+            rest => format!("{before}. {rest}"),
+        };
+    }
+    let raw = ["{\"", "\":", "[{"].iter().any(|mark| prose.contains(mark));
+    (!prose.is_empty() && !raw).then_some(prose)
+}
 pub fn session_story(db: &Db, paths: &Paths, sid: &str) -> Value {
     // No session id yet (a pane opened before it is known): `%conv_%` below would match the
     // newest story of any conversation, in any project.
@@ -51,10 +79,9 @@ pub fn session_story(db: &Db, paths: &Paths, sid: &str) -> Value {
         let Some(r) = rows.first() else {
             continue;
         };
-        let text = one_line(string(&r[0]), usize::MAX);
-        if text.is_empty() {
+        let Some(text) = story_prose(&one_line(string(&r[0]), usize::MAX)) else {
             continue;
-        }
+        };
         let tags: Value = serde_json::from_str(string(&r[1])).unwrap_or(Value::Null);
         let rev = array(&tags)
             .iter()
@@ -545,6 +572,32 @@ pub fn load_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The story the clean Studio install stored and the pane showed (2026-11-19).
+    const STORED: &str = r#"what did we work on lately? --- Signature: {"completion_status":"partial","confidence":"MEDIUM","frameworks":[],"pattern_reusability":"medium","error_recovery":false,"total_edits":0,"iteration_count":. Partially completed"#;
+    #[test]
+    fn a_story_shows_its_prose_and_never_the_signature_or_raw_json() {
+        assert_eq!(
+            story_prose(STORED).as_deref(),
+            Some("what did we work on lately?")
+        );
+        // A whole signature goes and the prose after it stays.
+        assert_eq!(
+            story_prose(r#"Fixed the reader --- Signature: {"completion_status":"success"}. Completed successfully"#)
+                .as_deref(),
+            Some("Fixed the reader. Completed successfully")
+        );
+        // Nothing but the block, or raw JSON with no block: nothing to show.
+        for raw in [
+            r#"--- Signature: {"completion_status":"partial"}"#,
+            r#"{"completion_status":"partial","confidence":"MEDIUM"}"#,
+            r#"Story: {"text": "x"}"#,
+        ] {
+            assert_eq!(story_prose(raw), None, "{raw}");
+        }
+        // Prose that only mentions a signature stays as it is.
+        let prose = "We verify the release. Signature: Ed25519 with key id K1.";
+        assert_eq!(story_prose(prose).as_deref(), Some(prose));
+    }
     #[test]
     fn repeated_retrievals_look_up_each_conversation_once_per_frame() {
         let d = tempfile::tempdir().unwrap();

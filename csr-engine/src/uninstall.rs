@@ -1,4 +1,4 @@
-//! `csr-engine uninstall [--dry-run] [--yes] [--keep-data] [--purge-mirror]`
+//! `csr-engine uninstall [--dry-run] [--yes] [--purge] [--purge-mirror]`
 //!
 //! Takes back what `setup` and `hook install --apply` wrote, and only that:
 //!
@@ -6,20 +6,31 @@
 //!    command; every other hook, matcher and key stays; a backup is written first and the file
 //!    is replaced whole, so it is valid JSON after or untouched),
 //! 2. the `claude-self-reflect` MCP entry in `~/.claude.json` (through `claude mcp remove`, and
-//!    by hand only if the CLI left it; the file is read again right before the edit),
+//!    by hand only if the CLI left it; the file is read again right before the edit), and any
+//!    project-scoped entry of that name (`-s local`, run from the project folder),
 //! 3. the same entry in Codex's config (through `codex mcp remove`, config backed up first),
-//! 4. the companion plugin and its marketplace (through `claude plugin ...`),
+//! 4. the companion plugin and its marketplace (through `claude plugin ...`), then the plugin
+//!    cache `~/.claude/plugins/cache/claude-self-reflect`,
 //! 5. the launch agent setup wrote (a plist without setup's marker is listed and left alone;
 //!    nothing is deleted while the daemon is not confirmed stopped),
-//! 6. the data folder `~/.claude-self-reflect`, except the transcript mirror unless
-//!    `--purge-mirror` is given,
-//! 7. the model cache `~/Library/Caches/csr-engine` (downloaded models, not user data, so it goes
-//!    with `--keep-data` too),
-//! 8. last, the binary itself, only when it sits in `~/.local/bin`; anywhere else (npm, a system
-//!    folder) the exact `rm` line is printed instead.
+//! 6. the npm global package `claude-self-reflect`, when `npm ls -g` lists it,
+//! 7. the data folder `~/.claude-self-reflect`: KEPT by default (its path and size are printed);
+//!    `--purge` deletes it except the transcript mirror, `--purge-mirror` (implies `--purge`)
+//!    deletes the mirror too. `--keep-data` is still accepted and does nothing,
+//! 8. the model cache `~/Library/Caches/csr-engine` (downloaded models, not user data, so it is
+//!    removed without `--purge`),
+//! 9. last, every csr-engine binary the hooks, MCP entries, launch agent and this process name:
+//!    one in `~/.local/bin` is deleted, any other gets its exact `rm` line printed.
+//!
+//! Every step prints what it removed or kept. The running csr-engine processes (sessions, relays)
+//! are listed at the end and never signalled: they recreate the data folder until restarted.
 //!
 //! Never touched: `~/.claude/projects`, any other agent, any other hook. Without `--yes` (or with
-//! `--dry-run`) nothing changes, no program is run, and the plan is printed.
+//! `--dry-run`) nothing changes, no program that changes anything is run (the plan reads files
+//! and runs only the read-only probes `npm ls` and `ps`), and the plan is printed.
+
+#[path = "uninstall_residue.rs"]
+mod residue;
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -48,12 +59,24 @@ pub struct UninstallArgs {
     /// Do it. Without this flag the plan is printed and nothing changes
     #[arg(long)]
     pub yes: bool,
-    /// Remove the integrations (hooks, MCP entries, plugin, launch agent) but keep the data folder
-    #[arg(long, conflicts_with = "purge_mirror")]
-    pub keep_data: bool,
-    /// Also delete the transcript mirror (the only copy of transcripts Claude Code deleted)
+    /// Also delete the data folder ~/.claude-self-reflect, except the transcript mirror. Without
+    /// this flag the data is kept and its path and size are printed
+    #[arg(long)]
+    pub purge: bool,
+    /// Also delete the transcript mirror (the only copy of transcripts Claude Code deleted);
+    /// implies --purge
     #[arg(long)]
     pub purge_mirror: bool,
+    /// Accepted for old command lines; does nothing, because the data is kept by default now
+    #[arg(long, hide = true, conflicts_with_all = ["purge", "purge_mirror"])]
+    pub keep_data: bool,
+}
+
+impl UninstallArgs {
+    /// True when the data folder is to be deleted (`--purge`, or `--purge-mirror` which implies it).
+    fn purges(&self) -> bool {
+        self.purge || self.purge_mirror
+    }
 }
 
 /// Entry point for the subcommand. Returns the process exit code. `db_path` is the global
@@ -78,31 +101,39 @@ pub fn run(args: &UninstallArgs, db_path: &Path) -> i32 {
     let apply = args.yes && !args.dry_run;
     let mut out = Vec::new();
     let mut ok = true;
+    // Read before the steps below remove the hooks, MCP entries and launch agent that name them.
+    let binaries = residue::registered_binaries(&home, std::env::current_exe().ok());
     ok &= settings_step(&home, apply, &mut out);
     ok &= mcp_step(&home, apply, &mut out);
+    ok &= residue::local_mcp_step(&home, apply, &mut out);
     ok &= codex_step(&home, apply, &mut out);
-    ok &= plugin_step(apply, &mut out);
+    let plugin_gone = plugin_step(apply, &mut out);
+    ok &= plugin_gone;
+    ok &= residue::plugin_cache_step(&home, apply, plugin_gone, &mut out);
     let agents = agent_step(&home, apply, &mut out);
     ok &= agents.ok;
     // The plist is not the daemon: whatever happened to it (deleted by an earlier run, never
-    // there, not ours), the data folder goes only when launchd runs no CSR daemon.
+    // there, not ours), nothing is deleted while launchd runs a CSR daemon.
     let mut hold_data = agents.hold_data;
-    if apply && !args.keep_data && !hold_data && daemon_still_loaded(&home, &mut out) {
+    if apply && !hold_data && daemon_still_loaded(&home, &mut out) {
         hold_data = true;
         ok = false;
     }
-    if hold_data {
+    ok &= residue::npm_step(apply, hold_data, &mut out);
+    if hold_data && args.purges() {
         out.push(
             "data: kept, because the daemon is not confirmed stopped. Stop it, then run \
-             `csr-engine uninstall --yes` again"
+             `csr-engine uninstall --yes --purge` again"
                 .into(),
         );
     } else {
         ok &= data_step(&home, apply, args, &mut out);
     }
     ok &= cache_step(apply, &mut out);
+    let processes =
+        residue::process_report(&binaries, &home.join(DATA_DIR), args.purges() && !hold_data);
     // Last: nothing after this may need the binary.
-    ok &= binary_step(&home, apply, hold_data, &mut out);
+    ok &= binary_step(&home, apply, hold_data, &binaries, &mut out);
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
     let _ = writeln!(
@@ -116,6 +147,9 @@ pub fn run(args: &UninstallArgs, db_path: &Path) -> i32 {
     );
     for line in &out {
         let _ = writeln!(w, "  {line}");
+    }
+    for line in &processes {
+        let _ = writeln!(w, "{line}");
     }
     if !apply && !args.dry_run {
         let _ = writeln!(w, "Run again with --yes to do this.");
@@ -421,11 +455,27 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Receiver<Vec<u8>> {
 /// Run `program args` with a stopwatch, stdin closed and output captured. Err when it could not
 /// start (not installed) or had to be stopped. Only the child this function started is killed.
 fn run_cmd(program: &str, args: &[&str], limit: Duration) -> Result<Run, String> {
-    let mut child = Command::new(program)
+    run_cmd_in(program, args, limit, None)
+}
+
+/// [`run_cmd`] with `cwd` as the child's working folder. A folder that does not exist is an Err
+/// (the child cannot start), like a missing program.
+fn run_cmd_in(
+    program: &str,
+    args: &[&str],
+    limit: Duration,
+    cwd: Option<&Path>,
+) -> Result<Run, String> {
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("could not run {program}: {e}"))?;
     let out_rx = drain(child.stdout.take());
@@ -983,8 +1033,13 @@ fn data_step(home: &Path, apply: bool, args: &UninstallArgs, out: &mut Vec<Strin
             format!("data: transcript mirror {} ({size})", mirror.display())
         }
     };
-    if args.keep_data {
-        out.push(format!("data: --keep-data, {} kept", data.display()));
+    if !args.purges() {
+        out.push(format!(
+            "data: {} ({}): {}; --purge deletes it",
+            data.display(),
+            human(tree_size(&data)),
+            if apply { "kept" } else { "would be kept" }
+        ));
         if mirror.exists() {
             out.push(mirror_note(true));
         }
@@ -1093,7 +1148,7 @@ fn data_step(home: &Path, apply: bool, args: &UninstallArgs, out: &mut Vec<Strin
 
 /// The model cache, `<cache dir>/csr-engine` (`~/Library/Caches/csr-engine` on macOS): the
 /// embedding model fastembed downloaded and reranker files. Not user data, so it is removed in
-/// every mode, `--keep-data` included. A link there is removed, never what it points at.
+/// every mode, with or without `--purge`. A link there is removed, never what it points at.
 fn cache_step(apply: bool, out: &mut Vec<String>) -> bool {
     let Some(cache) = dirs::cache_dir().map(|dir| dir.join("csr-engine")) else {
         out.push("model cache: this system has no cache folder".into());
@@ -1123,7 +1178,7 @@ fn cache_step(apply: bool, out: &mut Vec<String>) -> bool {
         };
         out.push(format!(
             "model cache: would delete {what} ({size}); downloaded models, not your data, so it \
-             goes with --keep-data too"
+             goes without --purge too"
         ));
         return true;
     }
@@ -1147,47 +1202,57 @@ fn cache_step(apply: bool, out: &mut Vec<String>) -> bool {
     }
 }
 
-/// The binary, last. Deleted only when it sits in `~/.local/bin`, where the install script and
-/// `setup` put it; a binary anywhere else (npm's folder, `/usr/local/bin`) belongs to whoever put
-/// it there, so the exact `rm` line is printed instead. Kept while the daemon is not confirmed
-/// stopped (`held`), since launchd would start it again.
-fn binary_step(home: &Path, apply: bool, held: bool, out: &mut Vec<String>) -> bool {
-    let Ok(exe) = std::env::current_exe() else {
+/// The binaries, last: this one and every one the hooks, MCP entries and launch agent named
+/// (`binaries`, read before those were removed). One that sits in `~/.local/bin` is deleted, where
+/// the install script and `setup` put it; one anywhere else (npm's folder, `/usr/local/bin`)
+/// belongs to whoever put it there, so the exact `rm` line is printed instead. A path that no
+/// longer exists is skipped. Kept while the daemon is not confirmed stopped (`held`), since
+/// launchd would start it again.
+fn binary_step(
+    home: &Path,
+    apply: bool,
+    held: bool,
+    binaries: &[PathBuf],
+    out: &mut Vec<String>,
+) -> bool {
+    if std::env::current_exe().is_err() {
         out.push("binary: could not tell where this binary is; remove csr-engine by hand".into());
-        return true;
-    };
+    }
     let local_bin = home.join(".local").join("bin");
-    let ours = exe.parent() == Some(local_bin.as_path())
-        && exe.file_name().is_some_and(|name| name == "csr-engine");
-    if !ours {
-        out.push(format!(
-            "binary: {} was not installed into {}; remove it yourself: rm \"{}\" (or `npm \
-             uninstall -g claude-self-reflect` if npm installed it)",
-            exe.display(),
-            local_bin.display(),
-            exe.display()
-        ));
-        return true;
-    }
-    if !apply {
-        out.push(format!("binary: would delete {} last", exe.display()));
-        return true;
-    }
-    if held {
-        out.push(format!(
-            "binary: kept {}, because the daemon is not confirmed stopped",
-            exe.display()
-        ));
-        return true;
-    }
-    match std::fs::remove_file(&exe) {
-        Ok(()) => {
-            out.push(format!("binary: deleted {}", exe.display()));
-            true
+    let mut ok = true;
+    for exe in binaries {
+        if std::fs::symlink_metadata(exe).is_err() {
+            continue;
         }
-        Err(e) => {
-            out.push(format!("binary: could not delete {}: {e}", exe.display()));
-            false
+        let ours = exe.parent() == Some(local_bin.as_path())
+            && exe.file_name().is_some_and(|name| name == "csr-engine");
+        if !ours {
+            out.push(format!(
+                "binary: {} was not installed into {}; remove it yourself: rm \"{}\"",
+                exe.display(),
+                local_bin.display(),
+                exe.display()
+            ));
+            continue;
+        }
+        if !apply {
+            out.push(format!("binary: would delete {} last", exe.display()));
+            continue;
+        }
+        if held {
+            out.push(format!(
+                "binary: kept {}, because the daemon is not confirmed stopped",
+                exe.display()
+            ));
+            continue;
+        }
+        match std::fs::remove_file(exe) {
+            Ok(()) => out.push(format!("binary: deleted {}", exe.display())),
+            Err(e) => {
+                out.push(format!("binary: could not delete {}: {e}", exe.display()));
+                ok = false;
+            }
         }
     }
+    ok
 }

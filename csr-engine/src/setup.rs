@@ -17,7 +17,7 @@
 //! plugin install`), so the plugin's version is always the engine's. `--no-companion` skips
 //! it. A failure there is reported with the one command that retries it and never fails setup.
 
-use std::io::{BufRead, IsTerminal, Read};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -25,12 +25,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::companion::relay::emit;
-use crate::daemon::dream_cadence;
-use crate::dream::policy::{self, EffortTier, NightEstimate};
 use crate::engine::Engine;
 use crate::hooks;
 use crate::import;
-use crate::storage::Storage;
 
 /// One line in the setup output: what calls `claude -p`, under whose account,
 /// and the switch that stops it. The README and the docs-site installation page
@@ -98,7 +95,10 @@ pub async fn handle(
             let harness_strip_root = codex_root.clone();
             let adapter_engine = eng.clone();
             let stats = tokio::task::spawn_blocking(move || {
-                crate::import::codex_rollout::import_changed_rollouts(&adapter_engine, &codex_root)
+                crate::import::codex_rollout::import_changed_rollouts_printing_progress(
+                    &adapter_engine,
+                    &codex_root,
+                )
             })
             .await??;
             eprintln!(
@@ -154,7 +154,7 @@ pub async fn handle(
                         let reimport_engine = eng.clone();
                         let reimport_root = harness_strip_root.clone();
                         match tokio::task::spawn_blocking(move || {
-                            crate::import::codex_rollout::import_changed_rollouts(
+                            crate::import::codex_rollout::import_changed_rollouts_printing_progress(
                                 &reimport_engine,
                                 &reimport_root,
                             )
@@ -1226,80 +1226,9 @@ fn next_steps(report: Option<&RelayReport>) -> String {
     next_steps_text(&companion_text)
 }
 
-/// Is this run allowed to ask an interactive question? `CSR_AUTO_SETUP=1`
-/// (the installer's automation path) and a non-tty stdin both mean "take the
-/// default without prompting". `CSR_SKIP_SETUP` belongs to `install.sh` and
-/// is never reached here — if it were set, setup would not be running.
-fn interactive() -> bool {
-    if std::env::var("CSR_AUTO_SETUP")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    std::io::stdin().is_terminal()
-}
-
-/// The estimate + toggle screen. Returns the recorded decision.
-///
-/// Honesty rules: the number shown is computed from the measured candidate
-/// count in the corpus and the configured tier, it is labelled an estimate
-/// and states its assumptions, and it is printed BEFORE the question. A
-/// non-interactive run takes the documented default (ON) and says so rather
-/// than silently assuming consent.
-fn dreaming_consent_step(storage: &Storage) -> Result<bool> {
-    let tier = policy::effort_tier();
-    let estimate = night_estimate(storage, tier);
-
-    eprintln!("[7/8] Dreaming (overnight review of your open work)");
-    eprintln!("  While Claude Code is idle, CSR re-checks open todos and blockers");
-    eprintln!("  against the code as it stands now, and writes what it can prove.");
-    eprintln!("  Cost: {}", estimate.label(tier));
-    eprintln!(
-        "  Effort tier '{}' ({} reasoning, up to {} episodes per pass) — change with CSR_DREAM_EFFORT=less|balanced|max.",
-        tier.as_str(),
-        tier.reasoning_effort(),
-        tier.episodes_per_pass(),
-    );
-
-    let granted = if interactive() {
-        ask_yes_default_yes("  Enable dreaming? [Y/n] ")
-    } else {
-        eprintln!("  Non-interactive run — keeping the default (enabled).");
-        true
-    };
-
-    dream_cadence::record_consent(storage, granted)?;
-    if granted {
-        eprintln!("  Dreaming enabled. Turn it off any time with CSR_NO_DREAMING=1.");
-    } else {
-        eprintln!("  Dreaming declined; the daemon will not run night passes.");
-    }
-    Ok(granted)
-}
-
-/// The per-night estimate for `tier`, from the corpus's measured candidate
-/// count and the configured cadence/budget.
-fn night_estimate(storage: &Storage, tier: EffortTier) -> NightEstimate {
-    policy::estimate_night(
-        crate::dream::threads::count_candidate_episodes(storage),
-        tier,
-        policy::budget_cap(tier),
-        dream_cadence::interval_secs(),
-    )
-}
-
-/// Read one line; anything but an explicit "n"/"no" keeps the default (yes).
-fn ask_yes_default_yes(prompt: &str) -> bool {
-    eprint!("{prompt}");
-    use std::io::Write;
-    let _ = std::io::stderr().flush();
-    let mut answer = String::new();
-    if std::io::stdin().lock().read_line(&mut answer).is_err() {
-        return true;
-    }
-    !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no")
-}
+#[path = "setup_consent.rs"]
+pub(crate) mod consent;
+use consent::dreaming_consent_step;
 
 /// The MCP server name we own in Claude Code's user-scope config.
 const MCP_SERVER_NAME: &str = "claude-self-reflect";
@@ -3661,93 +3590,6 @@ esac
     fn test_count_total_files_nonexistent() {
         let count = count_total_files(Path::new("/tmp/nonexistent-csr-setup-test"));
         assert_eq!(count, 0);
-    }
-
-    // ── dreaming consent (locked decision 15) ──
-
-    /// Seed one candidate episode: a v2 reflection with a partial outcome and
-    /// at least one touched file — exactly what a night pass would consider.
-    fn seed_candidate(storage: &Storage, session: &str) {
-        let content = serde_json::json!({
-            "schema": "v2",
-            "session_id": session,
-            "project": "proj",
-            "timestamp": "2026-08-11T10:00:00Z",
-            "request": "do the thing",
-            "outcome": "partial",
-            "completed": "half of it",
-            "files_modified": ["src/a.rs"],
-        })
-        .to_string();
-        storage
-            .with_connection(|conn| {
-                conn.execute(
-                    "INSERT INTO reflections (id, content, tags, timestamp)
-                     VALUES (?1, ?2, '[]', '2026-08-11T10:00:00Z')",
-                    rusqlite::params![session, content],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn the_estimate_is_computed_from_the_real_corpus_and_labelled_an_estimate() {
-        let storage = Storage::open_memory().unwrap();
-        let empty = night_estimate(&storage, EffortTier::Balanced);
-        assert_eq!(empty.candidates, 0, "an empty corpus estimates from zero");
-        assert_eq!(empty.total_tokens(), 0);
-
-        for index in 0..3 {
-            seed_candidate(&storage, &format!("session-{index}"));
-        }
-        let seeded = night_estimate(&storage, EffortTier::Balanced);
-        assert_eq!(
-            seeded.candidates, 3,
-            "the estimate must count the corpus, not a constant"
-        );
-        assert!(seeded.total_tokens() > 0);
-        let label = seeded.label(EffortTier::Balanced);
-        assert!(label.contains("estimate"), "not labelled: {label}");
-        assert!(label.contains("3 candidate episodes"), "no basis: {label}");
-    }
-
-    #[test]
-    fn a_non_interactive_run_keeps_dreaming_on_and_records_the_decision() {
-        let _guard = crate::daemon::dream_cadence::env_test_guard();
-        let storage = Storage::open_memory().unwrap();
-        std::env::set_var("CSR_AUTO_SETUP", "1");
-        let granted = dreaming_consent_step(&storage);
-        std::env::remove_var("CSR_AUTO_SETUP");
-        assert!(granted.unwrap(), "the default is ON");
-        assert!(!dream_cadence::consent_declined(&storage));
-        assert_eq!(
-            storage.get_meta(dream_cadence::META_CONSENT).unwrap(),
-            Some(dream_cadence::CONSENT_GRANTED.to_string()),
-            "a taken default is still recorded, not left ambiguous"
-        );
-    }
-
-    #[test]
-    fn auto_setup_makes_the_run_non_interactive() {
-        let _guard = crate::daemon::dream_cadence::env_test_guard();
-        std::env::set_var("CSR_AUTO_SETUP", "1");
-        let auto = interactive();
-        std::env::remove_var("CSR_AUTO_SETUP");
-        assert!(!auto, "CSR_AUTO_SETUP=1 must never prompt");
-    }
-
-    #[test]
-    fn a_declined_consent_stops_the_daemon_dreaming() {
-        let storage = Storage::open_memory().unwrap();
-        assert!(
-            !dream_cadence::consent_declined(&storage),
-            "never asked is not declined"
-        );
-        dream_cadence::record_consent(&storage, false).unwrap();
-        assert!(dream_cadence::consent_declined(&storage));
-        dream_cadence::record_consent(&storage, true).unwrap();
-        assert!(!dream_cadence::consent_declined(&storage));
     }
 
     /// The exact stderr Claude Code 2.1.x emits when the name is taken. Only
