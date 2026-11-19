@@ -53,9 +53,21 @@ jobs:
           mkdir -p "$OUT/docs"
           cp -R site/. "$OUT/"
           cp -R docs-site/dist/. "$OUT/docs/"
+          # The docs app used to own the root, so old cards and posts link to
+          # /claude-self-reflect/images/og-card.png, /favicon-32.png and so on.
+          # Serve the docs' public files at the root too (not index.html or the
+          # hashed assets/, which belong to the landing). Never overwrite a
+          # landing file.
+          for f in docs-site/dist/*; do
+            name=$(basename "$f")
+            case "$name" in index.html|assets) continue ;; esac
+            if [ -e "$OUT/$name" ]; then echo "::error::landing already has $name"; exit 1; fi
+            cp -R "$f" "$OUT/$name"
+          done
           test -f "$OUT/index.html"
           test -f "$OUT/404.html"
           test -f "$OUT/docs/index.html"
+          test -f "$OUT/images/og-card.png"
           # GitHub rejects files over 100 MB; warn from 50 MB.
           big=$(find "$OUT" -type f -size +100M)
           if [ -n "$big" ]; then echo "::error::files over 100 MB: $big"; exit 1; fi
