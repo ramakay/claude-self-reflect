@@ -1156,6 +1156,38 @@ fn one_unreadable_rollout_does_not_abort_the_pass() {
         .is_empty());
 }
 
+/// Setup prints from these reports: the count first, one per embed batch, one per file, and
+/// the last one is the whole pass.
+#[test]
+fn the_progress_callback_reports_the_count_then_every_file_to_the_total() {
+    let root = tempfile::tempdir().unwrap();
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+    std::fs::copy(&source, root.path().join("rollout-one.jsonl")).unwrap();
+    std::fs::copy(&source, root.path().join("rollout-two.jsonl")).unwrap();
+
+    let storage = Arc::new(Storage::open_memory().unwrap());
+    let engine = test_engine(storage, root.path());
+    let mut seen = Vec::new();
+    let stats =
+        import_changed_rollouts_with_progress(&engine, root.path(), &mut |p| seen.push(p)).unwrap();
+
+    let first = seen.first().copied().unwrap();
+    assert_eq!((first.done, first.total, first.chunks), (0, 2, 0));
+    let last = seen.last().copied().unwrap();
+    assert_eq!((last.done, last.total), (2, 2));
+    assert_eq!(last.chunks, stats.chunks_imported);
+    assert!(
+        seen.windows(2)
+            .all(|w| w[0].done <= w[1].done && w[0].chunks <= w[1].chunks),
+        "progress went backwards: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|p| p.done == 0 && p.chunks > 0),
+        "no report from inside the first file: {seen:?}"
+    );
+}
+
 #[test]
 fn modern_fixture_parses_messages_cwd_and_scrubs_csr_calls() {
     let path =

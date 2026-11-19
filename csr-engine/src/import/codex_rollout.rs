@@ -954,16 +954,58 @@ where
 
 /// Import every changed rollout discovered beneath the optional Codex root.
 /// This function is synchronous by design and is run inside `spawn_blocking`
-/// by setup/daemon call sites.
+/// by setup/daemon call sites. The daemon calls it as is: no progress output.
 pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<RolloutImportStats> {
+    import_changed_rollouts_with_progress(engine, root, &mut |_| {})
+}
+
+/// [`import_changed_rollouts`] for a person watching (`csr-engine setup`): progress lines on
+/// stderr, a file count first and then at most one line every few seconds.
+pub(crate) fn import_changed_rollouts_printing_progress(
+    engine: &Engine,
+    root: &Path,
+) -> Result<RolloutImportStats> {
+    let mut printer = progress::ProgressPrinter::stderr("Codex", "rollouts");
+    let began = std::time::Instant::now();
+    let result = import_changed_rollouts_with_progress(engine, root, &mut |p| {
+        printer.report(began.elapsed(), p)
+    });
+    printer.finish();
+    result
+}
+
+/// [`import_changed_rollouts`] that tells `on_progress` where it stands: once with `done == 0`
+/// after discovery (the file count), after each embed batch (so one large rollout is not
+/// silent), and after each file, imported, vanished or failed alike. `chunks` counts what this
+/// pass has written, including the file in progress; a busy retry restarts that file's count.
+pub(crate) fn import_changed_rollouts_with_progress(
+    engine: &Engine,
+    root: &Path,
+    on_progress: &mut dyn FnMut(progress::ImportProgress),
+) -> Result<RolloutImportStats> {
     let storage = engine.storage();
     let files = discover_rollouts(root, |key| storage.get_import_state_mtime(key))?;
     let mut stats = RolloutImportStats {
         files_discovered: files.len(),
         ..RolloutImportStats::default()
     };
-    for file in files {
-        match import_rollout_with_retries(engine, &file) {
+    let total = files.len();
+    on_progress(progress::ImportProgress {
+        done: 0,
+        total,
+        chunks: 0,
+    });
+    for (finished, file) in files.into_iter().enumerate() {
+        let base = stats.chunks_imported;
+        let mut in_file = |chunks_so_far: usize| {
+            on_progress(progress::ImportProgress {
+                done: finished,
+                total,
+                chunks: base + chunks_so_far,
+            })
+        };
+        let imported = import_rollout_with_retries_reporting(engine, &file, &mut in_file);
+        match imported {
             Ok(None) => stats.vanished += 1,
             Ok(Some(outcome)) => {
                 stats.schema_misses += outcome.schema_misses;
@@ -986,6 +1028,11 @@ pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<Ro
                 );
             }
         }
+        on_progress(progress::ImportProgress {
+            done: finished + 1,
+            total,
+            chunks: stats.chunks_imported,
+        });
     }
     Ok(stats)
 }
@@ -998,9 +1045,19 @@ fn import_rollout_with_retries(
     engine: &Engine,
     file: &RolloutFile,
 ) -> Result<Option<RolloutStreamOutcome>> {
+    import_rollout_with_retries_reporting(engine, file, &mut |_| {})
+}
+
+/// [`import_rollout_with_retries`] that reports the chunks written so far in the file after each
+/// embed batch. A retry starts the file again, so the count starts again from the first batch.
+fn import_rollout_with_retries_reporting(
+    engine: &Engine,
+    file: &RolloutFile,
+    on_batch: &mut dyn FnMut(usize),
+) -> Result<Option<RolloutStreamOutcome>> {
     let mut attempt = 0;
     loop {
-        match import_rollout(engine, file) {
+        match import_rollout(engine, file, on_batch) {
             Err(error) if attempt < ROLLOUT_BUSY_RETRIES && is_database_busy(&error) => {
                 attempt += 1;
                 std::thread::sleep(ROLLOUT_BUSY_BACKOFF * attempt as u32);
@@ -1012,8 +1069,13 @@ fn import_rollout_with_retries(
 
 /// `Ok(None)` means the rollout vanished between discovery and reading it,
 /// which is routine: Codex deletes session files aggressively.
-fn import_rollout(engine: &Engine, file: &RolloutFile) -> Result<Option<RolloutStreamOutcome>> {
+fn import_rollout(
+    engine: &Engine,
+    file: &RolloutFile,
+    on_batch: &mut dyn FnMut(usize),
+) -> Result<Option<RolloutStreamOutcome>> {
     let _operation = engine.storage().operation_lock()?;
+    let mut written = 0usize;
     let storage = engine.storage();
     let Some(metadata) = scan_rollout_metadata(&file.path)? else {
         return Ok(None);
@@ -1070,6 +1132,10 @@ fn import_rollout(engine: &Engine, file: &RolloutFile) -> Result<Option<RolloutS
                 }
             }
             drop(index);
+            if failure.is_none() {
+                written += chunks.len();
+                on_batch(written);
+            }
             failure.map_or(Ok(()), Err)
         },
     )?;
@@ -1727,6 +1793,9 @@ pub fn harness_strip_batch(
     }
     Ok(stats)
 }
+
+#[path = "progress.rs"]
+pub mod progress;
 
 #[cfg(test)]
 #[path = "codex_rollout_tests.rs"]
