@@ -28,7 +28,30 @@ jobs:
       - name: Clippy
         run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked --all-targets -- -D warnings
       - name: Test
-        run: cargo test --manifest-path csr-engine/Cargo.toml --locked --no-fail-fast
+        # DIAGNOSTIC: one cargo invocation per target under `timeout`, so a target that hangs on Linux
+        # is named in the log (and the rest still run) instead of stalling the whole job.
+        run: |
+          cargo test --manifest-path csr-engine/Cargo.toml --locked --no-run
+          rc=0
+          run_target() {
+            echo "::group::$1"
+            timeout --signal=KILL "$2" cargo test --manifest-path csr-engine/Cargo.toml --locked "${@:3}"
+            status=$?
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then echo "::error::target $1 exited $status (137 = timed out)"; rc=1; fi
+            # a killed cargo leaves its test binary running; stop it so it cannot hold the step open
+            if [ "$status" -eq 137 ]; then pkill -KILL -f 'csr-engine/target/debug/' || true; fi
+          }
+          run_target lib 40m --lib
+          run_target bin 5m --bins
+          run_target doc 10m --doc
+          for f in csr-engine/tests/*.rs; do
+            t=$(basename "$f" .rs)
+            limit=20m
+            [ "$t" = pane_contract ] && limit=60m
+            run_target "$t" "$limit" --test "$t"
+          done
+          exit $rc
       - name: Installer tests
         run: node --test installer/tests/*.test.js
       - name: Verify npm package
