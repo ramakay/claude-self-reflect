@@ -1,136 +1,53 @@
-# CSR Documentation Site — Design System
+# Self-Reflect Documentation Site: Design System
 
-> Reference comp: `public/images/csr-bento-comp.png`
+Matches the marketing site: warm paper, near-black ink, one vermilion accent, hairline rules, Georgia display type. Source of truth for tokens is `src/index.css` (`@theme`, `[data-theme="dark"]`, and the "Brand layer" block at the end of the file).
 
-## Design Direction: Editorial Glassmorphic Bento
+## Direction
 
-**Anti-patterns (BANNED):**
-- Gradient text with hero sections
-- Neon/glow effects
-- Dark mode SaaS archetype
-- React component library aesthetics
-- "Get Started" buttons with arrow icons on gradient backgrounds
+- Editorial paper, not glass. Cards are flat, 1px hairline, 2px radius, no blur, no shadow.
+- One accent (vermilion). Sage stays as the positive state colour only.
+- Anatomy / hairline illustration style for figures: thin ink strokes on paper, vermilion for the one thing that matters.
+- Banned: gradient text, neon glow, sky photo backgrounds, glassmorphism, handwritten fonts.
+- Display name is "Self-Reflect". Package, repo and CLI names (`claude-self-reflect`, `csr-engine`) stay as they are.
 
-**Design language:**
-- Newspaper/editorial — each card tells a story
-- Glassmorphism on serene sky
-- Microcharts and sparklines with real data
-- Post-it notes as gentle ambient elements
-- Staggered reveal animations
+## Type
 
-## Typography
+| Role | Font | Notes |
+|------|------|-------|
+| Display / headings | Georgia, Times New Roman | weight 400, letter-spacing -0.035em |
+| Body / UI | system UI sans (`ui-sans-serif, system-ui, ...`) | no web fonts are loaded |
+| Code / metrics | `ui-monospace, SFMono-Regular, Menlo` | |
 
-| Role | Font | Weight | Size | Color |
-|------|------|--------|------|-------|
-| **Hero background** | Playfair Display | 900 | 6-8vw | #2a2a3e / 20% opacity |
-| **Card headlines** | Playfair Display | 700 | 1.25rem | #1a1a2e |
-| **Card body** | Inter | 400 | 0.875rem | #4a4a6a |
-| **Metrics** | JetBrains Mono | 500 | 1.75rem | #1a1a2e |
-| **Labels** | Inter | 500 | 0.7rem | #8a8aaa |
-| **Post-it text** | Caveat (handwritten) | 400 | 0.8rem | #4a4a6a |
+## Tokens
 
-## Color Palette
+| Token | Light | Dark |
+|-------|-------|------|
+| `--paper` (page) | #f5f2eb | #17140f |
+| `--paper-card` | #fdfbf6 | #211d18 |
+| `--paper-rule` (hairline) | #d8d2c8 | #3a352d |
+| `--color-ink` | #24211e | #f3eee4 |
+| `--color-body` | #3d3934 | #d6d0c4 |
+| `--color-muted` | #645f57 | #a39d92 |
+| `--vermilion` / `--color-purple` (accent alias) | #c8442a | #ec7557 |
+| `--color-sage` | #5f7a56 | #9dbb90 |
 
-| Name | Hex | Usage |
-|------|-----|-------|
-| Sky top | #e8e4f0 | Background gradient start |
-| Sky bottom | #c8cae0 | Background gradient end |
-| Glass white | rgba(255,255,255,0.65) | Card background |
-| Glass border | rgba(255,255,255,0.3) | Card border |
-| Charcoal | #1a1a2e | Headlines |
-| Slate | #4a4a6a | Body text |
-| Muted purple | #6b5b95 | Primary accent |
-| Dusty rose | #b5838d | Secondary accent |
-| Sage green | #7c9473 | Positive/success |
-| Amber cream | #d4a574 | Warning/optional |
-| Post-it lavender | #d8d0e8 | Post-it bg |
-| Post-it rose | #e8c8d0 | Post-it bg |
-| Post-it sage | #c8dcc0 | Post-it bg |
-| Post-it amber | #e8dcc0 | Post-it bg |
+`--color-purple` and `--color-rose` keep their names so existing selectors work; they now hold vermilion tones.
 
-## Card Styles
+## Logo and icons
 
-### Glassmorphic Card
-```css
-.glass-card {
-  background: rgba(255, 255, 255, 0.55);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  border-radius: 1.25rem;
-  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.05);
-}
-```
+Chosen mark: two facing profiles forming the S in a ring, R on the right.
 
-### Post-it Note
-```css
-.post-it {
-  background: linear-gradient(135deg, #d8d0e8 0%, #c8c0d8 100%);
-  border-radius: 4px;
-  padding: 0.5rem 0.75rem;
-  font-family: 'Caveat', cursive;
-  transform: rotate(-3deg);
-  box-shadow: 2px 2px 8px rgba(0,0,0,0.08);
-}
-```
+| File | Use |
+|------|-----|
+| `src/components/BrandMark.jsx` | inline SVG, takes `currentColor`, used in nav |
+| `public/favicon.svg` | ink tile, paper mark |
+| `public/favicon-32.png`, `public/apple-touch-icon.png` (180), `public/icon-512.png` | raster favicons |
+| `public/images/logo-icon.png` | 1024 tile |
+| `public/brand/self-reflect-mark.svg` | master vector |
+| `public/brand/self-reflect-mark-light-1024.png` | ink mark, transparent (for light backgrounds) |
+| `public/brand/self-reflect-mark-dark-1024.png` | paper mark, transparent (for dark backgrounds) |
+| `public/images/og-card.png` | 1200x630 social card |
 
-## Bento Grid Layout (8 cards)
+## Layout
 
-```
-┌───────────┬──────────┬─────────────┐
-│           │          │             │
-│  FORGET   │  0.7ms   │  6 HOOKS    │
-│  PROBLEM  │ latency  │  timeline   │
-│  (tall)   │          │             │
-├───────────┼──────────┼─────────────┤
-│           │ WANTED:  │ ENRICHMENT  │
-│  IMPORT   │ INSTALL  │  PIPELINE   │
-│  STATS    │ (ad)     │  3 layers   │
-└───────────┴──────────┴─────────────┘
-```
-
-## Animation Choreography
-
-| Element | Animation | Delay | Duration | Easing |
-|---------|-----------|-------|----------|--------|
-| Hero text | fade-in + slight scale | 0ms | 800ms | ease-out |
-| Card row 1 | slide-up + fade | 200ms stagger | 600ms | cubic-bezier(0.16,1,0.3,1) |
-| Card row 2 | slide-up + fade | 400ms stagger | 600ms | cubic-bezier(0.16,1,0.3,1) |
-| Sparklines | draw-in (path animation) | 800ms | 1200ms | ease-in-out |
-| Progress bars | width grow | 600ms | 800ms | ease-out |
-| Hook dots | pulse-in (scale 0→1) | 100ms stagger each | 400ms | spring |
-| Post-its | float-in + rotate | 1000ms | 500ms | ease-out |
-
-## Microcharts
-
-All sparklines use SVG `<polyline>` with real data points:
-- Search latency: [2.1, 1.8, 1.2, 0.9, 0.8, 0.7, 0.7] — declining trend
-- Memory retention: [100, 85, 60, 30, 10, 0] — decay curve
-- Import progress: filled bar at 100%
-
-## Interaction
-
-- **Hover on card**: subtle lift (translateY -2px) + border brightens
-- **Hover on post-it**: slight rotation change + scale 1.05
-- **Scroll**: cards revealed via IntersectionObserver with stagger
-- **Cursor**: default (no custom cursor for v1 — keep it clean)
-
-## File Structure
-
-```
-docs-site/
-├── src/
-│   ├── pages/Landing.jsx      # Bento dashboard
-│   ├── components/
-│   │   ├── GlassCard.jsx      # Reusable glass card
-│   │   ├── PostIt.jsx         # Post-it note component
-│   │   ├── Sparkline.jsx      # SVG sparkline
-│   │   ├── ProgressBar.jsx    # Animated progress bar
-│   │   └── HookTimeline.jsx   # 6-dot hook visualization
-│   └── hooks/useInView.js     # IntersectionObserver hook
-├── public/images/
-│   ├── design-comp-claude-1.png
-│   ├── csr-bento-comp.png     # Primary reference comp
-│   └── ...
-└── DESIGN_SYSTEM.md           # This file
-```
+Landing: in-flow hero (Georgia, vermilion sub-line), then the 12-column bento grid. Doc pages: left nav, 62ch prose column. Mobile: single column, touch targets 44px.

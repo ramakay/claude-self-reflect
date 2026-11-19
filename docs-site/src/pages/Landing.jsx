@@ -63,12 +63,12 @@ function PostIt({ children, className = '', bg = 'var(--color-amber-paper)', rot
 
 function HookTimeline() {
   const nodes = [
-    ['Start', 28, '#6b5b95'],
-    ['Prompt', 100, '#7c9473'],
-    ['ToolUse', 172, '#6b5b95'],
-    ['Stop', 244, '#7c9473'],
-    ['Compact', 316, '#6b5b95'],
-    ['End', 388, '#7c9473'],
+    ['Start', 28, '#c8442a'],
+    ['Prompt', 100, '#5f7a56'],
+    ['ToolUse', 172, '#c8442a'],
+    ['Stop', 244, '#5f7a56'],
+    ['Compact', 316, '#c8442a'],
+    ['End', 388, '#5f7a56'],
   ]
 
   return (
@@ -406,8 +406,8 @@ function ASTCard() {
     { name: 'Rust', color: 'var(--color-rose)' },
     { name: 'Python', color: 'var(--color-purple)' },
     { name: 'TS', color: 'var(--color-sage)' },
-    { name: 'JS', color: '#d4a574' },
-    { name: 'Go', color: '#5b7b95' },
+    { name: 'JS', color: '#a39d92' },
+    { name: 'Go', color: '#645f57' },
     { name: 'TSX', color: 'var(--color-purple)' },
   ]
 
@@ -501,7 +501,7 @@ function ArchCard() {
           <ASTTreeViz />
           <div className="ast-langs" style={{ marginTop: 6 }}>
             {['Rust','Python','TS','JS','Go','TSX'].map(name => {
-              const colors = { Rust: 'var(--color-rose)', Python: 'var(--color-purple)', TS: 'var(--color-sage)', JS: '#d4a574', Go: '#5b7b95', TSX: 'var(--color-purple)' }
+              const colors = { Rust: 'var(--color-rose)', Python: 'var(--color-purple)', TS: 'var(--color-sage)', JS: '#a39d92', Go: '#645f57', TSX: 'var(--color-purple)' }
               return <span key={name} className="ast-lang" style={{ borderColor: colors[name], color: colors[name] }}>{name}</span>
             })}
           </div>
@@ -516,13 +516,13 @@ function ArchCard() {
           <TechBadge name="FastEmbed" abbr="384-dim local vectors" color="var(--color-sage)" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><rect x="4" y="8" width="3" height="10" rx="1" fill="currentColor" opacity="0.5" /><rect x="10.5" y="4" width="3" height="14" rx="1" fill="currentColor" opacity="0.7" /><rect x="17" y="10" width="3" height="8" rx="1" fill="currentColor" opacity="0.5" /></svg>
           } />
-          <TechBadge name="SQLite" abbr="embedded storage" color="#d4a574" icon={
+          <TechBadge name="SQLite" abbr="embedded storage" color="#a39d92" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><ellipse cx="12" cy="7" rx="8" ry="3" fill="none" stroke="currentColor" strokeWidth="1.4" /><path d="M4 7v10c0 1.66 3.58 3 8 3s8-1.34 8-3V7" fill="none" stroke="currentColor" strokeWidth="1.4" /><path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3" fill="none" stroke="currentColor" strokeWidth="1.2" opacity="0.5" /></svg>
           } />
           <TechBadge name="ast-grep" abbr="6-language AST parser" color="var(--color-purple)" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 4v4M12 8l-5 4M12 8l5 4M7 12v4M17 12v4M7 16l-2 3M7 16l2 3M17 16l-2 3M17 16l2 3" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></svg>
           } />
-          <TechBadge name="rmcp" abbr="MCP protocol (16 tools)" color="#5b7b95" icon={
+          <TechBadge name="rmcp" abbr="MCP protocol (16 tools)" color="#645f57" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><rect x="3" y="9" width="7" height="6" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.3" /><rect x="14" y="9" width="7" height="6" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.3" /><line x1="10" y1="12" x2="14" y2="12" stroke="currentColor" strokeWidth="1.3" /><circle cx="12" cy="12" r="1.2" fill="currentColor" /></svg>
           } />
         </div>
@@ -813,114 +813,6 @@ function ThemeToggle({ theme, setTheme }) {
   )
 }
 
-function LogoPreviews() {
-  return (
-    <section className="logo-previews" aria-label="Logo concept previews">
-      <div className="go-deeper__heading">
-        <span />
-        <h2>Logo concepts</h2>
-        <span />
-      </div>
-      <div className="logo-grid">
-        {/* 1. Recursive Mirror */}
-        <div className="logo-option">
-          <div className="logo-option__mark">
-            <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M7 6h12a6 6 0 0 1 6 6v13H13a6 6 0 0 1-6-6V6Z" strokeWidth="3"/>
-              <path d="M14 12h5a3 3 0 0 1 3 3v6h-5a3 3 0 0 1-3-3v-6Z" strokeWidth="2.5"/>
-              <path d="M9 24 24 9" strokeWidth="2.25"/>
-            </svg>
-          </div>
-          <strong>Recursive Mirror</strong>
-          <span>Nested echo — reflection within reflection</span>
-        </div>
-
-        {/* 2. Memory Spiral */}
-        <div className="logo-option">
-          <div className="logo-option__mark">
-            <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M22 7c-3-2-8-2-11 1-4 3-5 9-2 13 3 5 10 6 14 2 4-3 4-9 1-12-3-3-8-3-11 0-2 2-2 6 0 8 2 3 6 3 8 1 2-2 2-5 0-7-1-1-3-1-5 0" strokeWidth="3"/>
-              <circle cx="16" cy="16" r="2.5" fill="currentColor" stroke="none"/>
-            </svg>
-          </div>
-          <strong>Memory Spiral</strong>
-          <span>Conversation memory coiling inward</span>
-        </div>
-
-        {/* 3. Infinity Recall */}
-        <div className="logo-option">
-          <div className="logo-option__mark">
-            <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M5 16c3-6 8-6 11 0s8 6 11 0c-3-6-8-6-11 0S8 22 5 16Z" strokeWidth="3"/>
-              <circle cx="16" cy="16" r="3" fill="currentColor" stroke="none"/>
-              <path d="M16 9v3M16 20v3" strokeWidth="2.5"/>
-            </svg>
-          </div>
-          <strong>Infinity Recall</strong>
-          <span>Continuous loop — memory never ends</span>
-        </div>
-
-        {/* 4a. Isometric Mirror — clean */}
-        <div className="logo-option">
-          <div className="logo-option__mark">
-            <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
-              {/* Back face — faded reflection */}
-              <path d="M16 4 L28 10 L28 22 L16 28 Z" strokeWidth="2" opacity="0.25" fill="currentColor"/>
-              {/* Front face — solid mirror */}
-              <path d="M4 10 L16 4 L16 28 L4 22 Z" strokeWidth="2.5"/>
-              {/* Inner reflection of front face — smaller echo */}
-              <path d="M8 13 L14 10 L14 22 L8 19 Z" strokeWidth="1.5" opacity="0.4"/>
-              {/* Self dot at hinge */}
-              <circle cx="16" cy="16" r="2.2" fill="currentColor" stroke="none"/>
-            </svg>
-          </div>
-          <strong>Mirror — Echo</strong>
-          <span>Nested reflection inside the front face</span>
-        </div>
-
-        {/* 4b. Isometric Mirror — open book */}
-        <div className="logo-option">
-          <div className="logo-option__mark">
-            <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
-              {/* Left page */}
-              <path d="M16 6 L4 11 L4 24 L16 28 Z" strokeWidth="2.5"/>
-              {/* Right page — reflection, lighter */}
-              <path d="M16 6 L28 11 L28 24 L16 28 Z" strokeWidth="2" opacity="0.3" fill="currentColor"/>
-              {/* Left inner lines — content */}
-              <line x1="7" y1="14" x2="14" y2="11.5" strokeWidth="1.4" opacity="0.35"/>
-              <line x1="7" y1="17.5" x2="14" y2="15" strokeWidth="1.4" opacity="0.25"/>
-              <line x1="7" y1="21" x2="14" y2="18.5" strokeWidth="1.4" opacity="0.15"/>
-              {/* Spine glow */}
-              <circle cx="16" cy="17" r="1.8" fill="currentColor" stroke="none" opacity="0.7"/>
-            </svg>
-          </div>
-          <strong>Mirror — Book</strong>
-          <span>Open book reflecting its own pages</span>
-        </div>
-
-        {/* 4c. Isometric Mirror — folded */}
-        <div className="logo-option">
-          <div className="logo-option__mark">
-            <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
-              {/* Left face */}
-              <path d="M16 5 L4 12 L4 23 L16 27 Z" strokeWidth="2.5"/>
-              {/* Right face — the reflection */}
-              <path d="M16 5 L28 12 L28 23 L16 27 Z" strokeWidth="2" opacity="0.20"/>
-              {/* Reflected silhouette on right — echoing left shape */}
-              <path d="M18 10 L25 13.5 L25 21 L18 24 Z" fill="currentColor" opacity="0.08" strokeWidth="0"/>
-              {/* Center hinge — bright */}
-              <line x1="16" y1="5" x2="16" y2="27" strokeWidth="2.5" opacity="0.6"/>
-              <circle cx="16" cy="16" r="2.5" fill="currentColor" stroke="none"/>
-            </svg>
-          </div>
-          <strong>Mirror — Hinge</strong>
-          <span>Two faces meeting at a bright spine</span>
-        </div>
-      </div>
-    </section>
-  )
-}
-
 function GoDeeper() {
   const links = [
     ['Guide', '/docs/why-csr', 'Learn concepts, workflows, and best practices.'],
@@ -1026,7 +918,7 @@ export default function Landing() {
         </div>
       </header>
 
-      <div className="hero-watermark" aria-hidden="true">
+      <div className="hero-watermark">
         <h1 className="hero-watermark__title">Claude looks back at its own work</h1>
         <p className="hero-watermark__subtext">so you don't have to re-explain it.</p>
       </div>
