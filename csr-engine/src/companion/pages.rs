@@ -482,10 +482,14 @@ fn last_section(s: &Value, now: f64, rows: usize) -> Option<Value> {
     let f = &s["last_session"];
     let id = f["id"].as_str()?;
     let id8 = id.chars().take(8).collect::<String>();
+    // Facts kept before pastes were skipped can still hold one as the last prompt.
+    let typed = f["typed"][1]
+        .as_str()
+        .filter(|t| !super::paste::is_paste(t));
     let title = one_line(
         f["title"]
             .as_str()
-            .or_else(|| f["typed"][1].as_str())
+            .or(typed)
             .unwrap_or(&format!("session {id8}")),
         200,
     );
@@ -567,7 +571,7 @@ fn last_section(s: &Value, now: f64, rows: usize) -> Option<Value> {
             }
         )
     };
-    if let Some(text) = f["typed"][1].as_str() {
+    if let Some(text) = typed {
         detail.push(format!("You last: {}", quoted(text)));
     }
     if let Some(text) = f["said"][1].as_str() {

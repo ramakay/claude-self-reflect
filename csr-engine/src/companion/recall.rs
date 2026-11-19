@@ -60,6 +60,16 @@ pub fn story_prose(text: &str) -> Option<String> {
             rest => format!("{before}. {rest}"),
         };
     }
+    // A story synthesized before pastes were skipped opens with the pasted request (a router
+    // status page) copied in as its first sentence: that sentence goes.
+    let first_end = [". ", "? ", "! "]
+        .iter()
+        .filter_map(|end| prose.find(end))
+        .min()
+        .map_or(prose.len(), |at| at + 1);
+    if super::paste::is_paste(&prose[..first_end]) {
+        prose = prose[first_end..].trim_start().to_owned();
+    }
     let raw = ["{\"", "\":", "[{"].iter().any(|mark| prose.contains(mark));
     (!prose.is_empty() && !raw).then_some(prose)
 }
@@ -540,10 +550,14 @@ pub fn load_changes(
             &[json!(c.conversation)],
         );
         let seen = rows.first();
-        let prompt = titles.get(&c.conversation).map(String::as_str).or_else(|| {
-            seen.and_then(|r| r[0].as_str())
-                .filter(|s| !s.is_empty() && !s.starts_with('/'))
-        });
+        let prompt = titles
+            .get(&c.conversation)
+            .map(String::as_str)
+            .or_else(|| {
+                seen.and_then(|r| r[0].as_str())
+                    .filter(|s| !s.is_empty() && !s.starts_with('/'))
+            })
+            .filter(|p| !super::paste::is_paste(p));
         c.title = prompt.map(title_of).unwrap_or_else(|| {
             format!(
                 "session {}",
@@ -597,6 +611,20 @@ mod tests {
         // Prose that only mentions a signature stays as it is.
         let prose = "We verify the release. Signature: Ed25519 with key id K1.";
         assert_eq!(story_prose(prose).as_deref(), Some(prose));
+    }
+    /// A story stored before pastes were skipped, its request a pasted router page: the story
+    /// card shows what is left, and nothing when nothing is.
+    #[test]
+    fn a_story_never_opens_with_a_pasted_request() {
+        let router = "Firmware=V7.2.8.8_5.1.24 RegionTag=RBRE960_NA Region=us Model=RBRE960 \
+                      InternetConnectionStatus=Up SOAPVersion=3.46";
+        assert_eq!(
+            story_prose(&format!("{router}. Partially completed")).as_deref(),
+            Some("Partially completed")
+        );
+        assert_eq!(story_prose(router), None);
+        let asked = "Why does the router drop the link? Fixed the retry loop.";
+        assert_eq!(story_prose(asked).as_deref(), Some(asked));
     }
     #[test]
     fn repeated_retrievals_look_up_each_conversation_once_per_frame() {
