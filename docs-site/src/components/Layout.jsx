@@ -249,6 +249,8 @@ export default function Layout() {
             <span>Search</span>
             <kbd>⌘K</kbd>
           </button>
+          {/* The header hides its links on a narrow screen; the version switch stays reachable here */}
+          <div className="lg:hidden mb-[12px]"><VersionSwitcher location={location} /></div>
           <Link to="/" className="flex items-center gap-[6px] px-[12px] py-[6px] mb-[12px] type-caption hover:text-[var(--color-ink)] rounded-lg hover:bg-white/20">
             <ArrowLeft size={11} /> Home
           </Link>
