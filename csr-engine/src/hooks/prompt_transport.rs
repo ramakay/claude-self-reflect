@@ -861,7 +861,11 @@ mod tests {
             .unwrap();
         Arc::new(Engine::from_parts_with_index_dir(
             storage,
-            Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            Arc::new(
+                crate::embeddings::EmbeddingEngine::new()
+                    .unwrap()
+                    .with_probe_dir(dir),
+            ),
             Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
                 10,
             ))),
@@ -995,8 +999,8 @@ mod tests {
         let content =
             "Token validation regression was fixed by refreshing expired credentials before retry.";
         seed_solution(&engine, dir.path(), content, vector).await;
-        // Uncommitted: a committed render would mark the item delivered to this
-        // session, and the socket render would rightly not send it again.
+        // Warm the intent-probe cache as well as the model. An uncommitted
+        // render leaves the item eligible for delivery over the socket.
         let expected = super::super::prompt_submit::render_uncommitted(&input, &engine, dir.path())
             .await
             .unwrap();
@@ -1143,7 +1147,7 @@ mod tests {
             vector,
         )
         .await;
-        // Uncommitted, so the socket render below is not a repeat delivery.
+        // Warm the intent-probe cache without recording a delivery.
         let expected = super::super::prompt_submit::render_uncommitted(&input, &engine, dir.path())
             .await
             .unwrap();
@@ -1151,19 +1155,18 @@ mod tests {
             expected.contains("refreshing expired credentials"),
             "{expected}"
         );
-        let storage = engine.storage().clone();
-        let events = |storage: &crate::storage::Storage| -> i64 {
-            storage
-                .with_connection(|conn| {
-                    Ok(
-                        conn.query_row("SELECT COUNT(*) FROM retrieval_events", [], |row| {
-                            row.get(0)
-                        })?,
-                    )
+        // A separate WAL reader can query while the receipt writer is blocked.
+        let reader =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let events = || -> i64 {
+            reader
+                .query_row("SELECT COUNT(*) FROM retrieval_events", [], |row| {
+                    row.get(0)
                 })
                 .unwrap()
         };
-        let before = events(&storage);
+        let before = events();
         let shutdown = Arc::new(AtomicBool::new(false));
         let server = spawn_for_daemon(engine, shutdown.clone());
         ready(dir.path()).await;
@@ -1180,7 +1183,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert_eq!(first, Some(expected));
+        assert_eq!(first.as_ref(), Some(&expected));
         let started = Instant::now();
         let mut second = None;
         while started.elapsed() < Duration::from_millis(1500) {
@@ -1194,17 +1197,19 @@ mod tests {
             second.is_some(),
             "a prompt was refused while receipts waited for the writer"
         );
-        assert_eq!(events(&storage), before, "receipts cannot have landed yet");
+        assert_eq!(second, Some(expected));
+        assert_eq!(events(), before, "receipts cannot have landed yet");
 
         // Once the writer commits, the receipts land: none were dropped.
         writer.execute_batch("COMMIT").unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while events(&storage) <= before {
+            while events() < before + 2 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("the retrieval events of the first reply were written");
+        .expect("the retrieval events of both replies were written");
+        assert_eq!(events(), before + 2);
         shutdown.store(true, Ordering::SeqCst);
         server.await.unwrap();
     }

@@ -593,6 +593,7 @@ impl Ink {
 pub struct Pill {
     pub size: f32,
     pub lines: Vec<Vec<Vec<Run>>>,
+    gap: f32,
 }
 
 // ---------------------------------------------------------------- widgets
@@ -1313,6 +1314,7 @@ pub fn draw_card(
     Some(c.pm)
 }
 const PILL_GAP: f32 = 10.;
+const COMPACT_PILL_GAP: f32 = 6.;
 fn pill_width(p: &Pill, f: &CardFonts) -> f32 {
     let line = |groups: &Vec<Vec<Run>>| {
         let mut w = 0.;
@@ -1326,7 +1328,7 @@ fn pill_width(p: &Pill, f: &CardFonts) -> f32 {
                 );
             }
             if gi + 1 < groups.len() {
-                w += PILL_GAP;
+                w += p.gap;
             }
         }
         w
@@ -1395,7 +1397,7 @@ pub fn draw_pill(
                 );
             }
             if gi + 1 < groups.len() {
-                px0 += PILL_GAP;
+                px0 += p.gap;
             }
         }
     }
@@ -1860,20 +1862,23 @@ pub fn pill_of(
     avail: f32,
     f: &CardFonts,
 ) -> Option<Pill> {
-    // the dreams go first when room is short: they are on the info view's dreams card too
-    for (size, short_form, with_dreams) in [
-        (12., false, true),
-        (12., false, false),
-        (12., true, true),
-        (12., true, false),
-        (11., true, true),
-        (11., true, false),
+    // The dreams go first when room is short: they are on the info view's dreams card too.
+    // Wider font faces can need tighter spacing even with the shortest labels.
+    for (size, short_form, with_dreams, gap) in [
+        (12., false, true, PILL_GAP),
+        (12., false, false, PILL_GAP),
+        (12., true, true, PILL_GAP),
+        (12., true, false, PILL_GAP),
+        (11., true, true, PILL_GAP),
+        (11., true, false, PILL_GAP),
+        (11., true, true, COMPACT_PILL_GAP),
+        (11., true, false, COMPACT_PILL_GAP),
     ] {
         let lines = pill_lines(g, csr, dreams.filter(|_| with_dreams), short_form);
         if lines.is_empty() {
             return None;
         }
-        let pill = Pill { size, lines };
+        let pill = Pill { size, lines, gap };
         if pill_width(&pill, f) + 2. * MARGIN <= avail {
             return Some(pill);
         }

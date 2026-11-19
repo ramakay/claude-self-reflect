@@ -115,7 +115,7 @@ incremental = true
 debug-assertions = false
 overflow-checks = false
 
-# CI's `cargo test` uses the dev profile. Optimize third-party crates there too, so latency tests
+# Plain `cargo test` uses the dev profile. Optimize third-party crates there too, so latency tests
 # (hnsw_rs probes, tiny-skia pictures) run the dependency code optimized, as in release builds;
 # csr-engine's own code stays unoptimized and keeps its debug checks.
 # Without it, below_floor_probes_stay_under_five_ms_at_p95 read p95 12.6 ms against its 5 ms bar.

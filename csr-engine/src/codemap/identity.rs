@@ -673,8 +673,8 @@ fn core_entries(text: &str) -> Vec<(String, String)> {
 
 /// The user's global excludes file, if it is safe to read: `core.excludesfile`
 /// from a plain `<home>/.gitconfig` (no includes; `~/` expanded; an absolute
-/// path only), else the XDG default `$XDG_CONFIG_HOME/git/ignore` or
-/// `<home>/.config/git/ignore`, as git decides. The path is run through
+/// path only), else `<home>/.config/git/ignore`. The process's
+/// `$XDG_CONFIG_HOME` applies only to its own home. The path is run through
 /// `resolve_safe`: one that leads into a protected folder is dropped, and
 /// nothing protected is opened. This replaces the `ignore` crate's own global
 /// loading (`git_global`), which reads those files with plain opens. No git
@@ -694,9 +694,11 @@ pub(crate) fn global_excludes_file(home: Option<&Path>) -> Option<PathBuf> {
             Some(rest) => home.join(rest),
             None => PathBuf::from(v),
         },
-        None => std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|x| !x.is_empty())
+        None => (home_dir().as_deref() == Some(home))
+            .then(|| std::env::var_os("XDG_CONFIG_HOME"))
+            .flatten()
             .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
             .unwrap_or_else(|| home.join(".config"))
             .join("git")
             .join("ignore"),

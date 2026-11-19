@@ -973,13 +973,12 @@ fn the_visit_budget_stops_a_walk_over_many_non_code_entries_and_marks_the_view_t
     write(&main, "a.py", &py(&["alpha"]));
     fx.commit_all(&main, "init");
     // 150 untracked entries that are walkable but never code files, spread over
-    // directories, plus a code file that sorts after all of them.
+    // directories. Only the visit budget can stop the walk.
     for d in 0..15 {
         for f in 0..10 {
             write(&main, &format!("docs{d:02}/n{f}.txt"), "not code\n");
         }
     }
-    write(&main, "zzz_late.py", &py(&["late"]));
     let conn = db();
     let mut o = opts(&fx);
     o.max_files_per_view = 5;
@@ -997,6 +996,7 @@ fn the_visit_budget_stops_a_walk_over_many_non_code_entries_and_marks_the_view_t
     );
     assert!(found.stopped);
     assert_eq!(found.visited, budget);
+    assert_eq!(found.observed, budget + 1);
     assert!(found.files.is_empty(), "{:?}", found.files);
 
     let report = scan_repo(&conn, &common_of(&main), &o).unwrap();
@@ -1115,7 +1115,6 @@ fn a_flat_directory_larger_than_the_budget_stops_the_walk_at_the_budget() {
     for i in 0..budget + 40 {
         write(&main, &format!("flat/n{i:04}"), "");
     }
-    write(&main, "zzz.py", &py(&["late"]));
     let found = collect_walk(
         &main,
         &common_of(&main),
@@ -1126,7 +1125,8 @@ fn a_flat_directory_larger_than_the_budget_stops_the_walk_at_the_budget() {
         budget,
     );
     assert!(found.stopped);
-    assert!(found.visited <= budget, "visited {}", found.visited);
+    assert_eq!(found.visited, budget);
+    assert_eq!(found.observed, budget + 1);
     assert!(found.files.is_empty(), "{:?}", found.files);
 }
 
@@ -1141,8 +1141,8 @@ fn entries_the_filter_rejects_count_toward_the_budget() {
     // view), so none is ever yielded. The walk must still run out of budget.
     for i in 0..budget + 30 {
         write(&main, &format!("pkgs/r{i:04}/.git"), "gitdir: nowhere\n");
+        write(&main, &format!("pkgs/r{i:04}/nested.py"), &py(&["nested"]));
     }
-    write(&main, "zzz.py", &py(&["late"]));
     let found = collect_walk(
         &main,
         &common_of(&main),
@@ -1153,7 +1153,8 @@ fn entries_the_filter_rejects_count_toward_the_budget() {
         budget,
     );
     assert!(found.stopped, "rejected entries were never counted");
-    assert!(found.visited <= budget, "visited {}", found.visited);
+    assert_eq!(found.visited, budget);
+    assert_eq!(found.observed, budget + 1);
     assert!(found.files.is_empty(), "{:?}", found.files);
 }
 

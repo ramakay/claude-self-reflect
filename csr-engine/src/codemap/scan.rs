@@ -536,6 +536,9 @@ pub(super) struct WalkOutcome {
     /// Read by the tests that prove the budget holds.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) visited: usize,
+    /// Includes the first entry past the budget that tells the walker to stop.
+    #[cfg(test)]
+    pub(super) observed: usize,
 }
 
 /// The walker the full scan's untracked pass and the directory-event pass share:
@@ -690,6 +693,8 @@ pub(super) fn collect_walk(
         files: Vec::new(),
         stopped: false,
         visited: 0,
+        #[cfg(test)]
+        observed: 0,
     };
     // Shared with the walker's `filter_entry`, which counts every entry the
     // crate offers it (kept or rejected); the walk is over once it passes the
@@ -746,6 +751,10 @@ pub(super) fn collect_walk(
         out.files.push(rel.to_string());
     }
     let seen = counter.load(Ordering::Relaxed);
+    #[cfg(test)]
+    {
+        out.observed = seen;
+    }
     out.stopped |= seen > visit_budget;
     out.visited = seen.min(visit_budget);
     // The walker is not sorted (see `untracked_walk`): put what was kept in path

@@ -87,6 +87,17 @@ fn the_pill_keeps_every_fact_of_the_text_masthead_at_46_and_33_columns() {
     ahead["quotas"][0]["text"] = json!("7D 80% \u{21bb}Sun 09:00");
     let pill = pill_of(&ahead, 0, None, 360., f).unwrap();
     assert!(said(&pill).contains("7D 80%\u{bb}"), "{}", said(&pill));
+
+    // Drop below the normal spacing's measured width on any installed font.
+    let normal = Pill {
+        size: 11.,
+        lines: pill_lines(&g, 2, None, true),
+        gap: PILL_GAP,
+    };
+    let avail = pill_width(&normal, f) + 2. * MARGIN - 1.;
+    let compact = pill_of(&g, 2, None, avail, f).expect("tight spacing fits");
+    assert_eq!(compact.lines, normal.lines);
+    assert_eq!(compact.gap, COMPACT_PILL_GAP);
 }
 #[test]
 fn a_pill_fact_with_no_data_drops_and_no_data_means_no_pill() {
