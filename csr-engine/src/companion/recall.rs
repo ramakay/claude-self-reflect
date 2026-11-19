@@ -139,6 +139,20 @@ fn gist(text: &str) -> String {
     };
     c.to_uppercase().collect::<String>() + chars.as_str()
 }
+/// The remembered list's title for `text`, which also goes into what the pane types into Claude:
+/// the gist of its prose through [`story_prose`], or None when what is left is still a signature
+/// block, raw JSON, markup or a paste, so the caller takes its next source.
+fn shown_title(text: &str) -> Option<String> {
+    let title = gist(&story_prose(&one_line(text, usize::MAX))?);
+    let markup = title.starts_with(['#', '<', '{', '[', '|', '>'])
+        || title.starts_with("---")
+        || title.contains("Signature:");
+    (!title.is_empty()
+        && !markup
+        && story_prose(&title).is_some()
+        && !super::paste::is_paste(&title))
+    .then_some(title)
+}
 pub fn rules(db: &Db, s: &Value, root: &str, most: usize) -> (Vec<Value>, f64) {
     let sid = string(&s["id"]);
     let mut rules = vec![];
@@ -321,7 +335,15 @@ fn recalled_groups(db: &Db, s: &Value) -> BTreeMap<String, Value> {
             let Some(r) = rows.first() else {
                 continue;
             };
-            (gist(string(&r[0])), epoch(string(&r[1])), String::new())
+            let content = string(&r[0]);
+            let title = shown_title(content).unwrap_or_else(|| {
+                if content.trim().is_empty() {
+                    String::new()
+                } else {
+                    "A saved reflection".into()
+                }
+            });
+            (title, epoch(string(&r[1])), String::new())
         } else {
             let rows = db.query(
                 "select first_prompt,first_ts,last_ts,project from \
@@ -335,7 +357,11 @@ fn recalled_groups(db: &Db, s: &Value) -> BTreeMap<String, Value> {
                     limit 1",
                 &[json!(format!("%conv_{conversation}%"))],
             );
-            let extracted = if story.is_null() {
+            // Each source goes through the sanitizer; one that is still a signature block, raw
+            // JSON or a paste after it gives way to the next. The extraction is read only when
+            // no story passes, and only its request, never the raw text.
+            let from_story = story.as_str().and_then(shown_title);
+            let extracted = if from_story.is_none() {
                 db.scalar(
                     "select content from reflections where id=?",
                     &[json!(format!("extracted_v3_{conversation}"))],
@@ -343,16 +369,36 @@ fn recalled_groups(db: &Db, s: &Value) -> BTreeMap<String, Value> {
             } else {
                 Value::Null
             };
-            let title = story
-                .as_str()
-                .or(extracted.as_str())
+            let prompt = seen
+                .and_then(|r| r[0].as_str())
+                .filter(|s| !s.trim_start().starts_with(['[', '<', '/']));
+            let some_source = [story.as_str(), extracted.as_str(), prompt]
+                .iter()
+                .flatten()
+                .any(|s| !s.trim().is_empty());
+            let title = from_story
                 .or_else(|| {
-                    seen.and_then(|r| r[0].as_str())
-                        .filter(|s| !s.trim_start().starts_with(['[', '<', '/']))
+                    extracted
+                        .as_str()
+                        .and_then(crate::extraction::story::request_of)
+                        .as_deref()
+                        .and_then(shown_title)
                 })
-                .unwrap_or("");
+                .or_else(|| prompt.and_then(shown_title))
+                .unwrap_or_else(|| {
+                    // Something was there but none of it reads as prose: a neutral title keeps
+                    // the row, as the page names a session it knows nothing else about.
+                    if some_source {
+                        format!(
+                            "session {}",
+                            conversation.chars().take(8).collect::<String>()
+                        )
+                    } else {
+                        String::new()
+                    }
+                });
             (
-                gist(title),
+                title,
                 seen.and_then(|r| {
                     epoch(if string(&r[2]).is_empty() {
                         string(&r[1])
@@ -625,6 +671,81 @@ mod tests {
         assert_eq!(story_prose(router), None);
         let asked = "Why does the router drop the link? Fixed the retry loop.";
         assert_eq!(story_prose(asked).as_deref(), Some(asked));
+    }
+    /// A recalled conversation with an extraction but no story, or a story stored before the
+    /// sanitizer: the remembered title (and so what the pane types into Claude) was
+    /// `## User Request what did we work on lately? --- Signature: {"completion_status":…`.
+    #[test]
+    fn a_remembered_title_never_shows_the_signature_block_or_raw_json() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let v3 = "## User Request\nwhat did we work on lately?\n\n---\nSignature: \
+                  {\"completion_status\":\"partial\",\"confidence\":\"MEDIUM\",\"frameworks\":[]}\
+                  \nContext:\nnone";
+        let router = "Firmware=V7.2.8.8_5.1.24 RegionTag=RBRE960_NA Region=us Model=RBRE960";
+        let title = |story: Option<&str>, extracted: Option<&str>, prompt: Option<&str>| {
+            let d = tempfile::tempdir().unwrap();
+            let paths = Paths::new(d.path().into());
+            std::fs::create_dir_all(paths.db.parent().unwrap()).unwrap();
+            let con = rusqlite::Connection::open(&paths.db).unwrap();
+            con.execute_batch(include_str!("../../tests/fixtures/companion/home.sql"))
+                .unwrap();
+            con.execute(
+                "insert into session_registry values(?1,'project',?2,?3,?3)",
+                rusqlite::params![id, prompt, "2026-10-18T00:00:00Z"],
+            )
+            .unwrap();
+            if let Some(story) = story {
+                con.execute(
+                    "insert into reflections values('story_x',?1,?2,'2026-10-18T00:00:00Z')",
+                    [story, &format!(r#"["session_story", "conv_{id}"]"#)],
+                )
+                .unwrap();
+            }
+            if let Some(v3) = extracted {
+                con.execute(
+                    "insert into reflections values(?1,?2,'[]','2026-10-18T00:00:00Z')",
+                    [&format!("extracted_v3_{id}"), v3],
+                )
+                .unwrap();
+            }
+            con.execute(
+                "insert into chunks(id,conversation_id) values('c0',?1)",
+                [id],
+            )
+            .unwrap();
+            con.execute(
+                "insert into retrieval_events values('live','2026-10-18T01:00:00Z','chunk','c0')",
+                [],
+            )
+            .unwrap();
+            drop(con);
+            let db = Db::open(&paths).unwrap();
+            let s = json!({"id":"live","questions":[[1800000000,"recall",id]]});
+            string(&remembered(&db, &s)[0]["title"]).to_owned()
+        };
+        // An extraction, no story: its request, never the raw text.
+        assert_eq!(title(None, Some(v3), None), "What did we work on lately?");
+        // A story stored before the sanitizer, cut mid-JSON.
+        assert_eq!(
+            title(Some(STORED), None, None),
+            "What did we work on lately?"
+        );
+        // A story that is nothing but raw JSON gives way to the extraction, then the prompt.
+        let raw = r#"{"completion_status":"partial","confidence":"MEDIUM"}"#;
+        assert_eq!(
+            title(Some(raw), Some(v3), None),
+            "What did we work on lately?"
+        );
+        assert_eq!(
+            title(Some(raw), None, Some("Fix the reader")),
+            "Fix the reader"
+        );
+        // Nothing that reads as prose: a neutral title, never the paste or the markup.
+        let pasted = format!("## User Request\n{router}\n\n---\nSignature: {{\"a\":1}}");
+        assert_eq!(
+            title(Some(raw), Some(&pasted), Some(router)),
+            "session aaaaaaaa"
+        );
     }
     #[test]
     fn repeated_retrievals_look_up_each_conversation_once_per_frame() {

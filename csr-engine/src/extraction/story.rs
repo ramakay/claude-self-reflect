@@ -100,6 +100,13 @@ pub fn synthesize_story_from_v3(v3_content: &str, project: &str) -> Option<Strin
     Some(capped)
 }
 
+/// The request a V3 extraction holds (its `## User Request` section, cleaned as the story
+/// cleans it), or None when there is none or it was a paste. Never the signature block.
+pub fn request_of(v3_content: &str) -> Option<String> {
+    let request = clean_request_text(&extract_section(v3_content, "## User Request")?);
+    (!request.is_empty() && !crate::companion::paste::is_paste(&request)).then_some(request)
+}
+
 /// Synthesize a story from heuristic enrichment data.
 pub fn synthesize_story_from_heuristic(heuristic: &str, project: &str) -> String {
     let tools = extract_heuristic_field(heuristic, "Tools:");
