@@ -39,3 +39,6 @@ Display name: no "Claude Self-Reflect" in display copy was found in src/ (remain
 ## Verification
 Dev server on 4194 (headless agent-browser). Shots in `.brand-shots/` (git-excluded): before-* (landing + features, hooks, installation, light/dark, 1440x900 and 390x844 full page) and after1..after5 (landing top/mid, content pages). Two look-fix rounds: round 1 found the hero title colliding with the cards (fixed by moving it in flow) and a transform-override from the old hero animation (fixed); round 2 checked landing and three content pages in both themes on desktop and mobile.
 `npm run build`: passes.
+
+## Commits
+99e7a4eb favicon/mark/og assets; 4f86d5cf theme + hero; 8386491b this file.
