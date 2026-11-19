@@ -73,7 +73,7 @@ function packageVersion() {
 
 function help() {
   const version = packageVersion();
-  console.log(`\nSelf-Reflect${version ? ` v${version}` : ''} - Searchable memory for Claude\n`);
+  console.log(`\nSelf-Reflect${version ? ` v${version}` : ''} - Claude reflects on its own work\n`);
   console.log('Usage: claude-self-reflect <command>\n');
   console.log('Commands:');
   for (const [cmd, desc] of Object.entries(commands)) {

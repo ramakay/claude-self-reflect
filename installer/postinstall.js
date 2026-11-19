@@ -362,8 +362,8 @@ async function main() {
   const tag = `v${pkgVersion}`;
 
   if (pythonSignals.length > 0) {
-    console.log('\n  \x1b[1;33mUpgrading from Python CSR to v8.0 (Rust)\x1b[0m');
-    console.log('  v8.0 replaces Docker + Python + Qdrant with a single binary (about 135 MB).');
+    console.log(`\n  \x1b[1;33mUpgrading from Python CSR to v${pkgVersion} (Rust)\x1b[0m`);
+    console.log('  One csr-engine binary (about 138 MB) replaces Docker, Python and Qdrant.');
     console.log('  Your conversation data is preserved.\n');
   }
 
@@ -382,8 +382,8 @@ async function main() {
   if (plan.reason === 'different') {
     console.log(`  Replacing ${destPath} (${plan.installedVersion}) with ${pkgVersion}...`);
   } else if (plan.reason === 'unknown') {
-    // Pre-10.1 binaries have no --version flag, so "unknown" is the normal
-    // answer on the first upgrade past this release.
+    // Binaries older than 9.5.8 have no --version flag, so "unknown" is the
+    // normal answer when upgrading from one of them.
     console.log(`  Replacing ${destPath} (version unknown) with ${pkgVersion}...`);
   }
 

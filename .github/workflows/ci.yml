@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # release.yml calls this workflow as its test job, so a release is tested exactly as CI tests a PR.
+  workflow_call:
 
 permissions:
   contents: read
