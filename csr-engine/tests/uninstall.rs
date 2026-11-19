@@ -47,11 +47,20 @@ exit 0"#;
 
 /// `launchctl`: `print` answers from `FAKE_LOADED` (the plist the job was loaded from; empty means
 /// no such job) until `bootout` has run; `BOOTOUT_FAIL` and `PRINT_FAIL` make those calls fail.
+/// `DAEMON_PID` is the job's process: `print` names it, and after `bootout` keeps the job loaded
+/// (launchd's "SIGTERMed" state) for as long as that process lives. A `print` after `bootout`
+/// that still finds the plist on disk logs `plist-present-after-bootout`.
 const LAUNCHCTL_SHIM: &str = r#"echo "launchctl $*" >> "$CALLS"
 case "$1" in
 print)
   if [ -n "$PRINT_FAIL" ]; then echo "Operation not permitted" >&2; exit 1; fi
-  if [ -n "$FAKE_LOADED" ] && [ ! -f "$STATE/booted" ]; then echo "	path = $FAKE_LOADED"; else echo "Could not find service \"x\" in domain" >&2; exit 113; fi;;
+  if [ -f "$STATE/booted" ] && [ -n "$FAKE_LOADED" ] && [ -f "$FAKE_LOADED" ]; then echo "plist-present-after-bootout" >> "$CALLS"; fi
+  alive=
+  if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then alive=1; fi
+  if [ -n "$FAKE_LOADED" ] && { [ ! -f "$STATE/booted" ] || [ -n "$alive" ]; }; then
+    echo "	path = $FAKE_LOADED"
+    if [ -n "$alive" ]; then echo "	pid = $DAEMON_PID"; fi
+  else echo "Could not find service \"x\" in domain" >&2; exit 113; fi;;
 bootout)
   if [ -n "$BOOTOUT_FAIL" ]; then echo "Boot-out failed: 5" >&2; exit 5; fi
   : > "$STATE/booted";;
@@ -545,7 +554,7 @@ fn a_job_loaded_from_another_file_is_not_stopped_and_the_data_stays() {
 }
 
 #[test]
-fn a_failed_daemon_stop_keeps_the_plist_and_the_data_and_exits_nonzero() {
+fn a_failed_daemon_stop_deletes_the_plist_keeps_the_data_and_exits_nonzero() {
     let s = Scratch::new();
     let loaded = s.plist();
     let out = s.run_env(
@@ -557,13 +566,20 @@ fn a_failed_daemon_stop_keeps_the_plist_and_the_data_and_exits_nonzero() {
     );
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(1), "{text}");
-    assert!(s.plist().exists(), "a retry needs the plist: {text}");
+    // The plist goes anyway: RunAtLoad would start the daemon again at the next login. A retry
+    // finds a daemon that keeps running by its label.
+    assert!(!s.plist().exists(), "{text}");
     assert!(
         s.data().join("csr-engine.db").exists()
             && s.data().join("mirror/transcripts/a.zst").exists(),
         "the data folder stays under a daemon that may still run: {text}"
     );
     assert!(text.contains("could not stop"), "{text}");
+    assert!(text.contains("`launchctl bootout gui/"), "{text}");
+    assert!(
+        text.contains("not finished:") && text.contains("uninstall --yes --purge-mirror"),
+        "what is left and the command that finishes: {text}"
+    );
     // The other integrations were still removed.
     assert!(!s.settings()["hooks"]
         .to_string()
@@ -583,8 +599,192 @@ fn a_launchd_that_cannot_be_asked_is_not_read_as_not_running() {
     );
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(1), "{text}");
-    assert!(s.plist().exists() && s.data().join("csr-engine.db").exists());
+    assert!(!s.plist().exists(), "nothing may start it at login: {text}");
+    assert!(s.data().join("csr-engine.db").exists(), "{text}");
     assert!(text.contains("could not tell whether"), "{text}");
+    assert!(
+        text.contains("not finished:") && text.contains("uninstall --yes --purge"),
+        "{text}"
+    );
+    assert!(!s.calls().contains("bootout"), "{}", s.calls());
+}
+
+/// A stand-in daemon process this test starts, `/bin/sleep` by absolute path (or, with
+/// `ignore_term`, one that ignores SIGTERM). A thread reaps it, so it never lingers as a zombie
+/// that `kill -0` still finds; the handle returns how it ended.
+fn daemon_standin(
+    secs: &str,
+    ignore_term: bool,
+) -> (u32, std::thread::JoinHandle<std::process::ExitStatus>) {
+    let mut cmd = if ignore_term {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", &format!("trap '' TERM; exec /bin/sleep {secs}")]);
+        c
+    } else {
+        let mut c = Command::new("/bin/sleep");
+        c.arg(secs);
+        c
+    };
+    let mut child = cmd.spawn().unwrap();
+    let pid = child.id();
+    (pid, std::thread::spawn(move || child.wait().unwrap()))
+}
+
+/// Lines of the call log after the first `launchctl bootout`.
+fn calls_after_bootout(calls: &str) -> Vec<&str> {
+    calls
+        .lines()
+        .skip_while(|l| !l.starts_with("launchctl bootout"))
+        .skip(1)
+        .collect()
+}
+
+/// launchd answers bootout at once but keeps the job, "SIGTERMed", until the daemon has
+/// finished its graceful stop (about 20 s on the Studio). The plist goes before that wait, and
+/// the run waits, then finishes cleanly in one go.
+#[test]
+fn the_plist_goes_before_the_wait_and_a_slow_daemon_stop_still_exits_zero() {
+    let s = Scratch::new();
+    let (pid, reaped) = daemon_standin("1", false);
+    let out = s.run_env(
+        &["--yes", "--purge"],
+        &[
+            ("FAKE_LOADED", s.plist().to_str().unwrap()),
+            ("DAEMON_PID", &pid.to_string()),
+            ("CSR_UNINSTALL_STOP_WAIT_MS", "20000"),
+        ],
+    );
+    let text = stdout(&out);
+    let status = reaped.join().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        status.success(),
+        "the daemon ended by itself, unsignalled: {status:?}"
+    );
+    let calls = s.calls();
+    let after = calls_after_bootout(&calls);
+    assert!(
+        after
+            .iter()
+            .filter(|l| l.starts_with("launchctl print"))
+            .count()
+            >= 2,
+        "the run waited on launchd after the bootout:\n{calls}"
+    );
+    assert!(
+        !calls.contains("plist-present-after-bootout"),
+        "the plist was still on disk during the wait:\n{calls}"
+    );
+    let deleted = text.find(&format!("launch agent: deleted {}", s.plist().display()));
+    let stopped = text.find(&format!("launch agent: stopped {LABEL}"));
+    assert!(deleted.is_some() && deleted < stopped, "{text}");
+    assert!(
+        !text.contains("SIGTERM") && !text.contains("not finished"),
+        "{text}"
+    );
+    assert!(!s.data().join("csr-engine.db").exists(), "{text}");
+}
+
+/// The daemon outlives the wait: one SIGTERM goes to the pid launchd and `daemon.lock` both
+/// name, and once it is gone the run finishes with exit 0.
+#[test]
+fn a_daemon_past_the_wait_gets_one_sigterm_by_its_recorded_pid() {
+    use fs2::FileExt;
+    use std::os::unix::process::ExitStatusExt;
+    let s = Scratch::new();
+    let (pid, reaped) = daemon_standin("30", false);
+    // What the daemon does at start: write its pid into daemon.lock and hold the lock.
+    let lock_path = s.data().join("daemon.lock");
+    std::fs::write(&lock_path, pid.to_string()).unwrap();
+    let lock = std::fs::File::open(&lock_path).unwrap();
+    lock.try_lock_exclusive().unwrap();
+    let out = s.run_env(
+        &["--yes"],
+        &[
+            ("FAKE_LOADED", s.plist().to_str().unwrap()),
+            ("DAEMON_PID", &pid.to_string()),
+            ("CSR_UNINSTALL_STOP_WAIT_MS", "300"),
+        ],
+    );
+    let text = stdout(&out);
+    drop(lock);
+    let status = reaped.join().unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{text}");
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains(&format!("the daemon (pid {pid}) was still running"))
+            && text.contains("sent it SIGTERM"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("launch agent: stopped {LABEL}")),
+        "{text}"
+    );
+    assert!(!s.plist().exists(), "{text}");
+    assert!(
+        !s.calls().contains("plist-present-after-bootout"),
+        "{}",
+        s.calls()
+    );
+}
+
+/// A daemon that will not stop leaves the run unfinished: plist gone, binary and data kept, exit
+/// 1, and the last line says what to wait for and the exact command that finishes. The SIGTERM
+/// goes only to a pid `daemon.lock` agrees on; one only launchd names is never signalled.
+#[test]
+fn a_daemon_that_will_not_stop_keeps_binary_and_data_and_the_finish_is_printed() {
+    use fs2::FileExt;
+    for with_lock in [true, false] {
+        let s = Scratch::new();
+        let local = s.home.join(".local/bin/csr-engine");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::copy(env!("CARGO_BIN_EXE_csr-engine"), &local).unwrap();
+        let (pid, reaped) = daemon_standin("30", true);
+        let lock_path = s.data().join("daemon.lock");
+        std::fs::write(&lock_path, pid.to_string()).unwrap();
+        let lock = std::fs::File::open(&lock_path).unwrap();
+        if with_lock {
+            lock.try_lock_exclusive().unwrap();
+        }
+        let out = s.run_program(
+            &local,
+            &["--yes", "--purge"],
+            &[
+                ("FAKE_LOADED", s.plist().to_str().unwrap()),
+                ("DAEMON_PID", &pid.to_string()),
+                ("CSR_UNINSTALL_STOP_WAIT_MS", "300"),
+            ],
+        );
+        let text = stdout(&out);
+        drop(lock);
+        // Stop the stand-in this test started, by its own pid, before any assertion can fail.
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+        reaped.join().unwrap();
+        assert_eq!(out.status.code(), Some(1), "lock {with_lock}: {text}");
+        assert_eq!(
+            text.contains(&format!("the daemon (pid {pid}) was still running")),
+            with_lock,
+            "{text}"
+        );
+        assert!(!s.plist().exists(), "{text}");
+        assert!(
+            local.exists(),
+            "the binary stays while the daemon runs: {text}"
+        );
+        assert!(s.data().join("csr-engine.db").exists(), "{text}");
+        assert!(text.contains("could not stop"), "{text}");
+        let finish = text
+            .lines()
+            .find(|l| l.contains("not finished:"))
+            .unwrap_or_default();
+        assert!(
+            finish.contains(&format!("\"{}\" uninstall --yes --purge", local.display()))
+                && finish.contains("launchctl print gui/"),
+            "{text}"
+        );
+    }
 }
 
 #[test]
