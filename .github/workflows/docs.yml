@@ -53,7 +53,9 @@ jobs:
           mkdir -p "$OUT/docs"
           cp -R site/. "$OUT/"
           cp -R docs-site/dist/. "$OUT/docs/"
-          test -f "$OUT/index.html" && test -f "$OUT/404.html" && test -f "$OUT/docs/index.html"
+          test -f "$OUT/index.html"
+          test -f "$OUT/404.html"
+          test -f "$OUT/docs/index.html"
           # GitHub rejects files over 100 MB; warn from 50 MB.
           big=$(find "$OUT" -type f -size +100M)
           if [ -n "$big" ]; then echo "::error::files over 100 MB: $big"; exit 1; fi
