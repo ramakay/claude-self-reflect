@@ -3511,3 +3511,41 @@ body, [data-theme="dark"] body {
   border-radius: 2px;
   box-shadow: none;
 }
+
+/* first screen: hero stays compact so the first bento row shows without scrolling */
+.sky-shell .hero-watermark { padding: clamp(24px,3.2vw,44px) 24px 0; animation: none; }
+.sky-shell .hero-watermark__title { font-size: clamp(40px,5.8vw,84px); max-width: 14em; }
+.sky-shell .hero-watermark__subtext { margin: 12px 0 0; font-size: clamp(20px,2vw,28px); }
+.hero-lede {
+  margin: 14px 0 0;
+  max-width: 62ch;
+  font: 400 clamp(15px,1.25vw,18px)/1.5 var(--font-sans);
+  color: var(--color-body);
+}
+.sky-shell .landing-main { padding-top: 12px; }
+.landing-dateline { margin-bottom: 14px; }
+.bento-card.is-visible { animation-duration: 380ms; }
+
+/* header: one-line brand, tagline and GitHub pill */
+.site-nav__brand { flex-shrink: 0; white-space: nowrap; }
+.site-nav__tag { white-space: nowrap; }
+.site-nav__inner { gap: 22px; }
+.site-nav__github { white-space: nowrap; flex-shrink: 0; padding: 0 14px; }
+.site-nav__github span { white-space: nowrap; }
+@media (max-width: 1500px) { .site-nav__tag { display: none; } }
+@media (max-width: 1100px) { .gh-pre { display: none; } }
+@media (max-width: 560px) {
+  .sky-shell .hero-watermark { padding: 24px 14px 0; }
+  .sky-shell .hero-watermark__title { font-size: clamp(34px,10.5vw,48px); }
+  .hero-lede { font-size: 15px; }
+}
+
+/* docs header on phones: icons only so nothing is pushed off-screen */
+@media (max-width: 560px) {
+  .site-nav__inner { gap: 8px; padding: 0 12px; }
+  .site-nav__links { gap: 8px; margin-left: auto; }
+  .search-trigger span, .search-trigger kbd { display: none; }
+  .search-trigger { padding: 0; width: 44px; justify-content: center; }
+  .site-nav__github { padding: 0; width: 44px; }
+  .docs-nav .site-nav__name { font-size: 16px !important; }
+}

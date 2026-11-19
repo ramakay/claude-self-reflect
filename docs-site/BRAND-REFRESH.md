@@ -42,3 +42,9 @@ Dev server on 4194 (headless agent-browser). Shots in `.brand-shots/` (git-exclu
 
 ## Commits
 99e7a4eb favicon/mark/og assets; 4f86d5cf theme + hero; 8386491b this file.
+
+## Lead review fixes (round 3)
+1. First screen: hero compacted (title clamp 40-84px, short lede line added), and the card reveal base delay cut from 1800 ms to 120 ms. The first bento row now starts at y=422 on 1440x900 and y=328 on 390x844 and is painted in the first viewport.
+2. "View on GitHub" is nowrap; below 1100 px it shows "GitHub"; on phones it is an icon.
+3. Brand tagline is nowrap and hidden below 1500 px. Docs header on phones shows icon buttons only (search, theme, GitHub); no horizontal overflow at 390 or 360 px (checked scrollWidth).
+Shots: `.brand-shots/after6-*`, `after7-*`.

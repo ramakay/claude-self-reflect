@@ -7,7 +7,7 @@ function useDelayedReveal(baseDelay = 0) {
   const [ready, setReady] = useState(false)
 
   useEffect(() => {
-    const t = setTimeout(() => setReady(true), 1800 + baseDelay)
+    const t = setTimeout(() => setReady(true), 120 + baseDelay)
     return () => clearTimeout(t)
   }, [baseDelay])
 
@@ -912,7 +912,7 @@ export default function Landing() {
             }}>Install</a>
             <ThemeToggle theme={theme} setTheme={setTheme} />
             <a className="site-nav__github" href="https://github.com/ramakay/claude-self-reflect" target="_blank" rel="noopener noreferrer">
-              <Github size={18} aria-hidden="true" /> <span>View on GitHub</span>
+              <Github size={18} aria-hidden="true" /> <span><span className="gh-pre">View on </span>GitHub</span>
             </a>
           </nav>
         </div>
@@ -921,6 +921,7 @@ export default function Landing() {
       <div className="hero-watermark">
         <h1 className="hero-watermark__title">Claude looks back at its own work</h1>
         <p className="hero-watermark__subtext">so you don't have to re-explain it.</p>
+        <p className="hero-lede">A recap at session start, dreams that check old conclusions against history, and receipts for what was settled. Local, inline, no API call.</p>
       </div>
 
       <main className="landing-main">
