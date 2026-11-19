@@ -2,7 +2,7 @@
 title: Quick Start
 ---
 
-> Everything below assumes CSR is activated — you've run `csr-engine setup` (`claude-self-reflect setup` for an npm install) and restarted Claude Code. Setup also installed the csr-companion plugin unless you passed `--no-companion`; if you did, run `csr-engine companion plugin install`. Installing alone doesn't activate anything; see [Installation](#/docs/installation).
+> Everything below assumes CSR is activated — you've run `csr-engine setup` (`claude-self-reflect setup` for an npm install) and restarted Claude Code. Setup also installed the csr-companion plugin unless you passed `--no-companion`; if you did, run `csr-engine companion plugin install`. Without herdr, type `/csr` in Claude Code to open the companion panel; see [Choose your view](#/docs/companion-views). Installing alone doesn't activate anything; see [Installation](#/docs/installation).
 
 ## Your First Search
 

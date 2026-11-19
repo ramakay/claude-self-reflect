@@ -9,7 +9,7 @@ title: Upgrading
 - **npm:** run `npm install -g claude-self-reflect`, then `claude-self-reflect setup`.
 - **curl installer:** run the install script and answer yes at "Run setup now?". Where it cannot prompt, it prints the `csr-engine setup` command to run.
 
-Then restart Claude Code. Setup repoints the MCP registration at the new binary and adds the hooks 10.1.0 needs. Your data is not touched. The first daemon start rebuilds the vector index once, and MCP tools answer keyword-only until it publishes. Then check `csr-engine status` as described in "Upgrading within 10.x" below.
+Then restart Claude Code. 9.5.8 setup installed no companion plugin; this setup adds csr-companion. Inside herdr it opens a pane beside Claude; without herdr, type `/csr` to open its panel. See [Choose your view](#/docs/companion-views). Setup repoints the MCP registration at the new binary and adds the hooks 10.1.0 needs. Your data is not touched. The first daemon start rebuilds the vector index once, and MCP tools answer keyword-only until it publishes. Then check `csr-engine status` as described in "Upgrading within 10.x" below.
 
 ## What Changed in v8
 

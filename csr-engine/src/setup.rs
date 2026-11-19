@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::companion::relay::emit;
+use crate::companion::relay::emit::{self, VIEW_LINES};
 use crate::engine::Engine;
 use crate::hooks;
 use crate::import;
@@ -1208,7 +1208,7 @@ fn next_steps(report: Option<&RelayReport>) -> String {
                 String::new()
             };
             format!(
-                "companion: {} {} from {}, scope {}\n{reload}",
+                "companion: {} {} from {}, scope {}\n{VIEW_LINES}{reload}",
                 i.plugin, i.version, i.marketplace, i.scope
             )
         }
@@ -4159,7 +4159,7 @@ esac
             calls.iter().all(|c| c.ends_with("list --json")),
             "something other than a listing ran: {calls:?}"
         );
-        assert!(!next_steps(Some(&report)).contains("/reload-plugins"));
+        assert!(next_steps(Some(&report)).ends_with(VIEW_LINES)); // and no /reload-plugins
     }
 
     #[test]

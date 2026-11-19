@@ -8,6 +8,7 @@ export const navigation = [
       { label: 'Features', href: '/docs/features' },
       { label: 'Installation', href: '/docs/installation' },
       { label: 'Quick Start', href: '/docs/quickstart' },
+      { label: 'Choose your view', href: '/docs/companion-views' },
     ],
   },
   {
@@ -64,6 +65,7 @@ import features from './features.md?raw'
 import reportCard from './report-card.md?raw'
 import installation from './installation.md?raw'
 import quickstart from './quickstart.md?raw'
+import companionViews from './companion-views.md?raw'
 import architecture from './architecture.md?raw'
 import hooks from './hooks.md?raw'
 import search from './search.md?raw'
@@ -85,9 +87,10 @@ export const pages = {
   '/docs/report-card': { title: 'What we\'re working on', description: 'Seven known gaps in 10.1.0, with measured numbers, targets and the work under way.', content: stripFrontmatter(reportCard), path: '/docs/report-card' },
   '/docs/installation': { title: 'Installation', description: 'Install CSR in under a minute. One command, zero dependencies.', content: stripFrontmatter(installation), path: '/docs/installation' },
   '/docs/quickstart': { title: 'Quick Start', description: 'Your first search in 60 seconds.', content: stripFrontmatter(quickstart), path: '/docs/quickstart' },
+  '/docs/companion-views': { title: 'Choose your view: herdr pane or in-Claude panel', description: 'Where the companion shows, how to set up each view, how to switch, and how to turn it off.', content: stripFrontmatter(companionViews), path: '/docs/companion-views' },
   '/docs/architecture': { title: 'Architecture', description: 'How CSR works — single binary, five components, zero services.', content: stripFrontmatter(architecture), path: '/docs/architecture' },
   '/docs/hooks': { title: 'Session hooks', description: 'Eight hooks on seven events: they inject context when Claude needs it and capture the rest.', content: stripFrontmatter(hooks), path: '/docs/hooks' },
-  '/docs/search': { title: 'Search & Retrieval', description: 'How CSR finds relevant context — hybrid search, decay scoring, cross-project.', content: stripFrontmatter(search), path: '/docs/search' },
+  '/docs/search': { title: 'Search & Retrieval', description: 'How CSR finds relevant context: hybrid search, cross-encoder re-ranking, project scope.', content: stripFrontmatter(search), path: '/docs/search' },
   '/docs/enrichment': { title: 'Enrichment Pipeline', description: 'Three layers of progressive enrichment.', content: stripFrontmatter(enrichment), path: '/docs/enrichment' },
   '/docs/mcp-tools': { title: 'MCP Tools Reference', description: 'All 16 MCP tools with parameters, examples, and return formats.', content: stripFrontmatter(mcpTools), path: '/docs/mcp-tools' },
   '/docs/cli': { title: 'CLI Reference', description: 'Every csr-engine command and flag.', content: stripFrontmatter(cli), path: '/docs/cli' },

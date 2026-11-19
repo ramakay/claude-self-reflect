@@ -15,7 +15,7 @@ Self-Reflect lets Claude look back at its own work: what it did, what it settled
 | Conversations: `~/.claude/projects/<project>/*.jsonl` | Watcher import | The primary corpus |
 | Subagent sidechains: `<session>/subagents/agent-*.jsonl` | Watcher import | Filed under the real project; the parent session wins over the child in search |
 | Tasks: `~/.claude/tasks/<session>/` | Stop hook | Task state sets the episode outcome. Open tasks mean "partial", never "success". A completed task that matches a still-open verdict becomes a proposal you confirm with `csr_resolve` |
-| Plans: `~/.claude/plans/*.md` | Daemon, every 30 minutes | Linked to the conversation that produced them. The origin conversation outranks its plan in search. Plans decay with age |
+| Plans: `~/.claude/plans/*.md` | Daemon, every 30 minutes | Linked to the conversation that produced them. The origin conversation outranks its plan in search. A plan's age is its file time |
 | Codex sessions: `~/.codex/sessions/**/rollout-*.jsonl` | Daemon and setup | Optional. Detected automatically. Nothing to set up |
 | Session history: `~/.claude/history.jsonl` | Daemon, every 10 minutes | A registry of sessions. It is never embedded or injected. `status` reports its coverage |
 
@@ -58,7 +58,7 @@ The recap states a clause only when it has evidence for it. Dream notes in searc
 
 ## Companion pane
 
-The companion plugin puts a pane beside the session. It shows what Self-Reflect handed Claude and which code changed since your past sessions. It needs Claude Code 2.1.296 or later and the [herdr](https://herdr.dev) terminal multiplexer. `csr-engine setup` installs the plugin after you confirm. `csr-engine setup --no-companion` skips it.
+The companion plugin shows what Self-Reflect handed Claude and which code changed since your past sessions. It needs Claude Code 2.1.296 or later. Inside the [herdr](https://herdr.dev) terminal multiplexer it is a pane beside the session that opens by itself. Without herdr it is a panel inside Claude Code that you open with `/csr`. `csr-engine setup` installs the plugin after you confirm. `csr-engine setup --no-companion` skips it. See [Choose your view](#/docs/companion-views).
 
 ## MCP tools and hooks
 

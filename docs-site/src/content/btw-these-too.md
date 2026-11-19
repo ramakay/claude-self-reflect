@@ -57,7 +57,7 @@ Open `http://127.0.0.1:7373/`. `CSR_JOURNAL_PORT` moves the port and `CSR_NO_JOU
 
 ## Companion pane, beyond the five axes
 
-The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew install herdr`). Its picture cards need a terminal that draws kitty graphics (Ghostty, kitty, WezTerm, Warp). In macOS Terminal.app the pane shows the same cards as text, also inside herdr; `CSR_COMPANION_PIXELS=0` asks for text anywhere, and `CSR_COMPANION_PIXELS=1` forces pictures on (for a herdr server started in Terminal.app and attached from another terminal). Without herdr, the cards show in a panel inside Claude Code.
+The cards and keys below (`i`, `l`, `m`) are the herdr pane's; the band, the guard and the compaction items come from the plugin and work in both views. Inside the [herdr](https://herdr.dev) terminal multiplexer (`brew install herdr`) the pane opens beside Claude. Its picture cards need a terminal that draws kitty graphics (Ghostty, kitty, WezTerm, Warp). In macOS Terminal.app the pane draws its cards as text; `CSR_COMPANION_PIXELS=0` asks for text anywhere, and `CSR_COMPANION_PIXELS=1` forces pictures on (for a herdr server started in Terminal.app and attached from another terminal). Without herdr, type `/csr` in Claude Code: a panel with a smaller card set opens inside Claude Code. See [Choose your view](#/docs/companion-views).
 
 - **How Claude read you:** spots shorthand Claude misread, such as "dknr" read as "done".
 - **Your rules:** corrections you typed, kept in your own words, never Claude's.
@@ -72,7 +72,7 @@ The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew instal
 - **Push guard:** opt-in. Blocks `--no-verify` and pushes to protected branches. A guard rail, not a security boundary.
 - **"Later" survives compaction:** threads you deferred are carried across compaction, and subagents keep their task brief through their own compaction.
 - **autoCompact:** `off`, `suggest` (default) or `auto`.
-- **`/csr statusline`:** moves your status bar into the pane, and restores it when the pane closes.
+- **Status line retired:** the pane's masthead shows context and limits. `csr-engine hook install --apply` puts back a status line an older version wrapped, and `/csr statusline` now only says so.
 - **Phone layout:** the pane has a layout for a narrow terminal.
 - **One dreamer per session, crash guard:** a lease stops two dreamers on one session, and a broken edit to the pane does not kill it.
 

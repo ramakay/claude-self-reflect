@@ -163,7 +163,7 @@ Open `http://127.0.0.1:7373/`. `CSR_JOURNAL_PORT` moves the port and `CSR_NO_JOU
 
 ### Companion pane, beyond the five axes
 
-The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew install herdr`). Its picture cards need a terminal that draws kitty graphics (Ghostty, kitty, WezTerm, Warp). In macOS Terminal.app the pane shows the same cards as text, also inside herdr; `CSR_COMPANION_PIXELS=0` asks for text anywhere, and `CSR_COMPANION_PIXELS=1` forces pictures on (for a herdr server started in Terminal.app and attached from another terminal). Without herdr, the cards show in a panel inside Claude Code.
+The cards and keys below (`i`, `l`, `m`) are the herdr pane's; the band, the guard and the compaction items come from the plugin and work in both views. Without herdr, type `/csr` in Claude Code for a panel with a smaller card set; see [Two ways to see the companion](#two-ways-to-see-the-companion). Picture cards need a terminal that draws kitty graphics (Ghostty, kitty, WezTerm, Warp). In macOS Terminal.app the herdr pane draws its cards as text; `CSR_COMPANION_PIXELS=0` asks for text anywhere, and `CSR_COMPANION_PIXELS=1` forces pictures on (for a herdr server started in Terminal.app and attached from another terminal).
 
 - **How Claude read you:** spots shorthand Claude misread, such as "dknr" read as "done".
 - **Your rules:** corrections you typed, kept in your own words, never Claude's.
@@ -178,7 +178,7 @@ The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew instal
 - **Push guard:** opt-in. Blocks `--no-verify` and pushes to protected branches. A guard rail, not a security boundary.
 - **"Later" survives compaction:** threads you deferred are carried across compaction, and subagents keep their task brief through their own compaction.
 - **autoCompact:** `off`, `suggest` (default) or `auto`.
-- **`/csr statusline`:** moves your status bar into the pane, and restores it when the pane closes.
+- **Status line retired:** the pane's masthead shows context and limits. `csr-engine hook install --apply` puts back a status line an older version wrapped, and `/csr statusline` now only says so.
 - **Phone layout:** the pane has a layout for a narrow terminal.
 - **Road trial line (maintainers):** a trial spec with `"track": "road"` adds one line to the CSR performance card; off by default, switch on with `CSR_PANE_ROAD=1` or `"road": true` under the `csr-companion` entry of `pluginConfigs` in `~/.claude/settings.json`.
 - **One dreamer per session, crash guard:** a lease stops two dreamers on one session, and a broken edit to the pane does not kill it.
@@ -359,13 +359,24 @@ csr-engine setup
 
 ### The companion pane (optional)
 
-A Claude Code plugin that sits beside the session. The pane needs the [herdr](https://herdr.dev) terminal multiplexer (`brew install herdr`). It shows what your memory handed Claude, the agents and Codex runs in flight, the dreamer's "what if...?", and a compaction coach. It needs Claude Code 2.1.296 or later. It runs inside `csr-engine` itself: the plugin is one generated file that starts `csr-engine companion serve`, so it needs no Node, TypeScript or Python. `csr-engine setup` writes that plugin and installs it through Claude Code's own plugin CLI, after the same consent. `csr-engine setup --no-companion` skips it. If setup cannot install it, it prints why, and you can retry with one command:
+A Claude Code plugin, `csr-companion`. It shows what Self-Reflect handed Claude, the agents and Codex runs in flight, the dreamer's "what if...?", and a compaction coach. It needs Claude Code 2.1.296 or later.
+
+#### Two ways to see the companion
+
+| Where you run `claude` | What you get | How it opens |
+|---|---|---|
+| Inside [herdr](https://herdr.dev) (`brew install herdr`) | A pane to the right of Claude with the full cards. Pictures in Ghostty, kitty, WezTerm or Warp; text cards in Terminal.app. | By itself at session start in a project folder; `/csr` opens it again |
+| A plain terminal, no herdr | A panel inside Claude Code with a smaller card set | Type `/csr`. In the 10.1.0 clean-machine test it did not open by itself. |
+
+Setup installs one plugin for both and does not choose between them: the plugin checks for herdr at each session start and each `/csr`. To switch, start `claude` inside or outside herdr; no reinstall. `claude plugin disable csr-companion@claude-self-reflect` turns the whole companion off. Setup, checks and troubleshooting: [Choose your view](https://ramakay.github.io/claude-self-reflect/#/docs/companion-views).
+
+It runs inside `csr-engine` itself: the plugin is one generated file that starts `csr-engine companion serve`, so it needs no Node, TypeScript or Python. `csr-engine setup` writes that plugin and installs it through Claude Code's own plugin CLI, after the same consent. `csr-engine setup --no-companion` skips it. If setup cannot install it, it prints why, and you can retry with one command:
 
 ```bash
 csr-engine companion plugin install
 ```
 
-**The cards the pane draws, top to bottom:**
+**The cards the herdr pane draws, top to bottom:**
 
 | Card | What it shows |
 |------|---------------|
@@ -500,6 +511,8 @@ The Stop hook has no watchdog of its own. It hands the turn to a detached worker
 <details>
 <summary><strong>Experimental: Claude Mods</strong> — CSR recall as an in-process function hook</summary>
 
+> This is not the companion. The companion (`csr-companion`, the herdr pane or the `/csr` panel) is installed by setup; see [Two ways to see the companion](#two-ways-to-see-the-companion). The spike below is a separate plugin that nothing installs.
+
 Claude Code is adding "Claude Mods" (function hooks, anthropics/claude-code#91870):
 plugin TypeScript that runs in-process with a typed `$` instead of a shell command per
 event. `mods/csr-recall/` is a spike of CSR recall on that surface: one `prompt.submit`
@@ -551,7 +564,7 @@ csr-engine status --compact    One-line statusline output
 csr-engine daemon              Background enrichment daemon
 csr-engine hook install --apply Install Claude Code hooks
 csr-engine eval                Quick eval (6 checks)
-csr-engine eval --full         Full eval (25 results plus a census line; 88s on a 12.6GB database, most of it the integrity check)
+csr-engine eval --full         Full eval (24 results plus a census line; 88s on a 12.6GB database, most of it the integrity check)
 csr-engine quality <file>      AST-based code quality analysis
 ```
 
@@ -656,7 +669,7 @@ csr-engine uninstall --yes --purge        # also delete the data folder, except 
 csr-engine uninstall --yes --purge-mirror # delete the data folder and the mirror too (implies --purge)
 ```
 
-It removes CSR's hooks from `~/.claude/settings.json` (your other hooks stay; a `settings.json.csr-uninstall-<time>` backup is written first), the `claude-self-reflect` MCP entry (and any project-scoped entry of that name, through `claude mcp remove -s local` run from the project folder), the companion plugin and its cache under `~/.claude/plugins/cache/claude-self-reflect`, the launch agent `setup` wrote (a plist you wrote yourself is left alone), and the npm global package `claude-self-reflect` when `npm ls -g` lists it. Your data is kept by default: `~/.claude-self-reflect/` (database, settings, the transcript mirror) stays, and its path and size are printed with "kept; --purge deletes it". `--purge` deletes that folder except the transcript mirror, the only copy of transcripts Claude Code has deleted; `--purge-mirror` deletes the mirror too. (`--keep-data` from older versions is still accepted and does nothing.) `~/.claude/projects` is never touched. The Codex MCP entry is removed through `codex mcp remove`, with Codex's `config.toml` copied aside first. Nothing is deleted while the daemon is not confirmed stopped: the launch agent, the npm package, the binary and, with `--purge`, the data folder stay, the command exits 1 and says why, and you can run it again. It also deletes the model cache `~/Library/Caches/csr-engine` (the downloaded embedding model, about 90 MB; it is not your data, so it goes without `--purge` too), and last every csr-engine binary the hooks, the MCP entries and the launch agent named, plus the one running: a copy in `~/.local/bin` is deleted, any other (a build folder, `/usr/local/bin`) is not touched and its exact `rm` line is printed. Every step prints a line for what it removed or kept. Running csr-engine sessions are listed at the end with their PIDs, and never signalled: restart them, or they keep using the old hooks and, after `--purge`, recreate the data folder. The plan (without `--yes`) runs only read-only probes (`npm ls`, `ps`).
+It removes CSR's hooks from `~/.claude/settings.json` (your other hooks stay; a `settings.json.csr-uninstall-<time>` backup is written first), the `claude-self-reflect` MCP entry (and any project-scoped entry of that name, through `claude mcp remove -s local` run from the project folder), the companion plugin and its cache under `~/.claude/plugins/cache/claude-self-reflect`, the launch agent `setup` wrote (a plist you wrote yourself is left alone), and the npm global package `claude-self-reflect` when `npm ls -g` lists it. Your data is kept by default: `~/.claude-self-reflect/` (database, settings, the transcript mirror) stays, and its path and size are printed with "kept; --purge deletes it". `--purge` deletes that folder except the transcript mirror, the only copy of transcripts Claude Code has deleted; `--purge-mirror` deletes the mirror too. (`--keep-data` from older versions is still accepted and does nothing.) `~/.claude/projects` is never touched. The Codex MCP entry is removed through `codex mcp remove`, with Codex's `config.toml` copied aside first. The launch agent is booted out and its plist deleted first, so nothing starts the daemon again at login. Uninstall then waits up to 35 s (launchd's `ExitTimeOut` plus 5 s) for the daemon to exit. A daemon still running then gets one SIGTERM, sent only when launchd and `daemon.lock` name the same pid, and 5 s more. If the daemon has not stopped, the npm package, the binary and, with `--purge`, the data folder stay, the command exits 1, and its last line starts with "not finished:" and gives the exact command that finishes once `launchctl print` no longer finds the job. It also deletes the model cache `~/Library/Caches/csr-engine` (the downloaded embedding model, about 90 MB; it is not your data, so it goes without `--purge` too), and last every csr-engine binary the hooks, the MCP entries and the launch agent named, plus the one running: a copy in `~/.local/bin` is deleted, any other (a build folder, `/usr/local/bin`) is not touched and its exact `rm` line is printed. Every step prints a line for what it removed or kept. Running csr-engine sessions are listed at the end with their PIDs, and never signalled (only the launchd daemon can get that one SIGTERM): restart them, or they keep using the old hooks and, after `--purge`, recreate the data folder. The plan (without `--yes`) runs only read-only probes (`npm ls`, `ps`).
 
 By hand, if you prefer:
 
