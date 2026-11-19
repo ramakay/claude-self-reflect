@@ -27,7 +27,7 @@ The existing `vite.config.js` already has the GitHub Pages base path:
 ```js
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  base: '/claude-self-reflect/',
+  base: '/claude-self-reflect/docs/',
   build: {
     outDir: 'dist',
   },
@@ -41,7 +41,7 @@ cd docs-site
 npm run build
 ```
 
-For GitHub Pages, publish `docs-site/dist` from a GitHub Actions workflow or the Pages deployment settings. Keep the Vite `base` value above or image and route URLs will be wrong on `https://<owner>.github.io/claude-self-reflect/`.
+`.github/workflows/docs.yml` deploys GitHub Pages from `main`: the landing page from `site/` at the root and `docs-site/dist` under `docs/`. Keep the Vite `base` value above or image and route URLs will be wrong on `https://<owner>.github.io/claude-self-reflect/docs/`. Write public images as `/images/...` in CSS and `index.html` so Vite adds the base; markdown images under `/claude-self-reflect/images/...` are mapped to the base by `DocPage.jsx`.
 
 ## Global CSS Tokens
 

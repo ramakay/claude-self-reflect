@@ -209,7 +209,7 @@ Env controls: `CSR_AUTO_SETUP=1`, `CSR_SKIP_SETUP=1` (install.sh only).
 
 ## Documentation
 
-Primary docs: https://ramakay.github.io/claude-self-reflect/ (GitHub Pages, built from `docs-site/`)
+Site: https://ramakay.github.io/claude-self-reflect/ (GitHub Pages: the landing from `site/` at the root, the docs app from `docs-site/` under `/docs/`; both assembled by `.github/workflows/docs.yml`)
 
 ---
 *Published research record (saga paper + experiment results): `docs/plans/` — internal planning docs live in `.plans/` (untracked)*

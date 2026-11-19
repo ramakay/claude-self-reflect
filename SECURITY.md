@@ -55,7 +55,7 @@ Off switches (set them where Claude Code and the daemon start):
 
 No single setting turns off every model call. The full list, with each caller and
 its switch, is in the docs: Privacy & Security
-(https://ramakay.github.io/claude-self-reflect/#/docs/privacy).
+(https://ramakay.github.io/claude-self-reflect/docs/#/docs/privacy).
 
 Do not run CSR on conversation data that is not appropriate to send to
 Anthropic unless the switches above are set.

@@ -12,7 +12,7 @@ Self-Reflect is Claude reflecting on its own work: a recap when a session starts
 
 A memory layer sits underneath as plumbing. It is one Rust binary (about 138 MB) with embedded SQLite, no database server, no containers, no Python and no API keys required.
 
-[Install](#install) | [What we're working on](#what-were-working-on) | [How It Works](#what-it-does) | [MCP Tools](#mcp-tools) | [Paper](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
+[Install](#install) | [What we're working on](#what-were-working-on) | [How It Works](#what-it-does) | [MCP Tools](#mcp-tools) | [Paper](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf) | [FAQ](https://ramakay.github.io/claude-self-reflect/docs/#/docs/troubleshooting)
 
 > **v10.1.0: Claude reflects on its own work**
 > When there is evidence to state (a commit, a finished or open task, a next step, a verdict, a correction, a dream finding), a session that starts or resumes opens with one recap paragraph (intent, what got done, what was settled, what is open, the next step) instead of a pile of fragments. Without evidence it opens with the older `CSR CONTINUUM` and `LAST` lines. A `learnt` line follows only when CSR stored notes, verdicts or retired anchors for your last session. After a compact, you get a compact receipt: a pointer line and `csr_transcript` slices of the turns the summary replaced. Every clause carries a receipt or drops out.
@@ -52,7 +52,7 @@ Without a record, Claude starts every session not knowing what it finished last 
 
 No special syntax. Install once, and the recap and receipts show up on their own.
 
-> **[Explore the full documentation →](https://ramakay.github.io/claude-self-reflect/)**
+> **[Explore the full documentation →](https://ramakay.github.io/claude-self-reflect/docs/)**
 
 ---
 
@@ -67,19 +67,19 @@ Everything runs locally in a single process from one binary of about 138 MB. No 
 
 **8 hooks on 7 events** fire across the session lifecycle (SessionStart runs two: the recap and the async briefing). **16 MCP tools** for explicit search — including `csr_code_graph`, linking code symbols to the conversations that shaped them.
 
-> **[Explore the full documentation →](https://ramakay.github.io/claude-self-reflect/#/docs/architecture)**
+> **[Explore the full documentation →](https://ramakay.github.io/claude-self-reflect/docs/#/docs/architecture)**
 
 ---
 
 ## The Pipeline
 
-Three layers turn raw chunks into searchable context: the chunks themselves, extracted metadata, and optional AI narratives ([details](https://ramakay.github.io/claude-self-reflect/#/docs/enrichment)).
+Three layers turn raw chunks into searchable context: the chunks themselves, extracted metadata, and optional AI narratives ([details](https://ramakay.github.io/claude-self-reflect/docs/#/docs/enrichment)).
 
 Higher quality context. Better decisions. Fewer tokens.
 
 <br clear="both" />
 
-> **[Explore the full documentation →](https://ramakay.github.io/claude-self-reflect/#/docs/enrichment)**
+> **[Explore the full documentation →](https://ramakay.github.io/claude-self-reflect/docs/#/docs/enrichment)**
 
 ---
 
@@ -584,7 +584,7 @@ Then run `csr-engine status`:
 - `hooks_missing` lists hook events that `~/.claude/settings.json` lacks, and `degraded` says why in words. `csr-engine hook install --apply` fixes just the hooks.
 - `stale_processes` lists every live process (daemon, MCP server, companion pane) that still runs the older binary. A dormant pane shows up here until you restart it.
 
-Open Claude Code sessions keep their old MCP server until you restart them. Your data is not touched. More in [the upgrade guide](https://ramakay.github.io/claude-self-reflect/#/docs/upgrading).
+Open Claude Code sessions keep their old MCP server until you restart them. Your data is not touched. More in [the upgrade guide](https://ramakay.github.io/claude-self-reflect/docs/#/docs/upgrading).
 
 </details>
 
@@ -616,7 +616,7 @@ Your conversation data (`~/.claude/projects/`) is untouched. The new engine re-i
 | "spawn ENOENT" in MCP | Ensure `csr-engine` is in PATH |
 | Slow first startup | Normal (the index is rebuilt once; later starts load the saved index, which takes longer for a larger index) |
 
-Full guide: [Documentation](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
+Full guide: [Documentation](https://ramakay.github.io/claude-self-reflect/docs/#/docs/troubleshooting)
 
 </details>
 
@@ -705,4 +705,4 @@ Then open `~/.claude/settings.json` and delete every entry under `hooks` whose c
 
 ---
 
-[Documentation](https://ramakay.github.io/claude-self-reflect/) | [npm](https://www.npmjs.com/package/claude-self-reflect) | [Issues](https://github.com/ramakay/claude-self-reflect/issues) | MIT License
+[Documentation](https://ramakay.github.io/claude-self-reflect/docs/) | [npm](https://www.npmjs.com/package/claude-self-reflect) | [Issues](https://github.com/ramakay/claude-self-reflect/issues) | MIT License
