@@ -28,7 +28,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked --all-targets -- -D warnings
       - name: Test
-        run: cargo test --manifest-path csr-engine/Cargo.toml --locked
+        run: cargo test --manifest-path csr-engine/Cargo.toml --locked --no-fail-fast
       - name: Installer tests
         run: node --test installer/tests/*.test.js
       - name: Verify npm package
