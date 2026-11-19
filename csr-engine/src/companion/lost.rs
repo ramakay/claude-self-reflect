@@ -635,9 +635,15 @@ pub fn stopped_at(prev: &Session) -> Option<Thread> {
         .map(|r| num(&r[0]))
         .unwrap_or(0.);
     // A paste (a status page, JSON, a log) is never quoted back as what was asked.
-    let typed: Vec<_> = pairs(&p["typed"])
+    let all_typed: Vec<_> = pairs(&p["typed"])
         .into_iter()
-        .filter(|(_, words)| !HANDED_OFF.is_match(words) && !super::paste::is_paste(words))
+        .filter(|(_, words)| !HANDED_OFF.is_match(words))
+        .collect();
+    // A paste still answers Claude: "paste the log here" and the log came.
+    let answered = all_typed.last().map(|(at, _)| *at);
+    let typed: Vec<_> = all_typed
+        .into_iter()
+        .filter(|(_, words)| !super::paste::is_paste(words))
         .collect();
     let after: Vec<_> = typed
         .iter()
@@ -660,7 +666,7 @@ pub fn stopped_at(prev: &Session) -> Option<Thread> {
                 0,
             )
         } else if let Some(ask) = ask
-            .filter(|_| said.is_some_and(|(at, _)| at > since && last.is_none_or(|(t, _)| at > *t)))
+            .filter(|_| said.is_some_and(|(at, _)| at > since && answered.is_none_or(|t| at > t)))
         {
             (
                 format!(
@@ -825,6 +831,29 @@ mod tests {
         ))));
         assert!(!quotes_a_paste(&kept(shown)));
         assert!(!quotes_a_paste(&kept("Install the queue dashboard".into())));
+    }
+
+    /// Claude asks for the router's status page, the person pastes it: the paste is skipped as a
+    /// quote but it is still the answer, so the card never says no answer came.
+    #[test]
+    fn a_pasted_answer_still_answers_claude() {
+        use serde_json::json;
+        let blob = "Firmware=V7.2.8.8_5.1.24 RegionTag=RBRE960_NA Region=us Model=RBRE960 \
+                    InternetConnectionStatus=Up SOAPVersion=3.46";
+        let mut prev = Session::new("prev");
+        prev.data["typed"] = json!([[100., "why does the router drop the link?"], [300., blob]]);
+        prev.data["said"] = json!([200., "Can you paste the router's status page?"]);
+        prev.data["turn_end"] = json!(500.);
+        let shown = stopped_at(&prev).map(|t| t.text).unwrap_or_default();
+        assert!(!shown.contains("no answer came"), "{shown}");
+        assert!(!shown.contains("Firmware"), "{shown}");
+        // With no reply after it, the ask still shows.
+        prev.data["typed"] = json!([[100., "why does the router drop the link?"]]);
+        let shown = stopped_at(&prev).map(|t| t.text).unwrap_or_default();
+        assert!(
+            shown.starts_with("Claude asked last, no answer came"),
+            "{shown}"
+        );
     }
 
     #[test]
