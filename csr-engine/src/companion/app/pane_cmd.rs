@@ -4,7 +4,9 @@
 //! - `start` has two entries. The first (`register`) clears the status line and registers the
 //!   command, for a person's session only (`isInteractive` true). The late one (`register_late`)
 //!   sets the 10-minute refresh and, in the background, refreshes once and opens the pane when the
-//!   folder is a repository.
+//!   folder is a repository (git, or a folder with indexed sessions). Outside herdr, Claude Code
+//!   draws a pane nobody asked for only from 144 terminal columns (110 once the person opened
+//!   it); below that `ui.open` answers `isPlaced: false` and the start says to type `/csr`.
 //! - `csr` routes by the first word: `dreams`, `setup`, `statusline` (retired: one line), or the
 //!   default, which refreshes, opens the pane, and counts.
 //! - `pane` draws the cards (`pane` submodule); its dreams offer asks once before it turns dreams
@@ -27,9 +29,12 @@ use super::{
     setup_walk,
     state::{config_row, config_rows, update, Options},
 };
-use crate::companion::relay::{
-    dispatch::{handler, Ctx, Handler, Reply, Table, PRESS},
-    host::Call,
+use crate::companion::{
+    relay::{
+        dispatch::{handler, Ctx, Handler, Reply, Table, PRESS},
+        host::Call,
+    },
+    store::MACHINE,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -44,6 +49,9 @@ const SHIFTS_LIMIT: Duration = Duration::from_secs(20);
 /// What one herdr command may take.
 const HERDR_LIMIT: Duration = Duration::from_secs(10);
 const LABEL: &str = "CSR";
+/// The session start's toast when Claude Code holds the pane back (see `Opened::Waiting`).
+const WAITING: &str = "CSR pane is ready: type /csr to open it. It opens by itself only in a \
+    window 144 columns wide or more.";
 const RETIRED: &str = "The status line wrapper is gone: the pane's masthead shows context and \
     limits, and \"csr-engine hook install --apply\" already put back any wrapped line.";
 
@@ -239,16 +247,55 @@ async fn open_herdr_pane(cx: &Ctx, outside: &dyn Outside, cwd: &str) -> bool {
     true
 }
 
+/// Where an open of the pane landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Opened {
+    /// A herdr split beside Claude.
+    Herdr,
+    /// Claude Code's own pane, drawn (or a Claude Code that does not say).
+    Pane,
+    /// Claude Code's own pane, open but not drawn, with Claude Code's reason. An open nobody
+    /// asked for (the session start's) waits below 144 terminal columns, 110 once the person
+    /// has opened the pane; `/csr` is asked, so it draws at any width.
+    Waiting(String),
+}
+
+/// The machine row `/csr` sets once it opened Claude Code's pane: the person knows the command,
+/// so a session start that cannot draw the pane no longer says to type it.
+const OPENED_BY_HAND: &str = "pane:opened-by-hand";
+
 /// Open the pane: a herdr split when there is one, else Claude Code's own pane. Says which.
-pub(crate) async fn open_pane(cx: &Ctx, outside: &dyn Outside, cwd: &str) -> &'static str {
+pub(crate) async fn open_pane(cx: &Ctx, outside: &dyn Outside, cwd: &str) -> Opened {
     if open_herdr_pane(cx, outside, cwd).await {
-        return "herdr";
+        return Opened::Herdr;
     }
-    let _ = cx
+    let opened = cx
         .host
         .call("ui.open", vec![json!({ "id": "csr", "title": LABEL })])
         .await;
-    "pane"
+    match opened {
+        Ok(v) if v["isPlaced"] == false => {
+            Opened::Waiting(v["reason"].as_str().unwrap_or_default().to_string())
+        }
+        _ => Opened::Pane,
+    }
+}
+
+/// The session start's pane waits undrawn: log Claude Code's reason, and, until the person has
+/// typed `/csr` once, say in a toast how to open it. A run with no surface gets no toast.
+async fn say_how_to_open(cx: &Ctx, reason: &str) {
+    let line = format!("CSR pane not drawn: {reason}");
+    let _ = cx
+        .host
+        .call("ui.log", vec![json!(line), json!({ "to": "debug" })])
+        .await;
+    if reason.starts_with("no-surface") {
+        return;
+    }
+    if matches!(cx.store.get(MACHINE, OPENED_BY_HAND), Ok(Some(_))) {
+        return;
+    }
+    let _ = cx.host.call("ui.toast", vec![json!(WAITING)]).await;
 }
 
 fn has_repo(fresh: &Option<Value>) -> bool {
@@ -309,7 +356,11 @@ fn on_start_late(outside: Arc<dyn Outside>) -> Handler {
                 async move {
                     let fresh = refresh(&cx, outside.as_ref(), &cwd).await;
                     if has_repo(&fresh) {
-                        open_pane(&cx, outside.as_ref(), &cwd).await;
+                        if let Opened::Waiting(reason) =
+                            open_pane(&cx, outside.as_ref(), &cwd).await
+                        {
+                            say_how_to_open(&cx, &reason).await;
+                        }
                     }
                 }
             });
@@ -362,7 +413,10 @@ fn on_command(outside: Arc<dyn Outside>) -> Handler {
                         ),
                         None => "csr-engine could not be read".to_string(),
                     };
-                    let where_ = if opened == "herdr" {
+                    if opened != Opened::Herdr {
+                        let _ = cx.store.set(MACHINE, OPENED_BY_HAND, &json!(true));
+                    }
+                    let where_ = if opened == Opened::Herdr {
                         "CSR pane opened beside this one"
                     } else {
                         "CSR pane opened"

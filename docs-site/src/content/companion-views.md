@@ -10,7 +10,7 @@ Self-Reflect's companion shows what it handed Claude this session, the dreamer's
 |---|---|---|
 | A terminal, inside [herdr](https://herdr.dev) | The **herdr pane**: a split to the right of Claude, labelled `CSR`, with the full card set and keys (`i` figure, `b` theme, `q` close) | By itself when a session starts in a project folder. `/csr` opens it again. |
 | Inside herdr, in macOS Terminal.app | The herdr pane, with the cards drawn as text, not pictures | Same as above |
-| A plain terminal, no herdr | The **in-Claude panel**: a smaller card set inside Claude Code's own window, under the conversation | Type `/csr` |
+| A plain terminal, no herdr | The **in-Claude panel**: a smaller card set inside Claude Code's own window, under the conversation | By itself in a project folder when the window is at least 144 columns wide. Narrower, type `/csr`. |
 
 Use herdr if you want the companion on screen all the time, with the full cards. Use the in-Claude panel if you do not want another tool: it needs nothing beyond setup.
 
@@ -31,7 +31,7 @@ Use herdr if you want the companion on screen all the time, with the full cards.
 3. Open Claude Code in a project you have worked in.
 4. Type `/csr` and press Enter.
 
-**What you should see:** Claude Code answers `CSR pane opened (N dreams this week, N changed since your sessions)` and a short note on dreams. Under it, a panel with a `THIS SESSION` bar and cards such as "Dreams are on" and "What CSR can do here". In the 10.1.0 clean-machine test the panel did not open by itself in a plain terminal, so type `/csr` in each session where you want it.
+**What you should see:** Claude Code answers `CSR pane opened (N dreams this week, N changed since your sessions)` and a short note on dreams. Under it, a panel with a `THIS SESSION` bar and cards such as "Dreams are on" and "What CSR can do here". The panel also opens by itself when a session starts in a project folder, but only if the window is at least 144 columns wide (110 after you have opened it once with `/csr`). Claude Code sets that floor for a panel nobody asked for. In a narrower window the session start shows "CSR pane is ready: type /csr to open it" until you have typed `/csr` once. `/csr` opens it at any width.
 
 ## Set up the herdr pane
 
@@ -111,7 +111,7 @@ The pane reads the variable, not Claude Code. Set it where herdr's panes start, 
 ## Troubleshooting
 
 ### No panel after setup, plain terminal
-Type `/csr`. Without herdr the panel may not open by itself; in the 10.1.0 clean-machine test it did not.
+Type `/csr`. Without herdr, Claude Code draws a panel nobody asked for only in a window at least 144 columns wide (110 after you have opened it once). Below that it waits; `/csr` opens it at any width, or widen the window. Run `tput cols` to see the width.
 
 ### `/csr` is not a command
 The plugin is not loaded. Run `/reload-plugins` or restart Claude Code. If `claude plugin list` does not show `csr-companion@claude-self-reflect`, run:

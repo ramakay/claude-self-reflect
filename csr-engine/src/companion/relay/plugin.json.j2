@@ -1,17 +1,17 @@
 {
   "name": "csr-companion",
   "version": "{{ version }}",
-  "description": "Self-Reflect beside Claude: a pane that shows what your memory handed Claude this session, a side agent that asks \"what if...?\" when your past sessions give it a reason, and a heads up when Claude opens code that changed since you last worked on it",
+  "description": "Self-Reflect beside Claude: a pane that shows what Claude drew from its own past work this session, a side agent that asks \"what if...?\" when your past sessions give it a reason, and a heads up when Claude opens code that changed since you last worked on it",
   "author": { "name": "Rama Annaswamy" },
   "homepage": "https://github.com/ramakay/claude-self-reflect",
   "repository": "https://github.com/ramakay/claude-self-reflect",
   "license": "MIT",
-  "keywords": ["memory", "side-pane", "dreams", "what-if", "claude-self-reflect"],
+  "keywords": ["reflection", "side-pane", "dreams", "what-if", "claude-self-reflect"],
   "userConfig": {
     "dreams": {
       "type": "boolean",
       "title": "Dreams",
-      "description": "While Claude works, Self-Reflect's dreamer asks one \"what if...?\" when its memory gives a reason. It looks only when CSR has something new, slows down when it finds nothing, and checks before each look that its spend stays within 1 token for every 10 Claude spends. A look can still run over, since a fork takes no token cap; the next one waits until Claude has caught up.",
+      "description": "While Claude works, Self-Reflect's dreamer asks one \"what if...?\" when Claude's past work gives a reason. It looks only when CSR has something new, slows down when it finds nothing, and checks before each look that its spend stays within 1 token for every 10 Claude spends. A look can still run over, since a fork takes no token cap; the next one waits until Claude has caught up.",
       "default": true
     },
     "autoCompact": {

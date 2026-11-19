@@ -336,6 +336,87 @@ async fn session_start_outside_herdr_opens_the_claude_code_pane_instead() {
     );
 }
 
+/// A fake Claude Code whose `ui.open` answers these, in order.
+fn world_opening(answers: &[Value]) -> World {
+    let mut world = world(true, false);
+    let open = world.script.entry("ui.open".into()).or_default();
+    for answer in answers {
+        open.push_back(Ok(answer.clone()));
+    }
+    world
+}
+
+fn narrow() -> Value {
+    json!({ "isPlaced": false, "reason": "opened unasked: placed from 144 columns, now 106" })
+}
+
+impl Rig {
+    fn toasts(&self) -> Vec<String> {
+        self.fx.host.seen.lock().unwrap().toasts.clone()
+    }
+
+    fn logged(&self) -> Vec<String> {
+        self.fx.host.seen.lock().unwrap().logged.clone()
+    }
+}
+
+#[tokio::test]
+async fn a_start_drawn_in_a_wide_window_says_nothing_more() {
+    let r = rig(true, false, shifts());
+    r.started().await;
+    assert_eq!(r.opened().len(), 1);
+    assert!(r.toasts().is_empty(), "{:?}", r.toasts());
+    assert!(r.logged().is_empty(), "{:?}", r.logged());
+}
+
+#[tokio::test]
+async fn a_start_in_a_narrow_window_says_to_type_csr_and_logs_why_it_waits() {
+    let r = rig_with(world_opening(&[narrow()]), Fake::new(false, Some(shifts())));
+    r.started().await;
+    assert_eq!(r.opened(), [json!({ "id": "csr", "title": "CSR" })]);
+    assert_eq!(r.toasts(), [WAITING]);
+    assert!(r.toasts()[0].contains("type /csr"));
+    assert_eq!(
+        r.logged(),
+        ["CSR pane not drawn: opened unasked: placed from 144 columns, now 106"]
+    );
+}
+
+#[tokio::test]
+async fn once_csr_opened_the_pane_a_narrow_start_no_longer_says_to_type_it() {
+    let r = rig_with(
+        world_opening(&[json!({ "isPlaced": true }), narrow()]),
+        Fake::new(false, Some(shifts())),
+    );
+    r.csr("").await;
+    assert_eq!(
+        r.fx.cx.store.get(MACHINE, OPENED_BY_HAND).unwrap(),
+        Some(json!(true))
+    );
+    r.started().await;
+    assert_eq!(r.opened().len(), 2);
+    assert!(r.toasts().is_empty(), "{:?}", r.toasts());
+    assert_eq!(r.logged().len(), 1, "the reason is still logged");
+}
+
+#[tokio::test]
+async fn a_start_with_no_surface_or_in_herdr_gives_no_toast() {
+    let none = json!({ "isPlaced": false, "reason": "no-surface: none attached" });
+    let r = rig_with(world_opening(&[none]), Fake::new(false, Some(shifts())));
+    r.started().await;
+    assert!(r.toasts().is_empty(), "{:?}", r.toasts());
+
+    let herdr = rig_with(world_opening(&[narrow()]), Fake::new(true, Some(shifts())));
+    herdr.started().await;
+    assert!(herdr.opened().is_empty());
+    assert!(herdr.toasts().is_empty(), "{:?}", herdr.toasts());
+    herdr.csr("").await;
+    assert_eq!(
+        herdr.fx.cx.store.get(MACHINE, OPENED_BY_HAND).unwrap(),
+        None
+    );
+}
+
 #[tokio::test]
 async fn outside_a_git_repo_no_status_text_no_pane_opened() {
     let r = rig(true, true, no_repo());
