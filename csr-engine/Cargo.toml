@@ -3,6 +3,8 @@ name = "csr-engine"
 version = "10.1.0"
 edition = "2021"
 description = "Self-Reflect: Rust MCP server with embedded vector search"
+license = "MIT"
+publish = false
 
 [dependencies]
 rmcp = { version = "3.1", features = ["server", "transport-io", "macros", "elicitation"] }

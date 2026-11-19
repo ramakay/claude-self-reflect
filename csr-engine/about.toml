@@ -1,0 +1,33 @@
+# cargo-about config for THIRD_PARTY_LICENSES.txt (scripts/third-party-licenses.sh).
+# Only crates that are compiled into the shipped csr-engine binary on the three
+# release targets are listed; dev and build dependencies do not ship.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+# Order is preference: a dual-licensed crate is listed under the first match.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "WTFPL",
+]
+
+[private]
+ignore = true

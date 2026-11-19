@@ -32,7 +32,8 @@
     "installer/postinstall.js",
     "installer/statusline-setup.js",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_LICENSES.txt"
   ],
   "scripts": {
     "postinstall": "node installer/postinstall.js"

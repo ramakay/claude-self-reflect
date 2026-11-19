@@ -6524,12 +6524,12 @@ pub(crate) struct ConvValidity {
 ///
 /// `ancestry_enabled` (the pre-existing `CSR_NO_VALIDITY_PARTITION` kill
 /// switch outcome) and `consumption_enabled` (v10.1's new
-/// `CSR_DREAM_CONSUMPTION`, default OFF) are DELIBERATELY separate
+/// `CSR_DREAM_CONSUMPTION`, default `annotate`) are DELIBERATELY separate
 /// parameters below, never folded into one: `ancestry_enabled` gates whether
 /// this pass loads ANY signals at all (ancestry included), while
 /// `consumption_enabled` gates ONLY whether the resolved verdict map is
 /// populated. Folding them (the rejected first T2 attempt's bug) meant
-/// `CSR_DREAM_CONSUMPTION`'s default-OFF state silently killed release-
+/// `CSR_DREAM_CONSUMPTION=off` silently killed release-
 /// ancestry ranking too — an unrelated feature dream-verdict consumption
 /// must never touch.
 #[derive(Default)]
