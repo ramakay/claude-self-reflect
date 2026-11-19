@@ -11,7 +11,13 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # The instrument goldens were rendered on arm64, which is also what the macOS build ships. The x86
+    # leg keeps the rest of the suite covered on the other Linux release target.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -72,7 +78,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: instrument-png
+          name: instrument-png-${{ matrix.os }}
           path: ${{ runner.temp }}/instrument-png
           if-no-files-found: ignore
       - name: Installer tests

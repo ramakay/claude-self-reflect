@@ -172,6 +172,7 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
 }
 #[test]
 fn all_nine_states_and_both_themes_have_honest_top_frame_goldens() {
+    let mut mismatched = Vec::new(); // every frame is checked, so one run names all that moved
     for (cols, rows) in [(76, 67), (38, 30), (44, 30), (60, 40), (35, 30)] {
         // 35x30 is the live pane: its cell is 26x58 px, not the headless 16x34.
         let owner = (cols, rows) == (35, 30);
@@ -180,30 +181,29 @@ fn all_nine_states_and_both_themes_have_honest_top_frame_goldens() {
         for theme in [Theme::Dark, Theme::Light] {
             for &state in states {
                 let (value, png) = snapshot(state, theme, cols, rows);
-                let name = if theme == Theme::Dark {
-                    "dark"
-                } else {
-                    "light"
-                };
+                let name = format!("{theme:?}").to_lowercase();
                 let mut dir = fixture().join("instrument");
                 if (cols, rows) != (76, 67) {
                     dir = dir.join(format!("{cols}x{rows}"));
                 }
-                let golden = dir.join(name).join(format!("{state}.json"));
+                let golden = dir.join(&name).join(format!("{state}.json"));
                 if std::env::var_os("CSR_INSTRUMENT_UPDATE").is_some() {
                     write_json(&golden, &value);
                 }
                 if let Some(dir) = std::env::var_os("CSR_INSTRUMENT_PNG") {
-                    let dir = PathBuf::from(dir).join(format!("{cols}x{rows}")).join(name);
+                    let dir = PathBuf::from(dir).join(format!("{cols}x{rows}/{name}"));
                     fs::create_dir_all(&dir).unwrap();
                     fs::write(dir.join(format!("{state}.png")), png).unwrap();
                 }
                 let expected: Value = serde_json::from_slice(&fs::read(&golden).unwrap()).unwrap();
-                assert_eq!(value, expected, "{name}/{state} {cols}x{rows}");
+                if value != expected {
+                    mismatched.push(format!("{name}/{state} {cols}x{rows}"));
+                }
             }
         }
     }
     csr_engine::companion::render::kitty::set_cell_override(None);
+    assert!(mismatched.is_empty(), "goldens moved: {mismatched:?}");
 }
 /// The pane's text scale: the width fit, or the height fit when the layout is taller than the
 /// pane. 605 is the layout width in pt. This is what `instrument::draw` resizes the picture by.
