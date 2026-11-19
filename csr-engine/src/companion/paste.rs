@@ -14,11 +14,23 @@ static LOG_LINE: LazyLock<regex::Regex> = LazyLock::new(|| {
     ))
     .unwrap()
 });
-/// A word as people write one: letters, maybe an apostrophe or a hyphen, maybe closing
-/// punctuation.
+/// A word as people write one, in any script: letters and the marks that join them (Devanagari
+/// vowel signs, Vietnamese tones), maybe an apostrophe or a hyphen, maybe closing punctuation
+/// (Latin, the Devanagari danda, CJK full stops and commas).
 static WORD: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"^[("“']?[A-Za-z][A-Za-z'’\-]*[)"”']?[.,;:!?]*$"#).unwrap()
+    regex::Regex::new(r#"^[("“'«]?\p{L}[\p{L}\p{M}'’\-]*[)"”'»]?[.,;:!?।॥。、，？！]*$"#).unwrap()
 });
+/// A character of a script written without spaces between words: a sentence in it is one long
+/// token, not a blob.
+static UNSPACED: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"[\p{Han}\p{Hiragana}\p{Katakana}\p{Thai}\p{Lao}\p{Khmer}\p{Myanmar}]")
+        .unwrap()
+});
+
+/// True when most of `token`'s characters come from a script written without spaces.
+fn unspaced_run(token: &str) -> bool {
+    UNSPACED.find_iter(token).count() * 2 > token.chars().count()
+}
 
 /// True when `text` reads as pasted data, not as something a person asked.
 pub fn is_paste(text: &str) -> bool {
@@ -51,10 +63,11 @@ pub fn is_paste(text: &str) -> bool {
         return true;
     }
     // Long tokens without spaces (hashes, base64, minified code) make up most of it. A link is
-    // something people type around their question.
+    // something people type around their question, and a Japanese, Chinese or Thai sentence is
+    // one token because those scripts put no spaces between words.
     let long: usize = tokens
         .iter()
-        .filter(|t| t.chars().count() > 40 && !t.contains("://"))
+        .filter(|t| t.chars().count() > 40 && !t.contains("://") && !unspaced_run(t))
         .map(|t| t.len())
         .sum();
     if long * 2 > text.len() {
@@ -107,6 +120,35 @@ mod tests {
             "rename the field to snake_case and update the three callers",
         ] {
             assert!(!is_paste(asked), "{asked}");
+        }
+    }
+
+    /// Words are letters in any script, not only A to Z, and a sentence in a script written
+    /// without spaces is not a hash. Before, every Russian or Hindi question read as "mostly not
+    /// words" and a Japanese one as a 60-character blob.
+    #[test]
+    fn questions_in_other_languages_are_not_pastes() {
+        let japanese =
+            "このファイルのバグを直して、テストをもう一度実行してから結果を教えてください。\
+                        変更点も短くまとめて、ドキュメントの説明も新しい動作に合わせてください。";
+        assert!(japanese.chars().count() >= 60);
+        for asked in [
+            "почему тесты падают на студии, а здесь нет?",
+            "कृपया इस फ़ाइल में बग ठीक करें और टेस्ट चलाएँ।",
+            "sửa lỗi trong tệp này và chạy lại kiểm thử nhé",
+            japanese,
+            "请帮我修复这个文件里的错误，然后重新运行全部测试，再把结果和改动的地方都告诉我一下。",
+            "ช่วยแก้บั๊กในไฟล์นี้แล้วรันเทสต์ใหม่อีกครั้งหนึ่งแล้วบอกผลลัพธ์ให้ฉันทราบด้วยนะครับ",
+        ] {
+            assert!(!is_paste(asked), "{asked}");
+        }
+        // Pasted data stays a paste, and one CJK character does not excuse a blob.
+        for paste in [
+            ROUTER_STATUS,
+            r#"{"completion_status":"partial","confidence":"MEDIUM","frameworks":[]}"#,
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.漢dozjgNryP4J3jVmNHl0w5N",
+        ] {
+            assert!(is_paste(paste), "{paste}");
         }
     }
 }
