@@ -696,3 +696,34 @@ fn section_frame_main_46x30_rules() {
 fn section_frame_main_46x30_compacted() {
     check_section("frame-main-46x30", "compacted");
 }
+
+/// macOS Terminal.app under herdr (2026-11-19 first-run test): herdr answers a kitty graphics query
+/// itself, then hands the pictures to a terminal that prints them as text, so the pane showed no
+/// cards. A pane whose herdr server started in Terminal.app draws text cards from the top: a title
+/// in bold, the first row used, no picture sent.
+#[test]
+fn terminal_app_under_herdr_draws_text_cards_from_the_top_and_sends_no_picture() {
+    use csr_engine::companion::render::kitty;
+    let pixels = kitty::pixels_for_host("herdr", None, Some("com.apple.Terminal"));
+    assert!(!pixels);
+    for sid in ["sess-now", "sess-fresh"] {
+        for cols in [27, 46] {
+            let (_home, paths) = rich_home();
+            let mut pane = Pane::new(paths, &args(sid, cols, 30));
+            pane.pixels = pixels;
+            pane.enable_cards();
+            let text = pane.frame(cols, 30, 1_792_320_000.);
+            let at = format!("{sid} {cols}x30");
+            assert!(pane.placed.is_empty(), "{at}: a picture was placed");
+            let sent = kitty::repaint_pictures(None, cols, 30, &text, &kitty::bands(&pane.placed));
+            assert!(!sent.contains("\x1b_G"), "{at}: kitty graphics sent");
+            assert!(!strip(&text[0]).trim().is_empty(), "{at}: top row blank");
+            let titles = text.iter().filter(|row| row.contains("\x1b[1m")).count();
+            assert!(titles >= 1, "{at}: no card title");
+            // Bold titles must not cut the ground short: every body row fills the pane's width.
+            for row in &text[..text.len() - 1] {
+                assert_eq!(strip(row).chars().count(), cols, "{at}: {row:?}");
+            }
+        }
+    }
+}

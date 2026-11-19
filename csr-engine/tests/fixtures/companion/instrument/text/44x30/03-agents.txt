@@ -1,4 +1,3 @@
-
 ☾ What if one of Fable's three prototypes
 made the what-if question the star of the
 pane, as you wanted on 10-09?
@@ -8,6 +7,7 @@ pane, as you wanted on 10-09?
 4 ask the agent
 3 notes kept · 2 findings confirmed
 1 fact retired
+
 Story · refreshed <1m ago
 Text parity is ready for review.
 ~ reader.rs · read ⌗8e4e3f27

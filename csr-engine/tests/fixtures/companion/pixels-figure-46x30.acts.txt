@@ -1,14 +1,14 @@
-14	{"key":"instrument:dreams"}
-15	{"key":"instrument:dreams"}
-16	{"dream":"newest","key":"dream:newest","send":"Self-Reflect's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”","spans":[[0,11,"helpful"],[11,23,"thought_of_it"],[23,34,"not_relevant"],[34,46,"ask_claude"]]}
-18	{"key":"instrument:threads"}
-20	{"key":"instrument:changes"}
-21	{"key":"instrument:figure"}
-22	{"key":"instrument:figure"}
-23	{"key":"instrument:figure"}
-24	{"key":"instrument:figure"}
-25	{"key":"instrument:figure"}
-26	{"key":"instrument:figure"}
-27	{"key":"instrument:figure"}
-28	{"key":"instrument:figure"}
+0	{"key":"instrument:dreams"}
+1	{"key":"instrument:dreams"}
+2	{"dream":"newest","key":"dream:newest","send":"Self-Reflect's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”","spans":[[0,11,"helpful"],[11,23,"thought_of_it"],[23,34,"not_relevant"],[34,46,"ask_claude"]]}
+5	{"key":"instrument:threads"}
+7	{"key":"instrument:changes"}
+9	{"key":"instrument:figure"}
+10	{"key":"instrument:figure"}
+11	{"key":"instrument:figure"}
+12	{"key":"instrument:figure"}
+13	{"key":"instrument:figure"}
+14	{"key":"instrument:figure"}
+15	{"key":"instrument:figure"}
+16	{"key":"instrument:figure"}
 29	{"key":"legend","keys":[[1,10,"l"],[11,22,"t"],[23,28,"i"],[29,36,"b"],[37,44,"q"]]}

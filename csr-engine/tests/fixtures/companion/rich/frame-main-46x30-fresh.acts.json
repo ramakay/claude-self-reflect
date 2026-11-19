@@ -1,13 +1,4 @@
 {
-  "21": {
-    "key": "observe:3:0"
-  },
-  "22": {
-    "key": "observe:3:0"
-  },
-  "24": {
-    "key": "instrument:figure"
-  },
   "29": {
     "key": "legend",
     "keys": [
@@ -27,5 +18,14 @@
         "q"
       ]
     ]
+  },
+  "3": {
+    "key": "observe:3:0"
+  },
+  "4": {
+    "key": "observe:3:0"
+  },
+  "7": {
+    "key": "instrument:figure"
   }
 }

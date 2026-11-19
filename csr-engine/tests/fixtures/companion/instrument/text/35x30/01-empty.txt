@@ -1,4 +1,3 @@
-
 ☾ The dreamer looks as you work.
 dreamer 0 of 40k
 It asks a what-if from your past
@@ -6,6 +5,7 @@ sessions.
 Ask about past work. CSR finds it.
 Code changed? CSR warns Claude.
 CSR keeps the threads you dropped.
+
 Try a question
 What did we decide about this repo?
 Find a decision and its source

@@ -370,9 +370,10 @@ fn view_acts_keep_summary_and_threads_but_cannot_open_info() {
     for view in ["summary", "threads", "info"] {
         let (mut pane, _home) = pane_on("main", "sess-now", (100, 40));
         pane.frame(100, 40, NOW);
+        // A row the text cards leave blank (they start at the top), so no card's popup takes the click.
         pane.acts
-            .insert(3, serde_json::json!({"key":format!("view:{view}")}));
-        pane.click(3, 4, NOW);
+            .insert(37, serde_json::json!({"key":format!("view:{view}")}));
+        pane.click(37, 4, NOW);
         assert_eq!(pane.view, if view == "info" { "main" } else { view });
     }
 }

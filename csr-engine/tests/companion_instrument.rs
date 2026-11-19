@@ -508,11 +508,11 @@ fn live_context_without_transcript_or_open_dream_is_not_an_empty_session() {
             assert!(!shown.contains("Ask about past work.") && !shown.contains("Code changed?"));
             assert!(!shown.contains("→ passed") && !shown.contains("Launch images"));
             assert!(lines.iter().all(|line| text::len(line) <= cols));
-            let last_content = lines[..29]
+            let first_content = lines[..29]
                 .iter()
-                .rposition(|line| !line.trim().is_empty())
+                .position(|line| !line.trim().is_empty())
                 .unwrap();
-            assert!(28 - last_content <= 3, "{cols}: {shown}");
+            assert_eq!(first_content, 0, "top-anchored, {cols}: {shown}");
             let footer = &lines[29];
             assert!(
                 footer.contains("b thm") || footer.contains("b theme"),

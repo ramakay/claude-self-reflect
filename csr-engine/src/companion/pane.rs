@@ -1132,7 +1132,7 @@ impl Pane {
         cols: usize,
         rows: usize,
     ) -> Vec<String> {
-        use super::render::{instrument, raster, text};
+        use super::render::{instrument, raster, text, text_cards};
         self.instrument_metrics = None;
         self.obs_lines = [
             ObsCard::Confusing,
@@ -1756,20 +1756,13 @@ impl Pane {
         }
         out.truncate(rows.saturating_sub(1));
         out = out.into_iter().map(|line| text::safe_line(&line)).collect();
-        // Text content sits immediately above the keys; placements already own their rows.
+        // Text content: the dashboard reads as cards from the top; a popup or a page sits right
+        // above the keys. Placements already own their rows.
         if self.placed.is_empty() && !out.is_empty() {
-            let gap = rows.saturating_sub(1 + out.len());
-            if gap > 0 {
-                self.acts = std::mem::take(&mut self.acts)
-                    .into_iter()
-                    .map(|(row, act)| (row + gap, act))
-                    .collect();
-                hits = std::mem::take(&mut hits)
-                    .into_iter()
-                    .map(|(row, hit)| (row + gap, hit))
-                    .collect();
-                out.splice(0..0, std::iter::repeat_n(String::new(), gap));
-            }
+            let dashboard = open.popup.is_none() && !open.threads && !open.changes;
+            let moved = text_cards::place(&mut out, rows.saturating_sub(1), dashboard);
+            self.acts = text_cards::remap(std::mem::take(&mut self.acts), &moved);
+            hits = text_cards::remap(std::mem::take(&mut hits), &moved);
         }
         out.resize(rows.saturating_sub(1), String::new());
         let token = self.theme.tokens();
@@ -1778,7 +1771,7 @@ impl Pane {
         let ink = [token.ink[0], token.ink[1], token.ink[2]];
         let weekly_csr = format!("CSR {} pts", composition.csr_cost.share_label());
         for line in &mut out {
-            let padding = " ".repeat(cols.saturating_sub(text::len(line)));
+            let padding = " ".repeat(cols.saturating_sub(text_cards::width(line)));
             if line.contains(&weekly_csr) {
                 let csr_ink =
                     text::fg([token.csr_share[0], token.csr_share[1], token.csr_share[2]]);

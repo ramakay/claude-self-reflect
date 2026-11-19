@@ -2,13 +2,30 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use std::sync::Arc;
 
 pub fn pixels_enabled() -> bool {
-    pixels_for(
-        &std::env::var("TERM_PROGRAM").unwrap_or_default(),
-        std::env::var("CSR_COMPANION_PIXELS").ok().as_deref(),
+    let var = |key: &str| std::env::var(key).ok();
+    pixels_for_host(
+        &var("TERM_PROGRAM").unwrap_or_default(),
+        var("CSR_COMPANION_PIXELS").as_deref(),
+        var("__CFBundleIdentifier").as_deref(),
     )
 }
 pub fn pixels_for(program: &str, override_value: Option<&str>) -> bool {
     override_value != Some("0") && matches!(program, "herdr" | "kitty" | "ghostty" | "WezTerm")
+}
+/// macOS terminals that draw no kitty graphics. Under herdr nothing in-band tells the pane what
+/// the outer terminal is: herdr strips the host's TERM_PROGRAM and answers a kitty `a=q` query
+/// itself (OK, inside Terminal.app too), then hands the pictures to a host that prints them as
+/// text. The bundle id the herdr server was started from still reaches its panes, so a known
+/// host that cannot draw them gets the text cards. An unknown host (a server started over ssh
+/// has none) keeps pictures, and `CSR_COMPANION_PIXELS=1` forces them back on.
+pub const NO_PICTURE_HOSTS: [&str; 1] = ["com.apple.Terminal"];
+/// `pixels_for`, knowing the macOS app the terminal (or herdr's server) was started from.
+pub fn pixels_for_host(program: &str, override_value: Option<&str>, host: Option<&str>) -> bool {
+    if override_value == Some("1") {
+        return true;
+    }
+    let no_pictures = host.is_some_and(|host| NO_PICTURE_HOSTS.contains(&host));
+    pixels_for(program, override_value) && !(program == "herdr" && no_pictures)
 }
 thread_local! {
     static CELL_OVERRIDE: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
@@ -189,7 +206,11 @@ pub fn repaint_pictures(
     let mut out = SYNC_ON.to_owned();
     let start = out.len();
     if same.is_none() {
-        out.push_str(DELETE_ALL);
+        // A pane with no picture to show or to take down sends no graphics at all: a terminal
+        // without them (Terminal.app, through herdr too) prints the command as text.
+        if !placed.is_empty() || drawn.is_some_and(|d| !d.placed.is_empty()) {
+            out.push_str(DELETE_ALL);
+        }
         out.push_str("\x1b[H\x1b[2J");
     }
     let shown = same.map(|d| d.placed.as_slice()).unwrap_or_default();
@@ -450,5 +471,55 @@ mod picture_tests {
         for name in ["", "wezterm", "Terminal.app", "vscode"] {
             assert!(!pixels_for(name, None));
         }
+    }
+    #[test]
+    fn a_text_pane_sends_no_graphics_command_and_a_picture_pane_clears_old_pictures() {
+        let written = vec!["a".to_string(), "b".to_string()];
+        let text = repaint_pictures(None, 10, 2, &written, &[]);
+        assert!(text.contains("\x1b[2J") && !text.contains("\x1b_G"));
+        let picture = Placement {
+            row: 0,
+            col: 0,
+            cols: 2,
+            rows: 1,
+            png: Arc::from(b"png".as_slice()),
+        };
+        let first = repaint_pictures(None, 10, 2, &written, std::slice::from_ref(&picture));
+        assert!(first.starts_with(&format!("{SYNC_ON}{DELETE_ALL}")));
+        // A resize of a pane that showed a picture takes it down even when none follows.
+        let shown = Drawn {
+            cols: 10,
+            rows: 2,
+            written: written.clone(),
+            placed: vec![picture],
+            ids: vec![],
+        };
+        assert!(repaint_pictures(Some(&shown), 12, 2, &written, &[]).contains(DELETE_ALL));
+    }
+    #[test]
+    fn herdr_started_from_terminal_app_draws_text_not_pictures() {
+        // The env of a pane herdr 0.9.3 opened in macOS Terminal.app (seen on the Studio,
+        // 2026-11-19): pictures there came out as raw `Ga=p,...` text.
+        let terminal_app = Some("com.apple.Terminal");
+        assert!(!pixels_for_host("herdr", None, terminal_app));
+        assert!(!pixels_for_host("herdr", Some("0"), terminal_app));
+        // Forced back on, for a server started in Terminal.app and attached from Ghostty.
+        assert!(pixels_for_host("herdr", Some("1"), terminal_app));
+        // An unknown host keeps pictures: a herdr server started over ssh has no bundle id.
+        assert!(pixels_for_host("herdr", None, None));
+        for host in [
+            "com.mitchellh.ghostty",
+            "net.kovidgoyal.kitty",
+            "dev.warp.Warp-Stable",
+        ] {
+            assert!(pixels_for_host("herdr", None, Some(host)), "{host}");
+        }
+        // Outside herdr the host program already says it.
+        assert!(pixels_for_host(
+            "ghostty",
+            None,
+            Some("com.mitchellh.ghostty")
+        ));
+        assert!(!pixels_for_host("Apple_Terminal", None, terminal_app));
     }
 }
