@@ -1354,18 +1354,21 @@ mod tests {
         // creates anything under the real /Volumes.
         let icloud = fx.home.join("Library").join("Mobile Documents").join("x");
         let vol = PathBuf::from("/Volumes/csr-rs4-no-such-volume/x");
-        for (name, target, root) in [
-            (
-                "icloud",
-                icloud,
-                fx.home.join("Library").join("Mobile Documents"),
-            ),
-            (
+        let mut rows = vec![(
+            "icloud",
+            icloud,
+            fx.home.join("Library").join("Mobile Documents"),
+        )];
+        // `/Volumes` is a macOS folder. Without it (Linux) the chain fails on that missing
+        // first hop, which is the right answer there, so the volume row only runs where it exists.
+        if Path::new("/Volumes").is_dir() {
+            rows.push((
                 "volume",
                 vol,
                 PathBuf::from("/Volumes/csr-rs4-no-such-volume"),
-            ),
-        ] {
+            ));
+        }
+        for (name, target, root) in rows {
             let link2 = fx.root.join(format!("{name}2"));
             let link1 = fx.root.join(format!("{name}1"));
             symlink(&target, &link2).unwrap();

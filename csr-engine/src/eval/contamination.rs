@@ -1410,10 +1410,14 @@ pub fn matrix_rows(outputs: &[Output]) -> Vec<Case> {
 
 /// Every matrix row the current formatters produce.
 pub fn expected_matrix() -> Vec<Case> {
-    let mut outputs = engine_outputs();
-    outputs.extend(pane_outputs());
-    outputs.extend(plugin_synthetic());
-    matrix_rows(&outputs)
+    // Some formatters print a local clock time (the handoff draft's "went quiet after"). The
+    // stored rows are in UTC so the canary agrees with them in any time zone.
+    crate::companion::recall::with_utc_dates(|| {
+        let mut outputs = engine_outputs();
+        outputs.extend(pane_outputs());
+        outputs.extend(plugin_synthetic());
+        matrix_rows(&outputs)
+    })
 }
 
 /// The fixture file as it should be: the hand-written rows already in

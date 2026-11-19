@@ -347,11 +347,31 @@ pub struct Change {
 }
 
 pub fn date(at: f64, format: &str) -> String {
+    let instant = chrono::DateTime::from_timestamp(at as i64, 0);
+    if UTC_DATES.with(std::cell::Cell::get) {
+        return instant
+            .map(|t| t.format(format).to_string())
+            .unwrap_or_default();
+    }
     Local
         .timestamp_opt(at as i64, 0)
         .single()
         .map(|t| t.format(format).to_string())
         .unwrap_or_default()
+}
+
+thread_local! {
+    static UTC_DATES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with [`date`] reading UTC on this thread instead of the machine's zone. The
+/// contamination canary builds its checked-in fixture rows this way, so the same bytes come out
+/// in every time zone: the shipped health check compares them with the stored rows.
+pub fn with_utc_dates<T>(f: impl FnOnce() -> T) -> T {
+    let before = UTC_DATES.with(|cell| cell.replace(true));
+    let out = f();
+    UTC_DATES.with(|cell| cell.set(before));
+    out
 }
 
 pub fn quoted(text: &str, width: usize) -> String {
