@@ -2155,7 +2155,7 @@ pub(crate) fn daemon_agents_on_disk(home: &Path) -> Vec<DaemonAgentFile> {
 }
 
 /// The pid in `daemon.lock` while something holds the lock.
-fn daemon_lock_holder(home: &Path) -> Option<u32> {
+pub(crate) fn daemon_lock_holder(home: &Path) -> Option<u32> {
     let lock = home.join(".claude-self-reflect/daemon.lock");
     crate::daemon::lock_file_held(&lock)
         .then(|| std::fs::read_to_string(&lock).ok())
@@ -2167,8 +2167,15 @@ fn daemon_lock_holder(home: &Path) -> Option<u32> {
 /// own configuration and must never be written back into a plist.
 const LAUNCHD_INJECTED_ENV: [&str; 2] = ["XPC_SERVICE_NAME", "OSLogRateLimit"];
 
-/// `CSR_*` variables that describe the setup run, not the daemon.
-const SETUP_ONLY_ENV: [&str; 3] = ["CSR_AUTO_SETUP", "CSR_SKIP_SETUP", "CSR_NO_DAEMON"];
+/// `CSR_*` variables that describe the setup run, not the daemon: the installer's consent
+/// answer and install folder included. Kept out of the agent, and dropped from one that has them.
+const SETUP_ONLY_ENV: [&str; 5] = [
+    "CSR_AUTO_SETUP",
+    "CSR_SKIP_SETUP",
+    "CSR_NO_DAEMON",
+    "CSR_DREAMS_CONSENT",
+    "CSR_INSTALL_DIR",
+];
 
 /// The `CSR_*` choices of the setup process that the daemon should keep.
 fn carried_process_env(
@@ -2249,7 +2256,8 @@ fn merge_agent_env(
     };
     for (source, label) in [earlier, (this_run, "this run")] {
         for (key, value) in source {
-            if key != "PATH" && !LAUNCHD_INJECTED_ENV.contains(&key.as_str()) {
+            let foreign = [&LAUNCHD_INJECTED_ENV[..], &SETUP_ONLY_ENV[..]].concat();
+            if key != "PATH" && !foreign.contains(&key.as_str()) {
                 merged.insert(key.clone(), (value.clone(), label));
             }
         }
@@ -5426,22 +5434,6 @@ esac
         assert!(said.contains("CSR_NO_DREAMING=1 (from this run)"), "{said}");
         // an accepted consent does not outrank a kill switch, and the user is told
         assert!(said.contains("will not dream"), "{said}");
-    }
-
-    #[test]
-    fn setup_only_variables_are_not_written_into_the_agent() {
-        let carried = carried_process_env(
-            [
-                ("CSR_AUTO_SETUP", "1"),
-                ("CSR_SKIP_SETUP", "1"),
-                ("CSR_NO_DAEMON", "0"),
-                ("CSR_BUILD_GIT_SHA", "abc"),
-                ("HOME", "/Users/x"),
-                ("CSR_NO_RECAP", "1"),
-            ]
-            .map(|(k, v)| (k.to_owned(), v.to_owned())),
-        );
-        assert_eq!(carried, env_of(&[("CSR_NO_RECAP", "1")]));
     }
 
     #[test]

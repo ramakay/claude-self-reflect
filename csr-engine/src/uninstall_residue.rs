@@ -410,8 +410,14 @@ pub(super) fn local_mcp_step(home: &Path, apply: bool, out: &mut Vec<String>) ->
 
 /// Lines naming every csr-engine process that runs one of `binaries`, for the end of the output.
 /// Empty when none runs. Sends no signal: a session is the user's to restart. When `purge` is set
-/// the data folder is being deleted and these processes will write it again.
-pub(super) fn process_report(binaries: &[PathBuf], data: &Path, purge: bool) -> Vec<String> {
+/// the data folder is being deleted and these processes will write it again. `signalled` is the
+/// launchd daemon the agent step sent SIGTERM, if it did, so the header never claims otherwise.
+pub(super) fn process_report(
+    binaries: &[PathBuf],
+    data: &Path,
+    purge: bool,
+    signalled: Option<u32>,
+) -> Vec<String> {
     let mut seen: std::collections::BTreeMap<u32, crate::stale_report::StaleEngine> =
         std::collections::BTreeMap::new();
     for exe in binaries {
@@ -422,8 +428,12 @@ pub(super) fn process_report(binaries: &[PathBuf], data: &Path, purge: bool) -> 
     if seen.is_empty() {
         return Vec::new();
     }
+    let signals = match signalled.filter(|pid| seen.contains_key(pid)) {
+        Some(pid) => format!("only the launchd daemon (pid {pid}) was sent SIGTERM"),
+        None => "none was signalled".to_string(),
+    };
     let mut lines = vec![format!(
-        "csr-engine is still running in {} process(es); none was signalled:",
+        "csr-engine is still running in {} process(es); {signals}:",
         seen.len()
     )];
     for e in seen.values() {

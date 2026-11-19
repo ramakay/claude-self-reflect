@@ -11,8 +11,12 @@
 //! 3. the same entry in Codex's config (through `codex mcp remove`, config backed up first),
 //! 4. the companion plugin and its marketplace (through `claude plugin ...`), then the plugin
 //!    cache `~/.claude/plugins/cache/claude-self-reflect`,
-//! 5. the launch agent setup wrote (a plist without setup's marker is listed and left alone;
-//!    nothing is deleted while the daemon is not confirmed stopped),
+//! 5. the launch agent setup wrote (a plist without setup's marker is listed and left alone):
+//!    booted out, then its plist deleted at once, so nothing starts the daemon again at login,
+//!    then a bounded wait for the daemon to exit (launchd's `ExitTimeOut` plus a margin); a
+//!    daemon still running then gets one SIGTERM, sent only to the pid both launchd and
+//!    `daemon.lock` name. Nothing after this step is deleted while the daemon is not confirmed
+//!    stopped, and the last line says what is left and the command that finishes,
 //! 6. the npm global package `claude-self-reflect`, when `npm ls -g` lists it,
 //! 7. the data folder `~/.claude-self-reflect`: KEPT by default (its path and size are printed);
 //!    `--purge` deletes it except the transcript mirror, `--purge-mirror` (implies `--purge`)
@@ -23,7 +27,8 @@
 //!    one in `~/.local/bin` is deleted, any other gets its exact `rm` line printed.
 //!
 //! Every step prints what it removed or kept. The running csr-engine processes (sessions, relays)
-//! are listed at the end and never signalled: they recreate the data folder until restarted.
+//! are listed at the end and never signalled (only the launchd daemon of step 5 can be): they
+//! recreate the data folder until restarted.
 //!
 //! Never touched: `~/.claude/projects`, any other agent, any other hook. Without `--yes` (or with
 //! `--dry-run`) nothing changes, no program that changes anything is run (the plan reads files
@@ -42,9 +47,18 @@ use serde_json::Value;
 
 use crate::companion::relay::emit;
 use crate::hooks::statusline_retire;
-use crate::setup::{daemon_agents_on_disk, DAEMON_LABEL, DAEMON_PLIST_MARKER};
+use crate::setup::{
+    daemon_agents_on_disk, daemon_lock_holder, DAEMON_EXIT_TIMEOUT, DAEMON_LABEL,
+    DAEMON_PLIST_MARKER,
+};
 
 const MCP_NAME: &str = "claude-self-reflect";
+/// How often the wait for the daemon asks launchd again.
+const STOP_POLL: Duration = Duration::from_millis(200);
+/// How long the daemon gets after uninstall's own SIGTERM.
+const SIGTERM_GRACE: Duration = Duration::from_secs(5);
+/// Overrides the wait for the daemon, in milliseconds (tests; capped at two minutes).
+const STOP_WAIT_ENV: &str = "CSR_UNINSTALL_STOP_WAIT_MS";
 const DATA_DIR: &str = ".claude-self-reflect";
 const CONFIG_CAP: u64 = 32 * 1024 * 1024;
 const OUTPUT_CAP: usize = 1024 * 1024;
@@ -130,10 +144,17 @@ pub fn run(args: &UninstallArgs, db_path: &Path) -> i32 {
         ok &= data_step(&home, apply, args, &mut out);
     }
     ok &= cache_step(apply, &mut out);
-    let processes =
-        residue::process_report(&binaries, &home.join(DATA_DIR), args.purges() && !hold_data);
+    let processes = residue::process_report(
+        &binaries,
+        &home.join(DATA_DIR),
+        args.purges() && !hold_data,
+        agents.signalled,
+    );
     // Last: nothing after this may need the binary.
     ok &= binary_step(&home, apply, hold_data, &binaries, &mut out);
+    if apply && hold_data {
+        out.push(finish_line(args));
+    }
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
     let _ = writeln!(
@@ -165,6 +186,27 @@ pub fn run(args: &UninstallArgs, db_path: &Path) -> i32 {
     } else {
         1
     }
+}
+
+/// The last line of a run that left things behind because the daemon is not confirmed stopped:
+/// what to wait for, then the exact command that removes the rest.
+fn finish_line(args: &UninstallArgs) -> String {
+    let exe = std::env::current_exe()
+        .map(|p| format!("\"{}\"", p.display()))
+        .unwrap_or_else(|_| "csr-engine".to_string());
+    let purge = if args.purge_mirror {
+        " --purge-mirror"
+    } else if args.purge {
+        " --purge"
+    } else {
+        ""
+    };
+    let job = format!("gui/{}/{DAEMON_LABEL}", unsafe { libc::getuid() });
+    format!(
+        "not finished: what the lines above keep stays until the daemon has stopped. Once \
+         `launchctl print {job}` says it cannot find the service, finish with: {exe} uninstall \
+         --yes{purge}"
+    )
 }
 
 fn unix_secs() -> u64 {
@@ -825,8 +867,9 @@ fn marketplace_gone(out: &mut Vec<String>) -> bool {
 enum Launchd {
     /// No such job.
     NotLoaded,
-    /// A job with this label, loaded from this very plist.
-    LoadedHere,
+    /// A job with this label, loaded from this very plist, with the pid launchd gives its
+    /// process (none while it is not running).
+    LoadedHere(Option<u32>),
     /// A job with this label, loaded from another file.
     LoadedElsewhere,
     /// launchd could not be asked, or did not answer clearly.
@@ -843,7 +886,12 @@ fn launchd_state(job: &str, here: &str) -> Launchd {
                     .is_some_and(|p| p.trim() == here)
             });
             if from_here {
-                Launchd::LoadedHere
+                let pid = run.stdout.lines().find_map(|l| {
+                    l.trim()
+                        .strip_prefix("pid = ")
+                        .and_then(|p| p.trim().parse::<u32>().ok())
+                });
+                Launchd::LoadedHere(pid)
             } else {
                 Launchd::LoadedElsewhere
             }
@@ -877,7 +925,7 @@ fn daemon_still_loaded(home: &Path, out: &mut Vec<String>) -> bool {
             Launchd::NotLoaded => {}
             Launchd::Unknown(why)
                 if plist.is_none() && why.starts_with("could not run launchctl") => {}
-            Launchd::LoadedHere | Launchd::LoadedElsewhere => {
+            Launchd::LoadedHere(_) | Launchd::LoadedElsewhere => {
                 out.push(format!(
                     "launch agent: a job named {label} is still loaded in launchd; stop it with \
                      `launchctl bootout {job}`"
@@ -901,12 +949,82 @@ struct Agents {
     ok: bool,
     /// True when a daemon may still be running: the data folder must stay.
     hold_data: bool,
+    /// The daemon pid this step sent SIGTERM, if it had to.
+    signalled: Option<u32>,
+}
+
+/// How long to wait for the daemon to exit after bootout: launchd's `ExitTimeOut` (when it sends
+/// SIGKILL itself) plus a margin, unless [`STOP_WAIT_ENV`] says otherwise.
+fn stop_wait() -> Duration {
+    std::env::var(STOP_WAIT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|ms| Duration::from_millis(ms.min(120_000)))
+        .unwrap_or(DAEMON_EXIT_TIMEOUT + Duration::from_secs(5))
+}
+
+/// Ask launchd until it no longer has `job`, for at most `limit`. True when it is gone.
+fn wait_until_unloaded(job: &str, here: &str, limit: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if matches!(launchd_state(job, here), Launchd::NotLoaded) {
+            return true;
+        }
+        if start.elapsed() >= limit {
+            return false;
+        }
+        std::thread::sleep(STOP_POLL.min(limit.saturating_sub(start.elapsed())));
+    }
+}
+
+/// After a successful bootout (the plist already deleted): wait for the daemon to exit. launchd
+/// keeps the job, state "SIGTERMed", until the process is gone, and the daemon's graceful stop
+/// takes up to 20 s. Still there after the wait: one SIGTERM to `recorded`, and only while
+/// launchd and `daemon.lock` both still name that pid, so a reused pid is never signalled; then
+/// a short last wait. `None` when the daemon is gone, else why not.
+fn wait_for_daemon_exit(
+    home: &Path,
+    job: &str,
+    here: &str,
+    recorded: Option<u32>,
+    agents: &mut Agents,
+    out: &mut Vec<String>,
+) -> Option<String> {
+    let wait = stop_wait();
+    if wait_until_unloaded(job, here, wait) {
+        return None;
+    }
+    let waited = format!("{:.1} s", wait.as_secs_f64());
+    let Some(pid) = recorded else {
+        return Some(format!(
+            "it is still running {waited} after the stop, and no pid was recorded to signal"
+        ));
+    };
+    let still_ours = matches!(launchd_state(job, here), Launchd::LoadedHere(Some(p)) if p == pid)
+        && daemon_lock_holder(home) == Some(pid);
+    if still_ours && pid > 1 {
+        // SAFETY: kill(2) with a pid launchd and the daemon's own lock both name right now.
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == 0 {
+            agents.signalled = Some(pid);
+            out.push(format!(
+                "launch agent: the daemon (pid {pid}) was still running {waited} after the stop; \
+                 sent it SIGTERM"
+            ));
+        }
+    }
+    if wait_until_unloaded(job, here, SIGTERM_GRACE.min(wait)) {
+        return None;
+    }
+    Some(format!(
+        "pid {pid} is still running {waited} after the stop"
+    ))
 }
 
 fn agent_step(home: &Path, apply: bool, out: &mut Vec<String>) -> Agents {
     let mut agents = Agents {
         ok: true,
         hold_data: false,
+        signalled: None,
     };
     let found = daemon_agents_on_disk(home);
     if found.is_empty() {
@@ -926,86 +1044,92 @@ fn agent_step(home: &Path, apply: bool, out: &mut Vec<String>) -> Agents {
         }
         if !apply {
             out.push(format!(
-                "launch agent: would stop {} and delete {}",
+                "launch agent: would stop {} and delete {}, then wait up to {} s for the daemon \
+                 to exit",
                 agent.label,
-                agent.path.display()
+                agent.path.display(),
+                stop_wait().as_secs()
             ));
             continue;
         }
         // launchd names jobs by label, not by file: stop the loaded job only when it was loaded
         // from this very file, so another account's or another copy's daemon is never stopped.
-        // The plist goes only once the job is known to be gone, so a retry can still find it.
+        // The plist is deleted in every case, right after any bootout and before any wait: with
+        // RunAtLoad it would start the daemon again at the next login. A retry still finds a
+        // daemon that keeps running by its label (`daemon_still_loaded`).
         let job = format!("gui/{}/{}", unsafe { libc::getuid() }, agent.label);
         let here = agent.path.to_string_lossy().into_owned();
-        let delete_plist = match launchd_state(&job, &here) {
-            Launchd::NotLoaded => true,
+        let hold = |agents: &mut Agents| {
+            agents.ok = false;
+            agents.hold_data = true;
+        };
+        match launchd_state(&job, &here) {
+            Launchd::NotLoaded => {
+                delete_plist(&agent.path, &mut agents, out);
+            }
             Launchd::LoadedElsewhere => {
                 out.push(format!(
                     "launch agent: a job named {} is loaded from another file and keeps running; \
                      stop it with `launchctl bootout {job}` if it is yours",
                     agent.label
                 ));
-                agents.ok = false;
-                agents.hold_data = true;
-                true
+                hold(&mut agents);
+                delete_plist(&agent.path, &mut agents, out);
             }
             Launchd::Unknown(why) => {
+                delete_plist(&agent.path, &mut agents, out);
                 out.push(format!(
-                    "launch agent: could not tell whether {} is running ({why}); {} left in place",
-                    agent.label,
-                    agent.path.display()
+                    "launch agent: could not tell whether {} is running ({why}); if it is, stop \
+                     it with `launchctl bootout {job}`",
+                    agent.label
                 ));
-                agents.ok = false;
-                agents.hold_data = true;
-                false
+                hold(&mut agents);
             }
-            Launchd::LoadedHere => {
+            Launchd::LoadedHere(launchd_pid) => {
+                // The daemon's pid, recorded before the stop: launchd's and the lock's must agree.
+                let recorded = launchd_pid.filter(|pid| daemon_lock_holder(home) == Some(*pid));
                 let booted = run_cmd(
                     "launchctl",
                     &["bootout", job.as_str()],
                     Duration::from_secs(60),
                 );
+                delete_plist(&agent.path, &mut agents, out);
                 let failure = match booted {
-                    Ok(run) if run.success => match launchd_state(&job, &here) {
-                        Launchd::NotLoaded => None,
-                        _ => Some("it is still loaded afterwards".to_string()),
-                    },
+                    Ok(run) if run.success => {
+                        wait_for_daemon_exit(home, &job, &here, recorded, &mut agents, out)
+                    }
                     Ok(run) => Some(run.first_stderr_line()),
                     Err(e) => Some(e),
                 };
                 match failure {
-                    None => {
-                        out.push(format!("launch agent: stopped {}", agent.label));
-                        true
-                    }
+                    None => out.push(format!("launch agent: stopped {}", agent.label)),
                     Some(why) => {
                         out.push(format!(
-                            "launch agent: could not stop {} ({why}); {} left in place",
-                            agent.label,
-                            agent.path.display()
+                            "launch agent: could not stop {} ({why}); stop it with `launchctl \
+                             bootout {job}`",
+                            agent.label
                         ));
-                        agents.ok = false;
-                        agents.hold_data = true;
-                        false
+                        hold(&mut agents);
                     }
                 }
-            }
-        };
-        if !delete_plist {
-            continue;
-        }
-        match std::fs::remove_file(&agent.path) {
-            Ok(()) => out.push(format!("launch agent: deleted {}", agent.path.display())),
-            Err(e) => {
-                out.push(format!(
-                    "launch agent: could not delete {}: {e}",
-                    agent.path.display()
-                ));
-                agents.ok = false;
             }
         }
     }
     agents
+}
+
+/// Delete a launch agent plist setup wrote, and say so.
+fn delete_plist(path: &Path, agents: &mut Agents, out: &mut Vec<String>) {
+    match std::fs::remove_file(path) {
+        Ok(()) => out.push(format!("launch agent: deleted {}", path.display())),
+        Err(e) => {
+            out.push(format!(
+                "launch agent: could not delete {}: {e}",
+                path.display()
+            ));
+            agents.ok = false;
+        }
+    }
 }
 
 fn data_step(home: &Path, apply: bool, args: &UninstallArgs, out: &mut Vec<String>) -> bool {
