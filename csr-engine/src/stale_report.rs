@@ -245,10 +245,23 @@ fn same_file_as(exe: &Path) -> impl Fn(&str) -> bool {
 }
 
 fn census(exe: &Path) -> Vec<StaleEngine> {
+    match std::fs::metadata(exe).map(|m| m.ino()) {
+        Ok(disk) => census_of(exe, Some(disk)),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Every process running the binary at `exe`, on an older file or not, this process left out.
+/// Reads only (`ps`, `lsof`) and signals nothing. `uninstall` uses it to name the sessions that
+/// will recreate the data folder; the binary need not exist any more.
+pub(crate) fn running(exe: &Path) -> Vec<StaleEngine> {
+    census_of(exe, None)
+}
+
+/// The census behind [`census`] (`disk` is the inode on disk: only processes that map another one
+/// are kept) and [`running`] (`disk` is `None`: every process of `exe` is kept).
+fn census_of(exe: &Path, disk: Option<u64>) -> Vec<StaleEngine> {
     let Some(exe_str) = exe.to_str() else {
-        return Vec::new();
-    };
-    let Ok(disk) = std::fs::metadata(exe).map(|m| m.ino()) else {
         return Vec::new();
     };
     let Some(ps) = text_of("ps", &["-axo", "pid=,ppid=,args="]) else {
@@ -264,9 +277,16 @@ fn census(exe: &Path) -> Vec<StaleEngine> {
     }
     let list = |ids: Vec<u32>| ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
     let pids = list(raws.iter().map(|r| r.pid).collect());
-    let txt = text_of("lsof", &["-a", "-d", "txt", "-p", &pids, "-Fpfin"])
-        .map(|t| parse_txt(&t, exe_str))
-        .unwrap_or_default();
+    let (txt, disk) = match disk {
+        Some(disk) => (
+            text_of("lsof", &["-a", "-d", "txt", "-p", &pids, "-Fpfin"])
+                .map(|t| parse_txt(&t, exe_str))
+                .unwrap_or_default(),
+            disk,
+        ),
+        // No inode test: give every pid an inode that differs from the "disk" one.
+        None => (raws.iter().map(|r| (r.pid, 0)).collect(), 1),
+    };
     let mut parents: Vec<u32> = raws.iter().map(|r| r.ppid).filter(|p| *p > 1).collect();
     parents.sort_unstable();
     parents.dedup();
