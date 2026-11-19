@@ -166,7 +166,7 @@ impl Canvas {
         let (mut left, mut ink) = (on, true);
         for pair in points.windows(2) {
             let [(x0, y0), (x1, y1)] = [pair[0], pair[1]];
-            let length = (x1 - x0).hypot(y1 - y0);
+            let length = libm::hypotf(x1 - x0, y1 - y0);
             let mut done = 0.;
             while done < length {
                 let step = left.min(length - done);
@@ -1347,17 +1347,14 @@ fn slot(mark: Pixmap, cell: Cell, backs: [Rgb; 2], emblem: bool) -> Option<Pixma
             [p.red(), p.green(), p.blue(), p.alpha()]
         })
         .collect();
-    let image = image::RgbaImage::from_raw(mark.width(), mark.height(), data)?;
-    let image = image::imageops::resize(
-        &image,
-        mw.max(1),
-        mh.max(1),
-        if k > 0 {
-            image::imageops::FilterType::Nearest
-        } else {
-            image::imageops::FilterType::Lanczos3
-        },
-    );
+    let size = (mw.max(1), mh.max(1));
+    let dimensions = (mark.width(), mark.height());
+    let image = if k > 0 {
+        let image = image::RgbaImage::from_raw(dimensions.0, dimensions.1, data)?;
+        image::imageops::resize(&image, size.0, size.1, image::imageops::FilterType::Nearest)
+    } else {
+        super::resample::lanczos3_resize(&data, dimensions, size)?
+    };
     let k = k.max(1) as i32;
     let x = (w as i32 - mw as i32 - if emblem { 2 * k } else { 0 }).div_euclid(2);
     let y = (h as i32 - mh as i32 - if emblem { k } else { 0 }).div_euclid(2);

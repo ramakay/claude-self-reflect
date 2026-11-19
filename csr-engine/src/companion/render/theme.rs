@@ -355,7 +355,7 @@ mod instrument_tests {
             if v <= 0.04045 {
                 v / 12.92
             } else {
-                ((v + 0.055) / 1.055).powf(2.4)
+                libm::pow((v + 0.055) / 1.055, 2.4)
             }
         };
         0.2126 * channel(c[0]) + 0.7152 * channel(c[1]) + 0.0722 * channel(c[2])
@@ -424,13 +424,13 @@ mod instrument_tests {
             if v <= 0.04045 {
                 v / 12.92
             } else {
-                ((v + 0.055) / 1.055).powf(2.4)
+                libm::pow((v + 0.055) / 1.055, 2.4)
             }
         };
         let [r, g, b] = [linear(rgb[0]), linear(rgb[1]), linear(rgb[2])];
         let f = |v: f64| {
             if v > 216. / 24389. {
-                v.cbrt()
+                libm::cbrt(v)
             } else {
                 v * 841. / 108. + 4. / 29.
             }
@@ -443,15 +443,15 @@ mod instrument_tests {
     fn delta_e_2000(a: [f64; 3], b: [f64; 3]) -> f64 {
         let [l1, a1, b1] = a;
         let [l2, a2, b2] = b;
-        let c = (a1.hypot(b1) + a2.hypot(b2)) / 2.;
+        let c = (libm::hypot(a1, b1) + libm::hypot(a2, b2)) / 2.;
         let g = 0.5 * (1. - (c.powi(7) / (c.powi(7) + 25_f64.powi(7))).sqrt());
         let (a1, a2) = ((1. + g) * a1, (1. + g) * a2);
-        let (c1, c2) = (a1.hypot(b1), a2.hypot(b2));
+        let (c1, c2) = (libm::hypot(a1, b1), libm::hypot(a2, b2));
         let hue = |a: f64, b: f64| {
             if a == 0. && b == 0. {
                 0.
             } else {
-                b.atan2(a).to_degrees().rem_euclid(360.)
+                libm::atan2(b, a).to_degrees().rem_euclid(360.)
             }
         };
         let (h1, h2) = (hue(a1, b1), hue(a2, b2));
@@ -463,7 +463,7 @@ mod instrument_tests {
         } else if dh < -180. {
             dh += 360.;
         }
-        let dh = 2. * (c1 * c2).sqrt() * (dh / 2.).to_radians().sin();
+        let dh = 2. * (c1 * c2).sqrt() * libm::sin((dh / 2.).to_radians());
         let (dl, dc) = (l2 - l1, c2 - c1);
         let (lm, cm) = ((l1 + l2) / 2., (c1 + c2) / 2.);
         let hm = if c1 * c2 == 0. {
@@ -475,7 +475,7 @@ mod instrument_tests {
         } else {
             (h1 + h2 - 360.) / 2.
         };
-        let cos = |v: f64| v.to_radians().cos();
+        let cos = |v: f64| libm::cos(v.to_radians());
         let t = 1. - 0.17 * cos(hm - 30.) + 0.24 * cos(2. * hm) + 0.32 * cos(3. * hm + 6.)
             - 0.20 * cos(4. * hm - 63.);
         let sl = 1. + 0.015 * (lm - 50.).powi(2) / (20. + (lm - 50.).powi(2)).sqrt();
@@ -483,9 +483,7 @@ mod instrument_tests {
         let sh = 1. + 0.015 * cm * t;
         let rt = -2.
             * (cm.powi(7) / (cm.powi(7) + 25_f64.powi(7))).sqrt()
-            * (60. * (-((hm - 275.) / 25.).powi(2)).exp())
-                .to_radians()
-                .sin();
+            * libm::sin((60. * libm::exp(-((hm - 275.) / 25.).powi(2))).to_radians());
         ((dl / sl).powi(2) + (dc / sc).powi(2) + (dh / sh).powi(2) + rt * (dc / sc) * (dh / sh))
             .sqrt()
     }

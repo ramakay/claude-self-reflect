@@ -1042,6 +1042,7 @@ dependencies = [
  "ignore",
  "image",
  "libc",
+ "libm",
  "memchr",
  "minijinja",
  "notify",
@@ -5880,6 +5881,7 @@ checksum = "edca365c3faccca67d06593c5980fa6c57687de727a03131735bb85f01fdeeb9"
 dependencies = [
  "arrayref",
  "bytemuck",
+ "libm",
  "strict-num",
 ]
 

@@ -7,7 +7,7 @@ pub mod kitty;
 pub mod observation;
 pub mod pictures;
 pub mod raster;
-mod resample;
+pub(super) mod resample;
 pub mod text;
 pub mod theme;
 

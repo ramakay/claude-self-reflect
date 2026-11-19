@@ -2,7 +2,7 @@ use super::{
     cli::PaneArgs,
     pane::Pane,
     paths::Paths,
-    render::{kitty, raster, text, theme::Theme},
+    render::{kitty, raster, resample, text, theme::Theme},
 };
 
 pub fn export(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
@@ -258,12 +258,12 @@ pub fn compose(
             continue;
         }
         let source = image::load_from_memory(&p.png)?.to_rgba8();
-        let display = image::imageops::resize(
-            &source,
-            p.cols as u32 * cell.0,
-            p.rows as u32 * cell.1,
-            image::imageops::FilterType::Lanczos3,
-        );
+        let display = resample::lanczos3_resize(
+            source.as_raw(),
+            source.dimensions(),
+            (p.cols as u32 * cell.0, p.rows as u32 * cell.1),
+        )
+        .ok_or_else(|| anyhow::anyhow!("invalid PNG placement buffer"))?;
         image::imageops::overlay(
             &mut image,
             &display,

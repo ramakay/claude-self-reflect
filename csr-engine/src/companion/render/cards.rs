@@ -808,12 +808,12 @@ fn moon(c: &mut Canvas, f: &CardFonts, cx: f32, cy: f32, r: f32, m: &MoonFact) {
             for i in 0..=steps {
                 let t =
                     -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / steps as f32;
-                pts.push((cx + r * t.cos(), cy + r * t.sin()));
+                pts.push((cx + r * libm::cosf(t), cy + r * libm::sinf(t)));
             }
             for i in 0..=steps {
                 let t =
                     std::f32::consts::FRAC_PI_2 - std::f32::consts::PI * i as f32 / steps as f32;
-                pts.push((cx + k * r * t.cos(), cy + r * t.sin()));
+                pts.push((cx + k * r * libm::cosf(t), cy + r * libm::sinf(t)));
             }
             c.lit(&pts, px(super::text::heat(m.tokens)));
         }

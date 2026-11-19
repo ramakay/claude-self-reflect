@@ -398,7 +398,7 @@ pub fn share_text(percent: Option<f64>, bound: bool) -> String {
     let digits = if percent >= 1. {
         1
     } else {
-        -(percent.log10().floor() as i32)
+        -(libm::log10(percent).floor() as i32)
     };
     let scale = 10f64.powi(digits);
     let shown = if bound {
@@ -409,7 +409,7 @@ pub fn share_text(percent: Option<f64>, bound: bool) -> String {
     if shown >= 1. {
         return format!("{mark}{}%", pyfmt::fixed(shown, 1));
     }
-    let digits = -((shown.log10() + 1e-9).floor() as i32);
+    let digits = -((libm::log10(shown) + 1e-9).floor() as i32);
     format!("{mark}{}%", pyfmt::fixed(shown, digits.max(0) as usize))
 }
 

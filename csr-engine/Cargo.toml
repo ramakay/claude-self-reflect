@@ -44,8 +44,9 @@ ast-grep-language = { version = "0.42", default-features = false, features = [
 ] }
 ratatui = "0.30"
 crossterm = "0.29"
-tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
+tiny-skia = { version = "0.12", default-features = false, features = ["no-std-float", "simd"] }
 ab_glyph = "0.2.32"
+libm = "0.2"
 ttf-parser = "0.25.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"

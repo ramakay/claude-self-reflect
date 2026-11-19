@@ -220,7 +220,7 @@ pub(super) fn linear(c: f64) -> f64 {
     if c <= 0.04045 {
         c / 12.92
     } else {
-        ((c + 0.055) / 1.055).powf(2.4)
+        libm::pow((c + 0.055) / 1.055, 2.4)
     }
 }
 pub(super) fn lab(rgb: Rgb) -> [f64; 3] {
@@ -230,7 +230,7 @@ pub(super) fn lab(rgb: Rgb) -> [f64; 3] {
     let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
     let f = |t: f64| {
         if t > 216. / 24389. {
-            t.powf(1. / 3.)
+            libm::pow(t, 1. / 3.)
         } else {
             (24389. / 27. * t + 16.) / 116.
         }
@@ -260,7 +260,7 @@ pub(super) fn from_lab([l, a, b]: [f64; 3]) -> Rgb {
             (if c <= 0.0031308 {
                 c * 12.92
             } else {
-                1.055 * c.max(0.).powf(1. / 2.4) - 0.055
+                1.055 * libm::pow(c.max(0.), 1. / 2.4) - 0.055
             }) * 255.,
         )
         .clamp(0., 255.) as u8

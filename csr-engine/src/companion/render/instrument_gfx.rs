@@ -760,17 +760,17 @@ pub fn arc_path(cx: f32, cy: f32, r: f32, a0: f32, a1: f32) -> Option<Path> {
     let (t0, t1) = ((a0 as f64).to_radians(), (a1 as f64).to_radians());
     let n = (((t1 - t0).abs() / std::f64::consts::FRAC_PI_2).ceil() as usize).max(1);
     let d = (t1 - t0) / n as f64;
-    let k = 4. / 3. * (d / 4.).tan();
+    let k = 4. / 3. * libm::tan(d / 4.);
     let (cx, cy, r) = (cx as f64, cy as f64, r as f64);
-    let pt = |t: f64| (cx + r * t.sin(), cy - r * t.cos());
+    let pt = |t: f64| (cx + r * libm::sin(t), cy - r * libm::cos(t));
     let mut pb = PathBuilder::new();
     let (x0, y0) = pt(t0);
     pb.move_to(x0 as f32, y0 as f32);
     for i in 0..n {
         let (ta, tb) = (t0 + d * i as f64, t0 + d * (i + 1) as f64);
         let (pa, pbp) = (pt(ta), pt(tb));
-        let c1 = (pa.0 + k * r * ta.cos(), pa.1 + k * r * ta.sin());
-        let c2 = (pbp.0 - k * r * tb.cos(), pbp.1 - k * r * tb.sin());
+        let c1 = (pa.0 + k * r * libm::cos(ta), pa.1 + k * r * libm::sin(ta));
+        let c2 = (pbp.0 - k * r * libm::cos(tb), pbp.1 - k * r * libm::sin(tb));
         pb.cubic_to(
             c1.0 as f32,
             c1.1 as f32,
@@ -784,7 +784,7 @@ pub fn arc_path(cx: f32, cy: f32, r: f32, a0: f32, a1: f32) -> Option<Path> {
 }
 pub fn on_ring(cx: f32, cy: f32, r: f32, deg: f32) -> (f32, f32) {
     let t = deg.to_radians();
-    (cx + r * t.sin(), cy - r * t.cos())
+    (cx + r * libm::sinf(t), cy - r * libm::cosf(t))
 }
 pub fn stops(s: &[(f32, Rgba)]) -> Vec<GradientStop> {
     s.iter()
@@ -1198,7 +1198,7 @@ impl Canvas {
         let (w, h) = (self.pm.width() as f32 / S, self.pm.height() as f32 / S);
         self.pm.fill(color(t.mesh_ground));
         let full = rrect_path(0., 0., w, h, 0.);
-        let diagonal = w.hypot(h);
+        let diagonal = libm::hypotf(w, h);
         for ((x, y, radius), stops) in [
             (-0.15 * w, -0.10 * h, 0.9 * diagonal),
             (1.15 * w, 0.45 * h, diagonal),
@@ -1443,14 +1443,12 @@ pub fn contact(f: &Fonts, tiles: &[(String, Pixmap, String)], path: &str, bg: Rg
                 break;
             }
             let (name, pm, cap) = &tiles[i];
-            let img =
-                image::RgbaImage::from_raw(pm.width(), pm.height(), pm.data().to_vec()).unwrap();
-            let half = image::imageops::resize(
-                &img,
-                pm.width() / 2,
-                pm.height() / 2,
-                image::imageops::FilterType::Lanczos3,
-            );
+            let half = super::resample::lanczos3_resize(
+                pm.data(),
+                (pm.width(), pm.height()),
+                (pm.width() / 2, pm.height() / 2),
+            )
+            .unwrap();
             let (hw, hh) = half.dimensions();
             let small =
                 Pixmap::from_vec(half.into_raw(), IntSize::from_wh(hw, hh).unwrap()).unwrap();
