@@ -43,6 +43,15 @@ export default function DocPage({ title, description, content, path }) {
               }
               return <a href={href} target={href?.startsWith('http') ? '_blank' : undefined} rel="noopener noreferrer">{children}</a>
             },
+            // Content writes images as /claude-self-reflect/images/...; the app
+            // is served from Vite's base (/claude-self-reflect/docs/), so map the
+            // old site prefix onto the current base.
+            img: ({ node: _node, src, ...props }) => (
+              <img
+                src={src?.startsWith('/claude-self-reflect/') ? import.meta.env.BASE_URL + src.slice('/claude-self-reflect/'.length) : src}
+                {...props}
+              />
+            ),
           }}
         >
           {content}

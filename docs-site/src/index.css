@@ -36,7 +36,7 @@ body {
   font-family: var(--font-sans);
   color: var(--color-body);
   background:
-    url('/claude-self-reflect/images/sky-bg.webp') center/cover fixed no-repeat,
+    url('/images/sky-bg.webp') center/cover fixed no-repeat,
     radial-gradient(circle at 78% 16%, rgba(255,255,255,0.78) 0 8%, rgba(255,255,255,0.34) 12%, transparent 28%),
     radial-gradient(ellipse at 22% 38%, rgba(255,248,236,0.58) 0 13%, rgba(255,255,255,0.28) 26%, transparent 48%),
     linear-gradient(145deg, #edf0f7 0%, #e8e4f0 26%, #d8d4e8 52%, #c8cae0 100%);
@@ -2967,7 +2967,7 @@ ul.latency-compare {
 
 [data-theme="dark"] body {
   background:
-    url('/claude-self-reflect/images/sky-bg-dark.webp') center/cover fixed no-repeat,
+    url('/images/sky-bg-dark.webp') center/cover fixed no-repeat,
     linear-gradient(145deg, #080d1f 0%, #111832 46%, #1b2240 100%);
 }
 
@@ -3180,7 +3180,7 @@ ul.latency-compare {
 
 /* Dark sky background */
 [data-theme="dark"] body {
-  background: url('/claude-self-reflect/images/sky-bg-dark.webp') center/cover fixed no-repeat,
+  background: url('/images/sky-bg-dark.webp') center/cover fixed no-repeat,
     linear-gradient(145deg, #080d1f 0%, #111832 46%, #1b2240 100%);
 }
 

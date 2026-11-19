@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'docs-site/**'
+      - 'site/**'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -41,10 +42,28 @@ jobs:
         run: npm run build
         working-directory: docs-site
 
+      # One Pages artifact: the anatomy landing (site/) at the root, the docs
+      # app under docs/. site/404.html sends misses to the landing or the docs,
+      # and the landing forwards old #/docs/<slug> links to docs/.
+      - name: Assemble Pages site
+        env:
+          OUT: _site
+        run: |
+          rm -rf "$OUT"
+          mkdir -p "$OUT/docs"
+          cp -R site/. "$OUT/"
+          cp -R docs-site/dist/. "$OUT/docs/"
+          test -f "$OUT/index.html" && test -f "$OUT/404.html" && test -f "$OUT/docs/index.html"
+          # GitHub rejects files over 100 MB; warn from 50 MB.
+          big=$(find "$OUT" -type f -size +100M)
+          if [ -n "$big" ]; then echo "::error::files over 100 MB: $big"; exit 1; fi
+          find "$OUT" -type f -size +50M -exec echo "::warning::file over 50 MB: {}" \;
+          du -sh "$OUT"
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: docs-site/dist
+          path: _site
 
   deploy:
     needs: build
