@@ -25,7 +25,7 @@ const MAX_LEDGER_SHAS: usize = 20;
 
 #[path = "ratification_pace.rs"]
 pub mod pace;
-pub use pace::next_due;
+pub use pace::{next_due, record_failure, CallUnavailable};
 
 static DISABLED_LOG: Once = Once::new();
 
@@ -159,6 +159,8 @@ async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNa
     for candidate in ratification_model_candidates() {
         let attempt = tokio::time::timeout(RATIFICATION_TIMEOUT, async {
             let mut cmd = tokio::process::Command::new("claude");
+            // The 60 s timeout drops this future: the child goes with it, not left running.
+            cmd.kill_on_drop(true);
             // Same recursion guard as session_briefing: nested claude sessions
             // inherit hook config; without it each extraction call fires all CSR
             // hooks and Stop stores the extractor transcript as an episode.
@@ -462,19 +464,28 @@ pub async fn process_ratification(storage: &Arc<Storage>, conv_id: &str) -> Resu
         digest
     );
 
-    match call_claude_for_acts(&prompt).await {
+    // The usage row goes in before the call, so the hour's budget counts a call that is killed
+    // midway too. No row, no call: the budget could not count it.
+    let Some(usage_id) = reserve_usage(storage) else {
+        return Ok(());
+    };
+    let began = std::time::Instant::now();
+    let called = call_claude_for_acts(&prompt).await;
+    let measured =
+        |parsed: Option<&crate::narrative::ParsedNarrative>, success: bool| NarrativeUsageRow {
+            call_site: "ratification".into(),
+            model: parsed.map_or_else(|| "unknown".into(), |p| p.model.clone()),
+            input_tokens: parsed.map_or(0, |p| p.input_tokens),
+            output_tokens: parsed.map_or(0, |p| p.output_tokens),
+            cache_read_tokens: parsed.map_or(0, |p| p.cache_read_tokens),
+            cache_creation_tokens: parsed.map_or(0, |p| p.cache_creation_tokens),
+            duration_ms: began.elapsed().as_millis() as i64,
+            success,
+        };
+    match called {
         Some(parsed) => match parse_acts(&parsed.text) {
             Ok((acts_json, n_directs, n_accepts, n_rejects)) => {
-                let _ = storage.record_narrative_usage(&NarrativeUsageRow {
-                    call_site: "ratification".into(),
-                    model: parsed.model.clone(),
-                    input_tokens: parsed.input_tokens,
-                    output_tokens: parsed.output_tokens,
-                    cache_read_tokens: parsed.cache_read_tokens,
-                    cache_creation_tokens: parsed.cache_creation_tokens,
-                    duration_ms: 0,
-                    success: true,
-                });
+                settle_usage(storage, usage_id, &measured(Some(&parsed), true));
 
                 let conv_files = storage.files_for_session(conv_id, 50).unwrap_or_default();
                 let (start_ts, end_ts) = conversation_time_span(&chunks);
@@ -507,32 +518,60 @@ pub async fn process_ratification(storage: &Arc<Storage>, conv_id: &str) -> Resu
                 Ok(())
             }
             Err(e) => {
-                let _ = storage.record_narrative_usage(&NarrativeUsageRow {
-                    call_site: "ratification".into(),
-                    model: parsed.model,
-                    input_tokens: parsed.input_tokens,
-                    output_tokens: parsed.output_tokens,
-                    cache_read_tokens: parsed.cache_read_tokens,
-                    cache_creation_tokens: parsed.cache_creation_tokens,
-                    duration_ms: 0,
-                    success: false,
-                });
+                settle_usage(storage, usage_id, &measured(Some(&parsed), false));
                 Err(e)
             }
         },
         None => {
-            let _ = storage.record_narrative_usage(&NarrativeUsageRow {
-                call_site: "ratification".into(),
-                model: "unknown".into(),
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
-                duration_ms: 0,
-                success: false,
-            });
-            Err(anyhow!("ratification LLM call failed or unavailable"))
+            settle_usage(storage, usage_id, &measured(None, false));
+            Err(anyhow::Error::new(CallUnavailable))
         }
+    }
+}
+
+/// Write a ratification call's `narrative_usage` row before the call: unsuccessful and model
+/// `unknown` until [`settle_usage`] fills it in, which is what it stays when the call is killed.
+/// None, logged, when it cannot be written.
+fn reserve_usage(storage: &Storage) -> Option<i64> {
+    storage
+        .with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO narrative_usage (call_site, model, success)
+                 VALUES ('ratification', 'unknown', 0)",
+                [],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .inspect_err(|e| {
+            tracing::warn!(error = %e, "ratification skipped: its usage row could not be written")
+        })
+        .ok()
+}
+
+/// Fill the row [`reserve_usage`] wrote with what the call measured. A failed write is logged:
+/// the row still counts against the hour's budget.
+fn settle_usage(storage: &Storage, id: i64, row: &NarrativeUsageRow) {
+    let written = storage.with_connection(|conn| {
+        conn.execute(
+            "UPDATE narrative_usage SET model = ?2, input_tokens = ?3, output_tokens = ?4,
+                 cache_read_tokens = ?5, cache_creation_tokens = ?6, duration_ms = ?7,
+                 success = ?8
+             WHERE id = ?1",
+            rusqlite::params![
+                id,
+                row.model,
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_creation_tokens,
+                row.duration_ms,
+                row.success as i64,
+            ],
+        )?;
+        Ok(())
+    });
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "could not record a ratification call's usage");
     }
 }
 
@@ -559,6 +598,52 @@ fn conversation_time_span(
 
 #[cfg(test)]
 mod tests {
+    /// The usage row is written before the call and filled in after it: one row per call, counted
+    /// from the moment the call starts, so a call killed midway still spends the hour's budget.
+    #[test]
+    fn a_calls_usage_row_is_written_before_it_and_filled_in_after() {
+        use super::{reserve_usage, settle_usage, NarrativeUsageRow, Storage};
+        let storage = Storage::open_memory().unwrap();
+        let rows = |storage: &Storage| -> Vec<(String, i64, i64)> {
+            storage
+                .with_connection(|c| {
+                    let mut st = c.prepare(
+                        "SELECT model, output_tokens, success FROM narrative_usage
+                         WHERE call_site = 'ratification' ORDER BY id",
+                    )?;
+                    let rows = st
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                })
+                .unwrap()
+        };
+        let killed = reserve_usage(&storage).unwrap();
+        let answered = reserve_usage(&storage).unwrap();
+        assert_ne!(killed, answered);
+        settle_usage(
+            &storage,
+            answered,
+            &NarrativeUsageRow {
+                call_site: "ratification".into(),
+                model: "claude-haiku".into(),
+                input_tokens: 2,
+                output_tokens: 210,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                duration_ms: 900,
+                success: true,
+            },
+        );
+        assert_eq!(
+            rows(&storage),
+            [
+                ("unknown".to_owned(), 0, 0),
+                ("claude-haiku".to_owned(), 210, 1)
+            ]
+        );
+    }
+
     #[test]
     fn ratification_floor_is_the_minimum_of_its_conversation_chunks() {
         use crate::provenance::TrustTier;

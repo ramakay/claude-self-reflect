@@ -11,6 +11,13 @@
 //! - only conversations active in the last [`RECENT_DAYS`] days (`CSR_RATIFICATION_DAYS`, 0 for
 //!   all): older history is not ratified in the background. `csr-engine ratify` still takes any.
 //!
+//! - a conversation whose answer cannot be used [`MAX_FAILURES`] times is not tried again
+//!   (status `unavailable`): candidates come newest first, so one that kept failing (`acts JSON
+//!   parse failed`, ~1.3% of calls) took every call of every hour. A call that never came back
+//!   ([`CallUnavailable`]: `claude` missing, offline, timed out) is not the conversation's fault
+//!   and does not count, so a day offline does not retire the week's queue. The count lives in
+//!   `enrichment_state.batch_failures`, the column the AI-narrative batches count in.
+//!
 //! `CSR_NO_RATIFICATION=1` and `CSR_NO_AI_NARRATIVES=1` still stop the pass before any of this.
 
 use anyhow::Result;
@@ -23,6 +30,48 @@ use crate::storage::Storage;
 pub const PER_HOUR: usize = 4;
 /// Conversations last active longer ago than this are left alone by default.
 pub const RECENT_DAYS: i64 = 7;
+/// Failed attempts a conversation gets before the pass stops trying it.
+pub const MAX_FAILURES: i64 = 2;
+
+/// A ratification call that never produced an answer: the `claude` child could not start, timed
+/// out, or failed before inference. Not counted against the conversation.
+#[derive(Debug)]
+pub struct CallUnavailable;
+
+impl std::fmt::Display for CallUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ratification LLM call failed or unavailable")
+    }
+}
+
+impl std::error::Error for CallUnavailable {}
+
+/// Record a failed ratification of `conv_id`. A failure the conversation caused counts; at
+/// [`MAX_FAILURES`] the row turns `unavailable`, which the queue never hands out again, so the
+/// next candidate gets the hour's calls. A [`CallUnavailable`] failure leaves the row `failed`
+/// without counting. A write that fails is logged, never dropped silently.
+pub fn record_failure(storage: &Storage, conv_id: &str, error: &anyhow::Error) {
+    let counts = error.downcast_ref::<CallUnavailable>().is_none();
+    let written = storage.with_connection(|conn| {
+        conn.execute(
+            "INSERT INTO enrichment_state
+                 (conversation_id, enrichment_type, status, error_message, batch_failures, updated_at)
+             VALUES (?1, 'ratification',
+                     CASE WHEN ?3 >= ?4 THEN 'unavailable' ELSE 'failed' END,
+                     ?2, ?3, datetime('now'))
+             ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
+                 status = CASE WHEN batch_failures + ?3 >= ?4 THEN 'unavailable' ELSE 'failed' END,
+                 error_message = ?2,
+                 batch_failures = batch_failures + ?3,
+                 updated_at = datetime('now')",
+            rusqlite::params![conv_id, error.to_string(), counts as i64, MAX_FAILURES],
+        )?;
+        Ok(())
+    });
+    if let Err(e) = written {
+        tracing::warn!(conv = %conv_id, error = %e, "could not record a failed ratification");
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pace {
@@ -261,6 +310,52 @@ mod tests {
             0
         );
         assert_eq!(next_due_at(&storage, pace, later).unwrap()[0].0, "conv-04");
+    }
+
+    /// The newest conversation's answer never parses. Before, it stayed `failed`, sorted first
+    /// and took every call of every hour; now it is tried twice and the next one runs. A call
+    /// that never came back (offline) does not count against it.
+    #[test]
+    fn a_conversation_that_keeps_failing_gives_way_after_two_tries() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("csr-engine.db")).unwrap();
+        let pace = Pace::from_values(None, None);
+        let now = Utc::now();
+        imported(&storage, "bad", now);
+        imported(&storage, "next", now - Duration::minutes(5));
+        let parse = anyhow::anyhow!("acts JSON parse failed");
+        let offline = anyhow::Error::new(CallUnavailable);
+        // Offline twice: still the head of the queue, still `failed`.
+        for _ in 0..2 {
+            assert_eq!(next_due_at(&storage, pace, now).unwrap()[0].0, "bad");
+            record_failure(&storage, "bad", &offline);
+        }
+        let mut made = vec![];
+        for _ in 0..4 {
+            for (conv, _) in next_due_at(&storage, pace, now).unwrap() {
+                call(&storage);
+                if conv == "bad" {
+                    record_failure(&storage, &conv, &parse);
+                } else {
+                    storage
+                        .mark_enrichment_completed(&conv, "ratification", &conv)
+                        .unwrap();
+                }
+                made.push(conv);
+            }
+        }
+        assert_eq!(made, ["bad", "bad", "next"]);
+        let (status, failures): (String, i64) = storage
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT status, batch_failures FROM enrichment_state
+                     WHERE conversation_id = 'bad' AND enrichment_type = 'ratification'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!((status.as_str(), failures), ("unavailable", MAX_FAILURES));
     }
 
     #[test]

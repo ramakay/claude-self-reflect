@@ -1404,7 +1404,7 @@ async fn run(
             match csr_engine::daemon::ratification::process_ratification(&storage, cid).await {
                 Ok(()) => println!("ratified {cid}"),
                 Err(e) => {
-                    let _ = storage.mark_enrichment_failed(cid, "ratification", &e.to_string());
+                    csr_engine::daemon::ratification::record_failure(&storage, cid, &e);
                     eprintln!("FAILED {cid}: {e}");
                 }
             }
