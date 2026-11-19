@@ -62,6 +62,11 @@ For a daemon you started by hand, stop it and start `csr-engine daemon` again fr
 
 `CSR_NO_AI_NARRATIVES=1` stops the briefing, the story calls, ratification and the dream commands. It does not stop the Batch API narrator. Companion Dreams is a separate switch: turn off Dreams in `/config`.
 
+## Companion
+
+### No CSR panel in a plain terminal
+Type `/csr` in Claude Code. Without herdr the panel does not open by itself. More cases (no herdr pane, black or missing pictures, `/csr` not found) are in [Choose your view](#/docs/companion-views).
+
 ## Help
 
 - `csr-engine eval --full` — 25 results plus a census line

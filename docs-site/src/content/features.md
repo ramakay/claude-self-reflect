@@ -58,7 +58,7 @@ The recap states a clause only when it has evidence for it. Dream notes in searc
 
 ## Companion pane
 
-The companion plugin puts a pane beside the session. It shows what Self-Reflect handed Claude and which code changed since your past sessions. It needs Claude Code 2.1.296 or later and the [herdr](https://herdr.dev) terminal multiplexer. `csr-engine setup` installs the plugin after you confirm. `csr-engine setup --no-companion` skips it.
+The companion plugin shows what Self-Reflect handed Claude and which code changed since your past sessions. It needs Claude Code 2.1.296 or later. Inside the [herdr](https://herdr.dev) terminal multiplexer it is a pane beside the session that opens by itself. Without herdr it is a panel inside Claude Code that you open with `/csr`. `csr-engine setup` installs the plugin after you confirm. `csr-engine setup --no-companion` skips it. See [Choose your view](#/docs/companion-views).
 
 ## MCP tools and hooks
 

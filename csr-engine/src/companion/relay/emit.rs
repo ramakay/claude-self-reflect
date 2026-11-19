@@ -14,6 +14,13 @@ const MARKETPLACE_TEMPLATE: &str = include_str!("marketplace.json.j2");
 pub const MARKETPLACE_NAME: &str = "claude-self-reflect";
 pub const PLUGIN_NAME: &str = "csr-companion";
 
+/// What setup's next steps say about where the companion shows. The plugin picks the view at
+/// each session start and each `/csr` (`pane_cmd::open_pane`): a herdr split when Claude runs in
+/// herdr, else Claude Code's own panel, which a plain terminal shows only after `/csr`.
+pub const VIEW_LINES: &str =
+    "  In herdr: the CSR pane opens beside Claude when a session starts in a project.\n  \
+    Without herdr: type /csr in Claude Code to open the CSR panel.\n";
+
 /// A Unix socket path may be 104 bytes (macOS) or 108 (Linux); the Mods docs say near 100.
 const SOCKET_PATH_LIMIT: usize = 90;
 /// `<8 characters of the session id>.sock`, and the slash before it.
@@ -243,6 +250,15 @@ mod tests {
 
     pub(crate) fn fixture_render() -> String {
         render("/opt/csr/bin/csr-engine", "/run/csr", "0.0.0-fixture").unwrap()
+    }
+
+    #[test]
+    fn the_view_lines_name_both_views_and_the_command() {
+        let lines: Vec<&str> = VIEW_LINES.lines().collect();
+        assert_eq!(lines.len(), 2, "{VIEW_LINES}");
+        assert!(lines[0].contains("herdr") && lines[0].starts_with("  "));
+        assert!(lines[1].contains("type /csr") && lines[1].starts_with("  "));
+        assert!(VIEW_LINES.ends_with('\n'));
     }
 
     #[test]
