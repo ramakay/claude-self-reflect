@@ -90,7 +90,7 @@ export const pages = {
   '/docs/companion-views': { title: 'Choose your view: herdr pane or in-Claude panel', description: 'Where the companion shows, how to set up each view, how to switch, and how to turn it off.', content: stripFrontmatter(companionViews), path: '/docs/companion-views' },
   '/docs/architecture': { title: 'Architecture', description: 'How CSR works — single binary, five components, zero services.', content: stripFrontmatter(architecture), path: '/docs/architecture' },
   '/docs/hooks': { title: 'Session hooks', description: 'Eight hooks on seven events: they inject context when Claude needs it and capture the rest.', content: stripFrontmatter(hooks), path: '/docs/hooks' },
-  '/docs/search': { title: 'Search & Retrieval', description: 'How CSR finds relevant context — hybrid search, decay scoring, cross-project.', content: stripFrontmatter(search), path: '/docs/search' },
+  '/docs/search': { title: 'Search & Retrieval', description: 'How CSR finds relevant context: hybrid search, cross-encoder re-ranking, project scope.', content: stripFrontmatter(search), path: '/docs/search' },
   '/docs/enrichment': { title: 'Enrichment Pipeline', description: 'Three layers of progressive enrichment.', content: stripFrontmatter(enrichment), path: '/docs/enrichment' },
   '/docs/mcp-tools': { title: 'MCP Tools Reference', description: 'All 16 MCP tools with parameters, examples, and return formats.', content: stripFrontmatter(mcpTools), path: '/docs/mcp-tools' },
   '/docs/cli': { title: 'CLI Reference', description: 'Every csr-engine command and flag.', content: stripFrontmatter(cli), path: '/docs/cli' },

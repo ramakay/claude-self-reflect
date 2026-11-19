@@ -2,7 +2,7 @@
 title: Project Structure
 ---
 
-![csr-engine source modules: the 26 module folders under csr-engine/src](/claude-self-reflect/images/module-map-10.svg)
+![csr-engine source modules: the 26 module folders under csr-engine/src](images/module-map-10.svg)
 
 ## Key Patterns
 

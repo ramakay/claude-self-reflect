@@ -10,7 +10,7 @@ Claude does not have to ask. **Context finds you.**
 
 ## Session Lifecycle
 
-![Session lifecycle: eight hooks on seven events, from SessionStart through SessionEnd, each hook with its csr-engine command](/claude-self-reflect/images/hook-lifecycle-10.svg)
+![Session lifecycle: eight hooks on seven events, from SessionStart through SessionEnd, each hook with its csr-engine command](images/hook-lifecycle-10.svg)
 
 ## SessionStart — Past Context Injection
 

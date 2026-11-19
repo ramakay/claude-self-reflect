@@ -6,7 +6,7 @@ title: Architecture
 
 CSR is a single Rust binary of about 138 MB. Storage, search, embeddings, the MCP server, the hooks, enrichment and the companion all run from it. No database servers, no containers, no network services. Claude Code starts the MCP server and the hooks as `csr-engine` processes. The one long-running process is `csr-engine daemon`. On macOS `csr-engine setup` installs it as a launchd agent and starts it (`CSR_NO_DAEMON=1` skips that; `scripts/launchd/` holds a template for doing it by hand). Hooks and the MCP server still work without it, with less: see "The daemon" below.
 
-![CSR architecture: JSONL transcripts are imported, embedded locally and stored in SQLite with an HNSW index; the daemon enriches, the MCP server (16 tools) serves searches, and eight hooks on seven events inject and record context](/claude-self-reflect/images/system-map-10.svg)
+![CSR architecture: JSONL transcripts are imported, embedded locally and stored in SQLite with an HNSW index; the daemon enriches, the MCP server (16 tools) serves searches, and eight hooks on seven events inject and record context](images/system-map-10.svg)
 
 ## What it reads
 
@@ -44,7 +44,7 @@ The daemon reads `CSR_*` variables from its launch agent. To change one, set it 
 
 Eight hooks fire on seven events during Claude Code sessions (SessionStart runs two). Each is a `csr-engine hook <name>` process that Claude Code starts. The prompt hook asks the daemon for its context block over a private Unix socket. When the daemon cannot answer in time, the hook falls back to a smaller in-process recall (keyword and identifier lookups, re-ranked with static vectors). It never loads the full index.
 
-![Eight hooks on seven events: three inject context into Claude Code, three record the session into the store, two handle compaction](/claude-self-reflect/images/hook-flow-10.svg)
+![Eight hooks on seven events: three inject context into Claude Code, three record the session into the store, two handle compaction](images/hook-flow-10.svg)
 
 All hooks use catch-all error handling — they log and return OK, never blocking Claude Code.
 
