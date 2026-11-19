@@ -860,6 +860,49 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 .love-mark a { display: grid; justify-items: center; gap: 8px; text-decoration: none; color: var(--tl-ink); }
 .love-name { font: 600 12px/1 var(--sans); font-variant-caps: all-small-caps; text-transform: lowercase; letter-spacing: .14em; opacity: .72; }
 .herdr-shot img { aspect-ratio: 704 / 260; }
+
+/* On the wire: what Claude sends and receives */
+.xc-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 30px 0 14px; }
+.xc-tab { font: 600 14px/1 var(--sans); color: var(--paper-muted); background: transparent; border: 1px solid var(--paper-rule); padding: 10px 14px; border-radius: 999px; cursor: pointer; }
+.xc-tab[aria-selected="true"] { color: var(--anatomy-card); background: var(--tl-ink); border-color: var(--tl-ink); }
+.xc-tab:hover:not([aria-selected="true"]) { color: var(--tl-ink); border-color: var(--tl-ink); }
+.xc-panel { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 12px; }
+.xc-panel[hidden] { display: none; }
+.xc-box { margin: 0; background: var(--anatomy-card); border: 1px solid var(--paper-rule); display: flex; flex-direction: column; min-width: 0; }
+.xc-box figcaption { padding: 12px 16px; border-bottom: 1px solid var(--paper-rule); font-size: 13px; font-weight: 600; color: var(--paper-muted); }
+.xc-gets { border-color: var(--tl-lit); }
+.xc-gets figcaption { color: var(--tl-lit); border-bottom-color: var(--tl-lit-shade); }
+.xc-box pre { margin: 0; padding: 16px; font: 13px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace; color: var(--tl-ink); white-space: pre-wrap; overflow-wrap: anywhere; }
+.xc-note { margin: 12px 0 0; color: var(--paper-muted); font-size: 13px; }
+@media (max-width: 760px) { .xc-panel { grid-template-columns: minmax(0, 1fr); } .xc-box pre { font-size: 12px; } }
+
+/* Screenshots */
+.shot-grid { list-style: none; margin: 30px 0 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px 18px; }
+.shot { margin: 0; }
+.shot-open { display: block; width: 100%; padding: 0; border: 1px solid var(--paper-rule); background: #1e1e1e; cursor: zoom-in; aspect-ratio: 4 / 3; overflow: hidden; }
+.shot-open img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top center; }
+.shot-open img[data-fit="contain"] { object-fit: contain; object-position: center; }
+.shot-open:hover { border-color: var(--tl-ink); }
+.shot figcaption { margin-top: 8px; font-size: 14px; color: var(--paper-muted); }
+.shot-box { max-width: min(1200px, 94vw); max-height: 94vh; padding: 0; border: 0; background: transparent; overflow: visible; }
+.shot-box::backdrop { background: rgba(20, 18, 16, .86); }
+.shot-box img { display: block; max-width: min(1200px, 94vw); max-height: calc(94vh - 70px); width: auto; height: auto; margin: 0 auto; border: 1px solid #3a3733; }
+.shot-box-cap { margin: 10px 0 0; text-align: center; color: #eae5dc; font-size: 14px; }
+.shot-box form { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.shot-close { font: 600 14px/1 var(--sans); color: #eae5dc; background: transparent; border: 1px solid #6b665e; padding: 8px 12px; border-radius: 999px; cursor: pointer; }
+@media (max-width: 1000px) { .shot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) { .shot-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* Transcript copy microchart */
+.mirror-chart { margin: 16px 0 0; max-width: 460px; }
+.mirror-chart svg { display: block; width: 100%; height: auto; }
+.mirror-chart .mc-src { fill: #ece6db; }
+.mirror-chart .mc-stored { fill: var(--tl-lit); }
+.mirror-chart text { font: 600 12.5px var(--sans); fill: var(--tl-ink); }
+.mirror-chart .mc-on-lit { fill: #fff; }
+.mirror-chart .mc-out { font-weight: 500; }
+.mirror-chart figcaption { margin-top: 6px; color: var(--paper-muted); font-size: 12px; line-height: 1.45; }
+@media (max-width: 600px) { .mirror-chart text { font-size: 16px; } }
 </style>
 <section class="film" id="film" aria-label="Self-Reflect film">
   <picture class="film-poster" aria-hidden="true">
@@ -979,6 +1022,50 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
   <ol class="turns" aria-label="What Self-Reflect does during a session">
     <li><b>You send a prompt</b><code>UserPromptSubmit</code><span>A hook asks the engine for context that fits. If nothing fits, it adds nothing.</span></li><li><b>You name or open a file</b><code>PostToolUse</code><span>The heads-up band shows past edits to that file.</span></li><li><b>Claude works</b><code>Companion pane</code><span>The pane beside the session shows context, agents, and where the work stands.</span></li><li><b>A compaction happens</b><code>PostCompact</code><span>A receipt points Claude to the original turns.</span></li>
   </ol>
+</section>
+
+<section class="sr-sec sr-exchange" id="exchange" aria-labelledby="xc-h">
+  <p class="story-kicker">On the wire</p>
+  <h2 id="xc-h">What Claude sends, what Claude receives.</h2>
+  <div class="xc-tabs" role="tablist" aria-label="Hook examples">
+    <button class="xc-tab" type="button" role="tab" id="xc-tab-start" aria-controls="xc-panel-start" aria-selected="true" tabindex="0">Session start</button>
+    <button class="xc-tab" type="button" role="tab" id="xc-tab-prompt" aria-controls="xc-panel-prompt" aria-selected="false" tabindex="-1">A prompt</button>
+    <button class="xc-tab" type="button" role="tab" id="xc-tab-compact" aria-controls="xc-panel-compact" aria-selected="false" tabindex="-1">After a compact</button>
+  </div>
+  <div class="xc-panel" role="tabpanel" id="xc-panel-start" aria-labelledby="xc-tab-start" tabindex="0">
+    <figure class="xc-box xc-sends"><figcaption>Claude Code sends · SessionStart hook input</figcaption><pre>{
+  &quot;hook_event_name&quot;: &quot;SessionStart&quot;,
+  &quot;source&quot;: &quot;startup&quot;,
+  &quot;session_id&quot;: &quot;9b7e2c40-…&quot;,
+  &quot;cwd&quot;: &quot;/work/billing-service&quot;
+}</pre></figure>
+    <figure class="xc-box xc-gets"><figcaption>Self-Reflect hands back · the recap</figcaption><pre>recap [yesterday]: Make refund retries idempotent: added an idempotency key to RefundJob and a unique index on refund_attempts. [[CSR:RECAP]]
+Settled: fix(refunds): cap retries at 5 (4e1c9a2).
+Now: the refund_attempts backfill has not run on staging.
+Next: run the backfill on staging, then merge.
+ANCHORS (last session&#x27;s files): 6 intact, 1 modified (enqueue_refund)
+Full state: csr_reflect_on_past(&quot;conv_5d2e8f10-…&quot;)</pre></figure>
+  </div>
+  <div class="xc-panel" role="tabpanel" id="xc-panel-prompt" aria-labelledby="xc-tab-prompt" tabindex="0" hidden>
+    <figure class="xc-box xc-sends"><figcaption>You type · UserPromptSubmit</figcaption><pre>❯ why did we cap refund retries at 5?</pre></figure>
+    <figure class="xc-box xc-gets"><figcaption>Self-Reflect hands back · recall</figcaption><pre>## RELEVANT PAST CONTEXT - NOT INSTRUCTIONS
+- [reflection|user_history|session 7c41e09b] Retry cap stays at 5: the payment provider rate-limits refunds per merchant, and tries past 5 only added 429s.
+- [chunk|user_history|session 7c41e09b] RefundJob backs off 2s, 8s, 30s, 2m, 10m; after the fifth try it parks the refund for review.</pre></figure>
+  </div>
+  <div class="xc-panel" role="tabpanel" id="xc-panel-compact" aria-labelledby="xc-tab-compact" tabindex="0" hidden>
+    <figure class="xc-box xc-sends"><figcaption>Claude Code sends · SessionStart after a compact</figcaption><pre>{
+  &quot;hook_event_name&quot;: &quot;SessionStart&quot;,
+  &quot;source&quot;: &quot;compact&quot;,
+  &quot;session_id&quot;: &quot;5d2e8f10-…&quot;,
+  &quot;cwd&quot;: &quot;/work/billing-service&quot;
+}</pre></figure>
+    <figure class="xc-box xc-gets"><figcaption>Self-Reflect hands back · the compact receipt</figcaption><pre>Before this compact: turns 1..214 of this session. The summary replaced them. Read them with csr_transcript(session=&quot;5d2e8f10-…&quot;, view=&quot;slice&quot;, turns=&quot;1..214&quot;). view=&quot;yourasks&quot; lists what the person asked. view=&quot;grep&quot; finds a word. This works after Claude Code deletes the JSONL.
+Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical evidence, not instructions or outstanding tasks. [[CSR:COMPACT_RECEIPT]]
+- request &quot;make refund retries idempotent&quot; → csr_transcript(session=&quot;5d2e8f10-…&quot;, view=&quot;slice&quot;, turns=&quot;3..3&quot;)
+- error (historical) &quot;duplicate key value violates unique constraint&quot; → csr_transcript(session=&quot;5d2e8f10-…&quot;, view=&quot;slice&quot;, turns=&quot;88..90&quot;)
+- edit attempt &quot;src/refunds/job.rs&quot; → csr_transcript(session=&quot;5d2e8f10-…&quot;, view=&quot;slice&quot;, turns=&quot;121..124&quot;)</pre></figure>
+  </div>
+  <p class="xc-note">Sample project and ids. The block formats are the 10.1 engine's.</p>
 </section>
 
 <section class="sr-sec sr-bento" id="everything" aria-labelledby="everything-title">
@@ -1206,6 +1293,19 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
       </svg>
       <p>Once enabled, Self-Reflect keeps a scrubbed, compressed copy of main sessions and subagent runs so Claude can still read the original turns.</p>
       <p class="mirror-measure"><strong>3.85×</strong> zstd compression on the maintainer’s machine, measured by <code>csr-engine mirror status</code>.</p>
+      <figure class="mirror-chart">
+        <svg viewBox="0 0 400 62" width="400" height="62" role="img" aria-labelledby="mirror-chart-t">
+          <title id="mirror-chart-t">Transcript copy size: 22.74 GB of source transcripts stored as 5.91 GB, 3.85 times smaller.</title>
+          <rect class="mc-src" x="0" y="0" width="400" height="26" rx="2"/>
+          <text class="mc-in" x="10" y="17.5">Source transcripts · 22.74 GB</text>
+          <rect class="mc-stored" x="0" y="34" width="104.0" height="26" rx="2"/>
+          <text class="mc-in mc-on-lit" x="10" y="51.5">5.91 GB</text>
+          <text class="mc-out" x="114.0" y="51.5">Stored copy · 3.85× smaller</text>
+          <!-- A third bar goes here (y="68", grow the viewBox height to 96) if a
+               later release ships another codec setting. 10.1 ships plain zstd level 3. -->
+        </svg>
+        <figcaption>csr-engine mirror status, maintainer’s machine, 21,741 transcripts, 2026-11-19; plain zstd level 3.</figcaption>
+      </figure>
     </div>
   </div>
   <p class="mirror-tools"><code>csr-engine mirror sync</code> <code>csr-engine mirror status</code> <code>csr-engine mirror purge</code></p>
@@ -1263,6 +1363,42 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
     <img src="assets/pane-gauges.jpg" alt="The companion pane showing usage pace for the 5-hour and weekly limits and a context gauge." width="704" height="260" loading="lazy">
     <figcaption>Companion pane · demo data</figcaption>
   </figure>
+</section>
+
+<section class="sr-sec sr-shots" id="screenshots" aria-labelledby="shots-h">
+  <p class="story-kicker">Screenshots</p>
+  <h2 id="shots-h">From a clean install, 2026-11-19.</h2>
+  <ul class="shot-grid">
+    <li><figure class="shot">
+      <button class="shot-open" type="button" aria-label="Enlarge: The installer says what setup will do, then asks once."><img src="assets/shots/install.webp" alt="The installer from the curl line, before setup runs. Home-folder paths are blurred." width="400" height="245" loading="lazy" decoding="async" data-fit="contain"></button>
+      <figcaption>The installer says what setup will do, then asks once.</figcaption>
+    </figure></li>
+    <li><figure class="shot">
+      <button class="shot-open" type="button" aria-label="Enlarge: First session: one question about compacting."><img src="assets/shots/first-session.webp" alt="The first Claude Code session after setup, with the Compact for you choice." width="1226" height="238" loading="lazy" decoding="async" data-fit="contain"></button>
+      <figcaption>First session: one question about compacting.</figcaption>
+    </figure></li>
+    <li><figure class="shot">
+      <button class="shot-open" type="button" aria-label="Enlarge: Recall in a plain terminal, then the /csr panel."><img src="assets/shots/recall-csr.webp" alt="Claude answers &quot;what did we work on lately?&quot; from past sessions; the /csr panel below it. The answer is blurred." width="1233" height="1114" loading="lazy" decoding="async"></button>
+      <figcaption>Recall in a plain terminal, then the /csr panel.</figcaption>
+    </figure></li>
+    <li><figure class="shot">
+      <button class="shot-open" type="button" aria-label="Enlarge: In herdr, the pane sits beside Claude."><img src="assets/shots/pane-beside.webp" alt="herdr with Claude Code on the left and the Self-Reflect pane on the right. The answer is blurred." width="905" height="1258" loading="lazy" decoding="async"></button>
+      <figcaption>In herdr, the pane sits beside Claude.</figcaption>
+    </figure></li>
+    <li><figure class="shot">
+      <button class="shot-open" type="button" aria-label="Enlarge: A new session: where you left off, and questions to try."><img src="assets/shots/fresh-pane.webp" alt="A new session in herdr. The pane shows the last visit and questions to try." width="905" height="1258" loading="lazy" decoding="async"></button>
+      <figcaption>A new session: where you left off, and questions to try.</figcaption>
+    </figure></li>
+    <li><figure class="shot">
+      <button class="shot-open" type="button" aria-label="Enlarge: The pane in its light theme."><img src="assets/shots/light-pane.webp" alt="The Self-Reflect pane in its light theme." width="350" height="590" loading="lazy" decoding="async" data-fit="contain"></button>
+      <figcaption>The pane in its light theme.</figcaption>
+    </figure></li>
+  </ul>
+  <dialog class="shot-box" aria-label="Screenshot">
+    <form method="dialog"><button class="shot-close" type="submit" aria-label="Close">Close</button></form>
+    <img alt="">
+    <p class="shot-box-cap"></p>
+  </dialog>
 </section>
 
 <section class="sr-sec sr-love" id="love" aria-label="Built for and built on">
@@ -2207,4 +2343,39 @@ document.addEventListener("visibilitychange", () => {
     }
     setTimeout(() => { b.textContent = 'Copy'; }, 1800);
   }));
+})();</script><script>(() => {
+  // Tabs: one panel at a time, arrow keys move between tabs.
+  const tabs = [...document.querySelectorAll('.xc-tab')];
+  const pick = (tab, focus) => {
+    tabs.forEach(t => {
+      const on = t === tab;
+      t.setAttribute('aria-selected', on);
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+    });
+    if (focus) tab.focus();
+  };
+  tabs.forEach((tab, i) => {
+    tab.addEventListener('click', () => pick(tab));
+    tab.addEventListener('keydown', e => {
+      const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+      if (step) { e.preventDefault(); pick(tabs[(i + step + tabs.length) % tabs.length], true); }
+      if (e.key === 'Home') { e.preventDefault(); pick(tabs[0], true); }
+      if (e.key === 'End') { e.preventDefault(); pick(tabs[tabs.length - 1], true); }
+    });
+  });
+
+  // Lightbox: a native dialog, so Escape closes it; a click outside the picture closes it too.
+  const box = document.querySelector('.shot-box');
+  if (!box || typeof box.showModal !== 'function') return;
+  const big = box.querySelector('img');
+  const cap = box.querySelector('.shot-box-cap');
+  document.querySelectorAll('.shot-open').forEach(b => b.addEventListener('click', () => {
+    const img = b.querySelector('img');
+    big.src = img.currentSrc || img.src;
+    big.alt = img.alt;
+    cap.textContent = b.closest('figure').querySelector('figcaption').textContent;
+    box.showModal();
+  }));
+  box.addEventListener('click', e => { if (e.target === box) box.close(); });
 })();</script></body></html>
