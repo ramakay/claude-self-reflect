@@ -14,7 +14,7 @@ The timing log holds timing, counts, sizes and scores. Each prompt detail holds 
 | Storage | No — SQLite |
 | MCP server | No — stdio |
 
-The index, search and storage run on your machine, and CSR sends no telemetry. A few features do use the network or a model. The section Network and model use, below, lists each one with its off switch.
+The index, search and storage run on your machine, and CSR sends no telemetry. (This docs site counts page views with GoatCounter, which sets no cookies; that is the site, not the product.) A few features do use the network or a model. The section Network and model use, below, lists each one with its off switch.
 
 ## Consent-Gated Activation
 

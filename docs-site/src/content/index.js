@@ -33,7 +33,7 @@ export const navigation = [
     label: 'Guides',
     icon: 'Compass',
     items: [
-      { label: 'Upgrading to v8', href: '/docs/upgrading' },
+      { label: 'Upgrading', href: '/docs/upgrading' },
       { label: 'Search Strategies', href: '/docs/search-strategies' },
       { label: 'Privacy & Security', href: '/docs/privacy' },
       { label: 'btw, these too', href: '/docs/btw-these-too' },
@@ -92,7 +92,7 @@ export const pages = {
   '/docs/mcp-tools': { title: 'MCP Tools Reference', description: 'All 16 MCP tools with parameters, examples, and return formats.', content: stripFrontmatter(mcpTools), path: '/docs/mcp-tools' },
   '/docs/cli': { title: 'CLI Reference', description: 'Every csr-engine command and flag.', content: stripFrontmatter(cli), path: '/docs/cli' },
   '/docs/configuration': { title: 'Configuration', description: 'Environment variables, settings, and customization.', content: stripFrontmatter(configuration), path: '/docs/configuration' },
-  '/docs/upgrading': { title: 'Upgrading to v8', description: 'Migrate from v7.x to the single Rust binary.', content: stripFrontmatter(upgrading), path: '/docs/upgrading' },
+  '/docs/upgrading': { title: 'Upgrading', description: 'Upgrade from 9.5.8, within 10.x, or from the v7.x Python stack.', content: stripFrontmatter(upgrading), path: '/docs/upgrading' },
   '/docs/search-strategies': { title: 'Search Strategies', description: 'Get the best results from CSR\'s search tools.', content: stripFrontmatter(searchStrategies), path: '/docs/search-strategies' },
   '/docs/privacy': { title: 'Privacy & Security', description: 'Everything runs locally by default.', content: stripFrontmatter(privacy), path: '/docs/privacy' },
   '/docs/btw-these-too': { title: 'btw, these too', description: 'Smaller features that ship with this release.', content: stripFrontmatter(btwTheseToo), path: '/docs/btw-these-too' },

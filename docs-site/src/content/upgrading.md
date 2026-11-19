@@ -2,7 +2,17 @@
 title: Upgrading
 ---
 
-## What Changed
+## Upgrade from 9.5.8
+
+9.5.8 is the last 9.x release on npm.
+
+- **npm:** run `npm install -g claude-self-reflect`, then `claude-self-reflect setup`.
+- **curl installer:** run the install script and answer yes at "Run setup now?". Where it cannot prompt, it prints the `csr-engine setup` command to run.
+
+Then restart Claude Code. Setup repoints the MCP registration at the new binary and adds the hooks 10.1.0 needs. Your data is not touched. The first daemon start rebuilds the vector index once, and MCP tools answer keyword-only until it publishes. Then check `csr-engine status` as described in "Upgrading within 10.x" below.
+
+## What Changed in v8
+
 
 v8.0 replaced the Python/Docker/Qdrant stack with a single Rust binary.
 

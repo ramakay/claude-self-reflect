@@ -25,6 +25,7 @@ Configured in `~/.claude/settings.json` via `csr-engine hook install --apply`.
 | CSR_STORY_REWRITES | — | Opt-in. Set to `1` and Haiku writes each session's story: after every compaction, and at session end if you asked something since the last story. Each is one metered Haiku call (`claude -p`, about $0.003). Unset, the story after each compaction is CSR's free extract |
 | CSR_TIMING_LOG | ~/.claude-self-reflect/hook-timing.log | Custom hook-timing log path (test runs redirect to a temp file automatically) |
 | CSR_NO_TIMING_DETAIL | — | Set to `1` to turn off the prompt detail lines in hook-timing.log; timing lines stay on |
+| CSR_NO_CODEX_MCP | — | Set to `1` and `csr-engine setup` does not register the MCP server with Codex (`codex mcp add`) when the `codex` CLI is installed |
 | CSR_NO_PROMPT_GATE | — | Set to `1` to turn off the prompt hook's send gate. With the gate on, a search-based block goes out only when its best ranked score (the `top=` value in hook-timing.log) is 0.45 or more and 3 or more past-conversation items fit in it. Otherwise the hook sends nothing and logs `reason=below_floor` or `reason=thin_pool`. The daemon must run with the same value as the hook: when they differ, the daemon does not answer the prompt |
 
 ### Code map
