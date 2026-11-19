@@ -31,7 +31,16 @@ To pin a release, pass `--version` (`curl -fsSL .../install.sh | sh -s -- --vers
 
 ### What calls `claude -p`
 
-Some features run the Claude Code CLI in print mode (`claude -p`) as a child process. It runs under your own Claude account, so it uses your plan's usage (or your API key's billing, if that is how Claude Code is set up); CSR sends nothing to any other service for this. The callers are the `session-briefing` SessionStart hook (on startup and resume; once a briefing is stored for a project, there is no new call for it for 30 minutes), session narratives and stories, the daemon's ratification pass, and dreams. On a long history that adds up to thousands of calls. `CSR_NO_AI_NARRATIVES=1` turns all of them off, the briefing included. `CSR_NO_DREAMING=1` stops dreams only and `CSR_NO_RATIFICATION=1` stops ratification only.
+Some features run the Claude Code CLI in print mode (`claude -p`) as a child process. It runs under your own Claude account, so it uses your plan's usage (or your API key's billing, if that is how Claude Code is set up); CSR sends nothing to any other service for this. The callers are the `session-briefing` SessionStart hook (on startup and resume; once a briefing is stored for a project, there is no new call for it for 30 minutes), session narratives and stories, the daemon's ratification pass, and dreams. `CSR_NO_AI_NARRATIVES=1` turns all of them off, the briefing included. `CSR_NO_DREAMING=1` stops dreams only and `CSR_NO_RATIFICATION=1` stops ratification only.
+
+| Caller | When it calls | Typical count | Pace and switch |
+|---|---|---|---|
+| Session briefing | a session start or resume | about one per session; none for a project briefed in the last 30 min | `CSR_NO_AI_NARRATIVES=1` |
+| Ratification (daemon) | once per conversation | about one per session you ran | at most 4 an hour (`CSR_RATIFICATION_PER_HOUR`), only conversations active in the last 7 days (`CSR_RATIFICATION_DAYS`, 0 for all); `CSR_NO_RATIFICATION=1` |
+| Narratives and stories | a finished session, a story refresh | a few per active session | `CSR_NO_AI_NARRATIVES=1` |
+| Dreams (daemon) | one pass per cadence | one pass per 6 h at most, within the budget setup shows | `CSR_DREAM_INTERVAL_SECS`, `CSR_NO_DREAMING=1` |
+
+A fresh install does not work through your whole imported history at once: ratification makes at most 4 calls in its first hour and leaves conversations older than a week alone (`csr-engine ratify` still takes any). To change a pace or a switch for the daemon, run `csr-engine setup` with the variable set: setup copies `CSR_*` variables into the launch agent.
 
 The default model differs by caller, and each has its own variable. Each chain tries your variable first (if set), then the caller's default, then the Claude Code CLI's own default (no `--model`).
 
