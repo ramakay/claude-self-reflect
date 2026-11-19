@@ -5,10 +5,10 @@ This guide is the implementation contract for rebuilding the documentation landi
 Primary references:
 
 - `docs-site/DESIGN_PROPOSAL.md`
-- `docs-site/public/images/design-comp.png`
-- `docs-site/public/images/card-detail.png`
+- `docs-site/public/images/v9/design-comp.png`
+- `docs-site/public/images/v9/card-detail.png`
 - Current prototype: `docs-site/src/pages/Landing.jsx`
-- Generated inner page comp: `docs-site/public/images/inner-page-comp.png`
+- Generated inner page comp: `docs-site/public/images/v9/inner-page-comp.png`
 
 The target is an editorial glassmorphic bento page: pale cloud sky, translucent paper cards, newspaper rules, serif headlines, mono datelines, compact data graphics, and a large faded hero statement behind the grid. Do not turn this into a conventional SaaS landing page.
 
@@ -2040,7 +2040,7 @@ The current implementation already has useful pieces: `Sparkline`, `Bar`, `HookD
 
 ## Inner Doc Pages
 
-Recommendation: maintain the sky/glass aesthetic, but switch the main content area into a cleaner reading mode. The generated comp at `public/images/inner-page-comp.png` shows the right balance: the cloud sky still bleeds through the sidebar and content panel, but body text sits on a larger, calmer frosted reading surface with stronger line length control. This preserves brand continuity from the landing page without making long documentation feel like a decorative dashboard.
+Recommendation: maintain the sky/glass aesthetic, but switch the main content area into a cleaner reading mode. The generated comp at `public/images/v9/inner-page-comp.png` shows the right balance: the cloud sky still bleeds through the sidebar and content panel, but body text sits on a larger, calmer frosted reading surface with stronger line length control. This preserves brand continuity from the landing page without making long documentation feel like a decorative dashboard.
 
 Use this layout:
 

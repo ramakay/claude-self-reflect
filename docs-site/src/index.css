@@ -3549,3 +3549,33 @@ body, [data-theme="dark"] body {
   .site-nav__github { padding: 0; width: 44px; }
   .docs-nav .site-nav__name { font-size: 16px !important; }
 }
+
+/* Docs version switcher (header) and the banner on an older version's pages */
+.version-switcher select {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid rgba(26,26,46,0.16);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.34);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--color-ink);
+  cursor: pointer;
+}
+[data-theme="dark"] .version-switcher select {
+  border-color: rgba(255,255,255,0.16);
+  background: rgba(255,255,255,0.06);
+}
+.version-banner {
+  margin-top: 16px;
+  padding: 10px 14px;
+  border: 1px solid rgba(107,91,149,0.35);
+  border-radius: 8px;
+  background: rgba(107,91,149,0.10);
+  font-size: 14px;
+  color: var(--color-ink);
+}
+.version-banner a {
+  color: var(--color-purple);
+  font-weight: 600;
+}
