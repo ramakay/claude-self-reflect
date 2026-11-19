@@ -40,6 +40,10 @@ jobs:
           fi
           run_target() {
             local status=0
+            # These golden fixtures captured Pacific wall-clock labels.
+            case "$1" in
+              companion|companion_mapzoom) local -x TZ=America/Los_Angeles ;;
+            esac
             echo "::group::$1"
             # GNU timeout signals the entire command group, including the test binary.
             timeout --signal=KILL "$2" "${cargo_test[@]}" "${@:3}" || status=$?

@@ -347,7 +347,15 @@ fn a_busy_pane_on_a_live_terminal_is_left_alone() {
     );
 }
 
-/// The executable a process runs, as `ps` names it.
+/// Linux ps reports a task name capped at 15 bytes, shorter than our copied binary's name.
+#[cfg(target_os = "linux")]
+fn running(pid: u32) -> String {
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
 fn running(pid: u32) -> String {
     let out = Command::new("ps")
         .args(["-o", "comm=", "-p", &pid.to_string()])
@@ -381,15 +389,16 @@ fn a_reload_with_an_alarm_armed_leaves_the_new_engine_alive() {
     .unwrap();
     let pid = pane.child.id();
     let start = Instant::now();
-    while !running(pid).ends_with("csr-engine-reloaded")
-        && start.elapsed() < Duration::from_secs(15)
+    let mut executable = running(pid);
+    while !executable.ends_with("csr-engine-reloaded") && start.elapsed() < Duration::from_secs(15)
     {
         assert!(pane.child.try_wait().unwrap().is_none(), "the pane died");
         thread::sleep(Duration::from_millis(50));
+        executable = running(pid);
     }
     assert!(
-        running(pid).ends_with("csr-engine-reloaded"),
-        "the pane did not reload"
+        executable.ends_with("csr-engine-reloaded"),
+        "the pane did not reload (executable: {executable:?})"
     );
     assert!(
         pane.ends_within(Duration::from_secs(3)).is_none(),

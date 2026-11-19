@@ -4,6 +4,9 @@
 //! builtins only, because nothing else is on PATH.
 #![cfg(unix)]
 
+#[path = "support/temp_home.rs"]
+mod temp_home;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -136,7 +139,7 @@ fn claude_json(mcp: &[(&str, &str)]) -> String {
 
 impl Scratch {
     fn new() -> Self {
-        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let root = temp_home::tempdir().unwrap();
         let rootp = root.path().to_path_buf();
         let home = rootp.join("home");
         let bin = rootp.join("bin");
@@ -824,7 +827,7 @@ fn a_link_inside_the_data_folder_loses_the_link_and_never_the_target() {
 #[test]
 fn the_model_cache_is_planned_with_its_size_and_goes_even_with_keep_data() {
     let s = Scratch::new();
-    let cache = s.home.join("Library/Caches/csr-engine");
+    let cache = temp_home::model_cache(&s.home);
     write(
         &cache.join("fastembed/model.onnx"),
         &"x".repeat(2 * 1024 * 1024),

@@ -1714,10 +1714,7 @@ mod relay {
     const OTHER: &str = "0.0.0-other";
 
     fn start(relay: &str, extra_env: &[(&str, &Path)]) -> Serve {
-        let dir = tempfile::Builder::new()
-            .prefix("csr-t")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let dir = tempfile::Builder::new().prefix("csr-t").tempdir().unwrap();
         let sock = dir.path().join("run/a.sock");
         let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
         command
@@ -1829,10 +1826,7 @@ mod relay {
 
     #[test]
     fn a_dead_socket_file_is_replaced_and_a_regular_file_is_refused() {
-        let dir = tempfile::Builder::new()
-            .prefix("csr-t")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let dir = tempfile::Builder::new().prefix("csr-t").tempdir().unwrap();
         let run = dir.path().join("run");
         std::fs::create_dir(&run).unwrap();
         let sock = run.join("a.sock");
@@ -2170,10 +2164,7 @@ mod relay {
 
     #[test]
     fn serve_clears_stale_sockets_from_its_folder_and_leaves_the_rest() {
-        let dir = tempfile::Builder::new()
-            .prefix("csr-t")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let dir = tempfile::Builder::new().prefix("csr-t").tempdir().unwrap();
         let run = dir.path().join("run");
         std::fs::create_dir(&run).unwrap();
         let dead = run.join("old-1a.sock");

@@ -3,6 +3,9 @@
 //! `~/.codex`; the only outside input is a clone-copy of the local embedding
 //! model cache, so the binary can embed queries without a network.
 
+#[path = "support/temp_home.rs"]
+mod temp_home;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -19,24 +22,10 @@ struct World {
 
 impl World {
     fn new() -> Self {
-        let home = tempfile::tempdir_in("/private/tmp").unwrap();
+        let home = temp_home::tempdir().unwrap();
         // The binary resolves its model cache from $HOME; give it a clone of
         // the one this test process resolves. No download, no credentials.
-        let source = dirs::cache_dir()
-            .expect("a cache dir")
-            .join("csr-engine")
-            .join("fastembed");
-        let target = home.path().join("Library/Caches/csr-engine");
-        std::fs::create_dir_all(&target).unwrap();
-        if source.exists() {
-            let status = Command::new("cp")
-                .args(["-Rc"])
-                .arg(&source)
-                .arg(target.join("fastembed"))
-                .status()
-                .unwrap();
-            assert!(status.success(), "could not clone the local model cache");
-        }
+        temp_home::copy_embedding_cache(home.path());
         let projects = home.path().join("projects");
         std::fs::create_dir_all(&projects).unwrap();
         let db = home.path().join("data").join("csr-engine.db");
@@ -52,6 +41,7 @@ impl World {
             .arg(&self.projects)
             .args(args)
             .env("HOME", self.home.path())
+            .env_remove("XDG_CACHE_HOME")
             .env("CSR_NO_DREAMING", "1")
             .env("CSR_NO_AI_NARRATIVES", "1")
             .env_remove("CSR_TRAINED_RERANK")

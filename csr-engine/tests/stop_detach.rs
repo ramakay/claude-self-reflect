@@ -3,6 +3,9 @@
 //! temp HOME and database, never live data.
 #![cfg(unix)]
 
+#[path = "support/temp_home.rs"]
+mod temp_home;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -32,25 +35,11 @@ impl World {
                     .output();
             }
         });
-        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let root = temp_home::tempdir().unwrap();
         let home = root.path().join("home");
         // The binary resolves its model from $HOME: give it a clone of the one
         // this test process resolves, so nothing downloads.
-        let source = dirs::cache_dir()
-            .expect("a cache dir")
-            .join("csr-engine")
-            .join("fastembed");
-        let target = home.join("Library/Caches/csr-engine");
-        std::fs::create_dir_all(&target).unwrap();
-        if source.exists() {
-            let status = Command::new("cp")
-                .arg("-Rc")
-                .arg(&source)
-                .arg(target.join("fastembed"))
-                .status()
-                .unwrap();
-            assert!(status.success(), "could not clone the local model cache");
-        }
+        temp_home::copy_embedding_cache(&home);
         let data = root.path().join("data");
         let projects = root.path().join("projects");
         std::fs::create_dir_all(&data).unwrap();
@@ -72,6 +61,7 @@ impl World {
             .arg(&self.projects)
             .args(args)
             .env("HOME", &self.home)
+            .env_remove("XDG_CACHE_HOME")
             .env("CSR_TIMING_LOG", &self.timing)
             .env("CSR_NO_DREAMING", "1")
             .env("CSR_NO_AI_NARRATIVES", "1")
@@ -294,7 +284,7 @@ struct Session {
 
 impl Session {
     fn new(id: &str) -> Self {
-        let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+        let tmp = temp_home::tempdir().unwrap();
         let dir = tmp.path().join("proj-stopdetach");
         std::fs::create_dir_all(&dir).unwrap();
         Self {
