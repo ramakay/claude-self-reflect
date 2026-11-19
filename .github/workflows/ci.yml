@@ -43,6 +43,8 @@ jobs:
             # These golden fixtures captured Pacific wall-clock labels.
             case "$1" in
               companion|companion_mapzoom) local -x TZ=America/Los_Angeles ;;
+              # Keep the rendered pictures so a hash mismatch can be inspected.
+              companion_instrument) local -x CSR_INSTRUMENT_PNG="$RUNNER_TEMP/instrument-png" ;;
             esac
             echo "::group::$1"
             # GNU timeout signals the entire command group, including the test binary.
@@ -66,6 +68,13 @@ jobs:
             echo "::error::failed targets: ${failed[*]}"
             exit 1
           fi
+      - name: Upload instrument pictures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrument-png
+          path: ${{ runner.temp }}/instrument-png
+          if-no-files-found: ignore
       - name: Installer tests
         run: node --test installer/tests/*.test.js
       - name: Verify npm package
