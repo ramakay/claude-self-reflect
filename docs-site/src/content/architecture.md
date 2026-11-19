@@ -124,7 +124,7 @@ source code → language detect → tree-sitter parse → AST → extract nodes 
 AST parsing is wrapped in `catch_unwind` for robustness — malformed code won't crash the engine.
 
 ### Continuity Engine (`src/provenance.rs`, `src/ledger/`, `src/governor/`)
-Retrieval is provenance-aware. Every chunk carries speaker attribution, source conversation, and supersession state. In the prompt hook (and in MCP search under `CSR_RETRIEVAL_LEGACY=1`), the re-ranker demotes assistant scaffold text (proposals, plans) and boosts primary sources (decisions, outcomes), so recall favors what actually happened. A Derivation Ledger tracks where injected context came from, and an Injection Governor applies reuse tracking and an anti-flap budget so repeated prompts don't thrash the same context in and out.
+Retrieval is provenance-aware. Every chunk carries speaker attribution, source conversation, and supersession state. Under `CSR_RETRIEVAL_LEGACY=1`, MCP search's re-ranker demotes assistant scaffold text (proposals, plans) and boosts primary sources (decisions, outcomes), so recall favors what actually happened. A Derivation Ledger tracks where injected context came from, and an Injection Governor applies reuse tracking and an anti-flap budget so repeated prompts don't thrash the same context in and out.
 
 Verified live: `csr-engine eval --continuity-live` probes the real index (not fixtures) against a grep baseline.
 

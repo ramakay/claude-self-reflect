@@ -15,7 +15,7 @@ Self-Reflect lets Claude look back at its own work: what it did, what it settled
 | Conversations: `~/.claude/projects/<project>/*.jsonl` | Watcher import | The primary corpus |
 | Subagent sidechains: `<session>/subagents/agent-*.jsonl` | Watcher import | Filed under the real project; the parent session wins over the child in search |
 | Tasks: `~/.claude/tasks/<session>/` | Stop hook | Task state sets the episode outcome. Open tasks mean "partial", never "success". A completed task that matches a still-open verdict becomes a proposal you confirm with `csr_resolve` |
-| Plans: `~/.claude/plans/*.md` | Daemon, every 30 minutes | Linked to the conversation that produced them. The origin conversation outranks its plan in search. Plans decay with age |
+| Plans: `~/.claude/plans/*.md` | Daemon, every 30 minutes | Linked to the conversation that produced them. The origin conversation outranks its plan in search. A plan's age is its file time |
 | Codex sessions: `~/.codex/sessions/**/rollout-*.jsonl` | Daemon and setup | Optional. Detected automatically. Nothing to set up |
 | Session history: `~/.claude/history.jsonl` | Daemon, every 10 minutes | A registry of sessions. It is never embedded or injected. `status` reports its coverage |
 

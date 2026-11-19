@@ -31,7 +31,7 @@ Use herdr if you want the companion on screen all the time, with the full cards.
 3. Open Claude Code in a project you have worked in.
 4. Type `/csr` and press Enter.
 
-**What you should see:** Claude Code answers `CSR pane opened (N dreams this week, N changed since your sessions)` and a short note on dreams. Under it, a panel with a `THIS SESSION` bar and cards such as "Dreams are on" and "What CSR can do here". The panel does not open by itself in a plain terminal. Type `/csr` in each session where you want it.
+**What you should see:** Claude Code answers `CSR pane opened (N dreams this week, N changed since your sessions)` and a short note on dreams. Under it, a panel with a `THIS SESSION` bar and cards such as "Dreams are on" and "What CSR can do here". In the 10.1.0 clean-machine test the panel did not open by itself in a plain terminal, so type `/csr` in each session where you want it.
 
 ## Set up the herdr pane
 
@@ -111,7 +111,7 @@ The pane reads the variable, not Claude Code. Set it where herdr's panes start, 
 ## Troubleshooting
 
 ### No panel after setup, plain terminal
-Type `/csr`. Without herdr the panel does not open by itself.
+Type `/csr`. Without herdr the panel may not open by itself; in the 10.1.0 clean-machine test it did not.
 
 ### `/csr` is not a command
 The plugin is not loaded. Run `/reload-plugins` or restart Claude Code. If `claude plugin list` does not show `csr-companion@claude-self-reflect`, run:
