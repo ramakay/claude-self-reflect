@@ -880,13 +880,16 @@ build, so the engine cannot be built for this platform either."
 
 # `csr-engine setup`, with the consent variable only when the prompt was
 # answered yes. The assignment applies to this one command and is not exported
-# to the rest of the script.
-run_setup() {
+# to the rest of the script. The installer's own variables are dropped in a
+# subshell first: setup copies every CSR_* variable into the daemon's launch
+# agent, and these describe this install, not the daemon.
+run_setup() (
+    unset CSR_VERSION CSR_TARBALL CSR_RELEASE_BASE_URL CSR_CHECKSUMS CSR_TTY
     if [ "$PROMPTED_YES" = "yes" ]; then
         CSR_DREAMS_CONSENT=yes "${INSTALL_DIR}/${BINARY_NAME}" setup
     else
         "${INSTALL_DIR}/${BINARY_NAME}" setup
     fi
-}
+)
 
 main "$@"

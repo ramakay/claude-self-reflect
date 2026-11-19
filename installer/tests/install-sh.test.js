@@ -105,6 +105,8 @@ function buildRelease({ setupWrites, setupRecordsEnv } = {}) {
     body +=
       '  setup)\n' +
       '    printf "consent=%s\\n" "${CSR_DREAMS_CONSENT-<unset>}" > "$HOME/setup-env.txt"\n' +
+      // The installer's own variables, which setup would copy into the launch agent.
+      '    env | grep -E "^CSR_(VERSION|TARBALL|RELEASE_BASE_URL|CHECKSUMS|TTY)=" > "$HOME/setup-installer-env.txt"\n' +
       '    echo "=== Setup Complete ===" ;;\n';
   }
   body += '  *) echo "unexpected: $*" >&2; exit 2 ;;\nesac\n';
@@ -853,6 +855,8 @@ describe('install.sh: consent pass-through to setup', { skip: !HAVE_SH && 'no /b
       // The prompt went to the stand-in terminal, so the prompt branch ran.
       assert.match(readFileSync(tty, 'utf8'), /Run setup now\? \[Y\/n\]/);
       assert.equal(recorded(dirs), 'consent=yes');
+      // CSR_TTY was set for the installer; setup (and so the launch agent) never sees it.
+      assert.equal(readFileSync(join(dirs.home, 'setup-installer-env.txt'), 'utf8'), '');
     });
   }
 

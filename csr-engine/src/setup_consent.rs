@@ -58,6 +58,20 @@ pub(crate) enum Basis {
     Asked,
     /// Nobody was asked: no tty and no preset. The documented default.
     Default,
+    /// A decline recorded by an earlier setup, kept: an upgrade that answers the installer's
+    /// yes, or a run with no one to ask, does not turn dreams back on.
+    Kept,
+}
+
+/// A yes nobody gave at this step's own question (the installer's, or the silent default) does
+/// not undo a decline an earlier setup recorded. Only the question asked here can.
+pub(crate) fn keep_decline(plan: Plan, declined_before: bool) -> Plan {
+    match plan {
+        Plan::Decided(true, Basis::Installer | Basis::Default) if declined_before => {
+            Plan::Decided(false, Basis::Kept)
+        }
+        other => other,
+    }
 }
 
 /// One decision: the answer, who gave it, and whether the question has to be asked now.
@@ -131,7 +145,10 @@ pub(super) fn dreaming_consent_step(storage: &Storage) -> Result<bool> {
     consent_step(
         storage,
         &card_store,
-        plan(preset, interactive()),
+        keep_decline(
+            plan(preset, interactive()),
+            dream_cadence::consent_declined(storage),
+        ),
         &mut ask_yes_default_yes,
     )
 }
@@ -171,11 +188,14 @@ fn consent_step(
         (_, Basis::Default) => {
             eprintln!("  Non-interactive run — keeping the default (enabled).")
         }
+        (_, Basis::Kept) => eprintln!(
+            "  Dreaming: stays off (you declined it before). Run `csr-engine setup` in a terminal to turn it on."
+        ),
         _ => {}
     }
 
     dream_cadence::record_consent(storage, granted)?;
-    if basis != Basis::Installer {
+    if !matches!(basis, Basis::Installer | Basis::Kept) {
         if granted {
             eprintln!("  Dreaming enabled. Turn it off any time with CSR_NO_DREAMING=1.");
         } else {
@@ -261,6 +281,38 @@ mod tests {
             plan(Preset::Unset, false),
             Plan::Decided(true, Basis::Default)
         );
+    }
+
+    #[test]
+    fn an_earlier_decline_survives_the_installers_yes_and_the_default_but_not_a_question() {
+        let kept = Plan::Decided(false, Basis::Kept);
+        assert_eq!(keep_decline(plan(Preset::Yes, true), true), kept);
+        assert_eq!(keep_decline(plan(Preset::Unset, false), true), kept);
+        assert_eq!(keep_decline(plan(Preset::Unset, true), true), Plan::Ask);
+        assert_eq!(
+            keep_decline(plan(Preset::No, false), true),
+            Plan::Decided(false, Basis::Installer)
+        );
+        // With no decline on record nothing changes.
+        for (preset, interactive) in [(Preset::Yes, true), (Preset::Unset, false)] {
+            let p = plan(preset, interactive);
+            assert_eq!(keep_decline(p, false), p);
+        }
+    }
+
+    #[test]
+    fn an_upgrade_through_the_installer_keeps_dreams_off_after_a_decline() {
+        let storage = Storage::open_memory().unwrap();
+        dream_cadence::record_consent(&storage, false).unwrap();
+        let (_dir, store) = tempstore();
+        let p = keep_decline(
+            plan(Preset::Yes, false),
+            dream_cadence::consent_declined(&storage),
+        );
+        let granted = consent_step(&storage, &store, p, &mut |_| panic!("asked")).unwrap();
+        assert!(!granted);
+        assert!(dream_cadence::consent_declined(&storage));
+        assert_eq!(store.get(MACHINE, CARD_ANSWER_KEY).unwrap(), None);
     }
 
     #[test]
