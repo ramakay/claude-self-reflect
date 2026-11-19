@@ -23,6 +23,10 @@ const MAX_RATIFICATION_PROMPT_SIZE: u64 = 10 * 1024;
 const EXTRACTOR_VERSION: &str = "ratification-v3";
 const MAX_LEDGER_SHAS: usize = 20;
 
+#[path = "ratification_pace.rs"]
+pub mod pace;
+pub use pace::next_due;
+
 static DISABLED_LOG: Once = Once::new();
 
 /// Entry-point guard used by the daemon loop. Logs once per process when disabled.

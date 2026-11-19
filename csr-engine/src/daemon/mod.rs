@@ -2229,7 +2229,7 @@ async fn ratification_loop(storage: Arc<Storage>, shutdown: Arc<AtomicBool>) {
 }
 
 async fn ratification_loop_inner(storage: &Arc<Storage>) -> Result<()> {
-    let unenriched = storage.get_unenriched_conversations("ratification", 1)?;
+    let unenriched = crate::daemon::ratification::next_due(storage)?;
     for (conv_id, _file_path) in &unenriched {
         if let Err(e) = crate::daemon::ratification::process_ratification(storage, conv_id).await {
             let _ = storage.mark_enrichment_failed(conv_id, "ratification", &e.to_string());
