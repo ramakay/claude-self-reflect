@@ -9,6 +9,7 @@ export const navigation = [
       { label: 'Installation', href: '/docs/installation' },
       { label: 'Quick Start', href: '/docs/quickstart' },
       { label: 'Choose your view', href: '/docs/companion-views' },
+      { label: 'What\'s new in 10.1', href: '/docs/whats-new' },
     ],
   },
   {
@@ -80,6 +81,7 @@ import troubleshooting from './troubleshooting.md?raw'
 import devSetup from './dev-setup.md?raw'
 import structure from './structure.md?raw'
 import btwTheseToo from './btw-these-too.md?raw'
+import whatsNew from './whats-new.md?raw'
 
 export const pages = {
   '/docs/why-csr': { title: 'Why Self-Reflect?', description: 'Claude reflecting on its own work, on top of a local index of your sessions.', content: stripFrontmatter(whyCsr), path: '/docs/why-csr' },
@@ -88,6 +90,7 @@ export const pages = {
   '/docs/installation': { title: 'Installation', description: 'Install CSR in under a minute. One command, zero dependencies.', content: stripFrontmatter(installation), path: '/docs/installation' },
   '/docs/quickstart': { title: 'Quick Start', description: 'Your first search in 60 seconds.', content: stripFrontmatter(quickstart), path: '/docs/quickstart' },
   '/docs/companion-views': { title: 'Choose your view: herdr pane or in-Claude panel', description: 'Where the companion shows, how to set up each view, how to switch, and how to turn it off.', content: stripFrontmatter(companionViews), path: '/docs/companion-views' },
+  '/docs/whats-new': { title: 'What\'s new in 10.1', description: 'The 10.1.0 release in short: recap, dreaming, more sources, code map, companion.', content: stripFrontmatter(whatsNew), path: '/docs/whats-new' },
   '/docs/architecture': { title: 'Architecture', description: 'How CSR works — single binary, five components, zero services.', content: stripFrontmatter(architecture), path: '/docs/architecture' },
   '/docs/hooks': { title: 'Session hooks', description: 'Eight hooks on seven events: they inject context when Claude needs it and capture the rest.', content: stripFrontmatter(hooks), path: '/docs/hooks' },
   '/docs/search': { title: 'Search & Retrieval', description: 'How CSR finds relevant context: hybrid search, cross-encoder re-ranking, project scope.', content: stripFrontmatter(search), path: '/docs/search' },

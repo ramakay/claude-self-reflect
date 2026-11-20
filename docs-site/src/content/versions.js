@@ -38,8 +38,17 @@ export function slugPath(pathname) {
   return pathname.startsWith(`${V9_PREFIX}/`) ? pathname.slice(V9_PREFIX.length) : pathname
 }
 
+/** The marketing landing (repo site/), one level above the docs app: /claude-self-reflect/. */
+export const LANDING_URL = import.meta.env.BASE_URL.replace(/docs\/$/, '')
+
+/** A version's docs index route: `/` for 10.1, `/v9` for 9.x. */
+export function homeOf(version) {
+  return version.prefix || '/'
+}
+
 /** The same page in another version, or that version's first page when it has no such page. */
 export function sameIn(target, pathname) {
+  if (pathname === '/' || pathname === V9_PREFIX) return homeOf(target)
   const path = `${target.prefix}${slugPath(pathname)}`
   return target.pages[path] ? path : target.navigation[0].items[0].href
 }
