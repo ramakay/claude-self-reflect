@@ -65,7 +65,7 @@ For a daemon you started by hand, stop it and start `csr-engine daemon` again fr
 ## Companion
 
 ### No CSR panel in a plain terminal
-Type `/csr` in Claude Code. Without herdr the panel may not open by itself; in the 10.1.0 clean-machine test it did not. More cases (no herdr pane, black or missing pictures, `/csr` not found) are in [Choose your view](#/docs/companion-views).
+Type `/csr` in Claude Code. Without herdr the panel opens by itself only in a window at least 144 columns wide (110 after you have opened it once); `/csr` opens it at any width. More cases (no herdr pane, black or missing pictures, `/csr` not found) are in [Choose your view](#/docs/companion-views).
 
 ## Help
 

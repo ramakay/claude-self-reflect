@@ -240,7 +240,7 @@ pub(super) fn note_node(shown: &Value) -> Value {
                 format!(" · commit {oid}")
             };
             let session: String = word("conversation").chars().take(8).collect();
-            format!("From CSR's memory · 0 model tokens{commit} · session {session}")
+            format!("From your past sessions · 0 model tokens{commit} · session {session}")
         };
         body.push(text(
             json!({ "dimColor": true, "wrap": "truncate-end" }),

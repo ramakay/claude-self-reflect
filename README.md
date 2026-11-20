@@ -173,7 +173,7 @@ The cards and keys below (`i`, `l`, `m`) are the herdr pane's; the band, the gua
 - **Changed since (`l`):** every commit that moved code your past sessions worked on.
 - **Shift Map (`m`):** shift, risk, decision and regression rows, each grounded in receipts.
 - **Heads up band:** a note when Claude opens a file that has history.
-- **You Should Know:** the same idea as Claude Code's own "You should know", fed from your memory.
+- **You Should Know:** the same idea as Claude Code's own "You should know", fed from your past sessions.
 - **Terms coach:** offers a `## Terms` line for your CLAUDE.md that teaches Claude your shorthand.
 - **Push guard:** opt-in. Blocks `--no-verify` and pushes to protected branches. A guard rail, not a security boundary.
 - **"Later" survives compaction:** threads you deferred are carried across compaction, and subagents keep their task brief through their own compaction.
@@ -366,7 +366,7 @@ A Claude Code plugin, `csr-companion`. It shows what Self-Reflect handed Claude,
 | Where you run `claude` | What you get | How it opens |
 |---|---|---|
 | Inside [herdr](https://herdr.dev) (`brew install herdr`) | A pane to the right of Claude with the full cards. Pictures in Ghostty, kitty, WezTerm or Warp; text cards in Terminal.app. | By itself at session start in a project folder; `/csr` opens it again |
-| A plain terminal, no herdr | A panel inside Claude Code with a smaller card set | Type `/csr`. In the 10.1.0 clean-machine test it did not open by itself. |
+| A plain terminal, no herdr | A panel inside Claude Code with a smaller card set | By itself in a project folder in a window 144+ columns wide; narrower, type `/csr` |
 
 Setup installs one plugin for both and does not choose between them: the plugin checks for herdr at each session start and each `/csr`. To switch, start `claude` inside or outside herdr; no reinstall. `claude plugin disable csr-companion@claude-self-reflect` turns the whole companion off. Setup, checks and troubleshooting: [Choose your view](https://ramakay.github.io/claude-self-reflect/#/docs/companion-views).
 

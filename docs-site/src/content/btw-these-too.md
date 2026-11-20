@@ -67,7 +67,7 @@ The cards and keys below (`i`, `l`, `m`) are the herdr pane's; the band, the gua
 - **Changed since (`l`):** every commit that moved code your past sessions worked on.
 - **Shift Map (`m`):** shift, risk, decision and regression rows, each grounded in receipts.
 - **Heads up band:** a note when Claude opens a file that has history.
-- **You Should Know:** the same idea as Claude Code's own "You should know", fed from your memory.
+- **You Should Know:** the same idea as Claude Code's own "You should know", fed from your past sessions.
 - **Terms coach:** offers a `## Terms` line for your CLAUDE.md that teaches Claude your shorthand.
 - **Push guard:** opt-in. Blocks `--no-verify` and pushes to protected branches. A guard rail, not a security boundary.
 - **"Later" survives compaction:** threads you deferred are carried across compaction, and subagents keep their task brief through their own compaction.

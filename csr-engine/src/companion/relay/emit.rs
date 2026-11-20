@@ -16,10 +16,10 @@ pub const PLUGIN_NAME: &str = "csr-companion";
 
 /// What setup's next steps say about where the companion shows. The plugin picks the view at
 /// each session start and each `/csr` (`pane_cmd::open_pane`): a herdr split when Claude runs in
-/// herdr, else Claude Code's own panel, which a plain terminal shows only after `/csr`.
+/// herdr, else Claude Code's own panel, which Claude Code draws unasked only from 144 columns.
 pub const VIEW_LINES: &str =
     "  In herdr: the CSR pane opens beside Claude when a session starts in a project.\n  \
-    Without herdr: type /csr in Claude Code to open the CSR panel.\n";
+    Without herdr: type /csr to open the CSR panel (by itself only 144+ columns wide).\n";
 
 /// A Unix socket path may be 104 bytes (macOS) or 108 (Linux); the Mods docs say near 100.
 const SOCKET_PATH_LIMIT: usize = 90;
