@@ -175,7 +175,8 @@ fn registry_priors(storage: &Storage, project: &str, sid: &str, now: f64) -> Vec
 }
 
 fn clean_prompt(prompt: &str) -> Option<String> {
-    if crate::import::contamination::has_csr_text(prompt) {
+    // A pasted status page, log or JSON body is not what anyone asked: never "you asked: …".
+    if crate::import::contamination::has_csr_text(prompt) || super::paste::is_paste(prompt) {
         return None;
     }
     crate::extraction::provenance::extractable(prompt).and_then(|p| recap::clean_intent(&p))
@@ -296,7 +297,8 @@ fn session_recap(
     // Only a measured anchor may lead the recap while other evidence exists.
     let anchor = ep
         .recap_evidence_version
-        .and_then(|_| recap::recap_intent(&ep));
+        .and_then(|_| recap::recap_intent(&ep))
+        .filter(|anchor| !super::paste::is_paste(anchor));
     let displayed = recap::displayed_receipts(&ep.completions);
     let completed = !displayed.is_empty();
     let settled_intent = feeds.settled.iter().find(|f| fact_intent(f).is_some());
@@ -715,6 +717,28 @@ mod tests {
             clean_next("Next steps: Run the device tests"),
             Some("Run the device tests".into())
         );
+    }
+
+    /// A pasted router page as the first prompt, the episode's request and its anchor: "Last
+    /// time here" and "Earlier here" never read "you asked: Firmware=…".
+    #[test]
+    fn a_pasted_prompt_is_never_what_you_asked() {
+        let router = "Firmware=V7.2.8.8_5.1.24 RegionTag=RBRE960_NA Region=us Model=RBRE960 \
+                      InternetConnectionStatus=Up SOAPVersion=3.46 XCloudSupported=1";
+        let storage = Storage::open_memory().unwrap();
+        let prior = Prior {
+            session: "prior".into(),
+            at: 0.,
+            prompt: Some(router.into()),
+        };
+        let mut episode = empty_episode("repo", &prior);
+        episode.request = router.into();
+        episode.anchor_request = Some(router.into());
+        let (summary, text) = session_recap(&storage, "repo", prior, Some(&episode), 3600.);
+        for shown in [&summary.intent, &text] {
+            assert!(!shown.contains("Firmware"), "{shown}");
+        }
+        assert_eq!(summary.intent, UNAVAILABLE);
     }
 
     #[test]

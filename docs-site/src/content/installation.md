@@ -36,7 +36,7 @@ Some features run the Claude Code CLI in print mode (`claude -p`) as a child pro
 | Caller | When it calls | Typical count | Pace and switch |
 |---|---|---|---|
 | Session briefing | a session start or resume | about one per session; none for a project briefed in the last 30 min | `CSR_NO_AI_NARRATIVES=1` |
-| Ratification (daemon) | once per conversation | about one per session you ran | at most 4 an hour (`CSR_RATIFICATION_PER_HOUR`), only conversations active in the last 7 days (`CSR_RATIFICATION_DAYS`, 0 for all); `CSR_NO_RATIFICATION=1` |
+| Ratification (daemon) | once per conversation: each session, subagent run and Codex rollout | one per session you ran, plus one per subagent run and one per Codex rollout; a conversation whose answer fails to parse twice is not tried again | at most 4 an hour (`CSR_RATIFICATION_PER_HOUR`), only conversations active in the last 7 days (`CSR_RATIFICATION_DAYS`, 0 for all); off: `CSR_NO_RATIFICATION=1` |
 | Narratives and stories | a finished session, a story refresh | a few per active session | `CSR_NO_AI_NARRATIVES=1` |
 | Dreams (daemon) | one pass per cadence | one pass per 6 h at most, within the budget setup shows | `CSR_DREAM_INTERVAL_SECS`, `CSR_NO_DREAMING=1` |
 

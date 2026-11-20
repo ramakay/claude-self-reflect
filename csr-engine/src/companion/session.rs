@@ -1001,7 +1001,14 @@ pub fn previous_facts(paths: &Paths, prev: &Session, db: Option<&Db>) -> Value {
             .collect::<Vec<_>>(),
         "todos": left_todos(paths, &prev.id, db),
         "said": cut(&p["said"]),
-        "typed": cut(array(&p["typed"]).last().unwrap_or(&Value::Null)),
+        // "You last: …" quotes this: the last prompt the person asked, never one they pasted.
+        "typed": cut(
+            array(&p["typed"])
+                .iter()
+                .rev()
+                .find(|r| !r[1].as_str().is_some_and(super::paste::is_paste))
+                .unwrap_or(&Value::Null)
+        ),
     })
 }
 
@@ -1090,6 +1097,28 @@ mod previous_tests {
         assert!(facts["handed"].is_null());
         assert_eq!(facts["typed"][1], "the last words I typed");
         assert_eq!(facts["said"][1], "words");
+    }
+    /// A pasted router page as the last prompt: "Last time here" quotes the question before it.
+    #[test]
+    fn the_last_session_quotes_the_last_prompt_that_was_not_a_paste() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let mut prev = Session::new("old");
+        prev.data["typed"] = json!([
+            [1300, "why does the router drop the link every hour?"],
+            [
+                1400,
+                "Firmware=V7.2.8.8_5.1.24 RegionTag=RBRE960_NA Region=us Model=RBRE960 \
+                    InternetConnectionStatus=Up SOAPVersion=3.46"
+            ],
+        ]);
+        let facts = previous_facts(&paths, &prev, None);
+        assert_eq!(
+            facts["typed"][1],
+            "why does the router drop the link every hour?"
+        );
+        prev.data["typed"] = json!([[1400, "Firmware=V7 RegionTag=RB Region=us Model=RB"]]);
+        assert!(previous_facts(&paths, &prev, None)["typed"].is_null());
     }
 }
 
