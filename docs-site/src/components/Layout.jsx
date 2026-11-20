@@ -241,7 +241,8 @@ export default function Layout() {
 
       <div className="flex">
         {/* Sidebar — glassmorphic */}
-        <aside className={`fixed lg:sticky top-[72px] left-0 z-40 w-[220px] h-[calc(100vh-72px)] overflow-y-auto p-[16px] transition-transform lg:translate-x-0
+        {/* Top and height follow the floating nav: --nav-offset is set in index.css per breakpoint */}
+        <aside className={`docs-sidebar fixed lg:sticky top-(--nav-offset) left-0 z-40 w-[220px] h-[calc(100dvh-var(--nav-offset))] overflow-y-auto p-[16px] transition-transform lg:translate-x-0
           ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
           bg-[#e8e5f0] border-r border-[rgba(0,0,0,0.06)] dark:bg-[#0e1225] dark:border-[rgba(255,255,255,0.08)]`}>
           <button onClick={() => setSearchOpen(true)} className="search-sidebar-btn">

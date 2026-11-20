@@ -305,17 +305,6 @@ body {
   background: #0e1225;
 }
 
-.docs-nav {
-  background: #eae7f2 !important;
-  backdrop-filter: none !important;
-  -webkit-backdrop-filter: none !important;
-  border-bottom-color: rgba(0,0,0,0.06) !important;
-}
-[data-theme="dark"] .docs-nav {
-  background: #111630 !important;
-  border-bottom-color: rgba(255,255,255,0.08) !important;
-}
-
 /* Doc page sidebar dark mode */
 [data-theme="dark"] .docs-shell aside {
   background: #0c1020 !important;
@@ -3329,7 +3318,6 @@ ul.latency-compare {
 
 /* Dark doc shell */
 [data-theme="dark"] .docs-shell { background: #0e1225; }
-[data-theme="dark"] .docs-nav { background: #111630 !important; border-bottom-color: rgba(244,239,228,0.08) !important; }
 [data-theme="dark"] .docs-shell aside { background: #0c1020 !important; border-right-color: rgba(244,239,228,0.08) !important; }
 
 /* Dark Go Deeper section */
@@ -3374,10 +3362,6 @@ body, [data-theme="dark"] body {
 ::selection { background: var(--vermilion-wash); }
 
 .docs-shell, [data-theme="dark"] .docs-shell { background: var(--paper); }
-.docs-nav, [data-theme="dark"] .docs-nav {
-  background: var(--paper) !important;
-  border-bottom: 1px solid var(--paper-rule) !important;
-}
 .docs-shell aside, [data-theme="dark"] .docs-shell aside {
   background: var(--paper-card) !important;
   border-right: 1px solid var(--paper-rule) !important;
@@ -3578,4 +3562,123 @@ body, [data-theme="dark"] body {
 .version-banner a {
   color: var(--color-purple);
   font-weight: 600;
+}
+
+/* ================================================================
+   Floating glass nav + top colour wash (docs app: home and doc pages).
+   One offset variable drives the nav, the sidebar top and anchor scroll.
+   Sits last so it wins the cascade over the flat brand-layer header.
+   ================================================================ */
+:root {
+  --nav-inset: 14px;
+  --nav-h: 60px;
+  --nav-gap: 10px;
+  --nav-offset: calc(var(--nav-inset) + var(--nav-h) + var(--nav-gap));
+  /* wash stops: vermilion family, warm amber bridge, one faint cool slate */
+  --wash-ember: rgba(200,68,42,0.12);
+  --wash-rose: rgba(241,210,199,0.80);
+  --wash-blush: rgba(251,233,227,0.95);
+  --wash-amber: rgba(239,227,196,0.60);
+  --wash-cool: rgba(143,166,184,0.24);
+  --glass-bg: color-mix(in srgb, var(--paper-card) 68%, transparent);
+  --glass-border: color-mix(in srgb, var(--paper-rule) 80%, transparent);
+  --glass-shadow: inset 0 1px 0 rgba(255,255,255,0.65), 0 1px 2px rgba(36,33,30,0.05), 0 12px 32px -14px rgba(36,33,30,0.20);
+}
+[data-theme="dark"] {
+  --wash-ember: rgba(236,117,87,0.14);
+  --wash-rose: rgba(74,42,33,0.62);
+  --wash-blush: rgba(110,58,45,0.22);
+  --wash-amber: rgba(107,90,48,0.18);
+  --wash-cool: rgba(60,84,104,0.26);
+  --glass-bg: color-mix(in srgb, var(--paper-card) 74%, transparent);
+  --glass-border: rgba(243,238,228,0.10);
+  --glass-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 1px 2px rgba(0,0,0,0.30), 0 14px 36px -14px rgba(0,0,0,0.65);
+}
+@media (max-width: 760px) {
+  :root { --nav-inset: 8px; --nav-h: 56px; --nav-gap: 8px; }
+}
+
+html { scroll-padding-top: calc(var(--nav-offset) + 8px); }
+.prose :is(h1,h2,h3,h4,[id]) { scroll-margin-top: calc(var(--nav-offset) + 8px); }
+
+/* Top wash: layered radials over the paper, sized to the top 400px, ending in the paper colour */
+.docs-shell, [data-theme="dark"] .docs-shell,
+.sky-shell, [data-theme="dark"] .sky-shell {
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(to bottom, transparent 0%, transparent 45%, var(--paper) 100%),
+    radial-gradient(ellipse 34% 62% at 4% 0%, var(--wash-ember) 0%, transparent 72%),
+    radial-gradient(ellipse 40% 90% at 24% 0%, var(--wash-rose) 0%, transparent 70%),
+    radial-gradient(ellipse 38% 85% at 52% 0%, var(--wash-blush) 0%, transparent 72%),
+    radial-gradient(ellipse 34% 80% at 76% 0%, var(--wash-amber) 0%, transparent 70%),
+    radial-gradient(ellipse 30% 90% at 98% 0%, var(--wash-cool) 0%, transparent 72%);
+  background-size: 100% 400px;
+  background-repeat: no-repeat;
+  background-position: top center;
+}
+/* Sticky nav needs a non-scrolling ancestor; clip keeps the old clipping without one */
+.sky-shell { overflow: clip; }
+
+/* Pill nav: solid paper by default, glass where backdrop-filter works */
+.site-nav, [data-theme="dark"] .site-nav {
+  position: sticky;
+  top: var(--nav-inset);
+  z-index: 50;
+  width: calc(100% - 2 * var(--nav-inset));
+  max-width: 1520px;
+  height: var(--nav-h);
+  margin: var(--nav-inset) auto 0;
+  border: 1px solid var(--glass-border);
+  border-radius: 18px;
+  background: var(--paper-card);
+  box-shadow: var(--glass-shadow);
+}
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .site-nav, [data-theme="dark"] .site-nav {
+    background: var(--glass-bg);
+    backdrop-filter: blur(18px) saturate(1.6);
+    -webkit-backdrop-filter: blur(18px) saturate(1.6);
+  }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .site-nav, [data-theme="dark"] .site-nav {
+    background: var(--paper-card);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+.site-nav .site-nav__inner {
+  max-width: none;
+  height: 100%;
+  padding: 0 10px 0 18px;
+}
+
+/* Desktop sidebar lets the wash through; the phone drawer stays solid */
+@media (min-width: 1024px) {
+  .docs-shell .docs-sidebar, [data-theme="dark"] .docs-shell .docs-sidebar {
+    background: transparent !important;
+  }
+}
+
+/* the inset pill is narrower than the old bar: tighten the docs header before it overflows */
+@media (max-width: 1240px) {
+  .docs-nav .site-nav__links { gap: 16px; }
+  .docs-nav .site-nav__github { width: 38px; padding: 0; }
+  .docs-nav .site-nav__github span, .docs-nav .search-trigger kbd { display: none; }
+}
+/* below lg the drawer carries the version switch and search; the header keeps icons */
+@media (max-width: 1023px) {
+  .docs-nav .site-nav__links .version-switcher { display: none; }
+  .docs-nav .search-trigger { width: 38px; padding: 0; justify-content: center; }
+  .docs-nav .search-trigger span { display: none; }
+}
+@media (max-width: 900px) {
+  .docs-nav .site-nav__links .site-nav__link { display: none; }
+}
+
+@media (max-width: 760px) {
+  .site-nav, [data-theme="dark"] .site-nav { border-radius: 16px; }
+  .site-nav .site-nav__inner { padding: 0 6px 0 12px; gap: 8px; }
+  /* the phone drawer carries its own version switch; the header one pushed the pill off-screen */
+  .site-nav__links .version-switcher { display: none; }
 }
