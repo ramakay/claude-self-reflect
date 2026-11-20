@@ -263,6 +263,19 @@ pub(crate) enum Opened {
 /// The machine row `/csr` sets once it opened Claude Code's pane: the person knows the command,
 /// so a session start that cannot draw the pane no longer says to type it.
 const OPENED_BY_HAND: &str = "pane:opened-by-hand";
+/// The session row a start sets when its pane waits undrawn and it said how to open it: the band
+/// shows `HINT` while it is set and `/csr` has never opened the pane. A drawn pane clears it.
+const PANE_WAITING: &str = "pane:waiting";
+/// The band's line while the session start's pane waits (the toast alone was not seen: Claude
+/// Code stacks a plugin toast under its own notices).
+pub(crate) const HINT: &str =
+    "CSR panel is ready: type /csr to open it (it opens by itself only in a wider window)";
+
+/// The band's hint line, while this session's pane waits and `/csr` has never opened it.
+pub(crate) fn hint(cx: &Ctx) -> Option<&'static str> {
+    let waiting = matches!(cx.store.get(&cx.sid, PANE_WAITING), Ok(Some(_)));
+    (waiting && !matches!(cx.store.get(MACHINE, OPENED_BY_HAND), Ok(Some(_)))).then_some(HINT)
+}
 
 /// Open the pane: a herdr split when there is one, else Claude Code's own pane. Says which.
 pub(crate) async fn open_pane(cx: &Ctx, outside: &dyn Outside, cwd: &str) -> Opened {
@@ -282,7 +295,8 @@ pub(crate) async fn open_pane(cx: &Ctx, outside: &dyn Outside, cwd: &str) -> Ope
 }
 
 /// The session start's pane waits undrawn: log Claude Code's reason, and, until the person has
-/// typed `/csr` once, say in a toast how to open it. A run with no surface gets no toast.
+/// typed `/csr` once, say how to open it, in a toast and in the band (`hint`). A run with no
+/// surface gets neither.
 async fn say_how_to_open(cx: &Ctx, reason: &str) {
     let line = format!("CSR pane not drawn: {reason}");
     let _ = cx
@@ -295,7 +309,9 @@ async fn say_how_to_open(cx: &Ctx, reason: &str) {
     if matches!(cx.store.get(MACHINE, OPENED_BY_HAND), Ok(Some(_))) {
         return;
     }
+    let _ = cx.store.set(&cx.sid, PANE_WAITING, &json!(true));
     let _ = cx.host.call("ui.toast", vec![json!(WAITING)]).await;
+    let _ = cx.host.call("ui.invalidate", vec![]).await;
 }
 
 fn has_repo(fresh: &Option<Value>) -> bool {
@@ -415,6 +431,9 @@ fn on_command(outside: Arc<dyn Outside>) -> Handler {
                     };
                     if opened != Opened::Herdr {
                         let _ = cx.store.set(MACHINE, OPENED_BY_HAND, &json!(true));
+                        if clear_waiting(&cx) {
+                            let _ = cx.host.call("ui.invalidate", vec![]).await;
+                        }
                     }
                     let where_ = if opened == Opened::Herdr {
                         "CSR pane opened beside this one"
@@ -429,8 +448,21 @@ fn on_command(outside: Arc<dyn Outside>) -> Handler {
     })
 }
 
+/// Drop this session's `PANE_WAITING` row; true when there was one.
+fn clear_waiting(cx: &Ctx) -> bool {
+    let up = matches!(cx.store.get(&cx.sid, PANE_WAITING), Ok(Some(_)));
+    if up {
+        let _ = cx.store.delete(&cx.sid, PANE_WAITING);
+    }
+    up
+}
+
 fn on_pane() -> Handler {
     handler(|cx, e| async move {
+        // Claude Code asks a pane to draw only once it is placed (a wider window, say): the
+        // band's hint to type `/csr` has done its work; the band drops it at its next draw (no
+        // invalidate from inside a draw).
+        clear_waiting(&cx);
         let data = cx.store.get(&cx.sid, "data").ok().flatten();
         let lasting = cx.store.get(&cx.sid, "infinite").ok().flatten();
         let on = dreams_on(&cx).await;
