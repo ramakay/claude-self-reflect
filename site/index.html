@@ -395,6 +395,15 @@ html[data-nav-stuck] .film a:focus-visible { outline-color: var(--tl-ink); }
 @keyframes nav-drift { from { transform: translate3d(-3%, 0, 0) scale(1); } to { transform: translate3d(4%, 10px, 0) scale(1.08); } }
 html[data-nav-stuck] .nav-glow { opacity: .62; }
 @media (max-width: 600px) { .nav-glow { height: 190px; top: -60px; } .nav-glow i { filter: blur(34px); } }
+/* Phones, past the film: scrolling down folds the pill to the logo and a » button. */
+.nav-more { display: none; }
+@media (max-width: 600px) {
+  html[data-nav-collapsed] .film-header { right: auto; width: auto; margin: 0 0 0 14px; padding: 6px 6px 6px 10px; gap: 6px; }
+  html[data-nav-collapsed] .film-brand-word, html[data-nav-collapsed] .film-nav { display: none; }
+  html[data-nav-collapsed] .nav-more { display: inline-grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid var(--tl-ink); border-radius: 999px; background: transparent; color: var(--tl-ink); font: 600 18px/1 var(--sans); cursor: pointer; }
+  html[data-nav-collapsed] .nav-more:focus-visible { outline: 2px solid var(--tl-ink); outline-offset: 2px; }
+  html[data-nav-collapsed] .nav-glow { opacity: 0; }
+}
 @media (prefers-reduced-motion: reduce) { .film-header, .nav-glow { transition: none; } .nav-glow i { animation: none; } }
 .film a { color: inherit; text-decoration: none; }
 .film a:focus-visible, .film button:focus-visible { outline-color: #fffaf2; }
@@ -952,8 +961,9 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
   <video class="film-video" muted playsinline preload="none" aria-label="A silent Blender film about Self-Reflect"></video>
   <div class="nav-glow" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
   <header class="film-header">
-    <a class="film-brand" href="#film"><img src="assets/self-reflect-mark.svg" alt="" width="27" height="27">Self-Reflect</a>
-    <nav class="film-nav" aria-label="Page">
+    <a class="film-brand" href="#film" aria-label="Self-Reflect, back to the top"><img src="assets/self-reflect-mark.svg" alt="" width="27" height="27"><span class="film-brand-word">Self-Reflect</span></a>
+    <button class="nav-more" type="button" aria-label="Show the navigation" aria-expanded="false" aria-controls="film-nav-links" hidden>»</button>
+    <nav class="film-nav" id="film-nav-links" aria-label="Page">
       <a href="#machine">Machine</a>
       <a class="film-nav-modules" href="#everything">Modules</a>
       <a class="film-nav-cost" href="#cost">Cost</a>
@@ -2452,6 +2462,28 @@ document.addEventListener("visibilitychange", () => {
   const film = document.querySelector('.film');
   if (!film || !('IntersectionObserver' in window)) return;
   const root = document.documentElement;
-  new IntersectionObserver(([e]) => root.toggleAttribute('data-nav-stuck', !e.isIntersecting),
+  new IntersectionObserver(([e]) => {
+    root.toggleAttribute('data-nav-stuck', !e.isIntersecting);
+    if (e.isIntersecting) root.removeAttribute('data-nav-collapsed');
+  },
     { rootMargin: '-72px 0px 0px 0px' }).observe(film);
+  // Phones: fold the stuck pill on a downward scroll; the » button opens it again.
+  const phone = matchMedia('(max-width: 600px)');
+  const more = document.querySelector('.nav-more');
+  if (!more) return;
+  let lastY = scrollY, openedAt = null;
+  const fold = on => {
+    root.toggleAttribute('data-nav-collapsed', on);
+    more.hidden = !on;
+    more.setAttribute('aria-expanded', String(!on));
+  };
+  addEventListener('scroll', () => {
+    const y = scrollY, down = y > lastY;
+    lastY = y;
+    if (!phone.matches || !root.hasAttribute('data-nav-stuck')) { if (root.hasAttribute('data-nav-collapsed')) fold(false); return; }
+    if (openedAt !== null) { if (y - openedAt > 80) openedAt = null; else return; }
+    if (down && !root.hasAttribute('data-nav-collapsed')) fold(true);
+  }, { passive: true });
+  more.addEventListener('click', () => { openedAt = scrollY; fold(false); [...document.querySelectorAll('.film-nav a')].find(l => l.offsetParent)?.focus({ preventScroll: true }); });
+  phone.addEventListener('change', () => fold(false));
 })();</script></body></html>
