@@ -1,5 +1,7 @@
 use csr_engine::companion::{cli::PaneArgs, pane::Pane, paths::Paths};
 use std::{fs, path::PathBuf, process::Command};
+#[path = "support/spawn_retry.rs"]
+mod spawn_retry;
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/companion")
@@ -321,34 +323,27 @@ fn terminal_session(reload: bool) {
         std::path::Path::new(env!("CARGO_BIN_EXE_csr-engine"))
     };
     let frame_log = paths.home.join("frames.log");
-    let child = Command::new(executable)
-        .env("HOME", &paths.home)
-        .env("TERM_PROGRAM", "kitty")
-        .env("CSR_PANE_FRAME_LOG", &frame_log)
-        .env_remove("CSR_COMPANION_PIXELS")
-        .args([
-            "companion",
-            "pane",
-            "--repo",
-            env!("CARGO_MANIFEST_DIR"),
-            "--watch",
-            "--sid",
-            "sess-now",
-        ])
-        .stdin(slave.try_clone().unwrap())
-        .stdout(slave.try_clone().unwrap())
-        .stderr(slave.try_clone().unwrap())
-        .spawn()
-        .unwrap();
-    struct ChildGuard(std::process::Child);
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
+    let child = spawn_retry::spawn_retrying(
+        Command::new(executable)
+            .env("HOME", &paths.home)
+            .env("TERM_PROGRAM", "kitty")
+            .env("CSR_PANE_FRAME_LOG", &frame_log)
+            .env_remove("CSR_COMPANION_PIXELS")
+            .args([
+                "companion",
+                "pane",
+                "--repo",
+                env!("CARGO_MANIFEST_DIR"),
+                "--watch",
+                "--sid",
+                "sess-now",
+            ])
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap()),
+    );
     // Only this test's own child can be signalled or killed, including assertion failures.
-    let mut child_guard = ChildGuard(child);
+    let mut child_guard = spawn_retry::ChildGuard(child);
     let pid = paths.keep.join("panes/sess-now.json");
     unsafe {
         libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
