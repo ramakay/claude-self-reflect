@@ -3780,3 +3780,7 @@ html { scroll-padding-top: calc(var(--nav-offset) + 8px); }
   .docs-home__card-arrow { left: auto; right: 16px; bottom: auto; top: 50%; transform: translateY(-50%); }
   .docs-home__search kbd { display: none; }
 }
+
+/* Tall pane captures: phone-width, not the full column. */
+.prose img[src*="pane-"] { max-width: 420px; margin-inline: 0; border-radius: 10px; }
+.prose img[src*="pane-proposal"] { max-width: 560px; }

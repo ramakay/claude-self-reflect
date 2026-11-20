@@ -98,6 +98,38 @@ If the plugin cannot open a herdr split (herdr is not on your `PATH`, or a herdr
 
 Search, the hooks, the MCP tools and the daemon do not need the companion. They keep working with it off.
 
+## What the herdr pane shows
+
+![The herdr pane, top to bottom: the dreamer, Same page?, a skill, memory or tool proposal, Lost and found, where the work stands, usage pace and the context gauge](images/pane-full-10.webp)
+
+The main view is a stack of cards, top to bottom:
+
+| Card | What it tells you | How to open more |
+|---|---|---|
+| **Self-Reflect's dreamer** | What the dreamer read of the session and what its last look found | — |
+| **Same page?** | The model's read: how many of your asks Claude missed, and where you were unclear | Click the card |
+| **Should be a skill / memory / tool** | Something you keep asking for, and where it could live | `o` |
+| **Lost and found** | Requests left open in this session and earlier ones | Click a row |
+| **Where the work stands** | The session story, refreshed as you work, and the files it touched | — |
+| **Usage and context** | Pace against your usage limits, and what fills the context window | `i` for the figure's facts |
+
+The last two rows of the context card, **CSR handed over** and **Self-Reflect this session**, open **What CSR told Claude**.
+
+### The pages behind the cards
+
+- **Monologue** (`t`): the session thinking out loud, newest first. Each row has a word for what happened: asked, tinkered, landed, delegated, heard back, made room (a compaction), wondered (a dream), left open. Click a left-open row for its handoff. `j`/`k` scroll; `t` or Esc goes back.
+- **Changes** (`l`): commits that changed files from your past work. When Claude opens one of those files, Self-Reflect can point to them. The key shows only when there are commits.
+- **What CSR told Claude**: every block Self-Reflect put in front of Claude this run, with its size in tokens. Claude reads it as history, not as tasks. `r` resumes from it, `c` copies it, Esc closes it.
+- **Should be a skill / memory / tool** (`o`): one proposal at a time, with your own words as evidence. `s` sends it to Claude, `c` copies it, `x` hides it, Tab shows the next one.
+
+![The Monologue page](images/pane-monologue-10.webp)
+
+![What CSR told Claude](images/pane-told-claude-10.webp)
+
+![A proposal to save a memory, with the evidence and the send, copy and hide keys](images/pane-proposal-10.webp)
+
+Other keys on the main view: `b` theme, `q` close, `d` the dream queue when it has items. A narrow pane shortens the labels, for example `chg` and `mono`.
+
 ## Picture or text cards
 
 This applies to the herdr pane only. The in-Claude panel is drawn by Claude Code and has no pictures.
