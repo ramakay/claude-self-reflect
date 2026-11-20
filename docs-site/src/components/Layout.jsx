@@ -225,7 +225,7 @@ export default function Layout() {
               <span>Search</span>
               <kbd>/</kbd>
             </button>
-            <Link className="site-nav__link" to={homeOf(version)}>Docs</Link>
+            <Link className="site-nav__link site-nav__link--docs" to={homeOf(version)}>Docs</Link>
             <Link className="site-nav__link" to="/docs/why-csr">Guide</Link>
             <Link className="site-nav__link" to="/docs/features">Features</Link>
             <Link className="site-nav__link" to="/docs/mcp-tools">Reference</Link>

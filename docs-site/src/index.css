@@ -3649,20 +3649,29 @@ html { scroll-padding-top: calc(var(--nav-offset) + 8px); }
   padding: 0 10px 0 18px;
 }
 
-/* Desktop sidebar lets the wash through; the phone drawer stays solid */
+/* Desktop sidebar lets a little wash through (a paper-card tint keeps its link contrast);
+   the phone drawer stays solid */
 @media (min-width: 1024px) {
   .docs-shell .docs-sidebar, [data-theme="dark"] .docs-shell .docs-sidebar {
-    background: transparent !important;
+    background: color-mix(in srgb, var(--paper-card) 72%, transparent) !important;
   }
 }
 
 /* the inset pill is narrower than the old bar: tighten the docs header before it overflows */
-@media (max-width: 1240px) {
+@media (max-width: 1320px) {
   .docs-nav .site-nav__links { gap: 16px; }
   .docs-nav .site-nav__github { width: 38px; padding: 0; }
   .docs-nav .site-nav__github span, .docs-nav .search-trigger kbd { display: none; }
 }
 /* below lg the drawer carries the version switch and search; the header keeps icons */
+/* the sidebar's "Docs index" link covers the header's Docs item where space runs out */
+@media (max-width: 1100px) {
+  .docs-nav .site-nav__link--docs { display: none; }
+}
+/* the landing-era rule hid the 5th link at <=1000px; the docs header has room for all of them there */
+@media (min-width: 901px) and (max-width: 1000px) {
+  .docs-nav .site-nav__link:nth-of-type(5) { display: inline; }
+}
 @media (max-width: 1023px) {
   .docs-nav .site-nav__links .version-switcher { display: none; }
   .docs-nav .search-trigger { width: 38px; padding: 0; justify-content: center; }
