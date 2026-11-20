@@ -93,10 +93,19 @@ fn registry_preserves_a_live_engine_with_a_superseded_identity() {
     std::fs::write(&old, b"superseded image").unwrap();
     let old_identity = FileIdentity::capture(&old).unwrap();
     let current = FileIdentity::capture(&executable).unwrap();
-    let mut child = std::process::Command::new(&executable)
-        .arg("2")
-        .spawn()
-        .unwrap();
+    // On Linux a parallel test can fork while the copy's write handle is still
+    // open, so exec briefly fails with ETXTBSY. Retry that one error only.
+    let mut attempt = 0;
+    let mut child = loop {
+        match std::process::Command::new(&executable).arg("2").spawn() {
+            Ok(child) => break child,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 50 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("spawn copied sleep: {e}"),
+        }
+    };
     let path = write_record(dir.path(), child.id(), old_identity);
     // Always reap our own child, including when an assertion below fails.
     let servers = live_mcp_servers(dir.path());
