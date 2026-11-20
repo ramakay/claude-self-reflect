@@ -182,7 +182,10 @@ resolve_source() {
     if [ -n "$PIN_VERSION" ]; then
         normalize_version "$PIN_VERSION"
         VERSION="$NORMALIZED_VERSION"
-    elif [ -n "${CSR_TARBALL:-}" ] || [ -n "${CSR_RELEASE_BASE_URL:-}" ]; then
+    elif [ -n "${CSR_TARBALL:-}" ]; then
+        # The tarball's name carries no version; the binary's own is printed once extracted.
+        VERSION="(local tarball)"
+    elif [ -n "${CSR_RELEASE_BASE_URL:-}" ]; then
         VERSION="(unpinned)"
     else
         get_latest_version
@@ -292,6 +295,13 @@ download_and_install() {
     BINARY_PATH="$(find "$TMPDIR" -name "$BINARY_NAME" -type f | head -1)"
     if [ -z "$BINARY_PATH" ]; then
         err "Binary not found in archive"
+    fi
+    # A local tarball names no version: say which one it holds, when its binary can tell.
+    if [ "$VERSION" = "(local tarball)" ] && [ -x "$BINARY_PATH" ]; then
+        TARBALL_VERSION="$("$BINARY_PATH" --version 2>/dev/null | head -1)" || TARBALL_VERSION=""
+        if [ -n "$TARBALL_VERSION" ]; then
+            ok "Version" "${TARBALL_VERSION#"${BINARY_NAME} "} (from the tarball's binary)"
+        fi
     fi
 
     # Stage, then rename over the destination — `mv -f` within one

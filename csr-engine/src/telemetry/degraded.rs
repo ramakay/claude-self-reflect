@@ -15,7 +15,12 @@
 //!   lines in `daemon.err.log` over 29 h, 2026-11-16/17), so more than 12 is not upgrades;
 //! - unimported transcripts: any `aux.unimported_transcripts` (a settled transcript on disk the
 //!   importer never recorded; the raw `aux.coverage.gap` is mostly deleted transcripts);
-//! - restamp exhausted: the Codex timestamp restamp gave up (`attempts_exhausted`, not done).
+//! - restamp exhausted: the Codex timestamp restamp gave up (`attempts_exhausted`, not done);
+//! - daemon down: the launch agent plist is installed (`daemon.agent_installed`) and no daemon
+//!   holds the lock (`daemon.up` false), unless `CSR_NO_DAEMON` opts out. An install that left the
+//!   plist but no daemon read `healthy: true, state: ok` before (Studio, 2026-11-19). It is a
+//!   signal here, not `healthy: false`: `healthy` is the database verdict, and its readers (the
+//!   telemetry `UNHEALTHY (reason)` line, SwiftBar's `DB:` line) would name a database fault.
 //!
 //! `state` is the one-word verdict a reader sees first: `unhealthy` when the database integrity
 //! check failed, else `degraded` when any signal is present, else `unknown` while no integrity
@@ -58,6 +63,7 @@ pub enum Degraded {
     DaemonRestarts { last_10m: u64, last_24h: u64 },
     UnimportedTranscripts(u64),
     RestampExhausted { attempts: u64 },
+    DaemonDown,
 }
 
 impl Degraded {
@@ -88,6 +94,7 @@ impl Degraded {
             Degraded::RestampExhausted { attempts } => format!(
                 "codex_restamp: gave up after {attempts} attempts with the pass unfinished (see codex_backfill.restamp)"
             ),
+            Degraded::DaemonDown => "daemon_down: the launch agent is installed but no daemon is running, so dreams and enrichment are stopped (run `csr-engine setup`; see logs/daemon.err.log)".to_string(),
         }
     }
 
@@ -103,14 +110,22 @@ impl Degraded {
             }
             Degraded::UnimportedTranscripts(n) => format!("{n} transcripts not imported"),
             Degraded::RestampExhausted { .. } => "codex restamp gave up".to_string(),
+            Degraded::DaemonDown => "daemon down".to_string(),
         }
     }
 }
 
 /// The signals the `status` report itself carries, read from its JSON so any report shape
 /// that serializes these keys works: `daemon.history`, `aux.unimported_transcripts`,
-/// `codex_backfill.restamp`. A key that is absent or null raises nothing.
+/// `codex_backfill.restamp`, `daemon.agent_installed` with `daemon.up`. A key that is absent or
+/// null raises nothing. `CSR_NO_DAEMON` is read here (see [`status_signals_with`]).
 pub fn status_signals(report: &serde_json::Value) -> Vec<Degraded> {
+    let opted_out = std::env::var("CSR_NO_DAEMON").is_ok_and(|v| matches!(v.trim(), "1" | "true"));
+    status_signals_with(report, opted_out)
+}
+
+/// [`status_signals`] with the `CSR_NO_DAEMON` opt-out given, so the rules stay pure.
+pub fn status_signals_with(report: &serde_json::Value, daemon_opted_out: bool) -> Vec<Degraded> {
     let num = |path: &[&str]| -> Option<u64> {
         path.iter()
             .try_fold(report, |value, key| value.get(key))
@@ -137,6 +152,15 @@ pub fn status_signals(report: &serde_json::Value) -> Vec<Degraded> {
         out.push(Degraded::RestampExhausted {
             attempts: num(&["codex_backfill", "restamp", "attempts"]).unwrap_or(0),
         });
+    }
+    let daemon = report.get("daemon");
+    let flag = |key: &str| {
+        daemon
+            .and_then(|d| d.get(key))
+            .and_then(serde_json::Value::as_bool)
+    };
+    if !daemon_opted_out && flag("agent_installed") == Some(true) && flag("up") == Some(false) {
+        out.push(Degraded::DaemonDown);
     }
     out
 }

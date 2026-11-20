@@ -48,7 +48,7 @@ use serde_json::Value;
 use crate::companion::relay::emit;
 use crate::hooks::statusline_retire;
 use crate::setup::{
-    daemon_agents_on_disk, daemon_lock_holder, DAEMON_EXIT_TIMEOUT, DAEMON_LABEL,
+    daemon_agents_on_disk, daemon_lock_holder, daemon_stop_wait as stop_wait, DAEMON_LABEL,
     DAEMON_PLIST_MARKER,
 };
 
@@ -57,8 +57,6 @@ const MCP_NAME: &str = "claude-self-reflect";
 const STOP_POLL: Duration = Duration::from_millis(200);
 /// How long the daemon gets after uninstall's own SIGTERM.
 const SIGTERM_GRACE: Duration = Duration::from_secs(5);
-/// Overrides the wait for the daemon, in milliseconds (tests; capped at two minutes).
-const STOP_WAIT_ENV: &str = "CSR_UNINSTALL_STOP_WAIT_MS";
 const DATA_DIR: &str = ".claude-self-reflect";
 const CONFIG_CAP: u64 = 32 * 1024 * 1024;
 const OUTPUT_CAP: usize = 1024 * 1024;
@@ -951,16 +949,6 @@ struct Agents {
     hold_data: bool,
     /// The daemon pid this step sent SIGTERM, if it had to.
     signalled: Option<u32>,
-}
-
-/// How long to wait for the daemon to exit after bootout: launchd's `ExitTimeOut` (when it sends
-/// SIGKILL itself) plus a margin, unless [`STOP_WAIT_ENV`] says otherwise.
-fn stop_wait() -> Duration {
-    std::env::var(STOP_WAIT_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|ms| Duration::from_millis(ms.min(120_000)))
-        .unwrap_or(DAEMON_EXIT_TIMEOUT + Duration::from_secs(5))
 }
 
 /// Ask launchd until it no longer has `job`, for at most `limit`. True when it is gone.

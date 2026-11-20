@@ -301,11 +301,11 @@ pub async fn handle(
     // Step 8: the background daemon. Last, so it never races the import above
     // for the database. Dreams are on by default and only the daemon runs them.
     eprintln!("[8/8] Starting the background daemon...");
-    let daemon_text = {
+    let (daemon_text, daemon_failed) = {
         let (db, projects) = (db_path.to_path_buf(), projects_dir.to_path_buf());
         tokio::task::spawn_blocking(move || daemon_step_live(&db, &projects))
             .await
-            .unwrap_or_else(|e| format!("  The daemon step did not finish: {e}\n"))
+            .unwrap_or_else(|e| (format!("  The daemon step did not finish: {e}\n"), true))
     };
     eprint!("{daemon_text}");
 
@@ -356,13 +356,22 @@ pub async fn handle(
         })
     });
 
-    eprintln!("\n=== Setup Complete ===\n");
+    let done = if daemon_failed {
+        "Setup Complete, except the daemon (see step 8)"
+    } else {
+        "Setup Complete"
+    };
+    eprintln!("\n=== {done} ===\n");
     eprintln!("  Conversations: {}", conversations);
     eprintln!("  Reflections:   {}", reflections);
     eprintln!("  Projects:      {}", projects);
     eprint!("\n{}", crate::stale_report::section().trim_start());
     eprint!("{}", next_steps(report.as_ref()));
-
+    // The installers print "Done" on exit 0; a daemon that is not running is not done.
+    anyhow::ensure!(
+        !daemon_failed,
+        "the daemon did not start; retry with: csr-engine setup"
+    );
     Ok(())
 }
 
@@ -1777,7 +1786,7 @@ impl DaemonAgentSpec {
 
 #[path = "setup_daemon_plist.rs"]
 mod daemon_plist;
-pub use daemon_plist::DAEMON_EXIT_TIMEOUT;
+pub use daemon_plist::{daemon_stop_wait, DAEMON_EXIT_TIMEOUT};
 use daemon_plist::{render_daemon_plist, xml_escape};
 
 fn xml_unescape(text: &str) -> String {
@@ -2593,19 +2602,12 @@ fn apply_daemon_agent(
     if loaded && (rewrite || !current) {
         // kickstart does not re-read the file: unload, and check it happened
         // before anything is written, so the file never gets ahead of the job.
+        // launchd keeps the job until the old daemon's graceful stop (~20 s) is over.
         let _ = launchctl(&["bootout", &target]);
-        let mut unloaded = false;
-        for attempt in 0..10 {
-            pause(Duration::from_millis(if attempt == 0 { 500 } else { 300 }));
-            if launchctl(&["print", &target]).is_err() {
-                unloaded = true;
-                break;
-            }
-        }
-        if !unloaded {
+        if let Err(waited) = wait_for_unload(launchctl, &target, pause) {
             return DaemonOutcome::Failed(format!(
-                "launchd still loaded {} after bootout, so the new settings were not applied. Run: launchctl bootout {target}",
-                agent.label
+                "launchd still loaded {} {} s after bootout (the old daemon had not exited), so the new settings were not applied. Run: launchctl bootout {target}",
+                agent.label, waited.as_secs()
             ));
         }
     }
@@ -2652,8 +2654,8 @@ fn apply_daemon_agent(
     DaemonOutcome::Failed(last)
 }
 
-/// The daemon step of setup. Never fails setup: the daemon is what keeps dreams
-/// and enrichment going, but every other part of the install works without it.
+/// The daemon step of setup. Never stops setup (every other part works without it), but a
+/// `Failed` start makes setup exit non-zero at the end, so no installer prints "Done" over it.
 fn daemon_step(
     spec: &DaemonAgentSpec,
     opted_out: bool,
@@ -2677,8 +2679,8 @@ fn daemon_step(
     }
 }
 
-/// [`daemon_step`] against the real machine, returning the text to print.
-fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
+/// [`daemon_step`] against the real machine: the text to print, and whether the step failed.
+fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> (String, bool) {
     let home = dirs::home_dir().unwrap_or_default();
     let engine = stable_engine_path(
         std::env::args_os().next().as_deref(),
@@ -2735,7 +2737,7 @@ fn daemon_step_live(db_path: &Path, projects_dir: &Path) -> String {
             "  launchd has the daemon job, but the process it started has not taken the lock yet (a large corpus loads slowly). Check: csr-engine status\n"
         });
     }
-    text
+    (text, daemon_step_failed(&run.outcome))
 }
 
 /// `path` made absolute against `cwd` (the directory the user ran setup from).
@@ -2792,77 +2794,13 @@ fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
         })
 }
 
-/// The lines setup prints for each outcome (stderr, like every other step).
-fn daemon_report(run: &DaemonRun, engine: &Path) -> String {
-    let label = &run.label;
-    let manual = format!(
-        "  To run it by hand: {} daemon   (keep it running; it does the overnight dreams)\n",
-        engine.display()
-    );
-    match &run.outcome {
-        DaemonOutcome::OptedOut => {
-            "  Daemon skipped (CSR_NO_DAEMON is set). Dreams and background enrichment need it.\n"
-                .to_owned()
-                + &manual
-        }
-        DaemonOutcome::Manual => {
-            "  No launchd on this system, so setup does not start the daemon.\n".to_owned() + &manual
-        }
-        DaemonOutcome::Running { rewritten } => format!(
-            "  Daemon agent {} and started: {label}\n  Stop it with: launchctl bootout gui/$(id -u)/{label}\n",
-            if *rewritten { "installed" } else { "already installed" },
-        ),
-        DaemonOutcome::KeptExisting => {
-            format!("  Kept your existing {label} agent and started it.\n")
-        }
-        DaemonOutcome::AlreadyRunning { pid } => format!(
-            "  A daemon is already running (pid {pid}) and launchd does not manage it, so setup added no second one.\n  To have launchd run it: stop that process (kill {pid}), then run: csr-engine setup\n"
-        ),
-        DaemonOutcome::Failed(why) => format!(
-            "  The daemon did not start: {why}\n  Setup is otherwise complete. Retry with: csr-engine setup\n{manual}"
-        ),
-    }
-}
-
-/// What one look at the daemon shows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct DaemonProbe {
-    /// `pid` in `launchctl print` for the job.
-    job_pid: Option<u32>,
-    /// Something holds `daemon.lock`.
-    lock_held: bool,
-    /// The pid written in `daemon.lock`.
-    lock_pid: Option<u32>,
-}
-
-/// Is this the process setup started? The lock is held by a pid, that pid is
-/// the job's, and it is not the pid the job had before setup touched it. A held
-/// lock alone proves nothing: an older daemon, or a daemon under another label,
-/// holds it too while the job setup started is still loading or failing.
-fn daemon_confirmed(probe: &DaemonProbe, previous_pid: Option<u32>) -> bool {
-    probe.lock_held
-        && probe.job_pid.is_some()
-        && probe.job_pid == probe.lock_pid
-        && probe.job_pid != previous_pid
-}
-
-/// Look until the daemon setup started is confirmed, or the polls run out.
-fn wait_for_daemon(
-    previous_pid: Option<u32>,
-    polls: u32,
-    probe: &mut dyn FnMut() -> DaemonProbe,
-    pause: &dyn Fn(),
-) -> bool {
-    for poll in 0..polls {
-        if poll > 0 {
-            pause();
-        }
-        if daemon_confirmed(&probe(), previous_pid) {
-            return true;
-        }
-    }
-    false
-}
+#[path = "setup_daemon_start.rs"]
+mod daemon_start;
+#[cfg(test)]
+use daemon_start::daemon_confirmed;
+use daemon_start::{
+    daemon_report, daemon_step_failed, wait_for_daemon, wait_for_unload, DaemonProbe,
+};
 
 // ---- Codex: the same MCP server, registered with the Codex CLI ----
 //
