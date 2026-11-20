@@ -384,7 +384,18 @@ html[data-nav-stuck] .film-brand img { filter: none; mix-blend-mode: normal; }
 html[data-nav-stuck] .film-install { border-color: var(--tl-ink); color: var(--tl-ink); background: transparent; }
 html[data-nav-stuck] .film-install:hover { color: #fffaf2; background: var(--tl-ink); }
 html[data-nav-stuck] .film a:focus-visible { outline-color: var(--tl-ink); }
-@media (prefers-reduced-motion: reduce) { .film-header { transition: none; } }
+/* A soft colour blob behind the pill, in the site's own pigments. Hidden over the film. */
+.nav-glow { position: fixed; z-index: 39; top: -70px; left: 50%; width: min(1280px, 112vw); height: 250px; transform: translateX(-50%); pointer-events: none; opacity: 0; transition: opacity .7s ease;
+  -webkit-mask-image: linear-gradient(#000 35%, transparent); mask-image: linear-gradient(#000 35%, transparent); }
+.nav-glow i { position: absolute; border-radius: 50%; filter: blur(46px); mix-blend-mode: multiply; animation: nav-drift 18s ease-in-out infinite alternate; }
+.nav-glow i:nth-child(1) { left: 6%;  top: 34px; width: 34%; height: 150px; background: rgba(226, 85, 58, .55); }
+.nav-glow i:nth-child(2) { left: 30%; top: 20px; width: 30%; height: 130px; background: rgba(236, 140, 160, .50); animation-delay: -6s; }
+.nav-glow i:nth-child(3) { left: 54%; top: 40px; width: 32%; height: 140px; background: rgba(244, 186, 74, .55); animation-delay: -11s; }
+.nav-glow i:nth-child(4) { left: 74%; top: 26px; width: 22%; height: 120px; background: rgba(132, 156, 184, .42); animation-delay: -3s; }
+@keyframes nav-drift { from { transform: translate3d(-3%, 0, 0) scale(1); } to { transform: translate3d(4%, 10px, 0) scale(1.08); } }
+html[data-nav-stuck] .nav-glow { opacity: .62; }
+@media (max-width: 600px) { .nav-glow { height: 190px; top: -60px; } .nav-glow i { filter: blur(34px); } }
+@media (prefers-reduced-motion: reduce) { .film-header, .nav-glow { transition: none; } .nav-glow i { animation: none; } }
 .film a { color: inherit; text-decoration: none; }
 .film a:focus-visible, .film button:focus-visible { outline-color: #fffaf2; }
 .film-brand { display: inline-flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 670; letter-spacing: -.03em; white-space: nowrap; }
@@ -939,6 +950,7 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
     <img src="assets/film/poster.jpg" alt="" width="1920" height="1080" fetchpriority="high">
   </picture>
   <video class="film-video" muted playsinline preload="none" aria-label="A silent Blender film about Self-Reflect"></video>
+  <div class="nav-glow" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
   <header class="film-header">
     <a class="film-brand" href="#film"><img src="assets/self-reflect-mark.svg" alt="" width="27" height="27">Self-Reflect</a>
     <nav class="film-nav" aria-label="Page">
@@ -1411,7 +1423,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
       <h3>What CSR told Claude</h3>
       <p>Every block Self-Reflect put in front of Claude this run, and its size. After this compaction it was about 900 tokens. Claude reads it as history, not as tasks. Press <kbd>r</kbd> to resume from it or <kbd>c</kbd> to copy it.</p>
       <button class="page-open" type="button" aria-label="Enlarge: the What CSR told Claude page"><img src="assets/shots/told-claude.webp" alt="The What CSR told Claude page: where you left off, then the open Lost and found threads, with Resume, copy and close keys." width="700" height="1223" loading="lazy" decoding="async"></button>
-      <figcaption>Opens from the “CSR handed over” row. Home-folder path blurred.</figcaption>
+      <figcaption>Opens from the “CSR handed over” row. Home-folder path and private notes blurred.</figcaption>
     </figure>
     <figure class="page-card">
       <h3>Should be a skill, memory or tool <kbd>o</kbd></h3>
