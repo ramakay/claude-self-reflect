@@ -304,6 +304,7 @@ body.iso[data-theme="light"] {
 
 .film {
   position: relative;
+  z-index: 30;
   isolation: isolate;
   display: flex;
   flex-direction: column;
@@ -370,6 +371,20 @@ body.iso[data-theme="light"] {
   padding-inline: var(--gutter);
 }
 .film-header { padding-block: max(18px, env(safe-area-inset-top)) 18px; }
+/* The nav stays with the reader: fixed over the film, a paper glass pill past it. */
+html { scroll-padding-top: 92px; }
+.film-header { position: fixed; z-index: 40; top: 0; left: 0; right: 0; transition: top .3s ease, padding .3s ease, background-color .3s ease, border-color .3s ease, box-shadow .3s ease, color .3s ease; border: 1px solid transparent; }
+html[data-nav-stuck] .film-header {
+  top: 12px; width: min(calc(100% - 28px), 1120px); padding-block: 9px; padding-inline: 22px 10px;
+  color: var(--tl-ink); background: rgba(250, 248, 243, .74); border-color: rgba(216, 210, 200, .9); border-radius: 999px;
+  -webkit-backdrop-filter: blur(18px) saturate(1.6); backdrop-filter: blur(18px) saturate(1.6);
+  box-shadow: 0 1px 0 rgba(255,255,255,.7) inset, 0 10px 30px -14px rgba(36,33,30,.28);
+}
+html[data-nav-stuck] .film-brand img { filter: none; mix-blend-mode: normal; }
+html[data-nav-stuck] .film-install { border-color: var(--tl-ink); color: var(--tl-ink); background: transparent; }
+html[data-nav-stuck] .film-install:hover { color: #fffaf2; background: var(--tl-ink); }
+html[data-nav-stuck] .film a:focus-visible { outline-color: var(--tl-ink); }
+@media (prefers-reduced-motion: reduce) { .film-header { transition: none; } }
 .film a { color: inherit; text-decoration: none; }
 .film a:focus-visible, .film button:focus-visible { outline-color: #fffaf2; }
 .film-brand { display: inline-flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 670; letter-spacing: -.03em; white-space: nowrap; }
@@ -867,6 +882,10 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 }
 .sr-name { display: flex; align-items: center; gap: clamp(12px, 2vw, 28px); }
 .sr-name-mark { height: .8em; width: auto; display: block; }
+/* Letterpress: the wordmark is pressed into the paper. */
+.sr-foot { background: linear-gradient(#efebe2, var(--anatomy-page) 38%); box-shadow: inset 0 1px 0 #fffdf8, inset 0 2px 0 rgba(36,33,30,.06); border-radius: 18px 18px 0 0; }
+.sr-name { color: #e9e4da; text-shadow: 0 -1px 1px rgba(36,33,30,.30), 0 -2px 2px rgba(36,33,30,.08), 0 2px 1px rgba(255,255,255,.95), 0 3px 3px rgba(255,255,255,.6); }
+.sr-name-mark { opacity: .9; filter: invert(.92) sepia(.2) brightness(1.06) drop-shadow(0 -1px 1px rgba(36,33,30,.35)) drop-shadow(0 2px 1px rgba(255,255,255,.95)); }
 .love-mark a { display: grid; justify-items: center; gap: 8px; text-decoration: none; color: var(--tl-ink); }
 .love-name { font: 600 12px/1 var(--sans); font-variant-caps: all-small-caps; text-transform: lowercase; letter-spacing: .14em; opacity: .72; }
 .herdr-shot img { aspect-ratio: 840 / 1488; border-radius: 10px; }
@@ -2417,4 +2436,10 @@ document.addEventListener("visibilitychange", () => {
     box.showModal();
   }));
   box.addEventListener('click', e => { if (e.target === box) box.close(); });
+})();</script><script>(() => {
+  const film = document.querySelector('.film');
+  if (!film || !('IntersectionObserver' in window)) return;
+  const root = document.documentElement;
+  new IntersectionObserver(([e]) => root.toggleAttribute('data-nav-stuck', !e.isIntersecting),
+    { rootMargin: '-72px 0px 0px 0px' }).observe(film);
 })();</script></body></html>
