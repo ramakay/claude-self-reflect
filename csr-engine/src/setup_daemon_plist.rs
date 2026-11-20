@@ -11,6 +11,21 @@ use super::{DaemonAgentSpec, DAEMON_LABEL, DAEMON_PLIST_MARKER};
 /// daemon bounds its loop joins under this (`daemon::stop_joins::JOIN_BUDGET`).
 pub const DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Overrides [`daemon_stop_wait`], in milliseconds (tests; capped at two minutes).
+pub const DAEMON_STOP_WAIT_ENV: &str = "CSR_DAEMON_STOP_WAIT_MS";
+
+/// How long setup and uninstall wait, after `launchctl bootout`, for launchd to let go of the
+/// daemon job. launchd answers bootout at once but keeps the job ("SIGTERMed") until the process
+/// exits, and the daemon's graceful stop takes up to 20 s; at [`DAEMON_EXIT_TIMEOUT`] launchd
+/// sends SIGKILL itself. So: that timeout plus a margin, unless [`DAEMON_STOP_WAIT_ENV`] is set.
+pub fn daemon_stop_wait() -> Duration {
+    std::env::var(DAEMON_STOP_WAIT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|ms| Duration::from_millis(ms.min(120_000)))
+        .unwrap_or(DAEMON_EXIT_TIMEOUT + Duration::from_secs(5))
+}
+
 pub(super) fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")

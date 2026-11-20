@@ -646,7 +646,10 @@ describe('install.sh: local tarball and release base', { skip: !HAVE_SH && 'no /
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(curlCalls(rel.curlLog), [], 'curl was never run');
     assert.match(result.stdout, /Checksum.* verified/);
-    assert.match(result.stdout, new RegExp(`Installing.* csr-engine \\(unpinned\\) \\(.*\\) from local tarball ${src.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(result.stdout, new RegExp(`Installing.* csr-engine \\(local tarball\\) \\(.*\\) from local tarball ${src.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    // The tarball's name has no version; the extracted binary's own is printed.
+    assert.match(result.stdout, /Version.* 10\.1\.0 \(from the tarball's binary\)/);
+    assert.doesNotMatch(result.stdout, /unpinned/);
     const dest = join(rel.dirs.installdir, 'csr-engine');
     assert.match(readFileSync(dest, 'utf8'), /csr-engine 10\.1\.0/);
     assert.equal(statSync(dest).mode & 0o111 ? true : false, true, 'installed binary is executable');

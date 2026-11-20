@@ -234,3 +234,47 @@ fn swiftbar_puts_the_state_first_and_lists_each_signal() {
         "State: ok | color=green"
     );
 }
+
+/// Studio round 3 (2026-11-19): setup over a running daemon left the plist and no daemon, and
+/// status read `healthy: true, state: ok, degraded: []` with `daemon.up: false`.
+#[test]
+fn an_installed_agent_with_no_daemon_is_degraded_unless_opted_out() {
+    let mut report = serde_json::json!({
+        "healthy": true,
+        "daemon": {"up": false, "agent_installed": true, "pid": null, "history": null},
+    });
+    let signals = status_signals_with(&report, false);
+    assert_eq!(signals, vec![Degraded::DaemonDown]);
+    add_degraded(&mut report, &signals);
+    assert_eq!(report["state"], "degraded");
+    // `healthy` stays the database verdict.
+    assert_eq!(report["healthy"], true);
+    assert!(report["degraded"][0]
+        .as_str()
+        .unwrap()
+        .starts_with("daemon_down: the launch agent is installed but no daemon is running"));
+    assert_eq!(
+        swiftbar_lines(Some(true), &signals)[..2],
+        [
+            "State: degraded | color=orange",
+            "--daemon down | font=Menlo"
+        ]
+    );
+    // CSR_NO_DAEMON, a running daemon, or no agent at all raise nothing.
+    let quiet = |daemon: serde_json::Value, opted_out: bool| {
+        status_signals_with(&serde_json::json!({ "daemon": daemon }), opted_out).is_empty()
+    };
+    assert!(quiet(
+        serde_json::json!({"up": false, "agent_installed": true}),
+        true
+    ));
+    assert!(quiet(
+        serde_json::json!({"up": true, "agent_installed": true}),
+        false
+    ));
+    assert!(quiet(
+        serde_json::json!({"up": false, "agent_installed": false}),
+        false
+    ));
+    assert!(quiet(serde_json::json!({"up": false}), false));
+}

@@ -651,7 +651,7 @@ fn the_plist_goes_before_the_wait_and_a_slow_daemon_stop_still_exits_zero() {
         &[
             ("FAKE_LOADED", s.plist().to_str().unwrap()),
             ("DAEMON_PID", &pid.to_string()),
-            ("CSR_UNINSTALL_STOP_WAIT_MS", "20000"),
+            ("CSR_DAEMON_STOP_WAIT_MS", "20000"),
         ],
     );
     let text = stdout(&out);
@@ -703,7 +703,7 @@ fn a_daemon_past_the_wait_gets_one_sigterm_by_its_recorded_pid() {
         &[
             ("FAKE_LOADED", s.plist().to_str().unwrap()),
             ("DAEMON_PID", &pid.to_string()),
-            ("CSR_UNINSTALL_STOP_WAIT_MS", "300"),
+            ("CSR_DAEMON_STOP_WAIT_MS", "300"),
         ],
     );
     let text = stdout(&out);
@@ -752,7 +752,7 @@ fn a_daemon_that_will_not_stop_keeps_binary_and_data_and_the_finish_is_printed()
             &[
                 ("FAKE_LOADED", s.plist().to_str().unwrap()),
                 ("DAEMON_PID", &pid.to_string()),
-                ("CSR_UNINSTALL_STOP_WAIT_MS", "300"),
+                ("CSR_DAEMON_STOP_WAIT_MS", "300"),
             ],
         );
         let text = stdout(&out);
