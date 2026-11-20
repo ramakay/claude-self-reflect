@@ -8,7 +8,7 @@ title: What's new in 10.1
 
 - **Recap paragraph.** At SessionStart, one causal paragraph replaces the old `CONTINUUM` / `LAST` / `NEXT` / `ANCHORS` fragments: intent, what got done, what was settled, what is open now, the next step. Each clause drops when there is no evidence for it, `Next:` is never invented, and there is no LLM call. A feed error falls back to the old fragments. `CSR_NO_RECAP=1` turns it off.
 - **Learnt line.** A separate line at startup or resume names what CSR stored for the previous session: memory notes, `csr_resolve` verdicts you confirmed, and anchors a commit retired. Each clause carries a receipt, and there is no line when there is no evidence. `CSR_NO_LEARNT=1` turns it off.
-- **Compact receipts.** A compact leaves pointers to the turns it replaced, with `csr_transcript` slice calls to read them back. `CSR_NO_COMPACT_POINTER=1` turns the pointer off.
+- **Compact receipts (prototype).** A compact leaves pointers to the turns it replaced, with `csr_transcript` slice calls to read them back. `CSR_NO_COMPACT_POINTER=1` turns the pointer off.
 
 ## Dreaming and witness anchors
 

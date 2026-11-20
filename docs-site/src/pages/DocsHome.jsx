@@ -5,6 +5,8 @@ import { versions, LANDING_URL } from '../content/versions'
 const PAPER_URL = 'https://github.com/ramakay/claude-self-reflect/blob/main/docs/plans/annaswamy-2026-similarity-drowns-intent.pdf'
 
 // "Start here" cards, in order; a version without one of these pages falls back to the next slug.
+const slug = s => s.toLowerCase().replace(/[^a-z0-9]+/g, '-')
+
 const START_SLUGS = ['/docs/installation', '/docs/quickstart', '/docs/companion-views', '/docs/why-csr']
 
 /** The docs index: what the docs app shows at its root. The marketing landing lives at LANDING_URL. */
@@ -68,8 +70,8 @@ export default function DocsHome({ version = 'current' }) {
 
       <div className="docs-home__groups">
         {groups.map(g => (
-          <section key={g.label} aria-labelledby={`grp-${g.label}`}>
-            <h2 id={`grp-${g.label}`} className="docs-home__group">{g.label}</h2>
+          <section key={g.label} aria-labelledby={`grp-${slug(g.label)}`}>
+            <h2 id={`grp-${slug(g.label)}`} className="docs-home__group">{g.label}</h2>
             <ul>
               {g.items.map(i => (
                 <li key={i.href}>
