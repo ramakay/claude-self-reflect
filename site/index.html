@@ -944,7 +944,7 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
       <div class="chapter-text">
         <p class="chapter-kicker">Live session</p>
         <h2 id="ch-label-open">Beside Claude as it works.</h2>
-        <p class="chapter-body">Self-Reflect works beside your Claude Code session on every turn. Hooks run on each prompt. A heads-up band brings in the history of a file you name. The pane shows where the work stands. It also checks old conclusions against git, and it can bring back turns a compaction replaced.</p>
+        <p class="chapter-body"><mark class="sr-hl">Self-Reflect works beside your Claude Code session on every turn.</mark> Hooks run on each prompt. A heads-up band brings in the history of a file you name. The pane shows where the work stands. It also checks old conclusions against git, and it can bring back turns a compaction replaced.</p>
         
       </div>
     </section><section class="tl-ch" id="ch-recall" data-mechanism="recall" aria-labelledby="ch-label-recall">
@@ -959,28 +959,28 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
       <div class="chapter-text">
         <p class="chapter-kicker">Recap</p>
         <h2 id="ch-label-recap">Pick up where you left off.</h2>
-        <p class="chapter-body">When a session starts or resumes with enough evidence, Claude gets one paragraph covering the intent, what got done, what was settled, what is open, and any next step the evidence supports. Self-Reflect builds it from commits, tasks, and your own turns without calling a model.</p>
+        <p class="chapter-body">When a session starts or resumes with enough evidence, Claude gets one paragraph covering the intent, what got done, what was settled, what is open, and any next step the evidence supports. <mark class="sr-hl">Self-Reflect builds it from commits, tasks, and your own turns without calling a model.</mark></p>
         <dl class="tl-read"><div><dt>Example recap</dt><dd><code>Done: Added the retry limit. Settled: The limit counts attempts per request (see request). Open: Move limits to config.</code></dd></div></dl>
       </div>
     </section><section class="tl-ch" id="ch-dream" data-mechanism="dream" aria-labelledby="ch-label-dream">
       <div class="chapter-text">
         <p class="chapter-kicker">Dreams</p>
         <h2 id="ch-label-dream">Check what still holds.</h2>
-        <p class="chapter-body">While you are away, the daemon re-checks old conclusions against git and marks changes with the commit that made them. With model dream threads enabled, the dreamer can also ask what you might do differently and show the turns behind its question.</p>
+        <p class="chapter-body">While you are away, the daemon re-checks old conclusions against git and <mark class="sr-hl">marks changes with the commit that made them.</mark> With model dream threads enabled, the dreamer can also ask what you might do differently and show the turns behind its question.</p>
         <dl class="tl-read"><div><dt>Git receipts</dt><dd><code>[stale anchor] · [evolved]</code></dd></div><div><dt>Model dream threads</dt><dd><code>CSR_DREAM_THREADS=1</code></dd></div></dl>
       </div>
     </section><section class="tl-ch" id="ch-pane" data-mechanism="pane" aria-labelledby="ch-label-pane">
       <div class="chapter-text">
         <p class="chapter-kicker">Same page?</p>
         <h2 id="ch-label-pane">See where Claude missed an ask.</h2>
-        <p class="chapter-body">The companion pane shows the dreamer’s count of requests it saw, which Claude missed, and which were unclear. Press a key to send Claude a follow-up that gets the work back on course.</p>
+        <p class="chapter-body">The companion pane shows the dreamer’s count of requests it saw, which Claude missed, and which were unclear. <mark class="sr-hl">Press a key to send Claude a follow-up that gets the work back on course.</mark></p>
         <dl class="tl-read"><div><dt>Card</dt><dd><code>Same page? · Model’s read</code></dd></div></dl>
       </div>
     </section><section class="tl-ch" id="ch-lessons" data-mechanism="lessons" aria-labelledby="ch-label-lessons">
       <div class="chapter-text">
         <p class="chapter-kicker">Lessons</p>
         <h2 id="ch-label-lessons">Turn a repeated correction into a rule.</h2>
-        <p class="chapter-body">Self-Reflect gathers corrections you made in more than one session and proposes lines for CLAUDE.md. You can check the original turns before you add a line.</p>
+        <p class="chapter-body">Self-Reflect gathers corrections you made in more than one session and proposes lines for CLAUDE.md. <mark class="sr-hl">You can check the original turns before you add a line.</mark></p>
         <dl class="tl-read"><div><dt>Command</dt><dd><code>csr-engine lessons --project P</code></dd></div><div><dt>Example candidate</dt><dd><code>Put retry limits in the config file.</code></dd></div></dl>
       </div>
     </section></div>
@@ -990,7 +990,7 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 <section class="sr-sec sr-loop" id="loop" aria-labelledby="loop-h">
   <p class="story-kicker">How it works</p>
   <h2 id="loop-h">An engine that checks. A Claude that looks back.</h2>
-  <p class="story-lead">Self-Reflect joins two parts. The engine is deterministic Rust: the same input gives the same output. Claude does the reflecting. Each part checks the other.</p>
+  <p class="story-lead">Self-Reflect joins two parts. The engine is deterministic Rust: the same input gives the same output. Claude does the reflecting. <mark class="sr-hl">Each part checks the other.</mark></p>
   <div class="loop-fig">
     <article class="loop-card loop-engine">
       <svg class="loop-glyph" viewBox="-44 -26 88 64" width="88" height="64" aria-hidden="true">
@@ -1027,6 +1027,7 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 <section class="sr-sec sr-exchange" id="exchange" aria-labelledby="xc-h">
   <p class="story-kicker">On the wire</p>
   <h2 id="xc-h">What Claude sends, what Claude receives.</h2>
+  <p class="story-lead"><mark class="sr-hl">Claude gets a few short lines and a pointer to the turns behind them.</mark></p>
   <div class="xc-tabs" role="tablist" aria-label="Hook examples">
     <button class="xc-tab" type="button" role="tab" id="xc-tab-start" aria-controls="xc-panel-start" aria-selected="true" tabindex="0">Session start</button>
     <button class="xc-tab" type="button" role="tab" id="xc-tab-prompt" aria-controls="xc-panel-prompt" aria-selected="false" tabindex="-1">A prompt</button>
@@ -1070,6 +1071,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
 
 <section class="sr-sec sr-bento" id="everything" aria-labelledby="everything-title">
   <h2 id="everything-title">Everything inside.</h2>
+  <p class="story-lead"><mark class="sr-hl">All of it ships in one Rust binary.</mark></p>
   
     <section class="module-group module-before" aria-labelledby="module-before">
       <h3 id="module-before">Before you start</h3>
@@ -1239,7 +1241,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
       <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M4 8a6 6 0 1 1 1 6M4 3v5h5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Replay</span>
     </button>
   </div>
-  <p class="mirror-bridge">Claude can read back the same evidence even after the original transcript is gone.</p>
+  <p class="mirror-bridge"><mark class="sr-hl">Claude can read back the same evidence even after the original transcript is gone.</mark></p>
   <div class="mirror-panels">
     <div class="mirror-panel mirror-delete">
       <h3>Claude Code</h3>
@@ -1319,7 +1321,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
       <li><b>One binary, one daemon.</b> The index is a local SQLite file and a local vector index under <code>~/.claude-self-reflect</code>.</li>
       <li><b>Embeddings run here.</b> The embedding model (all-MiniLM-L6-v2, about 90 MB) downloads once, then runs on your machine through FastEmbed.</li>
       <li><b>Model calls go only to Claude.</b> They are background <code>claude -p</code> calls on your plan. If you set your own API key, the optional batch lane uses that key instead. <code>CSR_NO_AI_NARRATIVES=1</code> stops them. <code>CSR_NO_DREAMING=1</code> stops dreams.</li>
-      <li><b>Quiet by design.</b> The daemon works when something happens, then rests. Companion panes rest too.</li>
+      <li><b>Quiet by design.</b> <mark class="sr-hl">The daemon works when something happens, then rests.</mark> Companion panes rest too.</li>
     </ul>
     <div class="dm" role="img" aria-label="The daemon wakes on a hook event or a changed transcript, does its work, then rests.">
       <ol class="dm-steps">
@@ -1352,7 +1354,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
     <h2 id="herdr-h">The pane lives in herdr.</h2>
     <p class="story-lead"><a class="sr-link" href="https://herdr.dev">herdr</a> is a terminal workspace manager for AI coding agents. Claude Code runs in one pane. The Self-Reflect companion runs in the pane beside it.</p>
     <ul class="herdr-gives">
-      <li><b>A pane beside the session.</b> The companion sits next to Claude and never covers it.</li>
+      <li><b>A pane beside the session.</b> <mark class="sr-hl">The companion sits next to Claude and never covers it.</mark></li>
       <li><b>Focus events that wake the pane.</b> herdr tells the pane when you look at it, so a resting pane wakes at once.</li>
       <li><b>Whether Claude is working.</b> The pane rests only when herdr says Claude is idle and unfocused.</li>
       <li><b>Pictures.</b> The pane draws charts and cards as pictures, and herdr shows them in the split.</li>
@@ -1368,6 +1370,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
 <section class="sr-sec sr-shots" id="screenshots" aria-labelledby="shots-h">
   <p class="story-kicker">Screenshots</p>
   <h2 id="shots-h">From a clean install, 2026-11-19.</h2>
+  <p class="story-lead"><mark class="sr-hl">Each one is a real screen from that install, not a mockup.</mark></p>
   <ul class="shot-grid">
     <li><figure class="shot">
       <button class="shot-open" type="button" aria-label="Enlarge: The installer says what setup will do, then asks once."><img src="assets/shots/install.webp" alt="The installer from the curl line, before setup runs. Home-folder paths are blurred." width="400" height="245" loading="lazy" decoding="async" data-fit="contain"></button>
@@ -1429,7 +1432,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
       <p class="sr-zero-t"><b>to install.</b> Free and MIT-licensed. Every line is on GitHub.</p>
       <a class="sr-gh" href="https://github.com/ramakay/claude-self-reflect"><svg viewBox="0 0 16 16" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span>Self-Reflect on GitHub</span></a>
     </div>
-    <p class="rv">Briefings and session stories use <code>claude -p</code> on your Claude plan by default. <code>csr-engine status</code> counts background calls.</p>
+    <p class="rv">Briefings and session stories use <code>claude -p</code> <mark class="sr-hl">on your Claude plan</mark> by default. <code>csr-engine status</code> counts background calls.</p>
   </div>
   <dl class="sr-costs">
     <div class="rv"><dt>Briefings and stories</dt><dd>On by default. The maintainer’s machine made 17 to 50 Haiku calls per complete day in the measured week, using about 0.4 to 1.1 million tokens per day, mostly cache writes.</dd><dd class="sr-sw"><code>CSR_NO_AI_NARRATIVES=1</code> stops every background <code>claude -p</code> call.</dd></div>
@@ -1442,7 +1445,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
 <section class="sr-sec sr-calc" id="calc" aria-labelledby="ca-h">
   <div class="sr-copy">
     <h2 id="ca-h" class="rv">Your plan, or the API?</h2>
-    <p class="rv">The background calls run on the Claude plan you already pay for, so Self-Reflect adds nothing to your bill. Here is what the same calls would cost at Haiku 5.5 API rates.</p>
+    <p class="rv">The background calls run on the Claude plan you already pay for, so <mark class="sr-hl">Self-Reflect adds nothing to your bill.</mark> Here is what the same calls would cost at Haiku 5.5 API rates.</p>
   </div>
   <form class="sr-calcbox rv" data-calc onsubmit="return false">
     <label><span>Calls a day <output data-o="calls">35</output></span><input type="range" min="0" max="200" step="1" value="35" data-i="calls"></label>
@@ -1465,7 +1468,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
   <ul class="sr-facts">
     <li class="rv"><b>One Rust binary.</b> No cloud, no Docker, no Python, no database server.</li>
     <li class="rv"><b>Consent first.</b> Setup asks before it turns anything on.</li>
-    <li class="rv"><b>Private tags.</b> Text inside <code>&lt;private&gt;</code> tags never reaches the index or the mirror.</li>
+    <li class="rv"><b>Private tags.</b> <mark class="sr-hl">Text inside <code>&lt;private&gt;</code> tags never reaches the index or the mirror.</mark></li>
     <li class="rv"><b>Secrets redacted.</b> Keys and tokens become <code>[secret redacted: &lt;kind&gt;]</code> before indexing or mirroring.</li>
     <li class="rv"><b>No prompt text in logs.</b> Timing lines keep counts and a salted hash, with the salt in a local <code>0600</code> file.</li>
     <li class="rv"><b>Loopback journal.</b> The journal listens on loopback, requires CSRF tokens for changes, and serves pages with <code>default-src 'none'</code>.</li>
@@ -1478,7 +1481,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
 <section class="sr-sec sr-install" id="install" aria-labelledby="in-h">
   <h2 id="in-h" class="rv">Install Self-Reflect 10.1.</h2>
   <div class="sr-cmd rv"><code id="sr-curl">curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh</code><button type="button" class="sr-btn" data-copy="sr-curl">Copy</button></div>
-  <p class="rv">Prebuilt for macOS on Apple Silicon and for Linux on x86_64 and ARM64. Setup asks before it turns anything on.</p>
+  <p class="rv">Prebuilt for macOS on Apple Silicon and for Linux on x86_64 and ARM64. <mark class="sr-hl">Setup asks before it turns anything on.</mark></p>
   <p class="rv"><a class="sr-link" href="https://github.com/ramakay/claude-self-reflect">Read the install steps on GitHub</a></p>
 </section>
 </div>
