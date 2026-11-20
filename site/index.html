@@ -816,6 +816,16 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 .herdr-how code { overflow-wrap: anywhere; font-size: .92em; }
 .herdr-shot { margin: 0; justify-self: end; width: 100%; max-width: 420px; }
 .herdr-shot img { display: block; width: 100%; height: auto; border: 1px solid var(--paper-rule); }
+.sr-pages .pages-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(24px, 4vw, 56px); margin-top: 32px; align-items: start; }
+.page-card { margin: 0; }
+.page-card h3 { margin: 0 0 6px; font-size: 20px; }
+.page-card p { margin: 0 0 16px; max-width: 46ch; color: #48433e; line-height: 1.55; }
+.page-open { display: block; padding: 0; border: 0; background: none; cursor: zoom-in; width: 100%; max-width: 440px; }
+.page-card img { display: block; width: 100%; max-width: 440px; height: auto; border-radius: 10px; border: 1px solid var(--paper-rule); }
+.page-card figcaption { margin-top: 6px; color: var(--paper-muted); font-size: 12px; }
+.page-card kbd { font: 600 .85em ui-monospace, SFMono-Regular, Menlo, monospace; padding: .05em .4em; border: 1px solid var(--paper-rule); border-radius: 4px; background: #fffdf8; }
+@media (max-width: 1100px) { .sr-pages .pages-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 760px) { .sr-pages .pages-grid { grid-template-columns: minmax(0, 1fr); } }
 .herdr-shot figcaption { margin-top: 6px; color: var(--paper-muted); font-size: 12px; }
 
 /* built for / on top of: static strip */
@@ -859,7 +869,7 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 .sr-name-mark { height: .8em; width: auto; display: block; }
 .love-mark a { display: grid; justify-items: center; gap: 8px; text-decoration: none; color: var(--tl-ink); }
 .love-name { font: 600 12px/1 var(--sans); font-variant-caps: all-small-caps; text-transform: lowercase; letter-spacing: .14em; opacity: .72; }
-.herdr-shot img { aspect-ratio: 704 / 260; }
+.herdr-shot img { aspect-ratio: 840 / 1488; border-radius: 10px; }
 
 /* On the wire: what Claude sends and receives */
 .xc-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 30px 0 14px; }
@@ -1362,9 +1372,35 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
     <p class="herdr-how"><code>brew install herdr</code> then <code>csr-engine companion serve</code>. The pane needs Claude Code 2.1.296 or later.</p>
   </div>
   <figure class="herdr-shot">
-    <img src="assets/pane-gauges.jpg" alt="The companion pane showing usage pace for the 5-hour and weekly limits and a context gauge." width="704" height="260" loading="lazy">
-    <figcaption>Companion pane · demo data</figcaption>
+    <img src="assets/shots/pane-full.webp" alt="The full companion pane, top to bottom: the dreamer, Same page?, a skill or memory suggestion, Lost and found, where the work stands, usage pace, and the context gauge." width="840" height="1488" loading="lazy" decoding="async">
+    <figcaption>The whole pane in herdr · maintainer’s live session, 2026-11-20</figcaption>
   </figure>
+</section>
+
+<section class="sr-sec sr-pages" id="pane-pages" aria-labelledby="pages-h">
+  <p class="story-kicker">Inside the pane</p>
+  <h2 id="pages-h">Three pages behind the cards.</h2>
+  <p class="story-lead"><mark class="sr-hl">See what Claude did, exactly what Self-Reflect told it, and what it suggests you keep.</mark></p>
+  <div class="pages-grid">
+    <figure class="page-card">
+      <h3>Monologue <kbd>t</kbd></h3>
+      <p>The session thinking out loud. Each row says what happened: you asked, Claude tinkered, a worker was delegated or heard back, a compaction made room, a dream wondered. Rows left open come back in Lost and found.</p>
+      <button class="page-open" type="button" aria-label="Enlarge: the Monologue page"><img src="assets/shots/monologue.webp" alt="The Monologue page: a timeline of rows tagged made room, left open, delegated, heard back, tinkered, noted and wondered." width="704" height="975" loading="lazy" decoding="async"></button>
+      <figcaption>Maintainer’s live session, 2026-11-20. Press <kbd>t</kbd> again to go back.</figcaption>
+    </figure>
+    <figure class="page-card">
+      <h3>What CSR told Claude</h3>
+      <p>Every block Self-Reflect put in front of Claude this run, and its size. After this compaction it was about 900 tokens. Claude reads it as history, not as tasks. Press <kbd>r</kbd> to resume from it or <kbd>c</kbd> to copy it.</p>
+      <button class="page-open" type="button" aria-label="Enlarge: the What CSR told Claude page"><img src="assets/shots/told-claude.webp" alt="The What CSR told Claude page: where you left off, then the open Lost and found threads, with Resume, copy and close keys." width="700" height="1223" loading="lazy" decoding="async"></button>
+      <figcaption>Opens from the “CSR handed over” row. Home-folder path blurred.</figcaption>
+    </figure>
+    <figure class="page-card">
+      <h3>Should be a skill, memory or tool <kbd>o</kbd></h3>
+      <p>Self-Reflect spots something you keep asking for and proposes where it belongs: a skill, a memory or a tool. The evidence is your own words. Press <kbd>s</kbd> to send it to Claude or <kbd>x</kbd> to hide it.</p>
+      <button class="page-open" type="button" aria-label="Enlarge: the Should be a skill, memory or tool popup"><img src="assets/shots/should-be.webp" alt="A popup proposing a memory: homepage highlights use the yellow highlighter style, with the owner's own words as evidence and copy, send, hide, next and close keys." width="700" height="481" loading="lazy" decoding="async"></button>
+      <figcaption>1 of 5 proposals in the maintainer’s session, 2026-11-20.</figcaption>
+    </figure>
+  </div>
 </section>
 
 <section class="sr-sec sr-shots" id="screenshots" aria-labelledby="shots-h">
@@ -2373,7 +2409,7 @@ document.addEventListener("visibilitychange", () => {
   if (!box || typeof box.showModal !== 'function') return;
   const big = box.querySelector('img');
   const cap = box.querySelector('.shot-box-cap');
-  document.querySelectorAll('.shot-open').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('.shot-open, .page-open').forEach(b => b.addEventListener('click', () => {
     const img = b.querySelector('img');
     big.src = img.currentSrc || img.src;
     big.alt = img.alt;
