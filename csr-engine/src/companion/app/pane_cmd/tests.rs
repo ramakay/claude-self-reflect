@@ -2,9 +2,15 @@
 //! `/csr`, the pane, its refresh and the pane opened, on a fake Claude Code and a fake `Outside`.
 
 use super::*;
-use crate::companion::relay::{
-    dispatch::testing::{fixture_in, run, Fixture},
-    host::fake::World,
+use crate::companion::{
+    app::band::{
+        self,
+        tests::kit::{draw, gear, Drawn},
+    },
+    relay::{
+        dispatch::testing::{fixture_in, run, Fixture},
+        host::fake::World,
+    },
 };
 use regex::Regex;
 use std::sync::Mutex;
@@ -415,6 +421,75 @@ async fn a_start_with_no_surface_or_in_herdr_gives_no_toast() {
         herdr.fx.cx.store.get(MACHINE, OPENED_BY_HAND).unwrap(),
         None
     );
+}
+
+impl Rig {
+    /// What the band above the prompt draws now, alone (nothing beneath it).
+    async fn band(&self) -> Drawn {
+        let mut t = Table::new();
+        band::register_with(&mut t, gear().seams);
+        Drawn::of(draw(&t, &self.fx.cx, Value::Null).await.as_ref())
+    }
+
+    fn invalidated(&self) -> usize {
+        self.fx.host.seen.lock().unwrap().invalidated
+    }
+}
+
+#[tokio::test]
+async fn a_narrow_start_puts_the_type_csr_line_in_the_band_until_csr_opens_the_pane() {
+    let r = rig_with(
+        world_opening(&[narrow(), json!({ "isPlaced": true })]),
+        Fake::new(false, Some(shifts())),
+    );
+    assert!(!r.band().await.says(HINT), "no line before the start");
+    r.started().await;
+    let band = r.band().await;
+    assert!(band.says(HINT), "{band:?}");
+    assert!(r.invalidated() >= 1, "the band is asked to draw again");
+    assert_eq!(r.toasts(), [WAITING], "the toast stays too");
+
+    let before = r.invalidated();
+    r.csr("").await;
+    assert!(!r.band().await.says(HINT));
+    assert!(
+        r.invalidated() > before,
+        "the band redraws without the line"
+    );
+}
+
+#[tokio::test]
+async fn no_type_csr_line_when_the_pane_draws_in_herdr_or_with_no_surface() {
+    let wide = rig(true, false, shifts());
+    wide.started().await;
+    assert!(!wide.band().await.says(HINT));
+
+    let herdr = rig_with(world_opening(&[narrow()]), Fake::new(true, Some(shifts())));
+    herdr.started().await;
+    assert!(!herdr.band().await.says(HINT));
+
+    let none = json!({ "isPlaced": false, "reason": "no-surface: none attached" });
+    let headless = rig_with(world_opening(&[none]), Fake::new(false, Some(shifts())));
+    headless.started().await;
+    assert!(!headless.band().await.says(HINT));
+}
+
+#[tokio::test]
+async fn the_type_csr_line_goes_once_csr_was_typed_before_or_the_pane_draws() {
+    let r = rig_with(world_opening(&[narrow()]), Fake::new(false, Some(shifts())));
+    r.fx.cx
+        .store
+        .set(MACHINE, OPENED_BY_HAND, &json!(true))
+        .unwrap();
+    r.started().await;
+    assert!(!r.band().await.says(HINT));
+
+    // A wider window places the waiting pane: Claude Code asks it to draw.
+    let w = rig_with(world_opening(&[narrow()]), Fake::new(false, Some(shifts())));
+    w.started().await;
+    assert!(w.band().await.says(HINT));
+    w.pane().await;
+    assert!(!w.band().await.says(HINT));
 }
 
 #[tokio::test]

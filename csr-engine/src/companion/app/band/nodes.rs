@@ -55,6 +55,22 @@ fn lead_row(body: Vec<Value>) -> Value {
     )
 }
 
+/// `ours` with the pane's hint line under it (`pane_cmd::hint`), or the hint alone.
+pub(super) fn with_hint(ours: Option<Value>, hint: Option<&str>) -> Option<Value> {
+    let Some(hint) = hint else {
+        return ours;
+    };
+    let line = lead_row(vec![json!(hint)]);
+    Some(match ours {
+        Some(ours) => node(
+            "Box",
+            json!({ "flexDirection": "column" }),
+            vec![ours, line],
+        ),
+        None => line,
+    })
+}
+
 fn warning(message: &str) -> Value {
     node(
         "Box",

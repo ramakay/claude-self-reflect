@@ -8,7 +8,8 @@
 //! - `digit`, late: every prompt a note survives counts; the second one clears it,
 //!   and a dream cleared that way was typed past (`dreamer::typed_past`).
 //! - `band`, the render: the compactor's countdown or offer first, else the walkthrough's next
-//!   step, else the note (offer, explained, asked, the coaching `term`).
+//!   step, else the note (offer, explained, asked, the coaching `term`); under any of them, or
+//!   alone, the pane's "type /csr" line while its unasked open waits (`pane_cmd::hint`).
 //! - `press`: the note's buttons, and the compactor's two (`compact-now`, `compact-cancel`).
 //!   The walkthrough's buttons are `setup_walk`'s own.
 //!
@@ -34,7 +35,7 @@ use super::{
 };
 use crate::companion::relay::dispatch::{handler, Ctx, Handler, Reply, Table, PRESS};
 use anyhow::Result;
-use nodes::{asks, note_node, over, walk_node};
+use nodes::{asks, note_node, over, walk_node, with_hint};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -200,11 +201,17 @@ fn on_band() -> Handler {
         if truthy(&e["props"]["hasSurvey"]) {
             return Ok(Reply::none());
         }
+        // The pane's "type /csr" line, under whatever else the band draws (`pane_cmd::hint`).
+        let hint = pane_cmd::hint(&cx);
+        let drawn = |ours: Option<Value>| match with_hint(ours, hint) {
+            Some(tree) => Reply::tree(over(tree, &beneath)),
+            None => Reply::none(),
+        };
         // A compaction counting down, or offered, comes first. Under another band that asks, it
         // draws no hotkeys of its own (two on one hotkey: the later wins).
         if let Some(counting) = compactor::compact_band_quiet(&cx, asking).await {
             set_waiting(&cx, view_row(&cx).is_some());
-            return Ok(Reply::tree(over(counting, &beneath)));
+            return Ok(drawn(Some(counting)));
         }
         // The walkthrough next, one step at a time; under another band that asks, it waits.
         let setup = setup_walk::view_of(&cx);
@@ -219,7 +226,7 @@ fn on_band() -> Handler {
             set_waiting(&cx, view_row(&cx).is_some());
             let options = Options::of(&config_rows(&cx).await);
             if let Some(walk) = setup_walk::walk(setup.as_ref(), &options) {
-                return Ok(Reply::tree(over(walk_node(&walk), &beneath)));
+                return Ok(drawn(Some(walk_node(&walk))));
             }
         }
         // One question at a time. Two bands both on 1, 2, 4 and 0 would answer the lower one, so
@@ -227,10 +234,9 @@ fn on_band() -> Handler {
         let shown = view_row(&cx);
         let waiting = shown.is_some() && asking;
         set_waiting(&cx, waiting);
-        let Some(shown) = shown.filter(|_| !waiting) else {
-            return Ok(Reply::none());
-        };
-        Ok(Reply::tree(over(note_node(&shown), &beneath)))
+        Ok(drawn(
+            shown.filter(|_| !waiting).map(|shown| note_node(&shown)),
+        ))
     })
 }
 

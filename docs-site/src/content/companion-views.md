@@ -31,7 +31,7 @@ Use herdr if you want the companion on screen all the time, with the full cards.
 3. Open Claude Code in a project you have worked in.
 4. Type `/csr` and press Enter.
 
-**What you should see:** Claude Code answers `CSR pane opened (N dreams this week, N changed since your sessions)` and a short note on dreams. Under it, a panel with a `THIS SESSION` bar and cards such as "Dreams are on" and "What CSR can do here". The panel also opens by itself when a session starts in a project folder, but only if the window is at least 144 columns wide (110 after you have opened it once with `/csr`). Claude Code sets that floor for a panel nobody asked for. In a narrower window the session start shows "CSR pane is ready: type /csr to open it" until you have typed `/csr` once. `/csr` opens it at any width.
+**What you should see:** Claude Code answers `CSR pane opened (N dreams this week, N changed since your sessions)` and a short note on dreams. Under it, a panel with a `THIS SESSION` bar and cards such as "Dreams are on" and "What CSR can do here". The panel also opens by itself when a session starts in a project folder, but only if the window is at least 144 columns wide (110 after you have opened it once with `/csr`). Claude Code sets that floor for a panel nobody asked for. In a narrower window a line above the prompt reads "☾ CSR panel is ready: type /csr to open it" until you have typed `/csr` once. `/csr` opens it at any width.
 
 ## Set up the herdr pane
 
