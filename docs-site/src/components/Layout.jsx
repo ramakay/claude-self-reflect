@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { Outlet, Link, useLocation, useNavigate } from 'react-router'
 import { Github, ChevronDown, ChevronRight, Menu, X, ArrowLeft, Sun, Moon, Search } from 'lucide-react'
-import { versions, versionOf, sameIn } from '../content/versions'
+import { versions, versionOf, sameIn, homeOf, LANDING_URL } from '../content/versions'
 import BrandMark from './BrandMark'
 
 function SidebarGroup({ group, location }) {
@@ -210,13 +210,14 @@ export default function Layout() {
           <button type="button" onClick={() => setSidebarOpen(!sidebarOpen)} aria-expanded={sidebarOpen} aria-label="Toggle navigation menu" className="lg:hidden mr-3 text-[var(--color-muted)] hover:text-[var(--color-ink)]">
             {sidebarOpen ? <X size={20} aria-hidden="true" /> : <Menu size={20} aria-hidden="true" />}
           </button>
-          <Link className="site-nav__brand" to="/">
+          {/* The logo goes to the marketing landing; the "Docs" link goes to this app's index */}
+          <a className="site-nav__brand" href={LANDING_URL}>
             <BrandMark size={28} />
             <span>
               <span className="site-nav__name" style={{ fontSize: 18 }}>Self-Reflect</span>
               <span className="site-nav__tag">Documentation</span>
             </span>
-          </Link>
+          </a>
           <nav className="site-nav__links" aria-label="Primary">
             <VersionSwitcher location={location} />
             <button className="search-trigger" onClick={() => setSearchOpen(true)} aria-label="Search docs">
@@ -224,6 +225,7 @@ export default function Layout() {
               <span>Search</span>
               <kbd>/</kbd>
             </button>
+            <Link className="site-nav__link" to={homeOf(version)}>Docs</Link>
             <Link className="site-nav__link" to="/docs/why-csr">Guide</Link>
             <Link className="site-nav__link" to="/docs/features">Features</Link>
             <Link className="site-nav__link" to="/docs/mcp-tools">Reference</Link>
@@ -252,8 +254,12 @@ export default function Layout() {
           </button>
           {/* The header hides its links on a narrow screen; the version switch stays reachable here */}
           <div className="lg:hidden mb-[12px]"><VersionSwitcher location={location} /></div>
-          <Link to="/" className="flex items-center gap-[6px] px-[12px] py-[6px] mb-[12px] type-caption hover:text-[var(--color-ink)] rounded-lg hover:bg-white/20">
-            <ArrowLeft size={11} /> Home
+          <a href={LANDING_URL} className="flex items-center gap-[6px] px-[12px] py-[6px] type-caption hover:text-[var(--color-ink)] rounded-lg hover:bg-white/20">
+            <ArrowLeft size={11} aria-hidden="true" /> Self-Reflect home
+          </a>
+          <Link to={homeOf(version)} className={`block px-[12px] py-[6px] mb-[12px] text-[13px] rounded-lg transition-colors ${
+            location.pathname === homeOf(version) ? 'text-[var(--color-purple)] font-medium' : 'text-[var(--color-body)] hover:text-[var(--color-ink)] hover:bg-white/20'}`}>
+            Docs index
           </Link>
           {version.navigation.map(g => <SidebarGroup key={`${version.id}-${g.label}`} group={g} location={location} />)}
         </aside>
@@ -263,7 +269,7 @@ export default function Layout() {
 
         {/* Content */}
         <main className="flex-1 min-w-0 px-[24px] lg:px-[48px] py-[36px] max-w-[720px] mx-auto">
-          <Outlet />
+          <Outlet context={{ openSearch: () => setSearchOpen(true) }} />
         </main>
       </div>
     </div>
