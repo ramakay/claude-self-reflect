@@ -320,6 +320,10 @@ my everyday account; on macOS, setup also installs a launch agent.
      hf download armand0e/claude-fable-5-claude-code --repo-type dataset --local-dir "$SCRATCH/hf/fable"
      hf download crispwisp/wisp-claude-code-sessions --repo-type dataset --local-dir "$SCRATCH/hf/wisp"
    Put each session's .jsonl under "$SCRATCH/home/.claude/projects/<project-folder>/".
+   Both public sets were used to fine-tune the shipped reranker (see
+   csr-engine/assets/models/ettin-tuned-run2/NOTICE). Use them to try the harness
+   and for measurements that do not score retrieval. Do not use them, or any set
+   listed in that NOTICE, for a scored retrieval comparison: the reranker has seen them.
 3. Install and import into the scratch home only:
      curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
      HOME="$SCRATCH/home" csr-engine setup --no-companion
@@ -334,7 +338,7 @@ my everyday account; on macOS, setup also installs a launch agent.
    changed code or the kit.
 ```
 
-Public datasets above: [armand0e/claude-fable-5-claude-code](https://huggingface.co/datasets/armand0e/claude-fable-5-claude-code) and [crispwisp/wisp-claude-code-sessions](https://huggingface.co/datasets/crispwisp/wisp-claude-code-sessions), both MIT. Both are small (under 1,000 sessions each), and the wisp set includes headless runs, so report human and headless counts separately.
+Public datasets above: [armand0e/claude-fable-5-claude-code](https://huggingface.co/datasets/armand0e/claude-fable-5-claude-code) and [crispwisp/wisp-claude-code-sessions](https://huggingface.co/datasets/crispwisp/wisp-claude-code-sessions), both MIT. Both are small (under 1,000 sessions each), and the wisp set includes headless runs, so report human and headless counts separately. **Both were part of the reranker's fine-tuning data**, so a retrieval score measured on them would look better than it is. Scored retrieval comparisons need your own history or a set that is not in [the reranker's NOTICE](csr-engine/assets/models/ettin-tuned-run2/NOTICE).
 
 ---
 

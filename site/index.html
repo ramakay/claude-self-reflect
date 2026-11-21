@@ -1608,7 +1608,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
     <li><b>Staleness benchmark.</b> T4 needs a held-out tag with a change that was later restored.</li>
     <li><b>Lost and found, Same page.</b> Both are built; neither has a labelled accuracy set yet.</li>
   </ul>
-  <p class="rv">A prompt to hand your coding agent. Fill in the item and run it in a throwaway environment. No corpus of your own? It points at two public, MIT-licensed sets of Claude Code transcripts on Hugging Face.</p>
+  <p class="rv">A prompt to hand your coding agent. Fill in the item and run it in a throwaway environment. No corpus of your own? It points at two public, MIT-licensed sets of Claude Code transcripts on Hugging Face. Both helped fine-tune the shipped reranker, so use them to try the harness, not to score retrieval.</p>
   <div class="help-prompt"><pre id="sr-help-prompt">You are contributing an outside measurement to Self-Reflect
 (https://github.com/ramakay/claude-self-reflect). Work only in a throwaway
 environment: a Linux container, a VM, or a CI runner. Do not install it into
@@ -1623,6 +1623,10 @@ my everyday account; on macOS, setup also installs a launch agent.
      hf download armand0e/claude-fable-5-claude-code --repo-type dataset --local-dir "$SCRATCH/hf/fable"
      hf download crispwisp/wisp-claude-code-sessions --repo-type dataset --local-dir "$SCRATCH/hf/wisp"
    Put each session's .jsonl under "$SCRATCH/home/.claude/projects/&lt;project-folder&gt;/".
+   Both public sets were used to fine-tune the shipped reranker (see
+   csr-engine/assets/models/ettin-tuned-run2/NOTICE). Use them to try the harness
+   and for measurements that do not score retrieval. Do not use them, or any set
+   listed in that NOTICE, for a scored retrieval comparison: the reranker has seen them.
 3. Install and import into the scratch home only:
      curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
      HOME="$SCRATCH/home" csr-engine setup --no-companion
