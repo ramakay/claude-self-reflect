@@ -1,0 +1,124 @@
+name: first-run
+
+# Clean-machine first-run test of the published install paths (README curl line and npm),
+# each on a fresh macOS runner. Runs on pushes to ci/first-run or by hand; never on main.
+on:
+  push:
+    branches: [ci/first-run]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: first-run-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  EXPECTED_SHA256: ec656a84e123176bd9fa188ddac0e860a752e83365db182a1060b080d4c892ea
+  DAEMON_LABEL: com.ramakay.csr-engine.daemon
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - name: launchd GUI domain
+        run: |
+          sw_vers; id; echo "managername: $(launchctl managername 2>&1)"
+          if launchctl print "gui/$(id -u)" >/dev/null 2>&1; then echo "gui domain: present"; else echo "gui domain: MISSING"; exit 1; fi
+
+  install:
+    name: FR (${{ matrix.path }})
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        path: [curl, npm]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/first-run
+      - name: Environment
+        run: |
+          sw_vers; id
+          launchctl print "gui/$(id -u)" >/dev/null 2>&1 && echo "gui domain: present" || echo "gui domain: MISSING"
+          ls -la ~/.claude ~/.claude-self-reflect ~/.local/bin/csr-engine 2>&1 || true
+      - name: Install Claude Code (no login)
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
+      - name: Seed one transcript before setup
+        run: |
+          d="$HOME/.claude/projects/-Users-runner-demo"; mkdir -p "$d"
+          sid=11111111-2222-4333-8444-555555555555
+          for i in 1 2 3; do
+            printf '{"type":"user","sessionId":"%s","cwd":"/Users/runner/demo","timestamp":"2026-11-20T10:0%s:00Z","uuid":"u%s","message":{"role":"user","content":"How do we rotate the zebracorn cache key safely, step %s?"}}\n' "$sid" "$i" "$i" "$i"
+            printf '{"type":"assistant","sessionId":"%s","cwd":"/Users/runner/demo","timestamp":"2026-11-20T10:0%s:30Z","uuid":"a%s","parentUuid":"u%s","message":{"role":"assistant","content":[{"type":"text","text":"Rotate the zebracorn cache key by writing the new key first, then flipping the reader, then deleting the old key. Step %s done."}]}}\n' "$sid" "$i" "$i" "$i" "$i"
+          done > "$d/$sid.jsonl"
+          wc -l "$d/$sid.jsonl"
+      - name: Install (README curl line)
+        if: matrix.path == 'curl'
+        run: |
+          set -o pipefail
+          time (curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | CSR_AUTO_SETUP=1 sh) 2>&1 | tee install.log
+      - name: Install (README npm lines)
+        if: matrix.path == 'npm'
+        run: |
+          set -o pipefail
+          node --version; npm --version
+          time npm install -g claude-self-reflect 2>&1 | tee install.log
+          time claude-self-reflect setup 2>&1 | tee -a install.log
+      - name: Binary is the published one
+        run: |
+          B="$HOME/.local/bin/csr-engine"; "$B" --version
+          got=$(shasum -a 256 "$B" | cut -d' ' -f1); echo "sha256 $got"
+          test "$got" = "$EXPECTED_SHA256"
+      - name: Hooks and MCP registered
+        run: |
+          grep -c 'csr-engine hook' ~/.claude/settings.json
+          claude mcp list 2>&1 | tee mcp.log
+          grep -qi 'claude-self-reflect' mcp.log
+      - name: Daemon running under launchd
+        run: |
+          launchctl print "gui/$(id -u)/$DAEMON_LABEL" | tee daemon.log | grep -E 'state =|pid =' 
+          grep -q 'state = running' daemon.log
+          ~/.local/bin/csr-engine status --json > status.json
+          python3 -c "import json;s=json.load(open('status.json'));d=s.get('daemon',{});print('state',s.get('state'),'daemon',d);assert d.get('up') is True"
+      - name: Seeded transcript searchable over MCP
+        run: python3 .github/first-run/mcp_search.py "$HOME/.local/bin/csr-engine" "rotate the zebracorn cache key" zebracorn
+      - name: New transcript picked up after setup
+        run: |
+          d="$HOME/.claude/projects/-Users-runner-later"; mkdir -p "$d"
+          sid=66666666-7777-4888-9999-000000000000
+          printf '{"type":"user","sessionId":"%s","cwd":"/Users/runner/later","timestamp":"2026-11-20T11:00:00Z","uuid":"u1","message":{"role":"user","content":"Where does the quokkaline migration log live?"}}\n{"type":"assistant","sessionId":"%s","cwd":"/Users/runner/later","timestamp":"2026-11-20T11:00:20Z","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"text","text":"The quokkaline migration log lives next to the schema file, one line per applied step."}]}}\n' "$sid" "$sid" > "$d/$sid.jsonl"
+          for i in $(seq 1 24); do
+            if python3 .github/first-run/mcp_search.py "$HOME/.local/bin/csr-engine" "quokkaline migration log" quokkaline; then echo "picked up after ~$((i*10))s"; exit 0; fi
+            sleep 10
+          done
+          echo "not picked up in 240s"; exit 1
+      - name: Uninstall leaves nothing behind
+        if: always()
+        run: |
+          set +e
+          B="$HOME/.local/bin/csr-engine"
+          [ -x "$B" ] || { echo "no binary to uninstall with"; exit 1; }
+          "$B" uninstall --purge --yes 2>&1 | tee uninstall.log
+          rc=${PIPESTATUS[0]}; echo "uninstall exit $rc"
+          left=0
+          for f in "$B" "$HOME/.claude-self-reflect" "$HOME/Library/LaunchAgents/$DAEMON_LABEL.plist"; do [ -e "$f" ] && { echo "LEFT: $f"; left=1; }; done
+          grep -q 'csr-engine hook' ~/.claude/settings.json 2>/dev/null && { echo "LEFT: hooks in settings.json"; left=1; }
+          launchctl print "gui/$(id -u)/$DAEMON_LABEL" >/dev/null 2>&1 && { echo "LEFT: daemon loaded"; left=1; }
+          pgrep -fl csr-engine && { echo "LEFT: csr-engine process"; left=1; }
+          test "$rc" = 0 && test "$left" = 0
+      - name: Keep logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: first-run-${{ matrix.path }}
+          path: |
+            *.log
+            status.json
+          if-no-files-found: ignore
