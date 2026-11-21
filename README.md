@@ -324,14 +324,16 @@ my everyday account; on macOS, setup also installs a launch agent.
    csr-engine/assets/models/ettin-tuned-run2/NOTICE). Use them to try the harness
    and for measurements that do not score retrieval. Do not use them, or any set
    listed in that NOTICE, for a scored retrieval comparison: the reranker has seen them.
-3. Install and import into the scratch home only:
+3. Use the scratch home for every command from here on, including step 5. The
+   installer puts the binary in $HOME/.local/bin, so add it to PATH too:
+     export HOME="$SCRATCH/home" PATH="$SCRATCH/home/.local/bin:$PATH"
      curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
-     HOME="$SCRATCH/home" csr-engine setup --no-companion
-     HOME="$SCRATCH/home" csr-engine status
+     csr-engine setup --no-companion
+     csr-engine status        # check the session and chunk counts match your corpus
 4. Before you measure, write down the question, the metric, the control and the bar
    that would count as a pass. Commit that note first.
-5. Run the measurement (the eval-kit scripts, `csr-engine eval --full`, or
-   `csr-engine bench`). Keep every command and its raw output.
+5. Run the measurement in the same shell (the eval-kit scripts, `csr-engine eval --full`,
+   or `csr-engine bench`). Keep every command and its raw output.
 6. Report: the corpus (name and counts), the pre-registered bar, the result, what
    failed, and the exact commands. A null or a loss is a useful result; say so plainly.
    Never invent a number. Open it as an issue, or as a pull request from a fork if you
