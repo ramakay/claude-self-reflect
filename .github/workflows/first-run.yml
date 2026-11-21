@@ -19,7 +19,7 @@ env:
   DAEMON_LABEL: com.ramakay.csr-engine.daemon
   # Branch whose scripts/install.sh the curl job runs. main is the README line; set a fix
   # branch here to test it before merge, and set it back after.
-  INSTALL_REF: fix/install-latest-fallback
+  INSTALL_REF: main
 
 jobs:
   probe:
