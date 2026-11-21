@@ -117,12 +117,29 @@ detect_platform() {
 # --- Find latest release ---
 
 get_latest_version() {
+    _api="https://api.github.com/repos/${REPO}/releases/latest"
+    # The API allows 60 anonymous calls an hour per address, so a shared address
+    # (CI runners, an office NAT) gets 403. The release page redirects to
+    # .../releases/tag/<tag> with no such limit, so it is the fallback.
+    _page="https://github.com/${REPO}/releases/latest"
+    _landed=""
     if command -v curl >/dev/null 2>&1; then
-        VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')"
+        VERSION="$(curl -fsSL "$_api" 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')"
+        [ -n "$VERSION" ] || _landed="$(curl -fsSL -o /dev/null -w '%{url_effective}' "$_page" 2>/dev/null || true)"
     elif command -v wget >/dev/null 2>&1; then
-        VERSION="$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')"
+        VERSION="$(wget -qO- "$_api" 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')"
+        [ -n "$VERSION" ] || _landed="$(wget -S -O /dev/null "$_page" 2>&1 | sed -n 's/^ *[Ll]ocation: *\([^ ]*\).*/\1/p' | tail -1 | tr -d '\r')"
     else
         err "Neither curl nor wget found. Please install one."
+    fi
+
+    if [ -z "$VERSION" ]; then
+        case "$_landed" in
+            */releases/tag/?*)
+                normalize_version "${_landed##*/releases/tag/}"
+                VERSION="$NORMALIZED_VERSION"
+                ;;
+        esac
     fi
 
     if [ -z "$VERSION" ]; then

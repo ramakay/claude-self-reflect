@@ -130,17 +130,24 @@ function buildRelease({ setupWrites, setupRecordsEnv } = {}) {
   writeFileSync(
     join(dirs.fakebin, 'curl'),
     `#!/bin/sh
-url=""; out=""
+url=""; out=""; fmt=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
+    -w) fmt="$2"; shift 2 ;;
     -*) shift ;;
     *)  url="$1"; shift ;;
   esac
 done
 printf '%s\\n' "$url" >> '${curlLog}'
 case "$url" in
-  *api.github.com*) printf '{"tag_name": "v10.1.0"}\\n'; exit 0 ;;
+  *api.github.com*)
+    # CSR_TEST_API_403 plays GitHub's anonymous rate limit (curl -f exits 22 on a 403).
+    [ -n "$CSR_TEST_API_403" ] && exit 22
+    printf '{"tag_name": "v10.1.0"}\\n'; exit 0 ;;
+  */releases/latest)
+    [ -n "$fmt" ] && printf '%s' "\${CSR_TEST_LANDED-https://github.com/ramakay/claude-self-reflect/releases/tag/v10.1.0}"
+    exit 0 ;;
 esac
 src="${dirs.fixtures}/\${url##*/}"
 [ -f "$src" ] || exit 22
@@ -580,6 +587,39 @@ describe('install.sh: pinned version', { skip: !HAVE_SH && 'no /bin/sh' }, () =>
     const calls = curlCalls(curlLog);
     assert.ok(calls.some((c) => c.includes('api.github.com/repos/ramakay/claude-self-reflect/releases/latest')), JSON.stringify(calls));
     assert.ok(calls.includes(`https://github.com/ramakay/claude-self-reflect/releases/download/v10.1.0/${tarball}`), JSON.stringify(calls));
+  });
+
+  test('when the GitHub API refuses, it reads the tag from the release page redirect', () => {
+    const { dirs, tarball, curlLog } = buildRelease();
+    const result = runInstall({ dirs, extraEnv: { CSR_SKIP_SETUP: '1', CSR_TEST_API_403: '1' } });
+
+    assert.equal(result.status, 0, result.stderr);
+    const calls = curlCalls(curlLog);
+    // Exact entries of the call log, not substrings.
+    const page = 'https://github.com/ramakay/claude-self-reflect/releases/latest';
+    const download = `https://github.com/ramakay/claude-self-reflect/releases/download/v10.1.0/${tarball}`;
+    assert.equal(calls.filter((c) => c === page).length, 1, JSON.stringify(calls));
+    assert.equal(calls.filter((c) => c === download).length, 1, JSON.stringify(calls));
+    assert.match(result.stdout, /csr-engine v10\.1\.0/);
+  });
+
+  test('a redirect that is not a release tag still fails with the clear error', () => {
+    for (const landed of ['', 'https://github.com/ramakay/claude-self-reflect/releases', 'https://github.com/login']) {
+      const { dirs } = buildRelease();
+      const result = runInstall({ dirs, extraEnv: { CSR_SKIP_SETUP: '1', CSR_TEST_API_403: '1', CSR_TEST_LANDED: landed } });
+      assert.equal(result.status, 1, landed);
+      assert.match(result.stderr, /Could not determine latest release version/, landed);
+    }
+  });
+
+  test('a redirect to a tag with unsafe characters is refused', () => {
+    const { dirs } = buildRelease();
+    const result = runInstall({
+      dirs,
+      extraEnv: { CSR_SKIP_SETUP: '1', CSR_TEST_API_403: '1', CSR_TEST_LANDED: 'https://github.com/x/y/releases/tag/v1.0;rm' },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Invalid version/);
   });
 
   test('CSR_VERSION skips the GitHub API and downloads that tag', () => {
