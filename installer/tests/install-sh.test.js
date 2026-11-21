@@ -595,8 +595,11 @@ describe('install.sh: pinned version', { skip: !HAVE_SH && 'no /bin/sh' }, () =>
 
     assert.equal(result.status, 0, result.stderr);
     const calls = curlCalls(curlLog);
-    assert.ok(calls.includes('https://github.com/ramakay/claude-self-reflect/releases/latest'), JSON.stringify(calls));
-    assert.ok(calls.includes(`https://github.com/ramakay/claude-self-reflect/releases/download/v10.1.0/${tarball}`), JSON.stringify(calls));
+    // Exact entries of the call log, not substrings.
+    const page = 'https://github.com/ramakay/claude-self-reflect/releases/latest';
+    const download = `https://github.com/ramakay/claude-self-reflect/releases/download/v10.1.0/${tarball}`;
+    assert.equal(calls.filter((c) => c === page).length, 1, JSON.stringify(calls));
+    assert.equal(calls.filter((c) => c === download).length, 1, JSON.stringify(calls));
     assert.match(result.stdout, /csr-engine v10\.1\.0/);
   });
 
