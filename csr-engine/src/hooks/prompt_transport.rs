@@ -163,7 +163,7 @@ const WATCHDOG_LOG_WAIT: Duration = Duration::from_millis(15);
 
 /// Run `work` on its own thread and wait for it at most `wait`; true when it
 /// finished. A blocked `work` is left behind: the watchdog exits next.
-fn finish_within(work: impl FnOnce() + Send + 'static, wait: Duration) -> bool {
+pub(super) fn finish_within(work: impl FnOnce() + Send + 'static, wait: Duration) -> bool {
     let (done, finished) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("prompt-deadline-log".into())
@@ -251,7 +251,7 @@ fn record_turn_start(db_path: &Path, session_id: Option<&str>) {
 
 /// Called before runtime/storage construction. Leave scheduling margin below 3s.
 pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
-    let Some(_operation) = super::try_start(db_path) else {
+    let Some(_operation) = super::try_start(db_path, "prompt-submit") else {
         return;
     };
     if !spawn_watchdog(started) {

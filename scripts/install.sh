@@ -357,12 +357,6 @@ download_and_install() {
 }
 
 # --- Report stale processes + restart the daemon (gap-G2 spec 2e) ---
-#
-# FORWARD-PORT NOTE (gap-G2 review finding 5): this branch's base predates
-# #316 on main, which rewrote this script's staging/rename logic. `git
-# merge-tree main HEAD` conflicts in this file. When this branch lands,
-# reconcile with that rewrite and port this function's logic + a test
-# alongside installer/lib.js's (see the matching note in postinstall.js).
 
 report_stale_and_kickstart() {
     # `status --stale` is a DB-free fast path (run-registry read + a

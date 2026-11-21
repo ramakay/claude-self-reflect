@@ -7,6 +7,7 @@
 //! 4. Exits with code 0 (never blocks the session)
 
 pub mod bash_writes;
+pub mod deadline;
 pub mod dream_match;
 pub mod exposure;
 pub mod install;
@@ -863,7 +864,11 @@ pub fn hook_may_persist_index(_hook_name: &str) -> bool {
 
 /// Skip a busy maintenance run before stdin, storage, embeddings or index startup.
 /// Hooks fail open with empty output if the lock is busy or unavailable.
-pub fn try_start(db_path: &Path) -> Option<crate::maintenance::SharedLock> {
+///
+/// The hooks that run under Claude Code's hook timeout with no deadline of their own
+/// are armed first (see [`deadline`]), so the deadline also covers a stuck lock probe.
+pub fn try_start(db_path: &Path, hook_name: &str) -> Option<crate::maintenance::SharedLock> {
+    deadline::arm(hook_name);
     crate::maintenance::try_shared(db_path.parent().unwrap_or(Path::new(".")))
         .ok()
         .flatten()
@@ -1500,7 +1505,7 @@ mod maintenance_probes {
             .to_string()
             .contains("maintenance in progress"));
         let mut constructed = false;
-        if let Some(_operation) = try_start(&db) {
+        if let Some(_operation) = try_start(&db, "stop") {
             constructed = true;
             let _ = Engine::new_for_hook(&db, &dir.path().join("projects"));
         }
@@ -1508,6 +1513,6 @@ mod maintenance_probes {
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         assert!(!dir.path().join("index-v3").exists());
         drop(owner);
-        assert!(try_start(&db).is_some());
+        assert!(try_start(&db, "stop").is_some());
     }
 }

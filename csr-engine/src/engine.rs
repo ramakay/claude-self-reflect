@@ -359,16 +359,16 @@ impl Engine {
 
         // Clean stale numbered HNSW files from previous sessions (crash resilience).
         if persist {
-            // Acquire exclusive lock to avoid racing with concurrent dump_to_disk writers.
             if let Ok(lock_file) = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(false)
                 .open(index_dir.join("index.lock"))
             {
-                crate::search::lock_index(&lock_file, true, crate::search::INDEX_LOCK_TIMEOUT)?;
-                crate::search::cleanup_stale_index_files(&index_dir);
-                // lock released on drop
+                // No wait: a busy lock means a live writer; it cleans up in dump_to_disk.
+                if crate::search::lock_index(&lock_file, true, std::time::Duration::ZERO).is_ok() {
+                    crate::search::cleanup_stale_index_files(&index_dir);
+                }
             }
         }
 
