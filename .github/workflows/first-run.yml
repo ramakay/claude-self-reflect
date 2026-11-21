@@ -17,6 +17,9 @@ concurrency:
 env:
   EXPECTED_SHA256: ec656a84e123176bd9fa188ddac0e860a752e83365db182a1060b080d4c892ea
   DAEMON_LABEL: com.ramakay.csr-engine.daemon
+  # Branch whose scripts/install.sh the curl job runs. main is the README line; set a fix
+  # branch here to test it before merge, and set it back after.
+  INSTALL_REF: fix/install-latest-fallback
 
 jobs:
   probe:
@@ -63,7 +66,7 @@ jobs:
         if: matrix.path == 'curl'
         run: |
           set -o pipefail
-          time (curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | CSR_AUTO_SETUP=1 sh) 2>&1 | tee install.log
+          time (curl -fsSL "https://raw.githubusercontent.com/ramakay/claude-self-reflect/${INSTALL_REF}/scripts/install.sh" | CSR_AUTO_SETUP=1 sh) 2>&1 | tee install.log
       - name: Install (README npm lines)
         if: matrix.path == 'npm'
         run: |
@@ -108,7 +111,13 @@ jobs:
           "$B" uninstall --purge --yes 2>&1 | tee uninstall.log
           rc=${PIPESTATUS[0]}; echo "uninstall exit $rc"
           left=0
-          for f in "$B" "$HOME/.claude-self-reflect" "$HOME/Library/LaunchAgents/$DAEMON_LABEL.plist"; do [ -e "$f" ] && { echo "LEFT: $f"; left=1; }; done
+          for f in "$B" "$HOME/Library/LaunchAgents/$DAEMON_LABEL.plist" "$HOME/Library/Caches/csr-engine"; do [ -e "$f" ] && { echo "LEFT: $f"; left=1; }; done
+          # --purge keeps the transcript mirror by design (--purge-mirror deletes it); nothing else may stay.
+          for f in "$HOME"/.claude-self-reflect/* "$HOME"/.claude-self-reflect/.[!.]*; do
+            [ -e "$f" ] || continue
+            [ "$f" = "$HOME/.claude-self-reflect/mirror" ] && continue
+            echo "LEFT: $f"; left=1
+          done
           grep -q 'csr-engine hook' ~/.claude/settings.json 2>/dev/null && { echo "LEFT: hooks in settings.json"; left=1; }
           launchctl print "gui/$(id -u)/$DAEMON_LABEL" >/dev/null 2>&1 && { echo "LEFT: daemon loaded"; left=1; }
           pgrep -fl csr-engine && { echo "LEFT: csr-engine process"; left=1; }
