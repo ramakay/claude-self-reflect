@@ -3,7 +3,7 @@ import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
 import { Link } from 'react-router'
 import { ChevronRight } from 'lucide-react'
-import { versions, sameIn, imageUrl } from '../content/versions'
+import { versions, sameIn, imageUrl, homeOf, LANDING_URL } from '../content/versions'
 
 function findAdjacent(currentPath, navigation) {
   const all = navigation.flatMap(g => g.items)
@@ -22,8 +22,10 @@ export default function DocPage({ title, description, content, path, version = '
     <article>
       {/* Breadcrumb */}
       <div className="flex items-center gap-1.5 text-sm" style={{ color: 'var(--color-muted)' }}>
-        <Link to="/" className="hover:underline" style={{ color: 'var(--color-muted)' }}>Home</Link>
-        <ChevronRight size={12} />
+        <a href={LANDING_URL} className="hover:underline" style={{ color: 'var(--color-muted)' }}>Home</a>
+        <ChevronRight size={12} aria-hidden="true" />
+        <Link to={homeOf(v)} className="hover:underline" style={{ color: 'var(--color-muted)' }}>Docs</Link>
+        <ChevronRight size={12} aria-hidden="true" />
         <span style={{ color: 'var(--color-body)' }}>{title}</span>
       </div>
 

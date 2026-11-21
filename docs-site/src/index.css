@@ -305,17 +305,6 @@ body {
   background: #0e1225;
 }
 
-.docs-nav {
-  background: #eae7f2 !important;
-  backdrop-filter: none !important;
-  -webkit-backdrop-filter: none !important;
-  border-bottom-color: rgba(0,0,0,0.06) !important;
-}
-[data-theme="dark"] .docs-nav {
-  background: #111630 !important;
-  border-bottom-color: rgba(255,255,255,0.08) !important;
-}
-
 /* Doc page sidebar dark mode */
 [data-theme="dark"] .docs-shell aside {
   background: #0c1020 !important;
@@ -3329,7 +3318,6 @@ ul.latency-compare {
 
 /* Dark doc shell */
 [data-theme="dark"] .docs-shell { background: #0e1225; }
-[data-theme="dark"] .docs-nav { background: #111630 !important; border-bottom-color: rgba(244,239,228,0.08) !important; }
 [data-theme="dark"] .docs-shell aside { background: #0c1020 !important; border-right-color: rgba(244,239,228,0.08) !important; }
 
 /* Dark Go Deeper section */
@@ -3374,10 +3362,6 @@ body, [data-theme="dark"] body {
 ::selection { background: var(--vermilion-wash); }
 
 .docs-shell, [data-theme="dark"] .docs-shell { background: var(--paper); }
-.docs-nav, [data-theme="dark"] .docs-nav {
-  background: var(--paper) !important;
-  border-bottom: 1px solid var(--paper-rule) !important;
-}
 .docs-shell aside, [data-theme="dark"] .docs-shell aside {
   background: var(--paper-card) !important;
   border-right: 1px solid var(--paper-rule) !important;
@@ -3579,3 +3563,224 @@ body, [data-theme="dark"] body {
   color: var(--color-purple);
   font-weight: 600;
 }
+
+/* ================================================================
+   Floating glass nav + top colour wash (docs app: home and doc pages).
+   One offset variable drives the nav, the sidebar top and anchor scroll.
+   Sits last so it wins the cascade over the flat brand-layer header.
+   ================================================================ */
+:root {
+  --nav-inset: 14px;
+  --nav-h: 60px;
+  --nav-gap: 10px;
+  --nav-offset: calc(var(--nav-inset) + var(--nav-h) + var(--nav-gap));
+  /* wash stops: vermilion family, warm amber bridge, one faint cool slate */
+  --wash-ember: rgba(200,68,42,0.12);
+  --wash-rose: rgba(241,210,199,0.80);
+  --wash-blush: rgba(251,233,227,0.95);
+  --wash-amber: rgba(239,227,196,0.60);
+  --wash-cool: rgba(143,166,184,0.24);
+  --glass-bg: color-mix(in srgb, var(--paper-card) 68%, transparent);
+  --glass-border: color-mix(in srgb, var(--paper-rule) 80%, transparent);
+  --glass-shadow: inset 0 1px 0 rgba(255,255,255,0.65), 0 1px 2px rgba(36,33,30,0.05), 0 12px 32px -14px rgba(36,33,30,0.20);
+}
+[data-theme="dark"] {
+  --wash-ember: rgba(236,117,87,0.14);
+  --wash-rose: rgba(74,42,33,0.62);
+  --wash-blush: rgba(110,58,45,0.22);
+  --wash-amber: rgba(107,90,48,0.18);
+  --wash-cool: rgba(60,84,104,0.26);
+  --glass-bg: color-mix(in srgb, var(--paper-card) 74%, transparent);
+  --glass-border: rgba(243,238,228,0.10);
+  --glass-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 1px 2px rgba(0,0,0,0.30), 0 14px 36px -14px rgba(0,0,0,0.65);
+}
+@media (max-width: 760px) {
+  :root { --nav-inset: 8px; --nav-h: 56px; --nav-gap: 8px; }
+}
+
+html { scroll-padding-top: calc(var(--nav-offset) + 8px); }
+.prose :is(h1,h2,h3,h4,[id]) { scroll-margin-top: calc(var(--nav-offset) + 8px); }
+
+/* Top wash: layered radials over the paper, sized to the top 400px, ending in the paper colour */
+.docs-shell, [data-theme="dark"] .docs-shell {
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(to bottom, transparent 0%, transparent 45%, var(--paper) 100%),
+    radial-gradient(ellipse 34% 62% at 4% 0%, var(--wash-ember) 0%, transparent 72%),
+    radial-gradient(ellipse 40% 90% at 24% 0%, var(--wash-rose) 0%, transparent 70%),
+    radial-gradient(ellipse 38% 85% at 52% 0%, var(--wash-blush) 0%, transparent 72%),
+    radial-gradient(ellipse 34% 80% at 76% 0%, var(--wash-amber) 0%, transparent 70%),
+    radial-gradient(ellipse 30% 90% at 98% 0%, var(--wash-cool) 0%, transparent 72%);
+  background-size: 100% 400px;
+  background-repeat: no-repeat;
+  background-position: top center;
+}
+/* Pill nav: solid paper by default, glass where backdrop-filter works */
+.site-nav, [data-theme="dark"] .site-nav {
+  position: sticky;
+  top: var(--nav-inset);
+  z-index: 50;
+  width: calc(100% - 2 * var(--nav-inset));
+  max-width: 1520px;
+  height: var(--nav-h);
+  margin: var(--nav-inset) auto 0;
+  border: 1px solid var(--glass-border);
+  border-radius: 18px;
+  background: var(--paper-card);
+  box-shadow: var(--glass-shadow);
+}
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .site-nav, [data-theme="dark"] .site-nav {
+    background: var(--glass-bg);
+    backdrop-filter: blur(18px) saturate(1.6);
+    -webkit-backdrop-filter: blur(18px) saturate(1.6);
+  }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .site-nav, [data-theme="dark"] .site-nav {
+    background: var(--paper-card);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+.site-nav .site-nav__inner {
+  max-width: none;
+  height: 100%;
+  padding: 0 10px 0 18px;
+}
+
+/* Desktop sidebar lets a little wash through (a paper-card tint keeps its link contrast);
+   the phone drawer stays solid */
+@media (min-width: 1024px) {
+  .docs-shell .docs-sidebar, [data-theme="dark"] .docs-shell .docs-sidebar {
+    background: color-mix(in srgb, var(--paper-card) 72%, transparent) !important;
+  }
+}
+
+/* the inset pill is narrower than the old bar: tighten the docs header before it overflows */
+@media (max-width: 1320px) {
+  .docs-nav .site-nav__links { gap: 16px; }
+  .docs-nav .site-nav__github { width: 38px; padding: 0; }
+  .docs-nav .site-nav__github span, .docs-nav .search-trigger kbd { display: none; }
+}
+/* below lg the drawer carries the version switch and search; the header keeps icons */
+/* the sidebar's "Docs index" link covers the header's Docs item where space runs out */
+@media (max-width: 1100px) {
+  .docs-nav .site-nav__link--docs { display: none; }
+}
+/* the landing-era rule hid the 5th link at <=1000px; the docs header has room for all of them there */
+@media (min-width: 901px) and (max-width: 1000px) {
+  .docs-nav .site-nav__link:nth-of-type(5) { display: inline; }
+}
+@media (max-width: 1023px) {
+  .docs-nav .site-nav__links .version-switcher { display: none; }
+  .docs-nav .search-trigger { width: 38px; padding: 0; justify-content: center; }
+  .docs-nav .search-trigger span { display: none; }
+}
+@media (max-width: 900px) {
+  .docs-nav .site-nav__links .site-nav__link { display: none; }
+}
+
+@media (max-width: 760px) {
+  .site-nav, [data-theme="dark"] .site-nav { border-radius: 16px; }
+  .site-nav .site-nav__inner { padding: 0 6px 0 12px; gap: 8px; }
+  /* the phone drawer carries its own version switch; the header one pushed the pill off-screen */
+  .site-nav__links .version-switcher { display: none; }
+}
+
+/* ================================================================
+   Docs index (#/ and #/v9): title, search, start-here cards, page lists.
+   ================================================================ */
+.docs-home__title {
+  margin: 24px 0 8px;
+  font: 400 clamp(34px, 5vw, 44px)/1.05 var(--font-serif);
+  letter-spacing: -.035em;
+  color: var(--color-ink);
+}
+.docs-home__intro { margin: 0 0 24px; font-size: 17px; line-height: 1.5; color: var(--color-muted); }
+.docs-home__search {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: 52px;
+  padding: 0 14px 0 18px;
+  border: 1px solid var(--paper-rule);
+  border-radius: 14px;
+  background: var(--paper-card);
+  box-shadow: 0 1px 2px rgba(36,33,30,0.04);
+  font-size: 16px;
+  color: var(--color-muted);
+  cursor: pointer;
+  transition: border-color 160ms ease;
+}
+.docs-home__search:hover { border-color: var(--vermilion); color: var(--color-ink); }
+.docs-home__search kbd {
+  margin-left: auto;
+  padding: 1px 8px;
+  border: 1px solid var(--paper-rule);
+  border-radius: 6px;
+  font: 12px/1.5 var(--font-mono);
+}
+.docs-home__h2, .docs-home__group {
+  margin: 40px 0 12px;
+  font: 500 12px/1.4 var(--font-mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+}
+.docs-home__cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.docs-home__card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 132px;
+  padding: 16px 16px 36px;
+  border: 1px solid var(--paper-rule);
+  border-radius: 12px;
+  background: var(--paper-card);
+  text-decoration: none;
+  transition: border-color 160ms ease;
+}
+.docs-home__card strong { font: 400 20px/1.15 var(--font-serif); letter-spacing: -.02em; color: var(--color-ink); }
+.docs-home__card span { font-size: 14px; line-height: 1.45; color: var(--color-muted); }
+.docs-home__card-arrow { position: absolute; left: 16px; bottom: 14px; color: var(--vermilion); }
+.docs-home__card:hover { border-color: var(--vermilion); }
+.docs-home__news {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin-top: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--paper-rule);
+  border-left: 3px solid var(--vermilion);
+  border-radius: 4px 12px 12px 4px;
+  background: color-mix(in srgb, var(--vermilion-wash) 35%, var(--paper-card));
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--color-body);
+  text-decoration: none;
+}
+.docs-home__news-kicker { font: 400 18px/1.2 var(--font-serif); color: var(--color-ink); }
+.docs-home__news svg { margin-left: auto; align-self: center; color: var(--vermilion); }
+.docs-home__news:hover { border-color: var(--vermilion); }
+.docs-home__groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 32px; }
+.docs-home__groups ul { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--paper-rule); }
+.docs-home__groups li { padding: 10px 0; border-bottom: 1px solid var(--paper-rule); }
+.docs-home__groups li a { font-weight: 560; font-size: 15px; color: var(--color-ink); text-decoration: none; }
+.docs-home__groups li a:hover { color: var(--vermilion); }
+.docs-home__groups li span { display: block; margin-top: 2px; font-size: 13.5px; line-height: 1.45; color: var(--color-muted); }
+.docs-home__paper { margin: 40px 0 0; font-size: 14px; color: var(--color-muted); }
+.docs-home__paper a { color: var(--vermilion); }
+@media (max-width: 760px) {
+  .docs-home__cards, .docs-home__groups { grid-template-columns: minmax(0, 1fr); }
+  .docs-home__card { min-height: 0; padding: 14px 44px 14px 16px; }
+  .docs-home__card-arrow { left: auto; right: 16px; bottom: auto; top: 50%; transform: translateY(-50%); }
+  .docs-home__search kbd { display: none; }
+}
+
+/* Tall pane captures: phone-width, not the full column. */
+.prose img[src*="pane-"] { max-width: 420px; margin-inline: 0; border-radius: 10px; }
+.prose img[src*="pane-proposal"] { max-width: 560px; }

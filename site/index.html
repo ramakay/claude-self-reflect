@@ -304,6 +304,7 @@ body.iso[data-theme="light"] {
 
 .film {
   position: relative;
+  z-index: 30;
   isolation: isolate;
   display: flex;
   flex-direction: column;
@@ -370,6 +371,40 @@ body.iso[data-theme="light"] {
   padding-inline: var(--gutter);
 }
 .film-header { padding-block: max(18px, env(safe-area-inset-top)) 18px; }
+/* The nav stays with the reader: fixed over the film, a paper glass pill past it. */
+html { scroll-padding-top: 92px; }
+.film-header { position: fixed; z-index: 40; top: 0; left: 0; right: 0; transition: top .3s ease, padding .3s ease, background-color .3s ease, border-color .3s ease, box-shadow .3s ease, color .3s ease; border: 1px solid transparent; }
+html[data-nav-stuck] .film-header {
+  top: 12px; width: min(calc(100% - 28px), 1120px); padding-block: 9px; padding-inline: 22px 10px;
+  color: var(--tl-ink); background: rgba(250, 248, 243, .74); border-color: rgba(216, 210, 200, .9); border-radius: 999px;
+  -webkit-backdrop-filter: blur(18px) saturate(1.6); backdrop-filter: blur(18px) saturate(1.6);
+  box-shadow: 0 1px 0 rgba(255,255,255,.7) inset, 0 10px 30px -14px rgba(36,33,30,.28);
+}
+html[data-nav-stuck] .film-brand img { filter: none; mix-blend-mode: normal; }
+html[data-nav-stuck] .film-install { border-color: var(--tl-ink); color: var(--tl-ink); background: transparent; }
+html[data-nav-stuck] .film-install:hover { color: #fffaf2; background: var(--tl-ink); }
+html[data-nav-stuck] .film a:focus-visible { outline-color: var(--tl-ink); }
+/* A soft colour blob behind the pill, in the site's own pigments. Hidden over the film. */
+.nav-glow { position: fixed; z-index: 39; top: -70px; left: 50%; width: min(1280px, 112vw); height: 250px; transform: translateX(-50%); pointer-events: none; opacity: 0; transition: opacity .7s ease;
+  -webkit-mask-image: linear-gradient(#000 35%, transparent); mask-image: linear-gradient(#000 35%, transparent); }
+.nav-glow i { position: absolute; border-radius: 50%; filter: blur(46px); mix-blend-mode: multiply; animation: nav-drift 18s ease-in-out infinite alternate; }
+.nav-glow i:nth-child(1) { left: 6%;  top: 34px; width: 34%; height: 150px; background: rgba(226, 85, 58, .55); }
+.nav-glow i:nth-child(2) { left: 30%; top: 20px; width: 30%; height: 130px; background: rgba(236, 140, 160, .50); animation-delay: -6s; }
+.nav-glow i:nth-child(3) { left: 54%; top: 40px; width: 32%; height: 140px; background: rgba(244, 186, 74, .55); animation-delay: -11s; }
+.nav-glow i:nth-child(4) { left: 74%; top: 26px; width: 22%; height: 120px; background: rgba(132, 156, 184, .42); animation-delay: -3s; }
+@keyframes nav-drift { from { transform: translate3d(-3%, 0, 0) scale(1); } to { transform: translate3d(4%, 10px, 0) scale(1.08); } }
+html[data-nav-stuck] .nav-glow { opacity: .62; }
+@media (max-width: 600px) { .nav-glow { height: 190px; top: -60px; } .nav-glow i { filter: blur(34px); } }
+/* Phones, past the film: scrolling down folds the pill to the logo and a » button. */
+.nav-more { display: none; }
+@media (max-width: 600px) {
+  html[data-nav-collapsed] .film-header { right: auto; width: auto; margin: 0 0 0 14px; padding: 6px 6px 6px 10px; gap: 6px; }
+  html[data-nav-collapsed] .film-brand-word, html[data-nav-collapsed] .film-nav { display: none; }
+  html[data-nav-collapsed] .nav-more { display: inline-grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid var(--tl-ink); border-radius: 999px; background: transparent; color: var(--tl-ink); font: 600 18px/1 var(--sans); cursor: pointer; }
+  html[data-nav-collapsed] .nav-more:focus-visible { outline: 2px solid var(--tl-ink); outline-offset: 2px; }
+  html[data-nav-collapsed] .nav-glow { opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) { .film-header, .nav-glow { transition: none; } .nav-glow i { animation: none; } }
 .film a { color: inherit; text-decoration: none; }
 .film a:focus-visible, .film button:focus-visible { outline-color: #fffaf2; }
 .film-brand { display: inline-flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 670; letter-spacing: -.03em; white-space: nowrap; }
@@ -816,6 +851,16 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 .herdr-how code { overflow-wrap: anywhere; font-size: .92em; }
 .herdr-shot { margin: 0; justify-self: end; width: 100%; max-width: 420px; }
 .herdr-shot img { display: block; width: 100%; height: auto; border: 1px solid var(--paper-rule); }
+.sr-pages .pages-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(24px, 4vw, 56px); margin-top: 32px; align-items: start; }
+.page-card { margin: 0; }
+.page-card h3 { margin: 0 0 6px; font-size: 20px; }
+.page-card p { margin: 0 0 16px; max-width: 46ch; color: #48433e; line-height: 1.55; }
+.page-open { display: block; padding: 0; border: 0; background: none; cursor: zoom-in; width: 100%; max-width: 440px; }
+.page-card img { display: block; width: 100%; max-width: 440px; height: auto; border-radius: 10px; border: 1px solid var(--paper-rule); }
+.page-card figcaption { margin-top: 6px; color: var(--paper-muted); font-size: 12px; }
+.page-card kbd { font: 600 .85em ui-monospace, SFMono-Regular, Menlo, monospace; padding: .05em .4em; border: 1px solid var(--paper-rule); border-radius: 4px; background: #fffdf8; }
+@media (max-width: 1100px) { .sr-pages .pages-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 760px) { .sr-pages .pages-grid { grid-template-columns: minmax(0, 1fr); } }
 .herdr-shot figcaption { margin-top: 6px; color: var(--paper-muted); font-size: 12px; }
 
 /* built for / on top of: static strip */
@@ -857,9 +902,13 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 }
 .sr-name { display: flex; align-items: center; gap: clamp(12px, 2vw, 28px); }
 .sr-name-mark { height: .8em; width: auto; display: block; }
+/* Letterpress: the wordmark is pressed into the paper. */
+.sr-foot { background: linear-gradient(#efebe2, var(--anatomy-page) 38%); box-shadow: inset 0 1px 0 #fffdf8, inset 0 2px 0 rgba(36,33,30,.06); border-radius: 18px 18px 0 0; }
+.sr-name { color: #e9e4da; text-shadow: 0 -1px 1px rgba(36,33,30,.30), 0 -2px 2px rgba(36,33,30,.08), 0 2px 1px rgba(255,255,255,.95), 0 3px 3px rgba(255,255,255,.6); }
+.sr-name-mark { opacity: .9; filter: invert(.92) sepia(.2) brightness(1.06) drop-shadow(0 -1px 1px rgba(36,33,30,.35)) drop-shadow(0 2px 1px rgba(255,255,255,.95)); }
 .love-mark a { display: grid; justify-items: center; gap: 8px; text-decoration: none; color: var(--tl-ink); }
 .love-name { font: 600 12px/1 var(--sans); font-variant-caps: all-small-caps; text-transform: lowercase; letter-spacing: .14em; opacity: .72; }
-.herdr-shot img { aspect-ratio: 704 / 260; }
+.herdr-shot img { aspect-ratio: 840 / 1488; border-radius: 10px; }
 
 /* On the wire: what Claude sends and receives */
 .xc-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 30px 0 14px; }
@@ -910,9 +959,11 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
     <img src="assets/film/poster.jpg" alt="" width="1920" height="1080" fetchpriority="high">
   </picture>
   <video class="film-video" muted playsinline preload="none" aria-label="A silent Blender film about Self-Reflect"></video>
+  <div class="nav-glow" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
   <header class="film-header">
-    <a class="film-brand" href="#film"><img src="assets/self-reflect-mark.svg" alt="" width="27" height="27">Self-Reflect</a>
-    <nav class="film-nav" aria-label="Page">
+    <a class="film-brand" href="#film" aria-label="Self-Reflect, back to the top"><img src="assets/self-reflect-mark.svg" alt="" width="27" height="27"><span class="film-brand-word">Self-Reflect</span></a>
+    <button class="nav-more" type="button" aria-label="Show the navigation" aria-expanded="false" aria-controls="film-nav-links" hidden>»</button>
+    <nav class="film-nav" id="film-nav-links" aria-label="Page">
       <a href="#machine">Machine</a>
       <a class="film-nav-modules" href="#everything">Modules</a>
       <a class="film-nav-cost" href="#cost">Cost</a>
@@ -944,7 +995,7 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
       <div class="chapter-text">
         <p class="chapter-kicker">Live session</p>
         <h2 id="ch-label-open">Beside Claude as it works.</h2>
-        <p class="chapter-body">Self-Reflect works beside your Claude Code session on every turn. Hooks run on each prompt. A heads-up band brings in the history of a file you name. The pane shows where the work stands. It also checks old conclusions against git, and it can bring back turns a compaction replaced.</p>
+        <p class="chapter-body"><mark class="sr-hl">Self-Reflect works beside your Claude Code session on every turn.</mark> Hooks run on each prompt. A heads-up band brings in the history of a file you name. The pane shows where the work stands. It also checks old conclusions against git, and it can bring back turns a compaction replaced.</p>
         
       </div>
     </section><section class="tl-ch" id="ch-recall" data-mechanism="recall" aria-labelledby="ch-label-recall">
@@ -959,28 +1010,28 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
       <div class="chapter-text">
         <p class="chapter-kicker">Recap</p>
         <h2 id="ch-label-recap">Pick up where you left off.</h2>
-        <p class="chapter-body">When a session starts or resumes with enough evidence, Claude gets one paragraph covering the intent, what got done, what was settled, what is open, and any next step the evidence supports. Self-Reflect builds it from commits, tasks, and your own turns without calling a model.</p>
+        <p class="chapter-body">When a session starts or resumes with enough evidence, Claude gets one paragraph covering the intent, what got done, what was settled, what is open, and any next step the evidence supports. <mark class="sr-hl">Self-Reflect builds it from commits, tasks, and your own turns without calling a model.</mark></p>
         <dl class="tl-read"><div><dt>Example recap</dt><dd><code>Done: Added the retry limit. Settled: The limit counts attempts per request (see request). Open: Move limits to config.</code></dd></div></dl>
       </div>
     </section><section class="tl-ch" id="ch-dream" data-mechanism="dream" aria-labelledby="ch-label-dream">
       <div class="chapter-text">
         <p class="chapter-kicker">Dreams</p>
         <h2 id="ch-label-dream">Check what still holds.</h2>
-        <p class="chapter-body">While you are away, the daemon re-checks old conclusions against git and marks changes with the commit that made them. With model dream threads enabled, the dreamer can also ask what you might do differently and show the turns behind its question.</p>
+        <p class="chapter-body">While you are away, the daemon re-checks old conclusions against git and <mark class="sr-hl">marks changes with the commit that made them.</mark> With model dream threads enabled, the dreamer can also ask what you might do differently and show the turns behind its question.</p>
         <dl class="tl-read"><div><dt>Git receipts</dt><dd><code>[stale anchor] · [evolved]</code></dd></div><div><dt>Model dream threads</dt><dd><code>CSR_DREAM_THREADS=1</code></dd></div></dl>
       </div>
     </section><section class="tl-ch" id="ch-pane" data-mechanism="pane" aria-labelledby="ch-label-pane">
       <div class="chapter-text">
         <p class="chapter-kicker">Same page?</p>
         <h2 id="ch-label-pane">See where Claude missed an ask.</h2>
-        <p class="chapter-body">The companion pane shows the dreamer’s count of requests it saw, which Claude missed, and which were unclear. Press a key to send Claude a follow-up that gets the work back on course.</p>
+        <p class="chapter-body">The companion pane shows the dreamer’s count of requests it saw, which Claude missed, and which were unclear. <mark class="sr-hl">Press a key to send Claude a follow-up that gets the work back on course.</mark></p>
         <dl class="tl-read"><div><dt>Card</dt><dd><code>Same page? · Model’s read</code></dd></div></dl>
       </div>
     </section><section class="tl-ch" id="ch-lessons" data-mechanism="lessons" aria-labelledby="ch-label-lessons">
       <div class="chapter-text">
         <p class="chapter-kicker">Lessons</p>
         <h2 id="ch-label-lessons">Turn a repeated correction into a rule.</h2>
-        <p class="chapter-body">Self-Reflect gathers corrections you made in more than one session and proposes lines for CLAUDE.md. You can check the original turns before you add a line.</p>
+        <p class="chapter-body">Self-Reflect gathers corrections you made in more than one session and proposes lines for CLAUDE.md. <mark class="sr-hl">You can check the original turns before you add a line.</mark></p>
         <dl class="tl-read"><div><dt>Command</dt><dd><code>csr-engine lessons --project P</code></dd></div><div><dt>Example candidate</dt><dd><code>Put retry limits in the config file.</code></dd></div></dl>
       </div>
     </section></div>
@@ -990,7 +1041,7 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 <section class="sr-sec sr-loop" id="loop" aria-labelledby="loop-h">
   <p class="story-kicker">How it works</p>
   <h2 id="loop-h">An engine that checks. A Claude that looks back.</h2>
-  <p class="story-lead">Self-Reflect joins two parts. The engine is deterministic Rust: the same input gives the same output. Claude does the reflecting. Each part checks the other.</p>
+  <p class="story-lead">Self-Reflect joins two parts. The engine is deterministic Rust: the same input gives the same output. Claude does the reflecting. <mark class="sr-hl">Each part checks the other.</mark></p>
   <div class="loop-fig">
     <article class="loop-card loop-engine">
       <svg class="loop-glyph" viewBox="-44 -26 88 64" width="88" height="64" aria-hidden="true">
@@ -1027,6 +1078,7 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 <section class="sr-sec sr-exchange" id="exchange" aria-labelledby="xc-h">
   <p class="story-kicker">On the wire</p>
   <h2 id="xc-h">What Claude sends, what Claude receives.</h2>
+  <p class="story-lead"><mark class="sr-hl">Claude gets a few short lines and a pointer to the turns behind them.</mark></p>
   <div class="xc-tabs" role="tablist" aria-label="Hook examples">
     <button class="xc-tab" type="button" role="tab" id="xc-tab-start" aria-controls="xc-panel-start" aria-selected="true" tabindex="0">Session start</button>
     <button class="xc-tab" type="button" role="tab" id="xc-tab-prompt" aria-controls="xc-panel-prompt" aria-selected="false" tabindex="-1">A prompt</button>
@@ -1070,6 +1122,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
 
 <section class="sr-sec sr-bento" id="everything" aria-labelledby="everything-title">
   <h2 id="everything-title">Everything inside.</h2>
+  <p class="story-lead"><mark class="sr-hl">All of it ships in one Rust binary.</mark></p>
   
     <section class="module-group module-before" aria-labelledby="module-before">
       <h3 id="module-before">Before you start</h3>
@@ -1239,7 +1292,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
       <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M4 8a6 6 0 1 1 1 6M4 3v5h5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Replay</span>
     </button>
   </div>
-  <p class="mirror-bridge">Claude can read back the same evidence even after the original transcript is gone.</p>
+  <p class="mirror-bridge"><mark class="sr-hl">Claude can read back the same evidence even after the original transcript is gone.</mark></p>
   <div class="mirror-panels">
     <div class="mirror-panel mirror-delete">
       <h3>Claude Code</h3>
@@ -1319,7 +1372,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
       <li><b>One binary, one daemon.</b> The index is a local SQLite file and a local vector index under <code>~/.claude-self-reflect</code>.</li>
       <li><b>Embeddings run here.</b> The embedding model (all-MiniLM-L6-v2, about 90 MB) downloads once, then runs on your machine through FastEmbed.</li>
       <li><b>Model calls go only to Claude.</b> They are background <code>claude -p</code> calls on your plan. If you set your own API key, the optional batch lane uses that key instead. <code>CSR_NO_AI_NARRATIVES=1</code> stops them. <code>CSR_NO_DREAMING=1</code> stops dreams.</li>
-      <li><b>Quiet by design.</b> The daemon works when something happens, then rests. Companion panes rest too.</li>
+      <li><b>Quiet by design.</b> <mark class="sr-hl">The daemon works when something happens, then rests.</mark> Companion panes rest too.</li>
     </ul>
     <div class="dm" role="img" aria-label="The daemon wakes on a hook event or a changed transcript, does its work, then rests.">
       <ol class="dm-steps">
@@ -1352,7 +1405,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
     <h2 id="herdr-h">The pane lives in herdr.</h2>
     <p class="story-lead"><a class="sr-link" href="https://herdr.dev">herdr</a> is a terminal workspace manager for AI coding agents. Claude Code runs in one pane. The Self-Reflect companion runs in the pane beside it.</p>
     <ul class="herdr-gives">
-      <li><b>A pane beside the session.</b> The companion sits next to Claude and never covers it.</li>
+      <li><b>A pane beside the session.</b> <mark class="sr-hl">The companion sits next to Claude and never covers it.</mark></li>
       <li><b>Focus events that wake the pane.</b> herdr tells the pane when you look at it, so a resting pane wakes at once.</li>
       <li><b>Whether Claude is working.</b> The pane rests only when herdr says Claude is idle and unfocused.</li>
       <li><b>Pictures.</b> The pane draws charts and cards as pictures, and herdr shows them in the split.</li>
@@ -1360,14 +1413,41 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
     <p class="herdr-how"><code>brew install herdr</code> then <code>csr-engine companion serve</code>. The pane needs Claude Code 2.1.296 or later.</p>
   </div>
   <figure class="herdr-shot">
-    <img src="assets/pane-gauges.jpg" alt="The companion pane showing usage pace for the 5-hour and weekly limits and a context gauge." width="704" height="260" loading="lazy">
-    <figcaption>Companion pane · demo data</figcaption>
+    <img src="assets/shots/pane-full.webp" alt="The full companion pane, top to bottom: the dreamer, Same page?, a skill or memory suggestion, Lost and found, where the work stands, usage pace, and the context gauge." width="840" height="1488" loading="lazy" decoding="async">
+    <figcaption>The whole pane in herdr · maintainer’s live session, 2026-11-20</figcaption>
   </figure>
+</section>
+
+<section class="sr-sec sr-pages" id="pane-pages" aria-labelledby="pages-h">
+  <p class="story-kicker">Inside the pane</p>
+  <h2 id="pages-h">Three pages behind the cards.</h2>
+  <p class="story-lead"><mark class="sr-hl">See what Claude did, exactly what Self-Reflect told it, and what it suggests you keep.</mark></p>
+  <div class="pages-grid">
+    <figure class="page-card">
+      <h3>Monologue <kbd>t</kbd></h3>
+      <p>The session thinking out loud. Each row says what happened: you asked, Claude tinkered, a worker was delegated or heard back, a compaction made room, a dream wondered. Rows left open come back in Lost and found.</p>
+      <button class="page-open" type="button" aria-label="Enlarge: the Monologue page"><img src="assets/shots/monologue.webp" alt="The Monologue page: a timeline of rows tagged made room, left open, delegated, heard back, tinkered, noted and wondered." width="704" height="975" loading="lazy" decoding="async"></button>
+      <figcaption>Maintainer’s live session, 2026-11-20. Press <kbd>t</kbd> again to go back.</figcaption>
+    </figure>
+    <figure class="page-card">
+      <h3>What CSR told Claude</h3>
+      <p>Every block Self-Reflect put in front of Claude this run, and its size. After this compaction it was about 900 tokens. Claude reads it as history, not as tasks. Press <kbd>r</kbd> to resume from it or <kbd>c</kbd> to copy it.</p>
+      <button class="page-open" type="button" aria-label="Enlarge: the What CSR told Claude page"><img src="assets/shots/told-claude.webp" alt="The What CSR told Claude page: where you left off, then the open Lost and found threads, with Resume, copy and close keys." width="700" height="1223" loading="lazy" decoding="async"></button>
+      <figcaption>Opens from the “CSR handed over” row. Home-folder path and private notes blurred.</figcaption>
+    </figure>
+    <figure class="page-card">
+      <h3>Should be a skill, memory or tool <kbd>o</kbd></h3>
+      <p>Self-Reflect spots something you keep asking for and proposes where it belongs: a skill, a memory or a tool. The evidence is your own words. Press <kbd>s</kbd> to send it to Claude or <kbd>x</kbd> to hide it.</p>
+      <button class="page-open" type="button" aria-label="Enlarge: the Should be a skill, memory or tool popup"><img src="assets/shots/should-be.webp" alt="A popup proposing a memory: homepage highlights use the yellow highlighter style, with the owner's own words as evidence and copy, send, hide, next and close keys." width="700" height="481" loading="lazy" decoding="async"></button>
+      <figcaption>1 of 5 proposals in the maintainer’s session, 2026-11-20.</figcaption>
+    </figure>
+  </div>
 </section>
 
 <section class="sr-sec sr-shots" id="screenshots" aria-labelledby="shots-h">
   <p class="story-kicker">Screenshots</p>
   <h2 id="shots-h">From a clean install, 2026-11-19.</h2>
+  <p class="story-lead"><mark class="sr-hl">Each one is a real screen from that install, not a mockup.</mark></p>
   <ul class="shot-grid">
     <li><figure class="shot">
       <button class="shot-open" type="button" aria-label="Enlarge: The installer says what setup will do, then asks once."><img src="assets/shots/install.webp" alt="The installer from the curl line, before setup runs. Home-folder paths are blurred." width="400" height="245" loading="lazy" decoding="async" data-fit="contain"></button>
@@ -1429,7 +1509,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
       <p class="sr-zero-t"><b>to install.</b> Free and MIT-licensed. Every line is on GitHub.</p>
       <a class="sr-gh" href="https://github.com/ramakay/claude-self-reflect"><svg viewBox="0 0 16 16" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span>Self-Reflect on GitHub</span></a>
     </div>
-    <p class="rv">Briefings and session stories use <code>claude -p</code> on your Claude plan by default. <code>csr-engine status</code> counts background calls.</p>
+    <p class="rv">Briefings and session stories use <code>claude -p</code> <mark class="sr-hl">on your Claude plan</mark> by default. <code>csr-engine status</code> counts background calls.</p>
   </div>
   <dl class="sr-costs">
     <div class="rv"><dt>Briefings and stories</dt><dd>On by default. The maintainer’s machine made 17 to 50 Haiku calls per complete day in the measured week, using about 0.4 to 1.1 million tokens per day, mostly cache writes.</dd><dd class="sr-sw"><code>CSR_NO_AI_NARRATIVES=1</code> stops every background <code>claude -p</code> call.</dd></div>
@@ -1442,7 +1522,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
 <section class="sr-sec sr-calc" id="calc" aria-labelledby="ca-h">
   <div class="sr-copy">
     <h2 id="ca-h" class="rv">Your plan, or the API?</h2>
-    <p class="rv">The background calls run on the Claude plan you already pay for, so Self-Reflect adds nothing to your bill. Here is what the same calls would cost at Haiku 5.5 API rates.</p>
+    <p class="rv">The background calls run on the Claude plan you already pay for, so <mark class="sr-hl">Self-Reflect adds nothing to your bill.</mark> Here is what the same calls would cost at Haiku 5.5 API rates.</p>
   </div>
   <form class="sr-calcbox rv" data-calc onsubmit="return false">
     <label><span>Calls a day <output data-o="calls">35</output></span><input type="range" min="0" max="200" step="1" value="35" data-i="calls"></label>
@@ -1465,7 +1545,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
   <ul class="sr-facts">
     <li class="rv"><b>One Rust binary.</b> No cloud, no Docker, no Python, no database server.</li>
     <li class="rv"><b>Consent first.</b> Setup asks before it turns anything on.</li>
-    <li class="rv"><b>Private tags.</b> Text inside <code>&lt;private&gt;</code> tags never reaches the index or the mirror.</li>
+    <li class="rv"><b>Private tags.</b> <mark class="sr-hl">Text inside <code>&lt;private&gt;</code> tags never reaches the index or the mirror.</mark></li>
     <li class="rv"><b>Secrets redacted.</b> Keys and tokens become <code>[secret redacted: &lt;kind&gt;]</code> before indexing or mirroring.</li>
     <li class="rv"><b>No prompt text in logs.</b> Timing lines keep counts and a salted hash, with the salt in a local <code>0600</code> file.</li>
     <li class="rv"><b>Loopback journal.</b> The journal listens on loopback, requires CSRF tokens for changes, and serves pages with <code>default-src 'none'</code>.</li>
@@ -1478,7 +1558,7 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
 <section class="sr-sec sr-install" id="install" aria-labelledby="in-h">
   <h2 id="in-h" class="rv">Install Self-Reflect 10.1.</h2>
   <div class="sr-cmd rv"><code id="sr-curl">curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh</code><button type="button" class="sr-btn" data-copy="sr-curl">Copy</button></div>
-  <p class="rv">Prebuilt for macOS on Apple Silicon and for Linux on x86_64 and ARM64. Setup asks before it turns anything on.</p>
+  <p class="rv">Prebuilt for macOS on Apple Silicon and for Linux on x86_64 and ARM64. <mark class="sr-hl">Setup asks before it turns anything on.</mark></p>
   <p class="rv"><a class="sr-link" href="https://github.com/ramakay/claude-self-reflect">Read the install steps on GitHub</a></p>
 </section>
 </div>
@@ -2370,7 +2450,7 @@ document.addEventListener("visibilitychange", () => {
   if (!box || typeof box.showModal !== 'function') return;
   const big = box.querySelector('img');
   const cap = box.querySelector('.shot-box-cap');
-  document.querySelectorAll('.shot-open').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('.shot-open, .page-open').forEach(b => b.addEventListener('click', () => {
     const img = b.querySelector('img');
     big.src = img.currentSrc || img.src;
     big.alt = img.alt;
@@ -2378,4 +2458,32 @@ document.addEventListener("visibilitychange", () => {
     box.showModal();
   }));
   box.addEventListener('click', e => { if (e.target === box) box.close(); });
+})();</script><script>(() => {
+  const film = document.querySelector('.film');
+  if (!film || !('IntersectionObserver' in window)) return;
+  const root = document.documentElement;
+  new IntersectionObserver(([e]) => {
+    root.toggleAttribute('data-nav-stuck', !e.isIntersecting);
+    if (e.isIntersecting) root.removeAttribute('data-nav-collapsed');
+  },
+    { rootMargin: '-72px 0px 0px 0px' }).observe(film);
+  // Phones: fold the stuck pill on a downward scroll; the » button opens it again.
+  const phone = matchMedia('(max-width: 600px)');
+  const more = document.querySelector('.nav-more');
+  if (!more) return;
+  let lastY = scrollY, openedAt = null;
+  const fold = on => {
+    root.toggleAttribute('data-nav-collapsed', on);
+    more.hidden = !on;
+    more.setAttribute('aria-expanded', String(!on));
+  };
+  addEventListener('scroll', () => {
+    const y = scrollY, down = y > lastY;
+    lastY = y;
+    if (!phone.matches || !root.hasAttribute('data-nav-stuck')) { if (root.hasAttribute('data-nav-collapsed')) fold(false); return; }
+    if (openedAt !== null) { if (y - openedAt > 80) openedAt = null; else return; }
+    if (down && !root.hasAttribute('data-nav-collapsed')) fold(true);
+  }, { passive: true });
+  more.addEventListener('click', () => { openedAt = scrollY; fold(false); [...document.querySelectorAll('.film-nav a')].find(l => l.offsetParent)?.focus({ preventScroll: true }); });
+  phone.addEventListener('change', () => fold(false));
 })();</script></body></html>
