@@ -28,6 +28,7 @@ A memory layer sits underneath as plumbing. It is one Rust binary (about 138 MB)
 
 - [What it does](#what-it-does) — Claude reflecting on its own work
 - [What we're working on](#what-were-working-on) — Measured numbers and open work
+- [Help wanted](#help-wanted-what-needs-work) — Open questions, and a prompt to hand your agent
 - [The Architecture](#one-binary) — How CSR solves it
 - [The Pipeline](#the-pipeline) — Progressive enrichment
 - [The Paper](#the-paper) — The research behind the retrieval design (two papers)
@@ -288,6 +289,52 @@ These are engineering items with numbers, not promises. Seven items; "not measur
 - Now: not measured yet.
 - Target: each returns a non-empty answer with receipts on a 10-query test set.
 - Doing: write the test set, then deepen the three tools.
+
+### Help wanted: what needs work
+
+The papers say plainly what is not shown yet. These are the open questions where an outside run would help most. Open an [issue](https://github.com/ramakay/claude-self-reflect/issues) with a result, start a [discussion](https://github.com/ramakay/claude-self-reflect/discussions) with a suggestion, or send a pull request from a fork.
+
+| Open question | Where it stands | What would settle it |
+|---|---|---|
+| Does it hold on someone else's history? | Every result comes from one operator's corpus. | Rerun the T3 and T4 kits in [`csr-engine/eval-kit/`](csr-engine/eval-kit/) on another corpus and publish the queries, labels and scores. |
+| A public contamination fixture | E3 used one dose on a private corpus; only its spec is public (`eval-kit/e3/spec.md`). | A rerunnable fixture with several doses, paraphrased re-asks and matched controls. |
+| Recovery after compaction, in real use | Transcripts Claude Code deleted stay readable, but agents almost never call `csr_transcript` after a compaction. | A controlled resume study: the same task resumed with and without the recovery tool. |
+| Paraphrased questions | Verbatim recall is near ceiling; paraphrase recall is weak. | A fresh set of natural paraphrase queries and a ranking change that clears a stated bar. |
+| Staleness benchmark | T4 has no held-out tag with a change that was later restored. | Add that case to the T4 kit and rerun. |
+| Lost and found, Same page | Both are built; neither has a labelled accuracy set. | A small hand-labelled set and a score against it. |
+
+**A prompt to hand your coding agent.** Copy it, fill in the item, and run it in a throwaway environment.
+
+```text
+You are contributing an outside measurement to Self-Reflect
+(https://github.com/ramakay/claude-self-reflect). Work only in a throwaway
+environment: a Linux container, a VM, or a CI runner. Do not install it into
+my everyday account; on macOS, setup also installs a launch agent.
+
+1. Clone the repo. Read docs/plans/annaswamy-2026-evaluating-self-recording-agents.pdf,
+   csr-engine/eval-kit/README.md and the "Help wanted" table in README.md.
+   The item I want to work on: <ITEM FROM THE TABLE>.
+2. Corpus. Either my own Claude Code history (copy ~/.claude/projects into the
+   sandbox; never paste transcript text into any issue or PR), or public MIT-licensed
+   Claude Code transcripts from Hugging Face:
+     hf download armand0e/claude-fable-5-claude-code --repo-type dataset --local-dir "$SCRATCH/hf/fable"
+     hf download crispwisp/wisp-claude-code-sessions --repo-type dataset --local-dir "$SCRATCH/hf/wisp"
+   Put each session's .jsonl under "$SCRATCH/home/.claude/projects/<project-folder>/".
+3. Install and import into the scratch home only:
+     curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
+     HOME="$SCRATCH/home" csr-engine setup --no-companion
+     HOME="$SCRATCH/home" csr-engine status
+4. Before you measure, write down the question, the metric, the control and the bar
+   that would count as a pass. Commit that note first.
+5. Run the measurement (the eval-kit scripts, `csr-engine eval --full`, or
+   `csr-engine bench`). Keep every command and its raw output.
+6. Report: the corpus (name and counts), the pre-registered bar, the result, what
+   failed, and the exact commands. A null or a loss is a useful result; say so plainly.
+   Never invent a number. Open it as an issue, or as a pull request from a fork if you
+   changed code or the kit.
+```
+
+Public datasets above: [armand0e/claude-fable-5-claude-code](https://huggingface.co/datasets/armand0e/claude-fable-5-claude-code) and [crispwisp/wisp-claude-code-sessions](https://huggingface.co/datasets/crispwisp/wisp-claude-code-sessions), both MIT. Both are small (under 1,000 sessions each), and the wisp set includes headless runs, so report human and headless counts separately.
 
 ---
 
