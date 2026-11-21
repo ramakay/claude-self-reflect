@@ -1,4 +1,4 @@
-# Gitleaks configuration for Claude Self-Reflect
+# Gitleaks configuration for Self-Reflect
 # This file configures secret scanning to reduce false positives
 
 [extend]
@@ -61,7 +61,7 @@ paths = ['''^work/claude-self-reflect/claude-self-reflect/results\.sarif$''']
 
 [allowlist]
 # Global allowlist configuration
-description = "Allowlists for Claude Self-Reflect"
+description = "Allowlists for Self-Reflect"
 
 # Allow test and archived directories
 paths = [
@@ -89,5 +89,13 @@ regexes = [
     '''YOUR_VOYAGE_KEY''',
     '''EXAMPLE_.*_KEY''',
     '''no API calls''',
-    '''no API keys'''
+    '''no API keys''',
+    # Rust fixtures and SQL that trip the default rules. Each entry matches the
+    # flagged value exactly, so a real key in the same file still fails.
+    '''^witness_verdicts_v2_floor$''',
+    '''^sk-0123456789abcdefghij$''',
+    '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.''',
+    '''^-----BEGIN (RSA )?PRIVATE KEY-----\\n(abc|MIIEow\\nabc|\{body\})\\n-----END ''',
+    # Claude session UUIDs used as eval-data keys are ids, not credentials.
+    '''^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'''
 ]

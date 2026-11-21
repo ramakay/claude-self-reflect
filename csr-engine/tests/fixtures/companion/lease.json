@@ -1,0 +1,80 @@
+[
+  {
+    "step": "take",
+    "held": null,
+    "root": "dev",
+    "rank": 1,
+    "busy": true,
+    "output": {
+      "held": true,
+      "lease": {
+        "root": "dev",
+        "rank": 1,
+        "at": 1792320000001,
+        "busy": true
+      }
+    }
+  },
+  {
+    "step": "take",
+    "held": {
+      "root": "installed",
+      "rank": 0,
+      "at": 1792320000000.0,
+      "busy": true
+    },
+    "root": "dev",
+    "rank": 1,
+    "busy": true,
+    "output": {
+      "held": false,
+      "lease": {
+        "root": "installed",
+        "rank": 0,
+        "at": 1792320000000.0,
+        "busy": true
+      }
+    }
+  },
+  {
+    "step": "renew",
+    "held": {
+      "root": "dev",
+      "rank": 1,
+      "at": 1792320000000.0,
+      "busy": true
+    },
+    "root": "dev",
+    "rank": 1,
+    "busy": false,
+    "output": {
+      "held": true,
+      "lease": {
+        "root": "dev",
+        "rank": 1,
+        "at": 1792320000001,
+        "busy": true
+      }
+    }
+  },
+  {
+    "step": "release",
+    "held": {
+      "root": "dev",
+      "rank": 1,
+      "at": 1792320000000.0,
+      "busy": true
+    },
+    "root": "dev",
+    "rank": 1,
+    "busy": false,
+    "output": {
+      "held": true,
+      "lease": {
+        "root": "dev",
+        "rank": 1,
+        "at": 1792320000000.0
+      }
+    }
+  }
+]

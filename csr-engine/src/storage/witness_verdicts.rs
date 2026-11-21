@@ -18,16 +18,30 @@
 //!
 //! [`insert_verdict_if_changed`] is the only write entry point. It compares
 //! the candidate event against the LATEST recorded event for that
-//! `witness_id` (see [`is_new_event`]) and skips the insert iff the two are
-//! identical in `(verdict, successor_witness_id, receipt_oid,
-//! observed_head_oid)` — so re-running `dream` at an unchanged HEAD with an
-//! unchanged conclusion adds nothing. There is deliberately NO UNIQUE
+//! `witness_id` (see [`is_new_event`]) and skips the insert iff the two carry
+//! the SAME VERDICT KIND. Event identity is the verdict kind only: the same
+//! conclusion re-confirmed at a newer `observed_head_oid`, with a different
+//! `receipt_oid`, or pointing at a different `successor_witness_id` is NOT a
+//! new event — it is the same conclusion, and re-recording it per HEAD
+//! (62k of 74k events in one live database) buried the real transitions and
+//! made every re-confirmation look like news. There is deliberately NO UNIQUE
 //! identity index backstop on the table: event history legitimately
 //! re-visits earlier states (B -> A -> B — superseded, reinstated, then
 //! superseded again with the exact same fields as the first event), and a
 //! UNIQUE index would silently swallow that third event, freezing the
 //! witness at "reinstated" forever. Only the latest event per witness
-//! matters, so "skip iff identical to latest" is the whole contract.
+//! matters, so "skip iff the latest has the same verdict kind" is the whole
+//! contract.
+//!
+//! # Live events (the v2 epoch floor)
+//!
+//! Events minted before the epoch floor (`meta` key
+//! `witness_verdicts_v2_floor`, set once by the migration to the table's
+//! `MAX(id)` the first time a binary with the fixed join opens a database)
+//! came out of the old buggy join. The table is append-only so they stay,
+//! but every reader ignores `id <= floor` — see
+//! [`LIVE_EVENT_FLOOR_SQL`]. A witness whose only events are below the floor
+//! is judged fresh by the join.
 //!
 //! # Symbol-level current state (order-independent, two channels)
 //!
@@ -72,6 +86,23 @@
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
+
+/// `meta` key holding the v2 epoch floor: the `MAX(id)` of `witness_verdicts`
+/// at the moment the first binary with the fixed dream join opened the
+/// database (see `storage::migrations`). Events with `id <= floor` were
+/// minted by the old buggy join; they stay in the append-only table but are
+/// invisible to every live reader.
+pub(crate) const LIVE_FLOOR_META_KEY: &str = "witness_verdicts_v2_floor";
+
+/// THE one place the live-event rule lives: an uncorrelated scalar subquery
+/// yielding the epoch floor (0 when the key is absent, e.g. a bare test
+/// schema). Every reader that feeds the dream join or a user-visible
+/// surface appends `AND <alias>.id > ` + this constant. SQLite evaluates the
+/// uncorrelated subquery once per statement, and `id > N` stays a rowid /
+/// index-column range test, so partial-index plans (the recap feed's
+/// `idx_witness_verdicts_recap_created`) keep working.
+pub(crate) const LIVE_EVENT_FLOOR_SQL: &str = "COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'witness_verdicts_v2_floor'), 0)";
 
 /// The three deterministic conclusions the `dream` successor join can draw
 /// about a witness. There is no "unknown" variant — every witness with more
@@ -129,8 +160,12 @@ pub struct WitnessVerdictRow {
     pub verdict: VerdictKind,
     /// Set only for `SupersededBy`.
     pub successor_witness_id: Option<i64>,
-    /// Commit proving the verdict: the successor's `at_oid` for
-    /// `SupersededBy`, else the HEAD oid observed when the dream cycle ran.
+    /// The commit that made the change, found in git history by
+    /// `dream::receipt`: the first commit that deleted the symbol
+    /// (`AnchorObsolete`), first changed its normalized content
+    /// (`SupersededBy`), or first restored it (`AnchorReinstated`). Never the
+    /// observed HEAD and never the successor witness's `at_oid` -- when no
+    /// such commit can be named the dream abstains and writes no event.
     pub receipt_oid: Option<String>,
     /// HEAD (or, for a multi-repo dream run, that witness's own repo's HEAD)
     /// observed when the dream cycle that minted this event ran. Never
@@ -138,14 +173,17 @@ pub struct WitnessVerdictRow {
     pub observed_head_oid: String,
 }
 
-/// The latest recorded event for `witness_id` (highest `id` — insertion
-/// order, which for an append-only table is also chronological order) —
-/// `None` if no event has ever been recorded for it.
+/// The latest LIVE event for `witness_id` (highest `id` above the epoch
+/// floor — insertion order, which for an append-only table is also
+/// chronological order) — `None` if no live event has ever been recorded for
+/// it. A witness whose only events predate the floor reads as never judged.
 pub fn latest_event(conn: &Connection, witness_id: i64) -> Result<Option<WitnessVerdictRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid
-         FROM witness_verdicts WHERE witness_id = ?1 ORDER BY id DESC LIMIT 1",
-    )?;
+         FROM witness_verdicts
+         WHERE witness_id = ?1 AND id > {LIVE_EVENT_FLOOR_SQL}
+         ORDER BY id DESC LIMIT 1"
+    ))?;
     let row = stmt
         .query_row(params![witness_id], |row| {
             let verdict_str: String = row.get(1)?;
@@ -162,25 +200,21 @@ pub fn latest_event(conn: &Connection, witness_id: i64) -> Result<Option<Witness
 }
 
 /// `true` when `candidate` would be a genuinely NEW conclusion relative to
-/// `latest` — i.e. they differ in `verdict`, `successor_witness_id`,
-/// `receipt_oid`, or `observed_head_oid`. Pure (no I/O) so both the dry-run
+/// `latest` — i.e. there is no latest event, or the two differ in `verdict`
+/// kind. A different `observed_head_oid`, `receipt_oid` or
+/// `successor_witness_id` alone is NOT a new event: the same conclusion
+/// re-drawn at a newer HEAD adds nothing. Pure (no I/O) so both the dry-run
 /// preview path and the real write path in [`insert_verdict_if_changed`]
 /// share exactly one definition of "changed".
 pub fn is_new_event(latest: Option<&WitnessVerdictRow>, candidate: &WitnessVerdictRow) -> bool {
     match latest {
         None => true,
-        Some(latest) => {
-            latest.verdict != candidate.verdict
-                || latest.successor_witness_id != candidate.successor_witness_id
-                || latest.receipt_oid != candidate.receipt_oid
-                || latest.observed_head_oid != candidate.observed_head_oid
-        }
+        Some(latest) => latest.verdict != candidate.verdict,
     }
 }
 
-/// Insert `row` unless it is identical in `(verdict, successor_witness_id,
-/// receipt_oid, observed_head_oid)` to the LATEST recorded event for
-/// `row.witness_id` — see the module-level idempotency doc (app-side only,
+/// Insert `row` unless the LATEST live event for `row.witness_id` already has
+/// the same verdict kind (see [`is_new_event`]) — see the module-level idempotency doc (app-side only,
 /// no DB-level UNIQUE backstop). Returns whether a new row was actually
 /// written (the caller uses this for dream-cycle stats).
 ///
@@ -194,6 +228,20 @@ pub fn is_new_event(latest: Option<&WitnessVerdictRow>, candidate: &WitnessVerdi
 /// `BEGIN IMMEDIATE` takes the write lock up front, so no second writer can
 /// interleave between reading the latest event and appending the new one.
 pub fn insert_verdict_if_changed(conn: &Connection, row: &WitnessVerdictRow) -> Result<bool> {
+    insert_verdict_with_commit_time(conn, row, None)
+}
+
+/// [`insert_verdict_if_changed`] that also records the receipt commit's
+/// committer time (`receipt_committed_at`, RFC 3339 in the committer's own
+/// offset, e.g. `2026-09-12T22:57:11-07:00`, so its first 10 characters are
+/// the date `git log` shows) on the event it appends. Compare it with
+/// `julianday()`, which normalizes the offset; never compare it as text. The column is written once, at insert; nothing updates
+/// it later, so the ledger stays append-only.
+pub fn insert_verdict_with_commit_time(
+    conn: &Connection,
+    row: &WitnessVerdictRow,
+    receipt_committed_at: Option<&str>,
+) -> Result<bool> {
     // `new_unchecked` rather than `Connection::transaction` because the
     // storage locking idiom hands out `&Connection` (behind the Mutex), not
     // `&mut Connection`; the Mutex already guarantees the exclusive access
@@ -205,16 +253,19 @@ pub fn insert_verdict_if_changed(conn: &Connection, row: &WitnessVerdictRow) -> 
     }
     let changed = tx.execute(
         "INSERT INTO witness_verdicts
-            (witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+            (witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid,
+             receipt_committed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             row.witness_id,
             row.verdict.as_str(),
             row.successor_witness_id,
             row.receipt_oid,
             row.observed_head_oid,
+            receipt_committed_at,
         ],
     )?;
+    super::artifact_backfill::record_witness(&tx, &tx.last_insert_rowid().to_string())?;
     tx.commit()?;
     Ok(changed > 0)
 }
@@ -233,18 +284,143 @@ pub enum VerdictChannel {
     Annotate,
 }
 
+/// One storage-resolved verdict bound to a stable search chunk identity.
+/// Consumers must key ranking and annotation decisions by `chunk_id`; the
+/// conversation grouping used by batched reads is transport only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkWitnessVerdict {
+    pub chunk_id: String,
+    pub file: String,
+    pub symbol: Option<String>,
+    pub channel: VerdictChannel,
+    pub verdict: &'static str,
+    pub receipt_oid: Option<String>,
+}
+
+/// Persist an exact witness-to-chunk attribution. This relation is separate
+/// from the append-only verdict event stream because one witness may support
+/// multiple historical chunks, while verdict state continues to evolve.
+pub fn bind_witness_to_chunk(conn: &Connection, witness_id: i64, chunk_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO witness_chunk_bindings (witness_id, chunk_id) VALUES (?1, ?2)",
+        params![witness_id, chunk_id],
+    )?;
+    Ok(())
+}
+
+/// Publish the exact chunk attribution captured by the live code-graph hook
+/// for a newly inserted (or deduplicated) witness row. Historical nodes that
+/// predate chunk attribution safely leave no binding.
+pub fn bind_witness_row_to_node_chunk(
+    conn: &Connection,
+    row: &super::witness_ledger::WitnessLedgerRow,
+    node_id: &str,
+) -> Result<()> {
+    let witness_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM witness_ledger
+             WHERE project = ?1 AND file = ?2
+               AND COALESCE(symbol, '') = COALESCE(?3, '')
+               AND COALESCE(span_start, -1) = COALESCE(?4, -1)
+               AND COALESCE(span_end, -1) = COALESCE(?5, -1)
+               AND stamp = ?6 AND tier = ?7
+               AND COALESCE(at_oid, '') = COALESCE(?8, '')
+               AND source_kind = ?9
+               AND COALESCE(source_id, '') = COALESCE(?10, '')",
+            params![
+                row.project,
+                row.file,
+                row.symbol,
+                row.span_start,
+                row.span_end,
+                row.stamp,
+                row.tier,
+                row.at_oid,
+                row.source_kind,
+                row.source_id,
+            ],
+            |result| result.get(0),
+        )
+        .optional()?;
+    let chunk_id: Option<String> = conn
+        .query_row(
+            "SELECT n.last_chunk_id
+             FROM code_nodes n JOIN chunks c ON c.id = n.last_chunk_id
+             WHERE n.id = ?1 AND n.last_chunk_id IS NOT NULL",
+            params![node_id],
+            |result| result.get(0),
+        )
+        .optional()?;
+    if let (Some(witness_id), Some(chunk_id)) = (witness_id, chunk_id) {
+        bind_witness_to_chunk(conn, witness_id, &chunk_id)?;
+    }
+    Ok(())
+}
+
+/// Exact persisted `(chunk_id, conversation_id)` bindings for the supplied
+/// witnesses. Orphaned chunk ids abstain through the inner join.
+pub fn chunk_bindings_for_witnesses(
+    conn: &Connection,
+    witness_ids: &[i64],
+) -> Result<HashMap<i64, Vec<(String, String)>>> {
+    let mut out: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+    const BATCH: usize = 400;
+    for batch in witness_ids.chunks(BATCH) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders: Vec<String> = (1..=batch.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT b.witness_id, b.chunk_id, c.conversation_id
+             FROM witness_chunk_bindings b
+             JOIN chunks c ON c.id = b.chunk_id
+             WHERE b.witness_id IN ({})
+             ORDER BY b.witness_id, b.chunk_id",
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        for row in rows {
+            let (witness_id, chunk_id, conversation_id) = row?;
+            out.entry(witness_id)
+                .or_default()
+                .push((chunk_id, conversation_id));
+        }
+    }
+    Ok(out)
+}
+
 /// Order-independent CURRENT state of a `(project, file, symbol)` anchor —
 /// the resolved [`VerdictChannel`] plus a deterministic representative
 /// negative event for surfacing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SymbolVerdictState {
     pub channel: VerdictChannel,
+    /// Every witness whose latest event is negative. Exact chunk attribution
+    /// may have been recorded on an older witness than the representative,
+    /// so binding must consult the complete current negative set.
+    pub negative_witness_ids: Vec<i64>,
     /// The newest (highest event `id`) negative latest-event among the
     /// symbol's witnesses — the source of `verdict` and `receipt_oid` for
     /// surfacing; never a claim that global insertion order is meaningful
     /// across witnesses.
     pub representative: WitnessVerdictRow,
 }
+
+/// The ledger stamp of `(file, symbol)` at an observed HEAD. Project-agnostic
+/// by design (see `symbol_verdict_state`), so it is served by
+/// `idx_witness_ledger_file_symbol (file, symbol, at_oid)`: the project-led
+/// ledger indexes cannot answer it and it would scan the whole table.
+const HEAD_STAMP_SQL: &str = "SELECT stamp FROM witness_ledger
+     WHERE file = ?1 AND symbol IS ?2 AND at_oid = ?3
+     ORDER BY id DESC LIMIT 1";
+
+/// Whether any ledger row of `(file, symbol)` carries the given stamp. Same
+/// index as [`HEAD_STAMP_SQL`] (the `(file, symbol)` prefix).
+const INTACT_STAMP_SQL: &str = "SELECT EXISTS(SELECT 1 FROM witness_ledger
+         WHERE file = ?1 AND symbol IS ?2 AND stamp = ?3)";
 
 /// Resolve the module doc's two-channel rule for one anchor: `None` when no
 /// witness has a negative latest event; otherwise `Demote` or `Annotate`
@@ -262,15 +438,16 @@ pub fn symbol_verdict_state(
     // id order is chronological WITHIN one witness), returned newest-first
     // globally so index 0 carries the most recent `observed_head_oid` seen
     // for this symbol.
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT v.witness_id, v.verdict, v.successor_witness_id, v.receipt_oid, v.observed_head_oid
          FROM witness_verdicts v
          JOIN witness_ledger wl ON wl.id = v.witness_id
          WHERE wl.project = ?1 AND wl.file = ?2 AND wl.symbol IS ?3
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
            AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
                        WHERE v2.witness_id = v.witness_id)
-         ORDER BY v.id DESC",
-    )?;
+         ORDER BY v.id DESC"
+    ))?;
     let latest_per_witness: Vec<WitnessVerdictRow> = stmt
         .query_map(params![project, file, symbol], |row| {
             let verdict_str: String = row.get(1)?;
@@ -295,24 +472,23 @@ pub fn symbol_verdict_state(
     // whose `at_oid` equals the newest event's `observed_head_oid`); if ANY
     // witness of the symbol carries that stamp, the symbol is present at
     // current truth — evolution, not staleness: Annotate. Otherwise the
-    // symbol is truly gone or fully stale: Demote.
+    // symbol is truly gone or fully stale: Demote. These ledger lookups are
+    // PROJECT-AGNOSTIC (file + symbol only): the HEAD stamp pass assigns one
+    // project per file, so the HEAD row for the same absolute file+symbol may
+    // sit under a different project than the witness whose verdict is being
+    // resolved. Only the outer negative-event filter is project-scoped.
     let head_oid = &latest_per_witness[0].observed_head_oid;
     let head_stamp: Option<String> = conn
-        .query_row(
-            "SELECT stamp FROM witness_ledger
-             WHERE project = ?1 AND file = ?2 AND symbol IS ?3 AND at_oid = ?4
-             LIMIT 1",
-            params![project, file, symbol, head_oid],
-            |r| r.get(0),
-        )
+        .query_row(HEAD_STAMP_SQL, params![file, symbol, head_oid], |r| {
+            r.get(0)
+        })
         .optional()?;
     let intact_at_head = match head_stamp {
-        Some(head_stamp) => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM witness_ledger
-                 WHERE project = ?1 AND file = ?2 AND symbol IS ?3 AND stamp = ?4)",
-            params![project, file, symbol, head_stamp],
-            |r| r.get(0),
-        )?,
+        Some(head_stamp) => {
+            conn.query_row(INTACT_STAMP_SQL, params![file, symbol, head_stamp], |r| {
+                r.get(0)
+            })?
+        }
         None => false,
     };
     Ok(Some(SymbolVerdictState {
@@ -321,6 +497,11 @@ pub fn symbol_verdict_state(
         } else {
             VerdictChannel::Demote
         },
+        negative_witness_ids: latest_per_witness
+            .iter()
+            .filter(|event| event.verdict.is_negative())
+            .map(|event| event.witness_id)
+            .collect(),
         representative: representative.clone(),
     }))
 }
@@ -344,19 +525,20 @@ pub struct DreamEventRow {
     pub created_at: String,
 }
 
-/// Every `witness_verdicts` event ever recorded, newest-first, joined to its
+/// Every LIVE `witness_verdicts` event, newest-first, joined to its
 /// witness's `(project, file, symbol)` identity. This is EVERY event, not
 /// just the latest per witness — the dream report's timeline is a journal of
 /// conclusions drawn over time, not just current state (that's
 /// `all_demoted_symbols`/`symbol_verdict_state`).
 pub fn all_events_with_anchor(conn: &Connection) -> Result<Vec<DreamEventRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT v.id, wl.project, wl.file, wl.symbol, v.verdict, v.successor_witness_id,
                 v.receipt_oid, v.observed_head_oid, v.created_at
          FROM witness_verdicts v
          JOIN witness_ledger wl ON wl.id = v.witness_id
-         ORDER BY v.id DESC",
-    )?;
+         WHERE v.id > {LIVE_EVENT_FLOOR_SQL}
+         ORDER BY v.id DESC"
+    ))?;
     let rows = stmt
         .query_map([], |row| {
             let verdict_str: String = row.get(4)?;
@@ -376,12 +558,87 @@ pub fn all_events_with_anchor(conn: &Connection) -> Result<Vec<DreamEventRow>> {
     Ok(rows)
 }
 
+/// Conversation provenance for exact `(project, file, symbol)` anchors.
+///
+/// Sourced EXCLUSIVELY from the trusted transcript channel of
+/// `code_node_attribution`. `code_nodes.first_conv_id`/`last_conv_id` are
+/// file-level projections measured at ~50.7% per-symbol accuracy and are
+/// forbidden on consumer surfaces (see the two-channel attribution work);
+/// an anchor with no transcript attribution is absent from the returned map
+/// so callers can distinguish it honestly from a linked anchor.
+pub(crate) fn conversation_ids_for_anchors(
+    conn: &Connection,
+    anchors: &[(String, String, String)],
+) -> Result<std::collections::BTreeMap<(String, String, String), Vec<String>>> {
+    let mut out = std::collections::BTreeMap::new();
+    if anchors.is_empty() {
+        return Ok(out);
+    }
+
+    let mut unique = anchors.to_vec();
+    unique.sort();
+    unique.dedup();
+
+    // Three bind variables per anchor; stay below SQLite's conservative
+    // default 999-variable ceiling.
+    const BATCH: usize = 300;
+    for batch in unique.chunks(BATCH) {
+        let filters: Vec<String> = (0..batch.len())
+            .map(|i| {
+                let base = 3 * i + 1;
+                format!(
+                    "(project = ?{base} AND file = ?{} AND name = ?{})",
+                    base + 1,
+                    base + 2
+                )
+            })
+            .collect();
+        let sql = format!(
+            "SELECT n.project, n.file, n.name, a.source_id
+             FROM code_nodes n
+             JOIN code_node_attribution a
+               ON a.node_id = n.id AND a.channel = 'transcript'
+             WHERE {}
+             ORDER BY n.project, n.file, n.name, n.id",
+            filters.join(" OR ")
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = batch
+            .iter()
+            .flat_map(|(project, file, symbol)| {
+                [
+                    project as &dyn rusqlite::types::ToSql,
+                    file as &dyn rusqlite::types::ToSql,
+                    symbol as &dyn rusqlite::types::ToSql,
+                ]
+            })
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                (row.get(0)?, row.get(1)?, row.get(2)?),
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (key, source_id) = row?;
+            let ids = out.entry(key).or_insert_with(Vec::new);
+            if !source_id.is_empty() && !ids.contains(&source_id) {
+                ids.push(source_id);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The most recent dream cycle observed anywhere in the ledger: the globally
 /// newest event's `(observed_head_oid, created_at)`. `None` if no dream
 /// cycle has ever written an event (a fresh install, or `dream` never run).
 pub fn last_dream_run(conn: &Connection) -> Result<Option<(String, String)>> {
     conn.query_row(
-        "SELECT observed_head_oid, created_at FROM witness_verdicts ORDER BY id DESC LIMIT 1",
+        &format!(
+            "SELECT observed_head_oid, created_at FROM witness_verdicts
+             WHERE id > {LIVE_EVENT_FLOOR_SQL} ORDER BY id DESC LIMIT 1"
+        ),
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -393,8 +650,10 @@ pub fn last_dream_run(conn: &Connection) -> Result<Option<(String, String)>> {
 /// recorded (not latest-per-witness) — the report header's "totals by
 /// verdict type" and `status`'s `by_verdict` block.
 pub fn event_totals_by_verdict(conn: &Connection) -> Result<(i64, i64, i64)> {
-    let mut stmt =
-        conn.prepare("SELECT verdict, COUNT(*) FROM witness_verdicts GROUP BY verdict")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT verdict, COUNT(*) FROM witness_verdicts
+         WHERE id > {LIVE_EVENT_FLOOR_SQL} GROUP BY verdict"
+    ))?;
     let mut obsolete = 0i64;
     let mut superseded = 0i64;
     let mut reinstated = 0i64;
@@ -445,13 +704,14 @@ pub struct DemotedSymbol {
 /// batched fn deliberately excludes; they are the rare case (minted only for
 /// files with no symbol-level nodes).
 pub fn all_demoted_symbols(conn: &Connection) -> Result<Vec<DemotedSymbol>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT wl.project, wl.file, wl.symbol
          FROM witness_verdicts v
          JOIN witness_ledger wl ON wl.id = v.witness_id
          WHERE v.verdict IN ('anchor_obsolete','superseded_by')
-           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2 WHERE v2.witness_id = v.witness_id)",
-    )?;
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
+           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2 WHERE v2.witness_id = v.witness_id)"
+    ))?;
     let anchors: Vec<(String, String, Option<String>)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -487,6 +747,33 @@ pub fn all_demoted_symbols(conn: &Connection) -> Result<Vec<DemotedSymbol>> {
     Ok(out)
 }
 
+/// SQL for [`symbol_verdict_states_for_files`] over `pairs` `(project, file)`
+/// bind pairs. The correlated `wl2` probe is served by
+/// `idx_witness_ledger_file_symbol`.
+fn files_states_sql(pairs: usize) -> String {
+    let pair_filter: Vec<String> = (0..pairs)
+        .map(|i| format!("(wl.project = ?{} AND wl.file = ?{})", 2 * i + 1, 2 * i + 2))
+        .collect();
+    format!(
+        "SELECT wl.project, wl.file, wl.symbol,
+                v.witness_id, v.verdict, v.successor_witness_id,
+                v.receipt_oid, v.observed_head_oid,
+                EXISTS(SELECT 1 FROM witness_ledger wl2
+                       WHERE wl2.file = wl.file
+                         AND wl2.symbol IS wl.symbol
+                         AND wl2.at_oid = v.observed_head_oid)
+         FROM witness_verdicts v
+         JOIN witness_ledger wl ON wl.id = v.witness_id
+         WHERE wl.symbol IS NOT NULL
+           AND ({})
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
+           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
+                       WHERE v2.witness_id = v.witness_id)
+         ORDER BY v.id DESC",
+        pair_filter.join(" OR ")
+    )
+}
+
 /// Bulk variant of [`symbol_verdict_state`]: resolve the CURRENT state of
 /// EVERY symbol-level anchor recorded for the given `(project, file)` pairs,
 /// in ONE query per ≤400-pair batch (chunk binding previously issued one
@@ -517,26 +804,7 @@ pub fn symbol_verdict_states_for_files(
     // SQLITE_MAX_VARIABLE_NUMBER reasoning as `codegraph::nodes_for_conversations`.
     const BATCH: usize = 400;
     for batch in files.chunks(BATCH) {
-        let pair_filter: Vec<String> = (0..batch.len())
-            .map(|i| format!("(wl.project = ?{} AND wl.file = ?{})", 2 * i + 1, 2 * i + 2))
-            .collect();
-        let sql = format!(
-            "SELECT wl.project, wl.file, wl.symbol,
-                    v.witness_id, v.verdict, v.successor_witness_id,
-                    v.receipt_oid, v.observed_head_oid,
-                    EXISTS(SELECT 1 FROM witness_ledger wl2
-                           WHERE wl2.project = wl.project AND wl2.file = wl.file
-                             AND wl2.symbol IS wl.symbol
-                             AND wl2.at_oid = v.observed_head_oid)
-             FROM witness_verdicts v
-             JOIN witness_ledger wl ON wl.id = v.witness_id
-             WHERE wl.symbol IS NOT NULL
-               AND ({})
-               AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
-                           WHERE v2.witness_id = v.witness_id)
-             ORDER BY v.id DESC",
-            pair_filter.join(" OR ")
-        );
+        let sql = files_states_sql(batch.len());
         let params: Vec<&dyn rusqlite::types::ToSql> = batch
             .iter()
             .flat_map(|(p, f)| {
@@ -594,12 +862,54 @@ pub fn symbol_verdict_states_for_files(
                     } else {
                         VerdictChannel::Demote
                     },
+                    negative_witness_ids: events
+                        .iter()
+                        .filter(|(event, _)| event.verdict.is_negative())
+                        .map(|(event, _)| event.witness_id)
+                        .collect(),
                     representative: representative.clone(),
                 },
             );
         }
     }
     Ok(out)
+}
+
+/// SQL for [`symbol_verdict_states_for_lineages`]. The anchors arrive as ONE
+/// bound JSON array of `[project, file, symbol, source_id|null]` rows, so the
+/// text never changes with the number of anchors: it is parsed once per
+/// connection (`prepare_cached`) instead of once per call. A statement built
+/// from an `OR` of per-anchor filters costs far more to parse than to run.
+/// `wl` is reached through `idx_witness_ledger_lookup`; the correlated `wl2`
+/// probe is served by `idx_witness_ledger_file_symbol`.
+fn lineage_states_sql() -> String {
+    format!(
+        "SELECT wl.project, wl.file, wl.symbol,
+                v.witness_id, v.verdict, v.successor_witness_id,
+                v.receipt_oid, v.observed_head_oid,
+                EXISTS(SELECT 1 FROM witness_ledger wl2
+                       WHERE wl2.file = wl.file
+                         AND wl2.symbol IS wl.symbol
+                         AND wl2.at_oid = v.observed_head_oid
+                         AND ((wl.source_kind = 'backfill_rederived_v2'
+                               AND wl2.source_kind = 'backfill_rederived_v2'
+                               AND wl2.source_id IS wl.source_id)
+                              OR (wl.source_kind <> 'backfill_rederived_v2'
+                                  AND wl2.source_kind <> 'backfill_rederived_v2')))
+         FROM witness_verdicts v
+         JOIN witness_ledger wl ON wl.id = v.witness_id
+         JOIN (SELECT j.value ->> 0 AS project, j.value ->> 1 AS file,
+                      j.value ->> 2 AS symbol, j.value ->> 3 AS source_id
+               FROM json_each(?1) j) a
+           ON wl.project = a.project AND wl.file = a.file AND wl.symbol = a.symbol
+          AND ((a.source_id IS NULL AND wl.source_kind <> 'backfill_rederived_v2')
+               OR (wl.source_kind = 'backfill_rederived_v2'
+                   AND wl.source_id = a.source_id))
+         WHERE v.id > {LIVE_EVENT_FLOOR_SQL}
+           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
+                       WHERE v2.witness_id = v.witness_id)
+         ORDER BY v.id DESC"
+    )
 }
 
 /// Binding-only bulk state lookup. Each anchor carries the exact selected
@@ -612,58 +922,18 @@ pub(crate) fn symbol_verdict_states_for_lineages(
     anchors: &[(String, String, String, Option<String>)],
 ) -> Result<std::collections::BTreeMap<(String, String, String), SymbolVerdictState>> {
     let mut out = std::collections::BTreeMap::new();
-    const BATCH: usize = 200;
-    for batch in anchors.chunks(BATCH) {
-        let filters: Vec<String> = (0..batch.len())
-            .map(|i| {
-                let base = 4 * i + 1;
-                format!(
-                    "(wl.project = ?{base} AND wl.file = ?{} AND wl.symbol = ?{}
-                      AND ((?{} IS NULL AND wl.source_kind <> 'backfill_rederived_v2')
-                           OR (wl.source_kind = 'backfill_rederived_v2'
-                               AND wl.source_id = ?{})))",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 3
-                )
-            })
-            .collect();
-        let sql = format!(
-            "SELECT wl.project, wl.file, wl.symbol,
-                    v.witness_id, v.verdict, v.successor_witness_id,
-                    v.receipt_oid, v.observed_head_oid,
-                    EXISTS(SELECT 1 FROM witness_ledger wl2
-                           WHERE wl2.project = wl.project AND wl2.file = wl.file
-                             AND wl2.symbol IS wl.symbol
-                             AND wl2.at_oid = v.observed_head_oid
-                             AND ((wl.source_kind = 'backfill_rederived_v2'
-                                   AND wl2.source_kind = 'backfill_rederived_v2'
-                                   AND wl2.source_id IS wl.source_id)
-                                  OR (wl.source_kind <> 'backfill_rederived_v2'
-                                      AND wl2.source_kind <> 'backfill_rederived_v2')))
-             FROM witness_verdicts v
-             JOIN witness_ledger wl ON wl.id = v.witness_id
-             WHERE ({})
-               AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
-                           WHERE v2.witness_id = v.witness_id)
-             ORDER BY v.id DESC",
-            filters.join(" OR ")
-        );
-        let params: Vec<&dyn rusqlite::types::ToSql> = batch
-            .iter()
-            .flat_map(|(project, file, symbol, source_id)| {
-                [
-                    project as &dyn rusqlite::types::ToSql,
-                    file as &dyn rusqlite::types::ToSql,
-                    symbol as &dyn rusqlite::types::ToSql,
-                    source_id as &dyn rusqlite::types::ToSql,
-                ]
-            })
-            .collect();
-        let mut stmt = conn.prepare(&sql)?;
+    // A repeated anchor would join its ledger rows twice; the old `OR` filter
+    // collapsed duplicates, so collapse them here.
+    let distinct: std::collections::BTreeSet<&(String, String, String, Option<String>)> =
+        anchors.iter().collect();
+    if distinct.is_empty() {
+        return Ok(out);
+    }
+    {
+        let anchors_json = serde_json::to_string(&distinct)?;
+        let mut stmt = conn.prepare_cached(&lineage_states_sql())?;
         let rows: Vec<((String, String, String), WitnessVerdictRow, bool)> = stmt
-            .query_map(params.as_slice(), |row| {
+            .query_map([anchors_json.as_str()], |row| {
                 let verdict_str: String = row.get(4)?;
                 Ok((
                     (row.get(0)?, row.get(1)?, row.get(2)?),
@@ -700,6 +970,11 @@ pub(crate) fn symbol_verdict_states_for_lineages(
                     } else {
                         VerdictChannel::Demote
                     },
+                    negative_witness_ids: events
+                        .iter()
+                        .filter(|(event, _)| event.verdict.is_negative())
+                        .map(|(event, _)| event.witness_id)
+                        .collect(),
                     representative: representative.clone(),
                 },
             );
@@ -708,579 +983,185 @@ pub(crate) fn symbol_verdict_states_for_lineages(
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::witness_ledger::{self, WitnessLedgerRow};
+// --- SINCE THEN payback panel (journal v2 Phase 5) --------------------------
+//
+// The panel renders the dream's RE-DELIBERATION about a symbol, not the
+// two-channel demote/annotate calculus `symbol_verdict_state` resolves for
+// chunk ranking (that answers "how should search treat this chunk today";
+// this answers "what did the dream conclude, last, in plain language" for a
+// human reading the journal — dreaming-subconscious-principles.md's "double
+// deliberation" frame).
 
-    fn open() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::storage::migrations::run(&conn).unwrap();
-        conn
-    }
-
-    fn ledger_row(at_oid: &str, stamp: &str) -> WitnessLedgerRow {
-        WitnessLedgerRow {
-            id: 0,
-            project: "proj".into(),
-            file: "/repo/src/lib.rs".into(),
-            symbol: Some("foo".into()),
-            span_start: Some(1),
-            span_end: Some(3),
-            stamp: stamp.into(),
-            tier: "committed".into(),
-            at_oid: Some(at_oid.into()),
-            source_kind: "backfill".into(),
-            source_id: Some(at_oid.into()),
-        }
-    }
-
-    #[test]
-    fn no_event_recorded_returns_none() {
-        let conn = open();
-        assert!(latest_event(&conn, 999).unwrap().is_none());
-    }
-
-    #[test]
-    fn insert_and_query_round_trip() {
-        let conn = open();
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        let w1 = witness_ledger::latest_witness_for_symbol(
-            &conn,
-            "proj",
-            "/repo/src/lib.rs",
-            Some("foo"),
-        )
-        .unwrap()
-        .unwrap();
-        let wid: i64 = conn
-            .query_row(
-                "SELECT id FROM witness_ledger WHERE stamp = 'b3:1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(w1.stamp, "b3:1");
-
-        let row = WitnessVerdictRow {
-            witness_id: wid,
-            verdict: VerdictKind::AnchorObsolete,
-            successor_witness_id: None,
-            receipt_oid: Some("headoid".into()),
-            observed_head_oid: "headoid".into(),
-        };
-        let wrote = insert_verdict_if_changed(&conn, &row).unwrap();
-        assert!(wrote, "first insert must write");
-        let latest = latest_event(&conn, wid).unwrap().unwrap();
-        assert_eq!(latest.verdict, VerdictKind::AnchorObsolete);
-        assert_eq!(latest.observed_head_oid, "headoid");
-    }
-
-    #[test]
-    fn identical_event_at_same_head_is_a_no_op() {
-        let conn = open();
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        let wid: i64 = conn
-            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
-            .unwrap();
-        let row = WitnessVerdictRow {
-            witness_id: wid,
-            verdict: VerdictKind::AnchorObsolete,
-            successor_witness_id: None,
-            receipt_oid: Some("headoid".into()),
-            observed_head_oid: "headoid".into(),
-        };
-        assert!(insert_verdict_if_changed(&conn, &row).unwrap());
-        assert!(
-            !insert_verdict_if_changed(&conn, &row).unwrap(),
-            "identical (verdict, successor, observed_head_oid) at the same witness must not re-insert"
-        );
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn same_verdict_new_head_still_inserts_a_fresh_event() {
-        // Per the module doc: identity is (verdict, successor, observed_head_oid)
-        // — an unchanged conclusion re-confirmed at a NEW HEAD is not
-        // "identical" to the prior event and gets its own row.
-        let conn = open();
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        let wid: i64 = conn
-            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
-            .unwrap();
-        let row_at_head1 = WitnessVerdictRow {
-            witness_id: wid,
-            verdict: VerdictKind::AnchorObsolete,
-            successor_witness_id: None,
-            receipt_oid: Some("head1".into()),
-            observed_head_oid: "head1".into(),
-        };
-        let row_at_head2 = WitnessVerdictRow {
-            observed_head_oid: "head2".into(),
-            receipt_oid: Some("head2".into()),
-            ..row_at_head1.clone()
-        };
-        assert!(insert_verdict_if_changed(&conn, &row_at_head1).unwrap());
-        assert!(insert_verdict_if_changed(&conn, &row_at_head2).unwrap());
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 2, "a new observed HEAD must mint a fresh event");
-    }
-
-    #[test]
-    fn reinstatement_is_a_new_event_not_a_mutation() {
-        let conn = open();
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        let wid: i64 = conn
-            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
-            .unwrap();
-        insert_verdict_if_changed(
-            &conn,
-            &WitnessVerdictRow {
-                witness_id: wid,
-                verdict: VerdictKind::SupersededBy,
-                successor_witness_id: Some(42),
-                receipt_oid: Some("head1".into()),
-                observed_head_oid: "head1".into(),
-            },
-        )
-        .unwrap();
-        insert_verdict_if_changed(
-            &conn,
-            &WitnessVerdictRow {
-                witness_id: wid,
-                verdict: VerdictKind::AnchorReinstated,
-                successor_witness_id: None,
-                receipt_oid: Some("head2".into()),
-                observed_head_oid: "head2".into(),
-            },
-        )
-        .unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM witness_verdicts WHERE witness_id = ?1",
-                params![wid],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 2, "both events must survive — no mutation");
-        let latest = latest_event(&conn, wid).unwrap().unwrap();
-        assert_eq!(latest.verdict, VerdictKind::AnchorReinstated);
-    }
-
-    #[test]
-    fn a_b_evolution_is_annotate_not_demote() {
-        // Two different at_oid rows for the SAME (project, file, symbol);
-        // the OLDER one is superseded by the newer, which IS the row at the
-        // observed HEAD — plain A -> B evolution. A negative-latest witness
-        // exists AND a witness is intact at HEAD, so the state is the
-        // ANNOTATE channel (no rank effect), never Demote.
-        let conn = open();
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        witness_ledger::insert_witness(&conn, &ledger_row("bbb", "b3:2")).unwrap();
-        let old_id: i64 = conn
-            .query_row(
-                "SELECT id FROM witness_ledger WHERE at_oid = 'aaa'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let new_id: i64 = conn
-            .query_row(
-                "SELECT id FROM witness_ledger WHERE at_oid = 'bbb'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        insert_verdict_if_changed(
-            &conn,
-            &WitnessVerdictRow {
-                witness_id: old_id,
-                verdict: VerdictKind::SupersededBy,
-                successor_witness_id: Some(new_id),
-                receipt_oid: Some("bbb".into()),
-                observed_head_oid: "bbb".into(),
-            },
-        )
-        .unwrap();
-        let state = symbol_verdict_state(&conn, "proj", "/repo/src/lib.rs", Some("foo"))
-            .unwrap()
-            .expect("A -> B evolution must surface on the annotate channel");
-        assert_eq!(
-            state.channel,
-            VerdictChannel::Annotate,
-            "a witness intact at the observed HEAD (the 'bbb' row) blocks demotion"
-        );
-        assert_eq!(
-            state.representative.receipt_oid.as_deref(),
-            Some("bbb"),
-            "annotation carries the most recent negative event's receipt"
-        );
-    }
-
-    #[test]
-    fn vanished_symbol_is_demote() {
-        // Negative latest event AND no ledger row at the observed HEAD —
-        // the symbol is truly gone at current truth: DEMOTE channel.
-        let conn = open();
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        witness_ledger::insert_witness(&conn, &ledger_row("bbb", "b3:2")).unwrap();
-        let old_id: i64 = conn
-            .query_row(
-                "SELECT id FROM witness_ledger WHERE at_oid = 'aaa'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        insert_verdict_if_changed(
-            &conn,
-            &WitnessVerdictRow {
-                witness_id: old_id,
-                verdict: VerdictKind::AnchorObsolete,
-                successor_witness_id: None,
-                receipt_oid: Some("headoid".into()),
-                observed_head_oid: "headoid".into(), // no ledger row at this oid
-            },
-        )
-        .unwrap();
-        let state = symbol_verdict_state(&conn, "proj", "/repo/src/lib.rs", Some("foo"))
-            .unwrap()
-            .expect("obsolete with no HEAD witness must surface");
-        assert_eq!(state.channel, VerdictChannel::Demote);
-        assert_eq!(state.representative.verdict, VerdictKind::AnchorObsolete);
-    }
-
-    #[test]
-    fn no_verdict_recorded_returns_none_for_symbol_query() {
-        let conn = open();
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        assert!(
-            symbol_verdict_state(&conn, "proj", "/repo/src/lib.rs", Some("foo"))
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_b_a_revert_is_never_demoted_regardless_of_event_insertion_order() {
-        // A -> B -> A with the FULL event history a real dream run leaves
-        // behind: ledger rows at c1 (stamp A), c2 (stamp B), c3 (stamp A
-        // again, c3 == the most recent observed HEAD). The c1 witness
-        // carries superseded_by (minted at HEAD c2) then anchor_reinstated
-        // (minted at HEAD c3); the c2 (B) witness carries its own
-        // superseded_by (receipt c3) and stays NEGATIVE-latest while the A
-        // witnesses are intact at HEAD. By the two-channel rule that is
-        // ANNOTATE — "the symbol carries history of a rejected change",
-        // surfaced with the B-supersession receipt (c3) — and NEVER Demote,
-        // whichever ORDER c1's two events were inserted in (C1:
-        // order-independence).
-        for reversed in [false, true] {
-            let conn = open();
-            witness_ledger::insert_witness(&conn, &ledger_row("c1", "b3:A")).unwrap();
-            witness_ledger::insert_witness(&conn, &ledger_row("c2", "b3:B")).unwrap();
-            witness_ledger::insert_witness(&conn, &ledger_row("c3", "b3:A")).unwrap();
-            let oid_id = |oid: &str| -> i64 {
-                conn.query_row(
-                    "SELECT id FROM witness_ledger WHERE at_oid = ?1",
-                    params![oid],
-                    |r| r.get(0),
-                )
-                .unwrap()
-            };
-            let (c1_id, c2_id, c3_id) = (oid_id("c1"), oid_id("c2"), oid_id("c3"));
-            let c1_superseded = WitnessVerdictRow {
-                witness_id: c1_id,
-                verdict: VerdictKind::SupersededBy,
-                successor_witness_id: Some(c2_id),
-                receipt_oid: Some("c2".into()),
-                observed_head_oid: "c2".into(),
-            };
-            let c1_reinstated = WitnessVerdictRow {
-                witness_id: c1_id,
-                verdict: VerdictKind::AnchorReinstated,
-                successor_witness_id: None,
-                receipt_oid: Some("c3".into()),
-                observed_head_oid: "c3".into(),
-            };
-            // B's own supersession by the revert commit — its latest (and
-            // uncancelled) event.
-            let c2_superseded = WitnessVerdictRow {
-                witness_id: c2_id,
-                verdict: VerdictKind::SupersededBy,
-                successor_witness_id: Some(c3_id),
-                receipt_oid: Some("c3".into()),
-                observed_head_oid: "c3".into(),
-            };
-            let events: [&WitnessVerdictRow; 3] = if reversed {
-                [&c1_reinstated, &c1_superseded, &c2_superseded]
-            } else {
-                [&c1_superseded, &c1_reinstated, &c2_superseded]
-            };
-            for e in events {
-                insert_verdict_if_changed(&conn, e).unwrap();
-            }
-            let state = symbol_verdict_state(&conn, "proj", "/repo/src/lib.rs", Some("foo"))
-                .unwrap()
-                .expect("B's uncancelled negative event must surface");
-            assert_eq!(
-                state.channel,
-                VerdictChannel::Annotate,
-                "A->B->A must never demote (reversed insertion: {reversed})"
-            );
-            assert_eq!(
-                state.representative.receipt_oid.as_deref(),
-                Some("c3"),
-                "annotation carries the B-supersession receipt"
-            );
-        }
-    }
-
-    #[test]
-    fn b_a_b_state_revisit_inserts_three_events_and_reruns_add_nothing() {
-        // B -> A -> B: superseded, reinstated, then superseded again with
-        // the exact same fields as the first event. The third event DIFFERS
-        // from the latest (reinstated), so it must insert — the old UNIQUE
-        // identity index would have silently swallowed it (C2). A rerun of
-        // the same final event at the same HEAD then adds nothing.
-        let conn = open();
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        let wid: i64 = conn
-            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
-            .unwrap();
-        let superseded = WitnessVerdictRow {
-            witness_id: wid,
-            verdict: VerdictKind::SupersededBy,
-            successor_witness_id: Some(42),
-            receipt_oid: Some("succ".into()),
-            observed_head_oid: "head1".into(),
-        };
-        let reinstated = WitnessVerdictRow {
-            witness_id: wid,
-            verdict: VerdictKind::AnchorReinstated,
-            successor_witness_id: None,
-            receipt_oid: Some("head2".into()),
-            observed_head_oid: "head2".into(),
-        };
-        assert!(insert_verdict_if_changed(&conn, &superseded).unwrap());
-        assert!(insert_verdict_if_changed(&conn, &reinstated).unwrap());
-        assert!(
-            insert_verdict_if_changed(&conn, &superseded).unwrap(),
-            "re-visiting an earlier state must insert a THIRD event"
-        );
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 3, "B -> A -> B is three events");
-        let latest = latest_event(&conn, wid).unwrap().unwrap();
-        assert!(
-            latest.verdict.is_negative(),
-            "final state must be negative (superseded)"
-        );
-        assert!(
-            !insert_verdict_if_changed(&conn, &superseded).unwrap(),
-            "rerun at the same HEAD with the same conclusion adds nothing"
-        );
-        let count_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count_after, 3);
-    }
-
-    #[test]
-    fn all_events_with_anchor_joins_and_orders_newest_first() {
-        let conn = open();
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        witness_ledger::insert_witness(&conn, &ledger_row("bbb", "b3:2")).unwrap();
-        let old_id: i64 = conn
-            .query_row(
-                "SELECT id FROM witness_ledger WHERE at_oid = 'aaa'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let new_id: i64 = conn
-            .query_row(
-                "SELECT id FROM witness_ledger WHERE at_oid = 'bbb'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        insert_verdict_if_changed(
-            &conn,
-            &WitnessVerdictRow {
-                witness_id: old_id,
-                verdict: VerdictKind::SupersededBy,
-                successor_witness_id: Some(new_id),
-                receipt_oid: Some("bbb".into()),
-                observed_head_oid: "bbb".into(),
-            },
-        )
-        .unwrap();
-        insert_verdict_if_changed(
-            &conn,
-            &WitnessVerdictRow {
-                witness_id: old_id,
-                verdict: VerdictKind::AnchorReinstated,
-                successor_witness_id: None,
-                receipt_oid: Some("ccc".into()),
-                observed_head_oid: "ccc".into(),
-            },
-        )
-        .unwrap();
-        let events = all_events_with_anchor(&conn).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].verdict,
-            VerdictKind::AnchorReinstated,
-            "newest event first"
-        );
-        assert_eq!(events[0].project, "proj");
-        assert_eq!(events[0].symbol.as_deref(), Some("foo"));
-        assert_eq!(events[1].verdict, VerdictKind::SupersededBy);
-    }
-
-    #[test]
-    fn all_events_with_anchor_empty_db_returns_empty() {
-        let conn = open();
-        assert!(all_events_with_anchor(&conn).unwrap().is_empty());
-    }
-
-    #[test]
-    fn last_dream_run_reports_the_globally_newest_event() {
-        let conn = open();
-        assert!(
-            last_dream_run(&conn).unwrap().is_none(),
-            "no events ever recorded"
-        );
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        let wid: i64 = conn
-            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
-            .unwrap();
-        insert_verdict_if_changed(
-            &conn,
-            &WitnessVerdictRow {
-                witness_id: wid,
-                verdict: VerdictKind::AnchorObsolete,
-                successor_witness_id: None,
-                receipt_oid: Some("head1".into()),
-                observed_head_oid: "head1".into(),
-            },
-        )
-        .unwrap();
-        let (head_oid, created_at) = last_dream_run(&conn).unwrap().unwrap();
-        assert_eq!(head_oid, "head1");
-        assert!(!created_at.is_empty());
-    }
-
-    #[test]
-    fn event_totals_by_verdict_counts_every_event_not_just_latest() {
-        let conn = open();
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        let wid: i64 = conn
-            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
-            .unwrap();
-        insert_verdict_if_changed(
-            &conn,
-            &WitnessVerdictRow {
-                witness_id: wid,
-                verdict: VerdictKind::SupersededBy,
-                successor_witness_id: Some(42),
-                receipt_oid: Some("head1".into()),
-                observed_head_oid: "head1".into(),
-            },
-        )
-        .unwrap();
-        insert_verdict_if_changed(
-            &conn,
-            &WitnessVerdictRow {
-                witness_id: wid,
-                verdict: VerdictKind::AnchorReinstated,
-                successor_witness_id: None,
-                receipt_oid: Some("head2".into()),
-                observed_head_oid: "head2".into(),
-            },
-        )
-        .unwrap();
-        let (obsolete, superseded, reinstated) = event_totals_by_verdict(&conn).unwrap();
-        assert_eq!(obsolete, 0);
-        assert_eq!(
-            superseded, 1,
-            "counts the event even though it's no longer latest"
-        );
-        assert_eq!(reinstated, 1);
-    }
-
-    #[test]
-    fn all_demoted_symbols_finds_only_the_demote_channel_anchor() {
-        let conn = open();
-        // Anchor 1 ("foo"): vanished symbol -> Demote.
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        let foo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM witness_ledger WHERE stamp = 'b3:1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        insert_verdict_if_changed(
-            &conn,
-            &WitnessVerdictRow {
-                witness_id: foo_id,
-                verdict: VerdictKind::AnchorObsolete,
-                successor_witness_id: None,
-                receipt_oid: Some("headoid".into()),
-                observed_head_oid: "headoid".into(),
-            },
-        )
-        .unwrap();
-
-        // Anchor 2 ("bar"): plain A -> B evolution -> Annotate, never Demote.
-        let mut bar_a = ledger_row("bbb", "b3:bar-a");
-        bar_a.symbol = Some("bar".into());
-        let mut bar_b = ledger_row("ccc", "b3:bar-b");
-        bar_b.symbol = Some("bar".into());
-        witness_ledger::insert_witness(&conn, &bar_a).unwrap();
-        witness_ledger::insert_witness(&conn, &bar_b).unwrap();
-        let bar_a_id: i64 = conn
-            .query_row(
-                "SELECT id FROM witness_ledger WHERE stamp = 'b3:bar-a'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let bar_b_id: i64 = conn
-            .query_row(
-                "SELECT id FROM witness_ledger WHERE stamp = 'b3:bar-b'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        insert_verdict_if_changed(
-            &conn,
-            &WitnessVerdictRow {
-                witness_id: bar_a_id,
-                verdict: VerdictKind::SupersededBy,
-                successor_witness_id: Some(bar_b_id),
-                receipt_oid: Some("ccc".into()),
-                observed_head_oid: "ccc".into(),
-            },
-        )
-        .unwrap();
-
-        let demoted = all_demoted_symbols(&conn).unwrap();
-        assert_eq!(demoted.len(), 1, "only the vanished 'foo' anchor demotes");
-        assert_eq!(demoted[0].symbol.as_deref(), Some("foo"));
-        assert_eq!(demoted[0].state.channel, VerdictChannel::Demote);
-    }
-
-    #[test]
-    fn all_demoted_symbols_empty_when_no_negative_events() {
-        let conn = open();
-        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
-        assert!(all_demoted_symbols(&conn).unwrap().is_empty());
-    }
+/// The dream's most recent conclusion about one `(project, file, symbol)`
+/// anchor: the single latest `witness_verdicts` event across every witness
+/// of the symbol (not latest-per-witness — SINCE THEN is a human-readable
+/// journal entry, not a ranking input).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SinceThenConclusion {
+    /// `None` when no verdict event has ever been recorded for this symbol
+    /// — see `witnessed` to distinguish "dream never looked at this" from
+    /// "dream looked, found it intact."
+    pub verdict: Option<VerdictKind>,
+    pub receipt_oid: Option<String>,
+    /// `witness_verdicts.created_at`; set only alongside `verdict`.
+    pub event_date: Option<String>,
+    /// `true` when at least one `witness_ledger` row exists for this
+    /// anchor — i.e. codewitness has actually observed it, even if no
+    /// verdict event ever followed. `false` combined with `verdict: None`
+    /// is the UNVERIFIED case: no evidence exists at all, and per the
+    /// dreaming principles doc ("honest forgetting") absence of evidence is
+    /// never rendered as "live."
+    pub witnessed: bool,
+    /// `MAX(witness_ledger.created_at)` for this anchor when `witnessed` is
+    /// `true` and no verdict event exists — the date to show alongside
+    /// "witnessed ... unverified since" (F1: a witness at commit A is NOT
+    /// evidence the symbol is still intact at HEAD; we can only honestly
+    /// report *when* it was last witnessed, never that it is "still live").
+    /// `None` whenever `witnessed` is `false`, or a verdict event exists
+    /// (that event's own `event_date` is authoritative in that case).
+    pub witnessed_at: Option<String>,
 }
+
+/// Resolve [`SinceThenConclusion`] for one symbol. Deliberately a plain
+/// "what happened last" read, not `symbol_verdict_state`'s current-state
+/// resolution — a symbol that was superseded and later reinstated shows as
+/// `reinstated` here (the dream's LATEST word on it), while
+/// `symbol_verdict_state` would fold that same history into "not demoted."
+/// Both are correct for their own question; SINCE THEN asks the human's
+/// question ("what's the last thing the dream concluded"), not the ranker's.
+pub fn since_then_conclusion(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    symbol: &str,
+) -> Result<SinceThenConclusion> {
+    let event = conn
+        .query_row(
+            &format!(
+                "SELECT v.verdict, v.receipt_oid, v.created_at
+                 FROM witness_verdicts v
+                 JOIN witness_ledger wl ON wl.id = v.witness_id
+                 WHERE wl.project = ?1 AND wl.file = ?2 AND wl.symbol = ?3
+                   AND v.id > {LIVE_EVENT_FLOOR_SQL}
+                 ORDER BY v.id DESC LIMIT 1"
+            ),
+            params![project, file, symbol],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((verdict_str, receipt_oid, event_date)) = event {
+        return Ok(SinceThenConclusion {
+            verdict: VerdictKind::parse(&verdict_str),
+            receipt_oid,
+            event_date: Some(event_date),
+            witnessed: true,
+            witnessed_at: None,
+        });
+    }
+    let witnessed_at: Option<String> = conn.query_row(
+        "SELECT MAX(created_at) FROM witness_ledger
+             WHERE project = ?1 AND file = ?2 AND symbol = ?3",
+        params![project, file, symbol],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    let witnessed = witnessed_at.is_some();
+    Ok(SinceThenConclusion {
+        verdict: None,
+        receipt_oid: None,
+        event_date: None,
+        witnessed,
+        witnessed_at,
+    })
+}
+
+/// The claim of an OPEN (not yet promoted to `resolution_ledger`) proposal
+/// bound to one of a symbol's witnesses — the SINCE THEN panel's "so"
+/// evidence source #2 (a `resolution_proposals` row awaiting `csr_resolve`).
+/// `None` when the symbol has no witness at all, or no chunk bound to one of
+/// its witnesses carries a still-open proposal. Same "not yet promoted"
+/// predicate as `Storage::recap_open_proposals`.
+pub fn open_proposal_claim_for_symbol(
+    conn: &Connection,
+    project: &str,
+    file: &str,
+    symbol: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT p.claim
+         FROM witness_ledger wl
+         JOIN witness_chunk_bindings b ON b.witness_id = wl.id
+         JOIN resolution_proposals p ON p.chunk_id = b.chunk_id
+         WHERE wl.project = ?1 AND wl.file = ?2 AND wl.symbol = ?3
+           AND NOT EXISTS (
+               SELECT 1 FROM resolution_ledger r
+               WHERE r.chunk_id = p.chunk_id
+                 AND r.source = 'user_confirmed'
+                 AND julianday(r.created_at) > julianday(p.created_at)
+           )
+         ORDER BY p.id DESC LIMIT 1",
+        params![project, file, symbol],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// One calendar day's (`YYYY-MM-DD`, UTC) dream activity — the journal
+/// index's optional day-header digest: "while away: N anchors retired, M
+/// proposals open."
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DayDigest {
+    pub retired_count: i64,
+    pub proposal_count: i64,
+    /// Full commit oids of every retirement that day, newest first — for the
+    /// digest line's `title` attribute (receipts, not the visible chip
+    /// text).
+    pub receipts: Vec<String>,
+}
+
+/// Resolve [`DayDigest`] for one calendar day. Unscoped by project — the
+/// journal report itself groups sessions across every project in one
+/// timeline, so the digest matches that same corpus-wide scope (consistent
+/// with `DreamReportData::totals`, which is also corpus-wide).
+pub fn day_digest(conn: &Connection, day: &str) -> Result<DayDigest> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT receipt_oid FROM witness_verdicts
+         WHERE verdict IN ('superseded_by', 'anchor_obsolete')
+           AND id > {LIVE_EVENT_FLOOR_SQL}
+           AND SUBSTR(datetime(created_at), 1, 10) = ?1
+         ORDER BY id DESC"
+    ))?;
+    let receipt_rows: Vec<Option<String>> = stmt
+        .query_map(params![day], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let retired_count = receipt_rows.len() as i64;
+    let receipts: Vec<String> = receipt_rows.into_iter().flatten().collect();
+
+    let proposal_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resolution_proposals p
+         WHERE SUBSTR(datetime(p.created_at), 1, 10) = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM resolution_ledger r
+               WHERE r.chunk_id = p.chunk_id
+                 AND r.source = 'user_confirmed'
+                 AND julianday(r.created_at) > julianday(p.created_at)
+           )",
+        params![day],
+        |row| row.get(0),
+    )?;
+    Ok(DayDigest {
+        retired_count,
+        proposal_count,
+        receipts,
+    })
+}
+
+#[cfg(test)]
+#[path = "witness_verdicts_tests.rs"]
+mod tests;

@@ -1,80 +1,183 @@
+# The prod environment requires a human review before a release can proceed.
+# APPLIED 2026-08-08 — verified as
+# protection_rules:[required_reviewers], reviewers:[ramakay].
+# This workflow deliberately does not call the GitHub API to change repository
+# or environment settings; the one-time admin command is recorded here so the
+# setting is reproducible if the environment is ever recreated:
+#
+#   gh api --method PUT repos/ramakay/claude-self-reflect/environments/prod \
+#     --input - <<'JSON'
+#   {
+#     "prevent_self_review": false,
+#     "reviewers": [
+#       { "type": "User", "id": 1927846 }
+#     ]
+#   }
+#   JSON
+#
+# prevent_self_review is false on purpose: reviewer 1927846 (ramakay, the repo
+# owner) is also the person who pushes release tags. With a single reviewer,
+# prevent_self_review:true would mean the actor can never approve their own
+# deployment and no release could ever pass the gate.
+#
+# Known limit: the environment keeps can_admins_bypass:true, so a repo admin can
+# skip the approval entirely. With one maintainer who is also the sole reviewer
+# that is not a real weakening — revisit if more maintainers are added.
 name: Release
 
+# Two ways in:
+#   - push a v* tag: the real release (test, build, package, stage a draft, then
+#     publish the GitHub release and npm on the prod environment).
+#   - workflow_dispatch with dry_run=true (the default): a rehearsal on any ref.
+#     It runs the same test job, every build leg and the npm pack, then stops.
+#     It never claims a tag, creates a release or publishes to npm:
+#       gh workflow run release.yml --ref release/10.1.0 -f dry_run=true
+#     dry_run=false is accepted only on a v* tag ref, where it behaves like the
+#     tag push (for re-running a release whose tag push run was lost).
+# A tag with a prerelease suffix (v10.1.0-rc.1) publishes a GitHub prerelease and
+# the npm dist-tag `next`; it never becomes `latest` on either side.
 on:
   push:
     tags: ['v*']
-    # A branch named release/vX.Y.Z releases tag vX.Y.Z; the tag is claimed at
-    # the built commit by the release job.
-    branches: ['release/v*']
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Release tag (e.g. v9.3.1). Claimed at the dispatched commit if it doesn't already exist."
-        required: true
-        type: string
+      dry_run:
+        description: Rehearse only. Test, build and package every target, then stop before any release or publish.
+        type: boolean
+        default: true
 
-# Serialize releases so two runs cannot interleave around the tag claim. This
-# is defence in depth only — the atomic ref POST in the release job is what
-# actually decides the winner, since these groups do not coincide across
-# trigger types (a tag push and a release/v* push for the same version produce
-# different ref names, and expressions cannot normalize them).
+# Serialize releases so two runs for the same tag cannot interleave around the
+# tag claim. This is defence in depth only — the atomic ref POST in the
+# stage-release job is what actually decides the winner.
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  test:
+  plan:
     runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      version: ${{ steps.plan.outputs.version }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      npm_tag: ${{ steps.plan.outputs.npm_tag }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Test
-        run: cargo test --manifest-path csr-engine/Cargo.toml --locked
-      - name: Clippy
-        run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked -- -D warnings
+      - name: Decide what this run may do
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          pkg=$(node -p "require('./package.json').version")
+          cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' csr-engine/Cargo.toml | head -n 1)
+          if [ "$pkg" != "$cargo" ]; then
+            echo "::error::package.json is ${pkg} but csr-engine/Cargo.toml is ${cargo}."
+            exit 1
+          fi
+          publish=false
+          if [ "$EVENT" = push ]; then
+            publish=true
+          elif [ "$DRY_RUN" = false ]; then
+            case "$REF" in
+              refs/tags/v*) publish=true ;;
+              *) echo "::error::dry_run=false needs a v* tag ref, got ${REF}."; exit 1 ;;
+            esac
+          fi
+          if [ "$publish" = true ] && [ "$REF_NAME" != "v${pkg}" ]; then
+            echo "::error::Tag ${REF_NAME} does not match the package version ${pkg} (expected v${pkg})."
+            exit 1
+          fi
+          case "$pkg" in
+            *-*) prerelease=true; npm_tag=next ;;
+            *) prerelease=false; npm_tag=latest ;;
+          esac
+          {
+            echo "publish=${publish}"
+            echo "version=${pkg}"
+            echo "prerelease=${prerelease}"
+            echo "npm_tag=${npm_tag}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release plan"
+            echo "- event: ${EVENT}, ref: ${REF}"
+            echo "- version: ${pkg} (prerelease: ${prerelease}, npm dist-tag: ${npm_tag})"
+            echo "- publish: ${publish}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The same job CI runs on every pull request (fetch-depth 0 for the goldens'
+  # commit, the gate profile, the per-target timeouts and TZ, the installer tests
+  # and npm pack, the plugin job), called rather than copied so the two cannot drift.
+  test:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
 
   build:
-    needs: test
+    needs: [plan, test]
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # macos-14 arm64 was retired 2026-11-02 (actions/runner-images#13518).
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             artifact: csr-engine-aarch64-apple-darwin.tar.gz
+          # Pinned, not ubuntu-latest: that label moves to 26.04 in November 2026
+          # (actions/runner-images#14748) and would raise the glibc floor. Matches the arm leg.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             artifact: csr-engine-x86_64-unknown-linux-gnu.tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             artifact: csr-engine-aarch64-unknown-linux-gnu.tar.gz
 
+    env:
+      ARTIFACT: ${{ matrix.artifact }}
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-${{ matrix.target }}
+          workspaces: csr-engine
 
       - name: Build release binary
         run: cargo build --release --locked --manifest-path csr-engine/Cargo.toml
 
+      # Every leg runs on its own architecture, so the binary can run here. The
+      # installers decide "already installed" from this exact output.
+      - name: Check the binary version
+        run: |
+          set -euo pipefail
+          got=$(csr-engine/target/release/csr-engine --version)
+          echo "$got"
+          [ "$got" = "csr-engine ${VERSION}" ] || { echo "::error::expected 'csr-engine ${VERSION}', got '${got}'"; exit 1; }
+
+      # The tarball carries the licence texts next to the binary (fonts, reranker,
+      # ONNX Runtime and Rust crates are compiled in). The installers extract the
+      # archive and install only csr-engine.
       - name: Package binary
         run: |
-          cd csr-engine/target/release
-          tar -czvf ${{ matrix.artifact }} csr-engine
-          mv ${{ matrix.artifact }} ../../../
+          set -euo pipefail
+          staging="$RUNNER_TEMP/package"
+          mkdir -p "$staging"
+          cp csr-engine/target/release/csr-engine LICENSE THIRD_PARTY_LICENSES.txt "$staging/"
+          tar -czvf "$ARTIFACT" -C "$staging" csr-engine LICENSE THIRD_PARTY_LICENSES.txt
+          tar -tzf "$ARTIFACT"
 
       - name: Generate checksum
-        run: shasum -a 256 ${{ matrix.artifact }} >> checksums-${{ matrix.target }}.txt
+        run: shasum -a 256 "$ARTIFACT" >> "checksums-${TARGET}.txt"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -84,9 +187,70 @@ jobs:
             ${{ matrix.artifact }}
             checksums-${{ matrix.target }}.txt
 
-  release:
-    needs: build
+  package-npm:
+    needs: [plan, test]
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Pack the npm package
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm pack
+          tarball="claude-self-reflect-${VERSION}.tgz"
+          tar -tzf "$tarball" | tee npm-contents.txt
+          for f in package/package.json package/LICENSE package/THIRD_PARTY_LICENSES.txt package/installer/postinstall.js; do
+            grep -qx "$f" npm-contents.txt || { echo "::error::${f} missing from ${tarball}"; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: claude-self-reflect-*.tgz
+
+  # Rehearsal only: gather what a release would upload and stop.
+  rehearsal-summary:
+    needs: [plan, build, package-npm]
+    if: needs.plan.outputs.publish != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: List the release assets this run would publish
+        run: |
+          set -euo pipefail
+          cat checksums-*.txt > checksums.txt
+          shasum -a 256 -c checksums.txt
+          {
+            echo "### Rehearsal: nothing was released or published"
+            echo '```'
+            ls -l ./*.tar.gz ./*.tgz checksums.txt
+            cat checksums.txt
+            for t in ./*.tar.gz; do echo "== $t"; tar -tzf "$t"; done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # List first, then grep the list: piping tar into `grep -q` lets grep exit
+          # early, tar dies on SIGPIPE, and pipefail reports a present file missing.
+          for t in ./*.tar.gz; do
+            listing=$(tar -tzf "$t")
+            for f in csr-engine LICENSE THIRD_PARTY_LICENSES.txt; do
+              grep -qx "$f" <<< "$listing" || { echo "::error::${f} missing from ${t}"; exit 1; }
+            done
+          done
+
+  stage-release:
+    needs: [plan, build, package-npm]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      release_id: ${{ steps.release.outputs.id }}
     steps:
       # Checked out only for .github/scripts/release-tag.sh. Pinned to the built
       # commit so the verifier is the one from the code being released.
@@ -103,9 +267,7 @@ jobs:
 
       - name: Resolve release tag
         id: tag
-        env:
-          INPUT_TAG: ${{ inputs.tag }}
-        run: echo "tag=${INPUT_TAG:-${GITHUB_REF_NAME#release/}}" >> "$GITHUB_OUTPUT"
+        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
 
       # The invariant: the tag must name the commit these artifacts were built
       # from. Checking whether the tag exists and then letting the release step
@@ -122,7 +284,8 @@ jobs:
         run: bash .github/scripts/release-tag.sh claim
 
       # Staged as a draft: refs stay mutable, so nothing becomes public until the
-      # tag has been re-checked below with the assets already in place.
+      # tag has been re-checked in the publish-release job with the assets
+      # already in place.
       - name: Stage draft release
         id: release
         uses: softprops/action-gh-release@v3
@@ -130,10 +293,24 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ github.sha }}
           draft: true
+          prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
           files: |
             *.tar.gz
             checksums.txt
           generate_release_notes: true
+
+  publish-release:
+    needs: [plan, stage-release]
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      contents: write
+    steps:
+      # Checked out only for .github/scripts/release-tag.sh, pinned to the same
+      # commit as stage-release so the verifier matches the code being released.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
 
       # Point of no return. Between the claim and here, anyone with push access
       # could have force-updated or recreated the tag at another commit, and
@@ -150,18 +327,22 @@ jobs:
       - name: Verify tag and publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
-          RELEASE_ID: ${{ steps.release.outputs.id }}
+          TAG: ${{ needs.stage-release.outputs.tag }}
+          RELEASE_ID: ${{ needs.stage-release.outputs.release_id }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
         run: |
           set -euo pipefail
-          [ -n "${RELEASE_ID:-}" ] || { echo "::error::No release id from the draft step."; exit 1; }
+          [ -n "${RELEASE_ID:-}" ] || { echo "::error::No release id from the stage-release job."; exit 1; }
           bash .github/scripts/release-tag.sh verify
+          # A prerelease never becomes the "latest" release: install.sh resolves
+          # releases/latest.
+          if [ "$PRERELEASE" = true ]; then make_latest=false; else make_latest=true; fi
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-            -F draft=false -F make_latest=true >/dev/null
+            -F draft=false -F prerelease="$PRERELEASE" -f make_latest="$make_latest" >/dev/null
           echo "Published release ${TAG}."
 
   publish-npm:
-    needs: release
+    needs: [plan, publish-release]
     runs-on: ubuntu-latest
     environment: prod
     permissions:
@@ -173,4 +354,8 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - run: npm publish --provenance --access public
+      # Prereleases go to the `next` dist-tag; only a plain vX.Y.Z becomes `latest`.
+      - name: Publish to npm
+        env:
+          NPM_TAG: ${{ needs.plan.outputs.npm_tag }}
+        run: npm publish --provenance --access public --tag "$NPM_TAG"

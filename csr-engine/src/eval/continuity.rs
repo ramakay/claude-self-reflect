@@ -17,7 +17,9 @@ use std::sync::Arc;
 use super::{EvalReport, EvalResult};
 use crate::embeddings::EmbeddingEngine;
 use crate::import::ConversationChunk;
-use crate::provenance::{ChunkProvenance, Speaker};
+use crate::provenance::{
+    content_hash, ChunkEvidence, ChunkProvenance, ChunkSpan, ProvenanceEvent, Speaker, TrustTier,
+};
 use crate::search::rerank::{rerank, RankCandidate};
 use crate::search::SearchEngine;
 use crate::storage::Storage;
@@ -53,6 +55,7 @@ pub struct ContinuityHit {
     pub id: String,
     pub score: f32,
     pub provenance: Option<ChunkProvenance>,
+    pub min_trust: TrustTier,
 }
 
 /// Grade a ranked result list against the corpus. Pure — no I/O — so the gate
@@ -105,9 +108,8 @@ pub fn grade(
 
     // Criterion 2: provenance attached (author + conv id present).
     let prov = decision_hit.and_then(|h| h.provenance.as_ref());
-    let prov_ok = prov
-        .map(|p| p.author == Speaker::User && !p.source_conv_id.is_empty())
-        .unwrap_or(false);
+    let prov_ok = decision_hit.is_some_and(|hit| hit.min_trust >= TrustTier::UserHistory)
+        && prov.is_some_and(|p| !p.source_conv_id.is_empty());
     out.push(judge(
         "provenance: user-authored + source conv id",
         CAT,
@@ -358,6 +360,45 @@ fn index_corpus(
                 supersedes: doc.supersedes.clone(),
             },
         )?;
+        let tier = match doc.author {
+            Speaker::User => TrustTier::UserHistory,
+            Speaker::Assistant => TrustTier::Unknown,
+            Speaker::ToolResult => TrustTier::External,
+        };
+        let event_id = format!("continuity:{}", doc.id);
+        storage.replace_chunk_evidence(&ChunkEvidence {
+            chunk_id: doc.id.clone(),
+            events: vec![ProvenanceEvent {
+                event_id: event_id.clone(),
+                conversation_id: doc.conv_id.clone(),
+                message_key: doc.id.clone(),
+                seq: 0,
+                channel: match doc.author {
+                    Speaker::User => "user_message",
+                    Speaker::Assistant => "assistant_message",
+                    Speaker::ToolResult => "tool_result:Bash",
+                }
+                .into(),
+                trust_tier: tier,
+                parent_event_id: None,
+                receipt_kind: "eval_fixture".into(),
+                receipt_ref: None,
+                observed_at: chunk.timestamp.clone(),
+            }],
+            spans: vec![ChunkSpan {
+                chunk_id: doc.id.clone(),
+                event_id,
+                start_char: 0,
+                end_char: doc.text.chars().count(),
+                content_hash: content_hash(&doc.text),
+            }],
+            min_trust: tier,
+            tool_result_share: Some(if doc.author == Speaker::ToolResult {
+                1.0
+            } else {
+                0.0
+            }),
+        })?;
         search.insert_chunk(doc.id.clone(), vec);
     }
     Ok((storage, search))
@@ -402,6 +443,9 @@ pub async fn run_continuity(embeddings: &Arc<EmbeddingEngine>) -> EvalReport {
                 .flatten()
                 .unwrap_or_default(),
             provenance: storage.get_chunk_provenance(&r.id).ok().flatten(),
+            min_trust: storage
+                .get_chunk_min_trust(&r.id)
+                .unwrap_or(crate::provenance::TrustTier::Unknown),
             id: r.id,
             cosine: r.score,
             // Fixture corpus has no timeline — primacy stays inert here.
@@ -415,6 +459,7 @@ pub async fn run_continuity(embeddings: &Arc<EmbeddingEngine>) -> EvalReport {
             id: c.id,
             score: c.cosine,
             provenance: c.provenance,
+            min_trust: c.min_trust,
         })
         .collect();
 
@@ -469,6 +514,9 @@ pub async fn run_continuity_live(
         candidates.push(RankCandidate {
             content,
             provenance: storage.get_chunk_provenance(&r.id).ok().flatten(),
+            min_trust: storage
+                .get_chunk_min_trust(&r.id)
+                .unwrap_or(crate::provenance::TrustTier::Unknown),
             id: r.id.clone(),
             cosine: r.score,
             timestamp,
@@ -580,11 +628,13 @@ mod tests {
                 id: "d_decision".into(),
                 score: 0.9,
                 provenance: Some(prov_full()),
+                min_trust: TrustTier::UserHistory,
             },
             ContinuityHit {
                 id: "m_bash_test".into(),
                 score: 0.3,
                 provenance: None,
+                min_trust: TrustTier::External,
             },
         ];
         let results = grade(&corpus, &ranked, Some(1));
@@ -607,6 +657,7 @@ mod tests {
             id: "d_decision".into(),
             score: 0.9,
             provenance: None,
+            min_trust: TrustTier::Unknown,
         }];
         let results = grade(&corpus, &ranked, Some(1));
         let gate = results
@@ -629,11 +680,13 @@ mod tests {
                 id: "m_edit_continuity".into(),
                 score: 0.8,
                 provenance: None,
+                min_trust: TrustTier::TrustedTool,
             },
             ContinuityHit {
                 id: "d_decision".into(),
                 score: 0.7,
                 provenance: Some(prov_full()),
+                min_trust: TrustTier::UserHistory,
             },
         ];
         let results = grade(&corpus, &ranked, Some(1));
@@ -652,11 +705,13 @@ mod tests {
                 id: "d_decision".into(),
                 score: 0.9,
                 provenance: Some(prov_full()),
+                min_trust: TrustTier::UserHistory,
             },
             ContinuityHit {
                 id: "p_poison".into(),
                 score: 0.85,
                 provenance: None,
+                min_trust: TrustTier::External,
             },
         ];
         let results = grade(&corpus, &ranked, Some(1));

@@ -2,13 +2,19 @@
 name = "csr-engine"
 version = "10.1.0"
 edition = "2021"
-description = "Claude Self-Reflect: Rust MCP server with embedded vector search"
+description = "Self-Reflect: Rust MCP server with embedded vector search"
+license = "MIT"
+publish = false
 
 [dependencies]
 rmcp = { version = "3.1", features = ["server", "transport-io", "macros", "elicitation"] }
 fastembed = "5.9"
+# Reaction shadow mode (src/reaction_shadow.rs) runs its own ONNX students. Pinned to
+# the exact ort / tokenizers fastembed already links so the graph keeps one copy of each.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "std", "api-24"] }
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 hnsw_rs = "0.3"
-rusqlite = { version = "0.40", features = ["bundled", "vtab"] }
+rusqlite = { version = "0.41", features = ["bundled", "vtab"] }
 notify = "8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -26,6 +32,9 @@ regex = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 async-trait = "0.1"
 sha2 = "0.11"
+sha1 = "0.10"
+memchr = "2"
+blake3 = "1"
 fs2 = "0.4"
 ast-grep-core = { version = "0.42", features = ["tree-sitter"] }
 ast-grep-language = { version = "0.42", default-features = false, features = [
@@ -37,18 +46,81 @@ ast-grep-language = { version = "0.42", default-features = false, features = [
 ] }
 ratatui = "0.30"
 crossterm = "0.29"
+tiny-skia = { version = "0.12", default-features = false, features = ["no-std-float", "simd"] }
+ab_glyph = "0.2.32"
+libm = "0.2"
+ttf-parser = "0.25.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
 ignore = "0.4"
 toml = "1.1"
 codewitness = { path = "../codewitness" }
+# Code map (src/codemap): reads each worktree's HEAD and index without spawning git.
+# Same gix version and backend as codewitness; "index" is already in the graph via
+# its "revision" feature, so this adds no crate to Cargo.lock.
+gix = { version = "0.86", default-features = false, features = ["index", "sha1"] }
 minijinja = "2.22"
+# Journal v4 dream server (loopback only). `default-features = false` keeps
+# http2, ws, multipart, form and macros OUT of the binary: the server binds
+# 127.0.0.1 and serves HTML/JSON over HTTP/1.1 to a local browser, nothing
+# else. hyper/hyper-util/tower/tower-http/rustls are already compiled via
+# reqwest, so this adds only axum, axum-core, httpdate, matchit and
+# serde_path_to_error.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+    "tracing",
+] }
+libc = "0.2"
+zstd = "0.14.2"
+usearch = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# Seams the integration tests need and a release build must not carry. The tests enable it through
+# the self dev-dependency below; nothing else turns it on.
+test-seams = []
+
 [dev-dependencies]
+csr-engine = { path = ".", features = ["test-seams"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
+# Route-level journal tests drive the axum Router through `ServiceExt::oneshot`
+# so no socket is ever bound in the test suite. tower 0.5 is already in the
+# dependency graph via reqwest/tower-http.
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "spike_bench"
 harness = false
+
+[[bench]]
+name = "contamination_bench"
+harness = false
+
+# The pre-commit gate's profile: release speed, with the debug safety nets kept. Debug runs of the
+# pane's picture tests took over 10 minutes (unoptimized tiny-skia); release took 28 s but drops
+# overflow checks and debug_assert!. Shipping builds stay on `release`.
+[profile.gate]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+incremental = true
+
+# The checks stay on csr-engine's own code; third-party crates run as in release (one
+# instrument draw: 71.5 ms with them, 58.4 ms without).
+[profile.gate.package."*"]
+debug-assertions = false
+overflow-checks = false
+
+# Plain `cargo test` uses the dev profile. Optimize third-party crates there too, so latency tests
+# (hnsw_rs probes, tiny-skia pictures) run the dependency code optimized, as in release builds;
+# csr-engine's own code stays unoptimized and keeps its debug checks.
+# Without it, below_floor_probes_stay_under_five_ms_at_p95 read p95 12.6 ms against its 5 ms bar.
+[profile.dev.package."*"]
+opt-level = 3

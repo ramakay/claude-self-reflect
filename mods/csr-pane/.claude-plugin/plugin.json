@@ -1,0 +1,75 @@
+{
+  "name": "csr-pane",
+  "version": "0.3.0",
+  "description": "The Self-Reflect pane in Claude Code: the herdr pane's cards (the dreamer, Same page?, what should be a skill, memory or tool, where the work stands, the limits with what Self-Reflect saved) and this session's timeline, painted by the mod and alive as the numbers change. With or without herdr. Feeds from the installed csr-engine. Open it with /csr-pane.",
+  "author": {
+    "name": "ramakay"
+  },
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "pane",
+    "function-hooks",
+    "claude-self-reflect"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "enginePath": {
+      "type": "string",
+      "title": "csr-engine path",
+      "description": "Full path of the csr-engine binary. Empty: /usr/local/bin/csr-engine, then csr-engine on PATH.",
+      "default": ""
+    },
+    "view": {
+      "type": "string",
+      "title": "Cards",
+      "description": "How the cards show in a terminal: auto (pictures where the terminal takes them, painted cells elsewhere, Warp included), picture, cells (the cards painted with coloured terminal cells), or text (plain cards in words). If you set CLAUDE_CODE_FORCE_TERMINAL_IMAGES and see '?' boxes in place of the cards, choose cells.",
+      "options": [
+        "auto",
+        "picture",
+        "cells",
+        "text"
+      ],
+      "default": "auto"
+    },
+    "theme": {
+      "type": "string",
+      "title": "Card colours",
+      "description": "auto (light or dark by the terminal's COLORFGBG, dark where it says nothing), dark, or light.",
+      "options": [
+        "auto",
+        "dark",
+        "light"
+      ],
+      "default": "auto"
+    },
+    "cellShape": {
+      "type": "string",
+      "title": "Cell shape",
+      "description": "How many times taller a terminal cell is than it is wide, from 1.2 to 4, so the painted cards keep their shape. auto: 2.43 in iTerm2, 2.2 elsewhere. If the words look tall, lower it; if they look squat, raise it.",
+      "default": "auto"
+    },
+    "motion": {
+      "type": "string",
+      "title": "Motion",
+      "description": "Whether the cards move when a number changes, a compaction lands or memory comes in: on, off, or auto (off in iTerm2, where each new picture asks 'Allow Terminal-Initiated Display?' unless you ticked 'Remember my choice'; on elsewhere).",
+      "options": [
+        "auto",
+        "on",
+        "off"
+      ],
+      "default": "auto"
+    },
+    "pane": {
+      "type": "string",
+      "title": "Which pane",
+      "description": "One Self-Reflect pane per session. auto: inside herdr, where the herdr Self-Reflect pane runs (or is opening), this mod opens no pane by itself and draws no band; elsewhere it opens its pane. mod: always this pane. herdr: never by itself. /csr-pane always opens it.",
+      "options": [
+        "auto",
+        "mod",
+        "herdr"
+      ],
+      "default": "auto"
+    }
+  }
+}

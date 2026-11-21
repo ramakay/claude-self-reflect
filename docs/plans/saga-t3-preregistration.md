@@ -59,7 +59,7 @@ One corpus snapshot, constructed once, used by all arms:
   from a gold conversation).
 - Gate M: R > K by sign test over per-query hit/miss discordant pairs, p < 0.05.
 
-**Deep set** (blind-judged):
+**Deep set** (judged, arm labels hidden):
 - Each arm's answer graded against ground_truth_key + grading_note by
   cross-family judges (Codex and Grok lanes; no Claude-family judge), blinded
   to arm identity, answers presented in shuffled order per question.
@@ -100,7 +100,8 @@ One corpus snapshot, constructed once, used by all arms:
 4. **Mechanical roster freeze**: 27 of 529 pairs' receipt-gold conversations
    fall inside the corpus-freeze exclusion (benchmark-construction sessions);
    the frozen mechanical roster is the remaining **396 receipt-class pairs**
-   (eval-kit/t3/mech_pairs.frozen.csv, sha256 5e03eb25…). Citation-only pairs
+   (eval-kit/t3/mech_pairs.frozen.csv, sha256 3877c517…; rows 244-391 org name
+   redacted 2026-11-18; original sha256 5e03eb25…). Citation-only pairs
    are excluded from Gate M as pre-specified (receipt-class primary).
 5. **Snapshot identity**: sha256 1d2b9923c79b078d3e923fa4987ca0c712e0851068b4edef726dd317e174fa18
    (t3-frozen-20260727/csr.db); 119 conversations excluded; leak check clean;

@@ -2,17 +2,17 @@
 title: Project Structure
 ---
 
-![csr-engine project structure — src/ modules for mcp, hooks, search, storage, import, embeddings, extraction, injection, format, temporal, daemon, eval, and api alongside tests/ and Cargo.toml](/claude-self-reflect/images/project-structure-2.png)
+![csr-engine source modules: the 26 module folders under csr-engine/src](images/module-map-10.svg)
 
 ## Key Patterns
 
 ### Engine Orchestrator
-`Engine` owns `Storage`, `EmbeddingEngine`, and `SearchIndex`.
+`Engine` owns `Storage`, `EmbeddingEngine`, and `SearchEngine`.
 
 ### Thread Safety
 - `Storage`: `Mutex<Connection>` (rusqlite isn't Send)
 - `EmbeddingEngine`: `Mutex` (embed needs `&mut self`)
-- `SearchIndex`: `tokio::sync::RwLock` for async access
+- `SearchEngine`: `tokio::sync::RwLock` for async access
 
 ### Hook Error Handling
 Every hook wraps inner logic in catch-all — never blocks Claude Code.

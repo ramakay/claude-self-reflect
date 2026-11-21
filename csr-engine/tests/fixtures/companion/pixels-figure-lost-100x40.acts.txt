@@ -1,0 +1,5 @@
+3	{"key":"observe:3:0"}
+19	{"key":"instrument:figure"}
+20	{"key":"instrument:figure"}
+21	{"key":"instrument:figure"}
+39	{"key":"legend","keys":[[1,9,"i"],[11,18,"b"],[20,27,"q"]]}

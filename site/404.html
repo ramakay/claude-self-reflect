@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Self-Reflect: page not found</title>
+<meta name="robots" content="noindex">
+<script>
+  // GitHub Pages serves this file for any missing path. Send readers home:
+  // a miss under /docs/ goes to the docs app, anything else to the landing.
+  // The hash is kept, so an old #/docs/<slug> link still reaches its page.
+  (function () {
+    var base = '/claude-self-reflect/';
+    var p = location.pathname;
+    var dest = p.indexOf(base + 'docs/') === 0 || p === base + 'docs' ? base + 'docs/' : base;
+    location.replace(dest + location.hash);
+  })();
+</script>
+<meta http-equiv="refresh" content="0; url=/claude-self-reflect/">
+</head>
+<body>
+<p>Page not found. Go to <a href="/claude-self-reflect/">Self-Reflect</a> or <a href="/claude-self-reflect/docs/">the docs</a>.</p>
+</body>
+</html>

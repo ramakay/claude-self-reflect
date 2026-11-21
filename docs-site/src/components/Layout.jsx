@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { Outlet, Link, useLocation, useNavigate } from 'react-router'
 import { Github, ChevronDown, ChevronRight, Menu, X, ArrowLeft, Sun, Moon, Search } from 'lucide-react'
-import { navigation, pages } from '../content'
+import { versions, versionOf, sameIn } from '../content/versions'
+import BrandMark from './BrandMark'
 
 function SidebarGroup({ group, location }) {
   const active = group.items.some(i => location.pathname === i.href)
@@ -31,8 +32,8 @@ function SidebarGroup({ group, location }) {
   )
 }
 
-// Build search index from all page content
-function buildIndex() {
+// Build search index from the page content of one version
+function buildIndex(pages) {
   return Object.entries(pages).map(([path, page]) => {
     // Extract headings from markdown
     const headings = []
@@ -51,11 +52,11 @@ function buildIndex() {
   })
 }
 
-function SearchDialog({ open, onClose }) {
+function SearchDialog({ open, onClose, pages }) {
   const [query, setQuery] = useState('')
   const inputRef = useRef(null)
   const navigate = useNavigate()
-  const index = useMemo(buildIndex, [])
+  const index = useMemo(() => buildIndex(pages), [pages])
 
   useEffect(() => {
     if (open) {
@@ -166,8 +167,24 @@ function getTheme() {
   return typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
 }
 
+// Pick 10.1 (current) or 9.x (previous); the same page in the other version when it has one.
+function VersionSwitcher({ location }) {
+  const navigate = useNavigate()
+  const active = versionOf(location.pathname)
+  return (
+    <label className="version-switcher">
+      <span className="sr-only">Docs version</span>
+      <select value={active.id} aria-label="Docs version"
+        onChange={e => navigate(sameIn(versions[e.target.value], location.pathname))}>
+        {Object.values(versions).map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
+      </select>
+    </label>
+  )
+}
+
 export default function Layout() {
   const location = useLocation()
+  const version = versionOf(location.pathname)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
   const [theme, setTheme] = useState(getTheme)
@@ -185,7 +202,7 @@ export default function Layout() {
 
   return (
     <div className="docs-shell">
-      <SearchDialog open={searchOpen} onClose={() => setSearchOpen(false)} />
+      <SearchDialog open={searchOpen} onClose={() => setSearchOpen(false)} pages={version.pages} />
 
       {/* Nav — matches landing */}
       <header className="site-nav docs-nav">
@@ -194,21 +211,24 @@ export default function Layout() {
             {sidebarOpen ? <X size={20} aria-hidden="true" /> : <Menu size={20} aria-hidden="true" />}
           </button>
           <Link className="site-nav__brand" to="/">
-            <img src="/claude-self-reflect/favicon.svg" alt="" width={28} height={28} />
+            <BrandMark size={28} />
             <span>
-              <span className="site-nav__name" style={{ fontSize: 18 }}>Claude Self-Reflect</span>
+              <span className="site-nav__name" style={{ fontSize: 18 }}>Self-Reflect</span>
               <span className="site-nav__tag">Documentation</span>
             </span>
           </Link>
           <nav className="site-nav__links" aria-label="Primary">
+            <VersionSwitcher location={location} />
             <button className="search-trigger" onClick={() => setSearchOpen(true)} aria-label="Search docs">
               <Search size={14} />
               <span>Search</span>
               <kbd>/</kbd>
             </button>
             <Link className="site-nav__link" to="/docs/why-csr">Guide</Link>
+            <Link className="site-nav__link" to="/docs/features">Features</Link>
             <Link className="site-nav__link" to="/docs/mcp-tools">Reference</Link>
             <Link className="site-nav__link" to="/docs/architecture">Architecture</Link>
+            <Link className="site-nav__link" to="/docs/report-card">Status</Link>
             <button className="theme-toggle" onClick={() => { const n = theme === 'dark' ? 'light' : 'dark'; localStorage.setItem('csr-theme', n); setTheme(n) }} aria-label="Toggle theme">
               {theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
             </button>
@@ -229,10 +249,12 @@ export default function Layout() {
             <span>Search</span>
             <kbd>⌘K</kbd>
           </button>
+          {/* The header hides its links on a narrow screen; the version switch stays reachable here */}
+          <div className="lg:hidden mb-[12px]"><VersionSwitcher location={location} /></div>
           <Link to="/" className="flex items-center gap-[6px] px-[12px] py-[6px] mb-[12px] type-caption hover:text-[var(--color-ink)] rounded-lg hover:bg-white/20">
             <ArrowLeft size={11} /> Home
           </Link>
-          {navigation.map(g => <SidebarGroup key={g.label} group={g} location={location} />)}
+          {version.navigation.map(g => <SidebarGroup key={`${version.id}-${g.label}`} group={g} location={location} />)}
         </aside>
 
         {/* Overlay */}

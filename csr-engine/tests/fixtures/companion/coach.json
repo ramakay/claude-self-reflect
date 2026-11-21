@@ -1,0 +1,15 @@
+[
+  {
+    "id": "term:quokka",
+    "kind": "term",
+    "file": "",
+    "symbol": null,
+    "oid": null,
+    "conversation": "",
+    "sketch": [],
+    "at": 1792320000000.0,
+    "line": "You said \u201cquokka\u201d in 2 sessions and Claude looked it up each time. Define it once?",
+    "title": "Define \u201cquokka\u201d once",
+    "text": "- quokka: said in 2 sessions, each time Claude looked it up (e.g. \u201ccall quokka now\u201d). Edit this line to say what you mean."
+  }
+]

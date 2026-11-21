@@ -1,4 +1,4 @@
-# Contributing to Claude Self-Reflect
+# Contributing to Self-Reflect
 
 ## Development Setup
 
@@ -13,7 +13,7 @@ cargo test
 
 ```bash
 cargo fmt
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 

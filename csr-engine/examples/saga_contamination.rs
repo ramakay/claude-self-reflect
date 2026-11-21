@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use csr_engine::engine::Engine;
-use csr_engine::provenance::ChunkProvenance;
+use csr_engine::provenance::{ChunkProvenance, TrustTier};
 use csr_engine::search::rerank::{rerank_with, RankCandidate, RankPolicy};
 use csr_engine::storage::Storage;
 use serde_json::json;
@@ -292,6 +292,7 @@ fn rerank_pool(
                 content,
                 provenance,
                 timestamp,
+                min_trust: TrustTier::Unknown,
             }
         })
         .collect();

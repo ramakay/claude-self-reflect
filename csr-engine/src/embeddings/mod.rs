@@ -1,14 +1,59 @@
 pub mod cache;
+pub mod onnx_embed;
+pub mod static_model;
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 /// Wraps fastembed for 384-dim all-MiniLM-L6-v2 embeddings.
-/// Thread-safe via Mutex (TextEmbedding::embed requires &mut self).
+///
+/// The ONNX model (fp32 AllMiniLML6V2) is NOT loaded by `new()` — it is
+/// loaded lazily, on first `embed`/`embed_single` call, behind a
+/// `Mutex<Option<TextEmbedding>>` acting as a fallible once-cell (a plain
+/// `OnceLock<TextEmbedding>` cannot hold the `Result` from a failed init).
+/// `new()` is cheap on purpose: it runs unconditionally in every
+/// `Engine::new` (MCP server startup, every hook invocation), and most
+/// hook invocations never call `embed` at all. Callers that DO know they
+/// are about to embed and want the load off the hot path (import/daemon)
+/// should call `warm()` right after construction.
 pub struct EmbeddingEngine {
-    model: Mutex<TextEmbedding>,
+    disabled: bool,
+    model: Mutex<Option<TextEmbedding>>,
+    /// An MCP server of a configured daemon embeds there and never loads the
+    /// model itself (see `search::vector_ipc`).
+    remote: Option<std::sync::Arc<crate::search::vector_ipc::VectorProxy>>,
+    /// The data directory the classifier probe caches live in. Unset for an
+    /// engine built without a database (tests), which then builds its probes
+    /// in memory and never touches the disk.
+    probe_dir: Option<std::path::PathBuf>,
+    /// Single-text embeds (a prompt's query) that are queued or running. A
+    /// batch embed releases the model between its texts and waits while this is
+    /// above zero, so a query waits for one text, not for a whole import.
+    interactive: AtomicUsize,
+}
+
+/// How long a batch embed yields to queued interactive embeds before going on
+/// regardless, so a stuck query cannot starve imports.
+const INTERACTIVE_YIELD_LIMIT: Duration = Duration::from_millis(250);
+
+/// Counts one interactive embed for as long as it lives.
+struct InteractiveEmbed<'a>(&'a AtomicUsize);
+
+impl<'a> InteractiveEmbed<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for InteractiveEmbed<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Serializes first-run model downloads within this process. Concurrent
@@ -17,15 +62,188 @@ pub struct EmbeddingEngine {
 /// "Lock acquisition failed" instead of waiting.
 static MODEL_INIT_LOCK: Mutex<()> = Mutex::new(());
 
+/// ONNX Runtime batch cap for a single `embed` call.
+///
+/// fastembed defaults to `DEFAULT_BATCH_SIZE = 256` when the batch argument is
+/// `None`, and pads every doc in a batch to the longest one (up to
+/// `DEFAULT_MAX_LENGTH = 512`). A 256x512 run needs a ~3.2GB attention tensor,
+/// and ORT's CPU arena satisfies that with a 4GiB power-of-two extension that it
+/// never returns to the OS. The daemon has uncapped call sites
+/// (`daemon::trained_rerank`, `import::plans`, `import::scrub` all pass their
+/// whole text list), so one large pass permanently parked ~17GB of arena in the
+/// long-lived daemon process while short-lived MCP servers stayed at ~670MB.
+/// Capping here fixes every call site at once.
+///
+/// One text per run: a batch is padded to its longest member and attention
+/// is quadratic in that length, so the arena sized itself to the longest
+/// text times the batch. Measured on 2,000 real chunk texts (mean 771
+/// chars) in the importer's calls of 10, arena on, 4 threads:
+///
+/// | per run | vectors/s | footprint after |
+/// |---------|-----------|-----------------|
+/// | 16      | 82.4      | 1,382 MB        |
+/// | 4       | 93.5      | 508 MB          |
+/// | 2       | 98.6      | 349 MB          |
+/// | 1       | 106.6     | 261 MB          |
+///
+/// Vectors differ from the 16-text runs by at most 1.9e-7 per component
+/// (min cosine 0.9999999999994), the same order as the padding-dependent
+/// noise between any two batch compositions. Disabling ORT's CPU arena
+/// instead was worse on macOS: same throughput, 2,270 MB after, because the
+/// system allocator kept the freed tensors.
+const EMBED_BATCH_SIZE: usize = 1;
+
+/// Resolve the ONNX intra-op thread cap: `CSR_EMBED_THREADS` if it parses
+/// as `1..=runtime::MAX_THREAD_OVERRIDE`, else `min(4, available_parallelism)`.
+/// Junk, zero, or oversized values fall back to the default rather than
+/// erroring — this runs on the lazy-init path of every hook process and must
+/// never fail, and ORT narrows the count to a C int, so an unbounded value
+/// could wrap to zero.
+fn resolve_intra_threads() -> usize {
+    intra_threads(
+        std::env::var("CSR_EMBED_THREADS").ok().as_deref(),
+        CALLING_THREAD_INFERENCE.load(Ordering::SeqCst),
+        std::thread::available_parallelism().map_or(4, |n| n.get()),
+    )
+}
+
+/// Set by the daemon at start: ONNX then runs each inference on the thread that asks for it.
+/// With one intra-op thread ORT creates no pool of its own (measured on the Studio: 3 busy
+/// helper threads at `CSR_EMBED_THREADS=4`, none at 1), so a background embed runs at the
+/// utility class of the thread that called it and a prompt's embed at that thread's class. A
+/// pool thread is created at the default class whatever its creator's, which under launchd
+/// `ProcessType Interactive` put background embedding above the daemon's other background work.
+static CALLING_THREAD_INFERENCE: AtomicBool = AtomicBool::new(false);
+
+/// Make this process run ONNX inference on the calling thread (see [`CALLING_THREAD_INFERENCE`]).
+/// An explicit `CSR_EMBED_THREADS` still wins. Costs throughput: about 2x per embed.
+pub fn run_inference_on_calling_thread() {
+    CALLING_THREAD_INFERENCE.store(true, Ordering::SeqCst);
+}
+
+/// The intra-op thread count for `CSR_EMBED_THREADS` = `env`, a process that runs inference on
+/// the calling thread or not, and `cpus` cores: the override when it parses within bounds, else
+/// 1 for a calling-thread process, else `min(4, cpus)`.
+fn intra_threads(env: Option<&str>, calling_thread: bool, cpus: usize) -> usize {
+    if let Some(n) = env.and_then(|raw| raw.trim().parse::<usize>().ok()) {
+        if (1..=crate::runtime::MAX_THREAD_OVERRIDE).contains(&n) {
+            return n;
+        }
+    }
+    if calling_thread {
+        1
+    } else {
+        cpus.min(4)
+    }
+}
+
 impl EmbeddingEngine {
-    /// Initialize the embedding model (downloads ~30MB on first run).
+    /// Construct the engine without loading the ONNX model. Cheap and
+    /// infallible in practice (no I/O beyond what `Mutex::new` does).
     pub fn new() -> Result<Self> {
+        Ok(Self {
+            disabled: false,
+            model: Mutex::new(None),
+            remote: None,
+            probe_dir: None,
+            interactive: AtomicUsize::new(0),
+        })
+    }
+
+    /// A cache-missing hook cannot perform semantic work or initialize a model.
+    pub fn disabled() -> Self {
+        Self {
+            disabled: true,
+            model: Mutex::new(None),
+            remote: None,
+            probe_dir: None,
+            interactive: AtomicUsize::new(0),
+        }
+    }
+
+    /// An engine that embeds through the daemon first (see `remote`).
+    pub fn with_remote(proxy: std::sync::Arc<crate::search::vector_ipc::VectorProxy>) -> Self {
+        Self {
+            disabled: false,
+            model: Mutex::new(None),
+            remote: Some(proxy),
+            probe_dir: None,
+            interactive: AtomicUsize::new(0),
+        }
+    }
+
+    /// The same engine, with its classifier probe caches kept in `dir`: the
+    /// data directory of the database the engine was opened for.
+    pub fn with_probe_dir(mut self, dir: &std::path::Path) -> Self {
+        self.probe_dir = Some(dir.to_path_buf());
+        self
+    }
+
+    /// Where the probe cache named `file` lives, or None when this engine has
+    /// no data directory.
+    pub fn probe_cache_path(&self, file: &str) -> Option<std::path::PathBuf> {
+        self.probe_dir.as_ref().map(|dir| dir.join(file))
+    }
+
+    /// Replace the probe cache `file` in one rename, so a hook reading it
+    /// while another process writes sees the old or the new bytes, never a
+    /// half-written file. Best effort: a failed write leaves the cache absent
+    /// and the next call rebuilds it.
+    pub fn write_probe_cache(&self, file: &str, bytes: &[u8]) {
+        let Some(path) = self.probe_cache_path(file) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// True once the ONNX model has been loaded into memory. Never
+    /// triggers a load itself.
+    pub fn is_loaded(&self) -> bool {
+        matches!(self.model.lock(), Ok(guard) if guard.is_some())
+    }
+
+    /// Force the model to load now instead of on first `embed`. Use where
+    /// first-embed latency or an early failure matters more than startup
+    /// memory (daemon, --import/--enrich, setup, eval) — not the MCP server
+    /// or hooks, which stay lazy so a process that never embeds never pays
+    /// the model load (~130MB resident, ~45ms).
+    pub fn warm(&self) -> Result<()> {
+        self.ensure_loaded()
+    }
+
+    /// Load the model if it isn't already loaded (downloads ~30MB on first
+    /// run). Idempotent: a second call after a successful load is a cheap
+    /// lock-and-check. A failed load leaves the cell empty so the next
+    /// call retries from scratch.
+    fn ensure_loaded(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.disabled && self.remote.is_none(),
+            "local semantic model is unavailable in this process"
+        );
+        let mut guard = self
+            .model
+            .lock()
+            .map_err(|e| anyhow::anyhow!("embedding lock: {e}"))?;
+        if guard.is_some() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        crate::search::heavy_loads::note();
+
         let cache_dir = cache::cache_dir();
         std::fs::create_dir_all(&cache_dir)?;
 
         let _init_guard = MODEL_INIT_LOCK
             .lock()
             .map_err(|e| anyhow::anyhow!("model init lock: {e}"))?;
+
+        let threads = resolve_intra_threads();
 
         // Retry across processes: another csr-engine may hold the hf-hub blob
         // lock mid-download; once it finishes, the cached model loads instantly.
@@ -36,12 +254,12 @@ impl EmbeddingEngine {
             }
             let options = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
                 .with_cache_dir(cache_dir.clone())
-                .with_show_download_progress(true);
+                .with_show_download_progress(true)
+                .with_intra_threads(threads);
             match TextEmbedding::try_new(options) {
                 Ok(model) => {
-                    return Ok(Self {
-                        model: Mutex::new(model),
-                    })
+                    *guard = Some(model);
+                    return Ok(());
                 }
                 Err(e) => last_err = Some(e),
             }
@@ -53,19 +271,62 @@ impl EmbeddingEngine {
     }
 
     /// Embed a batch of texts. Returns one 384-dim vector per input.
+    /// Loads the model on first call if it hasn't been `warm()`ed already.
+    ///
+    /// The model is held for one text at a time (the batch size was already 1,
+    /// see `EMBED_BATCH_SIZE`) and released between texts, and the batch waits
+    /// there while an [`embed_single`](Self::embed_single) is queued. A prompt's
+    /// query therefore never waits for the rest of an import's chunks.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let docs: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
-        let mut model = self
-            .model
-            .lock()
-            .map_err(|e| anyhow::anyhow!("embedding lock: {e}"))?;
-        let embeddings = model.embed(docs, None)?;
+        if let Some(proxy) = &self.remote {
+            // A server of a configured daemon never loads the model itself.
+            return proxy
+                .embed(texts)
+                .ok_or_else(|| anyhow::anyhow!(crate::search::vector_ipc::KEYWORD_ONLY_NOTE));
+        }
+        self.embed_locally(texts, false)
+    }
+
+    fn embed_locally(&self, texts: &[&str], interactive: bool) -> Result<Vec<Vec<f32>>> {
+        let _queued = interactive.then(|| InteractiveEmbed::new(&self.interactive));
+        self.ensure_loaded()?;
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for piece in texts.chunks(EMBED_BATCH_SIZE) {
+            if !interactive {
+                self.yield_to_interactive();
+            }
+            let docs: Vec<String> = piece.iter().map(|s| s.to_string()).collect();
+            let mut guard = self
+                .model
+                .lock()
+                .map_err(|e| anyhow::anyhow!("embedding lock: {e}"))?;
+            let model = guard
+                .as_mut()
+                .expect("ensure_loaded returned Ok, so the model is populated");
+            embeddings.extend(model.embed(docs, Some(EMBED_BATCH_SIZE))?);
+        }
         Ok(embeddings)
     }
 
-    /// Embed a single text string.
+    /// Between two texts of a batch: let queued interactive embeds take the
+    /// model first (bounded by [`INTERACTIVE_YIELD_LIMIT`]).
+    fn yield_to_interactive(&self) {
+        let started = Instant::now();
+        while self.interactive.load(Ordering::SeqCst) > 0
+            && started.elapsed() < INTERACTIVE_YIELD_LIMIT
+        {
+            std::thread::sleep(Duration::from_micros(500));
+        }
+    }
+
+    /// Embed a single text string. This is the interactive path (a prompt's
+    /// query): it takes the model ahead of any batch between that batch's texts.
     pub fn embed_single(&self, text: &str) -> Result<Vec<f32>> {
-        let results = self.embed(&[text])?;
+        let results = if self.remote.is_some() {
+            self.embed(&[text])?
+        } else {
+            self.embed_locally(&[text], true)?
+        };
         results
             .into_iter()
             .next()
@@ -75,5 +336,182 @@ impl EmbeddingEngine {
     /// Returns the embedding dimension (384 for all-MiniLM-L6-v2).
     pub fn dimension() -> usize {
         384
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `new()` must not touch the ONNX model — this is the whole point of
+    /// lazy init. No env/network access needed to verify this, so it's
+    /// always safe to run.
+    #[test]
+    fn new_does_not_load_the_model() {
+        let engine = EmbeddingEngine::new().expect("new() is infallible in practice");
+        assert!(
+            !engine.is_loaded(),
+            "EmbeddingEngine::new() must not eagerly load the ONNX model"
+        );
+    }
+
+    /// First `embed` loads the model; a second `embed` reuses the already
+    /// loaded model instead of reloading it. Downloads the model on first
+    /// run, so this is gated like the rest of the model-dependent suite.
+    #[test]
+    #[ignore = "downloads the ~30MB ONNX model on first run; run with --ignored"]
+    fn first_embed_loads_then_reuses_the_model() {
+        let engine = EmbeddingEngine::new().unwrap();
+        assert!(!engine.is_loaded());
+
+        let first = engine.embed_single("lazy load probe").unwrap();
+        assert!(engine.is_loaded(), "first embed must load the model");
+        assert_eq!(first.len(), EmbeddingEngine::dimension());
+
+        // Second call must not reload: same loaded model, no panic/reinit.
+        let second = engine.embed_single("second call reuses the model").unwrap();
+        assert!(engine.is_loaded());
+        assert_eq!(second.len(), EmbeddingEngine::dimension());
+    }
+
+    #[test]
+    #[ignore = "downloads the ~30MB ONNX model on first run; run with --ignored"]
+    fn warm_loads_the_model_eagerly() {
+        let engine = EmbeddingEngine::new().unwrap();
+        assert!(!engine.is_loaded());
+        engine.warm().unwrap();
+        assert!(engine.is_loaded(), "warm() must load the model immediately");
+    }
+
+    /// A prompt's query shares the model with the importer's batches. It must
+    /// wait for the text being embedded, not for the whole batch.
+    #[test]
+    fn a_query_does_not_wait_for_a_whole_running_batch() {
+        let engine = std::sync::Arc::new(EmbeddingEngine::new().unwrap());
+        engine.warm().unwrap();
+        let text = "retry the upload with backoff ".repeat(40);
+        let started = Instant::now();
+        engine.embed_single(&text).unwrap();
+        let one = started.elapsed();
+
+        let batch: Vec<String> = (0..40).map(|i| format!("{i} {text}")).collect();
+        let background = engine.clone();
+        let running = std::thread::spawn(move || {
+            let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+            let started = Instant::now();
+            background.embed(&refs).unwrap();
+            started.elapsed()
+        });
+        std::thread::sleep(one * 3);
+        let started = Instant::now();
+        engine.embed_single("a short question").unwrap();
+        let waited = started.elapsed();
+        let whole = running.join().unwrap();
+
+        assert!(
+            waited < whole / 3,
+            "the query waited {waited:?} of a {whole:?} batch (one text: {one:?})"
+        );
+    }
+
+    // Serialize env-var mutation across these tests: `cargo test` runs
+    // tests in the same process on multiple threads, and std::env::var is
+    // process-global.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env<F: FnOnce()>(value: Option<&str>, f: F) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var("CSR_EMBED_THREADS").ok();
+        match value {
+            Some(v) => std::env::set_var("CSR_EMBED_THREADS", v),
+            None => std::env::remove_var("CSR_EMBED_THREADS"),
+        }
+        f();
+        match previous {
+            Some(v) => std::env::set_var("CSR_EMBED_THREADS", v),
+            None => std::env::remove_var("CSR_EMBED_THREADS"),
+        }
+    }
+
+    #[test]
+    fn thread_count_env_unset_falls_back_to_default() {
+        with_env(None, || {
+            let expected = std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(4);
+            assert_eq!(resolve_intra_threads(), expected);
+        });
+    }
+
+    #[test]
+    fn thread_count_env_valid_override_is_used() {
+        with_env(Some("2"), || {
+            assert_eq!(resolve_intra_threads(), 2);
+        });
+    }
+
+    #[test]
+    fn thread_count_env_junk_falls_back_to_default() {
+        with_env(Some("not-a-number"), || {
+            let expected = std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(4);
+            assert_eq!(resolve_intra_threads(), expected);
+        });
+    }
+
+    #[test]
+    fn thread_count_env_excessive_falls_back_to_default() {
+        with_env(Some("4294967296"), || {
+            let expected = std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(4);
+            assert_eq!(resolve_intra_threads(), expected);
+        });
+        with_env(
+            Some(&(crate::runtime::MAX_THREAD_OVERRIDE + 1).to_string()),
+            || {
+                let expected = std::thread::available_parallelism()
+                    .map(|n| n.get().min(4))
+                    .unwrap_or(4);
+                assert_eq!(resolve_intra_threads(), expected);
+            },
+        );
+    }
+
+    #[test]
+    fn thread_count_env_zero_falls_back_to_default() {
+        with_env(Some("0"), || {
+            let expected = std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(4);
+            assert_eq!(resolve_intra_threads(), expected);
+        });
+    }
+
+    #[test]
+    fn a_daemon_runs_onnx_on_the_calling_thread_unless_told_otherwise() {
+        // Other processes keep the pool: min(4, cores).
+        assert_eq!(intra_threads(None, false, 28), 4);
+        assert_eq!(intra_threads(None, false, 2), 2);
+        // The daemon asks for no pool of its own, so inference keeps the caller's QoS class.
+        assert_eq!(intra_threads(None, true, 28), 1);
+        assert_eq!(intra_threads(Some("junk"), true, 28), 1);
+        assert_eq!(intra_threads(Some("0"), true, 28), 1);
+        // An explicit CSR_EMBED_THREADS wins in both.
+        assert_eq!(intra_threads(Some("3"), true, 28), 3);
+        assert_eq!(intra_threads(Some("3"), false, 28), 3);
+    }
+
+    #[test]
+    fn the_daemon_start_switch_changes_what_the_model_load_asks_for() {
+        with_env(None, || {
+            let before = resolve_intra_threads();
+            run_inference_on_calling_thread();
+            let after = resolve_intra_threads();
+            CALLING_THREAD_INFERENCE.store(false, Ordering::SeqCst);
+            assert_eq!(after, 1);
+            assert_eq!(before, resolve_intra_threads());
+        });
     }
 }

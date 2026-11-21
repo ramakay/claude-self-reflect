@@ -1,0 +1,4 @@
+{
+  "description": "csr-decide: typed decisions from a local System One endpoint. prompt.submit = reaction label in shadow mode; session.compact = keep/drop instead of a summary (needs vendor/fast-jev-compaction, see README). Needs CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1; builds without function hooks ignore the modules key.",
+  "modules": ["./register.ts"]
+}

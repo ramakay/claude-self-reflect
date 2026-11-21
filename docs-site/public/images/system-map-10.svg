@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 548" width="1000" height="548" role="img" aria-labelledby="t d">
+<title id="t">CSR architecture</title><desc id="d">JSONL transcripts are imported, embedded locally and stored in SQLite with an HNSW index. The daemon enriches, the MCP server (16 tools) answers searches, and 8 hooks inject and record context for Claude Code.</desc>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,1 L10,5 L0,9 z" fill="#c8442a"/></marker></defs>
+<rect width="1000" height="548" fill="#f5f2eb"/>
+<text x="40" y="48" font-family="Georgia, 'Times New Roman', serif" font-size="26" font-weight="normal" fill="#24211e" text-anchor="start">Architecture</text>
+<text x="40" y="72" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#6b645b" text-anchor="start">One Rust binary. Hooks and the MCP server run without the daemon.</text>
+<rect x="40" y="100" width="160" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="120.0" y="130.0" font-family="Georgia, 'Times New Roman', serif" font-size="14" font-weight="bold" fill="#24211e" text-anchor="middle">JSONL files</text>
+<text x="120.0" y="148.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="middle">~/.claude/projects</text>
+<rect x="250" y="100" width="160" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="330.0" y="130.0" font-family="Georgia, 'Times New Roman', serif" font-size="14" font-weight="bold" fill="#24211e" text-anchor="middle">Import</text>
+<text x="330.0" y="148.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="middle">chunks + tool context</text>
+<rect x="460" y="100" width="170" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="545.0" y="130.0" font-family="Georgia, 'Times New Roman', serif" font-size="14" font-weight="bold" fill="#24211e" text-anchor="middle">FastEmbed</text>
+<text x="545.0" y="148.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="middle">384-dim, local</text>
+<line x1="200" y1="132" x2="250" y2="132" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<line x1="410" y1="132" x2="460" y2="132" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<line x1="630" y1="132" x2="720" y2="132" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<rect x="720" y="100" width="240" height="360" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="840" y="132" font-family="Georgia, 'Times New Roman', serif" font-size="16" font-weight="bold" fill="#24211e" text-anchor="middle">Storage</text>
+<text x="840" y="152" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="normal" fill="#6b645b" text-anchor="middle">SQLite + HNSW index</text>
+<rect x="460" y="200" width="170" height="84" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="545.0" y="240.0" font-family="Georgia, 'Times New Roman', serif" font-size="14" font-weight="bold" fill="#24211e" text-anchor="middle">Daemon</text>
+<text x="545.0" y="258.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="middle">enrichment, dreaming</text>
+<line x1="630" y1="242" x2="720" y2="242" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<rect x="460" y="322" width="170" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="545.0" y="352.0" font-family="Georgia, 'Times New Roman', serif" font-size="14" font-weight="bold" fill="#24211e" text-anchor="middle">MCP server</text>
+<text x="545.0" y="370.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="middle">16 tools</text>
+<line x1="720" y1="354" x2="630" y2="354" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<rect x="460" y="424" width="170" height="64" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="545.0" y="454.0" font-family="Georgia, 'Times New Roman', serif" font-size="14" font-weight="bold" fill="#24211e" text-anchor="middle">Hooks</text>
+<text x="545.0" y="472.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="middle">8 hooks on 7 events</text>
+<line x1="630" y1="456" x2="720" y2="456" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)" marker-start="url(#ar)"/>
+<rect x="40" y="322" width="160" height="166" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="120" y="402" font-family="Georgia, 'Times New Roman', serif" font-size="14" font-weight="bold" fill="#24211e" text-anchor="middle">Claude Code</text>
+<line x1="460" y1="354" x2="200" y2="354" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<line x1="200" y1="456" x2="460" y2="456" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)" marker-start="url(#ar)"/>
+<text x="330" y="346" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="normal" fill="#6b645b" text-anchor="middle">search results</text>
+<text x="330" y="448" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="normal" fill="#6b645b" text-anchor="middle">inject / record</text>
+<text x="40" y="520" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="normal" fill="#6b645b" text-anchor="start">Enrichment tiers: L1 heuristic at import (free) | L2 V3 extract at session end (free) | L3 AI narrative, batch daemon (metered, optional).</text>
+
+</svg>

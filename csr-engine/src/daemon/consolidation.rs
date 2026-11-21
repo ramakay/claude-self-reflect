@@ -261,11 +261,7 @@ fn is_metadata_noise(s: &str) -> bool {
     // Lines that are mostly field names (key: value pairs with short values)
     let colon_count = trimmed.chars().filter(|c| *c == ':').count();
     let words = word_count(trimmed);
-    if colon_count > 0 && words < 6 && !starts_with_fact_label(&lower) {
-        return true;
-    }
-
-    false
+    colon_count > 0 && words < 6 && !starts_with_fact_label(&lower)
 }
 
 fn is_structural_noise_line(line: &str) -> bool {

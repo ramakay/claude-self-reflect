@@ -1,0 +1,129 @@
+{
+  "spike": "S5",
+  "binary": {
+    "path": ".testbed/core-rewrite/bin/csr-engine-s5",
+    "sha256": "e857c3b15a81077f0d45c3b4e381d9da256e5953b481a31cb5e77c134e532391",
+    "commit": "53d8cb29"
+  },
+  "warm_set": "12 probes + 50 audit queries, 62 calls, CSR_NO_DAEMON_PROXY=1, sandbox .testbed/core-rewrite/s5/data",
+  "serving": {
+    "r1_installed_10.1.0": {
+      "rss_after_warm_bytes": 5257805824,
+      "peak_rss_bytes": 5868699648,
+      "cold_start_ms": 10734.976,
+      "p50_ms": 653.572,
+      "p95_ms": 1109.52,
+      "calls": 62,
+      "errors": 0
+    },
+    "r2_branch_gen_ce": {
+      "rss_after_warm_bytes": 4011802624,
+      "peak_rss_bytes": 4029612032,
+      "cold_start_ms": 1873.102,
+      "p50_ms": 791.744,
+      "p95_ms": 1164.179,
+      "calls": 62,
+      "errors": 0
+    },
+    "r3_branch_gen_legacy": {
+      "rss_after_warm_bytes": 2206711808,
+      "peak_rss_bytes": 2209906688,
+      "cold_start_ms": 1088.962,
+      "p50_ms": 511.42,
+      "p95_ms": 983.331,
+      "calls": 62,
+      "errors": 0
+    },
+    "r4_branch_hnsw_legacy": {
+      "rss_after_warm_bytes": 5909135360,
+      "peak_rss_bytes": 5967544320,
+      "cold_start_ms": 8905.147,
+      "p50_ms": 508.625,
+      "p95_ms": 986.587,
+      "calls": 62,
+      "errors": 0
+    }
+  },
+  "deltas_bytes": {
+    "index_only_r4_minus_r3": {
+      "settled": 3702423552,
+      "peak": 3757637632
+    },
+    "ce_share_r2_minus_r3": {
+      "settled": 1805090816,
+      "peak": 1819705344
+    },
+    "rule_r3_minus_r1": {
+      "settled": -3051094016,
+      "peak": -3658792960
+    }
+  },
+  "load_ms_median_5_runs": {
+    "hnsw_rs": 4277.418,
+    "usearch_gen": 419.185
+  },
+  "recall_at_10_n10000": {
+    "usearch_gen": {
+      "recall_at_10": 0.84369,
+      "recall_tie_aware": 0.95941,
+      "truth_coverage": 1.0,
+      "recall_over_covered": 0.84369,
+      "p50_us": 283.333,
+      "p95_us": 434.25
+    },
+    "hnsw_rs": {
+      "recall_at_10": 0.86118,
+      "recall_tie_aware": 0.98521,
+      "truth_coverage": 0.99827,
+      "recall_over_covered": 0.8626724232922957,
+      "p50_us": 668.958,
+      "p95_us": 996.375
+    }
+  },
+  "flip_proof": "lsof: r2/r3 map chunks-g1.usearch, r4 maps chunks-97200-0.hnsw.data/.graph (logs/S5-verify-flip-r{2,3,4}-lsof.txt); meta vector_generation seq=2897804 = export seq",
+  "beside": "index-v3 holds chunks-g1.{usearch,ids,json} and chunks-97200-0.hnsw.{data,graph}; hnsw sha256 identical before/after activate",
+  "probe_run": {
+    "command": "CSR_NO_DAEMON_PROXY=1 $T/bin/csr-engine-s5 --db-path $T/s5/data/csr-engine.db bench --probe --probes $PR/probes.json --probe-out $T/s6/s5-probe.json --dump $T/logs/S6-verify-s5.ndjson",
+    "started_at": "2026-10-26T18:47:56Z",
+    "binary": {
+      "git_dirty": "true",
+      "git_sha": "3c8bf91d9b45c89992e09f0113feb6060334e66a",
+      "path": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect/.testbed/core-rewrite/bin/csr-engine-s5",
+      "sha256": "e857c3b15a81077f0d45c3b4e381d9da256e5953b481a31cb5e77c134e532391",
+      "version": "csr-engine 10.1.0"
+    },
+    "rank1": 9,
+    "rank1_ids": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      12
+    ],
+    "mrr5": 0.791667,
+    "hit_ranks": {
+      "1": null,
+      "2": 1,
+      "3": 1,
+      "4": 1,
+      "5": 1,
+      "6": 1,
+      "7": 1,
+      "8": 2,
+      "9": 1,
+      "10": 1,
+      "11": null,
+      "12": 1
+    },
+    "latency": {
+      "n": 12,
+      "p50_ms": 1085.286,
+      "p95_ms": 3103.979
+    },
+    "source": ".testbed/core-rewrite/s6/s5-probe.json"
+  }
+}

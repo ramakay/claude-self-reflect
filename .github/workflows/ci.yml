@@ -5,26 +5,126 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # release.yml calls this workflow as its test job, so a release is tested exactly as CI tests a PR.
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # The instrument goldens were rendered on arm64, which is also what the macOS build ships. The x86
+    # leg keeps the rest of the suite covered on the other Linux release target.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The companion pane goldens (tests/companion.rs, companion_cards_json.rs) render the
+          # subject of commit 8e4e3f27 from this repo's git history. That commit is on a public
+          # branch, not in the squashed release history, so a depth-1 checkout cannot show it.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: csr-engine
       - name: Format check
         run: cargo fmt --manifest-path csr-engine/Cargo.toml -- --check
       - name: Clippy
-        run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked -- -D warnings
+        run: cargo clippy --manifest-path csr-engine/Cargo.toml --locked --all-targets -- -D warnings
       - name: Test
-        run: cargo test --manifest-path csr-engine/Cargo.toml --locked
+        # Use the pre-commit profile for release-speed tests with debug assertions and overflow checks.
+        # Time out each target separately so a hang still leaves results for the others.
+        run: |
+          cargo_test=(cargo test --manifest-path csr-engine/Cargo.toml --locked --profile gate --no-fail-fast)
+          failed=()
+          if ! "${cargo_test[@]}" --no-run; then
+            failed+=(build)
+          fi
+          run_target() {
+            local status=0
+            # These golden fixtures captured Pacific wall-clock labels.
+            case "$1" in
+              companion|companion_mapzoom) local -x TZ=America/Los_Angeles ;;
+              # Keep the rendered pictures so a hash mismatch can be inspected.
+              companion_instrument) local -x CSR_INSTRUMENT_PNG="$RUNNER_TEMP/instrument-png" ;;
+            esac
+            echo "::group::$1"
+            # GNU timeout signals the entire command group, including the test binary.
+            timeout --signal=KILL "$2" "${cargo_test[@]}" "${@:3}" || status=$?
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              echo "::error::target $1 exited $status (137 = killed)"
+              failed+=("$1")
+            fi
+          }
+          run_target lib 40m --lib
+          run_target bin 5m --bins
+          run_target doc 10m --doc
+          for f in csr-engine/tests/*.rs; do
+            t=$(basename "$f" .rs)
+            limit=20m
+            if [ "$t" = pane_contract ]; then limit=60m; fi
+            run_target "$t" "$limit" --test "$t"
+          done
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "::error::failed targets: ${failed[*]}"
+            exit 1
+          fi
+      - name: Upload instrument pictures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrument-png-${{ matrix.os }}
+          path: ${{ runner.temp }}/instrument-png
+          if-no-files-found: ignore
       - name: Installer tests
         run: node --test installer/tests/*.test.js
       - name: Verify npm package
         run: npm pack --dry-run
+
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare home
+        # Everything below runs under a throwaway HOME: the install writes under
+        # $HOME/.claude-self-reflect and `claude plugin` under $HOME/.claude. The `runner` context is not
+        # available in a job-level `env:`, so HOME is set for the steps below from here. cargo resolves under it too.
+        run: |
+          mkdir -p "$RUNNER_TEMP/plugin-home"
+          echo "HOME=$RUNNER_TEMP/plugin-home" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install Claude Code
+        # Claude Code is the host the generated plugin runs in, so it is the thing that tests and validates it.
+        run: npm install -g @anthropic-ai/claude-code
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: csr-engine
+      - name: Build the binary
+        run: cargo build --manifest-path "$GITHUB_WORKSPACE/csr-engine/Cargo.toml" --locked --bin csr-engine
+      - name: Relay test cases on a fresh emit
+        # The binary writes the relay plugin (plugin.json, hooks.json, register.js); the fixture's cases run
+        # against it under `claude plugin test`, with the engine scripted behind it.
+        run: |
+          "$GITHUB_WORKSPACE/csr-engine/target/debug/csr-engine" companion plugin emit "$RUNNER_TEMP/relay-under-test"
+          mkdir "$RUNNER_TEMP/relay-under-test/tests"
+          cp "$GITHUB_WORKSPACE/csr-engine/tests/fixtures/relay/relay.test.ts" "$RUNNER_TEMP/relay-under-test/tests/"
+          claude plugin test "$RUNNER_TEMP/relay-under-test"
+      - name: Install the plugin the binary writes, and validate it
+        # `companion plugin install` is what `csr-engine setup` runs: it writes the local marketplace and has
+        # Claude Code install the plugin from it.
+        run: |
+          "$GITHUB_WORKSPACE/csr-engine/target/debug/csr-engine" companion plugin install
+          market="$HOME/.claude-self-reflect/csr-companion/marketplace"
+          claude plugin validate "$market/plugins/csr-companion"
+          claude plugin validate "$market/.claude-plugin/marketplace.json"
+          claude plugin list --json | grep -q '"csr-companion@claude-self-reflect"'

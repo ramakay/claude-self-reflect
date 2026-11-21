@@ -646,11 +646,23 @@ describe('choosing a binary to run', () => {
   });
 });
 
+// postinstall.js ends a fresh install with `launchctl kickstart -k` on the
+// user's daemon. These cases take the "already installed" branch, which never
+// gets there, but a stub first on PATH keeps any future case from restarting
+// the real daemon of whoever runs the tests.
+function launchctlStubDir() {
+  const dir = tempDir('fake-launchctl');
+  writeFileSync(join(dir, 'launchctl'), '#!/bin/sh\nexit 0\n');
+  chmodSync(join(dir, 'launchctl'), 0o755);
+  return dir;
+}
+
 function runPostinstall({ home, installDir, pathPrefix, autoSetup }) {
+  const stub = launchctlStubDir();
   const env = {
     ...process.env,
     HOME: home,
-    PATH: pathPrefix ? `${pathPrefix}:${process.env.PATH}` : process.env.PATH,
+    PATH: [stub, ...(pathPrefix ? [pathPrefix] : []), process.env.PATH].join(':'),
     CSR_INSTALL_DIR: installDir,
     CSR_FORCE_POSTINSTALL: '1',
   };
@@ -711,5 +723,63 @@ describe('postinstall end to end (skip branch, no network)', () => {
     assert.match(result.stdout, /Not active yet/);
     assert.match(result.stdout, re('/opt/old/csr-engine'));
     assert.doesNotMatch(result.stdout, /Done\. Restart Claude Code/);
+  });
+});
+
+describe('python CSR upgrade notice', () => {
+  test('names this release, not v8.0', () => {
+    const home = tempDir('e2e-python');
+    const installDir = tempDir('e2e-python-install');
+    fakeBinary(installDir, 'csr-engine', PKG_VERSION);
+    writeHomeSettings(
+      home,
+      JSON.stringify({
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                { type: 'command', command: 'python3 ~/claude-self-reflect/hooks/stop.py' },
+              ],
+            },
+          ],
+        },
+      })
+    );
+
+    const result = runPostinstall({ home, installDir });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, re(`Upgrading from Python CSR to v${PKG_VERSION} (Rust)`));
+    assert.doesNotMatch(result.stdout, /v8\.0/);
+  });
+});
+
+describe('package contents', () => {
+  const ROOT = join(INSTALLER_DIR, '..');
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+
+  test('the npm package ships the licence files', () => {
+    assert.ok(pkg.files.includes('LICENSE'));
+    assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
+  });
+
+  test('THIRD_PARTY_LICENSES.txt covers every embedded third-party work', () => {
+    const text = readFileSync(join(ROOT, 'THIRD_PARTY_LICENSES.txt'), 'utf8');
+    for (const needle of [
+      'Inter (InterVariable, subset): SIL Open Font License 1.1',
+      'Source Serif 4',
+      'JetBrains Mono',
+      'Lucide icons (font subset): ISC License',
+      'cross-encoder/ettin-reranker-32m-v1: Apache License 2.0',
+      'ONNX Runtime: MIT License',
+      'Rust crates',
+    ]) {
+      assert.ok(text.includes(needle), `missing: ${needle}`);
+    }
+  });
+
+  test('every release tarball packs the licence files next to the binary', () => {
+    const workflow = readFileSync(join(ROOT, '.github', 'workflows', 'release.yml'), 'utf8');
+    assert.match(workflow, /tar -czvf .* csr-engine LICENSE THIRD_PARTY_LICENSES\.txt/);
   });
 });

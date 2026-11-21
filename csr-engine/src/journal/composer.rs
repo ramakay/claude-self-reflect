@@ -1,0 +1,1701 @@
+//! Journal v4 Phase 4 — the proposal composer and spend visibility.
+//!
+//! Four deliverables, each with its own honesty rule:
+//!
+//! * **BRIEF** — the context a fresh session needs (origin ask, what was
+//!   completed, what the night pass concluded, the receipts). Every clause
+//!   is copied from a stored row; a clause with no row behind it is dropped
+//!   rather than filled. Truncation is explicit: [`Brief::truncation`]
+//!   carries a measured `showing N of M` marker, never a silent cut.
+//! * **COPY BLOCK** (locked decision 3) — a paste-ready markdown resume
+//!   prompt for a NEW Claude Code session. Assembled from stored rows only.
+//!   When a night-pass thread exists for the item's origin session it
+//!   carries that thread's evidence quote **verbatim, with its receipt**;
+//!   when none exists the block SAYS SO in the same slot instead of leaving
+//!   a gap the reader could mistake for a finding.
+//! * **STRUCTURED PLAN** (locked decision 2) — the model drafts
+//!   context → steps → files → acceptance through the propose-verify
+//!   machinery that already exists in [`crate::dream::threads`]: its
+//!   [`NightActor`] abstraction, its model chain, its convergence hashing
+//!   idiom and its `narrative_usage` accounting. Nothing here re-implements
+//!   any of those. The verifier ([`verify_plan`]) is deterministic and has
+//!   no LLM in it: a step whose citation is not a verbatim substring of the
+//!   evidence corpus, or whose files are not in the allowlist, is
+//!   **dropped**. Dropped lines are dropped — never softened, never
+//!   rewritten into a hedge. Surviving steps are labelled
+//!   [`PLAN_LABEL`] ("proposed — not executed") and carry their receipts
+//!   inline.
+//! * **SPEND** (locked decision 13) — tokens in / tokens out / cost per
+//!   dream, summed from `narrative_usage` rows tagged with the convergence
+//!   hash the work ran under. **If usage was not recorded for a dream this
+//!   returns `None` and the surface renders nothing** — never a zero, which
+//!   would read as "this dream was free".
+//!
+//! # Convergence, and why a GET never spends
+//!
+//! Plans are proposed by a background caller and **stored**; the detail
+//! route only ever *reads* [`load_plan`]. A page view can therefore never
+//! invoke an actor. A re-run over unchanged evidence hits either the stored
+//! plan or the sentinel row (empty context + empty steps, written when
+//! verification kept nothing), so a frozen corpus costs zero further spend —
+//! the same convergence-by-construction contract as
+//! `dream::threads::already_converged`.
+
+use std::collections::BTreeSet;
+
+use anyhow::Result;
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::dream::report::{iso_date, short_oid};
+use crate::dream::threads::{self, DreamThread, NightActor, Receipt, ReceiptTier};
+use crate::storage::dream_attribution;
+use crate::storage::dream_items::{DreamEvidence, DreamItem};
+use crate::storage::queries::{self, NarrativeUsageByModel};
+use crate::storage::Storage;
+
+/// Bumped whenever the plan prompt or its output contract changes. Folded
+/// into `plan_hash`, so every row cached under an older prompt version
+/// misses deterministically — no ALTER, no backfill (same idiom as
+/// `dream::threads::THREAD_PROMPT_VERSION`).
+const PLAN_PROMPT_VERSION: u32 = 2;
+
+/// The label every rendered plan carries. A plan is a proposal that survived
+/// a deterministic verifier — it is never a record of work that happened.
+pub const PLAN_LABEL: &str = "proposed — not executed";
+
+/// Brief lines shown before truncation. The marker reports the true total.
+pub const BRIEF_MAX_LINES: usize = 6;
+/// Per-line character budget in the brief. A cut line ends with `…` and is
+/// counted in [`Brief::truncated_lines`], so "this text was shortened" is a
+/// measured fact on the view rather than something the reader must infer.
+pub const BRIEF_MAX_LINE_CHARS: usize = 320;
+/// Steps accepted per plan, matching the prompt's own "max 6".
+const MAX_PLAN_STEPS: usize = 6;
+/// Files listed on a plan.
+const MAX_PLAN_FILES: usize = 12;
+/// Hard prompt ceiling for the plan draft.
+const PLAN_PROMPT_CAP_BYTES: usize = 8 * 1024;
+
+// ─── spend ────────────────────────────────────────────────────────────────
+
+/// Published list prices, US$ per million tokens, keyed by the longest
+/// distinguishing fragment of a model id: `(key, input, output, cache-read
+/// multiplier)`. Ordered **most specific key first**: the match is a substring
+/// test, so `"opus-5-5"` must be tried before `"opus-5"` and `"haiku-4"`
+/// before `"haiku"`. A bare alias (`"haiku"`) resolves to the current model of
+/// that line, as `claude --model haiku` does. Rates as of 2026-10.
+///
+/// Cache reads are 0.1× input except Opus 5.5 (0.05×) and Fable/Mythos 5.1
+/// (0.025×). Haiku 5.5 has a second card for prompts over 100K tokens, which
+/// only [`list_cost`] can apply; see [`HAIKU_5_5_LONG`].
+///
+/// This is a *list price* table, not a bill. `claude -p` may be served under
+/// a subscription, in which case no per-call charge exists at all — which is
+/// exactly why [`DreamSpend::cost_usd`] is presented as an at-list-price
+/// figure and never as "you were charged this".
+const MODEL_PRICES: &[(&str, f64, f64, f64)] = &[
+    ("mythos-5-1", 10.0, 50.0, 0.025),
+    ("fable-5-1", 10.0, 50.0, 0.025),
+    ("mythos-5", 10.0, 50.0, 0.1),
+    ("fable-5", 10.0, 50.0, 0.1),
+    ("opus-5-5", 4.0, 20.0, 0.05),
+    ("sonnet-5-5", 2.0, 10.0, 0.1),
+    ("haiku-5-5", 0.10, 0.50, 0.1),
+    ("sonnet-5", 2.0, 10.0, 0.1),
+    ("sonnet-4", 3.0, 15.0, 0.1),
+    ("haiku-4", 1.0, 5.0, 0.1),
+    ("opus-5", 5.0, 25.0, 0.1),
+    ("opus-4", 5.0, 25.0, 0.1),
+    ("sonnet", 2.0, 10.0, 0.1),
+    ("haiku", 0.10, 0.50, 0.1),
+    ("opus", 4.0, 20.0, 0.05),
+];
+
+/// Haiku 5.5's card for a prompt over [`HAIKU_5_5_LONG_PROMPT`] tokens:
+/// `(input, output)` US$ per million.
+const HAIKU_5_5_LONG: (f64, f64) = (0.50, 2.50);
+/// Prompt size (input + cache read + cache write) above which Haiku 5.5
+/// bills at [`HAIKU_5_5_LONG`].
+const HAIKU_5_5_LONG_PROMPT: i64 = 100_000;
+/// Cache-write tokens bill at 1.25× the input rate (5-minute TTL).
+const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
+/// Cache-write tokens kept an hour bill at 2× the input rate.
+const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
+
+fn price_row(model: &str) -> Option<(f64, f64, f64)> {
+    let lower = model.to_ascii_lowercase();
+    MODEL_PRICES
+        .iter()
+        .find(|(key, ..)| lower.contains(key))
+        .map(|(_, input, output, read)| (*input, *output, *read))
+}
+
+/// `(input, output)` US$ per million tokens, or `None` when the model is not
+/// in the table. An unknown model yields no cost — never a zero.
+pub fn model_price(model: &str) -> Option<(f64, f64)> {
+    price_row(model).map(|(input, output, _)| (input, output))
+}
+
+/// List-price US$ for **one request's** usage: `[input, output, cache read,
+/// cache write, of that write kept an hour]`. Picks Haiku 5.5's long-prompt
+/// card when that request's prompt is over 100K tokens. `None` for an
+/// unpriced model.
+pub fn list_cost(model: &str, counts: [i64; 5]) -> Option<f64> {
+    let long = model.to_ascii_lowercase().contains("haiku-5-5")
+        && counts[0] + counts[2] + counts[3] > HAIKU_5_5_LONG_PROMPT;
+    cost_at(model, counts, long)
+}
+
+/// List-price US$ for usage **summed over many requests**. A sum cannot say
+/// which request crossed Haiku 5.5's 100K line, so this uses the base card;
+/// it understates only Haiku 5.5 calls whose own prompt was over 100K.
+pub fn list_cost_summed(model: &str, counts: [i64; 5]) -> Option<f64> {
+    cost_at(model, counts, false)
+}
+
+fn cost_at(model: &str, counts: [i64; 5], long: bool) -> Option<f64> {
+    let (base_in, base_out, read_multiplier) = price_row(model)?;
+    let (price_in, price_out) = if long {
+        HAIKU_5_5_LONG
+    } else {
+        (base_in, base_out)
+    };
+    let [tokens_in, tokens_out, read, write, write_1h] = counts.map(|n| n as f64);
+    let hour = write_1h.min(write);
+    Some(
+        (price_in
+            * (tokens_in
+                + read_multiplier * read
+                + CACHE_WRITE_MULTIPLIER * (write - hour)
+                + CACHE_WRITE_1H_MULTIPLIER * hour)
+            + price_out * tokens_out)
+            / 1e6,
+    )
+}
+
+/// Spend to date across dreaming's model call sites, as `status` reports it
+/// (`dream.spend`; moved here from `status.rs` beside the cost it carries).
+#[derive(Serialize, Debug, PartialEq)]
+pub struct DreamSpendStatus {
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    /// List-price US$, or the string `"unpriced"` when a model that carried
+    /// tokens has no published price (a partial total would understate it).
+    pub cost_usd: SpendCost,
+    /// Why `cost_usd` is `"unpriced"`; absent when it is a number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unpriced_reason: Option<String>,
+    pub unpriced_models: Vec<String>,
+}
+
+/// A spend total in `status` JSON: a number of US$, or the string `"unpriced"`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum SpendCost {
+    Usd(f64),
+    Unpriced(&'static str),
+}
+
+/// Measured spend for one dream. Every field is a sum over rows that
+/// actually exist; there is no constructor that fabricates one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DreamSpend {
+    /// Number of `narrative_usage` rows attributed to this dream.
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    /// List-price cost in US$, or `None` when **any** contributing model has
+    /// no published price — a partial total would understate the spend, so
+    /// the figure is withheld rather than shown low.
+    pub cost_usd: Option<f64>,
+    /// Models that carried tokens but have no price on record. Rendered so
+    /// the missing cost is explained rather than silently absent.
+    pub unpriced_models: Vec<String>,
+    /// Every model that contributed, for the detail view's breakdown.
+    pub models: Vec<String>,
+}
+
+impl DreamSpend {
+    /// Total the per-model rows. `None` when nothing was recorded.
+    pub fn from_rows(rows: &[NarrativeUsageByModel]) -> Option<Self> {
+        if rows.is_empty() {
+            return None;
+        }
+        let mut spend = DreamSpend {
+            calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost_usd: None,
+            unpriced_models: Vec::new(),
+            models: Vec::new(),
+        };
+        let mut cost = 0.0_f64;
+        for row in rows {
+            spend.calls += row.calls;
+            spend.input_tokens += row.input_tokens;
+            spend.output_tokens += row.output_tokens;
+            spend.cache_read_tokens += row.cache_read_tokens;
+            spend.cache_creation_tokens += row.cache_creation_tokens;
+            spend.models.push(row.model.clone());
+            let counts = [
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_creation_tokens,
+                0,
+            ];
+            // A row that carried no tokens (a failed call, a `default` model alias) costs
+            // nothing whatever its model, so it cannot withhold the total.
+            let carried = counts.iter().any(|&n| n > 0);
+            match list_cost_summed(&row.model, counts) {
+                Some(row_cost) => cost += row_cost,
+                None if !carried => {}
+                None => spend.unpriced_models.push(row.model.clone()),
+            }
+        }
+        spend.unpriced_models.dedup();
+        if spend.unpriced_models.is_empty() {
+            spend.cost_usd = Some(cost);
+        }
+        Some(spend)
+    }
+
+    /// `"1,240 in · 380 out"` — always renderable, because both numbers were
+    /// measured.
+    pub fn tokens_label(&self) -> String {
+        format!(
+            "{} in · {} out",
+            group_digits(self.input_tokens),
+            group_digits(self.output_tokens)
+        )
+    }
+
+    /// The cost as `status` JSON carries it: US$ at list price, or the literal
+    /// `"unpriced"` with the reason. Never null.
+    pub fn status_cost(&self) -> (SpendCost, Option<String>) {
+        match self.cost_usd {
+            Some(cost) => (SpendCost::Usd(cost), None),
+            None => (
+                SpendCost::Unpriced("unpriced"),
+                Some(format!(
+                    "no list price for {}; tokens are counted, a total would understate it",
+                    self.unpriced_models.join(", ")
+                )),
+            ),
+        }
+    }
+
+    /// `"≈$0.0123 at list price"`, or an explicit sentence naming the model
+    /// whose price is unknown. Never `$0.00` standing in for "unknown".
+    pub fn cost_label(&self) -> String {
+        match self.cost_usd {
+            Some(cost) => format!("≈${cost:.4} at list price"),
+            None => format!(
+                "cost unavailable — no published price for {}",
+                self.unpriced_models.join(", ")
+            ),
+        }
+    }
+}
+
+fn group_digits(value: i64) -> String {
+    let raw = value.abs().to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+    for (index, ch) in raw.chars().enumerate() {
+        if index > 0 && (raw.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if value < 0 {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+/// Every `ref_id` a dream's spend could have been recorded under: the
+/// convergence hashes of its night-pass threads plus its stored plan.
+pub fn spend_refs(threads: &[DreamThread], plan: Option<&StoredPlan>) -> Vec<String> {
+    let mut refs: BTreeSet<String> = threads
+        .iter()
+        .map(|thread| thread.episode_hash.clone())
+        .collect();
+    if let Some(plan) = plan {
+        refs.insert(plan.plan_hash.clone());
+    }
+    refs.into_iter().collect()
+}
+
+/// Sum the usage rows tagged with any of `refs`. `None` when no row carries
+/// one of them — the surface then renders nothing at all.
+pub fn load_spend(conn: &Connection, refs: &[String]) -> Result<Option<DreamSpend>> {
+    let rows = queries::narrative_usage_for_refs(conn, refs)?;
+    Ok(DreamSpend::from_rows(&rows))
+}
+
+// ─── brief ────────────────────────────────────────────────────────────────
+
+/// One labelled line of the brief. `label` is a fixed vocabulary, never
+/// model text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BriefLine {
+    pub label: &'static str,
+    pub text: String,
+    /// `true` when `text` was cut to [`BRIEF_MAX_LINE_CHARS`].
+    pub truncated: bool,
+}
+
+/// The context a fresh session needs, with truncation stated rather than
+/// hidden.
+///
+/// `Default` is implemented by hand, not derived: a derived one would set
+/// `empty: false` on a brief with no lines, and the template branches on
+/// exactly that flag. The default brief is the *no evidence at all* brief,
+/// so it must say so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Brief {
+    pub lines: Vec<BriefLine>,
+    /// Lines actually rendered.
+    pub shown: usize,
+    /// Lines that had evidence behind them, before the display cap.
+    pub total: usize,
+    /// `"showing 6 of 9"` — `None` when nothing was cut.
+    pub truncation: Option<String>,
+    /// How many rendered lines had their own text shortened.
+    pub truncated_lines: usize,
+    /// `true` when no clause had evidence behind it. The view renders an
+    /// explicit "nothing on record" state; it never renders an empty box.
+    pub empty: bool,
+}
+
+impl Default for Brief {
+    fn default() -> Self {
+        Self {
+            lines: Vec::new(),
+            shown: 0,
+            total: 0,
+            truncation: None,
+            truncated_lines: 0,
+            empty: true,
+        }
+    }
+}
+
+/// The stored episode fields the brief and copy block quote. All optional:
+/// a field the episode never carried drops its clause.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EpisodeFacts {
+    pub request: Option<String>,
+    pub completed: Option<String>,
+    pub outcome: Option<String>,
+    pub files: Vec<String>,
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
+    if text.chars().count() <= max_chars {
+        return (text.to_string(), false);
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    (out, true)
+}
+
+fn push_line(lines: &mut Vec<BriefLine>, label: &'static str, text: Option<&str>) {
+    let Some(text) = text.map(str::trim).filter(|t| !t.is_empty()) else {
+        return; // no row behind this clause — drop it, never fill it.
+    };
+    let (text, truncated) = truncate_chars(text, BRIEF_MAX_LINE_CHARS);
+    lines.push(BriefLine {
+        label,
+        text,
+        truncated,
+    });
+}
+
+/// Build the brief from stored rows only.
+///
+/// Clause order is fixed and meaningful: what was asked, what got done, what
+/// the night pass concluded, then the receipts that back it. Each clause
+/// drops independently when its row is absent.
+pub fn build_brief(item: &DreamItem, episode: &EpisodeFacts, threads: &[DreamThread]) -> Brief {
+    let mut lines: Vec<BriefLine> = Vec::new();
+
+    push_line(&mut lines, "origin ask", episode.request.as_deref());
+    push_line(&mut lines, "completed", episode.completed.as_deref());
+    push_line(&mut lines, "outcome", episode.outcome.as_deref());
+
+    for thread in threads.iter().take(2) {
+        push_line(&mut lines, "night pass", Some(&thread.thread));
+        push_line(
+            &mut lines,
+            "night-pass evidence",
+            Some(&format!("“{}”", thread.evidence_quote)),
+        );
+    }
+
+    let receipts = receipt_lines(&item.evidence);
+    for receipt in receipts.iter().take(2) {
+        push_line(&mut lines, "receipt", Some(receipt));
+    }
+
+    let total = lines.len();
+    let truncated_lines = lines
+        .iter()
+        .take(BRIEF_MAX_LINES)
+        .filter(|line| line.truncated)
+        .count();
+    lines.truncate(BRIEF_MAX_LINES);
+    let shown = lines.len();
+    Brief {
+        lines,
+        shown,
+        total,
+        truncation: (total > shown).then(|| format!("showing {shown} of {total}")),
+        truncated_lines,
+        empty: total == 0,
+    }
+}
+
+/// `"run_report anchor_obsolete in report.rs ⌗abcdef12 · witnessed 2026-08-09"`
+/// for each evidence row that actually carries a receipt oid. Rows without
+/// one are skipped here — the copy block states their absence separately.
+fn receipt_lines(evidence: &[DreamEvidence]) -> Vec<String> {
+    evidence
+        .iter()
+        .filter_map(|row| {
+            let oid = row.receipt_oid.as_deref()?;
+            let subject = match &row.symbol {
+                Some(symbol) => format!("{symbol} {}", row.verdict),
+                None => row.verdict.clone(),
+            };
+            Some(format!(
+                "{subject} in {} ⌗{} · witnessed {}",
+                row.file,
+                short_oid(oid),
+                iso_date(&row.witnessed_at)
+            ))
+        })
+        .collect()
+}
+
+// ─── copy block ───────────────────────────────────────────────────────────
+
+/// Sentence used in the night-pass slot when no thread exists for the item's
+/// origin session. Stating the gap is the point: the reader must not be able
+/// to mistake silence for "the night pass found nothing wrong".
+pub const NO_NIGHT_PASS: &str =
+    "No night-pass thread is on record for this session. Nothing is claimed \
+     about what a night pass concluded — the section is empty because the \
+     evidence is, not because the work is clean.";
+
+/// Sentence used in the plan slot when no verified plan is stored.
+pub const NO_PLAN: &str = "No verified plan is on record. Work from the receipts above.";
+
+/// A paste-ready resume prompt, plus the facts a caller may want to assert
+/// about it without re-parsing the markdown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CopyBlock {
+    pub markdown: String,
+    /// `true` iff a night-pass thread contributed a verbatim quote.
+    pub has_night_pass: bool,
+    /// `true` iff a stored, verified plan contributed steps.
+    pub has_plan: bool,
+    /// The attribution marker line this block ends with — the whole basis of
+    /// the dream→outcome loop. Exposed so a caller can record the emission
+    /// (`storage::dream_attribution::record_emission`) without re-parsing the
+    /// markdown.
+    pub marker: String,
+}
+
+/// Render one thread receipt as a single inline clause.
+fn receipt_clause(receipt: &Receipt) -> String {
+    match receipt {
+        Receipt::Verdict {
+            symbol,
+            verdict,
+            receipt_oid,
+            witnessed_at,
+        } => {
+            let subject = match symbol {
+                Some(symbol) => format!("{symbol} {verdict}"),
+                None => verdict.clone(),
+            };
+            match receipt_oid {
+                Some(oid) => format!(
+                    "{subject} ⌗{} · witnessed {}",
+                    short_oid(oid),
+                    iso_date(witnessed_at)
+                ),
+                None => format!(
+                    "{subject} · witnessed {} · no receipt",
+                    iso_date(witnessed_at)
+                ),
+            }
+        }
+        Receipt::Witnessed {
+            file,
+            witness_count,
+        } => format!("{file} · {witness_count} witness rows, no verdict"),
+    }
+}
+
+fn tier_word(tier: ReceiptTier) -> &'static str {
+    match tier {
+        ReceiptTier::Verdict => "verdict-backed",
+        ReceiptTier::Witnessed => "witnessed, no verdict",
+        ReceiptTier::Unverified => "unverified",
+    }
+}
+
+/// One `### heading` section of a paste-ready prompt: the stored text when there is some, else
+/// `gap`, which says in words that the row is missing. A section is never left out: the reader
+/// must not mistake an absent row for an empty one.
+pub(crate) fn push_stated_section(md: &mut String, heading: &str, text: Option<&str>, gap: &str) {
+    md.push_str(&format!("### {heading}\n\n"));
+    match text.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(text) => md.push_str(&format!("{text}\n\n")),
+        None => md.push_str(&format!("{gap}\n\n")),
+    }
+}
+
+/// Assemble the paste-ready resume prompt (locked decision 3).
+///
+/// Every section is built from a stored row. Where a row is missing the
+/// section says so in words; there is no branch that omits a heading and
+/// leaves the reader to guess whether the evidence was absent or merely not
+/// rendered.
+pub fn build_copy_block(
+    item: &DreamItem,
+    episode: &EpisodeFacts,
+    threads: &[DreamThread],
+    plan: Option<&StoredPlan>,
+) -> CopyBlock {
+    let mut md = String::new();
+
+    md.push_str(&format!("## Resume: {}\n\n", item.item));
+    md.push_str(&format!(
+        "This {} was left open on {} in session `{}` (project `{}`). \
+         Everything below is copied from stored rows; nothing is inferred.\n\n",
+        item.kind,
+        iso_date(&item.origin_ts),
+        item.origin_session,
+        item.project
+    ));
+
+    push_stated_section(
+        &mut md,
+        "What was originally asked",
+        episode.request.as_deref(),
+        "Not on record — the origin session stored no request text.",
+    );
+    push_stated_section(
+        &mut md,
+        "What was completed before it stopped",
+        episode.completed.as_deref(),
+        "Not on record — the origin session stored no completion summary.",
+    );
+
+    md.push_str("### What changed underneath it\n\n");
+    let receipts = receipt_lines(&item.evidence);
+    if receipts.is_empty() {
+        md.push_str(
+            "No evidence row on this item carries a receipt oid. The change is \
+             witnessed but not receipted; treat it as unproven.\n\n",
+        );
+    } else {
+        for line in &receipts {
+            md.push_str(&format!("- {line}\n"));
+        }
+        md.push('\n');
+    }
+
+    md.push_str("### What the night pass concluded\n\n");
+    let has_night_pass = !threads.is_empty();
+    if has_night_pass {
+        for thread in threads.iter().take(2) {
+            md.push_str(&format!("**{}**\n\n", thread.thread));
+            md.push_str(&format!("> {}\n\n", thread.evidence_quote));
+            md.push_str(&format!("Receipt tier: {}", tier_word(thread.receipt_tier)));
+            if thread.receipts.is_empty() {
+                md.push_str(" — no receipt rows stored.\n\n");
+            } else {
+                md.push_str(".\n");
+                for receipt in thread.receipts.iter().take(4) {
+                    md.push_str(&format!("- {}\n", receipt_clause(receipt)));
+                }
+                md.push('\n');
+            }
+        }
+    } else {
+        md.push_str(NO_NIGHT_PASS);
+        md.push_str("\n\n");
+    }
+
+    md.push_str("### Files to look at\n\n");
+    let mut files: BTreeSet<String> = item
+        .evidence
+        .iter()
+        .map(|evidence| evidence.file.clone())
+        .collect();
+    for thread in threads {
+        files.extend(thread.files.iter().cloned());
+    }
+    files.extend(episode.files.iter().cloned());
+    files.retain(|file| !file.trim().is_empty());
+    if files.is_empty() {
+        md.push_str("No file is on record for this item.\n\n");
+    } else {
+        for file in files.iter().take(MAX_PLAN_FILES) {
+            md.push_str(&format!("- `{file}`\n"));
+        }
+        md.push('\n');
+    }
+
+    md.push_str("### Proposed plan\n\n");
+    let has_plan = plan.is_some_and(|plan| !plan.steps.is_empty());
+    match plan.filter(|plan| !plan.steps.is_empty()) {
+        Some(plan) => {
+            md.push_str(&format!("_{PLAN_LABEL}._\n\n"));
+            if !plan.context.trim().is_empty() {
+                md.push_str(&format!("{}\n\n", plan.context));
+            }
+            for (index, step) in plan.steps.iter().enumerate() {
+                md.push_str(&format!("{}. {}\n", index + 1, step.action));
+                md.push_str(&format!(
+                    "   - rendered from receipt ⌗{}\n",
+                    short_oid(&step.citation)
+                ));
+                for file in &step.files {
+                    md.push_str(&format!("   - file: `{file}`\n"));
+                }
+            }
+            md.push('\n');
+            if plan.dropped > 0 {
+                md.push_str(&format!(
+                    "{} drafted step(s) were dropped by the verifier because their claims \
+                     did not trace to a stored row. They are not shown in any form.\n\n",
+                    plan.dropped
+                ));
+            }
+        }
+        None => {
+            md.push_str(NO_PLAN);
+            md.push_str("\n\n");
+        }
+    }
+
+    md.push_str("### How to verify\n\n");
+    match plan.and_then(|plan| plan.acceptance.clone()) {
+        Some(acceptance) => md.push_str(&format!("{acceptance}\n")),
+        None => md.push_str(
+            "No acceptance check is on record. Verify against the receipts listed \
+             above before treating the item as resolved.\n",
+        ),
+    }
+
+    // Attribution marker (P4b) — ONE opaque line, dream id only. It is what
+    // lets a pasted prompt be bound back to the dream that produced it; a
+    // block without it can never be attributed, because binding is evidence.
+    // Deliberately NOT a machine sentinel: sentinels suppress text from
+    // import, and this must be retained and indexed. See
+    // `storage::dream_attribution`.
+    let marker = dream_attribution::marker_line(&item.id);
+    md.push('\n');
+    md.push_str(&marker);
+    md.push('\n');
+
+    CopyBlock {
+        markdown: md,
+        has_night_pass,
+        has_plan,
+        marker,
+    }
+}
+
+// ─── attribution: rendering what a dream actually caused ──────────────────
+
+/// Render the outcome line for a dream, or `None`.
+///
+/// `None` is returned for every dream that has no marker-backed binding —
+/// which is most of them. There is deliberately no "probably acted on", no
+/// "no evidence of use", no zero: an unbound dream renders **nothing at all**
+/// about outcomes, because a missing marker is not evidence of anything.
+///
+/// Attribution is one-way. Presence proves use; absence proves nothing.
+pub fn render_outcome(attribution: Option<&dream_attribution::DreamAttribution>) -> Option<String> {
+    let attribution = attribution?;
+    let mut line = format!(
+        "acted on {} → session `{}`",
+        iso_date(&attribution.bound_at),
+        short_oid(&attribution.bound_session_id)
+    );
+    if let Some(kind) = attribution.kind.as_deref() {
+        line.push_str(&format!(" ({kind} prompt)"));
+    }
+    if let Some(outcome) = attribution.outcome.as_deref().map(str::trim) {
+        if !outcome.is_empty() {
+            line.push_str(&format!(" → outcome {outcome}"));
+        }
+    }
+    for receipt in attribution.receipts.iter().take(2) {
+        line.push_str(&format!(" · ⌗{}", short_oid(receipt)));
+    }
+    Some(line)
+}
+
+// ─── structured plan: the closed template registry ────────────────────────
+//
+// Codex X5 finding 1. The v1 verifier checked that *an* eight-character
+// citation occurred somewhere in the evidence and that any declared path was
+// allowlisted — it never checked that the imperative sentence followed from
+// that citation. `{"action": "Delete all production data", "citation":
+// "<any verbatim fragment>"}` therefore rendered as a *verified* execution
+// prompt. Adjacency is not entailment, and a merely adjacent citation can
+// never certify free-form model prose.
+//
+// The fix removes the free-text channel entirely. The model no longer writes
+// sentences: it NAMES a template from the closed registry below and NAMES an
+// evidence row to fill it. Every word the user reads is either a constant in
+// this binary or a structured identifier (symbol / file / verdict / receipt
+// oid) read straight out of a stored row. There is no field through which a
+// model-authored imperative can reach the page, so there is nothing left for
+// a citation to have to certify.
+
+/// The complete set of step templates. Adding one is a deliberate act with a
+/// diff; the model cannot invent one, and an unknown id is dropped.
+///
+/// Every verb here is inspect-or-annotate. None of them tells an agent to
+/// delete, deploy, publish, or run anything — the registry is the safety
+/// boundary, so it must stay boring by construction rather than by review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepTemplate {
+    ReviewSymbol,
+    ReviewFile,
+    ReconcileItem,
+    UpdateAnchor,
+    RetireClaim,
+    VerifyReceipt,
+    InvestigateImpact,
+}
+
+impl StepTemplate {
+    /// Resolve a model-named id. Unknown ids yield `None` → the step is
+    /// dropped.
+    pub fn from_id(id: &str) -> Option<Self> {
+        Some(match id.trim() {
+            "review_symbol" => Self::ReviewSymbol,
+            "review_file" => Self::ReviewFile,
+            "reconcile_item" => Self::ReconcileItem,
+            "update_anchor" => Self::UpdateAnchor,
+            "retire_claim" => Self::RetireClaim,
+            "verify_receipt" => Self::VerifyReceipt,
+            "investigate_impact" => Self::InvestigateImpact,
+            _ => return None,
+        })
+    }
+
+    /// Does this template need the row to name a symbol?
+    fn needs_symbol(self) -> bool {
+        matches!(
+            self,
+            Self::ReviewSymbol | Self::UpdateAnchor | Self::RetireClaim | Self::InvestigateImpact
+        )
+    }
+
+    /// Render the imperative from the row. Every interpolation is a
+    /// structured identifier that already passed [`safe_slot`]; the sentence
+    /// structure is a constant in this function.
+    fn render(self, row: &EvidenceRow) -> Option<String> {
+        let file = &row.file;
+        let verdict = &row.verdict;
+        let oid = short_oid(&row.receipt_oid);
+        let symbol = row.symbol.as_deref();
+        Some(match self {
+            Self::ReviewSymbol => format!(
+                "Review `{}` in `{file}` — the recorded verdict is {verdict} (receipt ⌗{oid}).",
+                symbol?
+            ),
+            Self::ReviewFile => format!(
+                "Review `{file}` against the recorded verdict {verdict} (receipt ⌗{oid})."
+            ),
+            Self::ReconcileItem => format!(
+                "Reconcile this item with the current state of `{file}` (receipt ⌗{oid})."
+            ),
+            Self::UpdateAnchor => format!(
+                "Update the stale anchor for `{}` in `{file}` to the state recorded at receipt ⌗{oid}.",
+                symbol?
+            ),
+            Self::RetireClaim => format!(
+                "Retire any claim that `{}` in `{file}` is current — the recorded verdict is \
+                 {verdict} at receipt ⌗{oid}.",
+                symbol?
+            ),
+            Self::VerifyReceipt => format!(
+                "Verify that the change recorded at receipt ⌗{oid} in `{file}` still satisfies \
+                 what this item assumed."
+            ),
+            Self::InvestigateImpact => format!(
+                "Investigate whether {verdict} on `{}` in `{file}` affects this item \
+                 (receipt ⌗{oid}).",
+                symbol?
+            ),
+        })
+    }
+}
+
+/// The acceptance-check registry. Same contract as [`StepTemplate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptanceTemplate {
+    Receipt,
+    Symbol,
+    Item,
+}
+
+impl AcceptanceTemplate {
+    pub fn from_id(id: &str) -> Option<Self> {
+        Some(match id.trim() {
+            "acceptance_receipt" => Self::Receipt,
+            "acceptance_symbol" => Self::Symbol,
+            "acceptance_item" => Self::Item,
+            _ => return None,
+        })
+    }
+
+    fn needs_symbol(self) -> bool {
+        matches!(self, Self::Symbol)
+    }
+
+    fn render(self, row: &EvidenceRow) -> Option<String> {
+        let file = &row.file;
+        let oid = short_oid(&row.receipt_oid);
+        Some(match self {
+            Self::Receipt => format!(
+                "Done when `{file}` no longer contradicts the state recorded at receipt ⌗{oid}."
+            ),
+            Self::Symbol => format!(
+                "Done when `{}` in `{file}` matches the state recorded at receipt ⌗{oid}.",
+                row.symbol.as_deref()?
+            ),
+            Self::Item => format!(
+                "Done when this item is closed with a receipt of its own (the anchor at \
+                 ⌗{oid} in `{file}` is what moved)."
+            ),
+        })
+    }
+}
+
+// ─── structured plan: types ───────────────────────────────────────────────
+
+/// What the actor is asked to produce: template ids and row selectors, never
+/// prose. Any other field the model emits is ignored by serde and can never
+/// reach the page.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RawPlan {
+    pub steps: Vec<RawPlanStep>,
+    /// Lenient: an old-shape string here (v1 asked for a sentence) parses as
+    /// `None` rather than failing the whole reply.
+    #[serde(deserialize_with = "lenient_acceptance")]
+    pub acceptance: Option<RawAcceptance>,
+}
+
+/// A step *selection*: which template, and which stored evidence row.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RawPlanStep {
+    pub template: String,
+    pub file: String,
+    pub symbol: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RawAcceptance {
+    pub template: String,
+    pub file: String,
+    pub symbol: String,
+}
+
+fn lenient_acceptance<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<RawAcceptance>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+/// One step that survived verification.
+///
+/// The field shape is unchanged from v1 (the views and the stored JSON both
+/// read it), but `action` is now always template-rendered and `citation` is
+/// always a stored receipt oid — neither can carry model text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub action: String,
+    pub files: Vec<String>,
+    /// The stored receipt oid this step was rendered from. Shown inline — a
+    /// step is never displayed without the row that produced it.
+    pub citation: String,
+}
+
+/// One stored verdict row, with everything a template needs. Only rows that
+/// carry a receipt oid become an `EvidenceRow`: a step whose imperative could
+/// not name a receipt has no honest weaker form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRow {
+    pub symbol: Option<String>,
+    pub file: String,
+    pub verdict: String,
+    pub receipt_oid: String,
+}
+
+/// The evidence a plan may be built from. Nothing outside this is reachable,
+/// by construction.
+#[derive(Debug, Clone, Default)]
+pub struct PlanEvidence {
+    /// Verbatim stored texts, shown to the model as context and folded into
+    /// [`plan_hash`]. **Never rendered into a step** — it is the free-text
+    /// channel, and the free-text channel is exactly what finding 1 closed.
+    pub corpus: String,
+    /// Every file the evidence named. Used by the copy block's "files to look
+    /// at" list and by the prompt; a step's file comes from a row, not here.
+    pub allowlist: Vec<String>,
+    /// Receipt oids (full and short form) the evidence carries.
+    pub receipts: Vec<String>,
+    /// The rows a step may be rendered from.
+    pub rows: Vec<EvidenceRow>,
+}
+
+/// Reject a slot value that could smuggle prose or structure into a rendered
+/// sentence. Stored values are usually clean identifiers; a poisoned one
+/// (whitespace, a newline, a backtick, a control character, absurd length)
+/// drops its step rather than being "cleaned up" into something plausible.
+fn safe_slot(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= max_len
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+        && !value.contains('`')
+}
+
+/// A verdict kind is a closed lowercase vocabulary in the ledger.
+fn safe_verdict(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+}
+
+/// A receipt oid is hex.
+fn safe_oid(value: &str) -> bool {
+    value.len() >= 4 && value.len() <= 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+impl PlanEvidence {
+    /// Build from stored rows only.
+    pub fn build(item: &DreamItem, episode: &EpisodeFacts, threads: &[DreamThread]) -> Self {
+        let mut corpus = String::new();
+        corpus.push_str(&item.item);
+        corpus.push('\n');
+        for text in [
+            episode.request.as_deref(),
+            episode.completed.as_deref(),
+            episode.outcome.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            corpus.push_str(text);
+            corpus.push('\n');
+        }
+        for thread in threads {
+            corpus.push_str(&thread.thread);
+            corpus.push('\n');
+            corpus.push_str(&thread.evidence_quote);
+            corpus.push('\n');
+        }
+        for evidence in &item.evidence {
+            corpus.push_str(&evidence.verdict);
+            corpus.push(' ');
+            if let Some(symbol) = &evidence.symbol {
+                corpus.push_str(symbol);
+                corpus.push(' ');
+            }
+            corpus.push_str(&evidence.file);
+            corpus.push('\n');
+        }
+
+        let mut allowlist: BTreeSet<String> = item
+            .evidence
+            .iter()
+            .map(|evidence| evidence.file.clone())
+            .collect();
+        for thread in threads {
+            allowlist.extend(thread.files.iter().cloned());
+        }
+        allowlist.extend(episode.files.iter().cloned());
+        allowlist.retain(|file| !file.trim().is_empty());
+
+        let mut receipts: BTreeSet<String> = BTreeSet::new();
+        for evidence in &item.evidence {
+            if let Some(oid) = &evidence.receipt_oid {
+                receipts.insert(oid.clone());
+                receipts.insert(short_oid(oid));
+            }
+        }
+        for thread in threads {
+            for receipt in &thread.receipts {
+                if let Receipt::Verdict {
+                    receipt_oid: Some(oid),
+                    ..
+                } = receipt
+                {
+                    receipts.insert(oid.clone());
+                    receipts.insert(short_oid(oid));
+                }
+            }
+        }
+
+        // Rows: item evidence only. A night-pass `Receipt::Verdict` carries a
+        // symbol and an oid but no file, so it cannot form a complete row —
+        // and stitching its symbol onto some other row's file would be
+        // exactly the cross-evidence fabrication this design forbids.
+        let mut rows: Vec<EvidenceRow> = Vec::new();
+        for evidence in &item.evidence {
+            let Some(oid) = evidence.receipt_oid.as_deref() else {
+                continue;
+            };
+            if !safe_slot(&evidence.file, 240) || !safe_verdict(&evidence.verdict) || !safe_oid(oid)
+            {
+                continue;
+            }
+            let symbol = match evidence.symbol.as_deref() {
+                Some(symbol) if safe_slot(symbol, 120) => Some(symbol.to_string()),
+                Some(_) => None, // poisoned symbol: the row survives without it
+                None => None,
+            };
+            let row = EvidenceRow {
+                symbol,
+                file: evidence.file.clone(),
+                verdict: evidence.verdict.clone(),
+                receipt_oid: oid.to_string(),
+            };
+            if !rows.contains(&row) {
+                rows.push(row);
+            }
+        }
+
+        Self {
+            corpus,
+            allowlist: allowlist.into_iter().collect(),
+            receipts: receipts.into_iter().collect(),
+            rows,
+        }
+    }
+
+    /// The row a selection names: the first row with this exact file, and —
+    /// when the template needs a symbol — this exact symbol on that same row.
+    ///
+    /// Matching file and symbol *on one row* is what stops a plan stitching a
+    /// symbol from one verdict onto another verdict's file and receipt.
+    fn select(&self, file: &str, symbol: &str, needs_symbol: bool) -> Option<&EvidenceRow> {
+        let file = file.trim();
+        let symbol = symbol.trim();
+        self.rows.iter().find(|row| {
+            row.file == file
+                && if needs_symbol {
+                    row.symbol.as_deref() == Some(symbol) && !symbol.is_empty()
+                } else {
+                    true
+                }
+        })
+    }
+}
+
+/// A plan after verification, ready to store or render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifiedPlan {
+    /// Deterministically composed from stored fields — never model prose.
+    /// Empty when no evidence row backs the item.
+    pub context: String,
+    pub steps: Vec<PlanStep>,
+    /// Union of the surviving steps' files. Never a file no step rendered.
+    pub files: Vec<String>,
+    /// `None` when the selected acceptance template did not resolve to a row.
+    pub acceptance: Option<String>,
+    /// Measured count of drafted steps the verifier removed.
+    pub dropped: usize,
+}
+
+impl VerifiedPlan {
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+}
+
+// ─── structured plan: the deterministic verifier ──────────────────────────
+
+/// The situation sentence, composed from stored fields only. No model text
+/// participates, so there is nothing here a citation would have to certify.
+fn deterministic_context(item: &DreamItem, evidence: &PlanEvidence) -> String {
+    if evidence.rows.is_empty() {
+        return String::new();
+    }
+    let verdicts: BTreeSet<&str> = evidence
+        .rows
+        .iter()
+        .map(|row| row.verdict.as_str())
+        .collect();
+    format!(
+        "This {} has been open in {} since {}. {} evidence row(s) carry a receipt; \
+         the recorded verdict(s) are {}.",
+        item.kind,
+        item.project,
+        iso_date(&item.origin_ts),
+        evidence.rows.len(),
+        verdicts.into_iter().collect::<Vec<_>>().join(", "),
+    )
+}
+
+/// The deterministic verifier. **No LLM, no network, no clock.**
+///
+/// A step survives only when all of these hold:
+///
+/// 1. `template` names a template in the closed registry;
+/// 2. `file` (and `symbol`, for symbol templates) select **one** stored
+///    evidence row — the same row, not two rows stitched together;
+/// 3. that row carries a receipt oid and every slot passes [`safe_slot`];
+/// 4. the rendered sentence is not a duplicate of one already kept.
+///
+/// A step that fails any of these is **dropped** and counted in
+/// [`VerifiedPlan::dropped`]. It is never rewritten, hedged, or downgraded to
+/// a "possible" step. Nothing the model wrote is ever rendered: the surviving
+/// sentence is a template constant plus identifiers from the selected row, so
+/// a drafted imperative like "Delete all production data" has no field to
+/// travel through, whatever citation accompanies it.
+pub fn verify_plan(raw: &RawPlan, evidence: &PlanEvidence, item: &DreamItem) -> VerifiedPlan {
+    let mut steps: Vec<PlanStep> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut dropped = 0usize;
+
+    for raw_step in raw.steps.iter().take(MAX_PLAN_STEPS * 2) {
+        let Some(step) = build_step(raw_step, evidence) else {
+            dropped += 1;
+            continue;
+        };
+        if steps.len() >= MAX_PLAN_STEPS || !seen.insert(step.action.clone()) {
+            dropped += 1;
+            continue;
+        }
+        steps.push(step);
+    }
+
+    let acceptance = raw.acceptance.as_ref().and_then(|raw_acceptance| {
+        let template = AcceptanceTemplate::from_id(&raw_acceptance.template)?;
+        let row = evidence.select(
+            &raw_acceptance.file,
+            &raw_acceptance.symbol,
+            template.needs_symbol(),
+        )?;
+        template.render(row)
+    });
+
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    for step in &steps {
+        files.extend(step.files.iter().cloned());
+    }
+
+    VerifiedPlan {
+        context: if steps.is_empty() {
+            // A plan that kept nothing asserts nothing, including context.
+            String::new()
+        } else {
+            deterministic_context(item, evidence)
+        },
+        steps,
+        files: files.into_iter().take(MAX_PLAN_FILES).collect(),
+        acceptance,
+        dropped,
+    }
+}
+
+/// Resolve one selection into a rendered step, or `None` (→ dropped).
+fn build_step(raw: &RawPlanStep, evidence: &PlanEvidence) -> Option<PlanStep> {
+    let template = StepTemplate::from_id(&raw.template)?;
+    let row = evidence.select(&raw.file, &raw.symbol, template.needs_symbol())?;
+    let action = template.render(row)?;
+    Some(PlanStep {
+        action,
+        files: vec![row.file.clone()],
+        citation: row.receipt_oid.clone(),
+    })
+}
+
+// ─── structured plan: propose through the existing machinery ──────────────
+
+const PLAN_RULES: &str = "You are SELECTING work steps for one unfinished item in a \
+developer's private journal.\n\
+\n\
+You do not write sentences. The program renders every sentence the user sees from the \
+template you name and the stored row you point at. Any prose you emit is discarded.\n\
+\n\
+Rules:\n\
+- Return ONLY a JSON object, no markdown fence, no prose before or after.\n\
+- Shape: {\"steps\": [ up to 6 of {\"template\": <one step template id>, \"file\": <a `file` \
+copied character-for-character from one ROWS entry>, \"symbol\": <that same ROWS entry's \
+`symbol`, or \"\">} ], \"acceptance\": {\"template\": <one acceptance id>, \"file\": <a ROWS \
+file>, \"symbol\": <that row's symbol, or \"\">}}.\n\
+- Step template ids: review_symbol (needs symbol), review_file, reconcile_item, \
+update_anchor (needs symbol), retire_claim (needs symbol), verify_receipt, \
+investigate_impact (needs symbol).\n\
+- Acceptance ids: acceptance_receipt, acceptance_symbol (needs symbol), acceptance_item.\n\
+- `file` and `symbol` MUST come from ONE AND THE SAME ROWS entry. A pair that does not \
+appear together in a single row is discarded.\n\
+- An unknown template id is discarded. Any other field you emit is ignored.\n\
+- If no template fits, return {\"steps\": []}. An empty steps array is a valid answer.\n";
+
+fn build_plan_prompt(item: &DreamItem, evidence: &PlanEvidence) -> String {
+    let record = serde_json::json!({
+        "item": item.item,
+        "kind": item.kind,
+        "project": item.project,
+        "left_open": iso_date(&item.origin_ts),
+    });
+    let rows = serde_json::Value::Array(
+        evidence
+            .rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "file": row.file,
+                    "symbol": row.symbol,
+                    "verdict": row.verdict,
+                    "receipt": row.receipt_oid,
+                })
+            })
+            .collect(),
+    );
+    let prompt = format!(
+        "{PLAN_RULES}\nITEM:\n{}\n\nROWS:\n{}\n\nEVIDENCE (context only — never quoted back):\n\
+         {}\n\nFILES:\n{}\n",
+        serde_json::to_string(&record).unwrap_or_default(),
+        serde_json::to_string(&rows).unwrap_or_default(),
+        evidence.corpus,
+        serde_json::to_string(&evidence.allowlist).unwrap_or_default(),
+    );
+    if prompt.len() > PLAN_PROMPT_CAP_BYTES {
+        let mut end = PLAN_PROMPT_CAP_BYTES;
+        while end > 0 && !prompt.is_char_boundary(end) {
+            end -= 1;
+        }
+        prompt[..end].to_string()
+    } else {
+        prompt
+    }
+}
+
+/// Same fence-stripping idiom as `dream::threads::strip_json_fences`.
+fn strip_fences(text: &str) -> &str {
+    let text = text.trim();
+    let text = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```JSON"))
+        .or_else(|| text.strip_prefix("```"))
+        .unwrap_or(text)
+        .trim();
+    text.strip_suffix("```").unwrap_or(text).trim()
+}
+
+fn parse_plan(text: &str) -> RawPlan {
+    serde_json::from_str::<RawPlan>(strip_fences(text)).unwrap_or_default()
+}
+
+/// SHA-256 over the plan's evidence inputs plus [`PLAN_PROMPT_VERSION`] and
+/// the configured target model — computable *before* any invocation, so a
+/// convergence check never itself costs a call. Same construction as
+/// `dream::threads::episode_hash`.
+pub fn plan_hash(item: &DreamItem, evidence: &PlanEvidence, model: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(item.id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(item.item.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(evidence.corpus.as_bytes());
+    hasher.update([0u8]);
+    for file in &evidence.allowlist {
+        hasher.update(file.as_bytes());
+        hasher.update([0u8]);
+    }
+    for receipt in &evidence.receipts {
+        hasher.update(receipt.as_bytes());
+        hasher.update([0u8]);
+    }
+    hasher.update(PLAN_PROMPT_VERSION.to_le_bytes());
+    hasher.update(model.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+/// Draft one plan through [`crate::dream::threads`]'s actor abstraction,
+/// model chain and usage accounting, then verify it deterministically.
+///
+/// `None` means the actor never produced a usable reply — nothing is cached
+/// and the caller retries next pass, exactly like `verify_reply`. `Some`
+/// carries the verified plan (possibly empty, which the caller stores as a
+/// sentinel) and the model that actually served it.
+///
+/// Usage rows are tagged `ref_id = plan_hash`, which is what makes the
+/// dream's spend figure evidence rather than a timestamp guess.
+pub(crate) fn propose_plan_with(
+    actor: &dyn NightActor,
+    chain: &[Option<String>],
+    storage: &Storage,
+    item: &DreamItem,
+    evidence: &PlanEvidence,
+    hash: &str,
+) -> Option<(VerifiedPlan, String)> {
+    let prompt = build_plan_prompt(item, evidence);
+    let result = threads::invoke_chain(actor, chain, &prompt);
+    threads::record_attempts(storage, &result.attempts, "dream_plan", Some(hash));
+    let text = result.text?;
+    let raw = parse_plan(&text);
+    Some((verify_plan(&raw, evidence, item), result.model_used))
+}
+
+// ─── structured plan: storage ─────────────────────────────────────────────
+
+/// A plan as stored. `plan_hash` doubles as the spend `ref_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPlan {
+    pub plan_hash: String,
+    pub item_id: String,
+    pub context: String,
+    pub steps: Vec<PlanStep>,
+    pub files: Vec<String>,
+    pub acceptance: Option<String>,
+    pub dropped: usize,
+    pub model: String,
+    pub created_at: String,
+}
+
+/// `true` when a plan (real or sentinel) already exists for `hash` — the
+/// convergence short-circuit that keeps a frozen corpus at zero spend.
+pub fn plan_converged(conn: &Connection, hash: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dream_plans WHERE plan_hash = ?1",
+        params![hash],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// `INSERT OR IGNORE` — append-only by convention, never updated. An empty
+/// `plan` is stored as the convergence sentinel.
+pub fn store_plan(
+    conn: &Connection,
+    hash: &str,
+    item: &DreamItem,
+    plan: &VerifiedPlan,
+    model: &str,
+) -> Result<()> {
+    crate::storage::artifact_provenance::atomic_write(conn, |conn| {
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO dream_plans
+                (plan_hash, item_id, project, session_id, context, steps_json, files_json,
+                 acceptance, dropped, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                hash,
+                item.id,
+                item.project,
+                item.origin_session,
+                plan.context,
+                serde_json::to_string(&plan.steps)?,
+                serde_json::to_string(&plan.files)?,
+                plan.acceptance,
+                plan.dropped as i64,
+                model,
+            ],
+        )?;
+        if inserted > 0 {
+            // Model output over the item's episode and that session's stored
+            // threads: each is one row-level input, read from cached floors.
+            use crate::storage::artifact_provenance::{
+                self as provenance, ArtifactKind, InputEnvelope,
+            };
+            let id = conn.last_insert_rowid().to_string();
+            let mut inputs = InputEnvelope::new(vec![provenance::episode_reflection_input(
+                conn,
+                &item.origin_session,
+            )?]);
+            let thread_ids: Vec<String> = conn
+                .prepare(
+                    "SELECT CAST(id AS TEXT) FROM dream_threads
+                      WHERE session_id = ?1 AND thread <> '' ORDER BY id",
+                )?
+                .query_map([&item.origin_session], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for thread_id in &thread_ids {
+                inputs.push(provenance::artifact_input(
+                    conn,
+                    ArtifactKind::DreamThread,
+                    thread_id,
+                )?);
+            }
+            provenance::record_stored_inputs(conn, ArtifactKind::DreamPlan, &id, &inputs)?;
+        }
+        Ok(())
+    })
+}
+
+/// Newest stored plan for `item_id`, or `None`. Sentinel rows (no steps) are
+/// returned as-is: the renderer distinguishes "converged to nothing" from
+/// "never run" by whether `steps` is empty, and says so either way.
+pub fn load_plan(conn: &Connection, item_id: &str) -> Result<Option<StoredPlan>> {
+    let mut stmt = conn.prepare(
+        "SELECT plan_hash, item_id, context, steps_json, files_json, acceptance, dropped,
+                model, created_at
+         FROM dream_plans WHERE item_id = ?1 ORDER BY id DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![item_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let steps_json: String = row.get(3)?;
+    let files_json: String = row.get(4)?;
+    Ok(Some(StoredPlan {
+        plan_hash: row.get(0)?,
+        item_id: row.get(1)?,
+        context: row.get(2)?,
+        steps: serde_json::from_str(&steps_json).unwrap_or_default(),
+        files: serde_json::from_str(&files_json).unwrap_or_default(),
+        acceptance: row.get(5)?,
+        dropped: row.get::<_, i64>(6)?.max(0) as usize,
+        model: row.get(7)?,
+        created_at: row.get(8)?,
+    }))
+}
+
+// ─── structured plan: the pass ────────────────────────────────────────────
+
+/// Summary of one [`run_plan_pass`] — daemon logging only. Every field is a
+/// count of something that happened, never an estimate.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PlanPassStats {
+    pub skipped: bool,
+    pub candidates: usize,
+    pub plans_stored: usize,
+    pub sentinels_stored: usize,
+    pub steps_dropped: usize,
+    pub errors: usize,
+    /// Items never attempted because the pass budget was already spent.
+    pub budget_queued: usize,
+}
+
+/// Default cap on dream items considered per pass.
+const DEFAULT_PLAN_CAP: usize = 20;
+
+fn plan_cap() -> usize {
+    std::env::var("CSR_DREAM_PLANS_CAP")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_PLAN_CAP)
+}
+
+/// Draft and verify plans for the newest dream items that do not have one.
+///
+/// Gated by the same switches as night-pass thread extraction
+/// (`threads::threads_disabled` — `CSR_NO_AI_NARRATIVES`, `CSR_NO_DREAMING`,
+/// and the `CSR_DREAM_THREADS=1` opt-in), because this is the same class of
+/// new LLM spend layered on the deterministic dream pass and must default
+/// OFF for the same reason. Fail-open at every level: a per-item error is
+/// counted and the pass continues; the pass never panics and never returns
+/// an `Err`.
+///
+/// **Nothing on the request path calls this.** The detail route only reads
+/// [`load_plan`], so a page view can never trigger an invocation.
+pub fn run_plan_pass(storage: &Storage) -> PlanPassStats {
+    let budget = crate::dream::policy::Budget::for_tier(crate::dream::policy::effort_tier());
+    run_plan_pass_with_budget(storage, &budget)
+}
+
+/// [`run_plan_pass`] against an explicit pass budget (locked decision 8).
+/// The budget is shared with night-pass thread extraction, so the cap is a
+/// per-pass total across both producers. Items are consumed newest-first
+/// (`load_dream_items`'s own order); once the budget is gone the remainder is
+/// counted as queued and nothing is cached for it, so the next pass retries.
+pub fn run_plan_pass_with_budget(
+    storage: &Storage,
+    budget: &crate::dream::policy::Budget,
+) -> PlanPassStats {
+    let mut stats = PlanPassStats::default();
+    if threads::threads_disabled() {
+        stats.skipped = true;
+        return stats;
+    }
+
+    let items = match storage.with_connection(crate::storage::dream_items::load_dream_items) {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(%error, "dream-plan candidate load failed (non-fatal)");
+            return stats;
+        }
+    };
+
+    let chain = threads::thread_model_candidates();
+    let target_model = threads::primary_thread_model();
+    let process_actor = threads::ProcessActor;
+    let actor = crate::dream::policy::BudgetedActor::new(&process_actor, budget);
+
+    for item in items.iter().take(plan_cap()) {
+        stats.candidates += 1;
+        if budget.exhausted() {
+            budget.note_queued();
+            stats.budget_queued += 1;
+            continue;
+        }
+        match plan_one_item(storage, &actor, &chain, &target_model, item) {
+            Ok(Some(plan)) => {
+                if plan.is_empty() {
+                    stats.sentinels_stored += 1;
+                } else {
+                    stats.plans_stored += 1;
+                }
+                stats.steps_dropped += plan.dropped;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    item = %item.id,
+                    "dream-plan proposal failed for one item (non-fatal, continuing)"
+                );
+                stats.errors += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        candidates = stats.candidates,
+        plans_stored = stats.plans_stored,
+        sentinels_stored = stats.sentinels_stored,
+        steps_dropped = stats.steps_dropped,
+        errors = stats.errors,
+        budget_queued = stats.budget_queued,
+        budget_used = budget.used(),
+        budget_cap = budget.cap(),
+        "dream-plan pass complete"
+    );
+    stats
+}
+
+/// `Ok(None)` means either already converged (no spend) or the actor never
+/// replied (nothing cached, retried next pass).
+fn plan_one_item(
+    storage: &Storage,
+    actor: &dyn NightActor,
+    chain: &[Option<String>],
+    target_model: &str,
+    item: &DreamItem,
+) -> Result<Option<VerifiedPlan>> {
+    let (episode, threads_for_item) = storage.with_connection(|conn| {
+        Ok((
+            episode_facts(conn, &item.origin_session)?,
+            threads_for_session(conn, &item.origin_session)?,
+        ))
+    })?;
+    let evidence = PlanEvidence::build(item, &episode, &threads_for_item);
+    let hash = plan_hash(item, &evidence, target_model);
+
+    if storage.with_connection(|conn| plan_converged(conn, &hash))? {
+        return Ok(None);
+    }
+
+    let Some((plan, model_used)) = propose_plan_with(actor, chain, storage, item, &evidence, &hash)
+    else {
+        return Ok(None);
+    };
+    storage.with_connection(|conn| store_plan(conn, &hash, item, &plan, &model_used))?;
+    Ok(Some(plan))
+}
+
+/// Every stored night-pass thread for one session, strongest receipt tier
+/// first, then newest.
+pub fn threads_for_session(conn: &Connection, session_id: &str) -> Result<Vec<DreamThread>> {
+    let mut all = threads::load_dream_threads(conn)?;
+    all.retain(|thread| thread.session_id == session_id);
+    all.sort_by(|a, b| {
+        a.receipt_tier
+            .cmp(&b.receipt_tier)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+    Ok(all)
+}
+
+/// The v2 episode fields the brief and copy block quote, for one session.
+/// A missing/malformed row yields the empty default — every clause built
+/// from it then drops on its own.
+pub fn episode_facts(conn: &Connection, session_id: &str) -> Result<EpisodeFacts> {
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default)]
+    struct Record {
+        request: String,
+        completed: String,
+        outcome: String,
+        files_modified: Vec<String>,
+        investigated: Vec<String>,
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT content FROM reflections
+         WHERE json_valid(content)
+           AND json_extract(content, '$.schema') = 'v2'
+           AND json_extract(content, '$.session_id') = ?1
+         ORDER BY rowid DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![session_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(EpisodeFacts::default());
+    };
+    let content: String = row.get(0)?;
+    let Ok(record) = serde_json::from_str::<Record>(&content) else {
+        return Ok(EpisodeFacts::default());
+    };
+    // Stored words are shown to a person: no harness wrapper tag goes with them.
+    let nonblank = |value: String| {
+        let value = crate::extraction::wrappers::without_harness_tags(&value);
+        (!value.trim().is_empty()).then_some(value)
+    };
+    let mut files: Vec<String> = record
+        .files_modified
+        .into_iter()
+        .chain(record.investigated)
+        .filter(|file| !file.trim().is_empty())
+        .collect();
+    files.sort();
+    files.dedup();
+    Ok(EpisodeFacts {
+        request: nonblank(record.request),
+        completed: nonblank(record.completed),
+        outcome: nonblank(record.outcome),
+        files,
+    })
+}
+
+#[cfg(test)]
+#[path = "composer_tests.rs"]
+mod tests;

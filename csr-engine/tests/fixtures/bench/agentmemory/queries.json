@@ -1,0 +1,4 @@
+[
+  {"id":"q-a","type":"single-session","question":"Which flag did alpha use?","answer":"cobalt","goldSessionIds":["sess-a"]},
+  {"id":"q-b","type":"multi-session","question":"Which releases used warm colors?","goldSessionIds":["sess-a","sess-b"]}
+]

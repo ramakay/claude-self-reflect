@@ -1,9 +1,9 @@
 #!/bin/bash
 # <bitbar.title>CSR Status</bitbar.title>
 # <bitbar.version>v1.0</bitbar.version>
-# <bitbar.author>Claude Self-Reflect</bitbar.author>
+# <bitbar.author>Self-Reflect</bitbar.author>
 # <bitbar.author.github>ramakay</bitbar.author.github>
-# <bitbar.desc>Live stats for Claude Self-Reflect conversation memory</bitbar.desc>
+# <bitbar.desc>Live stats for Self-Reflect conversation memory</bitbar.desc>
 # <bitbar.dependencies>csr-engine</bitbar.dependencies>
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>

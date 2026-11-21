@@ -1,0 +1,96 @@
+{
+  "0": {
+    "key": "instrument:dreams"
+  },
+  "1": {
+    "key": "instrument:dreams"
+  },
+  "11": {
+    "key": "observe:3:0"
+  },
+  "12": {
+    "key": "observe:3:0"
+  },
+  "13": {
+    "key": "observe:3:0"
+  },
+  "14": {
+    "key": "observe:3:0"
+  },
+  "15": {
+    "key": "observe:3:0"
+  },
+  "16": {
+    "key": "observe:3:0"
+  },
+  "17": {
+    "key": "observe:3:0"
+  },
+  "18": {
+    "key": "observe:3:0"
+  },
+  "19": {
+    "key": "observe:3:0"
+  },
+  "2": {
+    "key": "instrument:dreams"
+  },
+  "21": {
+    "key": "observe:2:0"
+  },
+  "29": {
+    "key": "legend",
+    "keys": [
+      [
+        1,
+        6,
+        "b"
+      ]
+    ]
+  },
+  "3": {
+    "key": "instrument:dreams"
+  },
+  "4": {
+    "key": "instrument:dreams"
+  },
+  "5": {
+    "key": "instrument:dreams"
+  },
+  "6": {
+    "key": "instrument:dreams"
+  },
+  "7": {
+    "key": "instrument:dreams"
+  },
+  "8": {
+    "key": "instrument:dreams"
+  },
+  "9": {
+    "dream": "newest",
+    "key": "dream:newest",
+    "send": "Self-Reflect's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”",
+    "spans": [
+      [
+        0,
+        1,
+        "helpful"
+      ],
+      [
+        1,
+        3,
+        "thought_of_it"
+      ],
+      [
+        3,
+        5,
+        "not_relevant"
+      ],
+      [
+        5,
+        7,
+        "ask_claude"
+      ]
+    ]
+  }
+}

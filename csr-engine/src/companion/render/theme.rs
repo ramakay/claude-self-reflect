@@ -1,0 +1,615 @@
+//! The pane's own colours, named once: the paper the cards sit on, the section inks, and the dark
+//! strip the masthead and its pill are drawn on. Every value is the pane's (text.rs, raster.rs).
+use super::text::Rgb;
+
+/// The pane's paper, and the paper of a note.
+/// The 8-bit Claude's clay, in both themes.
+pub const SPRITE_CLAY: [u8; 4] = [217, 119, 87, 255];
+pub const PAPER: Rgb = [251, 251, 249];
+pub const NOTE: Rgb = [250, 249, 244];
+pub const HAIRLINE: Rgb = [226, 225, 219];
+/// Text: ink, quiet and faint.
+pub const INK: Rgb = [23, 25, 28];
+pub const QUIET: Rgb = [94, 94, 89];
+pub const FAINT: Rgb = [136, 135, 129];
+/// Section inks on paper.
+pub const CTX: Rgb = [44, 90, 160];
+pub const RECALL: Rgb = [36, 131, 99];
+pub const TURN: Rgb = [200, 68, 42];
+pub const DREAM: Rgb = [152, 108, 0];
+pub const ASKED: Rgb = [123, 95, 201];
+pub const SEPIA: Rgb = [111, 86, 66];
+/// The masthead strip: its slate runs from the top colour to the bottom one.
+pub const SLATE_TOP: Rgb = [47, 58, 72];
+pub const SLATE_BOTTOM: Rgb = [14, 15, 17];
+/// Text on the strip and the gauge ramp's ends on it.
+pub const DATA: Rgb = [238, 245, 250];
+pub const DATA_QUIET: Rgb = [147, 155, 165];
+pub const RAMP_BLUE: Rgb = [58, 127, 224];
+pub const RAMP_AMBER: Rgb = [242, 182, 50];
+pub const RAMP_RED: Rgb = [232, 88, 44];
+pub const STRIP_GREEN: Rgb = [36, 163, 114];
+pub const STRIP_PURPLE: Rgb = [154, 123, 232];
+/// A track under a bar: a little darker than the hairline.
+pub const TRACK: Rgb = [214, 213, 206];
+
+/// The paper washed with `ink`, `strength` of the way: a card's face.
+pub fn wash(ink: Rgb, strength: f64) -> Rgb {
+    super::text::blend(PAPER, ink, strength)
+}
+
+/// The Instrument's single spacing scale, in layout points.
+pub const S1: f32 = 4.;
+pub const S2: f32 = 8.;
+pub const S3: f32 = 12.;
+pub const S4: f32 = 16.;
+pub const S5: f32 = 24.;
+pub const S6: f32 = 32.;
+pub const ICON_GAP: f32 = 6.;
+pub const TITLE_SIZE: f32 = 17.;
+pub const TITLE_LINE: f32 = 23.;
+pub const BODY_SIZE: f32 = 12.5;
+pub const BODY_LINE: f32 = 18.;
+pub const CAPTION_SIZE: f32 = 10.5;
+pub const CAPTION_LINE: f32 = 14.;
+pub const CHIP_SIZE: f32 = 10.;
+pub const CHIP_LINE: f32 = 14.;
+
+// The rows of the dreamer card, the two observation lists and the Context card are drawn a third
+// larger than the cards above (heading 17 to 22.5, row 12.5 to 16.5, caption 10.5 to 13.75), on
+// lines scaled the same. The other cards keep the sizes above. A pane at the layout's 800 pt height
+// floor (about 20 rows or fewer) cannot hold the larger rows and keeps the old ones: `row_*()` and
+// `pick` answer for the frame being drawn.
+pub const ROW_TITLE_SIZE: f32 = 22.5;
+pub const ROW_TITLE_LINE: f32 = 29.5;
+pub const ROW_BODY_SIZE: f32 = 16.5;
+pub const ROW_BODY_LINE: f32 = 23.;
+pub const ROW_CAPTION_SIZE: f32 = 13.75;
+pub const ROW_CAPTION_LINE: f32 = 18.;
+pub const ROW_CHIP_SIZE: f32 = 13.;
+pub const ROW_CHIP_LINE: f32 = 18.;
+
+thread_local! {
+    static ROWS_LARGE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+/// Whether the frame being drawn on this thread uses the larger rows.
+pub fn rows_large() -> bool {
+    ROWS_LARGE.with(std::cell::Cell::get)
+}
+/// Sets the row size for one frame and puts the larger rows back when the frame is done.
+pub struct RowsGuard;
+impl RowsGuard {
+    pub fn new(large: bool) -> Self {
+        ROWS_LARGE.with(|c| c.set(large));
+        Self
+    }
+}
+impl Drop for RowsGuard {
+    fn drop(&mut self) {
+        ROWS_LARGE.with(|c| c.set(true));
+    }
+}
+/// `large` for a frame with the larger rows, else `small`.
+pub fn pick(large: f32, small: f32) -> f32 {
+    if rows_large() {
+        large
+    } else {
+        small
+    }
+}
+pub fn row_title_size() -> f32 {
+    pick(ROW_TITLE_SIZE, TITLE_SIZE)
+}
+pub fn row_title_line() -> f32 {
+    pick(ROW_TITLE_LINE, TITLE_LINE)
+}
+pub fn row_body_size() -> f32 {
+    pick(ROW_BODY_SIZE, BODY_SIZE)
+}
+pub fn row_body_line() -> f32 {
+    pick(ROW_BODY_LINE, BODY_LINE)
+}
+pub fn row_caption_size() -> f32 {
+    pick(ROW_CAPTION_SIZE, CAPTION_SIZE)
+}
+pub fn row_caption_line() -> f32 {
+    pick(ROW_CAPTION_LINE, CAPTION_LINE)
+}
+pub fn row_chip_size() -> f32 {
+    pick(ROW_CHIP_SIZE, CHIP_SIZE)
+}
+pub fn row_chip_line() -> f32 {
+    pick(ROW_CHIP_LINE, CHIP_LINE)
+}
+
+#[derive(Clone, Copy)]
+pub struct Shadow {
+    pub y: f32,
+    pub blur: f32,
+    pub color: [u8; 4],
+}
+
+/// All appearance choices for the instrument composition. Adding a theme adds one set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Theme(usize);
+impl std::fmt::Debug for Theme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(SETS[self.0].0)
+    }
+}
+#[derive(Clone, Copy)]
+pub struct Tokens {
+    pub fresh: [u8; 4],
+    pub ground: [u8; 4],
+    pub mesh_ground: [u8; 4],
+    pub ink: [u8; 4],
+    pub quiet: [u8; 4],
+    pub faint: [u8; 4],
+    pub aurora: [&'static [(f32, [u8; 4])]; 3],
+    pub ambient_shadow: Shadow,
+    pub contact_shadow: Shadow,
+    pub top_highlight: [u8; 4],
+    pub linear_at: [f32; 2],
+    pub glass: [[u8; 4]; 2],
+    pub hair: [u8; 4],
+    pub mint: [u8; 4],
+    pub sky: [u8; 4],
+    pub csr_share: [u8; 4],
+    pub dream: [u8; 4],
+    pub amber: [u8; 4],
+    pub warn: [u8; 4],
+    pub risk: [u8; 4],
+    pub asked: [u8; 4],
+    /// Claude's own quota rings and legend swatch. Never a warning: CIEDE2000 from `amber`,
+    /// `warn` and `csr_share` is at least 20 in both sets.
+    pub claude: [u8; 4],
+    pub track: [u8; 4],
+    pub band: [u8; 4],
+    pub chip: [u8; 4],
+    pub ring: f32,
+    pub thin_ring: f32,
+    pub hair_width: f32,
+    pub regular: f32,
+    pub medium: f32,
+    pub bold: f32,
+}
+/// Registering a named set here is sufficient for environment selection and live cycling.
+pub const SETS: &[(&str, Tokens)] = &[
+    (
+        "dark",
+        Tokens {
+            fresh: [244, 145, 199, 255],
+            ground: [18, 20, 23, 255],
+            mesh_ground: [17, 20, 24, 255],
+            ink: [242, 244, 246, 255],
+            quiet: [184, 193, 203, 255],
+            faint: [174, 184, 196, 255],
+            aurora: [
+                &[(0., [14, 58, 58, 217]), (1., [14, 58, 58, 0])],
+                &[(0., [29, 42, 92, 191]), (1., [29, 42, 92, 0])],
+                &[(0., [44, 90, 46, 140]), (1., [44, 90, 46, 0])],
+            ],
+            ambient_shadow: Shadow {
+                y: 6.,
+                blur: 18.,
+                color: [0, 0, 0, 89],
+            },
+            contact_shadow: Shadow {
+                y: 1.,
+                blur: 2.,
+                color: [0, 0, 0, 77],
+            },
+            top_highlight: [255, 255, 255, 15],
+            linear_at: [0., 1.],
+            glass: [[31, 36, 43, 184], [26, 31, 38, 184]],
+            hair: [255, 255, 255, 23],
+            mint: [155, 232, 194, 255],
+            sky: [124, 196, 255, 255],
+            csr_share: [255, 151, 209, 255],
+            dream: [232, 197, 71, 255],
+            amber: [242, 182, 50, 255],
+            warn: [242, 182, 50, 255],
+            risk: [255, 163, 140, 255],
+            asked: [184, 173, 255, 255],
+            claude: [217, 119, 87, 255],
+            track: [58, 66, 77, 255],
+            band: [130, 150, 173, 255],
+            chip: [255, 255, 255, 18],
+            ring: 1.5,
+            thin_ring: 1.,
+            hair_width: 0.5,
+            regular: 400.,
+            medium: 500.,
+            bold: 600.,
+        },
+    ),
+    (
+        "light",
+        Tokens {
+            fresh: [133, 35, 96, 255],
+            ground: [251, 251, 249, 255],
+            mesh_ground: [247, 247, 245, 255],
+            ink: [23, 25, 28, 255],
+            quiet: [69, 77, 88, 255],
+            faint: [78, 87, 100, 255],
+            aurora: [
+                &[
+                    (0., [95, 218, 150, 245]),
+                    (0.35, [95, 218, 150, 245]),
+                    (1., [95, 218, 150, 0]),
+                ],
+                &[
+                    (0., [180, 155, 241, 235]),
+                    (0.35, [180, 155, 241, 235]),
+                    (1., [180, 155, 241, 0]),
+                ],
+                &[
+                    (0., [250, 177, 115, 225]),
+                    (0.35, [250, 177, 115, 225]),
+                    (1., [250, 177, 115, 0]),
+                ],
+            ],
+            ambient_shadow: Shadow {
+                y: 8.,
+                blur: 24.,
+                color: [16, 24, 40, 20],
+            },
+            contact_shadow: Shadow {
+                y: 1.,
+                blur: 2.,
+                color: [16, 24, 40, 15],
+            },
+            top_highlight: [255, 255, 255, 191],
+            linear_at: [0., 1.],
+            // Limit aurora leakage to 7/255; the background mesh keeps its full strength.
+            glass: [[255, 255, 255, 248], [249, 249, 249, 248]],
+            hair: [23, 25, 28, 35],
+            mint: [26, 109, 78, 255],
+            sky: [32, 91, 147, 255],
+            csr_share: [162, 27, 103, 255],
+            dream: [121, 85, 0, 255],
+            amber: [132, 86, 0, 255],
+            warn: [113, 69, 0, 255],
+            risk: [169, 53, 27, 255],
+            asked: [104, 68, 164, 255],
+            claude: [204, 90, 40, 255],
+            track: [212, 219, 223, 255],
+            band: [128, 145, 163, 255],
+            chip: [23, 25, 28, 12],
+            ring: 1.5,
+            thin_ring: 1.,
+            hair_width: 0.5,
+            regular: 400.,
+            medium: 500.,
+            bold: 600.,
+        },
+    ),
+];
+pub const DARK: Tokens = SETS[0].1;
+pub const LIGHT: Tokens = SETS[1].1;
+pub const REGULAR: f32 = DARK.regular;
+pub const MEDIUM: f32 = DARK.medium;
+pub const BOLD: f32 = DARK.bold;
+impl Theme {
+    #[allow(non_upper_case_globals)]
+    pub const Dark: Self = Self(0);
+    #[allow(non_upper_case_globals)]
+    pub const Light: Self = Self(1);
+    pub fn from_env() -> Self {
+        // There is no background query in the current terminal integration, so auto is dark.
+        let name = std::env::var("CSR_COMPANION_THEME").unwrap_or_else(|_| "auto".into());
+        Self(SETS.iter().position(|(key, _)| *key == name).unwrap_or(0))
+    }
+    pub fn tokens(self) -> &'static Tokens {
+        &SETS[self.0].1
+    }
+    pub fn toggle(&mut self) {
+        self.0 = (self.0 + 1) % SETS.len();
+    }
+}
+
+pub const OPAQUE_WHITE: [u8; 4] = [255, 255, 255, 255];
+pub const SWATCH_0: [u8; 3] = [22, 27, 38];
+pub const SWATCH_1: [u8; 3] = [47, 58, 72];
+pub const SWATCH_2: [u8; 3] = [14, 15, 17];
+pub const SWATCH_3: [u8; 3] = [46, 139, 106];
+pub const SWATCH_4: [u8; 3] = [251, 251, 249];
+pub const SWATCH_5: [u8; 3] = [36, 131, 99];
+pub const SWATCH_6: [u8; 3] = [0, 0, 0];
+pub const SWATCH_7: [u8; 3] = [255, 255, 255];
+pub const SWATCH_8: [u8; 4] = [200, 100, 50, 128];
+pub const SWATCH_9: [u8; 4] = [199, 100, 50, 128];
+pub const SWATCH_10: [u8; 3] = [238, 245, 250];
+pub const SWATCH_11: [u8; 3] = [58, 127, 224];
+pub const SWATCH_12: [u8; 3] = [36, 163, 114];
+pub const SWATCH_13: [u8; 3] = [232, 88, 44];
+pub const SWATCH_14: [u8; 3] = [242, 182, 50];
+pub const SWATCH_15: [u8; 3] = [154, 123, 232];
+pub const SWATCH_16: [u8; 4] = [0, 0, 0, 34];
+pub const SWATCH_17: [u8; 4] = [255, 255, 255, 40];
+pub const SWATCH_18: [u8; 4] = [0, 0, 0, 60];
+pub const SWATCH_19: [u8; 4] = [255, 255, 255, 60];
+pub const SWATCH_20: [u8; 4] = [0, 0, 0, 90];
+pub const SWATCH_21: [u8; 4] = [255, 255, 255, 90];
+pub const SWATCH_22: [u8; 3] = [250, 249, 244];
+pub const SWATCH_23: [u8; 3] = [226, 224, 216];
+pub const SWATCH_24: [u8; 4] = [0, 0, 0, 56];
+pub const SWATCH_25: [u8; 3] = [23, 25, 28];
+pub const SWATCH_26: [u8; 3] = [44, 90, 160];
+pub const SWATCH_27: [u8; 3] = [200, 68, 42];
+pub const SWATCH_28: [u8; 3] = [152, 108, 0];
+pub const SWATCH_29: [u8; 3] = [123, 95, 201];
+pub const SWATCH_30: [u8; 3] = [111, 86, 66];
+pub const SWATCH_31: [u8; 3] = [94, 94, 89];
+pub const SWATCH_32: [u8; 3] = [136, 135, 129];
+pub const SWATCH_33: [u8; 3] = [226, 225, 219];
+pub const SWATCH_34: [u8; 3] = [147, 155, 165];
+pub const SWATCH_35: [u8; 3] = [64, 190, 176];
+
+#[cfg(test)]
+mod instrument_tests {
+    use super::*;
+    fn luminance(c: [u8; 4]) -> f64 {
+        let channel = |v: u8| {
+            let v = f64::from(v) / 255.;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                libm::pow((v + 0.055) / 1.055, 2.4)
+            }
+        };
+        0.2126 * channel(c[0]) + 0.7152 * channel(c[1]) + 0.0722 * channel(c[2])
+    }
+    #[test]
+    fn text_meets_aa_on_every_glass_stop_over_every_aurora_stop() {
+        for (name, t) in SETS {
+            let mut minimum = f64::INFINITY;
+            let composite = |a: [u8; 4], b: [u8; 4]| {
+                let mut out = b;
+                for i in 0..3 {
+                    out[i] = ((f64::from(a[i]) * f64::from(a[3])
+                        + f64::from(b[i]) * f64::from(255 - a[3]))
+                        / 255.)
+                        .round() as u8;
+                }
+                out[3] = 255;
+                out
+            };
+            let mut grounds = vec![t.mesh_ground];
+            for layer in t.aurora {
+                grounds = grounds
+                    .iter()
+                    .flat_map(|base| layer.iter().map(|(_, c)| composite(*c, *base)))
+                    .collect();
+            }
+            for under in &grounds {
+                for glass in t.glass {
+                    let mut card = glass;
+                    for i in 0..3 {
+                        card[i] = ((f64::from(glass[i]) * f64::from(glass[3])
+                            + f64::from(under[i]) * f64::from(255 - glass[3]))
+                            / 255.)
+                            .round() as u8;
+                    }
+                    for ink in [
+                        // Dream-section bodies use ink; their short labels use dream amber.
+                        t.ink,
+                        t.dream,
+                        t.quiet,
+                        t.faint,
+                        t.mint,
+                        t.sky,
+                        t.amber,
+                        t.warn,
+                        t.risk,
+                        t.asked,
+                        t.csr_share,
+                        t.fresh,
+                    ] {
+                        let a = luminance(card);
+                        let b = luminance(ink);
+                        let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                        minimum = minimum.min(contrast);
+                        assert!(contrast >= 4.5, "{ink:?} on {card:?}: {contrast:.3}");
+                    }
+                }
+            }
+            println!("{name}: minimum text contrast {minimum:.3}:1, including CSR magenta");
+        }
+    }
+    // D65 sRGB -> CIELAB, then Sharma/Wu/Dalal CIEDE2000 (unit weights).
+    fn lab(rgb: [u8; 4]) -> [f64; 3] {
+        let linear = |v: u8| {
+            let v = f64::from(v) / 255.;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                libm::pow((v + 0.055) / 1.055, 2.4)
+            }
+        };
+        let [r, g, b] = [linear(rgb[0]), linear(rgb[1]), linear(rgb[2])];
+        let f = |v: f64| {
+            if v > 216. / 24389. {
+                libm::cbrt(v)
+            } else {
+                v * 841. / 108. + 4. / 29.
+            }
+        };
+        let x = f((0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047);
+        let y = f(0.2126729 * r + 0.7151522 * g + 0.0721750 * b);
+        let z = f((0.0193339 * r + 0.1191920 * g + 0.9503041 * b) / 1.08883);
+        [116. * y - 16., 500. * (x - y), 200. * (y - z)]
+    }
+    fn delta_e_2000(a: [f64; 3], b: [f64; 3]) -> f64 {
+        let [l1, a1, b1] = a;
+        let [l2, a2, b2] = b;
+        let c = (libm::hypot(a1, b1) + libm::hypot(a2, b2)) / 2.;
+        let g = 0.5 * (1. - (c.powi(7) / (c.powi(7) + 25_f64.powi(7))).sqrt());
+        let (a1, a2) = ((1. + g) * a1, (1. + g) * a2);
+        let (c1, c2) = (libm::hypot(a1, b1), libm::hypot(a2, b2));
+        let hue = |a: f64, b: f64| {
+            if a == 0. && b == 0. {
+                0.
+            } else {
+                libm::atan2(b, a).to_degrees().rem_euclid(360.)
+            }
+        };
+        let (h1, h2) = (hue(a1, b1), hue(a2, b2));
+        let mut dh = h2 - h1;
+        if c1 * c2 == 0. {
+            dh = 0.;
+        } else if dh > 180. {
+            dh -= 360.;
+        } else if dh < -180. {
+            dh += 360.;
+        }
+        let dh = 2. * (c1 * c2).sqrt() * libm::sin((dh / 2.).to_radians());
+        let (dl, dc) = (l2 - l1, c2 - c1);
+        let (lm, cm) = ((l1 + l2) / 2., (c1 + c2) / 2.);
+        let hm = if c1 * c2 == 0. {
+            h1 + h2
+        } else if (h1 - h2).abs() <= 180. {
+            (h1 + h2) / 2.
+        } else if h1 + h2 < 360. {
+            (h1 + h2 + 360.) / 2.
+        } else {
+            (h1 + h2 - 360.) / 2.
+        };
+        let cos = |v: f64| libm::cos(v.to_radians());
+        let t = 1. - 0.17 * cos(hm - 30.) + 0.24 * cos(2. * hm) + 0.32 * cos(3. * hm + 6.)
+            - 0.20 * cos(4. * hm - 63.);
+        let sl = 1. + 0.015 * (lm - 50.).powi(2) / (20. + (lm - 50.).powi(2)).sqrt();
+        let sc = 1. + 0.045 * cm;
+        let sh = 1. + 0.015 * cm * t;
+        let rt = -2.
+            * (cm.powi(7) / (cm.powi(7) + 25_f64.powi(7))).sqrt()
+            * libm::sin((60. * libm::exp(-((hm - 275.) / 25.).powi(2))).to_radians());
+        ((dl / sl).powi(2) + (dc / sc).powi(2) + (dh / sh).powi(2) + rt * (dc / sc) * (dh / sh))
+            .sqrt()
+    }
+    #[test]
+    fn ciede2000_matches_published_reference_pairs() {
+        for (a, b, expected) in [
+            ([50., 2.6772, -79.7751], [50., 0., -82.7485], 2.0425),
+            ([50., 3.1571, -77.2803], [50., 0., -82.7485], 2.8615),
+            ([50., -1.3802, -84.2814], [50., 0., -82.7485], 1.0000),
+            ([50., 0., 0.], [50., -1., 2.], 2.3669),
+            ([50., 2.49, -0.001], [50., -2.49, 0.001], 7.1792),
+        ] {
+            assert!((delta_e_2000(a, b) - expected).abs() < 0.0001);
+            assert!((delta_e_2000(b, a) - expected).abs() < 0.0001);
+        }
+    }
+    #[test]
+    fn light_mesh_anchor_colours_survive_raster_and_card_compositing() {
+        use super::super::instrument_gfx::{lin, Canvas, S};
+        // All three radial centres are outside the pane. Their nearest in-pane
+        // pixel centres must keep the existing strong mesh colour in the gaps.
+        for (w, h) in [
+            (605., 800.),
+            (605., 1135.),
+            (605., 400.),
+            (304., 500.),
+            (608., 986.), // 38 columns x 29 content rows at the fallback cell size.
+        ] {
+            let mut canvas = Canvas::new(w, h);
+            canvas.background(&LIGHT);
+            let points = [
+                (0, 0),
+                (canvas.pm.width() - 1, (h * S * 0.45) as u32),
+                ((w * S * 0.45) as u32, canvas.pm.height() - 1),
+            ];
+            let sample = |pm: &tiny_skia::Pixmap, x, y| {
+                let p = pm.pixel(x, y).unwrap().demultiply();
+                [p.red(), p.green(), p.blue(), p.alpha()]
+            };
+            let mut mesh_min = f64::INFINITY;
+            for (i, &(x, y)) in points.iter().enumerate() {
+                let mesh = sample(&canvas.pm, x, y);
+                let delta = delta_e_2000(lab(mesh), lab(LIGHT.ground));
+                mesh_min = mesh_min.min(delta);
+                assert!(delta >= 6., "{w}x{h} anchor {i}: mesh {delta}");
+            }
+            // Compare the real glass raster over the actual mesh to the same RGB
+            // gradient made opaque. No text/shadows; inset pixels exclude edge AA.
+            let mut reference = Canvas::new(w, h);
+            let stops = [
+                (LIGHT.linear_at[0], LIGHT.glass[0]),
+                (LIGHT.linear_at[1], LIGHT.glass[1]),
+            ];
+            let opaque = stops.map(|(at, mut rgba)| {
+                rgba[3] = 255;
+                (at, rgba)
+            });
+            canvas.glass(0., 0., w, h, 0., lin(0., 0., 0., h, &stops));
+            reference.glass(0., 0., w, h, 0., lin(0., 0., 0., h, &opaque));
+            let mut colours = std::collections::HashMap::new();
+            let mut max_delta = 0_f64;
+            let mut minimum_contrast = f64::INFINITY;
+            let mut checked = 0;
+            for y in 2..canvas.pm.height() - 2 {
+                for x in 2..canvas.pm.width() - 2 {
+                    let card = sample(&canvas.pm, x, y);
+                    let token = sample(&reference.pm, x, y);
+                    let (delta, contrast) = *colours.entry((card, token)).or_insert_with(|| {
+                        let delta = delta_e_2000(lab(card), lab(token));
+                        let a = luminance(card);
+                        let contrast = [
+                            LIGHT.ink,
+                            LIGHT.quiet,
+                            LIGHT.faint,
+                            LIGHT.mint,
+                            LIGHT.sky,
+                            LIGHT.dream,
+                            LIGHT.amber,
+                            LIGHT.warn,
+                            LIGHT.risk,
+                            LIGHT.asked,
+                            LIGHT.csr_share,
+                            LIGHT.fresh,
+                        ]
+                        .into_iter()
+                        .map(|ink| {
+                            let b = luminance(ink);
+                            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                        (delta, contrast)
+                    });
+                    max_delta = max_delta.max(delta);
+                    minimum_contrast = minimum_contrast.min(contrast);
+                    checked += 1;
+                }
+            }
+            println!("{w}x{h}: {checked} interior pixels, gap mesh min ΔE2000 {mesh_min:.3}, card max ΔE2000 {max_delta:.3}, min text contrast {minimum_contrast:.3}:1");
+            assert!(max_delta <= 4., "{w}x{h}: card tint ΔE2000 {max_delta}");
+            assert!(
+                minimum_contrast >= 4.5,
+                "{w}x{h}: contrast {minimum_contrast}"
+            );
+        }
+    }
+    #[test]
+    fn render_files_have_no_literal_colours() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/companion/render");
+        let pattern=regex::Regex::new(r"\[\s*(?:0|255)\s*;\s*[34]\s*\]|\[\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*\d{1,3})?\s*\]|0x[0-9a-fA-F]{6,8}\b|#[0-9a-fA-F]{6}\b").unwrap();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|x| x == "rs")
+                && path.file_name().unwrap() != "theme.rs"
+            {
+                let source = std::fs::read_to_string(&path).unwrap();
+                assert!(
+                    !pattern.find_iter(&source).any(|m| m.as_str().contains(';')
+                        || !m.as_str().starts_with('[')
+                        || m.as_str()
+                            .trim_matches(['[', ']'])
+                            .split(',')
+                            .all(|v| v.trim().parse::<u16>().is_ok_and(|v| v <= 255))),
+                    "literal colour in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}

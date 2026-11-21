@@ -1,17 +1,49 @@
-# Claude Self-Reflect v10.1 — Action Guide
+# Self-Reflect — Action Guide (10.x in development)
+
+## Version reality — read before claiming anything is shipped
+
+**Shipped/live series is 9.5.x. As of 2026-10-18 the latest published version is `9.5.8`**
+(npm `claude-self-reflect`, highest git tag `v9.5.8`, GitHub release `v9.5.8` marked Latest). **10.x has never been released — zero
+`v10*` tags exist.** `csr-engine/Cargo.toml` reads `10.1.0` because that is the *in-development*
+version on unreleased feature branches, NOT a shipped product.
+
+Rules that follow from this:
+
+1. **Never present a 10.x feature as current, live, or available to users.** Dreaming, recap
+   paragraph, memory-registry spine, csr_transcript, `--as-of`, and everything else this guide
+   documents under a "(v10)" / "(v10.1)" heading is unreleased work-in-progress on branches.
+   When you describe them, say "in development for 10.x", not "CSR does X".
+2. **This guide documents the 10.x development target, not the shipped 9.5.x binary.** The
+   binary a user has installed via npm is 9.5.8 and does not have these features unless they
+   built from a feature branch. Check `csr-engine --version` / `npm view claude-self-reflect
+   version` before telling a user what their install can do — pulled fresh, never from memory.
+3. Do not conflate the two series in user-facing text, release notes, or status claims. If you
+   are unsure whether something shipped, it did not; verify against the tag list.
+
+## Release strategy — target release branches, never main
+
+**Work targets a release branch. Never offer, suggest, or perform a push to `main`.** `main` is
+protected and moves only through reviewed PRs merged by the maintainer.
+
+- Feature work lives on `feat/*` / `fix/*` branches; a release is assembled on its own release
+  branch and tagged from there.
+- When work is ready, the deliverable is a **PR against the target branch** — opening it is a
+  publish action, so it waits for explicit maintainer approval (see GOAL-SEEKING rule 5).
+- Do not propose `git push origin main`, direct commits to `main`, or "I'll just push this up"
+  to any shared branch. State which branch the work sits on and stop there.
 
 ## Architecture
 
 Single Rust binary (`csr-engine`). No Python, no Docker, no Qdrant.
 
 ```
-csr-engine (44MB)
-  ├── MCP server (rmcp, 15 tools)
+csr-engine (about 135 MB release build)
+  ├── MCP server (rmcp, 16 tools)
   ├── Embeddings (FastEmbed, 384-dim, local)
-  ├── Search (HNSW, <1ms p95)
+  ├── Search (HNSW vector index; `eval` times the index lookup only, not a recall call)
   ├── Storage (SQLite)
   ├── AST analysis (ast-grep, 6 languages)
-  ├── 6 Claude Code hooks
+  ├── 6 hook events (7 commands; SessionStart runs two)
   └── 3-layer enrichment pipeline
 ```
 
@@ -23,35 +55,40 @@ csr-engine (44MB)
 | `~/.claude/projects/<proj>/<session>/subagents/agent-*.jsonl` | import (watcher, recursive) | `source='sidechain'`, real project from first path component (canonicalized), parent session via `chunk_provenance.source_conv_id`; parent beats child in search dedupe; legacy mis-scoped rows repaired import-side |
 | `~/.claude/tasks/<session>/` | Stop hook | authoritative task state → episode todos/outcome; completed tasks matching still-open verdicts → `resolution_proposals` (human promotes via `csr_resolve`) |
 | `~/.claude/plans/*.md` | daemon (30min) | `source='plan'`, `conversation_id=plan:<slug>`; margin-verified correlation, ambiguous → `_unscoped`; origin conversation always beats plan in search dedupe; decays via mtime timestamp |
-| `~/.codex/sessions/**/rollout-*.jsonl` | daemon (30min) + setup | optional vendor adapter, auto-detected; `source='codex_rollout'`; streaming batched ingest; capture-on-appearance (files deleted often); CSR tool payloads filtered via shared predicate |
+| `~/.codex/sessions/**/rollout-*.jsonl` | daemon (30min) + setup | optional vendor adapter, auto-detected; `source='codex_rollout'`; streaming batched ingest; capture-on-appearance (files deleted often); CSR tool payloads filtered via shared predicate; kill switch `CSR_NO_CODEX_IMPORT=1` (first pass over a large history takes hours) |
 | `~/.claude/history.jsonl` | daemon (10min) | `session_registry` spine — never embedded/injected; coverage in `status` |
-| memories / paste-cache | NOT indexed | circularity / privacy — deliberate non-goals |
+| `~/.claude/projects/<proj>/memory/*.md` | daemon (30min) | `memory_registry` spine — bodies NOT embedded/injected, metadata only (slug, description, `type`, `origin_session_id`, mtime, `[[links]]`); `MEMORY.md` skipped; hand-rolled frontmatter parser, `aux_schema_miss:memory_frontmatter` tripwire; feeds a read-only `csr_why` "distilled into memory" hop via `origin_session_id`; kill switch `CSR_NO_MEMORY_REGISTRY=1` |
+| memory bodies / paste-cache | NOT indexed | circularity / privacy — deliberate non-goals (memory *metadata* is registered, see row above) |
 
-`aux_schema_miss:*` counters in `csr-engine status` flag adapter parse failures — check them when Claude Code renames internal formats (TodoWrite→TaskCreate precedent). All reflection-producing pipelines share one sanitizer that suppresses CSR's own tool payloads and hook-injected blocks (`csr_tool_blocks_suppressed` + `csr_hook_wrappers_scrubbed` in status) — the self-contamination loop closed in v10.
+`aux_schema_miss:*` counters in `csr-engine status` flag adapter parse failures — check them when Claude Code renames internal formats (TodoWrite→TaskCreate precedent). All reflection-producing pipelines share one sanitizer that suppresses CSR's own tool payloads and hook-injected blocks (`csr_tool_blocks_suppressed` + `csr_hook_wrappers_scrubbed` in status); recap output additionally carries a machine-owned sentinel checked ahead of grammar-based detection, but `is_csr_emission` has documented bypasses (non-whitespace prefix on `recap [`, case-sensitive field tokens a real recap paragraph matches none of, four call sites that skip quote-stripping) — it narrows, not closes, new self-contamination, and does not retroactively clean the corpus. 58 of 1,330 embedded conversations (4.4%) in the maintainer's corpus remain self-contaminated — measured, not estimated; source transcripts carry far more (5,465 of 7,003 files) but the sanitizer strips those before embedding (known open debt, see CHANGELOG.md's "Known unproven in this release").
 
 ## Dreaming (v10)
 
-Evidence-grounded forgetting: append-only `witness_ledger` (span-level BLAKE3 stamps at commit OIDs) + `witness_generations` publication manifests; deterministic abstention-first verdicts (no LLM); demote+annotate consumption (`[stale anchor]`/`[evolved]` with commit receipts in search). Daemon dream cadence 6h (`CSR_DREAM_INTERVAL_SECS` override), kill switch `CSR_NO_DREAMING=1`; TAD v2 decays by release ancestry (`conversation_ancestry_cache`, hourly refresh, fail-open to neutral). Benchmark: `codewitness labels` + `codewitness bench` (eval-kit/t4) — deterministic, provenance-stamped. Supersession receipts carry their basis (`GraphOrdered` vs `ContentOnly`) — a squash/rebase successor is never read as graph-proven.
+Evidence-grounded forgetting: append-preferring event log (`witness_ledger` — no SQL trigger enforces immutability; span-level BLAKE3 stamps at commit OIDs) + `witness_generations` publication manifests; deterministic abstention-first verdicts (no LLM); verdict consumption is set by `CSR_DREAM_CONSUMPTION`: unset or `annotate` (the default) shows `[stale anchor]`/`[evolved]` search notes with commit receipts plus the status counters and never changes a rank; `full`/`1`/`true` adds the rank sink and the recap retired clause; `off`/`0`/`false` hides all of it (this one flag gates all verdict consumption; no demote-only switch exists). Daemon dream cadence 6h (`CSR_DREAM_INTERVAL_SECS` override), kill switch `CSR_NO_DREAMING=1`; TAD v2 decays by release ancestry (`conversation_ancestry_cache`, hourly refresh, fail-open to neutral). Benchmark: `codewitness labels` + `codewitness bench` (eval-kit/t4) — deterministic and provenance-stamped, but it does not execute the production dream algorithm (`dream::find_successor`); it predicts from sampled tag maps only. The `codewitness` crate's `Auditor::audit_against_successor` — not the production `dream::find_successor` path, which never emits this field — tags supersession receipts with their basis (`GraphOrdered` vs `ContentOnly`); a squash/rebase successor's receipt there is labeled `ContentOnly`, not presented as graph-proven. Dogfood corpus: 482 anchors observed at 2 HEAD commits — existence evidence, not accuracy.
 
 ## Recap (v10.1)
 
-SessionStart injects one causal paragraph instead of the fragment pile: `recap [<age>]: <intent>: <completed>. Settled: <claim> (<receipt>). Now: <blockers|still-open|proposals|todos>. Learnt-then-retired while away: <label> (superseded <date>, <oid>). Next: <evidenced next step>.` Composer `src/hooks/recap.rs` + feeds `src/storage/recap_feeds.rs`, zero LLM. Every clause drops independently without evidence; `Next:` is never fabricated; receipts mandatory. Feeds fail open to the byte-identical fragment fallback. Suppressed from re-import by exact emitted grammar in `provenance::is_csr_emission` (the self-contamination guard). Kill switch `CSR_NO_RECAP=1`.
+SessionStart injects one causal paragraph instead of the fragment pile: `recap [<age>]: <intent>: <completed>. Then: <later ask>. [[CSR:RECAP]]`, then one line each: `Last: <closing summary's finding> (conv <sid8>).` `Settled: <claim> (<receipt>).` `Now: <blockers|still-open|proposals|open todo(s): <title>; <title>[; +k more] (conv <sid8>)|last turn did not finish (conv <sid8>)>.` `Corrected: <quote> (<sid8>:<turn>, <date>).` `Learnt-then-retired while away: <label> (superseded <date>, <oid>).` `Dreamt: <symbol in file|file> <verdict> (<date>, <oid>).` `Next: <evidenced next step>.` In the SessionStart form the intent is composed (`recap::composed_intent`; the repo recap keeps its own rule and labels it "you asked"): the first sentence of the stored anchor request (else, when none is stored or its sentence is over 160 chars, the first sentence of the session's first prompt, only in a session of 40 messages or fewer), cut after the twelfth word at a word boundary with `…` when longer, so the head is never the raw prefix of a long prompt; the episode index lines use the same text. No model call, no word added or respelled; the `CSR CONTINUUM` fragment head uses the same text. The whole SessionStart block (pointer, manifest, briefing, recap, `Open` block, episode index, footer) is held at 3,000 bytes by `hooks::start_budget`: the episode index loses its oldest lines first (its header goes with its last line), then an `Open` block that alone busts the cap, then the learnt line, then the briefing (clipped to whole lines or a word boundary, header kept; dropped under 200 bytes of text); the recap itself is never trimmed. With no clean intent and nothing landed the head is the bare `recap [<age>]: [[CSR:RECAP]]`, and only when a `Settled:` or named `Now:` entry stands; otherwise (a correction, a dream, a retired note or a `Next:` alone) the fragment block runs, whose `LAST:` line carries the finding. `Last:` (SessionStart only) is the episode's closing summary as the fragment `LAST:` line shows it (`session_start::conclusion_preview`, 120 chars: its bold verdict sentence, else its first sentence, plus a distinct last sentence after ` … `; at least 2 words), dropped when the head already says it; it never counts as evidence for composing, so an intent-only paragraph still falls back to the fragments. `Now:` names up to two open todos by title, never a bare count, and not the todo `Next:` already names. SessionStart shows a `Dreamt:` or `Learnt-then-retired` entry only when the recap's own text (intent, `Then:`, `Latest:`, `Last:`, `Settled:`, `Now:`, `Next:`) names the verdict's file basename (case-insensitive) or symbol (case-sensitive) as a whole word of 4+ chars, checked again after the budget; a file the session merely touched does not count (`recap::WitnessSubject`); a session receipt listed before the anchor's first own receipt (made under an earlier prompt) is not `Settled:`. `Now:` carries a receipt in every entry; `last turn did not finish` is said only for an episode whose outcome rule ran and whose transcript did not end on a finished reply, never for the live session (compaction), and alone it does not stop the fragment fallback. A `Dreamt:` label is never a bare symbol. A commit receipt that `git merge-base --is-ancestor <oid> HEAD` proves is not on the cwd's HEAD reads `(<oid>, not on <branch>)` (`not on HEAD` when detached); `hooks::recap_git` makes no git call when the recap has no commit receipt, else one `git symbolic-ref --short -q HEAD` call (150 ms) and at most one ancestry call per receipt (150 ms each, 300 ms together, 8 receipts), and fails open to unmarked receipts. The working tree is never listed: the `Uncommitted: N files (…)` line is gone (the importer still recognises it in stored transcripts). The block ends `ANCHORS (last session's files): N intact, M modified[ (names)]` then `Full state:`; the older `ANCHORS: N intact, M modified since checkpoint` stays recognised. The briefing header reads `[briefing: model-derived, trust=<t>, written <age>, ages below as of then]`: the ages inside the briefing were counted when it was written, the recap's from now. Composer `src/hooks/recap.rs` + feeds `src/storage/recap_feeds.rs`, zero LLM. Every clause drops independently without evidence; `Next:` is never fabricated; receipts mandatory. Feeds fail open to the byte-identical fragment fallback. One receipt-less `Then: <ask>.` clause may follow the intent (before the sentinel; the `/clear` handoff puts it before `Still open:`): the session's literal last typed message when `recap::is_substantive_ask` reads it as an ask (`is_request`, a fail-closed check, plus at least 4 words after fillers, not an acknowledgement, not a command whose object is only "this"/"it": "save this", "ok", "continue" never count), else the latest task prompt Stop recorded after the anchor (`compact_anchor.request`) under the same rule; its opening paragraph, same 40-word cap; never one the intent already covers; and only when every other line comes out byte for byte as without it. Suppressed from re-import via a machine-owned sentinel (`RECAP_SENTINEL` = `[[CSR:RECAP]]`, emitted inside the 700-char budget) scanned across the full text in two places: `extractable`'s own precheck, which runs *before* `strip_quoted` so a blockquoted recap cannot shed its sentinel along with its quoted lines, and inside `is_csr_emission` ahead of its window-limited grammar branches. All five call sites — `extractable`, `rerank.rs`, `session_briefing.rs`, `prompt_submit.rs`, `session_start.rs` — therefore reject sentinel-bearing recaps regardless of quoting or window size. This narrows, not closes: the residual bypasses are legacy pre-sentinel recaps only (a non-whitespace prefix on `recap [` defeats the header match; the case-sensitive field tokens a real recap paragraph matches none of), and it does not clean transcripts already embedded (58 of 1,330 conversations, 4.4%, known open debt), and it rejects any text containing the sentinel — including source, grep output and design discussion of the sentinel itself, which is a live recall hole for work on CSR but unreachable for ordinary users. For `source="compact"` on the same session, the intent uses Stop’s cached latest renderable typed task (excluding notes, harness rows and thin side requests), falling back to the usual first-task rule when absent; startup, resume, clear and other sessions keep that rule. Kill switch `CSR_NO_RECAP=1`.
+
+## Learnt line (v10.1)
+
+SessionStart (`startup`, `resume`) prints one separate line after the Tier-0 block: `learnt [<age>]: <clauses>. [[CSR:LEARNT]]`, at most 320 bytes, composed by `src/hooks/learnt.rs` from session-keyed feeds in `src/storage/learnt_feeds.rs`, zero LLM. It reports what CSR *stored* for the previous session, never what is true: `N memory notes: <≤3 slugs> (<sid8>, <date>)` (by `memory_registry.origin_session_id`), `N csr_resolve verdicts` (user-confirmed only, by `provenance_events.conversation_id`), and `N anchors retired by <oid>` (dream verdicts, counts only; on by default, hidden by `CSR_DREAM_CONSUMPTION=off`, and only when the receipt commit falls inside the session window). Every clause carries a receipt, anything the recap already names is dropped, and no evidence means zero bytes. There is no stored-reflections clause: `reflections` has no session column and the owner runs concurrent sessions, so a time window would misattribute. On `source=resume` Claude Code starts a new session id, so `hooks/resume_lineage.rs` scans sibling transcripts (modified in the last 15 minutes, at most 64 files, last 256 KiB each) for the `continued-in` row naming the new sid and moves that episode to the front inside `recent_project_episodes`, so recap and learnt both describe the resumed session; no match, or a row not yet written, leaves the newest-by-timestamp order. Suppressed from re-import by `LEARNT_SENTINEL` (`[[CSR:LEARNT]]`, in `MACHINE_SENTINELS`) plus the `learnt` registry formatter in `import/contamination.rs`. Kill switch `CSR_NO_LEARNT=1`, independent of `CSR_NO_RECAP`.
 
 ## Key Commands
 
 ```bash
 csr-engine                     # Start MCP server (default)
-csr-engine setup               # Import + register MCP + install hooks
+csr-engine setup               # Import + register MCP + install hooks + start the daemon (macOS launchd agent; CSR_NO_DAEMON=1 skips)
 csr-engine status              # System status (JSON)
 csr-engine status --compact    # Statusline output
-csr-engine daemon              # Background enrichment (AI narratives)
+csr-engine daemon              # Background enrichment + dream cycle; setup installs its launchd agent (scripts/launchd/ holds the hand-install template)
 csr-engine hook install --apply # Install/update hooks
-csr-engine eval                # Quick eval (5 tests, ~7ms)
-csr-engine eval --full         # Full eval (20 tests, ~200ms)
+csr-engine eval                # Quick eval (6 checks, ~20ms after the index loads)
+csr-engine eval --full         # Full eval (24 results plus a census line; 44s on a 10GB database, most of it the integrity check)
 csr-engine quality <file>      # AST code quality analysis
 ```
 
-## MCP Tools (15 total)
+## MCP Tools (16 total)
 
 ```
 csr_reflect_on_past   — Semantic search across past conversations
@@ -69,6 +106,7 @@ get_session_learnings — Iteration memory for Ralph loops
 csr_code_graph        — Which conversations shaped a function/file (AST anchors)
 csr_why               — Provenance chain: why does this code/decision exist (reinstatement recall)
 csr_resolve           — Record verified verdicts (resolved/still_open/regressed) on chunks; resolved demote+annotate in future searches
+csr_transcript        — Structured facts from a session transcript JSONL (stats, prompts, tool calls, files, errors, slices, grep)
 ```
 
 ## Critical Rules
@@ -85,13 +123,13 @@ csr_resolve           — Record verified verdicts (resolved/still_open/regresse
 # Build
 cd csr-engine && cargo build --release
 
-# Test (615 unit + 45 hooks integration + 61 integration)
+# Test suite — 5,316 tests: 4,821 lib + 495 across 23 integration targets (verified at commit e7c6e00e); `cargo test` runs all of them
 cargo test
 cargo test --test hooks_integration
 cargo test --test integration
 
 # Format + lint
-cargo fmt && cargo clippy
+cargo fmt && cargo clippy --release --all-targets -- -D warnings
 
 # Benchmarks
 cargo bench --bench spike_bench
@@ -112,31 +150,33 @@ cargo bench --bench spike_bench
 ### Key Patterns
 
 - **rmcp tool params**: Use `Parameters<MyStruct>` pattern, NOT individual `#[tool(param)]`
-- **rmcp tool annotations**: All 15 tools declare `annotations(...)` in the macro — hints vary per tool (most use `read_only_hint, destructive_hint, idempotent_hint`; `get_full_conversation` uses `open_world_hint` instead of `idempotent_hint`)
+- **rmcp tool annotations**: All 16 tools declare `annotations(...)` in the macro — hints vary per tool (most use `read_only_hint, destructive_hint, idempotent_hint`; `get_full_conversation` uses `open_world_hint` instead of `idempotent_hint`)
 - **rmcp builders**: `ServerInfo::new(caps).with_instructions()`, `Implementation::new()`, `ReadResourceResult::new()`
 - **fastembed**: Requires `aarch64` Rust — no x86_64-apple-darwin ONNX binaries
 - **rusqlite 0.38**: No `ToSql` for `usize` — cast to `i64`
 - **Storage thread safety**: Wrap `Connection` in `std::sync::Mutex`
 - **EmbeddingEngine**: `embed` requires `&mut self`, wrap in `Mutex`
 - **Hooks**: All use catch-all wrappers — never block Claude Code
+- **Companion pane layout**: follow `csr-engine/src/companion/render/PANE_RULES.md` (height budget, tiers, stack); `tests/pane_contract.rs` fails any card that breaks a rule
 - **System sqlite3 (macOS)**: cannot load fts5 — CLI inspection silently skips `chunks_fts` (integrity checks look ~10x faster than the bundled engine's). Use `csr-engine status --deep` or Homebrew sqlite3.
 - **integrity_check**: never call raw `PRAGMA integrity_check` on the hot path — ~10s CPU on multi-GB DBs; use `Storage::integrity_check_cached` (meta-table cache, daemon refreshes)
 - **AI narratives**: `claude -p` (model chain: `CSR_NARRATIVE_MODEL` → `haiku` → CLI default); usage counted in `narrative_usage` table, shown in `csr-engine status`; kill switch `CSR_NO_AI_NARRATIVES=1`.
 
 ## Hooks
 
-6 hooks fire at strategic moments:
+7 hooks fire at strategic moments:
 
 | Hook | When | What |
 |------|------|------|
 | SessionStart | Session begins | Injects the recap paragraph (framed as history, not instructions); falls back to fragments when feeds are empty |
 | UserPromptSubmit | Every prompt | Predictive context injection |
-| PostToolUse | After Edit/Write | Tracks file changes |
-| Stop | Every response | Stores iteration learnings |
+| PostToolUse | After Edit/Write, and after a Bash call that wrote a file (`sed -i`, `perl -pi`, redirects, `tee`, Python writes) | Tracks file changes; a Bash call that wrote nothing exits before any other work |
+| Stop | Every response | Spools its input and returns; a detached `hook stop-work` worker stores iteration learnings (`CSR_STOP_INLINE=1` runs it inline) |
 | PreCompact | Before compaction | Backs up state |
+| PostCompact | After compaction | Stores Claude Code's own compaction summary once, as derived context |
 | SessionEnd | Session ends | Stores narrative |
 
-Hook CLI: `csr-engine hook session-start|session-end|precompact|stop|post-tool-use|prompt-submit|install`
+Hook CLI: `csr-engine hook session-start|session-end|precompact|post-compact|stop|post-tool-use|prompt-submit|install` (`subagent-stop` is a deprecated no-op kept so old settings.json entries don't fail; `hook install --apply` removes them)
 
 ## File Layout
 
@@ -169,7 +209,7 @@ Env controls: `CSR_AUTO_SETUP=1`, `CSR_SKIP_SETUP=1` (install.sh only).
 
 ## Documentation
 
-Primary docs: https://ramakay.github.io/claude-self-reflect/ (GitHub Pages, built from `docs-site/`)
+Site: https://ramakay.github.io/claude-self-reflect/ (GitHub Pages: the landing from `site/` at the root, the docs app from `docs-site/` under `/docs/`; both assembled by `.github/workflows/docs.yml`)
 
 ---
 *Published research record (saga paper + experiment results): `docs/plans/` — internal planning docs live in `.plans/` (untracked)*

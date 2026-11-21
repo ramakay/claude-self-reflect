@@ -183,4 +183,4 @@ traceability back to the source files.
 
 ---
 
-File: /private/tmp/claude-501/-Users-ramakrishnanannaswamy-projects-claude-self-reflect-csr-engine/efab2eb0-47e7-4b91-bb78-a962261c4214/scratchpad/t3-eval/final_set.md
+File: /private/tmp/claude-501/-Users-<you>-projects-claude-self-reflect-csr-engine/efab2eb0-47e7-4b91-bb78-a962261c4214/scratchpad/t3-eval/final_set.md

@@ -1,0 +1,377 @@
+{
+ "old": {
+  "v": 1,
+  "current": {
+   "rev": 4,
+   "at": 1792305600.0,
+   "by": "Haiku",
+   "covered_msgs": 3,
+   "entries": [
+    {
+     "kind": "shift",
+     "claim": "Bounded the reader",
+     "before": [
+      {
+       "scope": "csr-engine/src/companion/reader.rs",
+       "sym": "read",
+       "mark": "~",
+       "tier": "verified"
+      }
+     ],
+     "after": [
+      {
+       "scope": "csr-engine/src/companion/reader.rs",
+       "sym": "read",
+       "mark": "~",
+       "tier": "verified"
+      }
+     ],
+     "receipts": [
+      "oid:8e4e3f27a",
+      "evo:1"
+     ],
+     "grounded": true,
+     "sig": "aaaa1111",
+     "was": "The reader loaded a whole transcript.",
+     "now": "The reader streams chunks and stops at the byte budget.",
+     "moved": true
+    },
+    {
+     "kind": "decision",
+     "claim": "Kept the database read-only",
+     "before": [],
+     "after": [
+      {
+       "scope": "csr-engine/src/companion/pane.rs",
+       "sym": "frame",
+       "mark": "+",
+       "tier": "model"
+      }
+     ],
+     "receipts": [
+      "edge:1",
+      "node:2"
+     ],
+     "grounded": true,
+     "sig": "bbbb2222",
+     "was": "-",
+     "now": "Every page reads through the same Storage handle, never a second writer, so a frame can never block a hook and a hook can never see a half written row from the pane."
+    },
+    {
+     "kind": "risk",
+     "claim": "The legend row can overflow on a phone",
+     "before": [
+      {
+       "scope": "a/very/long/path/to/some/deeply/nested/module/file.rs",
+       "sym": "draw_legend_row",
+       "mark": "-",
+       "tier": "model"
+      }
+     ],
+     "after": [
+      {
+       "op": "rewrite the row"
+      },
+      {
+       "scope": "legend.rs",
+       "sym": null,
+       "mark": "!",
+       "tier": "model"
+      }
+     ],
+     "receipts": [],
+     "grounded": false,
+     "sig": "cccc3333"
+    },
+    {
+     "kind": "removal",
+     "claim": "Dropped the second reader",
+     "before": [
+      {
+       "scope": "old.rs",
+       "sym": null,
+       "mark": "-",
+       "tier": "verified"
+      }
+     ],
+     "after": [
+      {
+       "scope": "new.rs",
+       "sym": "go",
+       "mark": "+",
+       "tier": "verified"
+      },
+      {
+       "scope": "other.rs",
+       "sym": "go",
+       "mark": "~",
+       "tier": "verified"
+      }
+     ],
+     "receipts": [
+      "evo:3",
+      "oid:abcdef0123"
+     ],
+     "grounded": true,
+     "was": "Two readers ran.",
+     "now": "One reader runs."
+    }
+   ]
+  },
+  "previous": {
+   "sigs": [
+    "dddd4444"
+   ]
+  }
+ },
+ "fresh": {
+  "v": 1,
+  "current": {
+   "rev": 5,
+   "at": 1792319995.0,
+   "by": "Haiku",
+   "covered_msgs": 3,
+   "entries": [
+    {
+     "kind": "shift",
+     "claim": "Bounded the reader",
+     "before": [
+      {
+       "scope": "csr-engine/src/companion/reader.rs",
+       "sym": "read",
+       "mark": "~",
+       "tier": "verified"
+      }
+     ],
+     "after": [
+      {
+       "scope": "csr-engine/src/companion/reader.rs",
+       "sym": "read",
+       "mark": "~",
+       "tier": "verified"
+      }
+     ],
+     "receipts": [
+      "oid:8e4e3f27a",
+      "evo:1"
+     ],
+     "grounded": true,
+     "sig": "aaaa1111",
+     "was": "The reader loaded a whole transcript.",
+     "now": "The reader streams chunks and stops at the byte budget.",
+     "moved": true
+    },
+    {
+     "kind": "decision",
+     "claim": "Kept the database read-only",
+     "before": [],
+     "after": [
+      {
+       "scope": "csr-engine/src/companion/pane.rs",
+       "sym": "frame",
+       "mark": "+",
+       "tier": "model"
+      }
+     ],
+     "receipts": [
+      "edge:1",
+      "node:2"
+     ],
+     "grounded": true,
+     "sig": "bbbb2222",
+     "was": "-",
+     "now": "Every page reads through the same Storage handle, never a second writer, so a frame can never block a hook and a hook can never see a half written row from the pane."
+    },
+    {
+     "kind": "risk",
+     "claim": "The legend row can overflow on a phone",
+     "before": [
+      {
+       "scope": "a/very/long/path/to/some/deeply/nested/module/file.rs",
+       "sym": "draw_legend_row",
+       "mark": "-",
+       "tier": "model"
+      }
+     ],
+     "after": [
+      {
+       "op": "rewrite the row"
+      },
+      {
+       "scope": "legend.rs",
+       "sym": null,
+       "mark": "!",
+       "tier": "model"
+      }
+     ],
+     "receipts": [],
+     "grounded": false,
+     "sig": "cccc3333"
+    },
+    {
+     "kind": "removal",
+     "claim": "Dropped the second reader",
+     "before": [
+      {
+       "scope": "old.rs",
+       "sym": null,
+       "mark": "-",
+       "tier": "verified"
+      }
+     ],
+     "after": [
+      {
+       "scope": "new.rs",
+       "sym": "go",
+       "mark": "+",
+       "tier": "verified"
+      },
+      {
+       "scope": "other.rs",
+       "sym": "go",
+       "mark": "~",
+       "tier": "verified"
+      }
+     ],
+     "receipts": [
+      "evo:3",
+      "oid:abcdef0123"
+     ],
+     "grounded": true,
+     "was": "Two readers ran.",
+     "now": "One reader runs."
+    }
+   ]
+  },
+  "previous": {
+   "sigs": [
+    "dddd4444"
+   ]
+  }
+ },
+ "inherited": {
+  "v": 1,
+  "current": {
+   "rev": 2,
+   "at": 1792305600.0,
+   "by": "Haiku",
+   "covered_msgs": 3,
+   "entries": [
+    {
+     "kind": "shift",
+     "claim": "Bounded the reader",
+     "before": [
+      {
+       "scope": "csr-engine/src/companion/reader.rs",
+       "sym": "read",
+       "mark": "~",
+       "tier": "verified"
+      }
+     ],
+     "after": [
+      {
+       "scope": "csr-engine/src/companion/reader.rs",
+       "sym": "read",
+       "mark": "~",
+       "tier": "verified"
+      }
+     ],
+     "receipts": [
+      "oid:8e4e3f27a",
+      "evo:1"
+     ],
+     "grounded": true,
+     "sig": "aaaa1111",
+     "was": "The reader loaded a whole transcript.",
+     "now": "The reader streams chunks and stops at the byte budget.",
+     "moved": true
+    },
+    {
+     "kind": "decision",
+     "claim": "Kept the database read-only",
+     "before": [],
+     "after": [
+      {
+       "scope": "csr-engine/src/companion/pane.rs",
+       "sym": "frame",
+       "mark": "+",
+       "tier": "model"
+      }
+     ],
+     "receipts": [
+      "edge:1",
+      "node:2"
+     ],
+     "grounded": true,
+     "sig": "bbbb2222",
+     "was": "-",
+     "now": "Every page reads through the same Storage handle, never a second writer, so a frame can never block a hook and a hook can never see a half written row from the pane."
+    },
+    {
+     "kind": "risk",
+     "claim": "The legend row can overflow on a phone",
+     "before": [
+      {
+       "scope": "a/very/long/path/to/some/deeply/nested/module/file.rs",
+       "sym": "draw_legend_row",
+       "mark": "-",
+       "tier": "model"
+      }
+     ],
+     "after": [
+      {
+       "op": "rewrite the row"
+      },
+      {
+       "scope": "legend.rs",
+       "sym": null,
+       "mark": "!",
+       "tier": "model"
+      }
+     ],
+     "receipts": [],
+     "grounded": false,
+     "sig": "cccc3333"
+    },
+    {
+     "kind": "removal",
+     "claim": "Dropped the second reader",
+     "before": [
+      {
+       "scope": "old.rs",
+       "sym": null,
+       "mark": "-",
+       "tier": "verified"
+      }
+     ],
+     "after": [
+      {
+       "scope": "new.rs",
+       "sym": "go",
+       "mark": "+",
+       "tier": "verified"
+      },
+      {
+       "scope": "other.rs",
+       "sym": "go",
+       "mark": "~",
+       "tier": "verified"
+      }
+     ],
+     "receipts": [
+      "evo:3",
+      "oid:abcdef0123"
+     ],
+     "grounded": true,
+     "was": "Two readers ran.",
+     "now": "One reader runs."
+    }
+   ]
+  },
+  "previous": {
+   "sigs": [
+    "dddd4444"
+   ]
+  }
+ }
+}

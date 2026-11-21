@@ -7,6 +7,9 @@ pub mod anchors;
 pub mod ast_analysis;
 pub mod codegraph;
 pub mod errors;
+pub mod file_extract;
+pub mod graph_drain;
+pub mod graph_spool;
 pub mod heuristic;
 pub mod index_builder;
 pub mod manifest;
@@ -20,6 +23,7 @@ pub mod resolver;
 pub mod scoring;
 pub mod signature;
 pub mod story;
+pub mod wrappers;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

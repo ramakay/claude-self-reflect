@@ -1,0 +1,162 @@
+[
+ {
+  "rows": [],
+  "cost": null,
+  "label": "↻ refresh the shift map · one Haiku call"
+ },
+ {
+  "rows": [
+   [
+    "2026-10-18T10:00:00",
+    "claude-haiku-4-5",
+    "story",
+    1200,
+    300,
+    0,
+    0
+   ]
+  ],
+  "cost": {
+   "calls": 1,
+   "usd": 0.0027,
+   "tokens": 1500
+  },
+  "label": "↻ refresh the shift map · about 0.3¢ (avg of your 1 story call)"
+ },
+ {
+  "rows": [
+   [
+    "2026-10-18T10:00:00",
+    "claude-haiku-4-5",
+    "story",
+    1200,
+    300,
+    40000,
+    2000
+   ],
+   [
+    "2026-10-18T10:05:00",
+    "claude-haiku-4-5",
+    "story",
+    900,
+    250,
+    38000,
+    1500
+   ],
+   [
+    "2026-10-18T10:10:00",
+    "claude-sonnet-4-5",
+    "story",
+    100,
+    50,
+    0,
+    0
+   ],
+   [
+    "2026-10-18T10:10:00",
+    "claude-haiku-4-5",
+    "other",
+    5,
+    5,
+    5,
+    5
+   ]
+  ],
+  "cost": {
+   "calls": 3,
+   "usd": 0.006024999999999999,
+   "tokens": 28100
+  },
+  "label": "↻ refresh the shift map · about 0.6¢ (avg of your 3 story calls)"
+ },
+ {
+  "rows": [
+   [
+    "2026-10-18T10:00:00",
+    "mystery-model",
+    "story",
+    5000,
+    700,
+    0,
+    0
+   ]
+  ],
+  "cost": {
+   "calls": 1,
+   "usd": null,
+   "tokens": 5700
+  },
+  "label": "↻ refresh the shift map · about 5,700 tokens (avg of your 1 story call)"
+ },
+ {
+  "rows": [
+   [
+    "2026-10-18T10:00:00",
+    "mystery-model",
+    "story",
+    0,
+    0,
+    0,
+    0
+   ],
+   [
+    "2026-10-18T10:00:00",
+    "claude-haiku-4-5",
+    "story",
+    1,
+    1,
+    0,
+    0
+   ]
+  ],
+  "cost": {
+   "calls": 2,
+   "usd": 3e-06,
+   "tokens": 1
+  },
+  "label": "↻ refresh the shift map · about <0.1¢ (avg of your 2 story calls)"
+ },
+ {
+  "rows": [
+   [
+    "2026-10-18T10:00:00",
+    "claude-haiku-4-5",
+    "story",
+    12,
+    3,
+    0,
+    0
+   ]
+  ],
+  "cost": {
+   "calls": 1,
+   "usd": 2.7e-05,
+   "tokens": 15
+  },
+  "label": "↻ refresh the shift map · about <0.1¢ (avg of your 1 story call)"
+ },
+ {
+  "rows": [
+   [
+    "2026-10-18T10:00:00",
+    "mystery-model",
+    "story",
+    1234567,
+    8000,
+    0,
+    0
+   ]
+  ],
+  "cost": {
+   "calls": 1,
+   "usd": null,
+   "tokens": 1242567
+  },
+  "label": "↻ refresh the shift map · about 1,242,567 tokens (avg of your 1 story call)"
+ },
+ {
+  "rows": null,
+  "cost": null,
+  "label": "↻ refresh the shift map · one Haiku call"
+ }
+]

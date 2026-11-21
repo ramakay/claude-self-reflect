@@ -3,9 +3,9 @@ import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
 import { Link } from 'react-router'
 import { ChevronRight } from 'lucide-react'
-import { navigation } from '../content'
+import { versions, sameIn, imageUrl } from '../content/versions'
 
-function findAdjacent(currentPath) {
+function findAdjacent(currentPath, navigation) {
   const all = navigation.flatMap(g => g.items)
   const idx = all.findIndex(i => i.href === currentPath)
   return {
@@ -14,8 +14,9 @@ function findAdjacent(currentPath) {
   }
 }
 
-export default function DocPage({ title, description, content, path }) {
-  const { prev, next } = findAdjacent(path)
+export default function DocPage({ title, description, content, path, version = 'current' }) {
+  const v = versions[version]
+  const { prev, next } = findAdjacent(path, v.navigation)
 
   return (
     <article>
@@ -25,6 +26,14 @@ export default function DocPage({ title, description, content, path }) {
         <ChevronRight size={12} />
         <span style={{ color: 'var(--color-body)' }}>{title}</span>
       </div>
+
+      {/* An older version says so, and points at the same page in the current one */}
+      {version !== 'current' && (
+        <div className="version-banner" role="note">
+          You are reading the 9.x docs.{' '}
+          <Link to={sameIn(versions.current, path)}>10.1 is current &rarr;</Link>
+        </div>
+      )}
 
       {/* Header */}
       <h1 className="font-serif mt-6 mb-3" style={{ fontSize: 36, fontWeight: 700, color: 'var(--color-ink)' }}>{title}</h1>
@@ -38,11 +47,16 @@ export default function DocPage({ title, description, content, path }) {
           components={{
             a: ({ href, children }) => {
               if (href?.startsWith('/claude-self-reflect/')) {
-                const hashPath = href.replace('/claude-self-reflect/', '/docs/')
+                const hashPath = href.replace('/claude-self-reflect/', `${v.prefix}/docs/`)
                 return <Link to={hashPath} style={{ color: 'var(--color-purple)' }}>{children}</Link>
+              }
+              // A page link inside an older version stays in that version.
+              if (href?.startsWith('#/docs/')) {
+                return <Link to={`${v.prefix}${href.slice(1)}`} style={{ color: 'var(--color-purple)' }}>{children}</Link>
               }
               return <a href={href} target={href?.startsWith('http') ? '_blank' : undefined} rel="noopener noreferrer">{children}</a>
             },
+            img: ({ node, src, alt, ...rest }) => <img src={imageUrl(src)} alt={alt} {...rest} />,
           }}
         >
           {content}

@@ -1,0 +1,78 @@
+{
+  "39": {
+    "key": "instrument:dreams"
+  },
+  "40": {
+    "dream": "newest",
+    "key": "dream:newest",
+    "send": "Self-Reflect's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”",
+    "spans": [
+      [
+        0,
+        25,
+        "helpful"
+      ],
+      [
+        25,
+        50,
+        "thought_of_it"
+      ],
+      [
+        50,
+        75,
+        "not_relevant"
+      ],
+      [
+        75,
+        100,
+        "ask_claude"
+      ]
+    ]
+  },
+  "42": {
+    "key": "observe:3:0"
+  },
+  "43": {
+    "key": "observe:3:1"
+  },
+  "44": {
+    "key": "observe:3:2"
+  },
+  "53": {
+    "key": "observe:3:3"
+  },
+  "64": {
+    "key": "observe:3:4"
+  },
+  "66": {
+    "key": "observe:3:5"
+  },
+  "67": {
+    "key": "observe:3:6"
+  },
+  "69": {
+    "key": "legend",
+    "keys": [
+      [
+        1,
+        7,
+        "t"
+      ],
+      [
+        9,
+        19,
+        "j/k"
+      ],
+      [
+        21,
+        28,
+        "b"
+      ],
+      [
+        30,
+        37,
+        "q"
+      ]
+    ]
+  }
+}

@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 704" width="1000" height="704" role="img" aria-labelledby="t d">
+<title id="t">Hooks lifecycle: how the 8 hooks move data</title><desc id="d">Three hooks inject context from the CSR store into Claude Code; three record the session into the store; two handle compaction. Eight hooks on seven events.</desc>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,1 L10,5 L0,9 z" fill="#c8442a"/></marker></defs>
+<rect width="1000" height="704" fill="#f5f2eb"/>
+<text x="40" y="48" font-family="Georgia, 'Times New Roman', serif" font-size="26" font-weight="normal" fill="#24211e" text-anchor="start">Hooks: the session loop</text>
+<text x="40" y="72" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#6b645b" text-anchor="start">Eight csr-engine subcommands on seven events. They work without the daemon.</text>
+<rect x="40" y="96" width="180" height="554" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="130" y="126" font-family="Georgia, 'Times New Roman', serif" font-size="16" font-weight="bold" fill="#24211e" text-anchor="middle">Claude Code</text>
+<text x="130" y="146" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="normal" fill="#6b645b" text-anchor="middle">session</text>
+<rect x="780" y="96" width="180" height="554" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="870" y="126" font-family="Georgia, 'Times New Roman', serif" font-size="16" font-weight="bold" fill="#24211e" text-anchor="middle">CSR store</text>
+<text x="870" y="146" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="normal" fill="#6b645b" text-anchor="middle">SQLite + HNSW</text>
+<text x="260" y="118" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="bold" fill="#a0432f" text-anchor="start">INJECT CONTEXT</text>
+<rect x="260" y="128" width="480" height="44" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="276" y="147" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook session-start</text>
+<text x="276" y="164" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">recap, learnt line, episode index</text>
+<rect x="260" y="180" width="480" height="44" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="276" y="199" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook session-briefing</text>
+<text x="276" y="216" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">async, one claude -p call</text>
+<rect x="260" y="232" width="480" height="44" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="276" y="251" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook prompt-submit</text>
+<text x="276" y="268" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">routing + scoring, 500 tokens</text>
+<line x1="780" y1="202.0" x2="740" y2="202.0" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<line x1="260" y1="202.0" x2="220" y2="202.0" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<text x="260" y="308" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="bold" fill="#a0432f" text-anchor="start">RECORD</text>
+<rect x="260" y="318" width="480" height="44" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="276" y="337" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook post-tool-use</text>
+<text x="276" y="354" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">file edits, code-map queue</text>
+<rect x="260" y="370" width="480" height="44" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="276" y="389" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook stop</text>
+<text x="276" y="406" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">transcript import, episode</text>
+<rect x="260" y="422" width="480" height="44" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="276" y="441" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook session-end</text>
+<text x="276" y="458" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">final import, story, extraction</text>
+<line x1="220" y1="392.0" x2="260" y2="392.0" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<line x1="740" y1="392.0" x2="780" y2="392.0" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<text x="260" y="498" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="bold" fill="#a0432f" text-anchor="start">COMPACTION</text>
+<rect x="260" y="508" width="480" height="44" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="276" y="527" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook precompact</text>
+<text x="276" y="544" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">refresh task anchor, start dream</text>
+<rect x="260" y="560" width="480" height="44" rx="2" fill="#fdfbf6" stroke="#d8d2c8" stroke-width="1"/>
+<text x="276" y="579" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="normal" fill="#c8442a" text-anchor="start">csr-engine hook post-compact</text>
+<text x="276" y="596" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#6b645b" text-anchor="start">store Claude Code's summary</text>
+<line x1="220" y1="556.0" x2="260" y2="556.0" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<line x1="740" y1="556.0" x2="780" y2="556.0" stroke="#c8442a" stroke-width="1.5" marker-end="url(#ar)"/>
+<text x="40" y="684" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="normal" fill="#6b645b" text-anchor="start">Every hook logs and returns OK on error, so a failing hook never blocks Claude Code.</text>
+
+</svg>

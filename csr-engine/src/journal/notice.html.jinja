@@ -1,0 +1,10 @@
+{% extends "layout.html" %}
+{% block title %}{{ view.heading }} — CSR Dream Journal{% endblock %}
+{% block masthead_meta %}<span>{{ view.status }}</span>{% endblock %}
+{% block main %}
+<div class="empty">
+  <p class="lead">{{ view.heading }}</p>
+  <p>{{ view.detail }}</p>
+  <p><a href="/">← all dreams</a></p>
+</div>
+{% endblock %}

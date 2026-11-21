@@ -3,7 +3,8 @@
 **Run date:** 2026-07-27. Pre-registration: `saga-t3-preregistration.md`
 (committed 2302de0 with sealed 27-question roster before any arm ran).
 Corpus snapshot sha256 `1d2b9923…`; question seal `1b331d35…`;
-mechanical roster 396 receipt-class pairs (sha `5e03eb25…`).
+mechanical roster 396 receipt-class pairs (sha `3877c517…`; rows 244-391 org name
+redacted 2026-11-18; original sha256 `5e03eb25…`).
 
 ## Headline (pre-committed interpretation applies)
 

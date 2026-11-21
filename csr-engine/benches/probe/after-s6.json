@@ -1,0 +1,429 @@
+{
+  "schema": "after-s6/1",
+  "laptop": true,
+  "binary": {
+    "path": ".testbed/core-rewrite/bin/csr-engine-s6",
+    "sha256": "4d2f52fadc1b1bbc3fd1fc4dccae3033c36a3148c8ee148460ba8ab9e6f866f2",
+    "built_from": "c8546b8d + uncommitted S6-FS1/FS2 tree (committed after the runs, see S6-CLOSURE.md)",
+    "build_log": ".testbed/core-rewrite/logs/S6-verify-build.log"
+  },
+  "s5_probe_run": {
+    "command": "CSR_NO_DAEMON_PROXY=1 $T/bin/csr-engine-s5 --db-path $T/s5/data/csr-engine.db bench --probe --probes $PR/probes.json --probe-out $T/s6/s5-probe.json --dump $T/logs/S6-verify-s5.ndjson",
+    "started_at": "2026-10-26T18:47:56Z",
+    "rank1": 9,
+    "rank1_ids": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      12
+    ],
+    "mrr5": 0.791667,
+    "session_rank1": null,
+    "session_rank1_ids": null,
+    "session_mrr5": null,
+    "p50_ms": 1085.286,
+    "p95_ms": 3103.979,
+    "latency_n": 12,
+    "peak_rss_bytes": 4723195904,
+    "cold_start_ms": 10720.313,
+    "hit_ranks": {
+      "1": null,
+      "2": 1,
+      "3": 1,
+      "4": 1,
+      "5": 1,
+      "6": 1,
+      "7": 1,
+      "8": 2,
+      "9": 1,
+      "10": 1,
+      "11": null,
+      "12": 1
+    },
+    "session_hit_ranks": {
+      "1": null,
+      "2": null,
+      "3": null,
+      "4": null,
+      "5": null,
+      "6": null,
+      "7": null,
+      "8": null,
+      "9": null,
+      "10": null,
+      "11": null,
+      "12": null
+    },
+    "binary_sha256_16": "e857c3b15a81077f",
+    "git_sha": "3c8bf91d9b45c89992e09f0113feb6060334e66a",
+    "git_dirty": "true",
+    "source": ".testbed/core-rewrite/s6/s5-probe.json"
+  },
+  "control_s5_pipeline": {
+    "command": "CSR_NO_EPISODES=1 CSR_NO_DAEMON_PROXY=1 $T/bin/csr-engine-s6 --db-path $T/s6/data/csr-engine.db bench --probe --probes $PR/probes-s6.json --probe-out $T/s6/control.json --dump $T/logs/S6-verify-control.ndjson",
+    "started_at": "2026-10-26T18:49:19Z",
+    "rank1": 9,
+    "rank1_ids": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      12
+    ],
+    "mrr5": 0.791667,
+    "session_rank1": 9,
+    "session_rank1_ids": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      12
+    ],
+    "session_mrr5": 0.791667,
+    "p50_ms": 943.194,
+    "p95_ms": 2596.902,
+    "latency_n": 12,
+    "peak_rss_bytes": 4722507776,
+    "cold_start_ms": 7929.293,
+    "hit_ranks": {
+      "1": null,
+      "2": 1,
+      "3": 1,
+      "4": 1,
+      "5": 1,
+      "6": 1,
+      "7": 1,
+      "8": 2,
+      "9": 1,
+      "10": 1,
+      "11": null,
+      "12": 1
+    },
+    "session_hit_ranks": {
+      "1": null,
+      "2": 1,
+      "3": 1,
+      "4": 1,
+      "5": 1,
+      "6": 1,
+      "7": 1,
+      "8": 2,
+      "9": 1,
+      "10": 1,
+      "11": null,
+      "12": 1
+    },
+    "binary_sha256_16": "4d2f52fadc1b1bbc",
+    "git_sha": "c8546b8d93874fb75b4029a56540246247ad0d0c",
+    "git_dirty": "true",
+    "source": ".testbed/core-rewrite/s6/control.json"
+  },
+  "s6_run1": {
+    "command": "CSR_NO_DAEMON_PROXY=1 $T/bin/csr-engine-s6 --db-path $T/s6/data/csr-engine.db bench --probe --probes $PR/probes-s6.json --audit $T/audit-queries.json --probe-out $T/s6/s6-run1.json --dump $T/logs/S6-verify-run1.ndjson",
+    "started_at": "2026-10-26T18:49:42Z",
+    "rank1": 9,
+    "rank1_ids": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      12
+    ],
+    "mrr5": 0.791667,
+    "session_rank1": 9,
+    "session_rank1_ids": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      12
+    ],
+    "session_mrr5": 0.833333,
+    "p50_ms": 759.481,
+    "p95_ms": 1143.181,
+    "latency_n": 322,
+    "peak_rss_bytes": 5406326784,
+    "cold_start_ms": 6427.67,
+    "hit_ranks": {
+      "1": null,
+      "2": 1,
+      "3": 1,
+      "4": 1,
+      "5": 1,
+      "6": 1,
+      "7": 1,
+      "8": 2,
+      "9": 1,
+      "10": 1,
+      "11": null,
+      "12": 1
+    },
+    "session_hit_ranks": {
+      "1": 2,
+      "2": 1,
+      "3": 1,
+      "4": 1,
+      "5": 1,
+      "6": 1,
+      "7": 1,
+      "8": 2,
+      "9": 1,
+      "10": 1,
+      "11": null,
+      "12": 1
+    },
+    "binary_sha256_16": "4d2f52fadc1b1bbc",
+    "git_sha": "c8546b8d93874fb75b4029a56540246247ad0d0c",
+    "git_dirty": "true",
+    "source": ".testbed/core-rewrite/s6/s6-run1.json"
+  },
+  "s6_run2": {
+    "command": "CSR_NO_DAEMON_PROXY=1 $T/bin/csr-engine-s6 --db-path $T/s6/data/csr-engine.db bench --probe --probes $PR/probes-s6.json --audit $T/audit-queries.json --probe-out $T/s6/s6-run2.json --dump $T/logs/S6-verify-run2.ndjson",
+    "started_at": "2026-10-26T18:53:50Z",
+    "rank1": 9,
+    "rank1_ids": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      12
+    ],
+    "mrr5": 0.791667,
+    "session_rank1": 9,
+    "session_rank1_ids": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      12
+    ],
+    "session_mrr5": 0.833333,
+    "p50_ms": 731.1,
+    "p95_ms": 1113.701,
+    "latency_n": 322,
+    "peak_rss_bytes": 5479907328,
+    "cold_start_ms": 5647.288,
+    "hit_ranks": {
+      "1": null,
+      "2": 1,
+      "3": 1,
+      "4": 1,
+      "5": 1,
+      "6": 1,
+      "7": 1,
+      "8": 2,
+      "9": 1,
+      "10": 1,
+      "11": null,
+      "12": 1
+    },
+    "session_hit_ranks": {
+      "1": 2,
+      "2": 1,
+      "3": 1,
+      "4": 1,
+      "5": 1,
+      "6": 1,
+      "7": 1,
+      "8": 2,
+      "9": 1,
+      "10": 1,
+      "11": null,
+      "12": 1
+    },
+    "binary_sha256_16": "4d2f52fadc1b1bbc",
+    "git_sha": "c8546b8d93874fb75b4029a56540246247ad0d0c",
+    "git_dirty": "true",
+    "source": ".testbed/core-rewrite/s6/s6-run2.json"
+  },
+  "echo_filter": {
+    "method": "by shown id",
+    "script": ".testbed/core-rewrite/s6/echo_by_id.py",
+    "out": ".testbed/core-rewrite/logs/S6-verify-echo-id.json",
+    "control": {
+      "raw_rank1": 9,
+      "raw_ids": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        12
+      ],
+      "filtered_rank1": 9,
+      "filtered_ids": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        12
+      ],
+      "unresolved_hit_ids": []
+    },
+    "run1": {
+      "raw_rank1": 9,
+      "raw_ids": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        12
+      ],
+      "filtered_rank1": 9,
+      "filtered_ids": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        12
+      ],
+      "unresolved_hit_ids": []
+    },
+    "run2": {
+      "raw_rank1": 9,
+      "raw_ids": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        12
+      ],
+      "filtered_rank1": 9,
+      "filtered_ids": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        12
+      ],
+      "unresolved_hit_ids": []
+    },
+    "rank1_blocks_with_eid": 0,
+    "eid_blocks_in_run1_dump": 55
+  },
+  "drops": {
+    "hook_success": 203540,
+    "hook_additional_context": 19737,
+    "relevant_memories": 0,
+    "away_summary": 843,
+    "is_compact_summary": 540,
+    "api_request": 99227
+  },
+  "tier": {
+    "episodes": 9376,
+    "session_cards": 1422,
+    "conversations": 1422,
+    "files": 20416,
+    "skipped_csr_agent_files": 18968,
+    "skipped_conflicting_conversation_id": 61,
+    "compact_records": 1079,
+    "reparsed_from_zero": 0,
+    "conv_id_match_rate": 0.9085794655414908,
+    "chunk_units_90d": 668679,
+    "chunk_conversations_90d": 3198,
+    "chunk_conversations_90d_with_episode": 1292,
+    "chunk_conversations_90d_with_episode_share": 0.404,
+    "main_conversations_90d": 629,
+    "main_conversations_90d_with_episode": 266
+  },
+  "truncation_live": {
+    "fixture": ".testbed/core-rewrite/s6/trunc (Reycital d0172515, 858769 -> 588659 bytes)",
+    "build1": {
+      "reparsed_from_zero": 0,
+      "compact_records": 2
+    },
+    "build2": {
+      "reparsed_from_zero": 1,
+      "compact_records": 2
+    }
+  },
+  "compare": {
+    "probe_flips_run1_run2": 0,
+    "chunk_rank1_baseline": 9,
+    "chunk_rank1_run1": 9,
+    "chunk_rank1_run2": 9,
+    "baseline_rank1_lost_run1": [],
+    "baseline_rank1_lost_run2": [],
+    "control_chunk_equals_s5": true,
+    "probe2_session_hit_rank": [
+      1,
+      1
+    ],
+    "probe6_session_hit_rank": [
+      1,
+      1
+    ],
+    "session_mrr5_control_vs_s6": [
+      0.791667,
+      0.833333,
+      0.833333
+    ],
+    "probe11": "0 for every model, unreachable (log #11)",
+    "p95_vs_after_s2_ms": [
+      1068.374,
+      1143.181,
+      1113.701
+    ],
+    "p50_vs_after_s2_ms": [
+      684.168,
+      759.481,
+      731.1
+    ]
+  },
+  "commits": {
+    "s6_code": "50b76a7c",
+    "note": "measured binary 4d2f52fa was built from c8546b8d + the uncommitted S6 tree; 50b76a7c is that tree after cargo fmt only (pre-commit fmt check)"
+  }
+}

@@ -1,17 +1,33 @@
+pub mod assertions_partition;
 pub mod code_rank;
+pub mod cross_encoder;
 pub mod cross_project;
 pub mod decay;
+pub mod echo;
+pub mod episodes;
+pub mod hybrid;
+pub mod identifiers;
 pub mod reinstatement;
 pub mod rerank;
+pub mod retire;
+pub mod status_intent;
+pub mod trained_rerank;
+pub mod vector_ipc;
 
-use std::collections::HashSet;
+pub use retire::cleanup_stale_index_files;
+
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::Path;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use fs2::FileExt;
 use hnsw_rs::api::AnnT;
 use hnsw_rs::hnsw::Hnsw;
 use hnsw_rs::hnswio::HnswIo;
+use hnsw_rs::hnswio::ReloadOptions;
 use hnsw_rs::prelude::DistCosine;
 use hnsw_rs::prelude::Distance;
 use serde::{Deserialize, Serialize};
@@ -23,17 +39,37 @@ pub struct SearchResult {
     pub score: f32,
 }
 
+/// What [`SearchEngine::publish_to_disk`] published, for
+/// [`SearchEngine::settle_publish`] to record on the same engine.
+#[derive(Debug, Clone)]
+#[must_use = "settle the publish, or the published sides stay dirty"]
+pub struct Published {
+    /// Which engine published (see `SearchEngine::generation`).
+    generation: u64,
+    chunk_changes: u64,
+    reflection_changes: u64,
+    stale_generation: bool,
+    new_epoch: u64,
+    /// The generation files the committed manifest names.
+    basenames: (String, String),
+}
+
 /// HNSW-backed search engine for chunks and reflections.
 ///
 /// Uses `hnsw_rs` with cosine distance. Scores are converted from
 /// distance (1.0 - cosine_similarity) back to similarity (1.0 - distance).
 pub struct SearchEngine {
+    allow_local_mutations: bool,
     chunk_index: Hnsw<'static, f32, DistCosine>,
     reflection_index: Hnsw<'static, f32, DistCosine>,
     chunk_id_map: Vec<String>,
     reflection_id_map: Vec<String>,
-    chunk_id_set: HashSet<String>,
-    reflection_id_set: HashSet<String>,
+    chunk_positions: HashMap<String, usize>,
+    chunk_hashes: Vec<blake3::Hash>,
+    reflection_hashes: Vec<blake3::Hash>,
+    reflection_positions: HashMap<String, usize>,
+    /// Process-local identity, stable across mutations and distinct after index swaps.
+    generation: u64,
     active_reflection_count: usize,
     /// Chunk index dirty since the last `dump_to_disk`. Split from a single
     /// `dirty` flag so a reflection-only mutation (e.g. `store_reflection`,
@@ -44,6 +80,34 @@ pub struct SearchEngine {
     chunk_dirty: bool,
     /// Reflection index dirty since the last `dump_to_disk`. See `chunk_dirty`.
     reflection_dirty: bool,
+    /// Count of chunk-side mutations (every time `chunk_dirty` is set). A
+    /// dump published from a shared borrow ([`Self::publish_to_disk`]) records
+    /// it, and [`Self::settle_publish`] clears `chunk_dirty` only if nothing
+    /// changed in between, so a mutation that landed after the files were
+    /// written is never marked as published.
+    chunk_changes: u64,
+    /// Reflection-side counterpart of `chunk_changes`.
+    reflection_changes: u64,
+    /// `chunk_changes`/`reflection_changes` as of the last settled publish
+    /// (or load). Their difference from the live counters is how many
+    /// mutations the on-disk generation is missing — the daemon's dump
+    /// budget waits for enough of them before rewriting ~1.5 GB.
+    settled_chunk_changes: u64,
+    settled_reflection_changes: u64,
+    /// Highest `embedding_changes.seq` whose effect this engine's chunk
+    /// index is known to hold: loaded from the manifest, captured before a
+    /// rebuild streams from SQLite, advanced by the daemon's index sync as
+    /// it applies changes. The sync resumes after the lower of the two
+    /// sides' cursors and skips a change its side already holds, instead of
+    /// replaying the whole retained change log onto every loaded or
+    /// swapped-in generation — that replay turned each updated id into a
+    /// fresh tombstone on every daemon start and compaction swap (42k of
+    /// them live), which kept the tombstone share over the compaction
+    /// threshold forever. Per side, because a dump that rewrites one side
+    /// carries the other forward at its older cursor.
+    chunk_cursor: i64,
+    /// Reflection-index counterpart of `chunk_cursor`.
+    reflection_cursor: i64,
     /// Whether this engine's in-memory maps are currently known to
     /// correspond to the manifest that is (or, the instant this becomes
     /// true, was just made to be) on disk — i.e. an UNDIRTIED side's
@@ -73,6 +137,295 @@ pub struct SearchEngine {
     /// forcing a full rebuild on every single startup). See `dump_to_disk`'s
     /// doc comment for the full reasoning.
     manifest_backed: bool,
+    /// Compaction generation this engine last loaded (`load_from_disk`) or
+    /// published (`dump_to_disk`) — mirrors `IndexManifest::epoch`.
+    ///
+    /// `manifest_backed` plus the per-side dirty flags stop a long-lived
+    /// engine from republishing a side it never touched, but they say
+    /// nothing about a side the engine DID genuinely touch (a real
+    /// `insert_chunk`/`insert_reflection`, not just startup reconciliation)
+    /// after loading — if a concurrent compaction (a different process's
+    /// `rebuild_search_index`) replaced that exact side on disk with a
+    /// smaller, tombstone-free generation in the meantime, dirty-flag logic
+    /// alone still says "publish it, it's genuinely dirty", republishing
+    /// this engine's larger, pre-compaction graph over the newer one.
+    /// `epoch` closes that gap: `dump_to_disk` refuses to publish EITHER
+    /// side from memory (dirty or not) when the on-disk manifest's epoch is
+    /// newer than this value — see `dump_to_disk`'s stale-generation guard.
+    epoch: u64,
+    /// The `(chunk, reflection)` generation basenames of the manifest this
+    /// engine last loaded or published with its own content. The daemon
+    /// remaps from disk only when the manifest still names them.
+    published_basenames: Option<(String, String)>,
+    /// Whether the loaded vectors live in a memory map (see `is_mapped`).
+    vectors_mapped: bool,
+    /// Set on an MCP server's engine while the daemon is live: searches go
+    /// to the daemon (falling back to keyword-only results), and
+    /// this engine's own indexes stay empty and never dirty — see
+    /// [`vector_ipc`].
+    proxy: Option<std::sync::Arc<vector_ipc::VectorProxy>>,
+    /// A proxied engine was handed chunks since its last
+    /// [`Self::sync_pending_chunks`]: SQLite holds them, the daemon may not
+    /// have applied them yet.
+    chunks_unsynced: bool,
+    /// The `HnswIo`s a loaded engine's indexes borrow from (their memory
+    /// maps, when mapped). Declared after the indexes, so those drop first
+    /// and the maps are released with the engine. They used to be leaked
+    /// for the process lifetime, which kept every unlinked generation's
+    /// ~1.2 GB on disk until the process exited and made a reload a leak.
+    _mapped: Vec<MappedGeneration>,
+    /// The maintenance generation a full rebuild read before it streamed the
+    /// stored vectors ([`Self::mark_rebuilt_at`]). A rebuild that a maintenance
+    /// pass overtook read rows the pass has since rewritten: its publish is
+    /// refused ([`CrossedMaintenance`]) instead of restoring them (astra r2 #4).
+    rebuilt_at_generation: Option<u64>,
+    /// Set while chunk kNN is served from an activated USearch generation (the
+    /// `vector_generation` watermark): the hnsw_rs chunk graph is then empty
+    /// and unused, and the old `chunks.hnsw.*` files are never opened.
+    chunk_gen: Option<GenServe>,
+    /// No generation could be opened: chunk kNN is empty until one is built.
+    chunks_awaiting_generation: bool,
+}
+
+/// An activated USearch generation plus an exact-scan delta for everything
+/// that changed after the generation's watermark `seq`.
+pub struct GenServe {
+    pub gen: crate::index_gen::Generation,
+    /// Ids of chunks upserted after the watermark; row `i` of `delta_vecs`.
+    pub delta_ids: Vec<String>,
+    /// Row-major `delta_ids.len() * DIMS` floats.
+    pub delta_vecs: Vec<f32>,
+    /// Ids upserted or deleted after the watermark: the generation's copy of
+    /// each is stale and never served.
+    pub shadow: HashSet<String>,
+    delta_pos: HashMap<String, usize>,
+    /// Hashes of the generation's ids: O(1) membership without a second copy
+    /// of every id string.
+    gen_keys: HashSet<u64>,
+    /// How many ids of `shadow` the generation holds.
+    shadowed_in_gen: usize,
+}
+
+const GEN_DIMS: usize = crate::index_gen::DIMS;
+
+/// Cap on one growth step of the generation overfetch.
+const GEN_ESCALATION_FACTOR: usize = 8;
+
+fn gen_key(id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl GenServe {
+    fn new(
+        gen: crate::index_gen::Generation,
+        upserts: Vec<(String, Vec<f32>)>,
+        deleted: HashSet<String>,
+    ) -> Self {
+        let gen_keys: HashSet<u64> = gen.ids().iter().map(|id| gen_key(id)).collect();
+        let mut serve = Self {
+            gen,
+            delta_ids: Vec::new(),
+            delta_vecs: Vec::new(),
+            shadow: HashSet::new(),
+            delta_pos: HashMap::new(),
+            gen_keys,
+            shadowed_in_gen: 0,
+        };
+        for id in &deleted {
+            serve.shadow_id(id);
+        }
+        for (id, vector) in upserts {
+            serve.shadow_id(&id);
+            serve.put(id, &vector);
+        }
+        serve
+    }
+
+    fn in_gen(&self, id: &str) -> bool {
+        self.gen_keys.contains(&gen_key(id))
+    }
+
+    fn shadow_id(&mut self, id: &str) {
+        if self.shadow.insert(id.to_string()) && self.in_gen(id) {
+            self.shadowed_in_gen += 1;
+        }
+    }
+
+    /// Write `vector` as the delta copy of `id` (replacing an earlier one).
+    fn put(&mut self, id: String, vector: &[f32]) {
+        if vector.len() != GEN_DIMS {
+            return;
+        }
+        if let Some(&pos) = self.delta_pos.get(&id) {
+            self.delta_vecs[pos * GEN_DIMS..(pos + 1) * GEN_DIMS].copy_from_slice(vector);
+            return;
+        }
+        self.delta_pos.insert(id.clone(), self.delta_ids.len());
+        self.delta_ids.push(id);
+        self.delta_vecs.extend_from_slice(vector);
+    }
+
+    /// Drop the delta copy of `id`; `true` when there was one.
+    fn take(&mut self, id: &str) -> bool {
+        let Some(pos) = self.delta_pos.remove(id) else {
+            return false;
+        };
+        let last = self.delta_ids.len() - 1;
+        if pos != last {
+            let (head, tail) = self.delta_vecs.split_at_mut(last * GEN_DIMS);
+            head[pos * GEN_DIMS..(pos + 1) * GEN_DIMS].copy_from_slice(&tail[..GEN_DIMS]);
+            self.delta_ids.swap(pos, last);
+            self.delta_pos.insert(self.delta_ids[pos].clone(), pos);
+        }
+        self.delta_ids.pop();
+        self.delta_vecs.truncate(last * GEN_DIMS);
+        true
+    }
+
+    fn has(&self, id: &str) -> bool {
+        self.delta_pos.contains_key(id) || (self.in_gen(id) && !self.shadow.contains(id))
+    }
+
+    fn insert(&mut self, id: String, vector: &[f32]) {
+        if vector.len() != GEN_DIMS || self.has(&id) {
+            return;
+        }
+        self.shadow_id(&id);
+        self.put(id, vector);
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.take(id);
+        if self.in_gen(id) && !self.shadow.contains(id) {
+            self.shadow_id(id);
+        }
+    }
+
+    fn live_count(&self) -> usize {
+        self.gen.len() - self.shadowed_in_gen + self.delta_ids.len()
+    }
+
+    /// Best `limit` live chunks by cosine: the generation (overfetched past
+    /// the shadowed ids) merged with an exact scan of the delta.
+    fn search(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        min_score: f32,
+        allowed: Option<&HashSet<String>>,
+    ) -> Vec<SearchResult> {
+        if limit == 0 || query_vec.len() != GEN_DIMS {
+            return Vec::new();
+        }
+        let permitted = |id: &str| allowed.is_none_or(|ids| ids.contains(id));
+        let total = self.gen.len();
+        let mut results: Vec<SearchResult> = Vec::new();
+        if total > 0 {
+            let base = if allowed.is_some() { limit * 5 } else { limit };
+            let mut fetch = (base + self.shadowed_in_gen).clamp(1, total);
+            loop {
+                let hits = self.gen.search(query_vec, fetch);
+                let returned = hits.len();
+                let tail = hits.last().map(|hit| hit.1);
+                let found: Vec<SearchResult> = hits
+                    .into_iter()
+                    .filter(|(id, score)| {
+                        *score >= min_score && !self.shadow.contains(id) && permitted(id)
+                    })
+                    .map(|(id, score)| SearchResult { id, score })
+                    .collect();
+                // Hits are best first: once the weakest fetched score is below
+                // the threshold, a deeper fetch adds nothing.
+                if found.len() >= limit
+                    || fetch >= total
+                    || returned < fetch
+                    || tail.is_none_or(|score| score < min_score)
+                {
+                    results = found;
+                    break;
+                }
+                fetch = fetch.saturating_mul(GEN_ESCALATION_FACTOR).min(total);
+            }
+        }
+        for (row, id) in self.delta_ids.iter().enumerate() {
+            if !permitted(id) {
+                continue;
+            }
+            let vector = &self.delta_vecs[row * GEN_DIMS..(row + 1) * GEN_DIMS];
+            let score = 1.0 - DistCosine {}.eval(vector, query_vec);
+            if score >= min_score {
+                results.push(SearchResult {
+                    id: id.clone(),
+                    score,
+                });
+            }
+        }
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+        results
+    }
+}
+
+/// Owns an `HnswIo` whose memory map a loaded `Hnsw` borrows. Never touched
+/// after the load except to free it, after that `Hnsw` has been dropped.
+struct MappedGeneration(NonNull<HnswIo>);
+
+// SAFETY: the `HnswIo` is only dereferenced during the single-threaded load;
+// afterwards this handle only frees it. Its mapping is read-only shared memory.
+unsafe impl Send for MappedGeneration {}
+// SAFETY: as above — no `&self` method dereferences the pointer.
+unsafe impl Sync for MappedGeneration {}
+
+impl Drop for MappedGeneration {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        LIVE_MAPPED_GENERATIONS.with(|live| live.set(live.get() - 1));
+        // SAFETY: allocated by `Box::into_raw` in `PendingHnswIo::new` and
+        // owned uniquely here; the borrowing `Hnsw` was dropped first.
+        unsafe { drop(Box::from_raw(self.0.as_ptr())) }
+    }
+}
+
+// `MappedGeneration`s created minus dropped on this test thread (each test
+// runs on its own thread, so concurrent tests cannot disturb the count).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static HNSW_LOAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_MAPPED_GENERATIONS: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// A full rebuild tried to publish after a maintenance pass began: it read the
+/// stored vectors before the pass rewrote them. Rebuild again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossedMaintenance {
+    pub rebuilt_at: u64,
+    pub now: u64,
+}
+
+impl std::fmt::Display for CrossedMaintenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "index rebuild read at maintenance generation {} but the index is now at {}: rebuild again",
+            self.rebuilt_at, self.now
+        )
+    }
+}
+
+impl std::error::Error for CrossedMaintenance {}
+
+/// True when `error` is (or wraps) a [`CrossedMaintenance`].
+pub fn crossed_maintenance(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<CrossedMaintenance>().is_some())
 }
 
 // HNSW parameters
@@ -86,7 +439,114 @@ const MAX_LAYER: usize = 16;
 // exact cosine over ≤256 384-dim vectors is well under a millisecond anyway.
 const EXACT_SCAN_THRESHOLD: usize = 256;
 
-const MANIFEST_VERSION: u32 = 1;
+/// Cap on how far `search_index` scales its overfetch request past `limit`
+/// to survive tombstoned (blanked-orphan) slots. Bounds worst-case HNSW
+/// query cost when the live share of the index is tiny.
+const TOMBSTONE_OVERFETCH_CAP: usize = 20;
+
+/// Multiplier `search_index` scales `fetch_limit` by each time it escalates
+/// past tombstones, instead of jumping straight to the full index. Bounds
+/// escalation to O(log) steps while keeping each step's HNSW query cheap.
+const SEARCH_ESCALATION_FACTOR: usize = 4;
+
+// Reviewer-found regression (WP-D low #4): a wall-clock ceiling alone does
+// not guard the "no full-graph escalation on plain score exhaustion" fix —
+// a 2,000-point full-graph scan is cheap enough that a stale, unguarded
+// implementation can still pass a 200ms timing assertion. These
+// `thread_local` counters let a test assert a structural signal instead:
+// exactly how many times `index.search` was actually called, and the
+// largest `fetch_limit` any of those calls requested. `thread_local` (not a
+// shared global `static`) because cargo's default test harness runs each
+// `#[test]` to completion on one thread before that thread picks up
+// another — scoping per-thread means concurrent tests never see each
+// other's counts, with no explicit synchronization needed.
+#[cfg(test)]
+thread_local! {
+    static TEST_SEARCH_INDEX_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TEST_SEARCH_INDEX_MAX_FETCH_LIMIT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_search_index_test_counters() {
+    TEST_SEARCH_INDEX_CALLS.with(|c| c.set(0));
+    TEST_SEARCH_INDEX_MAX_FETCH_LIMIT.with(|c| c.set(0));
+}
+
+/// Returns `(calls, max_fetch_limit)` recorded by `search_index` since the
+/// last [`reset_search_index_test_counters`].
+#[cfg(test)]
+fn search_index_test_counters() -> (u64, u64) {
+    (
+        TEST_SEARCH_INDEX_CALLS.with(|c| c.get()),
+        TEST_SEARCH_INDEX_MAX_FETCH_LIMIT.with(|c| c.get()),
+    )
+}
+
+/// Filename of the marker written under the index directory when a foreground
+/// process (`Engine::new` in an MCP server, hook, or CLI query command) finds
+/// the loaded HNSW cache materially tombstoned but defers the full rebuild
+/// instead of blocking its own startup on it. The daemon's compaction loop,
+/// or the explicit `rebuild-index` maintenance command, consumes and clears
+/// this marker.
+pub const NEEDS_COMPACTION_MARKER: &str = "needs_compaction";
+
+/// Write the `needs_compaction` marker for the daemon (or an explicit
+/// maintenance command) to pick up. Best-effort: a failure to write it only
+/// costs a delayed compaction, never correctness, so it is logged and
+/// swallowed rather than propagated.
+pub fn mark_needs_compaction(index_dir: &Path) {
+    if let Err(e) = std::fs::write(index_dir.join(NEEDS_COMPACTION_MARKER), b"") {
+        tracing::warn!(error = %e, "failed to write needs_compaction marker (non-fatal)");
+    }
+}
+
+/// Whether the `needs_compaction` marker is present.
+pub fn needs_compaction(index_dir: &Path) -> bool {
+    index_dir.join(NEEDS_COMPACTION_MARKER).exists()
+}
+
+/// Clear the `needs_compaction` marker after a rebuild has run. Best-effort.
+pub fn clear_needs_compaction(index_dir: &Path) {
+    match std::fs::remove_file(index_dir.join(NEEDS_COMPACTION_MARKER)) {
+        Ok(()) | Err(_) => {}
+    }
+}
+
+const MANIFEST_VERSION: u32 = 3;
+static INDEX_GENERATION: AtomicU64 = AtomicU64::new(0);
+static ENGINE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Publishes running in this process ([`SearchEngine::publish_to_disk`]).
+/// Writers check it: a publish holds the index's read lock for seconds, and
+/// tokio's `RwLock` queues every later reader behind a waiting writer, so a
+/// writer that waits during a publish stalls every search with it.
+static PUBLISHING: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a publish is writing index files right now (see [`PUBLISHING`]).
+pub(crate) fn publish_in_progress() -> bool {
+    PUBLISHING.load(Ordering::SeqCst) > 0
+}
+
+struct PublishingGuard;
+
+impl PublishingGuard {
+    fn enter() -> Self {
+        PUBLISHING.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for PublishingGuard {
+    fn drop(&mut self) {
+        PUBLISHING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Hold the publish-in-progress flag, as a running publish does.
+#[cfg(test)]
+pub(crate) fn hold_publishing_for_test() -> impl Drop {
+    PublishingGuard::enter()
+}
 
 /// Metadata for validating a cached HNSW index.
 /// The `_expected` counts are DB row counts passed in from storage,
@@ -94,17 +554,118 @@ const MANIFEST_VERSION: u32 = 1;
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexManifest {
     version: u32,
+    files: HashMap<String, FileIntegrity>,
     created_at: String,
+    /// Empty once a vector generation took over the chunk side; absent in a
+    /// manifest an older reader never wrote, which reads as empty.
+    #[serde(default)]
     chunk_id_map: Vec<String>,
     reflection_id_map: Vec<String>,
     chunk_embeddings_expected: usize,
     reflection_embeddings_expected: usize,
     active_reflection_count: usize,
+    #[serde(default = "default_chunk_basename")]
+    chunk_basename: String,
+    #[serde(default = "default_reflection_basename")]
+    reflection_basename: String,
+    /// Compaction generation counter. Bumped by `dump_to_disk` every time an
+    /// engine that was NOT `manifest_backed` at call time (i.e. built fresh
+    /// from SQLite by `rebuild_search_index`/`rebuild_search_index_streaming`
+    /// — a real compaction, not an incremental update) publishes. `#[serde(
+    /// default)]` so a pre-epoch manifest on disk (written before this field
+    /// existed) reads as generation 0, which is always `<=` any freshly
+    /// bumped generation — so an old manifest never falsely looks newer than
+    /// a process that has never seen an epoch field at all.
+    ///
+    /// See `dump_to_disk`'s stale-generation guard (WP-D medium: the
+    /// dirty-flag-only ping-pong fix only covered reconciliation-only
+    /// dirtiness; a long-lived engine's own genuine new content on the side
+    /// that a concurrent compaction just replaced was still published from
+    /// memory, silently reverting the compaction).
+    #[serde(default)]
+    epoch: u64,
+    /// The change cursor each side's generation holds: the writer's cursor
+    /// for a side it wrote, the previous manifest's for a side it carried
+    /// forward. Absent in manifests written before they existed, which
+    /// reads as 0: replay the whole change log, exactly as before.
+    #[serde(default)]
+    chunk_change_cursor: i64,
+    #[serde(default)]
+    reflection_change_cursor: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FileIntegrity {
+    bytes: u64,
+    blake3: String,
+}
+
+fn file_integrity(path: &Path) -> Result<FileIntegrity> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening index file {}", path.display()))?;
+    let bytes = file.metadata().context("reading index file length")?.len();
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).context("hashing index file")?;
+    Ok(FileIntegrity {
+        bytes,
+        blake3: hasher.finalize().to_hex().to_string(),
+    })
+}
+
+fn verify_manifest_files(dir: &Path, manifest: &IndexManifest) -> Result<()> {
+    for (basename, nonempty) in [
+        (&manifest.chunk_basename, !manifest.chunk_id_map.is_empty()),
+        (
+            &manifest.reflection_basename,
+            !manifest.reflection_id_map.is_empty(),
+        ),
+    ] {
+        anyhow::ensure!(
+            Path::new(basename).file_name().and_then(|s| s.to_str()) == Some(basename.as_str()),
+            "invalid index basename"
+        );
+        if nonempty {
+            for extension in ["hnsw.graph", "hnsw.data"] {
+                let name = format!("{basename}.{extension}");
+                anyhow::ensure!(
+                    manifest.files.contains_key(&name),
+                    "missing integrity metadata for {name}"
+                );
+            }
+        }
+    }
+    for (name, expected) in &manifest.files {
+        anyhow::ensure!(
+            Path::new(name).file_name().and_then(|s| s.to_str()) == Some(name.as_str()),
+            "invalid index filename"
+        );
+        let path = dir.join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("checking {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() == expected.bytes,
+            "index file length or type mismatch: {name}"
+        );
+        anyhow::ensure!(
+            file_integrity(&path)? == *expected,
+            "index hash mismatch: {name}"
+        );
+    }
+    Ok(())
+}
+
+fn default_chunk_basename() -> String {
+    "chunks".to_string()
+}
+
+fn default_reflection_basename() -> String {
+    "reflections".to_string()
 }
 
 impl SearchEngine {
     pub fn new(estimated_size: usize) -> Self {
         Self {
+            allow_local_mutations: true,
             chunk_index: Hnsw::new(
                 MAX_NB_CONNECTION,
                 estimated_size,
@@ -121,34 +682,250 @@ impl SearchEngine {
             ),
             chunk_id_map: Vec::new(),
             reflection_id_map: Vec::new(),
-            chunk_id_set: HashSet::new(),
-            reflection_id_set: HashSet::new(),
+            chunk_positions: HashMap::new(),
+            chunk_hashes: Vec::new(),
+            reflection_hashes: Vec::new(),
+            reflection_positions: HashMap::new(),
+            generation: ENGINE_GENERATION.fetch_add(1, Ordering::Relaxed),
             active_reflection_count: 0,
             chunk_dirty: false,
             reflection_dirty: false,
+            chunk_changes: 0,
+            reflection_changes: 0,
+            settled_chunk_changes: 0,
+            settled_reflection_changes: 0,
+            chunk_cursor: 0,
+            reflection_cursor: 0,
             manifest_backed: false,
+            epoch: 0,
+            published_basenames: None,
+            vectors_mapped: false,
+            proxy: None,
+            chunks_unsynced: false,
+            _mapped: Vec::new(),
+            rebuilt_at_generation: None,
+            chunk_gen: None,
+            chunks_awaiting_generation: false,
+        }
+    }
+
+    /// Hook imports persist to SQLite without constructing or changing local graphs.
+    pub(crate) fn for_hook(mut self) -> Self {
+        self.allow_local_mutations = false;
+        self
+    }
+
+    /// An engine that searches through `proxy` (see the `proxy` field).
+    pub fn proxied(proxy: std::sync::Arc<vector_ipc::VectorProxy>) -> Self {
+        let mut engine = Self::new(16);
+        engine.proxy = Some(proxy);
+        engine
+    }
+
+    /// The daemon proxy, when this engine has one.
+    pub fn proxy(&self) -> Option<&std::sync::Arc<vector_ipc::VectorProxy>> {
+        self.proxy.as_ref()
+    }
+
+    /// Whether an index reads its loaded vectors from a memory-mapped
+    /// generation rather than heap copies.
+    pub fn is_mapped(&self) -> bool {
+        self.vectors_mapped
+    }
+
+    /// See the `published_basenames` field.
+    pub(crate) fn published_basenames(&self) -> Option<&(String, String)> {
+        self.published_basenames.as_ref()
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Record the maintenance generation read before this engine was rebuilt
+    /// from the stored vectors. Call it BEFORE the stream starts.
+    pub fn mark_rebuilt_at(&mut self, maintenance_generation: u64) {
+        self.rebuilt_at_generation = Some(maintenance_generation);
+    }
+
+    fn mark_chunk_dirty(&mut self) {
+        self.chunk_dirty = true;
+        self.chunk_changes += 1;
+    }
+
+    fn mark_reflection_dirty(&mut self) {
+        self.reflection_dirty = true;
+        self.reflection_changes += 1;
+    }
+
+    /// Mutations since the last settled publish (or load) — how far the
+    /// on-disk generation is behind this engine.
+    pub fn unpublished_changes(&self) -> u64 {
+        self.chunk_changes
+            .saturating_sub(self.settled_chunk_changes)
+            + self
+                .reflection_changes
+                .saturating_sub(self.settled_reflection_changes)
+    }
+
+    /// Count `chunks`/`reflections` points this engine holds that the
+    /// generation it loaded does not — the startup backfill — as
+    /// unpublished, so the owner's next dump carries them. Only the daemon
+    /// calls this: a foreground process's reconciliation must never be
+    /// published (see [`Self::clear_reconciliation_dirty`]).
+    pub fn note_unpublished(&mut self, chunks: usize, reflections: usize) {
+        if chunks > 0 {
+            self.chunk_dirty = true;
+            self.chunk_changes += chunks as u64;
+        }
+        if reflections > 0 {
+            self.reflection_dirty = true;
+            self.reflection_changes += reflections as u64;
+        }
+    }
+
+    /// Where the index sync resumes: the lower of the two sides' cursors
+    /// (see the `chunk_cursor` field).
+    pub fn change_cursor(&self) -> i64 {
+        self.chunk_cursor.min(self.reflection_cursor)
+    }
+
+    /// The cursor of one side.
+    pub fn side_cursor(&self, reflection: bool) -> i64 {
+        if reflection {
+            self.reflection_cursor
+        } else {
+            self.chunk_cursor
+        }
+    }
+
+    /// Whether the index sync has already moved past `fence` on one side, so
+    /// an importer's deferred index mutation must be left to it.
+    ///
+    /// `fence` is the journal sequence read BEFORE the importer's storage
+    /// commits (`Storage::change_fence`); the mutation is applied later,
+    /// under the write guard, without the guard having covered the commit. A
+    /// cursor past the fence means the sync replayed journal rows after our
+    /// commit point; it reads the vector SQLite holds now (or its absence, if
+    /// another connection deleted the row) and orders our change with every
+    /// later one, so replaying our stale in-memory copy over it could bring
+    /// back a vector SQLite no longer has, for good. A cursor at or before
+    /// the fence means the sync has not reached our change, and will replay it
+    /// and any later delete in order after this mutation. A proxied engine
+    /// only marks the chunks as pending, which is always safe.
+    pub(crate) fn defers_to_sync(&self, reflection: bool, fence: i64) -> bool {
+        self.proxy.is_none() && self.side_cursor(reflection) > fence
+    }
+
+    /// Record that both sides reflect every `embedding_changes` row up to
+    /// `seq` (a rebuild that read SQLite after it).
+    pub fn set_change_cursor(&mut self, seq: i64) {
+        self.chunk_cursor = seq;
+        self.reflection_cursor = seq;
+    }
+
+    /// The index sync processed every change up to `seq` in order, applying
+    /// or skipping each: both sides now reflect everything up to it.
+    pub fn advance_change_cursor(&mut self, seq: i64) {
+        self.chunk_cursor = self.chunk_cursor.max(seq);
+        self.reflection_cursor = self.reflection_cursor.max(seq);
+    }
+
+    /// Apply a stored vector only when it differs from the current vector.
+    pub(crate) fn apply_vector(&mut self, id: String, vector: Option<Vec<f32>>, reflection: bool) {
+        let (positions, hashes) = if reflection {
+            (&self.reflection_positions, &self.reflection_hashes)
+        } else {
+            (&self.chunk_positions, &self.chunk_hashes)
+        };
+        if let (Some(position), Some(vector)) = (positions.get(&id), vector.as_ref()) {
+            if hashes[*position] == vector_hash(vector) {
+                return;
+            }
+        }
+        if reflection {
+            self.remove_reflection(&id);
+            if let Some(vector) = vector {
+                self.insert_reflection(id, vector);
+            }
+        } else {
+            self.remove_chunk(&id);
+            if let Some(vector) = vector {
+                self.insert_chunk(id, vector);
+            }
         }
     }
 
     pub fn insert_chunk(&mut self, id: String, embedding: Vec<f32>) {
-        if !self.chunk_id_set.insert(id.clone()) {
+        if self.proxy.is_some() {
+            // SQLite holds the change. No round trip per chunk: the importer
+            // calls `sync_pending_chunks` once, after the file's last chunk.
+            self.chunks_unsynced = true;
+            return;
+        }
+        if !self.allow_local_mutations || self.chunks_awaiting_generation {
+            return;
+        }
+        if let Some(serve) = self.chunk_gen.as_mut() {
+            // The generation is read-only: the change lives in the delta, which
+            // SQLite recreates at the next load, so it is never "dirty".
+            serve.insert(id, &embedding);
+            return;
+        }
+        if self.chunk_positions.contains_key(&id) {
             return; // Already indexed — skip duplicate
         }
         let idx = self.chunk_id_map.len();
+        self.chunk_positions.insert(id.clone(), idx);
         self.chunk_id_map.push(id);
+        self.chunk_hashes.push(vector_hash(&embedding));
         self.chunk_index.insert((&embedding, idx));
-        self.chunk_dirty = true;
+        self.mark_chunk_dirty();
     }
 
-    pub fn insert_reflection(&mut self, id: String, embedding: Vec<f32>) {
-        if !self.reflection_id_set.insert(id.clone()) {
-            return; // Already indexed — skip duplicate
+    /// Ask the daemon, once, to apply every chunk handed to
+    /// [`Self::insert_chunk`] since the last call, so a search right after an
+    /// import finds them. Does nothing, and costs nothing, without a proxy or
+    /// when no chunk was written. `true` when the daemon confirmed it applied
+    /// them; a busy daemon answers `false` and is left alone for a while (see
+    /// `VectorProxy::sync_chunks`), and its own poll applies the chunks.
+    pub fn sync_pending_chunks(&mut self) -> bool {
+        if !std::mem::take(&mut self.chunks_unsynced) {
+            return false;
+        }
+        self.proxy.as_ref().is_some_and(|proxy| proxy.sync_chunks())
+    }
+
+    /// [`Self::insert_reflection`] for a caller that ignores the answer (the
+    /// Stop hook's episode, the heuristic summary): through a proxy it makes
+    /// no round trip and the daemon applies the row at its next poll, instead
+    /// of the caller waiting for an acknowledgement it throws away.
+    pub fn insert_reflection_unacked(&mut self, id: String, embedding: Vec<f32>) {
+        if self.proxy.is_some() {
+            return;
+        }
+        self.insert_reflection(id, embedding);
+    }
+
+    pub fn insert_reflection(&mut self, id: String, embedding: Vec<f32>) -> bool {
+        if let Some(proxy) = &self.proxy {
+            // SQLite holds the change; the daemon applies it before answering.
+            return proxy.sync_committed();
+        }
+        if !self.allow_local_mutations {
+            return false;
+        }
+        if self.reflection_positions.contains_key(&id) {
+            return true; // Already indexed — skip duplicate
         }
         let idx = self.reflection_id_map.len();
+        self.reflection_positions.insert(id.clone(), idx);
         self.reflection_id_map.push(id);
+        self.reflection_hashes.push(vector_hash(&embedding));
         self.reflection_index.insert((&embedding, idx));
         self.active_reflection_count += 1;
-        self.reflection_dirty = true;
+        self.mark_reflection_dirty();
+        true
     }
 
     /// Remove a reflection from search results.
@@ -156,16 +933,18 @@ impl SearchEngine {
     /// so search results won't include this reflection. The vector stays in the
     /// index but maps to nothing.
     pub fn remove_reflection(&mut self, id: &str) {
-        let removed = if let Some(pos) = self.reflection_id_map.iter().position(|x| x == id) {
-            self.reflection_id_map[pos] = String::new(); // Blank out the mapping
+        if let Some(proxy) = &self.proxy {
+            // SQLite holds the change; the daemon applies it before answering.
+            proxy.sync_committed();
+            return;
+        }
+        if !self.allow_local_mutations {
+            return;
+        }
+        if let Some(pos) = self.reflection_positions.remove(id) {
+            self.reflection_id_map[pos].clear();
             self.active_reflection_count = self.active_reflection_count.saturating_sub(1);
-            true
-        } else {
-            false
-        };
-        let removed_from_set = self.reflection_id_set.remove(id);
-        if removed || removed_from_set {
-            self.reflection_dirty = true;
+            self.mark_reflection_dirty();
         }
     }
 
@@ -175,26 +954,67 @@ impl SearchEngine {
     /// re-inserting a reused deterministic id was skipped as a duplicate (Codex
     /// HIGH), so stale plan content kept matching forever.
     pub fn remove_chunk(&mut self, id: &str) {
-        let removed = if let Some(pos) = self.chunk_id_map.iter().position(|x| x == id) {
-            self.chunk_id_map[pos] = String::new();
-            true
-        } else {
-            false
-        };
-        let removed_from_set = self.chunk_id_set.remove(id);
-        if removed || removed_from_set {
-            self.chunk_dirty = true;
+        if let Some(proxy) = &self.proxy {
+            // SQLite holds the change; the daemon applies it before answering.
+            proxy.sync_committed();
+            return;
+        }
+        if !self.allow_local_mutations || self.chunks_awaiting_generation {
+            return;
+        }
+        if let Some(serve) = self.chunk_gen.as_mut() {
+            serve.remove(id);
+            return;
+        }
+        if let Some(pos) = self.chunk_positions.remove(id) {
+            self.chunk_id_map[pos].clear();
+            self.mark_chunk_dirty();
         }
     }
 
     /// Check if a reflection ID exists in the index (non-blanked).
     pub fn has_reflection(&self, id: &str) -> bool {
-        self.reflection_id_set.contains(id)
+        self.reflection_positions.contains_key(id)
     }
 
     /// Check if a chunk ID is already present in the index.
     pub fn has_chunk(&self, id: &str) -> bool {
-        self.chunk_id_set.contains(id)
+        match &self.chunk_gen {
+            Some(serve) => serve.has(id),
+            None => self.chunk_positions.contains_key(id),
+        }
+    }
+
+    /// Generation number chunk kNN is served from, when there is one.
+    pub fn serving_generation(&self) -> Option<u64> {
+        self.chunk_gen
+            .as_ref()
+            .map(|serve| serve.gen.manifest().generation)
+    }
+
+    /// `(delta rows, pending ids)` of a generation-served engine: rows held in
+    /// the exact-scan delta, and every id changed since the watermark.
+    pub fn delta_stats(&self) -> Option<(usize, usize)> {
+        self.chunk_gen
+            .as_ref()
+            .map(|serve| (serve.delta_ids.len(), serve.shadow.len()))
+    }
+
+    /// Reflection mutations not yet written to disk. A replacement engine
+    /// loads the reflection side from disk, so it must wait for this to be 0.
+    pub(crate) fn unpublished_reflection_changes(&self) -> u64 {
+        self.reflection_changes
+            .saturating_sub(self.settled_reflection_changes)
+    }
+
+    /// Whether chunk kNN is served from a USearch generation.
+    pub fn is_generation_served(&self) -> bool {
+        self.chunk_gen.is_some()
+    }
+
+    /// The generation and delta serving chunks, when there is one.
+    pub fn generation_serve(&self) -> Option<&GenServe> {
+        self.chunk_gen.as_ref()
     }
 
     /// Blank reflection IDs in the map that are not present in the given DB ID set.
@@ -203,16 +1023,84 @@ impl SearchEngine {
         let mut blanked = 0;
         for entry in &mut self.reflection_id_map {
             if !entry.is_empty() && !db_ids.contains(entry.as_str()) {
-                self.reflection_id_set.remove(entry.as_str());
+                self.reflection_positions.remove(entry.as_str());
                 *entry = String::new();
                 blanked += 1;
             }
         }
         if blanked > 0 {
             self.active_reflection_count = self.active_reflection_count.saturating_sub(blanked);
-            self.reflection_dirty = true;
+            self.mark_reflection_dirty();
         }
         blanked
+    }
+
+    /// Blank chunk IDs in the map that are not present in the given DB ID set:
+    /// vectors whose rows were deleted after the process that dumped this cache
+    /// loaded them. Returns the number blanked. Marks the index dirty if any were.
+    pub fn blank_orphan_chunks(&mut self, db_ids: &std::collections::HashSet<&str>) -> usize {
+        if let Some(serve) = self.chunk_gen.as_mut() {
+            // The delta was read from SQLite at load, and deletes after it are
+            // shadowed; only a delta row since removed from the DB is an orphan.
+            let orphans: Vec<String> = serve
+                .delta_ids
+                .iter()
+                .filter(|id| !db_ids.contains(id.as_str()))
+                .cloned()
+                .collect();
+            for id in &orphans {
+                serve.remove(id);
+            }
+            return orphans.len();
+        }
+        let mut blanked = 0;
+        for entry in &mut self.chunk_id_map {
+            if !entry.is_empty() && !db_ids.contains(entry.as_str()) {
+                self.chunk_positions.remove(entry.as_str());
+                *entry = String::new();
+                blanked += 1;
+            }
+        }
+        if blanked > 0 {
+            self.mark_chunk_dirty();
+        }
+        blanked
+    }
+
+    /// Total chunk id-map slots (live + blanked/tombstoned). O(1).
+    pub fn chunk_slot_count(&self) -> usize {
+        match &self.chunk_gen {
+            Some(serve) => serve.gen.len() + serve.delta_ids.len(),
+            None => self.chunk_id_map.len(),
+        }
+    }
+
+    /// Total reflection id-map slots (live + blanked/tombstoned). O(1).
+    pub fn reflection_slot_count(&self) -> usize {
+        self.reflection_id_map.len()
+    }
+
+    /// Cumulative count of blanked ("tombstoned") chunk slots — every id
+    /// ever removed from the DB while still occupying a neighbour position
+    /// in the HNSW graph (hnsw_rs cannot delete), not just the ones blanked
+    /// during this process's most recent reconciliation pass. O(1): both
+    /// `chunk_id_map` (every slot ever inserted) and `chunk_positions` (live
+    /// ids only) are already maintained incrementally by `insert_chunk` /
+    /// `remove_chunk` / `blank_orphan_chunks`, so this never rescans the map.
+    pub fn chunk_tombstone_count(&self) -> usize {
+        if let Some(serve) = &self.chunk_gen {
+            return serve.shadowed_in_gen;
+        }
+        self.chunk_id_map
+            .len()
+            .saturating_sub(self.chunk_positions.len())
+    }
+
+    /// Reflection counterpart of [`Self::chunk_tombstone_count`].
+    pub fn reflection_tombstone_count(&self) -> usize {
+        self.reflection_id_map
+            .len()
+            .saturating_sub(self.reflection_positions.len())
     }
 
     /// Search chunk index. Returns results sorted by descending score.
@@ -222,12 +1110,19 @@ impl SearchEngine {
         limit: usize,
         min_score: f32,
     ) -> Vec<SearchResult> {
+        if let Some(proxy) = &self.proxy {
+            return proxy.search_chunks(query_vec, limit, min_score);
+        }
+        if let Some(serve) = &self.chunk_gen {
+            return serve.search(query_vec, limit, min_score, None);
+        }
         if self.chunk_id_map.is_empty() {
             return Vec::new();
         }
         self.search_index(
             &self.chunk_index,
             &self.chunk_id_map,
+            self.chunk_positions.len(),
             query_vec,
             limit,
             min_score,
@@ -241,12 +1136,16 @@ impl SearchEngine {
         limit: usize,
         min_score: f32,
     ) -> Vec<SearchResult> {
+        if let Some(proxy) = &self.proxy {
+            return proxy.search_reflections(query_vec, limit, min_score);
+        }
         if self.reflection_id_map.is_empty() {
             return Vec::new();
         }
         self.search_index(
             &self.reflection_index,
             &self.reflection_id_map,
+            self.reflection_positions.len(),
             query_vec,
             limit,
             min_score,
@@ -257,30 +1156,96 @@ impl SearchEngine {
         &self,
         index: &Hnsw<'static, f32, DistCosine>,
         id_map: &[String],
+        live_count: usize,
         query_vec: &[f32],
         limit: usize,
         min_score: f32,
     ) -> Vec<SearchResult> {
+        if limit == 0 {
+            return Vec::new();
+        }
         if id_map.len() <= EXACT_SCAN_THRESHOLD {
             return Self::exact_scan(index, id_map, query_vec, limit, min_score, None);
         }
-        let neighbours = index.search(query_vec, limit, EF_SEARCH);
 
-        let mut results: Vec<SearchResult> = neighbours
-            .into_iter()
-            .filter_map(|n| {
-                // hnsw_rs DistCosine returns distance = 1.0 - cosine_similarity
-                let score = 1.0 - n.distance;
-                if score >= min_score && n.d_id < id_map.len() && !id_map[n.d_id].is_empty() {
-                    Some(SearchResult {
-                        id: id_map[n.d_id].clone(),
-                        score,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Tombstone-aware overfetch. `id_map` slots blanked by
+        // `blank_orphan_chunks`/`blank_orphan_reflections` still occupy a
+        // neighbour position in the HNSW graph (hnsw_rs cannot delete), so a
+        // bare `index.search(query_vec, limit, ..)` can return fewer than
+        // `limit` live results once tombstones are common (negative-drift
+        // cache load, see `SearchEngine::load_from_disk`). Scale the request
+        // by the live/total ratio, capped, and escalate if still short —
+        // mirrors `search_chunks_filtered`'s adaptive overfetch. `live_count`
+        // comes from the caller's id-set length (O(1)) rather than a rescan
+        // of `id_map` here on every query.
+        let max_elements = id_map.len();
+        let live = live_count.max(1);
+        let mut fetch_limit = if live < max_elements {
+            let scale = (max_elements as f64 / live as f64).min(TOMBSTONE_OVERFETCH_CAP as f64);
+            ((limit as f64 * scale).ceil() as usize)
+                .max(limit)
+                .min(max_elements)
+        } else {
+            limit.min(max_elements)
+        };
+
+        let mut results = loop {
+            #[cfg(test)]
+            {
+                TEST_SEARCH_INDEX_CALLS.with(|c| c.set(c.get() + 1));
+                TEST_SEARCH_INDEX_MAX_FETCH_LIMIT.with(|c| c.set(c.get().max(fetch_limit as u64)));
+            }
+            let neighbours = index.search(query_vec, fetch_limit, EF_SEARCH);
+
+            // hnsw_rs returns neighbours sorted by ascending distance (best
+            // match first), so scores are monotonically non-increasing across
+            // this window. Track, over the whole fetched window, the lowest
+            // score seen and whether any slot in it was a tombstone — both
+            // needed below to decide whether a deeper fetch could possibly
+            // help, instead of assuming it always might.
+            let mut tail_score = f32::INFINITY;
+            let mut saw_tombstone = false;
+            let found: Vec<SearchResult> = neighbours
+                .into_iter()
+                .filter_map(|n| {
+                    // hnsw_rs DistCosine returns distance = 1.0 - cosine_similarity
+                    let score = 1.0 - n.distance;
+                    tail_score = tail_score.min(score);
+                    let is_tombstone = n.d_id < id_map.len() && id_map[n.d_id].is_empty();
+                    saw_tombstone |= is_tombstone;
+                    if score >= min_score && !is_tombstone && n.d_id < id_map.len() {
+                        Some(SearchResult {
+                            id: id_map[n.d_id].clone(),
+                            score,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if found.len() >= limit || fetch_limit >= max_elements {
+                break found;
+            }
+            // The window fell short of `limit`. A deeper fetch can only add
+            // more above-threshold live hits if (a) the window's weakest
+            // score has not yet dropped below `min_score` — since results
+            // only get weaker from here, once it has, nothing further out
+            // will qualify either — and (b) the shortfall could plausibly be
+            // tombstones rather than genuine score exhaustion (no tombstones
+            // in this window and still short means there just aren't enough
+            // qualifying points, deepening will not manufacture more).
+            if tail_score < min_score || !saw_tombstone {
+                break found;
+            }
+            // Escalate geometrically rather than jumping straight to the
+            // full index — bounds the cost of a fetch that only needed to
+            // clear a handful more tombstones.
+            fetch_limit = fetch_limit
+                .saturating_mul(SEARCH_ESCALATION_FACTOR)
+                .min(max_elements)
+                .max(fetch_limit + 1);
+        };
 
         results.sort_by(|a, b| {
             b.score
@@ -336,7 +1301,10 @@ impl SearchEngine {
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.chunk_id_map.len()
+        match &self.chunk_gen {
+            Some(serve) => serve.live_count(),
+            None => self.chunk_positions.len(),
+        }
     }
 
     pub fn reflection_count(&self) -> usize {
@@ -363,6 +1331,44 @@ impl SearchEngine {
         self.reflection_dirty
     }
 
+    /// Clear both dirty flags without dumping. `Engine::new`'s cached-load
+    /// path calls this after pure DB-mirroring reconciliation (orphan
+    /// blanking, additive backfill against `load_all_chunk_ids`/
+    /// `load_all_reflection_ids`) — work that only makes this engine's
+    /// in-memory maps agree with what the DB already says, not new content
+    /// this process is responsible for publishing.
+    ///
+    /// Reviewer-found ping-pong (WP-D medium #2): without this, a
+    /// long-lived foreground engine (MCP server, hook) that loaded BEFORE
+    /// the daemon's compaction swap keeps `chunk_dirty`/`reflection_dirty`
+    /// set from its own startup blanking. Its next unrelated dump (e.g. a
+    /// `store_reflection` flush, which only has new content on the
+    /// reflection side) then takes `dump_to_disk`'s "this side is dirty, so
+    /// publish it from memory" branch for the CHUNK side too — republishing
+    /// this process's pre-compaction, orphan-laden generation over the
+    /// generation the daemon just compacted. Last-writer-wins means the
+    /// compaction's tombstones come back, `orphans_material` trips again on
+    /// the next load, and the daemon runs another multi-minute rebuild for
+    /// no reason.
+    ///
+    /// Clearing here instead makes a later dump from this process take the
+    /// OTHER branch for an untouched, `manifest_backed` side: carry the
+    /// generation forward from whatever manifest is on disk **at dump
+    /// time** (re-read fresh, under `index.lock`, right before writing —
+    /// see `dump_to_disk`), which by then is the daemon's newer, compact
+    /// one. A genuine runtime content change (an actual `insert_chunk`/
+    /// `insert_reflection` from an import or a stored reflection, which
+    /// happen strictly after this call in `Engine::new`) still sets the
+    /// flag itself and is never lost by this.
+    pub fn clear_reconciliation_dirty(&mut self) {
+        self.chunk_dirty = false;
+        self.reflection_dirty = false;
+        // Nor does it count toward a dump budget; an owner that does want
+        // it published says so with `note_unpublished`.
+        self.settled_chunk_changes = self.chunk_changes;
+        self.settled_reflection_changes = self.reflection_changes;
+    }
+
     /// Search chunk index but only return results whose IDs are in `allowed_ids`.
     /// Used for project-scoped and time-range-scoped searches.
     pub fn search_chunks_filtered(
@@ -372,7 +1378,19 @@ impl SearchEngine {
         min_score: f32,
         allowed_ids: &HashSet<String>,
     ) -> Vec<SearchResult> {
-        if self.chunk_id_map.is_empty() || allowed_ids.is_empty() {
+        if let Some(proxy) = &self.proxy {
+            if allowed_ids.is_empty() || limit == 0 {
+                return Vec::new();
+            }
+            return proxy.search_chunks_filtered(query_vec, limit, min_score, allowed_ids);
+        }
+        if let Some(serve) = &self.chunk_gen {
+            if allowed_ids.is_empty() {
+                return Vec::new();
+            }
+            return serve.search(query_vec, limit, min_score, Some(allowed_ids));
+        }
+        if self.chunk_id_map.is_empty() || allowed_ids.is_empty() || limit == 0 {
             return Vec::new();
         }
         if self.chunk_id_map.len() <= EXACT_SCAN_THRESHOLD {
@@ -489,6 +1507,47 @@ impl SearchEngine {
         db_chunk_count: usize,
         db_reflection_count: usize,
     ) -> Result<()> {
+        let operation = crate::maintenance::shared(dir.parent().unwrap_or(Path::new(".")))?;
+        self.dump_to_disk_locked(dir, db_chunk_count, db_reflection_count, &operation)
+    }
+
+    /// The writing half of [`Self::dump_to_disk`], from a shared borrow: every
+    /// file, the manifest and the cleanup, exactly as `dump_to_disk` writes
+    /// them, but no change to `self`. A caller holding only a read lock can
+    /// run it while searches continue (the chunk generation alone is ~1.5 GB
+    /// to write), then take the write lock just for [`Self::settle_publish`].
+    pub fn publish_to_disk(
+        &self,
+        dir: &Path,
+        db_chunk_count: usize,
+        db_reflection_count: usize,
+    ) -> Result<Published> {
+        let lock = crate::maintenance::shared(dir.parent().unwrap_or(Path::new(".")))?;
+        self.publish_to_disk_locked(dir, db_chunk_count, db_reflection_count, &lock)
+    }
+
+    pub(crate) fn dump_to_disk_locked(
+        &mut self,
+        dir: &Path,
+        db_chunk_count: usize,
+        db_reflection_count: usize,
+        lock: &crate::maintenance::SharedLock,
+    ) -> Result<()> {
+        let published =
+            self.publish_to_disk_locked(dir, db_chunk_count, db_reflection_count, lock)?;
+        self.settle_publish(published);
+        Ok(())
+    }
+
+    pub(crate) fn publish_to_disk_locked(
+        &self,
+        dir: &Path,
+        db_chunk_count: usize,
+        db_reflection_count: usize,
+        lock: &crate::maintenance::SharedLock,
+    ) -> Result<Published> {
+        lock.check_directory(dir.parent().unwrap_or(Path::new(".")))?;
+        let _publishing = PublishingGuard::enter();
         std::fs::create_dir_all(dir)?;
 
         // Advisory lock prevents concurrent dump/load from separate processes (H-2)
@@ -497,9 +1556,7 @@ impl SearchEngine {
             .create(true)
             .truncate(false)
             .open(dir.join("index.lock"))?;
-        lock_file
-            .lock_exclusive()
-            .map_err(|e| anyhow::anyhow!("failed to acquire index lock for dump: {}", e))?;
+        lock_index(&lock_file, true, INDEX_LOCK_TIMEOUT)?;
 
         // Snapshot whatever manifest is on disk BEFORE this call writes
         // anything, while still holding the exclusive lock — no other
@@ -516,48 +1573,155 @@ impl SearchEngine {
         // from memory now, so whatever this call publishes is guaranteed to
         // match what's actually on disk" rather than risking the same
         // id-map/graph mismatch this whole fix exists to prevent.
+        // A manifest below the maintenance generation was published from a graph
+        // loaded before the last maintenance pass (an older binary's): it is no
+        // more trustworthy than none, and carrying its fields forward would
+        // relabel it current (astra r2 #5).
+        let floor = read_maintenance_generation(dir);
         let existing_manifest: Option<IndexManifest> =
             std::fs::read_to_string(dir.join("manifest.json"))
                 .ok()
                 .and_then(|raw| serde_json::from_str::<IndexManifest>(&raw).ok())
-                .filter(|m| m.version == MANIFEST_VERSION);
+                .filter(|m| m.version == MANIFEST_VERSION && m.epoch >= floor);
         let force_full = existing_manifest.is_none();
+        if let (false, Some(rebuilt_at)) = (self.manifest_backed, self.rebuilt_at_generation) {
+            if floor > rebuilt_at {
+                return Err(CrossedMaintenance {
+                    rebuilt_at,
+                    now: floor,
+                }
+                .into());
+            }
+        }
 
-        // Dump HNSW graph + data files (skip empty indices — file_dump fails on empty;
-        // skip untouched indices — nothing changed since the file on disk was last
-        // written, so re-dumping would just burn I/O to produce the same bytes; but
-        // NEVER skip a side under `force_full` — see the comment on `existing_manifest`
-        // above. hnsw_rs may return a numbered basename (e.g. "chunks-7905") when mmap
-        // is active (after load_from_disk). We promote it to the canonical name so
-        // load_from_disk always finds "chunks.hnsw.data" / "reflections.hnsw.data".
+        // WP-D medium (compaction epoch guard): `manifest_backed` plus the
+        // per-side dirty flags stop a long-lived engine from republishing a
+        // side it never touched, but they don't cover a side the engine DID
+        // genuinely touch (a real `insert_chunk`/`insert_reflection`, not
+        // just startup reconciliation — see `clear_reconciliation_dirty`)
+        // after loading, if a CONCURRENT compaction (a different process's
+        // `rebuild_search_index`, which always starts from a non-manifest-
+        // backed `SearchEngine::new` and so always bumps the epoch below)
+        // replaced that exact side on disk with a newer, smaller,
+        // tombstone-free generation in the meantime. Dirty-flag logic alone
+        // still says "publish it, it's genuinely dirty" and republishes
+        // this engine's larger, pre-compaction graph over the newer one —
+        // reviving the tombstones the compaction just removed. `epoch`
+        // closes that gap: read under the same `index.lock` this whole
+        // function already holds, so this is a consistent comparison
+        // against whatever the last writer actually published. Held ACROSS
+        // both sides — a compaction is a single atomic swap of the whole
+        // manifest, so a stale engine must not publish EITHER side from
+        // memory, not just the one whose dirty flag happens to be set.
+        // The maintenance generation counts too: a maintenance pass removes the
+        // manifest but leaves the generation it raised, so an engine loaded
+        // before the pass stays stale whether or not a manifest is on disk.
+        let on_disk_epoch = existing_manifest
+            .as_ref()
+            .map(|m| m.epoch)
+            .unwrap_or(0)
+            .max(floor);
+        let stale_generation = self.manifest_backed && on_disk_epoch > self.epoch;
+        if stale_generation {
+            tracing::warn!(
+                on_disk_epoch,
+                engine_epoch = self.epoch,
+                "on-disk index generation is newer than this engine's — refusing to \
+                 publish from memory this call; carrying the newer generation forward. \
+                 Any genuine new content already in SQLite is picked up by the next load's \
+                 additive backfill."
+            );
+        }
+
+        // Stale, and no manifest to carry forward (a maintenance pass removed it
+        // and has not published yet): there is nothing true this engine can
+        // publish. Write nothing; the next load rebuilds or loads the pass's.
+        if stale_generation && existing_manifest.is_none() {
+            return Ok(Published {
+                generation: self.generation,
+                chunk_changes: self.chunk_changes,
+                reflection_changes: self.reflection_changes,
+                stale_generation,
+                new_epoch: on_disk_epoch,
+                // No new publication; settle_publish ignores these basenames
+                // for a stale generation and keeps the mapped owner's names.
+                basenames: self.published_basenames.clone().unwrap_or_default(),
+            });
+        }
+
+        // Dump a side to a NEW generation only when it actually changed (skip empty
+        // indices — the generation dump fails on empty; skip untouched indices —
+        // nothing changed since the generation on disk was last written, so
+        // re-dumping would just burn I/O to produce the same bytes), but NEVER skip a
+        // side under `force_full` — see the comment on `existing_manifest` above.
+        // Neither fresh nor mmap-backed indexes may overwrite files referenced by the
+        // currently committed manifest, which is why each write goes to a new
+        // generation rather than over the existing one.
+        //
+        // The basename must track the SAME source as the id map chosen below, or the
+        // manifest would point at one generation while describing another. A side we
+        // just wrote takes its fresh basename; a side we skipped keeps whatever
+        // generation the previous manifest referenced, so `cleanup_stale_index_files`
+        // still sees it as referenced and leaves it alone.
         //
         // `chunk_dirty && chunk_id_map.is_empty()` can't actually happen —
         // `insert_chunk` only sets `chunk_dirty` after a non-empty push, and
         // `remove_chunk` only sets it after finding an existing (so
-        // already-non-empty) entry — but the empty check stays as a guard
-        // against `file_dump`'s documented failure on an empty index, and
-        // `chunk_actually_dumped` names the guarded condition once so the
-        // manifest logic below can ask "did we really just write this side"
-        // without repeating it.
-        let chunk_actually_dumped =
-            (self.chunk_dirty || force_full) && !self.chunk_id_map.is_empty();
-        if chunk_actually_dumped {
-            let basename = self
-                .chunk_index
-                .file_dump(dir, "chunks")
-                .map_err(|e| anyhow::anyhow!("chunk index dump failed: {}", e))?;
-            promote_to_canonical(dir, &basename, "chunks")?;
-        }
+        // already-non-empty) entry — but the empty check stays as a guard against
+        // the generation dump's failure on an empty index, and `chunk_actually_dumped`
+        // names the guarded condition once so the manifest logic below can ask "did we
+        // really just write this side" without repeating it.
+        let chunk_actually_dumped = !stale_generation
+            && self.chunk_gen.is_none()
+            && (self.chunk_dirty || force_full)
+            && !self.chunk_id_map.is_empty();
+        let chunk_basename = if chunk_actually_dumped {
+            dump_hnsw_generation(&self.chunk_index, dir, "chunks")
+                .map_err(|e| anyhow::anyhow!("chunk index dump failed: {}", e))?
+        } else if self.manifest_backed {
+            existing_manifest
+                .as_ref()
+                .map(|prev| prev.chunk_basename.clone())
+                .unwrap_or_else(default_chunk_basename)
+        } else {
+            default_chunk_basename()
+        };
 
-        let reflection_actually_dumped =
-            (self.reflection_dirty || force_full) && !self.reflection_id_map.is_empty();
-        if reflection_actually_dumped {
-            let basename = self
-                .reflection_index
-                .file_dump(dir, "reflections")
-                .map_err(|e| anyhow::anyhow!("reflection index dump failed: {}", e))?;
-            promote_to_canonical(dir, &basename, "reflections")?;
-        }
+        let reflection_actually_dumped = !stale_generation
+            && (self.reflection_dirty || force_full)
+            && !self.reflection_id_map.is_empty();
+        let reflection_basename = if reflection_actually_dumped {
+            dump_hnsw_generation(&self.reflection_index, dir, "reflections")
+                .map_err(|e| anyhow::anyhow!("reflection index dump failed: {}", e))?
+        } else if self.manifest_backed {
+            existing_manifest
+                .as_ref()
+                .map(|prev| prev.reflection_basename.clone())
+                .unwrap_or_else(default_reflection_basename)
+        } else {
+            default_reflection_basename()
+        };
+
+        // Compaction generation to publish. `!self.manifest_backed` means
+        // this engine came from `SearchEngine::new` and was populated
+        // directly from SQLite by `rebuild_search_index`/
+        // `rebuild_search_index_streaming` (or `Engine::new`'s cache-miss
+        // path) — a genuine compaction/full rebuild — so its first publish
+        // always claims a strictly newer generation than whatever (if
+        // anything) is on disk, guaranteeing any manifest-backed engine
+        // still holding an older epoch loses the `stale_generation` race
+        // above on ITS next dump. A `stale_generation` dump adopts the
+        // newer on-disk epoch it just deferred to, rather than
+        // republishing under its own stale one. Otherwise (a normal,
+        // non-stale, manifest-backed update) nothing compacted
+        // concurrently, so the epoch carries forward unchanged.
+        let new_epoch = if !self.manifest_backed {
+            on_disk_epoch.wrapping_add(1)
+        } else if stale_generation {
+            on_disk_epoch
+        } else {
+            on_disk_epoch.max(self.epoch)
+        };
 
         // Chunk side of the manifest: from memory if we just dumped it (now
         // provably matching what's on disk), OR if this engine isn't
@@ -603,31 +1767,128 @@ impl SearchEngine {
                 )
             };
 
+        // Each side's cursor comes from the same source as its id map: this
+        // engine for a side it wrote, the previous manifest for one it
+        // carried forward.
+        let chunk_change_cursor = match &existing_manifest {
+            Some(prev) if !(chunk_actually_dumped || !self.manifest_backed) => {
+                prev.chunk_change_cursor
+            }
+            _ => self.chunk_cursor,
+        };
+        let reflection_change_cursor = match &existing_manifest {
+            Some(prev) if !(reflection_actually_dumped || !self.manifest_backed) => {
+                prev.reflection_change_cursor
+            }
+            _ => self.reflection_cursor,
+        };
+
         // Write manifest atomically (tmp + rename)
-        let manifest = IndexManifest {
+        let mut manifest = IndexManifest {
             version: MANIFEST_VERSION,
+            files: HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             chunk_id_map,
             reflection_id_map,
             chunk_embeddings_expected,
             reflection_embeddings_expected,
             active_reflection_count,
+            chunk_basename,
+            reflection_basename,
+            epoch: new_epoch,
+            chunk_change_cursor,
+            reflection_change_cursor,
         };
 
-        let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        let tmp_path = dir.join("manifest.json.tmp");
-        let final_path = dir.join("manifest.json");
-        std::fs::write(&tmp_path, &manifest_json)?;
-        std::fs::rename(&tmp_path, &final_path)?;
+        for (basename, nonempty, written) in [
+            (
+                &manifest.chunk_basename,
+                !manifest.chunk_id_map.is_empty(),
+                chunk_actually_dumped,
+            ),
+            (
+                &manifest.reflection_basename,
+                !manifest.reflection_id_map.is_empty(),
+                reflection_actually_dumped,
+            ),
+        ] {
+            if nonempty {
+                for extension in ["hnsw.graph", "hnsw.data"] {
+                    let name = format!("{basename}.{extension}");
+                    let integrity = if written {
+                        file_integrity(&dir.join(&name))?
+                    } else {
+                        existing_manifest
+                            .as_ref()
+                            .and_then(|m| m.files.get(&name))
+                            .cloned()
+                            .with_context(|| format!("missing integrity metadata for {name}"))?
+                    };
+                    manifest.files.insert(name, integrity);
+                }
+            }
+        }
+        write_manifest_atomically(dir, &manifest)?;
+        if !self.manifest_backed {
+            // A full rebuild: keep the maintenance generation level with the
+            // epoch it published, so it never depends on the manifest surviving.
+            write_maintenance_generation(dir, new_epoch)?;
+        }
 
-        // Clean stale numbered HNSW files from previous dumps.
-        // hnsw_rs creates numbered files (e.g. chunks-7905.hnsw.data) when mmap is active
-        // on the old files (after load_from_disk). These are orphaned after each new dump.
+        // Clean numbered generations not referenced by the newly committed manifest.
         cleanup_stale_index_files(dir);
 
         // Lock is released when lock_file is dropped
-        self.chunk_dirty = false;
-        self.reflection_dirty = false;
+        Ok(Published {
+            generation: self.generation,
+            chunk_changes: self.chunk_changes,
+            reflection_changes: self.reflection_changes,
+            stale_generation,
+            new_epoch,
+            basenames: (manifest.chunk_basename, manifest.reflection_basename),
+        })
+    }
+
+    /// The bookkeeping half of [`Self::dump_to_disk`]: record what
+    /// [`Self::publish_to_disk`] published. A side's dirty flag clears only if
+    /// that side has not changed since the files were written (a later insert
+    /// stays dirty for the next dump); a `published` from a different engine
+    /// (a compaction swapped the index in between) is ignored. Otherwise the
+    /// same epoch and `manifest_backed` updates `dump_to_disk` always made.
+    pub fn settle_publish(&mut self, published: Published) {
+        if published.generation != self.generation {
+            return;
+        }
+        if self.chunk_changes == published.chunk_changes {
+            self.chunk_dirty = false;
+        }
+        if self.reflection_changes == published.reflection_changes {
+            self.reflection_dirty = false;
+        }
+        if !published.stale_generation {
+            self.settled_chunk_changes = published.chunk_changes;
+            self.settled_reflection_changes = published.reflection_changes;
+            self.published_basenames = Some(published.basenames.clone());
+        }
+        let stale_generation = published.stale_generation;
+        let new_epoch = published.new_epoch;
+        // WP-D medium (second review): do NOT adopt `new_epoch` when this
+        // dump was stale. Adopting it (`self.epoch = on_disk_epoch`)
+        // used to make `self.epoch == on_disk_epoch` again, so the very
+        // NEXT flush would see `stale_generation == false` (the epochs
+        // matched) and publish this engine's still-unreloaded,
+        // pre-compaction graph/id-maps over the generation it just
+        // deferred to — the same ping-pong one flush later. Leaving
+        // `self.epoch` at its old (lower) value keeps `stale_generation`
+        // true for every future dump from this engine, so it never
+        // publishes from memory again until the process reloads a fresh
+        // manifest (restart, or a future `Engine::new`). SQLite remains
+        // the durable record; the next fresh load's additive backfill
+        // recovers this engine's genuine new rows regardless of how many
+        // times it deferred here.
+        if !stale_generation {
+            self.epoch = new_epoch;
+        }
         // The manifest we just published (`std::fs::rename` above already
         // succeeded — this line only runs on that success path, never on an
         // early `?` return) now describes this engine's in-memory maps for
@@ -637,41 +1898,208 @@ impl SearchEngine {
         // `force_full` above) — so after this write, `self.chunk_id_map`/
         // `self.reflection_id_map` are exactly what the manifest on disk
         // says, regardless of whether this engine started out manifest-backed.
+        // EXCEPT under `stale_generation`: there, the manifest we just wrote
+        // describes the on-disk generation we deferred to, not this
+        // engine's own in-memory maps, which still hold whatever this
+        // process actually inserted/removed — deliberately left as-is (not
+        // reset from the manifest) so this process keeps serving its own
+        // superset of content until the epoch race resolves; SQLite is the
+        // durable record, and the next fresh load reconciles everything.
         // A rebuilt (`SearchEngine::new`) engine that has never dumped is
         // NOT yet in this state — that's `manifest_only_carries_forward_on_a_manifest_backed_engine`
         // — but one that just published successfully is, from this point on,
         // exactly as trustworthy for a future untouched-side carry-forward as
         // one that loaded a manifest at construction. See the field doc.
         self.manifest_backed = true;
-        Ok(())
     }
 
     /// Load HNSW indices from a cached directory.
-    /// Returns `None` on any failure — caller falls back to full rebuild.
+    /// Returns `Ok(None)` for an invalid cache so the caller can rebuild.
     ///
     /// Validates:
     /// - Manifest version matches
     /// - Chunk/reflection counts match current DB state (staleness detection)
     /// - All required files exist and load successfully
     ///
-    /// **WARNING**: This function uses `Box::leak` for `HnswIo` objects to satisfy
-    /// the `'static` lifetime requirement. Each call leaks ~200 bytes. Only call
-    /// this once per process (at startup).
+    /// On full success the engine owns the `HnswIo` objects whose maps its
+    /// indexes borrow (see the `mapped` field) and frees them when dropped.
+    /// Failed or partially failed loads reclaim them at once.
+    /// A missing or invalid cache is `Ok(None)`; lock failures must reach the
+    /// caller instead of starting a rebuild while a publisher holds the lock.
     pub fn load_from_disk(
         dir: &Path,
         expected_chunks: usize,
         expected_reflections: usize,
-    ) -> Option<Self> {
-        // Acquire shared advisory lock to avoid reading while dump_to_disk is writing.
-        // The File is held as _lock_guard for the duration of the load.
+    ) -> Result<Option<Self>> {
+        Self::load_from_disk_with_budget(
+            dir,
+            expected_chunks,
+            expected_reflections,
+            INDEX_LOCK_TIMEOUT,
+        )
+    }
 
-        let lock_path = dir.join("index.lock");
-        let _lock_guard = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&lock_path)
+    pub(crate) fn load_from_disk_with_budget(
+        dir: &Path,
+        expected_chunks: usize,
+        expected_reflections: usize,
+        budget: std::time::Duration,
+    ) -> Result<Option<Self>> {
+        #[cfg(test)]
+        heavy_loads::note();
+        let lock = match std::fs::File::open(dir.join("index.lock")) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        lock_index(&lock, false, budget)?;
+        Ok(Self::load_from_disk_locked(
+            dir,
+            expected_chunks,
+            expected_reflections,
+        ))
+    }
+
+    /// Serve chunk kNN from the activated USearch generation named by the
+    /// `vector_generation` watermark, with everything that changed after the
+    /// watermark `seq` held as an exact-scan delta (see [`GenServe`]).
+    ///
+    /// Loads the reflection hnsw files, the generation and the delta, and
+    /// nothing else: the `chunks-*.hnsw.*` files are never opened, read or
+    /// hashed, and are left exactly as they are. `Ok(None)` without a
+    /// watermark. An `Err` (a generation or reflection file that fails its
+    /// checks) leaves the caller to [`Self::load_after_failed_open`].
+    pub fn load_with_generation(
+        index_dir: &Path,
+        storage: &crate::storage::Storage,
+        expected_reflections: usize,
+    ) -> Result<Option<Self>> {
+        Self::load_with_generation_budget(
+            index_dir,
+            storage,
+            expected_reflections,
+            INDEX_LOCK_TIMEOUT,
+        )
+    }
+
+    pub(crate) fn load_with_generation_budget(
+        index_dir: &Path,
+        storage: &crate::storage::Storage,
+        expected_reflections: usize,
+        budget: std::time::Duration,
+    ) -> Result<Option<Self>> {
+        #[cfg(test)]
+        heavy_loads::note();
+        let Some(watermark) = crate::index_gen::read_watermark(storage)? else {
+            return Ok(None);
+        };
+        Self::load_generation(index_dir, storage, &watermark, expected_reflections, budget)
+            .map(Some)
+    }
+
+    /// Load only the reflection side of the manifest in `dir`. A missing or
+    /// unusable manifest leaves the reflection side empty (the caller's
+    /// reconciliation backfills it from SQLite). Damaged reflection files are
+    /// an error.
+    fn load_reflection_side(
+        &mut self,
+        dir: &Path,
+        expected_reflections: usize,
+        lock_held: bool,
+    ) -> Result<()> {
+        let floor = read_maintenance_generation(dir);
+        let manifest = std::fs::read_to_string(dir.join("manifest.json"))
             .ok()
-            .and_then(|f| f.lock_shared().ok().map(|_| f));
+            .and_then(|raw| serde_json::from_str::<IndexManifest>(&raw).ok())
+            .filter(|manifest| manifest.version == MANIFEST_VERSION && manifest.epoch >= floor);
+        let Some(manifest) = manifest else {
+            tracing::info!("no usable index manifest: reflections start empty");
+            return Ok(());
+        };
+        let basename = manifest.reflection_basename.as_str();
+        anyhow::ensure!(
+            Path::new(basename).file_name().and_then(|s| s.to_str()) == Some(basename),
+            "invalid index basename"
+        );
+        let points = manifest.reflection_id_map.len();
+        if points > 0 {
+            for extension in ["hnsw.graph", "hnsw.data"] {
+                let name = format!("{basename}.{extension}");
+                let expected = manifest
+                    .files
+                    .get(&name)
+                    .with_context(|| format!("missing integrity metadata for {name}"))?;
+                let path = dir.join(&name);
+                let metadata = std::fs::symlink_metadata(&path)
+                    .with_context(|| format!("checking {}", path.display()))?;
+                anyhow::ensure!(
+                    metadata.is_file() && metadata.len() == expected.bytes,
+                    "index file length or type mismatch: {name}"
+                );
+                anyhow::ensure!(
+                    file_integrity(&path)? == *expected,
+                    "index hash mismatch: {name}"
+                );
+            }
+            check_generation_files(dir, basename, points).map_err(|problem| {
+                anyhow::anyhow!("reflection generation {basename} damaged: {problem}")
+            })?;
+        }
+        if expected_reflections != manifest.reflection_embeddings_expected {
+            tracing::info!(
+                cached_reflections = manifest.reflection_embeddings_expected,
+                db_reflections = expected_reflections,
+                "reflection cache differs from DB — loading + reconciling"
+            );
+        }
+        let use_mmap =
+            should_mmap_generation(dir, basename, &default_reflection_basename(), lock_held);
+        let mut io = (points > 0).then(|| PendingHnswIo::new(dir, basename, use_mmap));
+        let index = if let Some(io) = io.as_mut() {
+            match io.load() {
+                Ok(hnsw) => hnsw,
+                Err(failure) => {
+                    log_hnsw_load_failure("reflection", &failure);
+                    anyhow::bail!("reflection index failed to load");
+                }
+            }
+        } else {
+            Hnsw::new(
+                MAX_NB_CONNECTION,
+                1_000,
+                MAX_LAYER,
+                EF_CONSTRUCTION,
+                DistCosine {},
+            )
+        };
+        self.vectors_mapped = io.is_some() && use_mmap;
+        self._mapped = io
+            .take()
+            .map(PendingHnswIo::into_mapped)
+            .into_iter()
+            .collect();
+        self.reflection_positions = manifest
+            .reflection_id_map
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| !id.is_empty())
+            .map(|(position, id)| (id.clone(), position))
+            .collect();
+        self.active_reflection_count = self.reflection_positions.len();
+        self.reflection_hashes = index_hashes(&index, points);
+        self.reflection_index = index;
+        self.reflection_id_map = manifest.reflection_id_map;
+        self.reflection_cursor = manifest.reflection_change_cursor;
+        self.epoch = manifest.epoch;
+        self.manifest_backed = true;
+        Ok(())
+    }
 
+    fn load_from_disk_locked(
+        dir: &Path,
+        expected_chunks: usize,
+        expected_reflections: usize,
+    ) -> Option<Self> {
         // Read and validate manifest
         let manifest_path = dir.join("manifest.json");
         let manifest_data = std::fs::read_to_string(&manifest_path).ok()?;
@@ -685,32 +2113,52 @@ impl SearchEngine {
             );
             return None;
         }
+        if let Err(error) = verify_manifest_files(dir, &manifest) {
+            tracing::warn!(%error, "index integrity mismatch; rebuilding");
+            return None;
+        }
+        // Published from a graph loaded before the last maintenance pass (an
+        // older binary that does not read the generation): not to be trusted.
+        let floor = read_maintenance_generation(dir);
+        if manifest.epoch < floor {
+            tracing::info!(
+                manifest_epoch = manifest.epoch,
+                maintenance_generation = floor,
+                "index cache predates the last maintenance pass"
+            );
+            return None;
+        }
 
-        // Staleness is asymmetric. Chunks and reflections normally only grow, so an
-        // ADDITIVE drift (db > cached) is cheap to reconcile: Engine::new loads this
-        // cache and incrementally inserts the few new rows (~ms) instead of rebuilding
-        // the whole HNSW (~tens of seconds). This avoids cache thrash when several
-        // csr-engine processes import transcripts concurrently.
+        // Staleness in either direction is reconciled by the caller, not here.
+        // Chunks and reflections normally only grow, so an ADDITIVE drift (db >
+        // cached) is cheap: Engine::new loads this cache and incrementally
+        // inserts the few new rows (~ms) instead of rebuilding the whole HNSW
+        // (~tens of seconds). This avoids cache thrash when several csr-engine
+        // processes import transcripts concurrently.
         //
-        // A NEGATIVE drift (db < cached) means rows were deleted, so the cache holds
-        // orphan vectors — fall back to a full rebuild for correctness.
-        if expected_chunks < manifest.chunk_embeddings_expected {
+        // A NEGATIVE drift (db < cached) means rows were deleted since the last
+        // dump, so the cache holds orphan (tombstone) vectors. This used to force
+        // a synchronous full rebuild here, which is the ~7 min cold-start stall a
+        // fresh MCP/hook process cannot afford (Claude Code's CONNECT_TIMEOUT is
+        // 30s). Instead: still return the loaded generation. `Engine::new`
+        // already runs `blank_orphan_chunks`/`blank_orphan_reflections` against
+        // the live DB ids on EVERY cache load (additive or negative) to reconcile
+        // exactly this case, and `search_index`/`search_chunks_filtered` overfetch
+        // past tombstoned slots so search still returns full pages. A full
+        // rebuild only ever runs out-of-band now (daemon consuming the
+        // `needs_compaction` marker, or the explicit `rebuild-index` command) —
+        // see `Engine::new`'s `orphans_material` handling.
+        if expected_chunks < manifest.chunk_embeddings_expected
+            || expected_reflections < manifest.reflection_embeddings_expected
+        {
             tracing::info!(
-                cached = manifest.chunk_embeddings_expected,
-                db = expected_chunks,
-                "index cache stale (chunks removed) — rebuilding"
+                cached_chunks = manifest.chunk_embeddings_expected,
+                db_chunks = expected_chunks,
+                cached_reflections = manifest.reflection_embeddings_expected,
+                db_reflections = expected_reflections,
+                "index cache ahead of DB (rows removed) — loading + reconciling tombstones"
             );
-            return None;
-        }
-        if expected_reflections < manifest.reflection_embeddings_expected {
-            tracing::info!(
-                cached = manifest.reflection_embeddings_expected,
-                db = expected_reflections,
-                "index cache stale (reflections removed) — rebuilding"
-            );
-            return None;
-        }
-        if expected_chunks > manifest.chunk_embeddings_expected
+        } else if expected_chunks > manifest.chunk_embeddings_expected
             || expected_reflections > manifest.reflection_embeddings_expected
         {
             tracing::info!(
@@ -722,16 +2170,53 @@ impl SearchEngine {
             );
         }
 
-        // Load chunk index.
-        // Box::leak gives the HnswIo a 'static lifetime required by load_hnsw.
-        // Leaked memory is ~200 bytes total — negligible for process-lifetime objects.
-        // Empty indices aren't dumped to disk, so create fresh ones if count is 0.
-        let chunk_hnsw = if manifest.chunk_embeddings_expected > 0 {
-            let chunk_io = Box::leak(Box::new(HnswIo::new(dir, "chunks")));
-            match chunk_io.load_hnsw::<f32, DistCosine>() {
+        // Hnsw borrows its HnswIo mmap. Keep each allocation owned while loading so
+        // failures can reclaim it; leak both only after both loads have succeeded.
+        //
+        // Gate the load on the SAME emptiness signal `dump_to_disk` used to decide
+        // whether it wrote a generation: the persisted id map, NOT the DB row count.
+        // `dump_to_disk` writes a generation pair iff `!chunk_id_map.is_empty()`, and
+        // serializes that exact map here. `chunk_embeddings_expected` is a DB count
+        // captured independently; under concurrent ingestion a dump can record a
+        // positive count while its in-memory id map was still empty, so no generation
+        // was written. Gating on the DB count would then load whatever legacy canonical
+        // `chunks.hnsw.*` files a prior generation left behind and map fresh ids onto
+        // those stale vectors. Gating on the id map treats that manifest as empty and
+        // rebuilds from the DB instead.
+        // This helper is only entered after the shared index lock succeeds.
+        let lock_held = true;
+        // hnsw_rs exits the process (`std::process::exit(1)`), rather than
+        // returning an error, on several damaged-dump paths: a data record it
+        // cannot read in heap mode, a pre-format-3 description, a file its
+        // mmap path cannot open. Check what can be checked before handing
+        // it the files; a damaged generation is rebuilt from SQLite instead.
+        for (basename, points) in [
+            (&manifest.chunk_basename, manifest.chunk_id_map.len()),
+            (
+                &manifest.reflection_basename,
+                manifest.reflection_id_map.len(),
+            ),
+        ] {
+            if points > 0 {
+                if let Err(problem) = check_generation_files(dir, basename, points) {
+                    tracing::warn!(basename, problem, "index generation damaged; rebuilding");
+                    return None;
+                }
+            }
+        }
+        let chunk_use_mmap = should_mmap_generation(
+            dir,
+            &manifest.chunk_basename,
+            &default_chunk_basename(),
+            lock_held,
+        );
+        let mut chunk_io = (!manifest.chunk_id_map.is_empty())
+            .then(|| PendingHnswIo::new(dir, &manifest.chunk_basename, chunk_use_mmap));
+        let chunk_hnsw = if let Some(io) = chunk_io.as_mut() {
+            match io.load() {
                 Ok(hnsw) => hnsw,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load chunk HNSW from cache");
+                Err(failure) => {
+                    log_hnsw_load_failure("chunk", &failure);
                     return None;
                 }
             }
@@ -745,12 +2230,21 @@ impl SearchEngine {
             )
         };
 
-        let refl_hnsw = if manifest.reflection_embeddings_expected > 0 {
-            let refl_io = Box::leak(Box::new(HnswIo::new(dir, "reflections")));
-            match refl_io.load_hnsw::<f32, DistCosine>() {
+        // Same reasoning as the chunk index above: gate on the persisted id map, which
+        // is what `dump_to_disk` keyed the generation write on, not the DB count.
+        let refl_use_mmap = should_mmap_generation(
+            dir,
+            &manifest.reflection_basename,
+            &default_reflection_basename(),
+            lock_held,
+        );
+        let mut refl_io = (!manifest.reflection_id_map.is_empty())
+            .then(|| PendingHnswIo::new(dir, &manifest.reflection_basename, refl_use_mmap));
+        let refl_hnsw = if let Some(io) = refl_io.as_mut() {
+            match io.load() {
                 Ok(hnsw) => hnsw,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load reflection HNSW from cache");
+                Err(failure) => {
+                    log_hnsw_load_failure("reflection", &failure);
                     return None;
                 }
             }
@@ -764,92 +2258,555 @@ impl SearchEngine {
             )
         };
 
-        // Rebuild ID sets from the loaded maps
-        let chunk_id_set: HashSet<String> = manifest
+        // These allocations own mmaps referenced by the returned Hnsw values:
+        // the engine keeps them, after its indexes, until it is dropped.
+        let vectors_mapped =
+            chunk_io.is_some() && chunk_use_mmap || refl_io.is_some() && refl_use_mmap;
+        let mapped: Vec<MappedGeneration> = [chunk_io.take(), refl_io.take()]
+            .into_iter()
+            .flatten()
+            .map(PendingHnswIo::into_mapped)
+            .collect();
+
+        // Rebuild live reverse positions without changing the on-disk manifest layout.
+        let chunk_positions: HashMap<String, usize> = manifest
             .chunk_id_map
             .iter()
-            .filter(|s| !s.is_empty())
-            .cloned()
+            .enumerate()
+            .filter(|(_, id)| !id.is_empty())
+            .map(|(position, id)| (id.clone(), position))
             .collect();
-        let reflection_id_set: HashSet<String> = manifest
+        let reflection_positions: HashMap<String, usize> = manifest
             .reflection_id_map
             .iter()
-            .filter(|s| !s.is_empty())
-            .cloned()
+            .enumerate()
+            .filter(|(_, id)| !id.is_empty())
+            .map(|(position, id)| (id.clone(), position))
             .collect();
 
         // Use non-blank map count — orphans will be blanked by Engine::new reconciliation
-        let active_count = reflection_id_set.len();
+        let active_count = reflection_positions.len();
 
+        let chunk_hashes = index_hashes(&chunk_hnsw, manifest.chunk_id_map.len());
+        let reflection_hashes = index_hashes(&refl_hnsw, manifest.reflection_id_map.len());
         Some(Self {
+            allow_local_mutations: true,
+            chunk_hashes,
+            reflection_hashes,
             chunk_index: chunk_hnsw,
             reflection_index: refl_hnsw,
             chunk_id_map: manifest.chunk_id_map,
             reflection_id_map: manifest.reflection_id_map,
-            chunk_id_set,
-            reflection_id_set,
+            chunk_positions,
+            reflection_positions,
+            generation: ENGINE_GENERATION.fetch_add(1, Ordering::Relaxed),
             active_reflection_count: active_count,
             chunk_dirty: false,
             reflection_dirty: false,
+            chunk_changes: 0,
+            reflection_changes: 0,
+            settled_chunk_changes: 0,
+            settled_reflection_changes: 0,
+            chunk_cursor: manifest.chunk_change_cursor,
+            reflection_cursor: manifest.reflection_change_cursor,
             manifest_backed: true,
+            epoch: manifest.epoch,
+            published_basenames: Some((manifest.chunk_basename, manifest.reflection_basename)),
+            vectors_mapped,
+            proxy: None,
+            chunks_unsynced: false,
+            _mapped: mapped,
+            rebuilt_at_generation: None,
+            chunk_gen: None,
+            chunks_awaiting_generation: false,
         })
     }
 }
 
-/// If `file_dump` returned a numbered basename (e.g. "chunks-7905"), rename its files
-/// to the canonical name (e.g. "chunks.hnsw.data") so `load_from_disk` can find them.
-/// This happens when the Hnsw was loaded via `load_hnsw` (mmap active → `overwrite=false`).
-fn promote_to_canonical(dir: &Path, returned_basename: &str, canonical: &str) -> Result<()> {
-    if returned_basename == canonical {
-        return Ok(()); // Already canonical, nothing to do
+fn vector_hash(vector: &[f32]) -> blake3::Hash {
+    // SAFETY: f32 has no padding and the byte slice borrows only initialized vector storage.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(vector.as_ptr().cast::<u8>(), std::mem::size_of_val(vector))
+    };
+    blake3::hash(bytes)
+}
+
+fn index_hashes(index: &Hnsw<'static, f32, DistCosine>, count: usize) -> Vec<blake3::Hash> {
+    if count == 0 {
+        return Vec::new();
     }
-    for ext in &[".hnsw.data", ".hnsw.graph"] {
-        let src = dir.join(format!("{}{}", returned_basename, ext));
-        let dst = dir.join(format!("{}{}", canonical, ext));
-        if src.exists() {
-            std::fs::rename(&src, &dst).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to promote {} to {}: {}",
-                    src.display(),
-                    dst.display(),
-                    e
-                )
-            })?;
+    let mut hashes = vec![blake3::hash(&[]); count];
+    for point in index.get_point_indexation() {
+        if let Some(hash) = hashes.get_mut(point.get_origin_id()) {
+            *hash = vector_hash(point.get_v());
         }
+    }
+    hashes
+}
+
+/// Graph description magics hnsw_rs 0.3.5 loads without exiting (format 3
+/// and 4; format 2 reaches a `process::exit`).
+const LOADABLE_GRAPH_MAGICS: [u32; 2] = [0x002a_6771, 0x002a_6779];
+/// The data file's leading magic.
+const DATA_MAGIC: u32 = 0xa67f_0000;
+
+/// Check a generation's files against what loading `points` points needs:
+/// a loadable graph description magic, the data magic, and a data file of
+/// exactly `12 + points * (20 + 4 * dimension)` bytes (header: magic +
+/// dimension; record: magic, id, length, the f32 vector). `Err` names the
+/// first problem.
+fn check_generation_files(
+    dir: &Path,
+    basename: &str,
+    points: usize,
+) -> std::result::Result<(), String> {
+    use std::io::Read;
+    let read_head =
+        |extension: &str, bytes: usize| -> std::result::Result<(Vec<u8>, u64), String> {
+            let path = dir.join(format!("{basename}{extension}"));
+            let mut file =
+                std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let len = file.metadata().map_err(|e| e.to_string())?.len();
+            let mut head = vec![0u8; bytes];
+            file.read_exact(&mut head)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok((head, len))
+        };
+    let (graph, _) = read_head(".hnsw.graph", 4)?;
+    let magic = u32::from_ne_bytes([graph[0], graph[1], graph[2], graph[3]]);
+    if !LOADABLE_GRAPH_MAGICS.contains(&magic) {
+        return Err(format!("graph magic {magic:#x} is not a loadable format"));
+    }
+    let (data, len) = read_head(".hnsw.data", 12)?;
+    let magic = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+    if magic != DATA_MAGIC {
+        return Err(format!("data magic {magic:#x}"));
+    }
+    let mut dimension = [0u8; 8];
+    dimension.copy_from_slice(&data[4..12]);
+    let dimension = u64::from_ne_bytes(dimension);
+    let expected = dimension
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(20))
+        .and_then(|record| (points as u64).checked_mul(record))
+        .and_then(|records| records.checked_add(12));
+    if expected != Some(len) {
+        return Err(format!(
+            "data file is {len} bytes, {points} points of dimension {dimension} need {expected:?}"
+        ));
     }
     Ok(())
 }
 
-/// Remove stale numbered HNSW files from the index directory.
-/// hnsw_rs creates numbered files (e.g. `chunks-7905.hnsw.data`) when mmap is active.
-/// After `dump_to_disk` promotes them to canonical names, the numbered copies are gone.
-/// This function catches any stragglers from crashes, concurrent processes, or old sessions.
-///
-/// Called after every `dump_to_disk` and at engine startup.
-/// Must be called while holding `index.lock` (dump_to_disk) or at startup before serving.
-pub fn cleanup_stale_index_files(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut removed = 0usize;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Match pattern: chunks-NNN.hnsw.data/graph or reflections-NNN.hnsw.data/graph
-        // Keep: chunks.hnsw.data, reflections.hnsw.graph, manifest.json, index.lock
-        if (name.starts_with("chunks-") || name.starts_with("reflections-"))
-            && (name.ends_with(".hnsw.data") || name.ends_with(".hnsw.graph"))
-        {
-            let _ = std::fs::remove_file(entry.path());
-            removed += 1;
+fn next_generation_basename(dir: &Path, prefix: &str) -> String {
+    loop {
+        let generation = INDEX_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let basename = format!("{prefix}-{}-{generation}", std::process::id());
+        let data_path = dir.join(format!("{basename}.hnsw.data"));
+        let graph_path = dir.join(format!("{basename}.hnsw.graph"));
+        if !data_path.exists() && !graph_path.exists() {
+            return basename;
         }
     }
-    if removed > 0 {
-        tracing::info!(removed, "cleaned stale numbered HNSW files");
+}
+
+fn dump_hnsw_generation(
+    index: &Hnsw<'static, f32, DistCosine>,
+    dir: &Path,
+    prefix: &str,
+) -> Result<String> {
+    let requested_basename = next_generation_basename(dir, prefix);
+    let actual_basename = index.file_dump(dir, &requested_basename)?;
+    sync_index_pair(dir, &actual_basename)?;
+    Ok(actual_basename)
+}
+
+fn sync_index_pair(dir: &Path, basename: &str) -> Result<()> {
+    for extension in [".hnsw.data", ".hnsw.graph"] {
+        std::fs::File::open(dir.join(format!("{basename}{extension}")))?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Index-dir file holding the maintenance generation: a counter that only
+/// grows and, unlike the manifest's `epoch`, survives manifest invalidation.
+/// Every publisher reads it under `index.lock`; an engine whose epoch is below
+/// it loaded its graph before a maintenance pass and must never publish from
+/// memory again (astra #6: invalidation used to delete the only epoch record,
+/// so the pass's rebuild republished epoch 1 and a pre-scrub engine still at 1
+/// restored the old vectors).
+const MAINTENANCE_GENERATION_FILE: &str = "generation";
+
+/// The maintenance generation recorded in `dir`; 0 when none is.
+pub fn read_maintenance_generation(dir: &Path) -> u64 {
+    std::fs::read_to_string(dir.join(MAINTENANCE_GENERATION_FILE))
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_maintenance_generation(dir: &Path, generation: u64) -> Result<()> {
+    let tmp_path = dir.join(format!("{MAINTENANCE_GENERATION_FILE}.tmp"));
+    let mut tmp_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    tmp_file.write_all(generation.to_string().as_bytes())?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+    std::fs::rename(&tmp_path, dir.join(MAINTENANCE_GENERATION_FILE))?;
+    Ok(())
+}
+
+/// Before a maintenance pass mutates vectors: raise the maintenance generation
+/// past every epoch published so far and remove the manifest, both under
+/// `index.lock`, so no engine loaded before the pass can publish its graph
+/// again, and an interrupted pass leaves no manifest to trust. Returns the new
+/// generation. A timeout leaves the generation unchanged. If the lock file
+/// cannot be opened, publishers cannot open it either, so invalidation proceeds.
+pub fn invalidate_for_maintenance(dir: &Path) -> Result<u64> {
+    let operation = crate::maintenance::shared(dir.parent().unwrap_or(Path::new(".")))?;
+    invalidate_for_maintenance_locked(dir, &operation)
+}
+
+pub(crate) fn invalidate_for_maintenance_locked(
+    dir: &Path,
+    operation: &crate::maintenance::SharedLock,
+) -> Result<u64> {
+    operation.check_directory(dir.parent().unwrap_or(Path::new(".")))?;
+    std::fs::create_dir_all(dir)?;
+    let lock = match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("index.lock"))
+    {
+        Ok(file) => {
+            lock_index(&file, true, INDEX_LOCK_TIMEOUT)?;
+            Some(file)
+        }
+        Err(error) => {
+            // A publisher cannot open this lock either. Preserve the existing
+            // invalidation fallback, but never continue after a lock timeout.
+            tracing::warn!(%error, path = %dir.display(), "index lock unavailable; invalidating without it");
+            None
+        }
+    };
+    let published = std::fs::read_to_string(dir.join("manifest.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<IndexManifest>(&raw).ok())
+        .map_or(0, |manifest| manifest.epoch);
+    let generation = read_maintenance_generation(dir).max(published) + 1;
+    write_maintenance_generation(dir, generation)?;
+    match std::fs::remove_file(dir.join("manifest.json")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    drop(lock);
+    Ok(generation)
+}
+
+pub(crate) const INDEX_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// No index lock may pin maintenance ownership beyond its caller's budget.
+pub(crate) fn lock_index(
+    file: &std::fs::File,
+    exclusive: bool,
+    budget: std::time::Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let result = if exclusive {
+            FileExt::try_lock_exclusive(file)
+        } else {
+            FileExt::try_lock_shared(file)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                anyhow::ensure!(
+                    !remaining.is_zero(),
+                    "timed out acquiring index.lock after {:?}",
+                    budget
+                );
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn write_manifest_atomically(dir: &Path, manifest: &IndexManifest) -> Result<()> {
+    let manifest_json = serde_json::to_vec_pretty(manifest)?;
+    let tmp_path = dir.join("manifest.json.tmp");
+    let final_path = dir.join("manifest.json");
+    let mut tmp_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    tmp_file.write_all(&manifest_json)?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+    std::fs::rename(&tmp_path, &final_path)?;
+    if let Err(error) = std::fs::File::open(dir).and_then(|directory| directory.sync_all()) {
+        tracing::warn!(%error, path = %dir.display(), "failed to fsync index directory");
+    }
+    Ok(())
+}
+
+/// Decide whether a HNSW generation is safe to mmap rather than heap-load.
+///
+/// Two conditions, both required:
+///
+/// 1. **Not the legacy canonical basename.** A dump from a pre-9.5.4 process
+///    (before numbered generations) writes the canonical `chunks.hnsw.data` /
+///    `reflections.hnsw.data` in place with `overwrite=true`, truncating it. If
+///    this process had that file mapped, the truncation would SIGBUS it. Numbered
+///    generations (`chunks-<pid>-<n>`) are written once to a unique name and never
+///    overwritten or truncated, so only they are safe to map while other processes
+///    (possibly older builds) share the directory. A canonical generation is loaded
+///    heap-backed; the mmap win arrives once any dump migrates the index to a
+///    numbered generation (every post-9.5.4 dump does).
+///
+/// 2. **The files are actually mappable.** `hnsw_rs`'s `from_hnswdump` calls
+///    `std::process::exit(1)` — not a recoverable error — if the graph file cannot
+///    be opened, the data file cannot be stat'd/opened, or the data file cannot be
+///    mapped. Turning mmap on would therefore let a transient mapping failure kill
+///    the MCP server or a hook instead of falling back to a heap rebuild. Probing
+///    the exact operations here (open the graph, map the data, unmap) means a
+///    failure returns `false` and the caller heap-loads, preserving the pre-mmap
+///    fallback behaviour.
+fn should_mmap_generation(
+    dir: &Path,
+    basename: &str,
+    default_basename: &str,
+    lock_held: bool,
+) -> bool {
+    // Only map with the shared load lock held. Without it, a concurrent dump could
+    // publish a new generation and unlink these files between hnsw_rs's `init()` and
+    // `from_hnswdump` reopening them, reaching a `process::exit(1)` path. The lock is
+    // present in normal operation (dump/startup create `index.lock`); a copied cache
+    // that lacks it is loaded heap-backed, which is always safe.
+    if !lock_held {
+        return false;
+    }
+    // Only map a NUMBERED generation (`<prefix>-...`), never the legacy canonical
+    // `<prefix>.hnsw.data`: a pre-9.5.4 process can truncate the canonical file in
+    // place, which would SIGBUS a process mapping it. Engine-written manifests only
+    // ever name `<prefix>` or `<prefix>-<pid>-<n>`, so this prefix check is exact for
+    // real inputs; it is not a general alias validator (a hand-crafted `<prefix>-x`
+    // pointing elsewhere would pass), which real manifests never produce.
+    let numbered_prefix = format!("{default_basename}-");
+    if !basename.starts_with(&numbered_prefix) {
+        return false;
+    }
+    // The graph file must open (from_hnswdump exits if it cannot) and the data file
+    // must be mappable (else from_hnswdump exits). Probing up front lets a failure
+    // fall back to a heap rebuild instead of killing the process. This narrows but
+    // cannot fully close the exit window: hnsw_rs reopens the files during the real
+    // load, so a resource failure that appears only then (e.g. EMFILE) can still hit
+    // its exit path — `raise_fd_limit` removes that specific trigger at startup.
+    if std::fs::File::open(dir.join(format!("{basename}.hnsw.graph"))).is_err() {
+        return false;
+    }
+    data_file_is_mmappable(&dir.join(format!("{basename}.hnsw.data")))
+}
+
+/// Probe that a file can be memory-mapped read-only, then unmap it. Returns false
+/// on any failure (missing, empty, unmappable filesystem, resource limit) so the
+/// caller can heap-load instead of handing an un-mappable file to `hnsw_rs`, which
+/// would `process::exit(1)`.
+#[cfg(unix)]
+fn data_file_is_mmappable(path: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let len = meta.len();
+    if len == 0 {
+        return false;
+    }
+    let Ok(len) = usize::try_from(len) else {
+        return false;
+    };
+    // SAFETY: a read-only probe map of an open regular file at offset 0. We never
+    // dereference the returned pointer and unmap it immediately; on failure `mmap`
+    // returns MAP_FAILED, which we check before calling `munmap`.
+    unsafe {
+        let addr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
+        if addr == libc::MAP_FAILED {
+            return false;
+        }
+        libc::munmap(addr, len);
+    }
+    true
+}
+
+/// Non-unix has no reliable unlink-under-mmap guarantee (Windows can deny or defer
+/// deletion of a mapped file), so never mmap there — heap-load is always correct.
+#[cfg(not(unix))]
+fn data_file_is_mmappable(_path: &Path) -> bool {
+    false
+}
+
+struct PendingHnswIo {
+    io: NonNull<HnswIo>,
+}
+
+/// Test-only count of the heavy loads a cheap path must never start: opening
+/// the vector index (`SearchEngine::load_from_disk*`, `load_with_generation*`)
+/// and loading the embedding model (`EmbeddingEngine::ensure_loaded`). Per
+/// thread, so parallel tests cannot see each other's loads. The statusline's
+/// `status --compact` asserts it stays at zero.
+#[cfg(test)]
+pub(crate) mod heavy_loads {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LOADS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note() {
+        LOADS.with(|loads| loads.set(loads.get() + 1));
+    }
+
+    pub(crate) fn count() -> usize {
+        LOADS.with(Cell::get)
+    }
+}
+
+impl PendingHnswIo {
+    /// `use_mmap` maps the `.hnsw.data` vectors instead of reading them into the
+    /// heap. The returned `Hnsw` then borrows point slices from this `HnswIo`'s
+    /// mapping, which is why a fully successful load leaks the `HnswIo` (see `leak`)
+    /// so the mapping outlives the process's use of the index. It must only be set
+    /// for a numbered generation the caller has already confirmed is mappable — see
+    /// `should_mmap_generation`.
+    fn new(dir: &Path, basename: &str, use_mmap: bool) -> Self {
+        let options = ReloadOptions::new(use_mmap);
+        let io = Box::new(HnswIo::new_with_options(dir, basename, options));
+        Self {
+            io: NonNull::new(Box::into_raw(io)).expect("Box::into_raw never returns null"),
+        }
+    }
+
+    fn load(&mut self) -> std::result::Result<Hnsw<'static, f32, DistCosine>, HnswLoadFailure> {
+        #[cfg(test)]
+        HNSW_LOAD_CALLS.with(|calls| calls.set(calls.get() + 1));
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: `self` uniquely owns this allocation until `leak`; the pointer
+            // remains stable, and a failed/unwound call cannot return a borrowing Hnsw.
+            unsafe { self.io.as_mut().load_hnsw::<f32, DistCosine>() }
+        }))
+        .map_err(HnswLoadFailure::Panic)?
+        .map_err(HnswLoadFailure::Error)
+    }
+
+    /// Hand the allocation to the engine whose `Hnsw` borrows its map.
+    fn into_mapped(self) -> MappedGeneration {
+        let this = std::mem::ManuallyDrop::new(self);
+        #[cfg(test)]
+        LIVE_MAPPED_GENERATIONS.with(|live| live.set(live.get() + 1));
+        MappedGeneration(this.io)
+    }
+}
+
+impl Drop for PendingHnswIo {
+    fn drop(&mut self) {
+        // SAFETY: no Hnsw escaped when a load returned Err or unwound. At a partial
+        // failure, Rust drops any previously loaded Hnsw before its PendingHnswIo.
+        unsafe {
+            drop(Box::from_raw(self.io.as_ptr()));
+        }
+    }
+}
+
+enum HnswLoadFailure {
+    Error(anyhow::Error),
+    Panic(Box<dyn std::any::Any + Send>),
+}
+
+fn log_hnsw_load_failure(kind: &str, failure: &HnswLoadFailure) {
+    match failure {
+        HnswLoadFailure::Error(error) => {
+            tracing::warn!(%error, index = kind, "failed to load HNSW from cache");
+        }
+        HnswLoadFailure::Panic(payload) => {
+            tracing::warn!(
+                panic = panic_payload_message(payload.as_ref()),
+                index = kind,
+                "panic while loading HNSW from cache"
+            );
+        }
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn round4_publisher_index_timeout_releases_maintenance_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("index-v3");
+        std::fs::create_dir(&index_dir).unwrap();
+        let held = std::fs::File::create(index_dir.join("index.lock")).unwrap();
+        FileExt::try_lock_exclusive(&held).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            drop(held);
+        });
+        let result = SearchEngine::new(16).publish_to_disk(&index_dir, 0, 0);
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path());
+        releaser.join().unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("timed out acquiring index.lock"));
+        assert!(owner.is_ok());
+        assert!(!index_dir.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn round4_index_reader_respects_tighter_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = std::fs::File::create(dir.path().join("index.lock")).unwrap();
+        FileExt::try_lock_exclusive(&held).unwrap();
+        let start = std::time::Instant::now();
+        let error = SearchEngine::load_from_disk_with_budget(
+            dir.path(),
+            0,
+            0,
+            std::time::Duration::from_millis(30),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("timed out acquiring index.lock"));
+        assert!(start.elapsed() < std::time::Duration::from_millis(300));
+    }
+
     use super::*;
 
     /// Test-only file identity check, mirroring `import::registry::file_identity`
@@ -869,6 +2826,210 @@ mod tests {
     }
 
     #[test]
+    fn blank_orphan_chunks_hides_rows_deleted_from_the_db() {
+        let mut engine = SearchEngine::new(4);
+        engine.insert_chunk("kept".into(), vec![1.0, 0.0, 0.0, 0.0]);
+        engine.insert_chunk("purged".into(), vec![0.0, 1.0, 0.0, 0.0]);
+        let db_ids = std::collections::HashSet::from(["kept"]);
+        assert_eq!(engine.blank_orphan_chunks(&db_ids), 1);
+        assert!(engine.has_chunk("kept"));
+        assert!(!engine.has_chunk("purged"));
+        assert!(engine.is_dirty());
+        let hits = engine.search_chunks(&[0.0, 1.0, 0.0, 0.0], 2, -1.0);
+        assert!(hits.iter().all(|hit| hit.id != "purged"));
+        assert_eq!(engine.blank_orphan_chunks(&db_ids), 0);
+    }
+
+    fn unit(i: usize) -> Vec<f32> {
+        let mut v = vec![0.0; 4];
+        v[i % 4] = 1.0;
+        v
+    }
+
+    /// `tests/fixtures/hnsw-0.3.4` is a 300-point graph dumped by hnsw_rs
+    /// 0.3.4 (the format every installed index is in), with the answers that
+    /// version gave for 20 queries. Upgrading must keep reading it and give
+    /// the same answers — the format is MAGICDESCR_4 in 0.3.4 and 0.3.5.
+    #[test]
+    fn an_hnsw_rs_0_3_4_dump_reloads_with_the_same_answers() {
+        fn vector(seed: u64) -> Vec<f32> {
+            let mut state = (seed + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (0..32)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state % 2001) as f32 / 1000.0 - 1.0
+                })
+                .collect()
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hnsw-0.3.4");
+        let expected: Vec<Vec<(usize, f32)>> =
+            serde_json::from_slice(&std::fs::read(dir.join("hnsw-0.3.4.expected.json")).unwrap())
+                .unwrap();
+        for mapped in [false, true] {
+            let mut io = HnswIo::new_with_options(&dir, "hnsw-0.3.4", ReloadOptions::new(mapped));
+            let hnsw: Hnsw<f32, DistCosine> = io.load_hnsw().unwrap();
+            for (q, want) in expected.iter().enumerate() {
+                let got: Vec<(usize, f32)> = hnsw
+                    .search(&vector(10_000 + q as u64), 10, EF_SEARCH)
+                    .into_iter()
+                    .map(|n| (n.d_id, n.distance))
+                    .collect();
+                assert_eq!(
+                    got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    want.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    "query {q}, mapped {mapped}"
+                );
+                for ((_, a), (_, b)) in got.iter().zip(want) {
+                    assert!((a - b).abs() < 1e-6, "query {q}: {a} vs {b}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_dropped_engine_releases_the_generation_it_mapped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut engine = SearchEngine::new(16);
+        for i in 0..4 {
+            engine.insert_chunk(format!("c{i}"), unit(i));
+            engine.insert_reflection(format!("r{i}"), unit(i));
+        }
+        engine.dump_to_disk(tmp.path(), 4, 4).unwrap();
+        let live = || LIVE_MAPPED_GENERATIONS.with(|live| live.get());
+        let loaded = SearchEngine::load_from_disk(tmp.path(), 4, 4)
+            .unwrap()
+            .unwrap();
+        assert!(loaded.is_mapped());
+        assert_eq!(live(), 2, "one per index");
+        let again = SearchEngine::load_from_disk(tmp.path(), 4, 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live(), 4);
+        assert_eq!(again.search_chunks(&unit(1), 1, 0.99)[0].id, "c1");
+        drop(again);
+        assert_eq!(live(), 2, "dropping an engine frees its maps");
+        assert_eq!(loaded.search_chunks(&unit(2), 1, 0.99)[0].id, "c2");
+        drop(loaded);
+        assert_eq!(live(), 0);
+    }
+
+    #[test]
+    fn crossed_maintenance_rebuild_keeps_mapped_owner_until_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut seed = SearchEngine::new(16);
+        seed.insert_chunk("c".into(), unit(0));
+        seed.insert_reflection("r".into(), unit(1));
+        seed.dump_to_disk(dir, 1, 1).unwrap();
+        let mut serving = SearchEngine::load_from_disk(dir, 1, 1).unwrap().unwrap();
+        let live = || LIVE_MAPPED_GENERATIONS.with(|live| live.get());
+        assert_eq!(live(), 2);
+        let mut delayed = SearchEngine::new(16);
+        delayed.mark_rebuilt_at(read_maintenance_generation(dir));
+        delayed.insert_chunk("c".into(), unit(0));
+        invalidate_for_maintenance(dir).unwrap();
+        assert!(crossed_maintenance(
+            &delayed.dump_to_disk(dir, 1, 0).unwrap_err()
+        ));
+        drop(delayed);
+        assert_eq!(live(), 2, "refusal retains the serving engine's maps");
+        assert_eq!(serving.search_chunks(&unit(0), 1, 0.99)[0].id, "c");
+
+        let mut fresh = SearchEngine::new(16);
+        fresh.mark_rebuilt_at(read_maintenance_generation(dir));
+        fresh.insert_chunk("c".into(), unit(2));
+        fresh.dump_to_disk(dir, 1, 0).unwrap();
+        serving = fresh;
+        assert_eq!(
+            live(),
+            0,
+            "replacement drops the old indexes before their maps"
+        );
+        assert_eq!(serving.search_chunks(&unit(2), 1, 0.99)[0].id, "c");
+        drop(serving);
+        assert_eq!(live(), 0);
+    }
+
+    #[test]
+    fn unpublished_changes_count_since_the_last_settled_publish() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut engine = SearchEngine::new(16);
+        for i in 0..3 {
+            engine.insert_chunk(format!("c{i}"), unit(i));
+        }
+        assert_eq!(engine.unpublished_changes(), 3);
+        engine.dump_to_disk(tmp.path(), 3, 0).unwrap();
+        assert_eq!(engine.unpublished_changes(), 0);
+        engine.insert_reflection("r".into(), unit(1));
+        engine.remove_chunk("c0");
+        assert_eq!(engine.unpublished_changes(), 2);
+        engine.note_unpublished(5, 2);
+        assert_eq!(engine.unpublished_changes(), 9);
+        assert!(engine.is_chunk_dirty() && engine.is_reflection_dirty());
+
+        let mut loaded = SearchEngine::load_from_disk(tmp.path(), 3, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.unpublished_changes(), 0, "a load is a settled state");
+        loaded.note_unpublished(0, 0);
+        assert!(!loaded.is_dirty(), "nothing to note, nothing dirtied");
+    }
+
+    #[test]
+    fn each_side_keeps_the_cursor_of_the_generation_it_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(16);
+        engine.insert_chunk("c".into(), unit(0));
+        engine.insert_reflection("r".into(), unit(1));
+        engine.set_change_cursor(7);
+        engine.dump_to_disk(dir, 1, 1).unwrap();
+
+        let mut loaded = SearchEngine::load_from_disk(dir, 1, 1).unwrap().unwrap();
+        assert_eq!(
+            (loaded.side_cursor(false), loaded.side_cursor(true)),
+            (7, 7)
+        );
+        // Only the reflection side is rewritten; the chunk side is carried
+        // forward from the cursor-7 manifest and keeps 7.
+        loaded.insert_reflection("r2".into(), unit(2));
+        loaded.advance_change_cursor(9);
+        loaded.dump_to_disk(dir, 1, 2).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 1, 2).unwrap().unwrap();
+        assert_eq!(
+            (reloaded.side_cursor(false), reloaded.side_cursor(true)),
+            (7, 9)
+        );
+        assert_eq!(reloaded.change_cursor(), 7, "the sync resumes at the lower");
+        // Both sides rewritten from memory: both at the engine's cursor.
+        loaded.insert_chunk("c2".into(), unit(3));
+        loaded.insert_reflection("r3".into(), unit(0));
+        loaded.dump_to_disk(dir, 2, 3).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 2, 3).unwrap().unwrap();
+        assert_eq!(
+            (reloaded.side_cursor(false), reloaded.side_cursor(true)),
+            (9, 9)
+        );
+
+        // A manifest written before the fields existed reads as 0.
+        let raw = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("chunk_change_cursor");
+        fields.remove("reflection_change_cursor");
+        std::fs::write(dir.join("manifest.json"), json.to_string()).unwrap();
+        assert_eq!(
+            SearchEngine::load_from_disk(dir, 2, 3)
+                .unwrap()
+                .unwrap()
+                .change_cursor(),
+            0
+        );
+    }
+
+    #[test]
     fn reflection_only_dump_leaves_chunk_files_untouched() {
         // Regression for the split-dirty-flag fix: before this, a single
         // `dirty` bool covering both indices meant any mutation — even a
@@ -884,8 +3045,13 @@ mod tests {
         engine.insert_reflection("r0".into(), vec![0.5; 384]);
         engine.dump_to_disk(dir, 5, 1).unwrap();
 
-        let chunk_data_path = dir.join("chunks.hnsw.data");
-        let chunk_graph_path = dir.join("chunks.hnsw.graph");
+        // Resolve the chunk generation's files from the manifest rather than
+        // a hardcoded canonical name — this line writes numbered generations
+        // (`chunks-<pid>-<n>.hnsw.*`), not `chunks.hnsw.*`.
+        let before_manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let chunk_data_path = dir.join(format!("{}.hnsw.data", before_manifest.chunk_basename));
+        let chunk_graph_path = dir.join(format!("{}.hnsw.graph", before_manifest.chunk_basename));
         let before_data = std::fs::metadata(&chunk_data_path).unwrap();
         let before_graph = std::fs::metadata(&chunk_graph_path).unwrap();
         let before_data_snapshot = (
@@ -912,6 +3078,14 @@ mod tests {
         assert!(engine.is_reflection_dirty());
         engine.dump_to_disk(dir, 5, 2).unwrap();
 
+        let after_manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            before_manifest.chunk_basename, after_manifest.chunk_basename,
+            "a reflection-only dump must carry the chunk generation forward unchanged, \
+             not point the manifest at a different generation"
+        );
+
         let after_data = std::fs::metadata(&chunk_data_path).unwrap();
         let after_graph = std::fs::metadata(&chunk_graph_path).unwrap();
         assert_eq!(
@@ -936,6 +3110,7 @@ mod tests {
         // The index must still round-trip correctly: both the untouched
         // chunk side and the freshly-dumped reflection side load and search.
         let loaded = SearchEngine::load_from_disk(dir, 5, 2)
+            .unwrap()
             .expect("reload after a partial (reflection-only) dump must succeed");
         assert!(loaded.has_chunk("c0") && loaded.has_chunk("c4"));
         assert!(loaded.has_reflection("r0") && loaded.has_reflection("r1"));
@@ -994,7 +3169,7 @@ mod tests {
 
         // "Process B" (e.g. a long-lived MCP server) loads that 5-chunk
         // state and never touches the chunk side again.
-        let mut proc_b = SearchEngine::load_from_disk(dir, 5, 0).unwrap();
+        let mut proc_b = SearchEngine::load_from_disk(dir, 5, 0).unwrap().unwrap();
 
         // Meanwhile "process A" imports 3 more chunks and dumps again — the
         // on-disk graph now has 8 points, but `proc_b`'s in-memory
@@ -1029,7 +3204,7 @@ mod tests {
         // Reload fresh and prove every original AND new chunk id still
         // resolves to ITS OWN vector — this is the assertion that would
         // have caught the silent wrong-answer bug.
-        let reloaded = SearchEngine::load_from_disk(dir, 8, 1).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 8, 1).unwrap().unwrap();
         assert_eq!(reloaded.chunk_count(), 8);
         for i in 0..8 {
             let q = distinct_embedding(i);
@@ -1113,7 +3288,7 @@ mod tests {
         // load_from_disk must ACCEPT this manifest (0 == 0, no drift) rather
         // than reject it as negative drift (0 < stale-3) and force a rebuild.
         assert!(
-            SearchEngine::load_from_disk(dir, 5, 0).is_some(),
+            SearchEngine::load_from_disk(dir, 5, 0).unwrap().is_some(),
             "load_from_disk rejected a correctly-published zero-reflection manifest as \
              negative drift — this is the permanent full-rebuild-on-every-startup bug"
         );
@@ -1185,7 +3360,7 @@ mod tests {
              prior successful dump"
         );
 
-        let reloaded = SearchEngine::load_from_disk(dir, 8, 2).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 8, 2).unwrap().unwrap();
         assert_eq!(reloaded.chunk_count(), 8);
         for i in 0..8 {
             let hits = reloaded.search_chunks(&distinct_embedding(i), 1, -1.0);
@@ -1218,7 +3393,7 @@ mod tests {
         }
         proc_a.dump_to_disk(dir, 5, 2).unwrap();
 
-        let mut proc_b = SearchEngine::load_from_disk(dir, 5, 2).unwrap();
+        let mut proc_b = SearchEngine::load_from_disk(dir, 5, 2).unwrap().unwrap();
         assert!(proc_b.manifest_backed);
 
         // "Process A" grows the chunk graph to 8 points and dumps again —
@@ -1271,6 +3446,7 @@ mod tests {
         // reload takes the normal "cache behind DB" path rather than being
         // rejected as negative drift for an unrelated reason.
         let reloaded = SearchEngine::load_from_disk(dir, 8, 3)
+            .unwrap()
             .expect("manifest and chunk graph file must agree after the forced re-dump");
         assert_eq!(reloaded.chunk_count(), 5);
         for i in 0..5 {
@@ -1304,6 +3480,75 @@ mod tests {
             v["version"] = serde_json::json!(MANIFEST_VERSION + 1);
             std::fs::write(dir.join("manifest.json"), v.to_string()).unwrap();
         });
+    }
+
+    #[test]
+    fn chunk_count_tracks_active_ids_across_vector_replacement() {
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("chunk".into(), vec![0.1; 384]);
+        assert_eq!(engine.chunk_count(), 1);
+
+        engine.remove_chunk("chunk");
+        assert_eq!(engine.chunk_count(), 0, "blanked slots are not live chunks");
+
+        engine.insert_chunk("chunk".into(), vec![0.9; 384]);
+        assert_eq!(
+            engine.chunk_count(),
+            1,
+            "remove then insert replaces one live vector; it does not add a chunk"
+        );
+    }
+
+    #[test]
+    fn reverse_positions_follow_reinsert_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = SearchEngine::new(10);
+        let original_generation = engine.generation();
+        assert_ne!(original_generation, SearchEngine::new(10).generation());
+        for _ in 0..2 {
+            engine.insert_chunk("chunk".into(), vec![0.1; 384]);
+            engine.insert_reflection("reflection".into(), vec![0.2; 384]);
+        }
+        assert_eq!(
+            engine.chunk_slot_count(),
+            1,
+            "duplicate inserts are skipped"
+        );
+        assert_eq!(engine.reflection_slot_count(), 1);
+        engine.remove_chunk("chunk");
+        engine.remove_reflection("reflection");
+        engine.insert_chunk("chunk".into(), vec![0.3; 384]);
+        engine.insert_reflection("reflection".into(), vec![0.4; 384]);
+        assert_eq!(engine.chunk_positions.get("chunk"), Some(&1));
+        assert_eq!(engine.reflection_positions.get("reflection"), Some(&1));
+        assert_eq!(engine.generation(), original_generation);
+        engine.dump_to_disk(dir.path(), 1, 1).unwrap();
+        let mut loaded = SearchEngine::load_from_disk(dir.path(), 1, 1)
+            .unwrap()
+            .unwrap();
+        assert_ne!(loaded.generation(), original_generation);
+        assert_eq!(loaded.chunk_positions.get("chunk"), Some(&1));
+        assert_eq!(loaded.reflection_positions.get("reflection"), Some(&1));
+        loaded.remove_chunk("chunk");
+        loaded.remove_reflection("reflection");
+        // A stale reverse position would blank the old tombstone and leave the
+        // reinserted point searchable, even though the live count becomes zero.
+        assert!(loaded.chunk_id_map.iter().all(String::is_empty));
+        assert!(loaded.reflection_id_map.iter().all(String::is_empty));
+        assert_eq!(loaded.chunk_tombstone_count(), 2);
+        assert_eq!(loaded.reflection_tombstone_count(), 2);
+        loaded.remove_chunk("chunk");
+        loaded.remove_reflection("reflection");
+        assert_eq!(loaded.chunk_tombstone_count(), 2);
+        assert_eq!(loaded.reflection_tombstone_count(), 2);
+        loaded.insert_chunk("chunk".into(), vec![0.5; 384]);
+        loaded.insert_reflection("reflection".into(), vec![0.6; 384]);
+        assert_eq!(loaded.blank_orphan_chunks(&HashSet::new()), 1);
+        assert_eq!(loaded.blank_orphan_reflections(&HashSet::new()), 1);
+        assert!(!loaded.has_chunk("chunk"));
+        assert!(!loaded.has_reflection("reflection"));
+        assert_eq!(loaded.chunk_tombstone_count(), 3);
+        assert_eq!(loaded.reflection_tombstone_count(), 3);
     }
 
     #[test]
@@ -1352,7 +3597,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_allows_additive_drift_rebuilds_on_deletion() {
+    fn test_load_allows_both_additive_and_negative_drift() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         std::fs::write(dir.join("index.lock"), "").unwrap();
@@ -1365,97 +3610,413 @@ mod tests {
         engine.dump_to_disk(dir, 5, 1).unwrap();
 
         // Exact match → loads.
-        assert!(SearchEngine::load_from_disk(dir, 5, 1).is_some());
+        assert!(SearchEngine::load_from_disk(dir, 5, 1).unwrap().is_some());
         // Additive drift (DB grew since dump) → loads; Engine::new backfills the new rows.
         assert!(
-            SearchEngine::load_from_disk(dir, 8, 3).is_some(),
+            SearchEngine::load_from_disk(dir, 8, 3).unwrap().is_some(),
             "additive drift must load the cache, not rebuild"
         );
-        // Negative drift (rows deleted) → None so the caller does a clean full rebuild.
+        // Negative drift (rows deleted) → also loads now (WP-D). A synchronous
+        // full rebuild here was the cold-start stall this fix removes;
+        // `Engine::new`'s cached-load branch reconciles the vanished ids via
+        // `blank_orphan_chunks`/`blank_orphan_reflections` instead.
         assert!(
-            SearchEngine::load_from_disk(dir, 4, 1).is_none(),
-            "chunk deletion must force a rebuild"
+            SearchEngine::load_from_disk(dir, 4, 1).unwrap().is_some(),
+            "chunk deletion must still load the cache, not force an inline rebuild"
         );
         assert!(
-            SearchEngine::load_from_disk(dir, 5, 0).is_none(),
-            "reflection deletion must force a rebuild"
+            SearchEngine::load_from_disk(dir, 5, 0).unwrap().is_some(),
+            "reflection deletion must still load the cache, not force an inline rebuild"
         );
     }
 
     #[test]
-    fn test_cleanup_removes_numbered_keeps_base() {
+    fn load_from_disk_returns_none_when_hnsw_pair_is_mismatched() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("c0".into(), vec![0.5; 384]);
+        engine.dump_to_disk(dir, 1, 0).unwrap();
+
+        let manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        // Retain the real graph but make its paired data file claim a different
+        // dimension. hnsw_rs asserts that the graph and data dimensions agree.
+        let mut data = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(format!("{}.hnsw.data", manifest.chunk_basename)))
+            .unwrap();
+        data.seek(SeekFrom::Start(std::mem::size_of::<u32>() as u64))
+            .unwrap();
+        data.write_all(&999usize.to_ne_bytes()).unwrap();
+        drop(data);
+
+        assert!(SearchEngine::load_from_disk(dir, 1, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn positive_count_without_a_generation_does_not_map_ids_onto_stale_files() {
+        // Regression: dump keys "a generation exists" on `!id_map.is_empty()`, but the
+        // manifest independently records a DB row count. Under concurrent ingestion a
+        // dump can commit a positive count while its in-memory id map was still empty,
+        // so no generation pair was written — only whatever legacy canonical
+        // `chunks.hnsw.*` files a prior generation left behind remain on disk. The
+        // loader must NOT resurrect those stale vectors and map fresh ids onto them; it
+        // must treat the index as empty and let the DB backfill rebuild it.
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
 
-        // Create stale numbered files
+        // Produce real, loadable canonical chunk files from a throwaway generation, so
+        // the buggy DB-count gate WOULD have loaded three stale vectors here.
+        let mut seeded = SearchEngine::new(10);
+        seeded.insert_chunk("stale0".into(), vec![0.1; 384]);
+        seeded.insert_chunk("stale1".into(), vec![0.2; 384]);
+        seeded.insert_chunk("stale2".into(), vec![0.3; 384]);
+        seeded.dump_to_disk(dir, 3, 0).unwrap();
+        let seeded_manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        for extension in [".hnsw.data", ".hnsw.graph"] {
+            std::fs::copy(
+                dir.join(format!("{}{extension}", seeded_manifest.chunk_basename)),
+                dir.join(format!("chunks{extension}")),
+            )
+            .unwrap();
+        }
+
+        // Rewrite the manifest to the bug shape: positive DB count, empty id map (no
+        // generation written for THIS manifest), basename pointing at the stale canonical
+        // files.
+        let manifest = IndexManifest {
+            version: MANIFEST_VERSION,
+            files: HashMap::new(),
+            created_at: "2026-08-19T00:00:00Z".into(),
+            chunk_id_map: Vec::new(),
+            reflection_id_map: Vec::new(),
+            chunk_embeddings_expected: 3,
+            reflection_embeddings_expected: 0,
+            active_reflection_count: 0,
+            chunk_basename: default_chunk_basename(),
+            reflection_basename: default_reflection_basename(),
+            // The epoch the seeding dump published: a manifest below the
+            // maintenance generation would be rejected for that reason instead.
+            epoch: seeded_manifest.epoch,
+            chunk_change_cursor: 0,
+            reflection_change_cursor: 0,
+        };
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = SearchEngine::load_from_disk(dir, 3, 0)
+            .unwrap()
+            .expect("empty-map manifest loads as an empty index, not None");
+        // The stale canonical vectors must not have been mapped in.
+        assert!(loaded.chunk_id_map.is_empty());
+        assert_eq!(loaded.chunk_index.get_nb_point(), 0);
+    }
+
+    #[test]
+    fn r3_load_rejects_v1_manifest_with_canonical_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("c0".into(), vec![0.5; 384]);
+        engine.dump_to_disk(dir, 1, 0).unwrap();
+
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let object = manifest.as_object_mut().unwrap();
+        let chunk_basename = object["chunk_basename"].as_str().unwrap().to_string();
+        for extension in [".hnsw.data", ".hnsw.graph"] {
+            std::fs::copy(
+                dir.join(format!("{chunk_basename}{extension}")),
+                dir.join(format!("chunks{extension}")),
+            )
+            .unwrap();
+        }
+        object.insert("version".into(), serde_json::json!(1));
+        object.remove("chunk_basename");
+        object.remove("reflection_basename");
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert!(SearchEngine::load_from_disk(dir, 1, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn clean_second_dump_reuses_generation_and_is_byte_identical() {
+        // A second `dump_to_disk` with NO mutation since the first one is a
+        // no-op for HNSW file I/O: `chunk_dirty` is false and the on-disk
+        // manifest is valid, so the dump skips rewriting `chunks-*.hnsw.*`
+        // and carries the prior manifest's `chunk_basename` forward
+        // untouched. That is safe, not just "still correct": nothing about
+        // the on-disk generation changed, so any other process (or this
+        // one, mmap-backed) that already has those exact files open or
+        // mapped keeps seeing exactly what it started with. Only a side
+        // that actually mutated needs a fresh generation — see
+        // `dirty_second_dump_writes_a_new_generation_without_overwriting_the_first`
+        // for the case where skipping would be unsound.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("c0".into(), vec![0.5; 384]);
+        engine.dump_to_disk(dir, 1, 0).unwrap();
+
+        let first_manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let first_data_path = dir.join(format!("{}.hnsw.data", first_manifest.chunk_basename));
+        let first_graph_path = dir.join(format!("{}.hnsw.graph", first_manifest.chunk_basename));
+        let first_data = std::fs::read(&first_data_path).unwrap();
+        let first_graph = std::fs::read(&first_graph_path).unwrap();
+
+        // Stage an orphan generation directly, as if a concurrent or aborted
+        // dump left one behind that no manifest references, to prove the
+        // second `dump_to_disk` call's `cleanup_stale_index_files` still
+        // sweeps it even though that call itself writes nothing.
+        let staged_basename = dump_hnsw_generation(&engine.chunk_index, dir, "chunks").unwrap();
+        assert_ne!(first_manifest.chunk_basename, staged_basename);
+        assert!(dir.join(format!("{staged_basename}.hnsw.data")).exists());
+        assert!(dir.join(format!("{staged_basename}.hnsw.graph")).exists());
+
+        // No mutation between the two dumps.
+        engine.dump_to_disk(dir, 1, 0).unwrap();
+
+        let second_manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            first_manifest.chunk_basename, second_manifest.chunk_basename,
+            "a clean second dump must reuse the same generation instead of rewriting \
+             an index that has not changed"
+        );
+        assert_eq!(
+            std::fs::read(&first_data_path).unwrap(),
+            first_data,
+            "chunk data file was rewritten by a dump with no mutation since the last one"
+        );
+        assert_eq!(
+            std::fs::read(&first_graph_path).unwrap(),
+            first_graph,
+            "chunk graph file was rewritten by a dump with no mutation since the last one"
+        );
+
+        // The orphaned staged generation is unreferenced by the (unchanged)
+        // committed manifest, so `cleanup_stale_index_files` — called at the
+        // end of every `dump_to_disk`, including this clean one — must have
+        // swept it.
+        assert!(
+            !dir.join(format!("{staged_basename}.hnsw.data")).exists(),
+            "cleanup_stale_index_files left an orphaned generation's data file behind"
+        );
+        assert!(
+            !dir.join(format!("{staged_basename}.hnsw.graph")).exists(),
+            "cleanup_stale_index_files left an orphaned generation's graph file behind"
+        );
+    }
+
+    #[test]
+    fn dirty_second_dump_writes_a_new_generation_without_overwriting_the_first() {
+        // This is the case the "never overwrite a referenced generation"
+        // invariant actually protects: a real mutation between two dumps
+        // must land in a brand-new generation, never mutate the bytes of a
+        // file another process may still have open or mapped.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("c0".into(), vec![0.5; 384]);
+        engine.dump_to_disk(dir, 1, 0).unwrap();
+
+        let first_manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let first_data_path = dir.join(format!("{}.hnsw.data", first_manifest.chunk_basename));
+        let first_graph_path = dir.join(format!("{}.hnsw.graph", first_manifest.chunk_basename));
+        let first_data = std::fs::read(&first_data_path).unwrap();
+        let first_graph = std::fs::read(&first_graph_path).unwrap();
+
+        // Hold the first generation's files open across the second dump,
+        // standing in for another process (e.g. an mmap-backed reader) that
+        // has them open. If the second dump overwrote them in place, this
+        // open handle would observe the new bytes. `cleanup_stale_index_files`
+        // unlinking an unreferenced generation does NOT affect an
+        // already-open handle's view on POSIX (the inode's content survives
+        // until the last fd closes) — so this proves "removed, not
+        // overwritten", which is the actual safety property, not just a
+        // proxy for it.
+        let mut held_data = std::fs::File::open(&first_data_path).unwrap();
+        let mut held_graph = std::fs::File::open(&first_graph_path).unwrap();
+
+        engine.insert_chunk("c1".into(), vec![0.7; 384]);
+        assert!(engine.is_chunk_dirty());
+        engine.dump_to_disk(dir, 2, 0).unwrap();
+
+        let second_manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        assert_ne!(
+            first_manifest.chunk_basename, second_manifest.chunk_basename,
+            "a dirty second dump must write a new generation"
+        );
+        let second_data_path = dir.join(format!("{}.hnsw.data", second_manifest.chunk_basename));
+        let second_graph_path = dir.join(format!("{}.hnsw.graph", second_manifest.chunk_basename));
+        assert!(second_data_path.exists());
+        assert!(second_graph_path.exists());
+
+        use std::io::{Read, Seek, SeekFrom};
+        let mut held_data_now = Vec::new();
+        held_data.seek(SeekFrom::Start(0)).unwrap();
+        held_data.read_to_end(&mut held_data_now).unwrap();
+        let mut held_graph_now = Vec::new();
+        held_graph.seek(SeekFrom::Start(0)).unwrap();
+        held_graph.read_to_end(&mut held_graph_now).unwrap();
+        assert_eq!(
+            held_data_now, first_data,
+            "first generation's data file was overwritten in place while a handle held it open"
+        );
+        assert_eq!(
+            held_graph_now, first_graph,
+            "first generation's graph file was overwritten in place while a handle held it open"
+        );
+
+        let loaded = SearchEngine::load_from_disk(dir, 2, 0).unwrap().unwrap();
+        assert!(loaded.has_chunk("c0") && loaded.has_chunk("c1"));
+    }
+
+    #[test]
+    fn dumps_write_current_manifest_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("c0".into(), vec![0.5; 384]);
+        engine.dump_to_disk(tmp.path(), 1, 0).unwrap();
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["version"], 3);
+    }
+
+    #[test]
+    fn manifest_commit_replaces_file_and_removes_temp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("manifest.json"), "old").unwrap();
+        let manifest = IndexManifest {
+            version: MANIFEST_VERSION,
+            files: HashMap::new(),
+            created_at: "2026-08-17T00:00:00Z".into(),
+            chunk_id_map: Vec::new(),
+            reflection_id_map: Vec::new(),
+            chunk_embeddings_expected: 0,
+            reflection_embeddings_expected: 0,
+            active_reflection_count: 0,
+            chunk_basename: default_chunk_basename(),
+            reflection_basename: default_reflection_basename(),
+            epoch: 0,
+            chunk_change_cursor: 0,
+            reflection_change_cursor: 0,
+        };
+
+        write_manifest_atomically(dir, &manifest).unwrap();
+
+        let committed: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(committed.version, MANIFEST_VERSION);
+        assert!(!dir.join("manifest.json.tmp").exists());
+    }
+
+    #[test]
+    fn reflection_panic_after_chunk_load_does_not_poison_later_load() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(10);
+        engine.insert_chunk("c0".into(), vec![0.5; 384]);
+        engine.insert_reflection("r0".into(), vec![0.25; 384]);
+        engine.dump_to_disk(dir, 1, 1).unwrap();
+
+        let manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let reflection_data_path = dir.join(format!("{}.hnsw.data", manifest.reflection_basename));
+        let valid_reflection_data = std::fs::read(&reflection_data_path).unwrap();
+        let mut data = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&reflection_data_path)
+            .unwrap();
+        data.seek(SeekFrom::Start(std::mem::size_of::<u32>() as u64))
+            .unwrap();
+        data.write_all(&999usize.to_ne_bytes()).unwrap();
+        drop(data);
+
+        assert!(SearchEngine::load_from_disk(dir, 1, 1).unwrap().is_none());
+        std::fs::write(&reflection_data_path, valid_reflection_data).unwrap();
+        assert!(SearchEngine::load_from_disk(dir, 1, 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn cleanup_keeps_manifest_generation_and_removes_other_numbered_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create stale and current numbered generations.
         std::fs::write(dir.join("chunks-100.hnsw.data"), "old").unwrap();
         std::fs::write(dir.join("chunks-100.hnsw.graph"), "old").unwrap();
-        std::fs::write(dir.join("chunks-200.hnsw.data"), "old").unwrap();
-        std::fs::write(dir.join("reflections-50.hnsw.data"), "old").unwrap();
-        std::fs::write(dir.join("reflections-50.hnsw.graph"), "old").unwrap();
+        std::fs::write(dir.join("chunks-200.hnsw.data"), "current").unwrap();
+        std::fs::write(dir.join("chunks-200.hnsw.graph"), "current").unwrap();
+        std::fs::write(dir.join("reflections-25.hnsw.data"), "old").unwrap();
+        std::fs::write(dir.join("reflections-25.hnsw.graph"), "old").unwrap();
+        std::fs::write(dir.join("reflections-50.hnsw.data"), "current").unwrap();
+        std::fs::write(dir.join("reflections-50.hnsw.graph"), "current").unwrap();
 
-        // Create base files that should be kept
+        // Canonical files are from an older cache generation, but cleanup only
+        // removes stale numbered generations.
         std::fs::write(dir.join("chunks.hnsw.data"), "current").unwrap();
         std::fs::write(dir.join("chunks.hnsw.graph"), "current").unwrap();
         std::fs::write(dir.join("reflections.hnsw.data"), "current").unwrap();
         std::fs::write(dir.join("reflections.hnsw.graph"), "current").unwrap();
-        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": MANIFEST_VERSION,
+                "files": {},
+                "created_at": "2026-08-17T00:00:00Z",
+                "chunk_id_map": [],
+                "reflection_id_map": [],
+                "chunk_embeddings_expected": 0,
+                "reflection_embeddings_expected": 0,
+                "active_reflection_count": 0,
+                "chunk_basename": "chunks-200",
+                "reflection_basename": "reflections-50"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         std::fs::write(dir.join("index.lock"), "").unwrap();
 
         cleanup_stale_index_files(dir);
 
-        // Numbered files should be gone
+        // Stale numbered generations should be gone.
         assert!(!dir.join("chunks-100.hnsw.data").exists());
-        assert!(!dir.join("chunks-200.hnsw.data").exists());
-        assert!(!dir.join("reflections-50.hnsw.data").exists());
+        assert!(!dir.join("chunks-100.hnsw.graph").exists());
+        assert!(!dir.join("reflections-25.hnsw.data").exists());
+        assert!(!dir.join("reflections-25.hnsw.graph").exists());
 
-        // Base files should remain
+        // The manifest's complete graph/data pairs must remain.
+        assert!(dir.join("chunks-200.hnsw.data").exists());
+        assert!(dir.join("chunks-200.hnsw.graph").exists());
+        assert!(dir.join("reflections-50.hnsw.data").exists());
+        assert!(dir.join("reflections-50.hnsw.graph").exists());
+
+        // Canonical files and non-index metadata should remain.
         assert!(dir.join("chunks.hnsw.data").exists());
         assert!(dir.join("chunks.hnsw.graph").exists());
         assert!(dir.join("reflections.hnsw.data").exists());
         assert!(dir.join("manifest.json").exists());
         assert!(dir.join("index.lock").exists());
-    }
-
-    #[test]
-    fn test_promote_renames_numbered_to_canonical() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        // Simulate hnsw_rs creating numbered files
-        std::fs::write(dir.join("chunks-4567.hnsw.data"), "new_data").unwrap();
-        std::fs::write(dir.join("chunks-4567.hnsw.graph"), "new_graph").unwrap();
-        // Old canonical files exist
-        std::fs::write(dir.join("chunks.hnsw.data"), "old_data").unwrap();
-        std::fs::write(dir.join("chunks.hnsw.graph"), "old_graph").unwrap();
-
-        let _ = promote_to_canonical(dir, "chunks-4567", "chunks");
-
-        // Canonical files should have the new content
-        assert_eq!(
-            std::fs::read_to_string(dir.join("chunks.hnsw.data")).unwrap(),
-            "new_data"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join("chunks.hnsw.graph")).unwrap(),
-            "new_graph"
-        );
-        // Numbered files should be gone (renamed)
-        assert!(!dir.join("chunks-4567.hnsw.data").exists());
-        assert!(!dir.join("chunks-4567.hnsw.graph").exists());
-    }
-
-    #[test]
-    fn test_promote_noop_when_already_canonical() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp.path();
-        std::fs::write(dir.join("chunks.hnsw.data"), "data").unwrap();
-
-        let _ = promote_to_canonical(dir, "chunks", "chunks"); // should not panic or corrupt
-        assert_eq!(
-            std::fs::read_to_string(dir.join("chunks.hnsw.data")).unwrap(),
-            "data"
-        );
     }
 
     #[test]
@@ -1467,5 +4028,1091 @@ mod tests {
     #[test]
     fn test_cleanup_no_panic_on_nonexistent_dir() {
         cleanup_stale_index_files(Path::new("/nonexistent/path")); // should not panic
+    }
+
+    // Build `n` deterministic 384-dim unit-ish vectors keyed by index.
+    fn synthetic_vectors(n: usize) -> Vec<Vec<f32>> {
+        // Well-separated deterministic vectors: a per-(i,j) hash decorrelates each
+        // vector from every other one, so a query's exact self-match is an unambiguous
+        // nearest neighbour. The earlier smooth-sinusoid scheme made consecutive
+        // vectors near-collinear; approximate HNSW recall for a self-query then hinged
+        // on float-summation order, which differs across platforms (top-1 self-match
+        // held on macOS but not Linux CI). Values are zero-mean so the cosine
+        // similarity between distinct vectors sits near 0.
+        (0..n)
+            .map(|i| {
+                (0..384)
+                    .map(|j| {
+                        let h = ((i as f32 + 1.0) * 12.9898 + (j as f32 + 1.0) * 78.233).sin()
+                            * 43758.547;
+                        (h - h.floor()) - 0.5
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Verify a self-query against an index built from `synthetic_vectors`, in two
+    /// parts, for indexes large enough (> `EXACT_SCAN_THRESHOLD`) that `search_chunks`
+    /// walks the approximate HNSW graph rather than exact-scanning:
+    ///
+    ///  1. A DETERMINISTIC structural check on the real `search_chunks` (approximate)
+    ///     path: non-empty, every returned id was actually inserted (`has_chunk`), every
+    ///     score is a plausible cosine similarity. This still walks the graph traversal
+    ///     end to end — including through the mmap where applicable — so it keeps
+    ///     catching what approximate search needs to protect against: a failed/empty
+    ///     load, a torn or truncated read, a panic/abort on corrupt graph data, or
+    ///     garbage ids leaking through.
+    ///  2. The exact top-1 IDENTITY check via the private `exact_scan` helper (the same
+    ///     one `search_chunks` itself falls back to for small/filtered corpora),
+    ///     bypassing HNSW's approximate graph traversal entirely.
+    ///
+    /// Part 2 exists, and part 1 is not itself an identity check, because of a measured
+    /// property of this corpus: `synthetic_vectors` (see its doc comment) produces
+    /// near-orthogonal vectors — every pair of DISTINCT points sits around cosine
+    /// 0.1-0.15 — so there is no "getting warmer" gradient for HNSW's greedy descent to
+    /// follow toward a query's own point once the walk starts elsewhere. hnsw_rs also
+    /// seeds its level-assignment RNG from OS entropy per process (`StdRng::from_os_rng`
+    /// in `hnsw_rs::hnsw`), so the graph topology — and therefore which points a
+    /// bounded-width beam search actually reaches — differs every run. Measured directly
+    /// on this corpus (300 independent build+reload trials of a 500-point self-query):
+    /// ~3% of runs missed the exact self-match via `search_chunks`, by a wide score
+    /// margin every time (true cosine ~1.0 vs ~0.1-0.15 for the wrong top-1) — never a
+    /// near-duplicate tie, never wrong/stale/corrupted data (the `has_chunk` check in
+    /// part 1 and the exact scan in part 2 both confirm the id map and vector are
+    /// correct). That is bounded, expected ANN behaviour on this intentionally
+    /// unstructured corpus, not a defect in the code under test, so the strict identity
+    /// assertion belongs on the exact scan, not on `search_chunks`'s approximate result.
+    fn assert_self_query_correct(
+        engine: &SearchEngine,
+        query: &[f32],
+        expected_id: &str,
+        limit: usize,
+        min_score: f32,
+    ) {
+        let approx = engine.search_chunks(query, limit, min_score);
+        assert!(
+            !approx.is_empty(),
+            "approximate search_chunks returned no results querying {expected_id}'s own vector"
+        );
+        for r in &approx {
+            assert!(
+                engine.has_chunk(&r.id),
+                "search_chunks returned an id that was never inserted (or was removed): {}",
+                r.id
+            );
+            assert!(
+                (-1.0001..=1.0001).contains(&r.score),
+                "search_chunks returned an implausible cosine score {} for id {}",
+                r.score,
+                r.id
+            );
+        }
+
+        let exact = SearchEngine::exact_scan(
+            &engine.chunk_index,
+            &engine.chunk_id_map,
+            query,
+            limit,
+            min_score,
+            None,
+        );
+        assert_eq!(
+            exact.first().map(|r| r.id.as_str()),
+            Some(expected_id),
+            "exact scan must find {expected_id} as its own nearest neighbour"
+        );
+    }
+
+    // The canonical (legacy, pre-9.5.4) basename must NOT be mmapped, because an old
+    // process can truncate it in place. `should_mmap_generation` returns false for it,
+    // true for a numbered generation with real files, and false when the files are
+    // missing. A canonical index still loads and searches correctly (heap-backed).
+    #[test]
+    fn canonical_generation_is_never_mmapped_but_still_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Canonical basename is refused regardless of whether files exist.
+        assert!(!should_mmap_generation(
+            dir,
+            &default_chunk_basename(),
+            &default_chunk_basename(),
+            true
+        ));
+        // A numbered basename with no files on disk is refused (would exit in hnsw_rs).
+        assert!(!should_mmap_generation(
+            dir,
+            "chunks-1-2",
+            &default_chunk_basename(),
+            true
+        ));
+
+        // Build an index, dump it, then rewrite the manifest to the LEGACY canonical
+        // layout (as a pre-9.5.4 dump would have left it) and rename the files to match.
+        let vecs = synthetic_vectors(300);
+        let mut writer = SearchEngine::new(400);
+        for (i, v) in vecs.iter().enumerate() {
+            writer.insert_chunk(format!("c{i}"), v.clone());
+        }
+        writer.dump_to_disk(dir, 300, 0).unwrap();
+        let manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let numbered = manifest.chunk_basename.clone();
+        std::fs::rename(
+            dir.join(format!("{numbered}.hnsw.data")),
+            dir.join("chunks.hnsw.data"),
+        )
+        .unwrap();
+        std::fs::rename(
+            dir.join(format!("{numbered}.hnsw.graph")),
+            dir.join("chunks.hnsw.graph"),
+        )
+        .unwrap();
+        let mut legacy = serde_json::to_value(&manifest).unwrap();
+        legacy["chunk_basename"] = serde_json::json!("chunks");
+        let mut files = serde_json::Map::new();
+        for extension in ["hnsw.graph", "hnsw.data"] {
+            let name = format!("chunks.{extension}");
+            files.insert(
+                name.clone(),
+                serde_json::to_value(file_integrity(&dir.join(&name)).unwrap()).unwrap(),
+            );
+        }
+        legacy["files"] = serde_json::Value::Object(files);
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        // Now the numbered generation is refused (files gone), the canonical layout is
+        // refused by basename, and the index still loads heap-backed and searches.
+        assert!(!should_mmap_generation(
+            dir,
+            "chunks",
+            &default_chunk_basename(),
+            true
+        ));
+        // A numbered generation with a missing lock is refused (no unlink protection).
+        assert!(!should_mmap_generation(
+            dir,
+            "chunks-9-9",
+            &default_chunk_basename(),
+            false
+        ));
+        let loaded = SearchEngine::load_from_disk(dir, 300, 0)
+            .unwrap()
+            .expect("canonical index loads");
+        assert_self_query_correct(&loaded, &vecs[42], "c42", 3, 0.1);
+    }
+
+    // The core PR2 safety property: a process holding an mmap-backed generation keeps
+    // serving correct results after ANOTHER process publishes a new generation and
+    // `cleanup_stale_index_files` unlinks the older one. On unix the inode and its
+    // pages survive until the last mapping is dropped, so the mapped reads stay valid.
+    // This is what makes turning mmap on safe under concurrent csr-engine processes.
+    #[cfg(unix)]
+    #[test]
+    fn mmap_backed_index_survives_concurrent_generation_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Generation 1: 300 chunks (> EXACT_SCAN_THRESHOLD, so search walks the HNSW
+        // graph and reads vectors through the mmap rather than exact-scanning).
+        let vecs = synthetic_vectors(300);
+        let mut writer = SearchEngine::new(400);
+        for (i, v) in vecs.iter().enumerate() {
+            writer.insert_chunk(format!("c{i}"), v.clone());
+        }
+        writer.dump_to_disk(dir, 300, 0).unwrap();
+
+        // A reader loads generation 1 mmap-backed (leaks an HnswIo holding the map).
+        let reader = SearchEngine::load_from_disk(dir, 300, 0)
+            .unwrap()
+            .expect("load generation 1");
+        let gen1_data = {
+            let manifest: IndexManifest =
+                serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+            dir.join(format!("{}.hnsw.data", manifest.chunk_basename))
+        };
+        assert!(gen1_data.exists(), "generation 1 data file should exist");
+        // The generation must be numbered so `should_mmap_generation` mapped it (a
+        // canonical basename would be heap-loaded and this test would not exercise mmap).
+        let gen1_basename = gen1_data
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .trim_end_matches(".hnsw.data")
+            .to_string();
+        assert!(
+            gen1_basename.starts_with("chunks-"),
+            "expected a numbered generation, got {gen1_basename}"
+        );
+        assert!(
+            should_mmap_generation(dir, &gen1_basename, &default_chunk_basename(), true),
+            "generation 1 should be mmap-backed"
+        );
+
+        // Sanity: the mmap-backed reader returns the self-match with a near-1.0 score.
+        assert_self_query_correct(&reader, &vecs[142], "c142", 5, 0.1);
+
+        // Another process publishes generation 2 (500 chunks). dump_to_disk commits the
+        // new manifest and runs cleanup, which unlinks generation 1's numbered files.
+        let vecs2 = synthetic_vectors(500);
+        let mut publisher = SearchEngine::new(600);
+        for (i, v) in vecs2.iter().enumerate() {
+            publisher.insert_chunk(format!("c{i}"), v.clone());
+        }
+        publisher.dump_to_disk(dir, 500, 0).unwrap();
+        assert!(
+            !gen1_data.exists(),
+            "cleanup should have unlinked generation 1's data file"
+        );
+
+        // The still-mapped reader must keep returning correct results after the unlink.
+        assert_self_query_correct(&reader, &vecs[142], "c142", 5, 0.1);
+        // A vector that only differs slightly should still resolve to its own id.
+        assert_self_query_correct(&reader, &vecs[7], "c7", 3, 0.1);
+
+        // And a fresh load now picks up generation 2, including the newer ids.
+        let reloaded = SearchEngine::load_from_disk(dir, 500, 0)
+            .unwrap()
+            .expect("load generation 2");
+        assert!(reloaded.has_chunk("c499"));
+        assert!(reloaded.has_chunk("c142"));
+        // c499 is the boundary point most exposed to approximate-search recall variance
+        // (see `assert_self_query_correct`'s doc comment for why and the measured rate).
+        assert_self_query_correct(&reloaded, &vecs2[499], "c499", 3, 0.1);
+    }
+
+    // Additive backfill into an mmap-backed index: newly inserted points are heap-owned
+    // Vecs while the loaded points remain mmap slices. Both must be searchable, and a
+    // subsequent dump (which writes a fresh generation, never truncating the mapped
+    // file) must round-trip every id.
+    #[cfg(unix)]
+    #[test]
+    fn mmap_backed_index_accepts_new_inserts_and_redumps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let vecs = synthetic_vectors(300);
+        let mut writer = SearchEngine::new(400);
+        for (i, v) in vecs.iter().enumerate() {
+            writer.insert_chunk(format!("c{i}"), v.clone());
+        }
+        writer.dump_to_disk(dir, 300, 0).unwrap();
+
+        let mut reader = SearchEngine::load_from_disk(dir, 300, 0)
+            .unwrap()
+            .expect("load generation 1");
+
+        // Insert a new point (heap-owned) alongside the mmap-backed ones.
+        let newv: Vec<f32> = (0..384).map(|j| ((j as f32) * 0.002).cos()).collect();
+        reader.insert_chunk("c_new".into(), newv.clone());
+
+        // newly inserted heap-owned point must be searchable
+        assert_self_query_correct(&reader, &newv, "c_new", 3, 0.1);
+        // mmap-backed points must remain searchable after a new insert
+        assert_self_query_correct(&reader, &vecs[10], "c10", 3, 0.1);
+
+        // Re-dump: writes a new generation, must not truncate the mapped file, and the
+        // result must round-trip both the mmap-origin ids and the new one.
+        reader.dump_to_disk(dir, 301, 0).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 301, 0)
+            .unwrap()
+            .expect("reload after redump");
+        assert!(reloaded.has_chunk("c_new"));
+        assert!(reloaded.has_chunk("c0"));
+        assert!(reloaded.has_chunk("c299"));
+        // Search must return the right vectors after the re-dump/reload, for both a
+        // mmap-origin point and the point that was inserted heap-side before the dump.
+        assert_self_query_correct(&reloaded, &vecs[0], "c0", 3, 0.1);
+        assert_self_query_correct(&reloaded, &newv, "c_new", 3, 0.1);
+    }
+
+    // --- WP-D: cold start must not block on a full rebuild for negative drift ---
+
+    #[test]
+    fn load_from_disk_accepts_negative_drift_db_count_below_manifest() {
+        // Simulate rows deleted from the DB since the last dump: the manifest
+        // (and the persisted HNSW graph) describes more chunks than the DB now
+        // has. This used to make `load_from_disk` return `None`, forcing the
+        // caller into a full synchronous rebuild. It must now still return the
+        // loaded generation — reconciliation (blanking the vanished ids) is
+        // `Engine::new`'s job, not this function's.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let mut writer = SearchEngine::new(10);
+        for i in 0..10 {
+            writer.insert_chunk(format!("c{i}"), distinct_embedding(i));
+        }
+        // Manifest says 10 chunks were expected at dump time.
+        writer.dump_to_disk(dir, 10, 0).unwrap();
+
+        // DB now reports only 6 (4 rows deleted) — negative drift.
+        let loaded = SearchEngine::load_from_disk(dir, 6, 0).unwrap();
+        assert!(
+            loaded.is_some(),
+            "load_from_disk must load a generation on negative drift, not return None \
+             and force the caller into an inline full rebuild"
+        );
+        let loaded = loaded.unwrap();
+        // The raw graph still holds all 10 — reconciliation (blanking the 4
+        // vanished ids) is the caller's job, exercised via `blank_orphan_chunks`
+        // in the `Engine::new` cached-load branch, not here.
+        assert!(loaded.has_chunk("c0"));
+        assert!(loaded.has_chunk("c9"));
+    }
+
+    #[test]
+    fn load_from_disk_accepts_negative_drift_for_reflections_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let mut writer = SearchEngine::new(10);
+        for i in 0..5 {
+            writer.insert_reflection(format!("r{i}"), distinct_embedding(1000 + i));
+        }
+        writer.dump_to_disk(dir, 0, 5).unwrap();
+
+        // DB now reports only 2 reflections.
+        let loaded = SearchEngine::load_from_disk(dir, 0, 2).unwrap();
+        assert!(
+            loaded.is_some(),
+            "negative drift on the reflection side must also load, not rebuild inline"
+        );
+    }
+
+    #[test]
+    fn search_over_majority_tombstoned_index_still_returns_a_full_page() {
+        // Once tombstones dominate, a bare `index.search(query, limit, ..)`
+        // request returns mostly-dead neighbour slots and the post-filter
+        // shrinks the result list below `limit` even though plenty of live
+        // points exist elsewhere in the graph. `search_index` must overfetch
+        // past that.
+        let mut engine = SearchEngine::new(400);
+        // 300 points, comfortably above EXACT_SCAN_THRESHOLD so this exercises
+        // the HNSW path, not `exact_scan`.
+        for i in 0..300 {
+            engine.insert_chunk(format!("c{i}"), distinct_embedding(i));
+        }
+        // Tombstone all but the last 20 (>50% tombstoned, matching the spec's
+        // verification scenario).
+        let live_owned: Vec<String> = (280..300).map(|i| format!("c{i}")).collect();
+        let live_ids: std::collections::HashSet<&str> =
+            live_owned.iter().map(|s| s.as_str()).collect();
+        let blanked = engine.blank_orphan_chunks(&live_ids);
+        assert!(
+            blanked >= 200,
+            "expected the majority of points tombstoned, got {blanked}"
+        );
+
+        // A query near c290's own vector, asking for a full page of 10 —
+        // there are 20 live points overall, so 10 must always be reachable.
+        let query = distinct_embedding(290);
+        let hits = engine.search_chunks(&query, 10, -1.0);
+        assert_eq!(
+            hits.len(),
+            10,
+            "search must overfetch past tombstones to still return a full page \
+             of `limit` live results when enough live points exist"
+        );
+        for hit in &hits {
+            assert!(
+                live_ids.contains(hit.id.as_str()),
+                "search returned a tombstoned (blanked) id: {}",
+                hit.id
+            );
+        }
+    }
+
+    #[test]
+    fn search_index_does_not_escalate_to_the_full_graph_on_plain_score_exhaustion() {
+        // Reviewer-found regression: the escalation loop used to jump
+        // straight from `fetch_limit` to `max_elements` (a full-graph beam
+        // search) any time the filtered result count fell short of `limit`
+        // — whether or not any tombstone was involved. On the real corpus
+        // (551k chunks) that turned every `min_score`-filtered query with
+        // fewer than `limit` qualifying hits into a ~700x-slower full-index
+        // scan, on the exact call `search_chunks(q, 15, 0.55)` the
+        // UserPromptSubmit hook makes on every typed prompt.
+        //
+        // No tombstones here — the shortfall is pure score exhaustion (an
+        // unreachable `min_score`), so a single bounded first-window search
+        // is enough to know no deeper fetch could add a qualifying hit.
+        // Assert both an empty result and a timing ceiling: a full-graph
+        // scan over 2,000 points would be measurably slower than a single
+        // bounded query even in a debug/CI build.
+        let mut engine = SearchEngine::new(2500);
+        // Comfortably above EXACT_SCAN_THRESHOLD (256) so this exercises the
+        // HNSW path, not `exact_scan`.
+        for i in 0..2000 {
+            engine.insert_chunk(format!("c{i}"), distinct_embedding(i));
+        }
+
+        let query = distinct_embedding(500);
+        reset_search_index_test_counters();
+        let t0 = std::time::Instant::now();
+        let hits = engine.search_chunks(&query, 15, 2.0); // 2.0 > any cosine score
+        let elapsed = t0.elapsed();
+        let (calls, max_fetch_limit) = search_index_test_counters();
+
+        assert!(
+            hits.is_empty(),
+            "an unreachable min_score must filter out every hit"
+        );
+        // Structural signal (reviewer-found gap): a 2,000-point full-graph
+        // scan is cheap enough that a wall-clock ceiling alone does not
+        // catch a regression back to the old "escalate straight to
+        // max_elements" behaviour — that regressed version still passed
+        // this test's 200ms bound at 810.792µs. Assert directly on what
+        // `search_index` actually asked the HNSW graph for instead: exactly
+        // one call (no escalation at all — no tombstones means a deeper
+        // fetch could not add a qualifying hit), and that its `fetch_limit`
+        // never exceeded `limit * TOMBSTONE_OVERFETCH_CAP` (here, with no
+        // tombstones, the `live == max_elements` branch requests exactly
+        // `limit`).
+        assert_eq!(
+            calls, 1,
+            "no-tombstone score exhaustion must resolve in a single bounded \
+             search call, not escalate"
+        );
+        assert!(
+            max_fetch_limit <= (15 * TOMBSTONE_OVERFETCH_CAP) as u64,
+            "fetch_limit must never exceed limit * TOMBSTONE_OVERFETCH_CAP, got {max_fetch_limit}"
+        );
+        assert_eq!(
+            max_fetch_limit, 15,
+            "no tombstones and no escalation means fetch_limit stays exactly `limit`"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "search took {elapsed:?} — looks like it escalated to a full-graph \
+             scan instead of stopping once the window's tail score dropped \
+             below min_score"
+        );
+    }
+
+    #[test]
+    fn needs_compaction_marker_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        assert!(!needs_compaction(dir));
+        mark_needs_compaction(dir);
+        assert!(needs_compaction(dir));
+        clear_needs_compaction(dir);
+        assert!(!needs_compaction(dir));
+        // Clearing an already-absent marker must not error/panic.
+        clear_needs_compaction(dir);
+    }
+
+    #[test]
+    fn negative_drift_loaded_engine_dumps_counts_matching_db_not_forcing_rebuild_on_next_load() {
+        // Full round trip for WP-D interface (5): load with negative drift,
+        // reconcile (as `Engine::new` would via `blank_orphan_chunks`), dump
+        // again with the now-current DB count, and prove the NEXT load sees
+        // zero drift — i.e. reconciliation does not leave the cache
+        // perpetually "behind" so every subsequent process pays the same
+        // negative-drift path forever.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let mut writer = SearchEngine::new(10);
+        for i in 0..10 {
+            writer.insert_chunk(format!("c{i}"), distinct_embedding(i));
+        }
+        writer.dump_to_disk(dir, 10, 0).unwrap();
+
+        // "Process B" loads with the DB now at 6 (4 deleted) — negative drift.
+        let mut reader = SearchEngine::load_from_disk(dir, 6, 0)
+            .unwrap()
+            .expect("negative-drift load");
+        let remaining: std::collections::HashSet<&str> =
+            ["c0", "c1", "c2", "c3", "c4", "c5"].into_iter().collect();
+        let blanked = reader.blank_orphan_chunks(&remaining);
+        assert_eq!(blanked, 4);
+
+        // Dump with the real (post-reconciliation) DB count.
+        reader.dump_to_disk(dir, 6, 0).unwrap();
+
+        let manifest_raw = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_raw).unwrap();
+        assert_eq!(manifest["chunk_embeddings_expected"].as_u64(), Some(6));
+
+        // The next load, querying the DB at the SAME count (6), must see zero
+        // drift — no more forced negative-drift reconciliation.
+        let reloaded = SearchEngine::load_from_disk(dir, 6, 0)
+            .unwrap()
+            .expect("reload after reconcile");
+        assert_eq!(reloaded.chunk_count(), 6);
+        assert!(
+            !reloaded.has_chunk("c9"),
+            "blanked id must not resurrect on reload"
+        );
+        assert!(reloaded.has_chunk("c5"));
+    }
+
+    #[test]
+    fn a_write_after_the_files_are_written_stays_dirty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(100);
+        for i in 0..5 {
+            engine.insert_chunk(format!("c{i}"), distinct_embedding(i));
+        }
+        engine.insert_reflection("r0".into(), distinct_embedding(9));
+        // Published from a shared borrow (a reader still searching), then a
+        // chunk lands before the bookkeeping takes the write lock.
+        let published = engine.publish_to_disk(dir, 5, 1).unwrap();
+        assert!(engine.is_chunk_dirty() && engine.is_reflection_dirty());
+        engine.insert_chunk("c5".into(), distinct_embedding(5));
+        engine.settle_publish(published);
+        assert!(engine.is_chunk_dirty(), "the late chunk is not on disk yet");
+        assert!(
+            !engine.is_reflection_dirty(),
+            "the reflection side was published"
+        );
+        // The next dump publishes it, and the manifest loads with all six.
+        engine.dump_to_disk(dir, 6, 1).unwrap();
+        assert!(!engine.is_dirty());
+        let reloaded = SearchEngine::load_from_disk(dir, 6, 1).unwrap().unwrap();
+        assert!(reloaded.has_chunk("c5"));
+    }
+
+    #[test]
+    fn publish_and_settle_write_what_dump_to_disk_writes() {
+        let build = || {
+            let mut engine = SearchEngine::new(100);
+            for i in 0..5 {
+                engine.insert_chunk(format!("c{i}"), distinct_embedding(i));
+            }
+            engine
+        };
+        let (one, two) = (
+            tempfile::TempDir::new().unwrap(),
+            tempfile::TempDir::new().unwrap(),
+        );
+        let mut dumped = build();
+        dumped.dump_to_disk(one.path(), 5, 0).unwrap();
+        let mut split = build();
+        let published = split.publish_to_disk(two.path(), 5, 0).unwrap();
+        split.settle_publish(published);
+        assert_eq!(dumped.is_dirty(), split.is_dirty());
+        assert_eq!(dumped.epoch, split.epoch);
+        assert_eq!(dumped.manifest_backed, split.manifest_backed);
+        let manifest = |dir: &Path| -> IndexManifest {
+            serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
+                .unwrap()
+        };
+        let (a, b) = (manifest(one.path()), manifest(two.path()));
+        assert_eq!(a.chunk_id_map, b.chunk_id_map);
+        assert_eq!(a.epoch, b.epoch);
+        assert_eq!(a.chunk_embeddings_expected, b.chunk_embeddings_expected);
+    }
+
+    #[test]
+    fn a_publish_from_a_swapped_out_engine_is_not_settled_on_its_successor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut old = SearchEngine::new(100);
+        old.insert_chunk("c0".into(), distinct_embedding(0));
+        let published = old.publish_to_disk(tmp.path(), 1, 0).unwrap();
+        // A compaction swaps a different engine in before the bookkeeping.
+        let mut fresh = SearchEngine::new(100);
+        fresh.insert_chunk("c0".into(), distinct_embedding(0));
+        fresh.settle_publish(published);
+        assert!(
+            fresh.is_chunk_dirty(),
+            "another engine's publish says nothing about this one"
+        );
+        assert!(!fresh.manifest_backed);
+    }
+
+    #[test]
+    fn r3_manifest_requires_hashes_and_rejects_graph_corruption_before_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = SearchEngine::new(8);
+        index.insert_chunk("a".into(), vec![0.1; 384]);
+        index.dump_to_disk(dir.path(), 1, 0).unwrap();
+        let path = dir.path().join("manifest.json");
+        let original = std::fs::read(&path).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        manifest.as_object_mut().unwrap().remove("files");
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(SearchEngine::load_from_disk(dir.path(), 1, 0)
+            .unwrap()
+            .is_none());
+        std::fs::write(&path, original).unwrap();
+        let manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let graph = dir
+            .path()
+            .join(format!("{}.hnsw.graph", manifest.chunk_basename));
+        let mut bytes = std::fs::read(&graph).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0x80;
+        std::fs::write(graph, bytes).unwrap();
+        HNSW_LOAD_CALLS.with(|calls| calls.set(0));
+        assert!(SearchEngine::load_from_disk(dir.path(), 1, 0)
+            .unwrap()
+            .is_none());
+        HNSW_LOAD_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
+    #[test]
+    fn r3_dump_size_formula_checks_dimension_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("chunks.hnsw.graph"),
+            LOADABLE_GRAPH_MAGICS[0].to_ne_bytes(),
+        )
+        .unwrap();
+        let mut bytes = DATA_MAGIC.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(&u64::MAX.to_ne_bytes());
+        std::fs::write(dir.path().join("chunks.hnsw.data"), bytes).unwrap();
+        assert!(check_generation_files(dir.path(), "chunks", 1).is_err());
+    }
+
+    #[test]
+    fn r3_identical_vector_apply_has_no_tombstone_or_publication_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = SearchEngine::new(8);
+        index.insert_chunk("a".into(), vec![0.1; 384]);
+        index.insert_reflection("r".into(), vec![0.2; 384]);
+        index.dump_to_disk(dir.path(), 1, 1).unwrap();
+        let mut loaded = SearchEngine::load_from_disk(dir.path(), 1, 1)
+            .unwrap()
+            .unwrap();
+        for current in [&mut index, &mut loaded] {
+            current.apply_vector("a".into(), Some(vec![0.1; 384]), false);
+            current.apply_vector("r".into(), Some(vec![0.2; 384]), true);
+            assert_eq!(current.unpublished_changes(), 0);
+            assert_eq!(current.chunk_tombstone_count(), 0);
+            assert_eq!(current.reflection_tombstone_count(), 0);
+            current.apply_vector("a".into(), Some(vec![0.3; 384]), false);
+            assert_eq!(current.unpublished_changes(), 2);
+            assert_eq!(current.chunk_tombstone_count(), 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "writes and hashes a 1.5 GiB file for the release validation benchmark"]
+    fn r3_hash_verification_realistic_file_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("realistic.hnsw.data");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let block: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
+        for _ in 0..1536 {
+            file.write_all(&block).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+        let start = std::time::Instant::now();
+        let integrity = file_integrity(&path).unwrap();
+        println!(
+            "r3_hash_timing bytes={} elapsed_ms={:.3} digest={}",
+            integrity.bytes,
+            start.elapsed().as_secs_f64() * 1000.0,
+            integrity.blake3
+        );
+        assert_eq!(integrity.bytes, 1_610_612_736);
+    }
+}
+
+/// Serving chunk kNN from a USearch generation by the `vector_generation`
+/// watermark (S5-FS2).
+#[cfg(test)]
+mod vector_gen_tests {
+    use super::*;
+    use crate::index_gen::{self, DIMS};
+    use crate::storage::Storage;
+
+    const N: usize = 40;
+
+    /// A fixed pseudo-random unit vector per `i` (SplitMix64 noise).
+    fn vector(i: usize) -> Vec<f32> {
+        let mut state = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        let mut v: Vec<f32> = (0..DIMS)
+            .map(|_| {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect();
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= norm);
+        v
+    }
+
+    fn blob(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn put(storage: &Storage, id: &str, v: &[f32]) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO chunks(id,conversation_id,project_name,timestamp,content,message_count) VALUES(?1,'conv','project','2026-09-26','content',1)",
+                    [id],
+                )?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO chunk_embeddings(chunk_id,embedding) VALUES(?1,?2)",
+                    rusqlite::params![id, blob(v)],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn max_seq(storage: &Storage) -> i64 {
+        storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COALESCE(MAX(seq),0) FROM embedding_changes",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        dir: std::path::PathBuf,
+        storage: Storage,
+    }
+
+    /// `N` chunks `c0..` in SQLite, an index-v3 dump of them (plus reflection
+    /// `r0`) and a USearch generation of them; the watermark row only if asked.
+    fn fixture(watermark: bool) -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("index-v3");
+        let storage = Storage::open_memory().unwrap();
+        let mut old = SearchEngine::new(100);
+        let mut ids = Vec::new();
+        let mut flat = Vec::new();
+        for i in 0..N {
+            let id = format!("c{i}");
+            put(&storage, &id, &vector(i));
+            old.insert_chunk(id.clone(), vector(i));
+            flat.extend(vector(i));
+            ids.push(id);
+        }
+        old.insert_reflection("r0".into(), vector(1000));
+        old.dump_to_disk(&dir, N, 1).unwrap();
+        let manifest = index_gen::build(&flat, DIMS, &ids, &dir, 1, max_seq(&storage), 2).unwrap();
+        if watermark {
+            index_gen::write_watermark(&storage, &manifest).unwrap();
+        }
+        Fixture {
+            _tmp: tmp,
+            dir,
+            storage,
+        }
+    }
+
+    fn load(f: &Fixture) -> SearchEngine {
+        SearchEngine::load_with_generation(&f.dir, &f.storage, 1)
+            .unwrap()
+            .expect("watermark present")
+    }
+
+    fn top(engine: &SearchEngine, v: &[f32], k: usize) -> Vec<SearchResult> {
+        engine.search_chunks(v, k, 0.0)
+    }
+
+    fn chunk_files(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().to_string();
+                name.starts_with("chunks")
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn snapshot(files: &[std::path::PathBuf]) -> Vec<(String, String, std::time::SystemTime)> {
+        files
+            .iter()
+            .map(|p| {
+                (
+                    p.file_name().unwrap().to_string_lossy().to_string(),
+                    index_gen::blake3_file(p).unwrap(),
+                    std::fs::metadata(p).unwrap().modified().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vector_gen_serves_from_the_generation_and_leaves_chunk_hnsw_files_alone() {
+        let f = fixture(true);
+        let files = chunk_files(&f.dir);
+        assert!(files
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with(".hnsw.data")));
+        assert!(files
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("g1.usearch")));
+        let before = snapshot(&files);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let engine = load(&f);
+        assert!(engine.is_generation_served());
+        assert_eq!(engine.chunk_count(), N);
+        assert_eq!(engine.chunk_slot_count(), N);
+        let hits = top(&engine, &vector(7), 3);
+        assert_eq!(hits[0].id, "c7");
+        assert!(hits[0].score > 0.99, "{}", hits[0].score);
+        assert!(hits.windows(2).all(|w| w[0].score >= w[1].score));
+        assert_eq!(engine.search_reflections(&vector(1000), 1, 0.0)[0].id, "r0");
+        assert!(engine.has_chunk("c0") && !engine.has_chunk("nope"));
+        drop(engine);
+
+        assert_eq!(
+            snapshot(&chunk_files(&f.dir)),
+            before,
+            "chunk files touched"
+        );
+    }
+
+    #[test]
+    fn vector_gen_never_reads_the_chunk_hnsw_files() {
+        let f = fixture(true);
+        let manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(f.dir.join("manifest.json")).unwrap()).unwrap();
+        // Damage both chunk graph files: opening or hashing either would fail.
+        for ext in ["hnsw.graph", "hnsw.data"] {
+            std::fs::write(
+                f.dir.join(format!("{}.{ext}", manifest.chunk_basename)),
+                b"not a graph",
+            )
+            .unwrap();
+        }
+        let engine = load(&f);
+        assert_eq!(top(&engine, &vector(3), 1)[0].id, "c3");
+        assert!(
+            SearchEngine::load_from_disk(&f.dir, N, 1)
+                .unwrap()
+                .is_none(),
+            "the index-v3 path does see the damage"
+        );
+    }
+
+    #[test]
+    fn vector_gen_without_a_watermark_declines() {
+        let f = fixture(false);
+        assert!(SearchEngine::load_with_generation(&f.dir, &f.storage, 1)
+            .unwrap()
+            .is_none());
+        let old = SearchEngine::load_from_disk(&f.dir, N, 1).unwrap().unwrap();
+        assert!(!old.is_generation_served());
+        assert_eq!(top(&old, &vector(7), 1)[0].id, "c7");
+    }
+
+    #[test]
+    fn vector_gen_a_damaged_generation_is_an_error_not_a_rebuild() {
+        let f = fixture(true);
+        let ids = index_gen::ids_path(&f.dir, "chunks-g1");
+        let mut bytes = std::fs::read(&ids).unwrap();
+        bytes[0] = b'X';
+        std::fs::write(&ids, bytes).unwrap();
+        assert!(SearchEngine::load_with_generation(&f.dir, &f.storage, 1).is_err());
+    }
+
+    #[test]
+    fn vector_gen_delta_upsert_shadows_the_generation_copy() {
+        let f = fixture(true);
+        // Changed in SQLite after the watermark: c3 now holds vector(500),
+        // and a brand-new chunk holds vector(501).
+        put(&f.storage, "c3", &vector(500));
+        put(&f.storage, "fresh", &vector(501));
+        let mut engine = load(&f);
+        assert_eq!(engine.chunk_count(), N + 1);
+        let hits = top(&engine, &vector(500), 2);
+        assert_eq!(hits[0].id, "c3");
+        assert!(hits[0].score > 0.99);
+        assert_eq!(top(&engine, &vector(501), 1)[0].id, "fresh");
+        // The generation's old vector for c3 is no longer served.
+        let old = top(&engine, &vector(3), N + 1);
+        assert!(old.iter().filter(|h| h.id == "c3").all(|h| h.score < 0.99));
+
+        // The same through the index sync: a changed vector replaces the copy.
+        engine.apply_vector("c5".into(), Some(vector(600)), false);
+        assert_eq!(top(&engine, &vector(600), 1)[0].id, "c5");
+        assert!(top(&engine, &vector(5), N + 1)
+            .iter()
+            .filter(|h| h.id == "c5")
+            .all(|h| h.score < 0.99));
+        assert_eq!(engine.chunk_count(), N + 1);
+        assert!(!engine.is_chunk_dirty());
+    }
+
+    #[test]
+    fn vector_gen_delta_delete_removes_the_hit() {
+        let f = fixture(true);
+        f.storage
+            .with_connection(|conn| {
+                conn.execute("DELETE FROM chunk_embeddings WHERE chunk_id='c9'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let mut engine = load(&f);
+        assert_eq!(engine.chunk_count(), N - 1);
+        assert!(!engine.has_chunk("c9"));
+        assert!(top(&engine, &vector(9), N).iter().all(|h| h.id != "c9"));
+
+        engine.remove_chunk("c11");
+        assert!(!engine.has_chunk("c11"));
+        assert_eq!(engine.chunk_count(), N - 2);
+        assert!(top(&engine, &vector(11), N).iter().all(|h| h.id != "c11"));
+        assert_eq!(engine.chunk_tombstone_count(), 2);
+
+        // A delta-only chunk comes and goes; the count follows.
+        engine.insert_chunk("late".into(), vector(700));
+        assert_eq!(engine.chunk_count(), N - 1);
+        assert_eq!(top(&engine, &vector(700), 1)[0].id, "late");
+        engine.remove_chunk("late");
+        assert_eq!(engine.chunk_count(), N - 2);
+        assert!(top(&engine, &vector(700), N).iter().all(|h| h.id != "late"));
+
+        // A deleted id can come back.
+        engine.insert_chunk("c9".into(), vector(9));
+        assert_eq!(top(&engine, &vector(9), 1)[0].id, "c9");
+        assert_eq!(engine.chunk_count(), N - 1);
+        assert!(!engine.is_chunk_dirty());
+    }
+
+    #[test]
+    fn vector_gen_filtered_search_respects_the_allowed_set_and_the_shadow() {
+        let f = fixture(true);
+        put(&f.storage, "c2", &vector(800));
+        let engine = load(&f);
+        let allowed: HashSet<String> = ["c1", "c2", "c4"].map(String::from).into();
+        let hits = engine.search_chunks_filtered(&vector(4), 5, -1.0, &allowed);
+        let ids: HashSet<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, HashSet::from(["c1", "c2", "c4"]));
+        assert_eq!(hits[0].id, "c4");
+        let c2 = hits.iter().find(|h| h.id == "c2").unwrap();
+        assert!(c2.score < 0.99, "c2 is served from its new vector");
+        let high = engine.search_chunks_filtered(&vector(4), 5, 0.99, &allowed);
+        assert_eq!(high.len(), 1);
+        assert!(engine
+            .search_chunks_filtered(&vector(4), 5, 0.0, &HashSet::new())
+            .is_empty());
+    }
+
+    #[test]
+    fn vector_gen_publish_keeps_the_generation_and_the_old_chunk_files() {
+        let f = fixture(true);
+        let files = chunk_files(&f.dir);
+        let before = snapshot(&files);
+        let manifest_before: IndexManifest =
+            serde_json::from_slice(&std::fs::read(f.dir.join("manifest.json")).unwrap()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let mut engine = load(&f);
+        engine.insert_chunk("late".into(), vector(700));
+        engine.remove_chunk("c4");
+        assert!(!engine.is_chunk_dirty() && !engine.is_dirty());
+        assert!(engine.insert_reflection("r1".into(), vector(1001)));
+        assert!(engine.is_reflection_dirty());
+
+        let published = engine.publish_to_disk(&f.dir, N, 2).unwrap();
+        engine.settle_publish(published);
+        engine.insert_reflection("r2".into(), vector(1002));
+        engine.dump_to_disk(&f.dir, N, 3).unwrap();
+        cleanup_stale_index_files(&f.dir);
+        // A stray numbered chunk file the manifest does not name is dead next to
+        // a generation too; the files it does name stay.
+        std::fs::write(f.dir.join("chunks-1-2.hnsw.data"), b"x").unwrap();
+        cleanup_stale_index_files(&f.dir);
+        assert!(!f.dir.join("chunks-1-2.hnsw.data").exists());
+
+        assert_eq!(
+            snapshot(&chunk_files(&f.dir)),
+            before,
+            "chunk files changed"
+        );
+        let manifest_after: IndexManifest =
+            serde_json::from_slice(&std::fs::read(f.dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest_after.chunk_basename,
+            manifest_before.chunk_basename
+        );
+        assert_eq!(manifest_after.chunk_id_map, manifest_before.chunk_id_map);
+        assert_eq!(
+            manifest_after.chunk_embeddings_expected,
+            manifest_before.chunk_embeddings_expected
+        );
+        assert_eq!(manifest_after.reflection_embeddings_expected, 3);
+
+        // The next load sees the reflections written, still on the generation.
+        drop(engine);
+        let reloaded = SearchEngine::load_with_generation(&f.dir, &f.storage, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.reflection_count(), 3);
+        assert_eq!(top(&reloaded, &vector(7), 1)[0].id, "c7");
+        // And the index-v3 path still loads its untouched chunk graph.
+        assert!(SearchEngine::load_from_disk(&f.dir, N, 3)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn vector_gen_matches_the_exact_answer_over_a_larger_corpus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open_memory().unwrap();
+        let n = 3000;
+        let mut ids = Vec::new();
+        let mut flat = Vec::new();
+        for i in 0..n {
+            let id = format!("c{i}");
+            put(&storage, &id, &vector(i));
+            flat.extend(vector(i));
+            ids.push(id);
+        }
+        let manifest =
+            index_gen::build(&flat, DIMS, &ids, tmp.path(), 1, max_seq(&storage), 2).unwrap();
+        index_gen::write_watermark(&storage, &manifest).unwrap();
+        // 30 deletes and 30 upserts after the watermark.
+        for i in 0..30 {
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "DELETE FROM chunk_embeddings WHERE chunk_id=?1",
+                        [format!("c{i}")],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            put(&storage, &format!("c{}", 100 + i), &vector(5000 + i));
+        }
+        let engine = SearchEngine::load_with_generation(tmp.path(), &storage, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(engine.chunk_count(), n - 30);
+        // Every query that was a deleted chunk finds a live neighbour, never
+        // the deleted id, and the page is full.
+        for i in 0..30 {
+            let hits = top(&engine, &vector(i), 10);
+            assert_eq!(hits.len(), 10);
+            assert!(hits.iter().all(|h| h.id != format!("c{i}")));
+        }
+        // Upserted chunks answer to their new vectors.
+        for i in 0..30 {
+            assert_eq!(
+                top(&engine, &vector(5000 + i), 1)[0].id,
+                format!("c{}", 100 + i)
+            );
+        }
     }
 }

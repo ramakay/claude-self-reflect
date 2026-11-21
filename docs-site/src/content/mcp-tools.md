@@ -2,7 +2,7 @@
 title: MCP Tools Reference
 ---
 
-15 tools available to Claude automatically via MCP.
+16 tools available to Claude automatically via MCP.
 
 ## Search Tools
 
@@ -17,7 +17,7 @@ Semantic search across all past conversations.
 | min_score | float | 0.3 | Minimum similarity (0-1) |
 
 ### csr_quick_check
-Fast existence check — count + top match only, with measured abstention (v9.5).
+Fast existence check — count + top match only, with measured abstention.
 
 The score floor is derived from probing topics that were never discussed
 against the full corpus. Below the floor the tool refuses rather than
@@ -31,6 +31,18 @@ fabricates:
   <floor>0.45</floor>
 </quick_search>
 ```
+
+Every positive answer carries `<conversation_id>`, `<chunk_id>` and `<project>`
+of the evidence, so you can open it with `csr_transcript` or `csr_reflect_on_past`.
+
+When the query is, or holds, an exact identifier (a digit run of eight or more,
+a token such as `Bond-ZZHE87751` or `INV_2024_0007`, a UUID, a commit SHA),
+`<found>true</found>` means the identifier appears in the returned text, as a
+whole token. The answer then carries `<exact>true</exact>` and
+`<matched_identifiers>`. If no stored text holds it, the answer is
+`<found>false</found>` with `<exact>false</exact>`; a chunk that is only similar
+is listed under `<nearest_related>`, labelled as not containing the
+identifier. Restatements of your own question do not count as evidence.
 
 Scores in the weak band (0.45–0.62) are returned but carry an explicit
 warning — matches there are not distinguishable from never-discussed topics,
@@ -46,11 +58,35 @@ before treating this as evidence the topic came up.</warning>
 ### search_by_recency
 Time-constrained search. Supports: "today", "last week", "last 3 months", etc.
 
+The header prints the exact UTC bounds that were searched. "last month" and
+"last week" are calendar periods: on 17 November, "last month" is 1 October up
+to 1 November, so a session from 2 November is outside it ("last 2 months" or
+"last 30 days" holds it). When the window holds nothing that clears the
+relevance floor, the answer says so and names the next wider window.
+
+### Result pages (csr_reflect_on_past)
+A row marked `<tier>weak</tier>` is a keyword-only hit, or a score under the
+relevance floor, that holds no identifier of your query. It keeps its place so
+paging holds; read it as a lead, not an answer. The first row is never marked.
+Rows are in ranked order (the vector, keyword and identifier channels fused by
+reciprocal rank, then reranked), and the score `s` of a row is its own
+similarity, so it need not fall from row to row; when it does not, the page's
+`<meta>` carries an `<order>` note. Identical text held by more than one
+conversation is shown once, and `<same-text-collapsed>` counts the copies left
+out (`CSR_NO_SAME_TEXT_COLLAPSE=1` shows them all). When copies of one text fill
+the first candidate window, the search reads one wider window (three times the
+first), so the page still fills with distinct rows that sit beyond the copies.
+When copies fill that window too, the page is short and its `<meta>` carries a
+`<short-page>` line saying distinct rows may sit beyond it. The pages of `csr_get_more`
+carry the same `<tier>weak</tier>` mark and the same `<weak-matches>` and
+`<order>` lines in their header; only the first row of the first page is
+exempt.
+
 ### csr_search_by_file
 Find conversations that discussed or modified a file. Uses 2-component matching (parent + filename).
 
 For code files with graph coverage, returns a per-symbol ledger with
-two-channel attribution (v9.5) — each symbol shows *how* its origin is known,
+two-channel attribution — each symbol shows *how* its origin is known,
 never a guess:
 
 ```xml
@@ -67,6 +103,8 @@ Channels that disagree by more than 48h are shown labeled, never merged.
 Symbols with no evidence in either channel render `unattributed` — they do
 not inherit their file's first toucher.
 
+In v10.1 the tool also appends a `<code_map>` section from the live code map (no new tool; there are still 16). For each matching path (an absolute path by its worktree, else an exact repo-relative path, else a suffix on a `/` boundary, at most 10) it lists the worktrees holding the file, grouped by blob (`same blob in main, a; differs in b (dirty)`), plus the definitions in the blob most worktrees share. When no conversation touched the file, it says so and the map is the answer. The section is at most 1,500 bytes and read-only. `CSR_NO_CODEMAP=1` removes it.
+
 ### csr_search_by_concept
 Theme-based cross-project search. E.g., "security patterns", "error handling".
 
@@ -79,11 +117,13 @@ Pagination for additional results.
 ### csr_code_graph
 Conversation-provenance code graph. Query which conversations touched a function or file — AST anchors link code symbols to the sessions that shaped them.
 
-Since v9.5, every edge and origin claim is evidence-labeled: call/import
+Every edge and origin claim is evidence-labeled: call/import
 edges resolve only through recorded witnesses (or state why they cannot —
 `external`, `method-dispatched`, `stale`, `local`), symbol origins come from
 the two-channel attribution described under `csr_search_by_file`, and the
 system abstains visibly (`unattributed`, `unverified:`) instead of guessing.
+
+In v10.1 the tool also appends a `<code_map>` section with the map's definitions of the exact symbol name. When the conversation graph does not know the symbol, the answer comes from the map. The map holds definitions, not call edges, and the answer says so: callers and callees are not in it. The section is at most 1,500 bytes and read-only. `CSR_NO_CODEMAP=1` removes it.
 
 ## Activity Tools
 
@@ -98,6 +138,14 @@ Retrieve complete JSONL conversation by ID.
 
 ### get_session_learnings
 Iteration-level memory for Ralph loops.
+
+### csr_transcript
+
+Structured facts from one Claude Code session transcript, without a hand-rolled `jq` or Python parser. Pick a `view`: `stats`, `prompts`, `tools`, `files`, `errors`, `slice` or `grep`. Every view shows its turn numbers, so a follow-up `slice` can zoom in. Large results end with a truncation marker and a `turns` hint to resume. The `prompts` view shows only turns you typed unless you pass `include_system: true`. Read-only.
+
+```python
+csr_transcript(session="a1b2c3d4", view="grep", grep="migration")
+```
 
 ## Storage Tools
 

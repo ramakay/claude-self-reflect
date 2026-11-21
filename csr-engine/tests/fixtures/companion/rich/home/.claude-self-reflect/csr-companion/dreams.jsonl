@@ -1,0 +1,13 @@
+{"kind":"chapter","session":"sess-now","at":1792314000.0,"of":5}
+{"kind":"dream","id":"passed1","session":"sess-now","at":1792315200.0,"line":"What if the queue kept every job?","title":"Keep every job","text":"- Jobs are cheap to keep.\n- Drop them after a week."}
+{"kind":"answer","id":"passed1","answer":"not_relevant","at":1792315260.0}
+{"kind":"dream","id":"passed2","session":"sess-now","at":1792316400.0,"line":"What if exports ran at night only?","title":"Night-only exports","text":"- Nights have spare capacity."}
+{"kind":"answer","id":"passed2","answer":"dismiss","at":1792316460.0}
+{"kind":"dream","id":"older","session":"sess-now","at":1792319500.0,"line":"What if every read stayed bounded?","title":"A small reader","text":"- Bound the tail before parsing."}
+{"kind":"answer","id":"older","answer":"helpful","at":1792319550.0}
+{"kind":"look","at":1792315800.0,"outcome":"quiet","every":8,"tokens":0}
+{"kind":"look","at":1792317900.0,"outcome":"dream","every":8,"tokens":41000,"model":"claude-opus-5","usage":{"input_tokens":3000,"output_tokens":1800,"cache_read_input_tokens":30000,"cache_creation_input_tokens":6200}}
+{"kind":"look","at":1792319400.0,"outcome":"dream","every":8,"tokens":38000,"model":"claude-opus-5","usage":{"input_tokens":2500,"output_tokens":1500,"cache_read_input_tokens":28000,"cache_creation_input_tokens":6000}}
+{"kind":"dream","id":"newest","session":"sess-now","at":1792319940.0,"line":"What if a frame failed while the agent was busy?","title":"Keep the pane alive","text":"- Catch a failing frame without losing the terminal.\n- Keep the heartbeat independent of the renderer.\n- Retry after a short backoff."}
+{"kind":"compact","event":"compact","outcome":"compacted","session":"sess-now","at":1792319140.0,"ctx_before":195000,"ctx_after":21000,"took_ms":70000}
+{"kind":"compact","event":"compact","outcome":"compacted","session":"sess-now","at":1792319870.0,"ctx_before":192000,"ctx_after":21500,"took_ms":79000,"why":"context passed the band","keep":{"running":["Export job wired to the nightly queue"],"decisions":["Retries use jittered backoff"],"work":["Edited the export job in lib.rs"],"rules":["Keep the read-only database boundary"]}}

@@ -1,0 +1,1626 @@
+//! Structured transcript-query primitive for Claude Code session JSONL files.
+//!
+//! Agents resuming or auditing a session need structured facts from its raw
+//! transcript ("what did the user ask", "which files were touched", "what
+//! failed") without hand-rolling a jq/Python parser over multi-megabyte
+//! JSONL every time. This module streams a session transcript line-by-line
+//! (never buffers the whole file) and exposes purpose-built views
+//! (`stats`/`prompts`/`yourasks`/`tools`/`files`/`errors`/`slice`/`grep`) over it.
+//!
+//! See `.plans/transcript-query-tool-design.md` for the full design and
+//! rationale.
+//!
+//! ## Reuse note (design doc "Schema-drift posture")
+//!
+//! `crate::import` already parses this same JSONL schema
+//! (`parse_jsonl_messages`, `classify_message_author`, `extract_tool_results`,
+//! …), but those functions buffer the *entire file* into
+//! `Vec<serde_json::Value>` and silently drop any `type` other than
+//! `human`/`user`/`assistant` — both wrong for this tool's streaming and
+//! drift-counting requirements (this module must never buffer a 65MB file,
+//! and must *count* unrecognized entries rather than discard them). Reshaping
+//! import's internals to serve both call sites was judged out of scope for a
+//! sidequest landing on a release-gate branch with a concurrent in-flight
+//! edit to the dream/report path. This module therefore duplicates the
+//! handful of small structural pieces it needs (content-block matching,
+//! tool_use/tool_result field extraction) — deliberate v1 duplication,
+//! documented here rather than hidden.
+//!
+//! Session-id → path resolution, however, *is* shared: both this module and
+//! `get_full_conversation` call [`crate::mcp::tools::find_conversation_file`].
+
+pub(crate) mod chunks;
+#[cfg(test)]
+mod chunks_tests;
+pub mod instrumentation;
+pub mod intent_events;
+pub mod query;
+pub mod reach;
+pub mod receipt;
+#[cfg(test)]
+mod replaced_tests;
+#[cfg(test)]
+mod star_tests;
+
+use anyhow::{Context, Result};
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+
+// ─── Entry model ───
+
+/// Who authored a recognized transcript entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    User,
+    Assistant,
+    System,
+}
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => "system",
+        }
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A `tool_use` content block, with the key input fields views care about
+/// lifted to the top level (per design: file_path, command, pattern, prompt).
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolUse {
+    pub id: Option<String>,
+    pub name: String,
+    pub file_path: Option<String>,
+    pub command: Option<String>,
+    pub pattern: Option<String>,
+    pub prompt: Option<String>,
+    /// The whole `input` object. Kept only when the parse asks for full
+    /// results (`grep` and `slice`); `None` otherwise. Never serialized.
+    #[serde(skip)]
+    pub input: Option<serde_json::Value>,
+}
+
+/// A `tool_result` content block. `preview` is a bounded, char-boundary-safe
+/// prefix of the flattened result text; `byte_size` is the full flattened
+/// text's byte length (not just the preview) so `stats`/`files` byte totals
+/// are honest even when the preview is cut.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolResult {
+    pub tool_use_id: Option<String>,
+    pub is_error: bool,
+    pub byte_size: usize,
+    pub preview: String,
+    /// The whole flattened result text. Kept only when the parse asks for
+    /// full results (`grep` and `slice`); `None` otherwise. Never serialized.
+    #[serde(skip)]
+    pub full: Option<String>,
+    /// An error result whose whole text carries a build, test, panic or git failure marker.
+    /// Read at parse time, because the marker can sit past the preview. Never serialized.
+    #[serde(skip)]
+    pub failure_marker: bool,
+}
+
+/// One recognized transcript entry ("turn"). Turn numbers are 1-based and
+/// assigned sequentially over recognized entries only (unrecognized lines
+/// never consume a turn number, so `--turns` ranges stay stable across
+/// schema-drift noise).
+#[derive(Debug, Clone, Serialize)]
+pub struct Entry {
+    pub turn: usize,
+    pub role: Role,
+    pub timestamp: Option<String>,
+    pub uuid: Option<String>,
+    pub is_sidechain: bool,
+    pub text: String,
+    pub tool_uses: Vec<ToolUse>,
+    pub tool_results: Vec<ToolResult>,
+    /// Top-level `origin.kind` (`"human"`, `"task-notification"`, `"peer"`,
+    /// …), or `attachment.origin.kind` for a queued_command attachment.
+    /// `None` on legacy transcripts that predate the field, and on every
+    /// synthetic entry this module builds itself (queue-operation echoes,
+    /// file-history deltas). Used only by `prompt_noise_class` — kept out of
+    /// every view's JSON output (`skip_serializing_if`) so no existing
+    /// output shape changes (inbox-B3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_kind: Option<String>,
+    /// Top-level `isMeta`, or `attachment.isMeta` for a queued_command
+    /// attachment. Marks skill bodies, local-command caveats, image
+    /// companions, and other harness-authored non-prose user turns.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_meta: bool,
+    /// Top-level `isCompactSummary` — marks the "This session is being
+    /// continued from a previous conversation…" summary Claude Code injects
+    /// as a user turn after `/compact`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_compact_summary: bool,
+}
+
+impl Entry {
+    /// True if this entry carries no genuine text and no tool activity
+    /// (e.g. a `system` hook-summary entry, or a `user` entry that is
+    /// tool_result-only).
+    pub fn is_empty_of_content(&self) -> bool {
+        self.text.trim().is_empty() && self.tool_uses.is_empty() && self.tool_results.is_empty()
+    }
+
+    /// True for the `system` entry Claude Code writes when it compacts.
+    /// The parser keeps a system entry's subtype in the text as
+    /// `[system:<subtype>]`, so this reads it from there.
+    pub fn is_compact_boundary(&self) -> bool {
+        const LABEL: &str = "[system:compact_boundary]";
+        self.role == Role::System
+            && self
+                .text
+                .strip_prefix(LABEL)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    }
+}
+
+/// Result of a streaming parse pass: recognized entries plus drift stats.
+#[derive(Debug, Clone, Default)]
+pub struct ParsedTranscript {
+    pub entries: Vec<Entry>,
+    /// Total non-blank lines seen (recognized + metadata + unrecognized).
+    pub total_lines: usize,
+    /// Lines whose shape IS a known Claude Code vendor kind (queue
+    /// bookkeeping other than a fresh `enqueue`, hook/task/plan
+    /// attachments, session UI state, bulk file-tracking checkpoints, …)
+    /// but that carry no fidelity-critical content for v1 views, so they
+    /// are counted rather than turned into an `Entry`. Kept separate from
+    /// `unrecognized_entries` so `stats` shows the real schema-drift
+    /// signal instead of drowning it in expected, already-classified noise
+    /// (adversarial review finding 1).
+    pub metadata_entries: usize,
+    /// Lines that were malformed JSON, or whose shape does not match any
+    /// known kind (recognized message type or metadata kind). Never causes
+    /// a panic or an abort — the fail-honest pattern `aux_schema_miss:*`
+    /// already uses on the import side (see repo CLAUDE.md). This is the
+    /// number that should stay near zero on a real transcript; a nonzero
+    /// count is the actual schema-drift signal.
+    pub unrecognized_entries: usize,
+    /// `api-request-blob` lines: request copies that hold message content.
+    /// They never become entries or turns, and they are not schema drift, so
+    /// they have their own count and do not close the receipt gate.
+    pub request_blobs: usize,
+    /// `remove`/`dequeue` `queue-operation` bookkeeping lines, in file
+    /// order, positioned relative to `entries` — an `enqueue` line already
+    /// becomes a real `Entry` (see `classify_queue_operation`), but
+    /// `remove`/`dequeue` carried no fidelity-critical text of their own so
+    /// they were previously dropped as `Metadata` entirely. `render_prompts`
+    /// needs them to know when a queued prompt was withdrawn (never
+    /// delivered) instead of staying armed to dedupe an unrelated later
+    /// prompt with the same text (gap-G6, inbox-B3 review #2 finding 1a).
+    pub(crate) queue_events: Vec<QueueEvent>,
+    /// For each hook attachment that carries a compact receipt: how many entries came before
+    /// it. A hook attachment is metadata and takes no turn; this only records that the
+    /// receipt is in the transcript, and where.
+    pub(crate) hook_receipts: Vec<usize>,
+    /// Parsed from the transcript mirror's scrubbed copy, not the original JSONL.
+    pub from_mirror: bool,
+    /// Why decoding the mirror copy stopped before its end (a torn or corrupt
+    /// frame). Everything after the damage is missing from this parse.
+    pub read_error: Option<String>,
+}
+
+/// A `queue-operation` line other than `enqueue` — `remove` or `dequeue` —
+/// positioned relative to `ParsedTranscript::entries`.
+#[derive(Debug, Clone)]
+pub(crate) struct QueueEvent {
+    pub op: QueueOpKind,
+    /// Normalized (`strip_control_chars` + trim) content, when the line
+    /// carried a non-empty `content` field. Real `dequeue` lines are
+    /// observed with an empty/absent `content` (verified against a live
+    /// transcript: 57/57 dequeues carry no content) — those decode to
+    /// `None`.
+    pub content: Option<String>,
+    /// `ParsedTranscript::entries.len()` at the moment this line was seen
+    /// during parsing — i.e. this event occurred immediately before
+    /// `entries[before_entry_index]` (or after the last entry, if this
+    /// equals `entries.len()`).
+    pub before_entry_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueOpKind {
+    Remove,
+    Dequeue,
+}
+
+/// Per-tool_result-character cap for the `preview` field. Mirrors the spirit
+/// of `import::mod`'s per-block cap without importing its private constant.
+const TOOL_RESULT_PREVIEW_CHARS: usize = 400;
+
+/// Stream-parse a JSONL transcript file line by line via `BufReader` — the
+/// full file is never read into memory at once. Malformed JSON lines and
+/// entries whose `type` is not `user`/`assistant`/`system` are counted in
+/// `unrecognized_entries` and skipped; parsing never panics and never stops
+/// early on bad input.
+pub fn parse_transcript(path: &Path) -> Result<ParsedTranscript> {
+    parse_transcript_with(path, ParseOpts::default())
+}
+
+/// Which entries keep their full tool payloads when `full_results` is on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FullScope {
+    /// Every entry. `grep` needs this.
+    #[default]
+    All,
+    /// Only the entries whose turn is in the inclusive range. `end: None`
+    /// means through the last turn.
+    Turns(usize, Option<usize>),
+    /// Only the last `n` entries whose role matches. The parser drops the
+    /// payloads of older entries as it goes on.
+    Last(usize, RoleFilter),
+}
+
+/// What a parse keeps. The default keeps what every view but `grep` and
+/// `slice` needs, so the memory cost of the other callers does not change.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ParseOpts {
+    /// Keep the full text of each tool result and the whole input object of
+    /// each tool call. Only `grep` and `slice` read them.
+    pub full_results: bool,
+    /// Which entries keep them. Read only when `full_results` is on.
+    pub scope: FullScope,
+}
+
+impl ParseOpts {
+    /// The parse a request's view needs.
+    pub fn for_view(view: ViewKind) -> ParseOpts {
+        ParseOpts {
+            full_results: matches!(view, ViewKind::Grep | ViewKind::Slice),
+            scope: FullScope::All,
+        }
+    }
+
+    /// The parse a request needs. A `slice` shows only the entries it selects,
+    /// so only those keep their full payloads. `grep` matches every entry.
+    pub fn for_request(req: &TranscriptRequest) -> ParseOpts {
+        let mut opts = ParseOpts::for_view(req.view);
+        if req.view == ViewKind::Slice {
+            opts.scope = match req.turns {
+                Some((start, end)) => FullScope::Turns(start, end),
+                None => FullScope::Last(req.last.unwrap_or(DEFAULT_LAST_N), req.role),
+            };
+        }
+        opts
+    }
+}
+
+/// [`parse_transcript`] with explicit [`ParseOpts`].
+pub fn parse_transcript_with(path: &Path, opts: ParseOpts) -> Result<ParsedTranscript> {
+    let file =
+        File::open(path).with_context(|| format!("opening transcript {}", path.display()))?;
+    let reader = BufReader::new(file);
+    Ok(parse_transcript_reader(reader, opts))
+}
+
+/// [`parse_transcript`] over a transcript mirror file (`*.jsonl.zst`),
+/// decoded as a stream: even the largest transcript is never held decoded.
+pub fn parse_mirrored_transcript(path: &Path) -> Result<ParsedTranscript> {
+    parse_mirrored_transcript_with(path, ParseOpts::default())
+}
+
+/// [`parse_mirrored_transcript`] with explicit [`ParseOpts`].
+pub fn parse_mirrored_transcript_with(path: &Path, opts: ParseOpts) -> Result<ParsedTranscript> {
+    let (reader, failure) = crate::mirror::open_transcript_checked(path)
+        .with_context(|| format!("opening mirrored transcript {}", path.display()))?;
+    let mut parsed = parse_transcript_reader(reader, opts);
+    parsed.from_mirror = true;
+    parsed.read_error = failure.lock().ok().and_then(|mut slot| slot.take());
+    Ok(parsed)
+}
+
+/// [`parse_transcript`] over the first `limit` bytes only, for a caller that
+/// took the file's length earlier and must not see rows appended since.
+pub fn parse_transcript_limited(path: &Path, limit: u64) -> Result<ParsedTranscript> {
+    use std::io::Read;
+    let file =
+        File::open(path).with_context(|| format!("opening transcript {}", path.display()))?;
+    Ok(parse_transcript_reader(
+        BufReader::new(file.take(limit)),
+        ParseOpts::default(),
+    ))
+}
+
+pub(crate) fn parse_transcript_fragment(raw: &str) -> ParsedTranscript {
+    parse_transcript_reader(BufReader::new(raw.as_bytes()), ParseOpts::default())
+}
+
+/// What the line pass counted besides the entries it handed out.
+#[derive(Default)]
+struct StreamTally {
+    total_lines: usize,
+    metadata_entries: usize,
+    unrecognized_entries: usize,
+    request_blobs: usize,
+    queue_events: Vec<QueueEvent>,
+    hook_receipts: Vec<usize>,
+}
+
+/// A main-thread SessionStart attachment whose output holds a whole compact receipt block.
+/// Real SessionStart output is `attachment.type == "hook_success"`, `hookEvent == "SessionStart"`,
+/// with the text in `attachment.content`. Another hook naming the sentinel is a mention.
+fn is_hook_receipt(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(|v| v.as_str()) == Some("attachment")
+        && value.get("isSidechain").and_then(|v| v.as_bool()) != Some(true)
+        && value.get("attachment").is_some_and(|a| {
+            a.get("type").and_then(|v| v.as_str()) == Some("hook_success")
+                && a.get("hookEvent").and_then(|v| v.as_str()) == Some("SessionStart")
+                && a.get("content")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(receipt::holds_block)
+        })
+}
+
+/// The one line pass. It classifies each line, numbers the recognized entries
+/// and hands each to `on_entry`. The full parse and the range scan both run
+/// it, so their entry numbers agree by construction.
+fn stream_entries(
+    reader: impl BufRead,
+    opts: ParseOpts,
+    mut on_entry: impl FnMut(Entry),
+) -> StreamTally {
+    let mut out = StreamTally::default();
+    let mut turn = 0usize;
+    // (timestamp, text) pairs already materialized as a queued-instruction
+    // entry — Claude Code records the same "enqueue" event under two
+    // different top-level line shapes (`queue-operation` and
+    // `attachment.queued_command`); this dedupes them across the whole
+    // file so the same instruction is never shown twice (see
+    // `classify_queue_operation`/`classify_attachment`).
+    let mut seen_queued: HashSet<(String, String)> = HashSet::new();
+
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => {
+                out.total_lines += 1;
+                out.unrecognized_entries += 1;
+                continue;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.total_lines += 1;
+
+        let value: serde_json::Value = match sonic_rs::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                out.unrecognized_entries += 1;
+                continue;
+            }
+        };
+
+        if is_hook_receipt(&value) {
+            out.hook_receipts.push(turn);
+        }
+        match classify_line(&value, &mut seen_queued, &mut out.queue_events, turn, opts) {
+            LineOutcome::Entry(mut entry) => {
+                turn += 1;
+                entry.turn = turn;
+                on_entry(entry);
+            }
+            LineOutcome::Metadata => out.metadata_entries += 1,
+            LineOutcome::RequestBlob => out.request_blobs += 1,
+            LineOutcome::Unrecognized => out.unrecognized_entries += 1,
+        }
+    }
+
+    out
+}
+
+/// Drop the full payloads of an entry. The preview and byte size stay.
+fn drop_full_payloads(entry: &mut Entry) {
+    for tu in &mut entry.tool_uses {
+        tu.input = None;
+    }
+    for tr in &mut entry.tool_results {
+        tr.full = None;
+    }
+}
+
+fn parse_transcript_reader(reader: impl BufRead, opts: ParseOpts) -> ParsedTranscript {
+    let mut entries: Vec<Entry> = Vec::new();
+    // Indices of the entries that still hold full payloads, for `FullScope::Last`.
+    let mut window: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let tally = stream_entries(reader, opts, |mut entry| {
+        if opts.full_results {
+            match opts.scope {
+                FullScope::All => {}
+                FullScope::Turns(start, end) => {
+                    if entry.turn < start || end.is_some_and(|e| entry.turn > e) {
+                        drop_full_payloads(&mut entry);
+                    }
+                }
+                FullScope::Last(n, role) => {
+                    if role.matches_role(entry.role) {
+                        window.push_back(entries.len());
+                    } else {
+                        drop_full_payloads(&mut entry);
+                    }
+                    entries.push(entry);
+                    if window.len() > n {
+                        if let Some(old) = window.pop_front() {
+                            drop_full_payloads(&mut entries[old]);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        entries.push(entry);
+    });
+    ParsedTranscript {
+        entries,
+        total_lines: tally.total_lines,
+        metadata_entries: tally.metadata_entries,
+        unrecognized_entries: tally.unrecognized_entries,
+        request_blobs: tally.request_blobs,
+        queue_events: tally.queue_events,
+        hook_receipts: tally.hook_receipts,
+        from_mirror: false,
+        read_error: None,
+    }
+}
+
+/// What one JSONL line resolves to.
+enum LineOutcome {
+    /// A recognized, fidelity-critical entry — consumes a turn number.
+    /// `Entry::turn` is a placeholder (0) here; the caller assigns the
+    /// real turn once it knows the line will be kept.
+    Entry(Entry),
+    /// A recognized vendor/harness line whose content is not
+    /// fidelity-critical for v1 views (see `ParsedTranscript::metadata_entries`).
+    Metadata,
+    /// An `api-request-blob` line: it holds message content, so it is never
+    /// turned into an entry, but it is a known kind and not schema drift.
+    RequestBlob,
+    /// Malformed JSON or a shape we don't recognize at all — the actual
+    /// schema-drift signal.
+    Unrecognized,
+}
+
+/// Classify one already-JSON-parsed transcript line. Dispatches on the
+/// top-level `type` field; see module doc + `.plans/transcript-query-tool-design.md`
+/// for the full inventory of Claude Code JSONL line kinds this was verified
+/// against (a real 12,270-line transcript — every kind below is a shape
+/// actually observed there).
+fn classify_line(
+    value: &serde_json::Value,
+    seen_queued: &mut HashSet<(String, String)>,
+    queue_events: &mut Vec<QueueEvent>,
+    entries_so_far: usize,
+    opts: ParseOpts,
+) -> LineOutcome {
+    let Some(type_str) = value.get("type").and_then(|v| v.as_str()) else {
+        return LineOutcome::Unrecognized;
+    };
+
+    match type_str {
+        "user" | "assistant" | "system" => {
+            LineOutcome::Entry(build_message_entry(type_str, value, opts))
+        }
+        "queue-operation" => {
+            classify_queue_operation(value, seen_queued, queue_events, entries_so_far)
+        }
+        "attachment" => classify_attachment(value, seen_queued),
+        "file-history-delta" => classify_file_history_delta(value),
+        // Recognized vendor/harness metadata kinds that carry no
+        // fidelity-critical content for v1 views: session UI/CLI state
+        // (mode, permission-mode, ai-title, agent-name, last-prompt,
+        // bridge-session), PR linkage (pr-link), and bulk file-tracking
+        // checkpoints (file-history-snapshot — a cumulative map of every
+        // currently-tracked file's backup metadata, not a single-file
+        // touch event; `file-history-delta` above is the per-touch signal
+        // that feeds the `files` view).
+        //
+        // Later harness kinds with no conversation text in the payload:
+        // `atis-latch` (an opaque token), `cost-state` (cost and token
+        // totals), `session-owner` (account ids), `tools-used` (tool
+        // names), `custom-title` (a session title), `api-request` (request
+        // parameters and hashes) and `api-request-shape` (the system prompt
+        // and tool schemas of a request). `api-request-blob` is NOT here:
+        // it holds message content, so it must never become an entry or a
+        // turn. It is counted on its own (`request_blobs`), apart from drift.
+        "last-prompt"
+        | "mode"
+        | "permission-mode"
+        | "ai-title"
+        | "agent-name"
+        | "bridge-session"
+        | "pr-link"
+        | "file-history-snapshot"
+        | "atis-latch"
+        | "cost-state"
+        | "session-owner"
+        | "tools-used"
+        | "custom-title"
+        | "api-request"
+        | "api-request-shape" => LineOutcome::Metadata,
+        "api-request-blob" => LineOutcome::RequestBlob,
+        _ => LineOutcome::Unrecognized,
+    }
+}
+
+/// Build a recognized `user`/`assistant`/`system` entry. `turn` is left at
+/// 0 — the caller in `parse_transcript` assigns it.
+fn build_message_entry(type_str: &str, value: &serde_json::Value, opts: ParseOpts) -> Entry {
+    let role = match type_str {
+        "user" => Role::User,
+        "assistant" => Role::Assistant,
+        _ => Role::System,
+    };
+
+    let timestamp = value
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let uuid = value
+        .get("uuid")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let is_sidechain = value
+        .get("isSidechain")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let origin_kind = value
+        .get("origin")
+        .and_then(|o| o.get("kind"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let is_meta = value
+        .get("isMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let is_compact_summary = value
+        .get("isCompactSummary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut text = String::new();
+    let mut tool_uses = Vec::new();
+    let mut tool_results = Vec::new();
+
+    if role == Role::System {
+        // Most `system` entries (stop_hook_summary, turn_duration) carry
+        // structured metadata, not prose — surface the subtype as a short
+        // label so `slice`/`grep` still have something to show. A few
+        // subtypes (away_summary, compact_boundary) DO carry a genuine
+        // `content` string — preserve it instead of discarding it (this was
+        // finding 1's "29 recognized summary entries lose their content").
+        let subtype = value.get("subtype").and_then(|v| v.as_str());
+        let content = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .filter(|c| !c.trim().is_empty());
+        text = match (subtype, content) {
+            (Some(st), Some(c)) => format!("[system:{st}] {}", strip_control_chars(c)),
+            (Some(st), None) => format!("[system:{st}]"),
+            (None, _) => "[system]".to_string(),
+        };
+    } else if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
+        flatten_content(content, &mut text, &mut tool_uses, &mut tool_results, opts);
+    }
+
+    Entry {
+        turn: 0,
+        role,
+        timestamp,
+        uuid,
+        is_sidechain,
+        text,
+        tool_uses,
+        tool_results,
+        origin_kind,
+        is_meta,
+        is_compact_summary,
+    }
+}
+
+/// `{"type":"queue-operation","operation":"enqueue"|"dequeue"|"remove"|"popAll",...}`
+/// records queued-input-box bookkeeping. Only `enqueue` introduces text
+/// that doesn't appear anywhere else in the transcript (verified against a
+/// real transcript: `dequeue`/`remove` entries' `content`, when present,
+/// duplicates an earlier `enqueue`'s text word-for-word) — materializing
+/// every operation would just repeat the same queued instruction.
+fn classify_queue_operation(
+    value: &serde_json::Value,
+    seen_queued: &mut HashSet<(String, String)>,
+    queue_events: &mut Vec<QueueEvent>,
+    entries_so_far: usize,
+) -> LineOutcome {
+    match value.get("operation").and_then(|v| v.as_str()) {
+        Some("remove") => {
+            queue_events.push(QueueEvent {
+                op: QueueOpKind::Remove,
+                content: value
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|c| strip_control_chars(c).trim().to_string())
+                    .filter(|c| !c.is_empty()),
+                before_entry_index: entries_so_far,
+            });
+            return LineOutcome::Metadata;
+        }
+        Some("dequeue") => {
+            queue_events.push(QueueEvent {
+                op: QueueOpKind::Dequeue,
+                content: value
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|c| strip_control_chars(c).trim().to_string())
+                    .filter(|c| !c.is_empty()),
+                before_entry_index: entries_so_far,
+            });
+            return LineOutcome::Metadata;
+        }
+        Some("enqueue") => {}
+        _ => return LineOutcome::Metadata,
+    }
+    let Some(content) = value.get("content").and_then(|v| v.as_str()) else {
+        return LineOutcome::Metadata;
+    };
+    if content.trim().is_empty() {
+        return LineOutcome::Metadata;
+    }
+    let timestamp = value
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    if !remember_queued(seen_queued, timestamp.as_deref(), content) {
+        return LineOutcome::Metadata; // already captured via a matching attachment/queue-operation line
+    }
+    LineOutcome::Entry(Entry {
+        turn: 0,
+        role: Role::User,
+        timestamp,
+        uuid: None,
+        is_sidechain: false,
+        text: format!("[queued] {}", strip_control_chars(content)),
+        tool_uses: vec![],
+        tool_results: vec![],
+        origin_kind: None,
+        is_meta: false,
+        is_compact_summary: false,
+    })
+}
+
+/// A `queued_command` attachment: a prompt typed (or injected by the harness)
+/// while Claude was busy. The one parse rule for every reader of these rows.
+pub(crate) struct QueuedCommand {
+    /// The prompt text; a string, or the text blocks of an array joined.
+    pub prompt: String,
+    /// `humanTurn`: the person typed it. False for task notifications and other
+    /// harness-queued text.
+    pub human_turn: bool,
+}
+
+/// `attachment` is the row's `attachment` object. `None` for any other
+/// attachment kind and for an empty prompt.
+pub(crate) fn queued_command(attachment: &serde_json::Value) -> Option<QueuedCommand> {
+    if attachment.get("type").and_then(|v| v.as_str()) != Some("queued_command") {
+        return None;
+    }
+    let prompt = match attachment.get("prompt")? {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    if prompt.trim().is_empty() {
+        return None;
+    }
+    Some(QueuedCommand {
+        prompt,
+        human_turn: attachment.get("humanTurn").and_then(|v| v.as_bool()) == Some(true),
+    })
+}
+
+/// `{"type":"attachment","attachment":{"type":"queued_command","prompt":...}}`
+/// is a second on-disk representation of the same enqueue event
+/// `queue-operation` records (verified: 145/147 real `queued_command`
+/// attachments share an exact `(timestamp, text)` pair with a
+/// `queue-operation` line) — deduped via `seen_queued` against whichever
+/// shape was seen first. Every other attachment kind (hook_success,
+/// task_reminder, file, plan_mode, …) is harness/UI bookkeeping, not a
+/// user instruction, so it stays metadata.
+fn classify_attachment(
+    value: &serde_json::Value,
+    seen_queued: &mut HashSet<(String, String)>,
+) -> LineOutcome {
+    let Some(attachment) = value.get("attachment") else {
+        return LineOutcome::Metadata;
+    };
+    let Some(queued) = queued_command(attachment) else {
+        return LineOutcome::Metadata;
+    };
+    let prompt = queued.prompt.as_str();
+    let timestamp = attachment
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("timestamp").and_then(|v| v.as_str()))
+        .map(str::to_string);
+    if !remember_queued(seen_queued, timestamp.as_deref(), prompt) {
+        return LineOutcome::Metadata;
+    }
+    let uuid = value
+        .get("uuid")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let origin_kind = attachment
+        .get("origin")
+        .and_then(|o| o.get("kind"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("origin")
+                .and_then(|o| o.get("kind"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    let is_meta = attachment
+        .get("isMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || value
+            .get("isMeta")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    LineOutcome::Entry(Entry {
+        turn: 0,
+        role: Role::User,
+        timestamp,
+        uuid,
+        is_sidechain: value
+            .get("isSidechain")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        text: format!("[queued] {}", strip_control_chars(prompt)),
+        tool_uses: vec![],
+        tool_results: vec![],
+        origin_kind,
+        is_meta,
+        is_compact_summary: false,
+    })
+}
+
+/// Records `(timestamp, content)` as seen; returns `false` if it was
+/// already recorded (i.e. this is a duplicate representation of an
+/// instruction already turned into an entry).
+fn remember_queued(
+    seen: &mut HashSet<(String, String)>,
+    timestamp: Option<&str>,
+    content: &str,
+) -> bool {
+    seen.insert((timestamp.unwrap_or("").to_string(), content.to_string()))
+}
+
+/// `{"type":"file-history-delta","trackingPath":"...",...}` is the
+/// per-touch signal for the `files` view: one delta = one file changed.
+/// Modeled as a `System`-role entry with a synthetic `FileHistory` tool_use
+/// so it flows through the exact same `files`/`tools` aggregation path real
+/// tool calls do (see `FILE_TOUCHING_TOOLS` in `query.rs`), rather than
+/// requiring a second code path.
+fn classify_file_history_delta(value: &serde_json::Value) -> LineOutcome {
+    let Some(tracking_path) = value.get("trackingPath").and_then(|v| v.as_str()) else {
+        return LineOutcome::Metadata;
+    };
+    let timestamp = value
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    LineOutcome::Entry(Entry {
+        turn: 0,
+        role: Role::System,
+        timestamp,
+        uuid: None,
+        is_sidechain: false,
+        text: format!("[file-history] {tracking_path}"),
+        tool_uses: vec![ToolUse {
+            id: None,
+            name: "FileHistory".to_string(),
+            file_path: Some(tracking_path.to_string()),
+            command: None,
+            pattern: None,
+            prompt: None,
+            input: None,
+        }],
+        tool_results: vec![],
+        origin_kind: None,
+        is_meta: false,
+        is_compact_summary: false,
+    })
+}
+
+/// Flatten a `message.content` value (string or array of content blocks)
+/// into plain text plus structured tool_use/tool_result records. Unknown
+/// block kinds (image, thinking, redacted_thinking, …) are silently skipped
+/// here — they are not fidelity-critical for v1 views and are not schema
+/// drift (they are documented Claude Code block kinds), so they do not
+/// count toward `unrecognized_entries`.
+fn flatten_content(
+    content: &serde_json::Value,
+    text: &mut String,
+    tool_uses: &mut Vec<ToolUse>,
+    tool_results: &mut Vec<ToolResult>,
+    opts: ParseOpts,
+) {
+    if let Some(s) = content.as_str() {
+        text.push_str(&strip_control_chars(s));
+        return;
+    }
+    let Some(items) = content.as_array() else {
+        return;
+    };
+    for item in items {
+        match item.get("type").and_then(|v| v.as_str()) {
+            Some("text") => {
+                if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&strip_control_chars(t));
+                }
+            }
+            Some("tool_use") => {
+                let name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let id = item.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                let input = item.get("input");
+                let field = |k: &str| {
+                    input
+                        .and_then(|i| i.get(k))
+                        .and_then(|v| v.as_str())
+                        .map(strip_control_chars)
+                };
+                tool_uses.push(ToolUse {
+                    id,
+                    name,
+                    file_path: field("file_path"),
+                    command: field("command"),
+                    pattern: field("pattern"),
+                    prompt: field("prompt"),
+                    input: if opts.full_results {
+                        input.cloned()
+                    } else {
+                        None
+                    },
+                });
+            }
+            Some("tool_result") => {
+                let tool_use_id = item
+                    .get("tool_use_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let is_error = item
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let result_text =
+                    strip_control_chars(&extract_tool_result_text(item.get("content")));
+                let byte_size = result_text.len();
+                let preview = truncate_chars(&result_text, TOOL_RESULT_PREVIEW_CHARS);
+                tool_results.push(ToolResult {
+                    tool_use_id,
+                    is_error,
+                    byte_size,
+                    preview,
+                    failure_marker: is_error && receipt::has_failure_marker(&result_text),
+                    full: opts.full_results.then_some(result_text),
+                });
+            }
+            _ => {} // thinking / image / redacted_thinking / unknown: not surfaced in v1 views
+        }
+    }
+}
+
+/// Strip C0 control characters other than `\n`/`\t` (plus DEL) from `s`.
+/// Applied once at ingestion so every downstream view — text AND JSON —
+/// inherits clean text automatically; no per-view call site can forget it.
+/// The highest-value case is ANSI escape sequences (ESC, `0x1B`), which
+/// would otherwise reach a terminal unchanged when a hostile transcript
+/// entry is rendered (adversarial review finding 2 — 3 real entries in a
+/// live transcript carried raw ANSI).
+pub(crate) fn strip_control_chars(s: &str) -> String {
+    if !s.chars().any(is_stripped_control) {
+        return s.to_string();
+    }
+    s.chars().filter(|c| !is_stripped_control(*c)).collect()
+}
+
+fn is_stripped_control(c: char) -> bool {
+    let cp = c as u32;
+    (cp <= 0x1F && c != '\n' && c != '\t') || cp == 0x7F
+}
+
+/// A `tool_result` block's `content` field is itself either a plain string
+/// or an array of blocks (usually `{"type":"text","text":...}`). Handle both.
+fn extract_tool_result_text(content: Option<&serde_json::Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(items) = content.as_array() {
+        let mut out = String::new();
+        for item in items {
+            if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(t);
+            }
+        }
+        return out;
+    }
+    String::new()
+}
+
+/// Truncate to at most `max_chars` **characters** (not bytes) — safe for
+/// multi-byte UTF-8 and for hostile input (HTML/control chars pass through
+/// unescaped; renderers are responsible for their own escaping).
+pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+/// Build a `tool_use_id -> ToolResult` index over every entry, so `tools`/
+/// `errors`/`files` can pair a `tool_use` block with the `tool_result` that
+/// answered it even though Claude Code usually delivers the result in a
+/// *later* entry (a `user`-typed message).
+pub(crate) fn index_tool_results(entries: &[Entry]) -> HashMap<String, (usize, ToolResult)> {
+    let mut index = HashMap::new();
+    for entry in entries {
+        for result in &entry.tool_results {
+            if let Some(id) = &result.tool_use_id {
+                index.insert(id.clone(), (entry.turn, result.clone()));
+            }
+        }
+    }
+    index
+}
+
+// ─── Prompt-noise classification (inbox-B3) ───
+
+/// Strip every leading `"[queued] "` token (queuing can in principle nest —
+/// mirrors `is_noisy_steer_text`'s normalization) and leading whitespace,
+/// returning the underlying text a noise-class check should match against.
+pub(crate) fn strip_queued_prefix(text: &str) -> &str {
+    const QUEUED_PREFIX: &str = "[queued] ";
+    let mut t = text.trim_start();
+    while let Some(stripped) = t.strip_prefix(QUEUED_PREFIX) {
+        t = stripped.trim_start();
+    }
+    t
+}
+
+/// True for a plain `/name` slash-command invocation with no arguments —
+/// `text` matches `^/[A-Za-z0-9:_-]+\s*$` (a leading slash, one or more
+/// name characters covering plugin-scoped names like `/codex:rescue`, then
+/// only trailing whitespace, if any). No regex crate needed for a check
+/// this small.
+fn is_bare_slash_command(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    let Some(rest) = trimmed.strip_prefix('/') else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
+}
+
+/// Extract the text between the first `open`...`close` tag pair in `text`.
+fn extract_tag(text: &str, open: &str, close: &str) -> Option<String> {
+    let start = text.find(open)? + open.len();
+    let rest = &text[start..];
+    let end = rest.find(close)?;
+    Some(rest[..end].to_string())
+}
+
+/// Parse a `<command-name>NAME</command-name>...<command-args>ARGS</command-args>`
+/// slash-command echo (Claude Code's on-disk representation of a typed
+/// `/name args` invocation). `args` is `""` when the tag is present but
+/// empty (e.g. `/compact`) or absent entirely. Returns `None` only when
+/// `<command-name>` itself doesn't parse (malformed/legacy shape).
+pub(crate) fn parse_command_tags(text: &str) -> Option<(String, String)> {
+    let name = extract_tag(text, "<command-name>", "</command-name>")?;
+    let args = extract_tag(text, "<command-args>", "</command-args>").unwrap_or_default();
+    Some((name.trim().to_string(), args.trim().to_string()))
+}
+
+/// Classify a `prompts`-view candidate entry as harness-authored noise, or
+/// `None` for a genuine human-typed turn. Order matters: earlier rules take
+/// priority over later, less-specific ones (inbox-B3 spec §3b). Text
+/// matching is always performed on `strip_queued_prefix(&e.text)` so a
+/// queued copy of a noise line is classified the same as its delivered
+/// twin.
+pub(crate) fn prompt_noise_class(e: &Entry) -> Option<&'static str> {
+    let text = strip_queued_prefix(&e.text);
+
+    if e.is_compact_summary
+        || text.starts_with("This session is being continued from a previous conversation")
+    {
+        return Some("compaction_summary");
+    }
+    if e.origin_kind.as_deref() == Some("task-notification")
+        || text.starts_with("<task-notification>")
+    {
+        return Some("task_notification");
+    }
+    if e.origin_kind.as_deref() == Some("peer")
+        || text.starts_with("Another Claude session sent a message:")
+        || text.starts_with("<cross-session-message")
+    {
+        return Some("cross_session_message");
+    }
+    if text.starts_with("Base directory for this skill:") {
+        return Some("skill_body");
+    }
+    if text.starts_with("<local-command-caveat>")
+        || text.starts_with("<local-command-stdout>")
+        || text.starts_with("<local-command-stderr>")
+    {
+        return Some("local_command");
+    }
+    if text.starts_with("<command-name>") || text.starts_with("<command-message>") {
+        if let Some((_, args)) = parse_command_tags(text) {
+            return if args.is_empty() {
+                Some("slash_command_no_args")
+            } else {
+                // A typed slash command carrying an ask (e.g.
+                // `/codex:rescue fix the bug`) IS a human prompt —
+                // `render_prompts` renders it as `/name args`.
+                None
+            };
+        }
+    }
+    if text.starts_with("[Request interrupted by user") {
+        return Some("interrupt_marker");
+    }
+    if text.starts_with("[SYSTEM NOTIFICATION") {
+        return Some("task_notification");
+    }
+    // A bare slash command typed with no arguments (e.g. `/compact`) never
+    // goes through the `<command-name>` echo shape above — Claude Code
+    // records it as plain text. Without this it shows as a genuine human
+    // prompt, and a queued copy of it inflates `queued_duplicate` instead
+    // of its own class (gap-G6, inbox-B3 review #2 finding, medium).
+    if is_bare_slash_command(text) {
+        return Some("slash_command_no_args");
+    }
+    if e.is_meta {
+        return Some("meta");
+    }
+    if let Some(k) = e.origin_kind.as_deref() {
+        if k != "human" {
+            // Future-proof: an unknown non-human origin is never shown as
+            // human by default.
+            return Some("other_origin");
+        }
+    }
+    None
+}
+
+/// The `prompts` noise class, except that a Remote Control prompt (origin
+/// `bridge`) is a person's ask. `yourasks` and the compact range scan both
+/// read a person's words through this.
+pub(crate) fn ask_noise_class(e: &Entry) -> Option<&'static str> {
+    match prompt_noise_class(e) {
+        Some("other_origin") if e.origin_kind.as_deref() == Some("bridge") => None,
+        // A note a side agent offered, replayed by the harness as a user row.
+        // One exact prefix; any other text stays a person's words.
+        None if strip_queued_prefix(&e.text).starts_with(SIDE_AGENT_NOTE_PREFIX) => {
+            Some("side_agent_note")
+        }
+        class => class,
+    }
+}
+
+/// How the harness opens a note that a side agent offered.
+const SIDE_AGENT_NOTE_PREFIX: &str = "Here is a note offered by a side agent:";
+
+// ─── Session resolution ───
+
+/// Resolve a session identifier (substring/exact id match, same rule
+/// `get_full_conversation` uses via [`crate::mcp::tools::find_conversation_file`],
+/// including its ambiguous-match handling) or an explicit filesystem path to
+/// a transcript file. An explicit path is checked first and bypasses the
+/// projects-dir walk entirely.
+pub(crate) fn resolve_session_path(
+    projects_dir: &Path,
+    data_dir: Option<&Path>,
+    session: &str,
+    project: Option<&str>,
+) -> crate::mcp::tools::ConversationLookup {
+    use crate::mcp::tools::ConversationLookup;
+    let direct = Path::new(session);
+    if direct.is_file() {
+        let project_name = direct
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        return ConversationLookup::Found(direct.to_path_buf(), project_name);
+    }
+    // The JSONL wins whenever it exists; the mirror answers only once it is gone.
+    match crate::mcp::tools::find_conversation_file(projects_dir, session, project) {
+        ConversationLookup::NotFound => match data_dir {
+            Some(data_dir) => {
+                crate::mcp::tools::find_mirrored_conversation(data_dir, session, project)
+            }
+            None => ConversationLookup::NotFound,
+        },
+        found => found,
+    }
+}
+
+fn is_mirror_file(path: &Path) -> bool {
+    path.to_string_lossy().ends_with(".jsonl.zst")
+}
+
+/// The turns the latest compact replaced, as `(first, last)`, inclusive. The
+/// numbers are `Entry::turn` values, so `slice` with the same range shows the
+/// same entries.
+///
+/// When the SessionStart hook runs for a compact, the file does not yet hold
+/// that compact's `compact_boundary` row. Then the range is everything after
+/// the previous boundary, or turn 1 if there is none. If a later Claude Code
+/// writes the boundary first, the last boundary is this compact only when
+/// nothing follows it but its summary row and harness entries: no assistant
+/// entry and no human prompt. The range then ends just before it.
+///
+/// The file is scanned as a stream and only counters are kept, so a large
+/// transcript costs time but no memory.
+///
+/// `None` when the file is missing or unreadable, a mirror copy stopped early,
+/// or the range is empty.
+pub fn replaced_turns(path: &Path) -> Option<(usize, usize)> {
+    scan_range(path)?.replaced_turns()
+}
+
+/// The few numbers `replaced_turns` needs from a transcript, counted in one
+/// streaming pass. It runs the same line classifier as `parse_transcript`, so
+/// its turn numbers equal that parse's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RangeScan {
+    /// Recognized entries. The last one has this turn number.
+    pub entries: usize,
+    /// Turn of the newest `compact_boundary` entry.
+    pub last_boundary: Option<usize>,
+    /// Turn of the boundary before that one.
+    pub previous_boundary: Option<usize>,
+    /// An assistant entry or a human prompt came after the last boundary.
+    pub live_after_last_boundary: bool,
+}
+
+/// A user entry that holds a person's words: not a summary, caveat, skill body,
+/// notification or other harness row, and not empty. A Remote Control prompt counts.
+fn is_human_prompt(e: &Entry) -> bool {
+    e.role == Role::User && !e.text.trim().is_empty() && ask_noise_class(e).is_none()
+}
+
+impl RangeScan {
+    fn observe(&mut self, e: &Entry) {
+        self.entries = e.turn;
+        if e.is_compact_boundary() {
+            self.previous_boundary = self.last_boundary;
+            self.last_boundary = Some(e.turn);
+            self.live_after_last_boundary = false;
+        } else if self.last_boundary.is_some() && (e.role == Role::Assistant || is_human_prompt(e))
+        {
+            self.live_after_last_boundary = true;
+        }
+    }
+
+    /// The scan of already parsed entries. Tests compare it with a file scan.
+    #[cfg(test)]
+    pub(crate) fn of_entries(entries: &[Entry]) -> RangeScan {
+        let mut scan = RangeScan::default();
+        for e in entries {
+            scan.observe(e);
+        }
+        scan
+    }
+
+    fn replaced_turns(&self) -> Option<(usize, usize)> {
+        if self.entries == 0 {
+            return None;
+        }
+        let (first, last) = match self.last_boundary {
+            None => (1, self.entries),
+            Some(newest) if self.live_after_last_boundary => (newest + 1, self.entries),
+            Some(newest) => (
+                self.previous_boundary.map_or(1, |before| before + 1),
+                newest - 1,
+            ),
+        };
+        (first <= last).then_some((first, last))
+    }
+}
+
+fn scan_reader(reader: impl BufRead) -> RangeScan {
+    let mut scan = RangeScan::default();
+    stream_entries(reader, ParseOpts::default(), |entry| scan.observe(&entry));
+    scan
+}
+
+/// [`RangeScan`] of a transcript file or mirror copy. `None` when it cannot be
+/// opened or a mirror copy stopped early.
+pub(crate) fn scan_range(path: &Path) -> Option<RangeScan> {
+    if is_mirror_file(path) {
+        let (reader, failure) = crate::mirror::open_transcript_checked(path).ok()?;
+        let scan = scan_reader(reader);
+        let damaged = failure
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .is_some();
+        return (!damaged).then_some(scan);
+    }
+    Some(scan_reader(BufReader::new(File::open(path).ok()?)))
+}
+
+/// How the compact pointer line opens.
+pub const COMPACT_POINTER_LEAD: &str = "Before this compact: ";
+
+/// The line the SessionStart hook prints first after a main-thread compact. It names the turns
+/// the summary replaced and the `csr_transcript` calls that read them. With no range (a
+/// transcript too big to parse in the hook) it names the session's earlier turns instead.
+///
+/// The text has this one source. The hook prints it, and the provenance guard
+/// (`extraction::provenance::is_compact_pointer_line`) builds its pattern from it, so a
+/// change here changes both.
+pub fn compact_pointer_line(sid: &str, range: Option<(usize, usize)>) -> String {
+    let lead = match range {
+        Some((first, last)) => format!(
+            "{COMPACT_POINTER_LEAD}turns {first}..{last} of this session. The summary replaced them. \
+             Read them with csr_transcript(session=\"{sid}\", view=\"slice\", turns=\"{first}..{last}\")."
+        ),
+        None => format!(
+            "{COMPACT_POINTER_LEAD}this session's earlier turns. The summary replaced them. \
+             Read them with csr_transcript(session=\"{sid}\", view=\"stats\"), then view=\"slice\" with turns."
+        ),
+    };
+    format!(
+        "{lead} view=\"yourasks\" lists what the person asked. view=\"grep\" finds a word. \
+         This works after Claude Code deletes the JSONL."
+    )
+}
+
+// ─── Request / dispatch ───
+
+/// Which view to render. `ValueEnum`-compatible names mirror the design
+/// doc's table exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewKind {
+    Receipt,
+    Stats,
+    Prompts,
+    YourAsks,
+    Tools,
+    Files,
+    Errors,
+    Slice,
+    Grep,
+}
+
+impl ViewKind {
+    pub fn parse(s: &str) -> Option<ViewKind> {
+        match s {
+            "receipt" => Some(ViewKind::Receipt),
+            "stats" => Some(ViewKind::Stats),
+            "prompts" => Some(ViewKind::Prompts),
+            "yourasks" | "your_asks" => Some(ViewKind::YourAsks),
+            "tools" => Some(ViewKind::Tools),
+            "files" => Some(ViewKind::Files),
+            "errors" => Some(ViewKind::Errors),
+            "slice" => Some(ViewKind::Slice),
+            "grep" => Some(ViewKind::Grep),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ViewKind::Receipt => "receipt",
+            ViewKind::Stats => "stats",
+            ViewKind::Prompts => "prompts",
+            ViewKind::YourAsks => "yourasks",
+            ViewKind::Tools => "tools",
+            ViewKind::Files => "files",
+            ViewKind::Errors => "errors",
+            ViewKind::Slice => "slice",
+            ViewKind::Grep => "grep",
+        }
+    }
+}
+
+/// Role filter shared by every view (`--role user|assistant|all`, `system`
+/// accepted too since the entry model recognizes it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RoleFilter {
+    #[default]
+    All,
+    User,
+    Assistant,
+    System,
+}
+
+impl RoleFilter {
+    pub fn parse(s: &str) -> Option<RoleFilter> {
+        match s {
+            "all" => Some(RoleFilter::All),
+            "user" => Some(RoleFilter::User),
+            "assistant" => Some(RoleFilter::Assistant),
+            "system" => Some(RoleFilter::System),
+            _ => None,
+        }
+    }
+
+    /// Whether `role` satisfies this filter. Shared by every view.
+    pub(crate) fn matches_role(self, role: Role) -> bool {
+        match self {
+            RoleFilter::All => true,
+            RoleFilter::User => role == Role::User,
+            RoleFilter::Assistant => role == Role::Assistant,
+            RoleFilter::System => role == Role::System,
+        }
+    }
+}
+
+pub const DEFAULT_BUDGET_CHARS: usize = 30_000;
+pub const DEFAULT_LAST_N: usize = 50;
+/// `slice` view: chars of each tool result, and of each tool call's input, shown by default.
+pub const DEFAULT_RESULT_CHARS: usize = 4_000;
+/// `slice` view: the most `result_chars` can ask for.
+pub const MAX_RESULT_CHARS: usize = 200_000;
+/// The most `budget_chars` a `csr_transcript` call gets. The CLI takes more, but a hint
+/// that names a call must name one both surfaces run as written. Claude Code refused
+/// every slice of 52,134 chars and up as over its MCP token limit (13 calls on
+/// 2026-11-14, all near-ASCII) and took every one up to 31,037, so the server keeps a
+/// reply well under the smallest refused size.
+pub const MAX_BUDGET_CHARS: usize = 40_000;
+
+/// Fully-resolved request for one `transcript` call — shared by the CLI and
+/// the `csr_transcript` MCP tool so both surfaces dispatch through the exact
+/// same core.
+#[derive(Debug, Clone)]
+pub struct TranscriptRequest {
+    pub session: String,
+    pub view: ViewKind,
+    pub project: Option<String>,
+    pub role: RoleFilter,
+    /// Inclusive (start, end) turn range from `--turns A..B`. `end: None`
+    /// means "through the last turn".
+    pub turns: Option<(usize, Option<usize>)>,
+    pub last: Option<usize>,
+    pub grep: Option<String>,
+    pub tool: Option<String>,
+    pub json: bool,
+    pub budget_chars: usize,
+    pub sidechains: bool,
+    /// `prompts`: include non-human user turns (task
+    /// notifications, skill bodies, cross-session messages, local-command
+    /// echoes, compaction summaries) and queued duplicates that the
+    /// default (human-only) view hides. `true` reproduces the pre-filter
+    /// output exactly. In `slice`, reveal queued transport echoes. Default `false`.
+    pub include_system: bool,
+    /// `slice` view only: chars of each tool result, and of each tool call's
+    /// input, to show. `None` means [`DEFAULT_RESULT_CHARS`]; the value is
+    /// clamped to `1..=`[`MAX_RESULT_CHARS`].
+    pub result_chars: Option<usize>,
+}
+
+impl Default for TranscriptRequest {
+    fn default() -> Self {
+        TranscriptRequest {
+            session: String::new(),
+            view: ViewKind::Stats,
+            project: None,
+            role: RoleFilter::All,
+            turns: None,
+            last: None,
+            grep: None,
+            tool: None,
+            json: false,
+            budget_chars: DEFAULT_BUDGET_CHARS,
+            sidechains: false,
+            include_system: false,
+            result_chars: None,
+        }
+    }
+}
+
+/// Parse a `--turns` spec: `"A..B"` (inclusive both ends) or `"A.."`
+/// (through the last turn). Rejects anything else with an honest message —
+/// never silently falls back to a default.
+pub fn parse_turns_spec(s: &str) -> Result<(usize, Option<usize>), String> {
+    let s = s.trim();
+    let Some((a, b)) = s.split_once("..") else {
+        return Err(format!(
+            "invalid --turns '{s}': expected 'A..B' or 'A..' (e.g. '40..120' or '340..')"
+        ));
+    };
+    let start: usize = if a.is_empty() {
+        1
+    } else {
+        a.parse()
+            .map_err(|_| format!("invalid --turns start '{a}': not a number"))?
+    };
+    let end: Option<usize> = if b.is_empty() {
+        None
+    } else {
+        Some(
+            b.parse()
+                .map_err(|_| format!("invalid --turns end '{b}': not a number"))?,
+        )
+    };
+    if let Some(e) = end {
+        if e < start {
+            return Err(format!(
+                "invalid --turns '{s}': end ({e}) is before start ({start})"
+            ));
+        }
+    }
+    Ok((start, end))
+}
+
+/// Same not-found phrasing `get_full_conversation` uses
+/// ([`crate::format::format_full_conversation`]'s `file_path: None` branch),
+/// so agents hitting either surface see one consistent message.
+fn not_found_message(session: &str, json: bool) -> String {
+    if json {
+        serde_json::json!({
+            "error": format!("Conversation ID '{session}' not found in any project."),
+            "suggestion": "The conversation may not have been imported yet, or the ID may be incorrect.",
+        })
+        .to_string()
+    } else {
+        format!(
+            "<conversation_file>\n<error>Conversation ID '{session}' not found in any project.</error>\n<suggestion>The conversation may not have been imported yet, or the ID may be incorrect.</suggestion>\n</conversation_file>"
+        )
+    }
+}
+
+/// Honest error for finding 5's ambiguous-substring-match case: lists every
+/// distinct candidate instead of silently resolving to whichever file the
+/// filesystem happened to enumerate first.
+fn ambiguous_message(session: &str, candidates: &[(String, String)], json: bool) -> String {
+    if json {
+        serde_json::json!({
+            "error": format!(
+                "Session id '{session}' is ambiguous: {} files match this substring.",
+                candidates.len()
+            ),
+            "candidates": candidates
+                .iter()
+                .map(|(id, project)| serde_json::json!({ "id": id, "project": project }))
+                .collect::<Vec<_>>(),
+            "suggestion": "Use a longer/more specific id, or pass --project to narrow the search.",
+        })
+        .to_string()
+    } else {
+        let listing = candidates
+            .iter()
+            .map(|(id, project)| format!("  <candidate id=\"{id}\" project=\"{project}\"/>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<transcript_error>\n<error>Session id '{session}' is ambiguous: {} files match this substring.</error>\n<candidates>\n{listing}\n</candidates>\n<suggestion>Use a longer/more specific id, or pass --project to narrow the search.</suggestion>\n</transcript_error>",
+            candidates.len()
+        )
+    }
+}
+
+fn sidechains_reserved_message(json: bool) -> String {
+    let msg = "--sidechains is reserved and not yet supported in v1 (design doc: 'Sidechain inclusion: v1 excludes'). Query the parent session's transcript instead, or the subagent's own agent-*.jsonl directly by path.";
+    if json {
+        serde_json::json!({ "error": msg }).to_string()
+    } else {
+        format!("<transcript_error>\n<error>{msg}</error>\n</transcript_error>")
+    }
+}
+
+/// Resolve the session, parse it, apply the role filter, and render the
+/// requested view. This is the single dispatch function both the CLI
+/// (`csr-engine transcript`) and the `csr_transcript` MCP tool call —
+/// exercised directly by tests, independent of clap or rmcp.
+pub fn run(projects_dir: &Path, req: &TranscriptRequest) -> String {
+    run_with_mirror(projects_dir, None, req)
+}
+
+/// [`run`], falling back to the transcript mirror under `data_dir` for a
+/// session whose JSONL Claude Code has deleted. The output says it came from
+/// the mirror.
+pub fn run_with_mirror(
+    projects_dir: &Path,
+    data_dir: Option<&Path>,
+    req: &TranscriptRequest,
+) -> String {
+    run_with_sources(projects_dir, data_dir, None, req)
+}
+
+/// [`run_with_mirror`], and when the JSONL and the mirror copy are both gone,
+/// answer from the indexed chunks in `db` (opened read-only by the caller).
+/// Order: JSONL, mirror, database chunks, a registry-aware error, the plain
+/// not-found message. A session rebuilt from chunks is lossy and says so.
+pub fn run_with_sources(
+    projects_dir: &Path,
+    data_dir: Option<&Path>,
+    db: Option<&crate::storage::Storage>,
+    req: &TranscriptRequest,
+) -> String {
+    if req.sidechains {
+        return sidechains_reserved_message(req.json);
+    }
+
+    use crate::mcp::tools::ConversationLookup;
+    let (path, project) =
+        match resolve_session_path(projects_dir, data_dir, &req.session, req.project.as_deref()) {
+            ConversationLookup::Found(p, proj) => (p, proj),
+            ConversationLookup::NotFound => {
+                return match db.map(|d| chunks::lookup(d, &req.session, req.project.as_deref())) {
+                    Some(chunks::DbLookup::Rebuilt(rebuilt)) => {
+                        query::render_rebuilt(&rebuilt, req)
+                    }
+                    Some(chunks::DbLookup::Known(known)) => chunks::known_message(&known, req.json),
+                    Some(chunks::DbLookup::Ambiguous(candidates)) => {
+                        ambiguous_message(&req.session, &candidates, req.json)
+                    }
+                    Some(chunks::DbLookup::Unknown) | None => {
+                        not_found_message(&req.session, req.json)
+                    }
+                };
+            }
+            ConversationLookup::Ambiguous(candidates) => {
+                return ambiguous_message(&req.session, &candidates, req.json)
+            }
+        };
+
+    let opts = ParseOpts::for_request(req);
+    let parsed = match if is_mirror_file(&path) {
+        parse_mirrored_transcript_with(&path, opts)
+    } else {
+        parse_transcript_with(&path, opts)
+    } {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("failed to read transcript at {}: {e}", path.display());
+            return if req.json {
+                serde_json::json!({ "error": msg }).to_string()
+            } else {
+                format!("<transcript_error>\n<error>{msg}</error>\n</transcript_error>")
+            };
+        }
+    };
+
+    query::render_view(&parsed, &path, &project, req)
+}

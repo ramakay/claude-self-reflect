@@ -6,16 +6,37 @@
 //! 3. Writes text to stdout (injected into Claude's context)
 //! 4. Exits with code 0 (never blocks the session)
 
+pub mod bash_writes;
+pub mod dream_match;
+pub mod exposure;
 pub mod install;
 pub mod intent;
+pub mod learnt;
+pub mod open_items;
+pub mod post_compact;
 pub mod post_tool_use;
 pub mod precompact;
+pub mod prompt_fallback;
+pub(crate) mod prompt_log;
+pub(crate) mod prompt_stages;
 pub mod prompt_submit;
+pub mod prompt_transport;
+pub mod reaction;
 pub mod recap;
+pub mod recap_evidence;
+pub mod recap_git;
+#[cfg(test)]
+mod recap_replay;
+pub(crate) mod resume_lineage;
+mod scope_folder;
 pub mod session_briefing;
 pub mod session_end;
 pub mod session_start;
+pub(crate) mod start_budget;
+pub mod statusline_retire;
 pub mod stop;
+pub mod stop_work;
+pub mod turn_marks;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -27,7 +48,7 @@ use crate::engine::Engine;
 use crate::search::cross_project::resolve_project_from_cwd;
 
 /// Input received from Claude Code via stdin JSON.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
 pub struct HookInput {
     #[serde(alias = "sessionId")]
     pub session_id: Option<String>,
@@ -48,6 +69,60 @@ pub struct HookInput {
     pub prompt: Option<String>,
     /// Hook event source (e.g. "startup", "resume", "compact", "clear") for SessionStart
     pub source: Option<String>,
+    /// Present only when the hook fires inside a subagent (Claude Code "Common input
+    /// fields"). The session id such a hook carries is the PARENT's.
+    #[serde(alias = "agentId")]
+    pub agent_id: Option<String>,
+    #[serde(alias = "agentType")]
+    pub agent_type: Option<String>,
+    /// Id of the prompt this hook belongs to (UserPromptSubmit, PostCompact).
+    #[serde(alias = "promptId")]
+    pub prompt_id: Option<String>,
+    /// What started a compaction ("manual" | "auto") for PostCompact.
+    pub trigger: Option<String>,
+    /// The summary Claude Code wrote at compaction, for PostCompact.
+    #[serde(alias = "compactSummary")]
+    pub compact_summary: Option<String>,
+    /// The event this input was sent for.
+    #[serde(alias = "hookEventName")]
+    pub hook_event_name: Option<String>,
+}
+
+impl HookInput {
+    /// `Some(agent type)` when this hook fired inside a subagent, `None` for a main
+    /// session. A non-empty `agent_id` decides; a `transcript_path` under
+    /// `/subagents/` is the fallback for a Claude Code that omits it. The label is
+    /// `unknown` when the type is missing.
+    pub fn subagent(&self) -> Option<String> {
+        let by_id = self
+            .agent_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty());
+        let by_path = self
+            .transcript_path
+            .as_deref()
+            .is_some_and(|p| p.replace('\\', "/").contains("/subagents/"));
+        if !(by_id || by_path) {
+            return None;
+        }
+        Some(
+            self.agent_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .unwrap_or("unknown")
+                .to_string(),
+        )
+    }
+}
+
+/// Log that a hook stood down because it fired inside a subagent.
+pub(crate) fn log_subagent_skip(hook_name: &str, cwd: &Path, agent_type: &str) {
+    let project =
+        resolve_project_from_cwd(&cwd.to_string_lossy()).unwrap_or_else(|| "unknown".to_string());
+    crate::telemetry::append_timing_line(&format!(
+        "CSR hook {hook_name} [{project}]: skip:subagent({agent_type})"
+    ));
 }
 
 /// How long the hook waits for the piped JSON before giving up.
@@ -115,6 +190,16 @@ where
     }
 }
 
+fn parse_failure_line(buf_len: usize, error: &serde_json::Error) -> String {
+    format!(
+        "CSR stdin: {}B received but JSON parse FAILED: class={:?} line={} column={}",
+        buf_len,
+        error.classify(),
+        error.line(),
+        error.column()
+    )
+}
+
 /// Turn a stdin read into a HookInput, recording *why* an input was unusable —
 /// empty, unreadable, too slow and unparseable used to be one indistinguishable
 /// `hook=0ms` line.
@@ -125,11 +210,7 @@ fn hook_input_from(read: StdinRead) -> HookInput {
             Err(e) => {
                 // A parse failure here silently degrades to Default (no prompt,
                 // no transcript_path) — the hook then no-ops. Log it loudly.
-                crate::telemetry::append_timing_line(&format!(
-                    "CSR stdin: {}B received but JSON parse FAILED: {}",
-                    buf.len(),
-                    e
-                ));
+                crate::telemetry::append_timing_line(&parse_failure_line(buf.len(), &e));
                 HookInput::default()
             }
         },
@@ -149,6 +230,192 @@ fn hook_input_from(read: StdinRead) -> HookInput {
             HookInput::default()
         }
     }
+}
+
+/// Code map session signal: record the cwd Claude Code sent as live. The hook's
+/// own cwd resolution (`resolve_hook_cwd`) canonicalizes, which stats the path;
+/// the signal takes the string as sent and does no filesystem call of its own.
+/// Best effort: a missing cwd, a missing table or a busy database is skipped,
+/// and nothing here can fail the hook.
+pub(crate) fn record_codemap_signal(input: &HookInput, engine: &Engine, source: &str) {
+    let Some(cwd) = input.cwd.as_deref().filter(|c| !c.trim().is_empty()) else {
+        return;
+    };
+    let cwd = Path::new(cwd);
+    if let Err(e) = engine
+        .storage()
+        .with_connection(|conn| crate::codemap::record_signal(conn, cwd, source))
+    {
+        eprintln!("CSR: code map signal skipped (non-fatal): {e}");
+    }
+}
+
+/// The database file behind the engine's connection, for the code map's detached
+/// children (`--db-path`). `None` for an in-memory store.
+pub(crate) fn engine_db_path(engine: &Engine) -> Option<std::path::PathBuf> {
+    engine
+        .storage()
+        .with_connection(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok())
+        })
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The cwd of a hook when it is absolute and sits in a macOS-protected folder
+/// (lexically, or through a symlink chain `resolve_safe` refuses without a stat
+/// inside it). `None` for every ordinary cwd and when the code map is off.
+fn protected_hook_cwd(input: &HookInput) -> Option<std::path::PathBuf> {
+    if crate::codemap::disabled() {
+        return None;
+    }
+    let cwd = std::path::PathBuf::from(input.cwd.as_deref().filter(|c| !c.trim().is_empty())?);
+    if !cwd.is_absolute() {
+        return None;
+    }
+    let home = crate::codemap::identity::home_dir();
+    crate::codemap::identity::protected_class(&cwd, home.as_deref())?;
+    Some(cwd)
+}
+
+/// SessionStart in a protected folder: start the detached session scan (see
+/// `codemap::session`). Nothing for an ordinary cwd or a subagent. Best effort:
+/// the hook never waits for the child and never fails because of it.
+pub(crate) fn codemap_session_start(input: &HookInput, engine: &Engine) {
+    if input.subagent().is_some() {
+        return;
+    }
+    let Some(cwd) = protected_hook_cwd(input) else {
+        codemap_session_start_ordinary(input, engine);
+        return;
+    };
+    let Some(db) = engine_db_path(engine) else {
+        return;
+    };
+    crate::codemap::session::on_session_start(
+        &cwd,
+        &db,
+        crate::codemap::identity::home_dir().as_deref(),
+        crate::codemap::disabled(),
+        &crate::codemap::session::DetachedSpawner,
+    );
+}
+
+/// PostToolUse after an edit in a protected folder: queue the file and start the
+/// detached drain unless one is in flight. Nothing for an ordinary cwd.
+pub(crate) fn codemap_session_post_tool_use(input: &HookInput, engine: &Engine) {
+    let Some(cwd) = protected_hook_cwd(input) else {
+        codemap_session_post_tool_use_ordinary(input, engine);
+        return;
+    };
+    let Some(db) = engine_db_path(engine) else {
+        return;
+    };
+    let edited = edited_file(input);
+    let home = crate::codemap::identity::home_dir();
+    let _ = engine.storage().with_connection(|conn| {
+        crate::codemap::session::on_post_tool_use(
+            conn,
+            &cwd,
+            edited.as_deref(),
+            &db,
+            home.as_deref(),
+            crate::codemap::disabled(),
+            crate::codemap::now_secs(),
+            &crate::codemap::session::pid_alive,
+            &crate::codemap::session::DetachedSpawner,
+        );
+        Ok(())
+    });
+}
+
+/// The file an Edit/Write/MultiEdit hook touched, as sent; for a Bash call, the
+/// first file its command wrote (the rest are queued by the generic enqueue, and
+/// one queued file is enough to start the drain).
+fn edited_file(input: &HookInput) -> Option<std::path::PathBuf> {
+    if post_tool_use::is_acted_on_tool(input.tool_name.as_deref()) {
+        input
+            .tool_input
+            .as_ref()
+            .and_then(|t| t.get("file_path"))
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+    } else {
+        post_tool_use::bash_written_files(input).into_iter().next()
+    }
+}
+
+/// The absolute cwd of a hook for the ordinary-repo session map, or `None` when
+/// the code map is off, a daemon is live (it owns the map) or the cwd is blank
+/// or relative. Whether it is a git repo is the session module's call.
+fn ordinary_hook_cwd(input: &HookInput) -> Option<std::path::PathBuf> {
+    if crate::codemap::disabled() {
+        return None;
+    }
+    let cwd = std::path::PathBuf::from(input.cwd.as_deref().filter(|c| !c.trim().is_empty())?);
+    cwd.is_absolute().then_some(cwd)
+}
+
+/// SessionStart in an ordinary git repo with no live daemon: the session starts
+/// the detached scan itself (see `codemap::session`). A fresh install has no
+/// daemon, so without this a repo is never mapped. Best effort, like the
+/// protected-folder path.
+fn codemap_session_start_ordinary(input: &HookInput, engine: &Engine) {
+    let Some(cwd) = ordinary_hook_cwd(input) else {
+        return;
+    };
+    let Some(db) = engine_db_path(engine) else {
+        return;
+    };
+    crate::codemap::session::on_session_start_ordinary(
+        &cwd,
+        &db,
+        crate::codemap::identity::home_dir().as_deref(),
+        crate::codemap::disabled(),
+        crate::daemon::Daemon::daemon_lock_live(),
+        &crate::codemap::identity::temp_excluded,
+        &crate::codemap::session::DetachedSpawner,
+    );
+}
+
+/// PostToolUse after an edit in an ordinary git repo with no live daemon: queue
+/// the edit, then start the detached drain (its first full pass registers a repo
+/// the map does not know yet). The queue write comes first, so the drain never
+/// starts on an empty queue. The generic
+/// PostToolUse enqueue later pushes the same path again; that is harmless.
+fn codemap_session_post_tool_use_ordinary(input: &HookInput, engine: &Engine) {
+    let Some(cwd) = ordinary_hook_cwd(input) else {
+        return;
+    };
+    let Some(db) = engine_db_path(engine) else {
+        return;
+    };
+    let edited = edited_file(input);
+    let home = crate::codemap::identity::home_dir();
+    let _ = engine.storage().with_connection(|conn| {
+        crate::codemap::session::on_post_tool_use_ordinary(
+            conn,
+            &cwd,
+            edited.as_deref(),
+            &db,
+            home.as_deref(),
+            crate::codemap::disabled(),
+            crate::daemon::Daemon::daemon_lock_live(),
+            &crate::codemap::identity::temp_excluded,
+            crate::codemap::now_secs(),
+            &crate::codemap::session::pid_alive,
+            &crate::codemap::session::DetachedSpawner,
+        );
+        Ok(())
+    });
 }
 
 /// Resolve the directory a hook operates on. Prefers the cwd Claude Code sent,
@@ -214,38 +481,47 @@ fn resolve_hook_cwd(input_cwd: Option<&str>) -> PathBuf {
 }
 
 /// Shared helper: import the current transcript incrementally.
-/// Used by stop, precompact, prompt_submit, and session_end hooks.
+/// Used by prompt_submit, stop, and session_end hooks.
 pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: &Path) {
-    let Some(ref transcript) = input.transcript_path else {
+    let Some(canonical) = validated_transcript_path(input) else {
         return;
     };
-    let tp = std::path::PathBuf::from(transcript);
-    if !tp.exists() {
-        return;
-    }
-
-    // S-1 fix: validate transcript path is a .jsonl file.
-    // The .jsonl extension check prevents importing arbitrary files (e.g. /etc/passwd)
-    // via crafted hook JSON. Claude Code only produces .jsonl transcripts.
-    let Ok(canonical) = tp.canonicalize() else {
-        return;
-    };
-    if canonical.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-        eprintln!(
-            "CSR: refusing non-JSONL transcript: {}",
-            canonical.display()
-        );
-        return;
-    }
-
-    let cwd_str = cwd.to_string_lossy();
-    let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
+    let project = hook_project_name(cwd);
 
     match engine.import_file(&canonical, &project).await {
         Ok(0) => {} // no new content, silent
         Ok(n) => eprintln!("CSR: indexed {} new chunks from active session", n),
         Err(e) => eprintln!("CSR: import failed (non-fatal): {}", e),
     }
+}
+
+/// The canonical transcript path a hook may read: it exists and is a `.jsonl`
+/// file. `None` when the hook carried no path, the path is missing, or the
+/// extension is wrong (the last one says so on stderr).
+///
+/// S-1 fix: the `.jsonl` check keeps crafted hook JSON from pointing the importer
+/// at an arbitrary file (e.g. /etc/passwd). Claude Code only produces `.jsonl`
+/// transcripts.
+pub(crate) fn validated_transcript_path(input: &HookInput) -> Option<PathBuf> {
+    let tp = PathBuf::from(input.transcript_path.as_ref()?);
+    if !tp.exists() {
+        return None;
+    }
+    let canonical = tp.canonicalize().ok()?;
+    if canonical.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        eprintln!(
+            "CSR: refusing non-JSONL transcript: {}",
+            canonical.display()
+        );
+        return None;
+    }
+    Some(canonical)
+}
+
+/// The project name a hook files its transcript under, from its resolved cwd.
+pub(crate) fn hook_project_name(cwd: &Path) -> String {
+    let cwd_str = cwd.to_string_lossy();
+    resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Redirect this process's stdout (fd 1) onto stderr (fd 2) for the rest of the
@@ -427,6 +703,11 @@ pub struct ClaimedStdout {
 }
 
 impl ClaimedStdout {
+    /// Refuse to serve MCP unless its output channel was claimed.
+    pub fn require(claim: Option<Self>) -> anyhow::Result<Self> {
+        claim.ok_or_else(|| anyhow::anyhow!("cannot claim stdout for the MCP channel"))
+    }
+
     /// Flushes Rust's stdout buffer, then diverts fd 1 to fd 2 and hands back a
     /// handle to the saved original. Returns `None` (nothing redirected, the
     /// caller falls back to the existing `rmcp::transport::io::stdio()` path)
@@ -477,7 +758,6 @@ impl ClaimedStdout {
     }
 }
 
-/// Main hook dispatcher. Parses stdin, routes to handler.
 /// Whether a hook can run on an import-only engine that skips loading and
 /// persisting the HNSW index (see [`crate::engine::Engine::new_import_only`]).
 ///
@@ -486,62 +766,143 @@ impl ClaimedStdout {
 /// skipping the load is safe and the new chunks are reconciled on the next
 /// search-time load.
 ///
+/// `stop` and `post-tool-use` are here for the same reason. `post-tool-use`
+/// never touches the index at all; `stop` matches resolutions via SQLite fts5
+/// and its single index interaction is an *insert* whose durable copy already
+/// went to SQLite via `insert_derived_reflection_ranges` — the additive
+/// backfill in [`Engine::new`] replays it into the next search-constructing
+/// process. They were held out of the original write-only split to bound its
+/// scope, not because they search, and they are the two hottest hooks on the
+/// bus: `stop` fires on every response and `post-tool-use` after every
+/// Edit/Write. On a 300k-chunk corpus each invocation was paying a full
+/// `HnswIo::load_hnsw` walk plus a ~644MB dump of the graph and data files.
+///
 /// Everything else stays on the full engine. `session-start` and
 /// `prompt-submit` query the index (recap, predictive injection) and genuinely
-/// need it loaded. `stop` and `post-tool-use` do not query the index either
-/// (stop matches resolutions via SQLite fts5 and *inserts* a reflection it
-/// expects persisted), but they are left out deliberately to keep this
-/// optimization's scope small — not because they search.
+/// need it loaded, except for the prompts [`hook_needs_index`] rules out.
 pub fn is_import_only_hook(hook_name: &str) -> bool {
-    matches!(hook_name, "precompact" | "session-end")
+    matches!(
+        hook_name,
+        "precompact" | "session-end" | "stop" | "post-tool-use"
+    )
 }
 
-/// Whether a hook is allowed to persist HNSW changes to the on-disk cache
-/// after it runs. Persistence used to be an unconditional side effect of
-/// `dispatch_hook` — every hook dumped whatever its engine happened to be
-/// holding dirty, including the additive backfill `Engine::new` performs on
-/// EVERY start whenever the cache trails SQLite (see the backfill block
-/// there). That made a purely read-only hook pay to rewrite the entire HNSW
-/// graph (measured up to ~25s on a ~1GB index — see hook-timing.log)
-/// whenever it happened to run against a stale-but-additive cache.
+/// Hooks that no longer do anything but may still be registered in a
+/// settings.json that predates their removal. They stay accepted so Claude
+/// Code never sees a failing command, and `main` returns before the lock, the
+/// stdin read or any engine startup. `hook install --apply` drops the stale
+/// registration.
 ///
-/// `prompt-submit` and `post-tool-use` are on Claude Code's hook budget
-/// (30s) and, for `prompt-submit`, its stdout IS the context-injection
-/// channel — a hook killed at the budget silently loses its injection. They
-/// must never persist. `session-start` and `session-briefing` are equally
-/// injection-critical (recap / briefing content) and are excluded for the
-/// same reason, even though they query the index and could plausibly argue
-/// for writing back a backfill.
-///
-/// `stop` is the one hook that may persist: it runs after the response is
-/// already delivered (not on the injection path), it runs on a full engine
-/// (never import-only — see `is_import_only_hook`), and it is the hook most
-/// likely to have just inserted a reflection the user wants to find next
-/// session.
-///
-/// `precompact` and `session-end` are excluded by construction, not by this
-/// predicate: they run on `Engine::new_import_only`, whose
-/// `skip_index_persistence` flag already makes `flush_index` a no-op
-/// regardless of what this function returns — see that field's doc comment.
-///
-/// This is a role gate layered ON TOP of `flush_index`'s existing dirty
-/// check and `skip_index_persistence` guard: it answers "should this hook
-/// even attempt a flush", not "does it have anything to write". It is the
-/// SOLE allowlist — there is no staleness escape hatch for the excluded
-/// hooks (one existed briefly during review and was removed: with `stop`
-/// persisting unconditionally whenever dirty and the four injection-critical
-/// hooks excluded outright, a bounded exception could only ever have fired
-/// for `stop`, where it added nothing `stop` doesn't already do — dead
-/// code that only widened the allowlist for future unknown hook names,
-/// which is backwards for a safety valve). Persistence on this line is:
-/// `stop` (this predicate), the daemon's watcher batches and shutdown
-/// flush, the MCP server's `store_reflection`/`flush_index`, and the
-/// CLI import/enrichment paths — nothing else.
-pub fn hook_may_persist_index(hook_name: &str) -> bool {
-    matches!(hook_name, "stop")
+/// `subagent-stop` captured nothing by design: `intent_events::is_foreign`
+/// treats sidechain transcripts as foreign, so it cost a process spawn per
+/// finished subagent for zero rows.
+pub fn is_retired_hook(hook_name: &str) -> bool {
+    matches!(hook_name, "subagent-stop")
 }
 
-pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
+/// Whether this argv is `hook <retired name>`, read straight from the OS
+/// strings. `main` needs the answer before clap runs (the timing probe prints
+/// first), and `std::env::args()` would panic on a non-UTF-8 `--db-path`, so
+/// the walk is over `OsString` and mirrors clap: global flags may precede or
+/// follow `hook`, and only the first non-flag token after it is the name — a
+/// flag's value (`--db-path subagent-stop`) is never mistaken for it.
+pub fn argv_names_retired_hook<I>(args: I) -> bool
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    const VALUE_FLAGS: [&str; 3] = ["--db-path", "--projects-dir", "--limit"];
+    let mut args = args.into_iter();
+    let mut seen_hook = false;
+    while let Some(arg) = args.next() {
+        let Some(text) = arg.to_str() else {
+            if arg.as_encoded_bytes().starts_with(b"-") {
+                continue;
+            }
+            return false;
+        };
+        if text.starts_with('-') {
+            if VALUE_FLAGS.contains(&text) {
+                args.next();
+            }
+            continue;
+        }
+        if !seen_hook {
+            if text != "hook" {
+                return false;
+            }
+            seen_hook = true;
+            continue;
+        }
+        return is_retired_hook(text);
+    }
+    false
+}
+
+/// Whether this invocation will query the HNSW index, decided from the hook
+/// name and its parsed input before the engine is built.
+///
+/// Loading the graph is the dominant cost of a hook process on a large corpus
+/// (measured 2026-09-19 at 259k chunks: ~880ms of a 1.1s wall clock for a
+/// `prompt-submit` whose handler returned in 0ms). `prompt-submit` leaves
+/// before any search for harness turns, continuation prompts, slash commands
+/// and bare acknowledgments, so those run on the import-only engine too.
+pub fn hook_needs_index(hook_name: &str, input: &HookInput) -> bool {
+    if is_import_only_hook(hook_name) {
+        return false;
+    }
+    !(hook_name == "prompt-submit" && prompt_submit::exits_before_search(input.prompt.as_deref()))
+}
+
+/// Hooks never publish the HNSW cache. Imports remain durable in SQLite;
+/// the daemon and normal search-engine startup reconcile those rows. Keep
+/// this gate even for import-only engines so a future constructor change
+/// cannot silently put multi-second index dumps back on the hook path.
+pub fn hook_may_persist_index(_hook_name: &str) -> bool {
+    false
+}
+
+/// Skip a busy maintenance run before stdin, storage, embeddings or index startup.
+/// Hooks fail open with empty output if the lock is busy or unavailable.
+pub fn try_start(db_path: &Path) -> Option<crate::maintenance::SharedLock> {
+    crate::maintenance::try_shared(db_path.parent().unwrap_or(Path::new(".")))
+        .ok()
+        .flatten()
+}
+
+/// ` tool=<name>` for the timing line, or nothing when the hook names no tool.
+/// A trailing key, so `telemetry::parser` (which reads `total=` and `hook=` by
+/// key) is unaffected, and a later split by tool needs only this token. Kept to
+/// the characters a tool name uses (`mcp__server__tool` included) so one odd
+/// name cannot break the line.
+fn tool_suffix(tool_name: Option<&str>) -> String {
+    let name: String = tool_name
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        .take(64)
+        .collect();
+    if name.is_empty() {
+        String::new()
+    } else {
+        format!(" tool={name}")
+    }
+}
+
+/// Main hook dispatcher: routes the parsed input to its handler.
+///
+/// `input` is read by the caller, ahead of engine construction, because
+/// [`hook_needs_index`] picks the engine from it; `stdin_elapsed` is how long
+/// that read took, kept for the timing line.
+pub async fn dispatch_hook(
+    hook_name: &str,
+    engine: &Engine,
+    input: HookInput,
+    stdin_elapsed: std::time::Duration,
+) -> Result<()> {
+    let _operation = match engine.storage().operation_lock() {
+        Ok(lock) => lock,
+        Err(_) => return Ok(()),
+    };
     // Recursive-hook guard. The session-briefing hook spawns a nested `claude -p`
     // with CSR_DISABLE_RECURSIVE_HOOKS=1 in its env. That nested session inherits
     // the user's hook config and would otherwise fire CSR hooks — most damagingly
@@ -554,9 +915,11 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
         return Ok(());
     }
 
+    // Phase marks stay cumulative from the start of the stdin read, as they
+    // were when this function did the read itself.
     let t0 = std::time::Instant::now();
-    let input = read_stdin_json();
-    let t_stdin = t0.elapsed();
+    let t_stdin = stdin_elapsed;
+    let elapsed = || stdin_elapsed + t0.elapsed();
 
     // Field-presence diagnostic: hook=0ms exits are indistinguishable from a
     // missing prompt without this (live debugging 2026-07-30).
@@ -571,7 +934,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
 
     let cwd = resolve_hook_cwd(input.cwd.as_deref());
 
-    let t_setup = t0.elapsed();
+    let t_setup = elapsed();
 
     let result = match hook_name {
         "session-start" => session_start::handle(&input, engine, &cwd).await,
@@ -586,7 +949,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
             Ok(())
         }
     };
-    let t_hook = t0.elapsed();
+    let t_hook = elapsed();
 
     // Persist HNSW changes only if this hook's role allows it — see
     // `hook_may_persist_index`, the sole allowlist. Injection-critical hooks
@@ -598,14 +961,14 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     if hook_may_persist_index(hook_name) {
         engine.flush_index().await;
     }
-    let t_total = t0.elapsed();
+    let t_total = elapsed();
 
     // Resolve project name for logging
     let cwd_str = cwd.to_string_lossy();
     let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
 
     let timing_line = format!(
-        "CSR hook {} [{}]: stdin={}ms setup={}ms hook={}ms flush={}ms total={}ms",
+        "CSR hook {} [{}]: stdin={}ms setup={}ms hook={}ms flush={}ms total={}ms{}",
         hook_name,
         project,
         t_stdin.as_millis(),
@@ -613,11 +976,13 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
         (t_hook - t_setup).as_millis(),
         (t_total - t_hook).as_millis(),
         t_total.as_millis(),
+        tool_suffix(input.tool_name.as_deref()),
     );
-    eprintln!("{}", timing_line);
-
-    // Append to timing log file for post-session analysis
-    crate::telemetry::append_timing_line(&timing_line);
+    // The same stamped text to stderr (kept by Claude Code in the transcript's hook record)
+    // and to the timing log, so a start can be joined to its log line byte for byte.
+    let stamped = crate::telemetry::stamp_timing_line(&timing_line);
+    eprintln!("{stamped}");
+    crate::telemetry::append_stamped_timing_line(&stamped);
 
     result
 }
@@ -625,6 +990,58 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_failure_line_does_not_include_input_content() {
+        let buf = r#""TOP_SECRET""#;
+        let error = serde_json::from_str::<HookInput>(buf).unwrap_err();
+        let line = parse_failure_line(buf.len(), &error);
+
+        // The old Display formatting includes the rejected string TOP_SECRET.
+        assert!(!line.contains("TOP_SECRET"));
+        assert!(line.contains("JSON parse FAILED"));
+    }
+
+    #[test]
+    fn timing_line_names_the_tool_only_when_there_is_one() {
+        assert_eq!(tool_suffix(Some("Edit")), " tool=Edit");
+        assert_eq!(
+            tool_suffix(Some("mcp__claude-self-reflect__csr_why")),
+            " tool=mcp__claude-self-reflect__csr_why"
+        );
+        assert_eq!(tool_suffix(None), "");
+        assert_eq!(tool_suffix(Some("")), "");
+        // Whitespace and control characters cannot split the line.
+        assert_eq!(tool_suffix(Some("Ed it\n total=1ms")), " tool=Edittotal1ms");
+        assert_eq!(
+            tool_suffix(Some(&"x".repeat(200))).len(),
+            " tool=".len() + 64
+        );
+    }
+
+    #[test]
+    fn subagent_is_decided_by_agent_id_then_by_transcript_path() {
+        let parse =
+            |json: serde_json::Value| -> HookInput { serde_json::from_value(json).unwrap() };
+        let main = parse(serde_json::json!({
+            "session_id": "s", "transcript_path": "/p/proj/s.jsonl", "source": "compact"
+        }));
+        assert_eq!(main.subagent(), None);
+        // An empty id is the main session, not a subagent.
+        let empty =
+            parse(serde_json::json!({"agent_id": "  ", "transcript_path": "/p/proj/s.jsonl"}));
+        assert_eq!(empty.subagent(), None);
+        let by_id = parse(serde_json::json!({"agent_id": "a1", "agent_type": "Explore"}));
+        assert_eq!(by_id.subagent().as_deref(), Some("Explore"));
+        let camel = parse(serde_json::json!({"agentId": "a1", "agentType": "Plan"}));
+        assert_eq!(camel.subagent().as_deref(), Some("Plan"));
+        let no_type = parse(serde_json::json!({"agent_id": "a1"}));
+        assert_eq!(no_type.subagent().as_deref(), Some("unknown"));
+        let by_path = parse(serde_json::json!({
+            "transcript_path": "/p/proj/s/subagents/agent-a1.jsonl"
+        }));
+        assert_eq!(by_path.subagent().as_deref(), Some("unknown"));
+    }
 
     /// The guard must divert writes while held and hand the descriptor back
     /// intact afterwards. Run on a pair of pipes so the test process's own
@@ -827,12 +1244,15 @@ mod tests {
         // Write-only importers may run on the import-only engine.
         assert!(is_import_only_hook("precompact"));
         assert!(is_import_only_hook("session-end"));
-        // Everything else stays on the full engine. session-start/prompt-submit
-        // query the index and MUST keep it loaded; stop/post-tool-use are kept
-        // out to bound this optimization's scope. A regression that added
-        // session-start or prompt-submit here would make it search an empty
+        // stop and post-tool-use never query the HNSW either: post-tool-use
+        // does not touch it, and stop's only interaction is an insert whose
+        // durable copy went to SQLite first.
+        assert!(is_import_only_hook("stop"));
+        assert!(is_import_only_hook("post-tool-use"));
+        // session-start/prompt-submit query the index and MUST keep it loaded.
+        // A regression that added either here would make it search an empty
         // index and silently return nothing.
-        for full in ["stop", "session-start", "prompt-submit", "post-tool-use"] {
+        for full in ["session-start", "prompt-submit"] {
             assert!(
                 !is_import_only_hook(full),
                 "{full} must not be treated as import-only"
@@ -841,36 +1261,129 @@ mod tests {
     }
 
     #[test]
-    fn only_stop_may_persist_the_index() {
-        // Positive: the one hook the design assigns as the persister.
-        assert!(
-            hook_may_persist_index("stop"),
-            "stop must be allowed to persist — it's the designated hook persister"
-        );
-        // Negative cases: a future regression that adds any of these to the
-        // persist set would silently reintroduce full-size dumps on the
-        // Claude Code injection path (prompt-submit's stdout IS the
-        // injection channel) or on the hook-latency budget generally.
-        for readonly in [
+    fn the_index_is_loaded_only_for_invocations_that_search() {
+        let with_prompt = |prompt: &str| HookInput {
+            prompt: Some(prompt.to_string()),
+            ..Default::default()
+        };
+        assert!(hook_needs_index(
             "prompt-submit",
-            "post-tool-use",
-            "session-start",
-            "session-briefing",
+            &with_prompt("fix the statusline badge count")
+        ));
+        for index_free in [
+            "continue",
+            "/compact",
+            "ok",
+            "<task-notification>\n<status>completed</status>\n</task-notification>",
         ] {
             assert!(
-                !hook_may_persist_index(readonly),
-                "{readonly} must never persist the HNSW index — it is injection-critical \
-                 or explicitly out of scope for this optimization"
+                !hook_needs_index("prompt-submit", &with_prompt(index_free)),
+                "{index_free}"
             );
         }
-        // precompact/session-end are excluded by construction (import-only
-        // engine, skip_index_persistence) rather than by this predicate, but
-        // the predicate should still say no if asked.
-        for import_only in ["precompact", "session-end"] {
-            assert!(!hook_may_persist_index(import_only));
+        assert!(!hook_needs_index("prompt-submit", &HookInput::default()));
+        // The prompt carve-out belongs to prompt-submit alone: session-start
+        // has no prompt and always searches.
+        assert!(hook_needs_index("session-start", &HookInput::default()));
+        assert!(hook_needs_index("session-briefing", &HookInput::default()));
+        assert!(!hook_needs_index(
+            "stop",
+            &with_prompt("fix the statusline badge count")
+        ));
+    }
+
+    #[test]
+    fn argv_names_the_retired_hook_only_as_the_hook_name() {
+        let argv = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        for yes in [
+            &["csr-engine", "hook", "subagent-stop"][..],
+            &["csr-engine", "hook", "subagent-stop", "--db-path", "/x"],
+            &["csr-engine", "--db-path", "/x", "hook", "subagent-stop"],
+            &[
+                "csr-engine",
+                "hook",
+                "--projects-dir",
+                "/x",
+                "subagent-stop",
+            ],
+            &["csr-engine", "hook", "--db-path=/x", "subagent-stop"],
+        ] {
+            assert!(
+                argv_names_retired_hook(argv(&yes[0..]).into_iter().skip(1)),
+                "{yes:?}"
+            );
         }
-        // Unknown hook names must not accidentally persist either.
-        assert!(!hook_may_persist_index("some-future-hook"));
+        for no in [
+            &["csr-engine", "hook", "--db-path", "subagent-stop", "stop"][..],
+            &["csr-engine", "--db-path", "subagent-stop", "hook", "stop"],
+            &["csr-engine", "hook", "stop", "subagent-stop"],
+            &["csr-engine", "status", "subagent-stop"],
+            &["csr-engine", "subagent-stop"],
+            &["csr-engine", "hook"],
+            &["csr-engine"],
+        ] {
+            assert!(
+                !argv_names_retired_hook(argv(&no[0..]).into_iter().skip(1)),
+                "{no:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn argv_scan_survives_non_utf8_values() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![b'/', 0xff, 0xfe]);
+        let argv = |name: &str| vec!["hook".into(), name.into(), "--db-path".into(), bad.clone()];
+        assert!(argv_names_retired_hook(argv("subagent-stop")));
+        assert!(!argv_names_retired_hook(argv("stop")));
+        assert!(!argv_names_retired_hook(vec![
+            "hook".into(),
+            "--db-path".into(),
+            bad.clone(),
+            "stop".into()
+        ]));
+    }
+
+    #[test]
+    fn only_subagent_stop_is_retired() {
+        assert!(is_retired_hook("subagent-stop"));
+        for live in [
+            "session-start",
+            "session-briefing",
+            "session-end",
+            "precompact",
+            "stop",
+            "post-tool-use",
+            "prompt-submit",
+            "install",
+        ] {
+            assert!(!is_retired_hook(live), "{live} is a live hook");
+        }
+    }
+
+    #[test]
+    fn no_hook_may_persist_the_index() {
+        for hook in [
+            "prompt-submit",
+            "post-tool-use",
+            "stop",
+            "session-start",
+            "session-briefing",
+            "precompact",
+            "session-end",
+            "future-hook",
+        ] {
+            assert!(
+                !hook_may_persist_index(hook),
+                "{hook} must never publish HNSW"
+            );
+        }
     }
 
     #[test]
@@ -947,5 +1460,54 @@ mod tests {
             let input = hook_input_from(unusable);
             assert!(input.prompt.is_none() && input.transcript_path.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod r3_stdout_tests {
+    #[test]
+    fn r3_mcp_refuses_an_unclaimed_stdout_channel() {
+        #[cfg(unix)]
+        let failed = super::ClaimedStdout::claim_on(-1, -1);
+        #[cfg(not(unix))]
+        let failed = None;
+        let error = super::ClaimedStdout::require(failed).err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("cannot claim stdout for the MCP channel"));
+    }
+}
+
+#[cfg(test)]
+mod maintenance_probes {
+    use super::*;
+
+    #[test]
+    fn round3_hook_skips_before_storage_and_cache_miss_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("large.db");
+        // Opening this sparse non-database would fail; the hook must not open it.
+        std::fs::File::create(&db)
+            .unwrap()
+            .set_len(4 * 1024 * 1024 * 1024)
+            .unwrap();
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        let start = std::time::Instant::now();
+        // The constructor also gates before probing a configured daemon or opening SQLite.
+        assert!(Engine::new_for_hook(&db, &dir.path().join("projects"))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("maintenance in progress"));
+        let mut constructed = false;
+        if let Some(_operation) = try_start(&db) {
+            constructed = true;
+            let _ = Engine::new_for_hook(&db, &dir.path().join("projects"));
+        }
+        assert!(!constructed);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!dir.path().join("index-v3").exists());
+        drop(owner);
+        assert!(try_start(&db).is_some());
     }
 }

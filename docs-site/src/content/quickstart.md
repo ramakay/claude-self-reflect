@@ -2,7 +2,7 @@
 title: Quick Start
 ---
 
-> Everything below assumes CSR is activated — you've run `csr-engine setup` and restarted Claude Code. Installing alone doesn't activate anything; see [Installation](#/docs/installation).
+> Everything below assumes CSR is activated — you've run `csr-engine setup` (`claude-self-reflect setup` for an npm install) and restarted Claude Code. Setup also installed the csr-companion plugin unless you passed `--no-companion`; if you did, run `csr-engine companion plugin install`. Without herdr, type `/csr` in Claude Code to open the companion panel; see [Choose your view](#/docs/companion-views). Installing alone doesn't activate anything; see [Installation](#/docs/installation).
 
 ## Your First Search
 
@@ -34,15 +34,18 @@ Claude uses `csr_reflect_on_past` for semantic search across all history.
 
 You don't need to do anything for these:
 
-- **Session start**: Past context injected before you ask
-- **Every prompt**: Context predicted and provided proactively
-- **Session end**: Session summarized and indexed
-- **Context compaction**: State backed up before trim
-- **File edits**: Tracked for future file-based search
+- **Session start**: on startup and resume, a recap paragraph on where you left off only when your last session left evidence (a commit, a finished task, a next step); otherwise the older `CSR CONTINUUM` and `LAST` lines. A learnt line appears only when CSR stored notes or verdicts for your last session
+- **File mentions**: name a file in your prompt, or write `@path`, and its edit history comes along
+- **Worktrees and subfolders**: start Claude in either and you get the repo's history, not an empty memory
+- **Subagent runs**: imported and searchable like any other session
+- **After compaction**: a compact receipt with `csr_transcript` pointers to the turns the summary replaced, and the recap names the task you were on
+- **Resume**: after `claude -c` or a resume, CSR names the session you continued
+
+CSR also maps the repo you work in, so it can answer where a function lives even if no conversation touched it.
 
 ## Run Evaluation
 
 ```bash
-csr-engine eval        # Quick (5 tests, <1s)
-csr-engine eval --full # Full (20 tests)
+csr-engine eval        # Quick (6 checks)
+csr-engine eval --full # Full (25 results plus a census line)
 ```

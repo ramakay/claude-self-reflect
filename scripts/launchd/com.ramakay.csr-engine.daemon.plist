@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps `csr-engine daemon` running under the logged-in user so the file
+  watcher, enrichment loops and the v10 dream cycle run without a terminal.
+
+  `csr-engine setup` writes and loads an agent like this one for you (with the
+  binary's real path and your home folder); CSR_NO_DAEMON=1 skips that. This
+  file is the template for installing or customizing one by hand. setup keeps a
+  hand-written agent whose binary still exists.
+
+  Before installing by hand, replace every /Users/YOUR_USERNAME below with your
+  home folder (launchd does not expand ~ or $HOME in this file). setup does this
+  for you.
+
+  Install by hand (macOS):
+    mkdir -p ~/.claude-self-reflect/logs
+    cp scripts/launchd/com.ramakay.csr-engine.daemon.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist
+  Stop / remove:
+    launchctl bootout gui/$(id -u)/com.ramakay.csr-engine.daemon
+
+  CSR_NO_CODEX_IMPORT=1 keeps the daemon from doing the hours-long one-time
+  ~/.codex/sessions import on its first start; remove the key once that
+  corpus is wanted. Every other kill switch (CSR_NO_DREAMING, CSR_NO_RECAP,
+  CSR_NO_AI_NARRATIVES, ...) can be added under EnvironmentVariables too.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ramakay.csr-engine.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/csr-engine</string>
+    <string>daemon</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CSR_NO_CODEX_IMPORT</key>
+    <string>1</string>
+    <!-- launchd starts with a bare PATH; the claude CLI (narratives, ratification,
+         strategy dreams) lives under ~/.local/bin on a typical install. -->
+    <key>PATH</key>
+    <string>/Users/YOUR_USERNAME/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <!-- Without this launchd runs the daemon from `/`. Its headless `claude -p`
+       children inherit that cwd, so Claude Code's seatbelt profile is scoped at
+       the filesystem root and sandboxd asks TCC for every protected location
+       under it (Desktop, Documents, Photos, Media Library, Network Volumes).
+       Scoping cwd to the CSR data dir keeps the profile off personal data. -->
+  <key>WorkingDirectory</key>
+  <string>/Users/YOUR_USERNAME/.claude-self-reflect</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <!-- SIGKILL comes this many seconds after SIGTERM. Without the key launchd
+       used 5 s, shorter than the daemon's graceful stop (it joins its loops
+       for up to 20 s, then flushes the index). -->
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+  <!-- Interactive, not Background or Adaptive (they throttle the whole job)
+       or Standard (it holds every thread at priority 20, prompt answers too).
+       The daemon runs its own threads at utility and raises only a render. -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USERNAME/.claude-self-reflect/logs/daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USERNAME/.claude-self-reflect/logs/daemon.err.log</string>
+</dict>
+</plist>

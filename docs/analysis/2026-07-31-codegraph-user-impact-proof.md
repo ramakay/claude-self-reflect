@@ -106,7 +106,7 @@ channel     = git          source = a190db66…         ts = 2026-07-07T20:44:13
 
 Two channels, ten days apart, agreeing on *what* while disagreeing on *when* — because the session did the work on 06-27 and the commit squashed on 07-07. Both values are stored; neither overwrites the other.
 
-**Repo identity (the H8 fix, R4).** Before: `code_nodes.project` split one repo into two labels — `claude-self-reflect-csr-engine` (1,583 nodes) and `claude-self-reflect` (1,254) — because `project` is the *session cwd*, not the repository. Every "how did this repo evolve" query silently answered about half the repo. After: both carry `repo_root = /Users/ramakrishnanannaswamy/projects/claude-self-reflect` (2,837 nodes) while `project` is preserved as its own signal. The `code_evolution` ledger is likewise now repo-keyed (894 CSR rows; 1,027 rows still null where the file was outside any git tree).
+**Repo identity (the H8 fix, R4).** Before: `code_nodes.project` split one repo into two labels — `claude-self-reflect-csr-engine` (1,583 nodes) and `claude-self-reflect` (1,254) — because `project` is the *session cwd*, not the repository. Every "how did this repo evolve" query silently answered about half the repo. After: both carry `repo_root = /Users/<you>/projects/claude-self-reflect` (2,837 nodes) while `project` is preserved as its own signal. The `code_evolution` ledger is likewise now repo-keyed (894 CSR rows; 1,027 rows still null where the file was outside any git tree).
 
 **Language census across all indexed repos** — the honest denominator for "how much Rust": rust 2,890 · tsx 1,571 · typescript 1,479 · javascript 826 · python 219, of 6,985 nodes. Rust kinds: function 2,657 / type 167 / module 66.
 
@@ -251,7 +251,7 @@ structural_file_coverage (informational, H8 innovation, not gated):
   overall = 400/1737 (23.0%); repo_roots measured=7, skipped(enumeration failed)=0
   claude-self-reflect      66/108  (61.1%)
   anukriti-command-center  92/169  (54.4%)
-  procsolve-website        67/172  (39.0%)
+  client-website           67/172  (39.0%)
   anukriti                137/610  (22.5%)
   anukriti-ota-rls-template 2/537  (0.4%)
 ```

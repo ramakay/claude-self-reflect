@@ -23,6 +23,10 @@ const MAX_RATIFICATION_PROMPT_SIZE: u64 = 10 * 1024;
 const EXTRACTOR_VERSION: &str = "ratification-v3";
 const MAX_LEDGER_SHAS: usize = 20;
 
+#[path = "ratification_pace.rs"]
+pub mod pace;
+pub use pace::{next_due, record_failure, CallUnavailable};
+
 static DISABLED_LOG: Once = Once::new();
 
 /// Entry-point guard used by the daemon loop. Logs once per process when disabled.
@@ -82,22 +86,31 @@ fn head_tail(text: &str, char_cap: usize) -> String {
     format!("{head}\n... [{omitted} chars omitted] ...\n{tail}")
 }
 
-/// v2: operator-turn-prioritized digest. Dialog-acts live in user-authored
-/// chunks (chunk author = genuine user prose, per import provenance); v1's
+/// v2: operator-turn-prioritized digest. The caller supplies chunk ids whose
+/// cached row-level floor reaches UserHistory; the legacy display author is
+/// deliberately not an authority signal. v1's
 /// undifferentiated head+tail sampled mostly assistant/tool text and starved
 /// the extractor of operator turns (Gate A' failure, 2026-07-19).
-pub fn build_digest(chunks: &[ConversationChunk], char_cap: usize) -> String {
-    use crate::provenance::Speaker;
+pub fn build_digest(
+    chunks: &[ConversationChunk],
+    trusted_user_chunk_ids: &std::collections::HashSet<String>,
+    char_cap: usize,
+) -> String {
+    // A pasted handoff draft or dream card is CSR's prose, not an operator turn: strip it
+    // before the head/tail cut, whichever side it sits on.
+    let stripped = |c: &ConversationChunk| {
+        crate::storage::dream_attribution::strip_pasted_csr_spans(&c.content)
+    };
     let user_text: String = chunks
         .iter()
-        .filter(|c| c.author == Speaker::User)
-        .map(|c| c.content.as_str())
+        .filter(|c| trusted_user_chunk_ids.contains(&c.id))
+        .map(stripped)
         .collect::<Vec<_>>()
         .join("\n---\n");
     let other_text: String = chunks
         .iter()
-        .filter(|c| c.author != Speaker::User)
-        .map(|c| c.content.as_str())
+        .filter(|c| !trusted_user_chunk_ids.contains(&c.id))
+        .map(stripped)
         .collect::<Vec<_>>()
         .join("\n---\n");
 
@@ -146,6 +159,8 @@ async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNa
     for candidate in ratification_model_candidates() {
         let attempt = tokio::time::timeout(RATIFICATION_TIMEOUT, async {
             let mut cmd = tokio::process::Command::new("claude");
+            // The 60 s timeout drops this future: the child goes with it, not left running.
+            cmd.kill_on_drop(true);
             // Same recursion guard as session_briefing: nested claude sessions
             // inherit hook config; without it each extraction call fires all CSR
             // hooks and Stop stores the extractor transcript as an episode.
@@ -153,7 +168,13 @@ async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNa
             if let Some(model) = &candidate {
                 cmd.args(["--model", model]);
             }
-            cmd.args(["-p", "-", "--output-format", "json"]);
+            // `--tools ""`: a print-mode child otherwise inherits every
+            // built-in tool (Bash, Edit, Write, Agent) under the user's
+            // permission mode; this call is a pure text extraction.
+            cmd.args(["-p", "-", "--output-format", "json", "--tools", ""]);
+            // No user settings (plugins, SessionStart hooks) and no transcript
+            // left behind for the watcher to re-import.
+            cmd.args(crate::narrative::isolation_args());
             // Must come LAST: --mcp-config is variadic in the claude CLI and would
             // consume any positional arg that followed it.
             if let Some(path) = &mcp_config_path {
@@ -426,32 +447,45 @@ pub async fn process_ratification(storage: &Arc<Storage>, conv_id: &str) -> Resu
         storage.mark_enrichment_completed(conv_id, "ratification", "")?;
         return Ok(());
     }
-    // Must use the provenance-joined path: get_chunks_by_ids alone always
-    // defaults author to ToolResult (author lives in chunk_provenance, not the
-    // chunks table), which silently starves build_digest's operator-turn
-    // filter (author == Speaker::User) and degrades the v2 extractor to plain
-    // head/tail sampling. See get_chunks_by_ids_with_provenance.
-    let chunks = storage.get_chunks_by_ids_with_provenance(&chunk_ids)?;
-    let digest = build_digest(&chunks, DIGEST_CHAR_CAP);
+    let chunks = storage.get_chunks_by_ids(&chunk_ids)?;
+    let trusted_user_chunk_ids = chunks
+        .iter()
+        .filter(|chunk| {
+            storage
+                .get_chunk_min_trust(&chunk.id)
+                .is_ok_and(|tier| tier >= crate::provenance::TrustTier::UserHistory)
+        })
+        .map(|chunk| chunk.id.clone())
+        .collect();
+    let digest = build_digest(&chunks, &trusted_user_chunk_ids, DIGEST_CHAR_CAP);
     let prompt = format!(
         "{}\n\nCONVERSATION DIGEST:\n{}",
         load_ratification_prompt(),
         digest
     );
 
-    match call_claude_for_acts(&prompt).await {
+    // The usage row goes in before the call, so the hour's budget counts a call that is killed
+    // midway too. No row, no call: the budget could not count it.
+    let Some(usage_id) = reserve_usage(storage) else {
+        return Ok(());
+    };
+    let began = std::time::Instant::now();
+    let called = call_claude_for_acts(&prompt).await;
+    let measured =
+        |parsed: Option<&crate::narrative::ParsedNarrative>, success: bool| NarrativeUsageRow {
+            call_site: "ratification".into(),
+            model: parsed.map_or_else(|| "unknown".into(), |p| p.model.clone()),
+            input_tokens: parsed.map_or(0, |p| p.input_tokens),
+            output_tokens: parsed.map_or(0, |p| p.output_tokens),
+            cache_read_tokens: parsed.map_or(0, |p| p.cache_read_tokens),
+            cache_creation_tokens: parsed.map_or(0, |p| p.cache_creation_tokens),
+            duration_ms: began.elapsed().as_millis() as i64,
+            success,
+        };
+    match called {
         Some(parsed) => match parse_acts(&parsed.text) {
             Ok((acts_json, n_directs, n_accepts, n_rejects)) => {
-                let _ = storage.record_narrative_usage(&NarrativeUsageRow {
-                    call_site: "ratification".into(),
-                    model: parsed.model.clone(),
-                    input_tokens: parsed.input_tokens,
-                    output_tokens: parsed.output_tokens,
-                    cache_read_tokens: parsed.cache_read_tokens,
-                    cache_creation_tokens: parsed.cache_creation_tokens,
-                    duration_ms: 0,
-                    success: true,
-                });
+                settle_usage(storage, usage_id, &measured(Some(&parsed), true));
 
                 let conv_files = storage.files_for_session(conv_id, 50).unwrap_or_default();
                 let (start_ts, end_ts) = conversation_time_span(&chunks);
@@ -467,43 +501,77 @@ pub async fn process_ratification(storage: &Arc<Storage>, conv_id: &str) -> Resu
                     Some(serde_json::to_string(&shas)?)
                 };
 
-                storage.upsert_ratification_score(&RatificationScoreRow {
-                    conversation_id: conv_id.into(),
-                    score,
-                    acts_json,
-                    ledger_refs,
-                    extractor_version: EXTRACTOR_VERSION.into(),
-                })?;
+                // Model output over the conversation digest: every chunk that
+                // fed the digest is one row-level input, read from cached floors.
+                let inputs = storage.conversation_chunk_inputs(&chunk_ids);
+                storage.upsert_ratification_score_with_inputs(
+                    &RatificationScoreRow {
+                        conversation_id: conv_id.into(),
+                        score,
+                        acts_json,
+                        ledger_refs,
+                        extractor_version: EXTRACTOR_VERSION.into(),
+                    },
+                    &inputs,
+                )?;
                 storage.mark_enrichment_completed(conv_id, "ratification", conv_id)?;
                 Ok(())
             }
             Err(e) => {
-                let _ = storage.record_narrative_usage(&NarrativeUsageRow {
-                    call_site: "ratification".into(),
-                    model: parsed.model,
-                    input_tokens: parsed.input_tokens,
-                    output_tokens: parsed.output_tokens,
-                    cache_read_tokens: parsed.cache_read_tokens,
-                    cache_creation_tokens: parsed.cache_creation_tokens,
-                    duration_ms: 0,
-                    success: false,
-                });
+                settle_usage(storage, usage_id, &measured(Some(&parsed), false));
                 Err(e)
             }
         },
         None => {
-            let _ = storage.record_narrative_usage(&NarrativeUsageRow {
-                call_site: "ratification".into(),
-                model: "unknown".into(),
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
-                duration_ms: 0,
-                success: false,
-            });
-            Err(anyhow!("ratification LLM call failed or unavailable"))
+            settle_usage(storage, usage_id, &measured(None, false));
+            Err(anyhow::Error::new(CallUnavailable))
         }
+    }
+}
+
+/// Write a ratification call's `narrative_usage` row before the call: unsuccessful and model
+/// `unknown` until [`settle_usage`] fills it in, which is what it stays when the call is killed.
+/// None, logged, when it cannot be written.
+fn reserve_usage(storage: &Storage) -> Option<i64> {
+    storage
+        .with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO narrative_usage (call_site, model, success)
+                 VALUES ('ratification', 'unknown', 0)",
+                [],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .inspect_err(|e| {
+            tracing::warn!(error = %e, "ratification skipped: its usage row could not be written")
+        })
+        .ok()
+}
+
+/// Fill the row [`reserve_usage`] wrote with what the call measured. A failed write is logged:
+/// the row still counts against the hour's budget.
+fn settle_usage(storage: &Storage, id: i64, row: &NarrativeUsageRow) {
+    let written = storage.with_connection(|conn| {
+        conn.execute(
+            "UPDATE narrative_usage SET model = ?2, input_tokens = ?3, output_tokens = ?4,
+                 cache_read_tokens = ?5, cache_creation_tokens = ?6, duration_ms = ?7,
+                 success = ?8
+             WHERE id = ?1",
+            rusqlite::params![
+                id,
+                row.model,
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_creation_tokens,
+                row.duration_ms,
+                row.success as i64,
+            ],
+        )?;
+        Ok(())
+    });
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "could not record a ratification call's usage");
     }
 }
 
@@ -530,6 +598,98 @@ fn conversation_time_span(
 
 #[cfg(test)]
 mod tests {
+    /// The usage row is written before the call and filled in after it: one row per call, counted
+    /// from the moment the call starts, so a call killed midway still spends the hour's budget.
+    #[test]
+    fn a_calls_usage_row_is_written_before_it_and_filled_in_after() {
+        use super::{reserve_usage, settle_usage, NarrativeUsageRow, Storage};
+        let storage = Storage::open_memory().unwrap();
+        let rows = |storage: &Storage| -> Vec<(String, i64, i64)> {
+            storage
+                .with_connection(|c| {
+                    let mut st = c.prepare(
+                        "SELECT model, output_tokens, success FROM narrative_usage
+                         WHERE call_site = 'ratification' ORDER BY id",
+                    )?;
+                    let rows = st
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                })
+                .unwrap()
+        };
+        let killed = reserve_usage(&storage).unwrap();
+        let answered = reserve_usage(&storage).unwrap();
+        assert_ne!(killed, answered);
+        settle_usage(
+            &storage,
+            answered,
+            &NarrativeUsageRow {
+                call_site: "ratification".into(),
+                model: "claude-haiku".into(),
+                input_tokens: 2,
+                output_tokens: 210,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                duration_ms: 900,
+                success: true,
+            },
+        );
+        assert_eq!(
+            rows(&storage),
+            [
+                ("unknown".to_owned(), 0, 0),
+                ("claude-haiku".to_owned(), 210, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn ratification_floor_is_the_minimum_of_its_conversation_chunks() {
+        use crate::provenance::TrustTier;
+        use crate::storage::artifact_provenance::ArtifactKind;
+        use crate::storage::queries::RatificationScoreRow;
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        storage
+            .with_connection(|c| {
+                for (id, tier) in [("c-user", 3), ("c-tool", 1)] {
+                    c.execute(
+                        "INSERT INTO chunks(id,conversation_id,project_name,timestamp,content,message_count,min_trust)
+                         VALUES(?1,'conv','p','now','text',1,?2)",
+                        rusqlite::params![id, tier],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let inputs = storage.conversation_chunk_inputs(&["c-user".into(), "c-tool".into()]);
+        assert_eq!(inputs.floor(), TrustTier::External);
+        let floor = storage
+            .upsert_ratification_score_with_inputs(
+                &RatificationScoreRow {
+                    conversation_id: "conv".into(),
+                    score: 0.5,
+                    acts_json: "[]".into(),
+                    ledger_refs: None,
+                    extractor_version: "test".into(),
+                },
+                &inputs,
+            )
+            .unwrap();
+        assert_eq!(floor, TrustTier::External);
+        assert_eq!(
+            storage
+                .get_artifact_min_trust(ArtifactKind::Ratification, "conv")
+                .unwrap(),
+            TrustTier::External
+        );
+        // A conversation with no chunks has no observable support.
+        assert_eq!(
+            storage.conversation_chunk_inputs(&[]).floor(),
+            TrustTier::Unknown
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -608,12 +768,50 @@ mod tests {
             seq: 0,
             is_sidechain: false,
         };
-        let digest = build_digest(&[chunk], 40);
+        let digest = build_digest(&[chunk], &["c1".to_string()].into_iter().collect(), 40);
         assert!(digest.contains("chars omitted"));
         // v2: user-authored content leads under the operator-turn header,
         // truncated to the 3/4 user budget (head+tail of 30 chars).
         assert!(digest.starts_with("=== OPERATOR-TURN EXCERPTS ===\n"));
         assert!(digest.ends_with("aaaaaaaaaaaaaaa")); // tail half of 30
+    }
+
+    /// A pasted handoff draft is CSR's prose, not an operator turn: the digest keeps the ask and
+    /// the person's own line, on the operator side and the other side alike.
+    #[test]
+    fn build_digest_strips_a_pasted_handoff_draft_before_the_cut() {
+        let draft = crate::companion::handoff::canary_draft();
+        let mk = |id: &str, content: String| ConversationChunk {
+            id: id.into(),
+            conversation_id: "conv".into(),
+            project_name: "p".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            content,
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let chunks = vec![
+            mk("c1", format!("{draft}also fix the footer")),
+            mk("c2", draft.clone()),
+        ];
+        for trusted in [["c1".to_string()], ["c2".to_string()]] {
+            let digest = build_digest(&chunks, &trusted.into_iter().collect(), 8000);
+            for csr in [
+                "went quiet",
+                "Wrote the retry",
+                "csr-engine.db",
+                "csr-handoff",
+            ] {
+                assert!(!digest.contains(csr), "{csr}: {digest}");
+            }
+            assert!(digest.contains("Revisit this thread"), "{digest}");
+        }
+        let digest = build_digest(&chunks, &["c1".to_string()].into_iter().collect(), 8000);
+        eprintln!("DIGEST: {digest:?}");
+        assert!(digest.contains("also fix the footer"), "{digest}");
     }
 
     #[test]
@@ -639,7 +837,7 @@ mod tests {
             mk("c2", "fix the import bug", crate::provenance::Speaker::User),
             mk("c3", "tool output", crate::provenance::Speaker::ToolResult),
         ];
-        let digest = build_digest(&chunks, 8000);
+        let digest = build_digest(&chunks, &["c2".to_string()].into_iter().collect(), 8000);
         let op = digest.find("OPERATOR-TURN EXCERPTS").unwrap();
         let user_pos = digest.find("fix the import bug").unwrap();
         let other = digest.find("OTHER CONTEXT").unwrap();
@@ -647,22 +845,11 @@ mod tests {
         assert!(digest.find("assistant explanation text").unwrap() > other);
     }
 
-    /// Regression (CodeRabbit PR #245 finding, pre-confirmed): the unit tests
-    /// above pass only because they build `ConversationChunk`s in memory with
-    /// `author` set directly. In production, `process_ratification` fetches
-    /// chunks via storage — and `get_chunks_by_ids` always defaults `author`
-    /// to `ToolResult` because the `chunks` table has no author column (it
-    /// lives in `chunk_provenance`). That meant `build_digest`'s
-    /// `author == Speaker::User` filter always saw an empty `user_text` in
-    /// production, silently degrading the v2 extractor to plain head/tail
-    /// sampling and never emitting the operator-turn excerpts section. This
-    /// test goes through the real storage path — insert chunks +
-    /// chunk_provenance rows into a temp DB, fetch via
-    /// `get_chunks_by_ids_with_provenance`, and confirm `build_digest` emits
-    /// the operator-turn section.
+    /// The aggregate display author must never mint an operator-turn signal.
+    /// Only the cached row-level trust floor supplied by the caller can do so.
     #[test]
     fn ratification_digest_via_storage_emits_operator_turns() {
-        use crate::provenance::{ChunkProvenance, Speaker};
+        use crate::provenance::Speaker;
 
         let storage = Storage::open_memory().unwrap();
         let mk = |id: &str, content: &str| ConversationChunk {
@@ -685,46 +872,19 @@ mod tests {
         let asst_chunk = mk("rc2", "done, added an advisory lock before dump_to_disk");
         storage.insert_chunk(&user_chunk, &[0.0; 4]).unwrap();
         storage.insert_chunk(&asst_chunk, &[0.0; 4]).unwrap();
-        storage
-            .insert_chunk_provenance(
-                "rc1",
-                &ChunkProvenance {
-                    author: Speaker::User,
-                    source_conv_id: "conv-real".into(),
-                    supersedes: None,
-                },
-            )
-            .unwrap();
-        storage
-            .insert_chunk_provenance(
-                "rc2",
-                &ChunkProvenance {
-                    author: Speaker::Assistant,
-                    source_conv_id: "conv-real".into(),
-                    supersedes: None,
-                },
-            )
-            .unwrap();
-
         let ids = vec!["rc1".to_string(), "rc2".to_string()];
-
-        // Old path (what process_ratification used before this fix): every
-        // chunk defaults to ToolResult, so build_digest never sees a user turn.
-        let plain_chunks = storage.get_chunks_by_ids(&ids).unwrap();
-        let plain_digest = build_digest(&plain_chunks, DIGEST_CHAR_CAP);
+        let chunks = storage.get_chunks_by_ids(&ids).unwrap();
+        let plain_digest = build_digest(&chunks, &Default::default(), DIGEST_CHAR_CAP);
         assert!(
             !plain_digest.contains("OPERATOR-TURN EXCERPTS"),
-            "sanity check: unjoined path must NOT surface operator turns (that's the bug)"
+            "display authors must not create authority"
         );
 
-        // New path: provenance-joined fetch recovers the true author, so
-        // build_digest correctly emits the operator-turn section.
-        let joined_chunks = storage.get_chunks_by_ids_with_provenance(&ids).unwrap();
-        let digest = build_digest(&joined_chunks, DIGEST_CHAR_CAP);
+        let trusted = ["rc1".to_string()].into_iter().collect();
+        let digest = build_digest(&chunks, &trusted, DIGEST_CHAR_CAP);
         assert!(
             digest.contains("=== OPERATOR-TURN EXCERPTS ==="),
-            "build_digest must emit the operator-turn section when fetched via \
-             get_chunks_by_ids_with_provenance; got: {digest}"
+            "cached UserHistory floor must emit the operator-turn section; got: {digest}"
         );
         assert!(digest.contains("please fix the flaky HNSW persistence test"));
     }

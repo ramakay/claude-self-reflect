@@ -19,9 +19,12 @@ pub fn synthesize_story_from_v3(v3_content: &str, project: &str) -> Option<Strin
     // Build story from available sections
     let mut parts = Vec::new();
 
+    // A pasted request (a router status page, a log, a JSON body) is not what the session was
+    // about: the story never quotes it, and neither does the fallback below.
+    let pasted = |text: &str| crate::companion::paste::is_paste(text);
     if let Some(req) = user_request {
         let cleaned = clean_request_text(&req);
-        if !cleaned.is_empty() {
+        if !cleaned.is_empty() && !pasted(&cleaned) {
             parts.push(cleaned);
         }
     }
@@ -67,7 +70,7 @@ pub fn synthesize_story_from_v3(v3_content: &str, project: &str) -> Option<Strin
         // Fallback: try to extract anything meaningful from the raw content
         let first_line = v3_content
             .lines()
-            .find(|l| !l.trim().is_empty() && !l.starts_with('#'));
+            .find(|l| !l.trim().is_empty() && !l.starts_with('#') && !pasted(l));
         if let Some(line) = first_line {
             let cleaned: String = line.trim().chars().take(200).collect();
             if cleaned.len() >= 10 {
@@ -81,9 +84,27 @@ pub fn synthesize_story_from_v3(v3_content: &str, project: &str) -> Option<Strin
     }
 
     // Join and cap at 500 chars
-    let story: String = parts.join(". ");
+    // ". " between parts, or a space after a part that already ends a sentence ("lately?").
+    let story = parts.iter().fold(String::new(), |mut story, part| {
+        if !story.is_empty() {
+            story.push_str(if story.ends_with(['.', '?', '!']) {
+                " "
+            } else {
+                ". "
+            });
+        }
+        story.push_str(part);
+        story
+    });
     let capped: String = story.chars().take(500).collect();
     Some(capped)
+}
+
+/// The request a V3 extraction holds (its `## User Request` section, cleaned as the story
+/// cleans it), or None when there is none or it was a paste. Never the signature block.
+pub fn request_of(v3_content: &str) -> Option<String> {
+    let request = clean_request_text(&extract_section(v3_content, "## User Request")?);
+    (!request.is_empty() && !crate::companion::paste::is_paste(&request)).then_some(request)
 }
 
 /// Synthesize a story from heuristic enrichment data.
@@ -125,7 +146,9 @@ fn extract_section(content: &str, header: &str) -> Option<String> {
     let start = lines.iter().position(|l| l.starts_with(header))?;
     let mut result = String::new();
     for line in &lines[start + 1..] {
-        if line.starts_with("## ") {
+        // `---` opens the extraction's signature block (`Signature: {json}`), never a section's
+        // words: a story that read through it showed the raw JSON in the pane.
+        if line.starts_with("## ") || line.trim() == "---" {
             break;
         }
         if !line.trim().is_empty() {
@@ -190,6 +213,35 @@ fn extract_heuristic_field<'a>(heuristic: &'a str, field: &str) -> Option<&'a st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The V3 reflection as the daemon writes it (`{search_index}\n\n---\nSignature: {json}\n
+    /// Context:\n…`): the story takes the request, never the signature after `---`
+    /// (2026-11-19 clean install: the pane showed `--- Signature: {"completion_status":…`).
+    #[test]
+    fn the_signature_block_never_reaches_the_story() {
+        let v3 = "## User Request\nwhat did we work on lately?\n\n---\nSignature: \
+                  {\"completion_status\":\"partial\",\"confidence\":\"MEDIUM\",\"frameworks\":[],\
+                  \"pattern_reusability\":\"medium\",\"error_recovery\":false,\"total_edits\":0,\
+                  \"iteration_count\":2}\nContext:\nnone";
+        let story = synthesize_story_from_v3(v3, "this-ai-life").unwrap();
+        assert_eq!(story, "what did we work on lately? Partially completed");
+        assert!(!story.contains("Signature") && !story.contains('{'));
+    }
+
+    /// A pasted router status page as the request: the story says how it went, never the page.
+    #[test]
+    fn a_pasted_request_never_reaches_the_story() {
+        let v3 = "## User Request\nFirmware=V7.2.8.8_5.1.24 RegionTag=RBRE960_NA Region=us \
+                  Model=RBRE960 InternetConnectionStatus=Up SOAPVersion=3.46\n\n---\nSignature: \
+                  {\"completion_status\":\"partial\"}\nContext:\nnone";
+        let story = synthesize_story_from_v3(v3, "this-ai-life").unwrap();
+        assert_eq!(story, "Partially completed");
+        let only =
+            "## User Request\nFirmware=V7.2.8.8 RegionTag=RBRE960_NA Region=us Model=RBRE960";
+        assert_eq!(synthesize_story_from_v3(only, "p"), None);
+        let bare = "Firmware=V7.2.8.8 RegionTag=RBRE960_NA Region=us Model=RBRE960";
+        assert_eq!(synthesize_story_from_v3(bare, "p"), None);
+    }
 
     #[test]
     fn test_synthesize_from_v3_with_user_request() {
@@ -311,7 +363,8 @@ mod tests {
 
     #[test]
     fn test_story_capped_at_500_chars() {
-        let long_request = "x".repeat(600);
+        // Words, not one 600-character token: a blob like that is a paste and never a story.
+        let long_request = "fix the slow import ".repeat(30);
         let v3_content = format!("## User Request\n\"{}\"\n", long_request);
         let story = synthesize_story_from_v3(&v3_content, "proj").unwrap();
         assert!(story.len() <= 500);

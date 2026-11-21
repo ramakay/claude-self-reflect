@@ -4,7 +4,7 @@ title: Development Setup
 
 ## Prerequisites
 
-- Rust 1.73+
+- Current stable Rust (built and tested on 1.98.1)
 - macOS (Apple Silicon) or Linux
 - Git
 
@@ -15,7 +15,7 @@ git clone https://github.com/ramakay/claude-self-reflect.git
 cd claude-self-reflect/csr-engine
 cargo build --release
 cargo test
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo fmt -- --check
 ```
 
@@ -25,7 +25,7 @@ cargo fmt -- --check
 cargo test               # All tests
 cargo test --lib          # Unit only
 cargo test --test hooks_integration  # Hooks
-cargo test test_reflect_on_past      # Specific
+cargo test --test integration weak_band   # Specific
 ```
 
 ## Workflow
@@ -33,7 +33,7 @@ cargo test test_reflect_on_past      # Specific
 1. Create feature branch from `main`
 2. Make changes
 3. `cargo test` — all must pass
-4. `cargo clippy -- -D warnings` — zero warnings
+4. `cargo clippy --all-targets -- -D warnings` — zero warnings
 5. `cargo fmt` — clean formatting
 6. Submit PR
 

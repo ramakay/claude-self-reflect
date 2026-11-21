@@ -15,6 +15,7 @@
 //! guess and never an `Err` the caller has to handle. `project` is never
 //! touched by anything in this module.
 
+use crate::process::CommandDeadline;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,7 +91,7 @@ fn git_toplevel(dir: &Path) -> Option<String> {
         .arg(dir)
         .arg("rev-parse")
         .arg("--show-toplevel")
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     if !output.status.success() {
         return None;
@@ -102,6 +103,148 @@ fn git_toplevel(dir: &Path) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Where a directory sits in git right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPlace {
+    /// Canonical top level of the working tree the directory is in: the main
+    /// checkout, or the linked worktree when it is inside one.
+    pub toplevel: PathBuf,
+    /// Canonical git COMMON directory: one value for a main checkout, every
+    /// subdirectory under it and every linked worktree, and a different value
+    /// for a nested repository or submodule sitting inside that checkout.
+    pub common_dir: String,
+}
+
+/// Both answers from one `git` call. The top level says which working tree a
+/// directory is in, the common directory says which repository; neither can be
+/// derived from the other (a linked worktree lives anywhere, a submodule's
+/// common directory is under its superproject's `.git`).
+///
+/// For comparing two directories in the same instant, never for storing: a
+/// path says nothing about which repository lived there last month. No
+/// fallback of any kind. `git` missing, too old for `--path-format` (before
+/// 2.31), a `safe.directory` refusal, a bare repository, a directory that is
+/// gone, or `git` still running at `deadline` (it is killed): all `None`, and
+/// every caller treats `None` as "not the same repository".
+pub fn git_place(dir: &Path, deadline: std::time::Instant) -> Option<GitPlace> {
+    if !dir.is_dir() || std::time::Instant::now() >= deadline {
+        return None;
+    }
+    let mut cmd = Command::new("git");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(&k);
+        }
+    }
+    let output = cmd
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ])
+        .output_with_deadline(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(crate::process::GIT_TIMEOUT),
+        )
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    // Exactly two lines, in the order asked. A path holding a newline gives
+    // more and is refused.
+    let mut lines = text.lines();
+    let (toplevel, common_dir) = (lines.next()?, lines.next()?);
+    if lines.next().is_some() || toplevel.is_empty() || common_dir.is_empty() {
+        return None;
+    }
+    Some(GitPlace {
+        toplevel: std::fs::canonicalize(toplevel).ok()?,
+        common_dir: std::fs::canonicalize(common_dir)
+            .ok()?
+            .to_string_lossy()
+            .into_owned(),
+    })
+}
+
+/// How long a found place is trusted without asking git again.
+const PLACE_TTL_FOUND: std::time::Duration = std::time::Duration::from_secs(600);
+/// How long a "no place" is trusted. Short: a `git init` should show soon.
+const PLACE_TTL_NONE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Entries held before the cache makes room.
+const PLACE_CACHE_CAP: usize = 4096;
+
+/// Process-wide memory of [`git_place`] answers, so the per-prompt repo check
+/// does not spawn `git` again for a directory it just judged.
+#[derive(Default)]
+struct PlaceCache {
+    entries: HashMap<PathBuf, (std::time::Instant, Option<GitPlace>)>,
+}
+
+impl PlaceCache {
+    fn get(&self, dir: &Path, now: std::time::Instant) -> Option<Option<GitPlace>> {
+        let (stored_at, place) = self.entries.get(dir)?;
+        let ttl = if place.is_some() {
+            PLACE_TTL_FOUND
+        } else {
+            PLACE_TTL_NONE
+        };
+        (now.saturating_duration_since(*stored_at) < ttl).then(|| place.clone())
+    }
+
+    fn put(&mut self, dir: &Path, now: std::time::Instant, place: Option<GitPlace>) {
+        if self.entries.len() >= PLACE_CACHE_CAP && !self.entries.contains_key(dir) {
+            self.entries.retain(|_, (stored_at, place)| {
+                let ttl = if place.is_some() {
+                    PLACE_TTL_FOUND
+                } else {
+                    PLACE_TTL_NONE
+                };
+                now.saturating_duration_since(*stored_at) < ttl
+            });
+            if self.entries.len() >= PLACE_CACHE_CAP {
+                self.entries.clear();
+            }
+        }
+        self.entries.insert(dir.to_path_buf(), (now, place));
+    }
+}
+
+static PLACE_CACHE: OnceLock<Mutex<PlaceCache>> = OnceLock::new();
+
+fn place_cache() -> std::sync::MutexGuard<'static, PlaceCache> {
+    PLACE_CACHE
+        .get_or_init(|| Mutex::new(PlaceCache::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// What [`git_place_cached`] already knows about `dir`, without running git:
+/// `Some(answer)` on a live entry (the answer itself may be `None`), `None`
+/// when the directory has to be asked about.
+pub fn git_place_peek(dir: &Path) -> Option<Option<GitPlace>> {
+    place_cache().get(dir, std::time::Instant::now())
+}
+
+/// [`git_place`] with a process-wide cache: 10 minutes for a found place, 30
+/// seconds for none, 4,096 directories. A hit spawns nothing. An answer that
+/// `deadline` may have cut short (git killed, or no time left) is not stored.
+pub fn git_place_cached(dir: &Path, deadline: std::time::Instant) -> Option<GitPlace> {
+    if let Some(known) = git_place_peek(dir) {
+        return known;
+    }
+    let place = git_place(dir, deadline);
+    let now = std::time::Instant::now();
+    if now < deadline {
+        place_cache().put(dir, now, place.clone());
+    }
+    place
 }
 
 /// Backfill fallback: walk up from `dir` looking for the nearest ancestor
@@ -162,6 +305,158 @@ mod tests {
             .as_ref()
             .map(|g| fs::canonicalize(g).unwrap_or_else(|_| PathBuf::from(g)));
         assert_eq!(got_canon, Some(expected));
+    }
+
+    /// `git <args>` with ambient `GIT_*` stripped (see the test above).
+    /// `false` when git is unavailable, so callers skip instead of failing.
+    fn git(args: &[&str], dir: &Path) -> bool {
+        let mut cmd = Command::new("git");
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(&k);
+            }
+        }
+        cmd.arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn soon() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(10)
+    }
+
+    #[test]
+    fn a_deadline_already_past_answers_none_instead_of_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return; // git unavailable in this environment
+        }
+        assert!(git_place(&repo, soon()).is_some());
+        assert_eq!(git_place(&repo, std::time::Instant::now()), None);
+    }
+
+    #[test]
+    fn a_cached_place_answers_without_running_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return; // git unavailable in this environment
+        }
+        assert_eq!(git_place_peek(&repo), None);
+        let first = git_place_cached(&repo, soon());
+        assert!(first.is_some());
+        assert_eq!(git_place_peek(&repo), Some(first.clone()));
+        // Break the repository: a real git call would now answer None.
+        fs::remove_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(git_place(&repo, soon()), None);
+        assert_eq!(
+            git_place_cached(&repo, soon()),
+            first,
+            "a hit spawns no git"
+        );
+    }
+
+    #[test]
+    fn a_cut_short_answer_is_not_stored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        assert_eq!(git_place_cached(&repo, std::time::Instant::now()), None);
+        assert_eq!(git_place_peek(&repo), None);
+    }
+
+    #[test]
+    fn place_cache_expires_found_and_none_on_their_own_clocks_and_stays_bounded() {
+        let t0 = std::time::Instant::now();
+        let at = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+        let place = GitPlace {
+            toplevel: PathBuf::from("/r"),
+            common_dir: "/r/.git".to_string(),
+        };
+        let mut cache = PlaceCache::default();
+        cache.put(Path::new("/found"), t0, Some(place.clone()));
+        cache.put(Path::new("/none"), t0, None);
+        assert_eq!(cache.get(Path::new("/found"), at(599)), Some(Some(place)));
+        assert_eq!(cache.get(Path::new("/found"), at(601)), None);
+        assert_eq!(cache.get(Path::new("/none"), at(29)), Some(None));
+        assert_eq!(cache.get(Path::new("/none"), at(31)), None);
+
+        let mut full = PlaceCache::default();
+        for i in 0..PLACE_CACHE_CAP + 10 {
+            full.put(Path::new(&format!("/d{i}")), t0, None);
+        }
+        assert!(full.entries.len() <= PLACE_CACHE_CAP);
+        assert!(full
+            .get(Path::new(&format!("/d{}", PLACE_CACHE_CAP + 9)), t0)
+            .is_some());
+    }
+
+    #[test]
+    fn common_dir_is_shared_by_subdirectories_and_worktrees_but_not_nested_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join("sub/deeper")).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return; // git unavailable in this environment
+        }
+        let main = GitPlace {
+            toplevel: fs::canonicalize(&repo).unwrap(),
+            common_dir: fs::canonicalize(repo.join(".git"))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        };
+        assert_eq!(git_place(&repo, soon()), Some(main.clone()));
+        assert_eq!(
+            git_place(&repo.join("sub/deeper"), soon()),
+            Some(main.clone())
+        );
+
+        // A linked worktree is its own top level in the main repository.
+        fs::write(repo.join("a.txt"), "a\n").unwrap();
+        if git(&["add", "a.txt"], &repo)
+            && git(&["commit", "-q", "-m", "a"], &repo)
+            && git(&["worktree", "add", "-q", "../wt", "-b", "wt"], &repo)
+        {
+            let wt = tmp.path().join("wt");
+            fs::create_dir_all(wt.join("sub")).unwrap();
+            assert_eq!(
+                git_place(&wt.join("sub"), soon()),
+                Some(GitPlace {
+                    toplevel: fs::canonicalize(&wt).unwrap(),
+                    common_dir: main.common_dir.clone(),
+                })
+            );
+        }
+
+        // A repository nested inside the checkout is its own repository.
+        let nested = repo.join("vendor/other");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(git(&["init", "-q"], &nested));
+        let nested_place = git_place(&nested, soon()).unwrap();
+        assert_ne!(nested_place.common_dir, main.common_dir);
+        assert_eq!(nested_place.toplevel, fs::canonicalize(&nested).unwrap());
+
+        // No working tree, no answer: outside any repository, a directory that
+        // is gone, and inside a bare repository.
+        assert_eq!(git_place(tmp.path(), soon()), None);
+        assert_eq!(git_place(&tmp.path().join("missing"), soon()), None);
+        let bare = tmp.path().join("bare.git");
+        if git(
+            &["init", "-q", "--bare", bare.to_str().unwrap()],
+            tmp.path(),
+        ) {
+            assert_eq!(git_place(&bare, soon()), None);
+        }
     }
 
     #[test]

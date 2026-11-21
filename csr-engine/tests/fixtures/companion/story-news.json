@@ -1,0 +1,15 @@
+{
+  "story": true,
+  "at": 1792319400.0,
+  "covered": 3,
+  "messages": 5,
+  "messages_since": 2,
+  "prompts_since": 0,
+  "receipts": 0,
+  "calls_24h": 0,
+  "usd_24h": null,
+  "tokens_2h": 0,
+  "last_tokens": null,
+  "liked_2h": 0,
+  "transcript": "<HOME>/.claude/projects/fixture/sess-now.jsonl"
+}
