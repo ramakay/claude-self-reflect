@@ -926,6 +926,18 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 @media (max-width: 760px) { .xc-panel { grid-template-columns: minmax(0, 1fr); } .xc-box pre { font-size: 12px; } }
 
 /* Screenshots */
+.noherdr-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 28px; margin-top: 30px; align-items: start; }
+.noherdr-info { border: 1px solid var(--paper-rule); border-left: 4px solid var(--tl-ink); border-radius: 12px; padding: 20px 22px; background: var(--anatomy-card); }
+.noherdr-info-t { margin: 0 0 10px; font-weight: 640; display: flex; align-items: center; gap: 10px; }
+.noherdr-info-t span { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; border: 1.5px solid currentColor; font: italic 600 13px/1 Georgia, serif; }
+.noherdr-info ul { margin: 0; padding-left: 18px; line-height: 1.55; }
+.noherdr-info li + li { margin-top: 6px; }
+.noherdr-link { display: inline-block; margin-top: 14px; font-weight: 600; color: var(--tl-ink); text-decoration: underline; text-underline-offset: 4px; }
+.noherdr-link:hover { color: var(--tl-lit); }
+.noherdr-grid .shot-open { aspect-ratio: auto; }
+.noherdr-grid .shot-open img { height: auto; }
+.noherdr-link::after { content: " \2192"; }
+@media (max-width: 1000px) { .noherdr-grid { grid-template-columns: minmax(0, 1fr); } }
 .shot-grid { list-style: none; margin: 30px 0 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px 18px; }
 .shot { margin: 0; }
 .shot-open { display: block; width: 100%; padding: 0; border: 1px solid var(--paper-rule); background: #1e1e1e; cursor: zoom-in; aspect-ratio: 4 / 3; overflow: hidden; }
@@ -1445,33 +1457,33 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
 </section>
 
 <section class="sr-sec sr-shots" id="screenshots" aria-labelledby="shots-h">
-  <p class="story-kicker">Screenshots</p>
-  <h2 id="shots-h">From a clean install.</h2>
-  <p class="story-lead"><mark class="sr-hl">Each one is a real screen from that install, in herdr, not a mockup.</mark></p>
+  <p class="story-kicker">The pane</p>
+  <h2 id="shots-h">What the pane shows.</h2>
+  <p class="story-lead"><mark class="sr-hl">Mockups in the pane's own fonts and colours, with a demo project.</mark> The real thing, from a live session, is in the herdr section above.</p>
   <ul class="shot-grid">
     <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: The first session after setup: the pane opens beside Claude by itself."><img src="assets/shots/first-herdr.webp" alt="The first Claude Code session after setup, in herdr. The Self-Reflect pane opened on its own with questions to try. The project path is blurred." width="850" height="1172" loading="lazy" decoding="async"></button>
-      <figcaption>The first session after setup: the pane opens beside Claude by itself.</figcaption>
+      <button class="shot-open" type="button" aria-label="Enlarge: First session: the pane offers questions to try."><img src="assets/shots/mock-first.webp" alt="Mockup of the Self-Reflect pane. First session: the pane offers questions to try." width="704" height="776" loading="lazy" decoding="async" data-fit="contain"></button>
+      <figcaption>First session: the pane offers questions to try.</figcaption>
     </figure></li>
     <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: Recall: Claude answers from past sessions, the pane beside it."><img src="assets/shots/recall-herdr.webp" alt="In herdr, Claude answers &quot;what did we work on lately?&quot; from past sessions, with the pane on the right. The answer is blurred." width="850" height="1172" loading="lazy" decoding="async"></button>
-      <figcaption>Recall: Claude answers from past sessions, the pane beside it.</figcaption>
+      <button class="shot-open" type="button" aria-label="Enlarge: After a recall: where the work stands, and what CSR handed over."><img src="assets/shots/mock-recall.webp" alt="Mockup of the Self-Reflect pane. After a recall: where the work stands, and what CSR handed over." width="704" height="664" loading="lazy" decoding="async" data-fit="contain"></button>
+      <figcaption>After a recall: where the work stands, and what CSR handed over.</figcaption>
     </figure></li>
     <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: /csr in herdr: Lost and found and the Story card."><img src="assets/shots/pane-beside.webp" alt="herdr with Claude Code on the left and the Self-Reflect pane on the right. The answer is blurred." width="905" height="1258" loading="lazy" decoding="async"></button>
-      <figcaption><code>/csr</code> in herdr: Lost and found and the Story card.</figcaption>
+      <button class="shot-open" type="button" aria-label="Enlarge: Lost and found: the question a session ended on."><img src="assets/shots/mock-lost.webp" alt="Mockup of the Self-Reflect pane. Lost and found: the question a session ended on." width="704" height="688" loading="lazy" decoding="async" data-fit="contain"></button>
+      <figcaption>Lost and found: the question a session ended on.</figcaption>
     </figure></li>
     <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: A new session: where you left off, and questions to try."><img src="assets/shots/fresh-pane.webp" alt="A new session in herdr. The pane shows the last visit and questions to try." width="905" height="1258" loading="lazy" decoding="async"></button>
-      <figcaption>A new session: where you left off, and questions to try.</figcaption>
+      <button class="shot-open" type="button" aria-label="Enlarge: A new session: where you left off."><img src="assets/shots/mock-next.webp" alt="Mockup of the Self-Reflect pane. A new session: where you left off." width="704" height="686" loading="lazy" decoding="async" data-fit="contain"></button>
+      <figcaption>A new session: where you left off.</figcaption>
     </figure></li>
     <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: Seven minutes on, the pane at rest."><img src="assets/shots/resting-pane.webp" alt="The Self-Reflect pane at rest: Lost and found, the Story card, the context and weekly gauges and fresh tokens per turn." width="350" height="620" loading="lazy" decoding="async" data-fit="contain"></button>
-      <figcaption>Seven minutes on, the pane at rest.</figcaption>
+      <button class="shot-open" type="button" aria-label="Enlarge: Usage pace and the context gauge."><img src="assets/shots/mock-pace.webp" alt="Mockup of the Self-Reflect pane. Usage pace and the context gauge." width="704" height="640" loading="lazy" decoding="async" data-fit="contain"></button>
+      <figcaption>Usage pace and the context gauge.</figcaption>
     </figure></li>
     <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: The pane in its light theme."><img src="assets/shots/light-pane.webp" alt="The Self-Reflect pane in its light theme." width="350" height="590" loading="lazy" decoding="async" data-fit="contain"></button>
-      <figcaption>The pane in its light theme.</figcaption>
+      <button class="shot-open" type="button" aria-label="Enlarge: The same pane in its light theme."><img src="assets/shots/mock-light.webp" alt="Mockup of the Self-Reflect pane. The same pane in its light theme." width="704" height="776" loading="lazy" decoding="async" data-fit="contain"></button>
+      <figcaption>The same pane in its light theme.</figcaption>
     </figure></li>
   </ul>
   <dialog class="shot-box" aria-label="Screenshot">
@@ -1479,6 +1491,28 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
     <img alt="">
     <p class="shot-box-cap"></p>
   </dialog>
+</section>
+
+<section class="sr-sec sr-noherdr" id="no-herdr" aria-labelledby="noherdr-h">
+  <p class="story-kicker">No herdr?</p>
+  <h2 id="noherdr-h">It works in a plain terminal too.</h2>
+  <p class="story-lead"><mark class="sr-hl">Type /csr and the panel opens inside Claude Code.</mark></p>
+  <div class="noherdr-grid">
+    <figure class="shot">
+      <button class="shot-open" type="button" aria-label="Enlarge: Recall in a plain terminal, then the /csr panel."><img src="assets/shots/recall-csr.webp" alt="Claude answers &quot;what did we work on lately?&quot; from past sessions in a plain terminal; the /csr panel below it. The answer is blurred." width="1233" height="1114" loading="lazy" decoding="async"></button>
+      <figcaption>Recall in Terminal.app, then the <code>/csr</code> panel. A real screen from a clean install, 2026-11-19; the answer is blurred.</figcaption>
+    </figure>
+    <aside class="noherdr-info" role="note" aria-label="Without herdr">
+      <p class="noherdr-info-t"><span aria-hidden="true">i</span> Without herdr</p>
+      <ul>
+        <li>Recall, the recap, dreams and all 16 MCP tools work the same.</li>
+        <li>Type <code>/csr</code> to open the panel. It opens by itself only in a window 144 columns or wider.</li>
+        <li>In a narrower window, a one-line notice says the panel is ready.</li>
+        <li>herdr adds the live pane beside Claude, with the picture cards.</li>
+      </ul>
+      <a class="noherdr-link" href="docs/#/docs/companion-views">Choose your view</a>
+    </aside>
+  </div>
 </section>
 
 <section class="sr-sec sr-love" id="love" aria-label="Built for and built on">
