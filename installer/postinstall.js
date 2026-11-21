@@ -254,15 +254,6 @@ function runOrExplainActivation(destPath, pathBinary) {
 }
 
 // --- Stale-process report + daemon restart (gap-G2 spec 2e) ---
-//
-// FORWARD-PORT NOTE (gap-G2 review finding 5): this branch's base predates
-// #316, which rewrote this file's staging/rename logic and added
-// installer/lib.js on main. `git merge-tree main HEAD` conflicts in this
-// file. When this branch lands on top of that rewrite, move
-// reportStaleAndKickstart (and the matching shell function in
-// scripts/install.sh) into lib.js behind an injectable exec, drop the
-// now-redundant staging duplicate, and add an installer test feeding a
-// fake `status --stale` output.
 
 const DAEMON_LABEL = 'com.ramakay.csr-engine.daemon';
 

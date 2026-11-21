@@ -568,3 +568,51 @@ fn the_storage_report_says_so_when_chunk_search_is_waiting_for_a_generation() {
     assert!(text.contains("serving: none"), "{text}");
     assert!(text.contains("keyword-only"), "{text}");
 }
+
+fn open_index_lock(dir: &Path) -> std::fs::File {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("index.lock"))
+        .unwrap()
+}
+
+/// The startup cleanup tries the exclusive lock with no wait. flock conflicts across
+/// separate opens even inside one process, so a second open stands in for the writer.
+#[test]
+fn the_zero_wait_exclusive_try_is_refused_at_once_while_the_lock_is_held() {
+    use crate::search::{lock_index, INDEX_LOCK_TIMEOUT};
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let holder = open_index_lock(tmp.path());
+    lock_index(&holder, false, INDEX_LOCK_TIMEOUT).unwrap();
+    let probe = open_index_lock(tmp.path());
+    let started = Instant::now();
+    assert!(lock_index(&probe, true, Duration::ZERO).is_err());
+    assert!(started.elapsed() < Duration::from_millis(100));
+    drop(holder);
+    lock_index(&probe, true, Duration::ZERO).unwrap();
+}
+
+/// A persisting engine used to wait out `INDEX_LOCK_TIMEOUT` for the cleanup lock and then
+/// fail startup. With a writer holding the lock it now starts and skips the cleanup.
+#[test]
+fn engine_startup_does_not_fail_or_wait_when_the_index_lock_is_busy() {
+    use crate::search::{lock_index, INDEX_LOCK_TIMEOUT};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("csr-engine.db");
+    let projects = tmp.path().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    // The first start builds and publishes the index; the second loads it.
+    drop(crate::engine::Engine::new(&db, &projects).unwrap());
+    let index_dir = tmp.path().join("index-v3");
+    let holder = open_index_lock(&index_dir);
+    lock_index(&holder, false, INDEX_LOCK_TIMEOUT).unwrap();
+    let started = std::time::Instant::now();
+    let engine = crate::engine::Engine::new(&db, &projects);
+    assert!(engine.is_ok(), "startup failed: {:?}", engine.err());
+    assert!(started.elapsed() < INDEX_LOCK_TIMEOUT);
+}

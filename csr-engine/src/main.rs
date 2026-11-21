@@ -1034,7 +1034,7 @@ fn main() -> Result<()> {
         // starts between the parent's spool and this process must not strand the
         // Stop it was started for.
         Some(Commands::Hook { name, .. }) if name != "install" && name != "stop-work" => {
-            let Some(operation) = csr_engine::hooks::try_start(&args.db_path) else {
+            let Some(operation) = csr_engine::hooks::try_start(&args.db_path, name) else {
                 return Ok(());
             };
             Some(operation)

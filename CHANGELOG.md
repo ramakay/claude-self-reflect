@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Slow hooks now stop at a deadline.** `session-start`, `precompact` and `post-tool-use` end after 55 seconds, and `session-briefing` after 145 seconds, with no output and exit 0, so Claude Code never reports them as killed by its hook timeout. One timing-log line records it. `CSR_HOOK_DEADLINE_SECS=<n>` changes the time. Thanks to Devin345458 (#325).
+- **A busy index lock no longer stops an engine from starting.** The startup cleanup of old index files now tries the lock once and skips the cleanup if another process holds it; that process cleans up when it writes. Before, startup waited 10 seconds and then failed. Thanks to Devin345458 (#323).
+- **Internal notes removed from the installers.** A leftover "forward-port" comment block is gone from `scripts/install.sh` and `installer/postinstall.js`. No behaviour change.
+
 ## [10.1.0] - 2026-11-18
 
 First public 10.x release. npm `latest` was 9.5.8; this release upgrades from 9.5.8 and replaces it. Self-Reflect stays one Rust binary, `csr-engine`, with no Python, Docker or Qdrant. Install with `scripts/install.sh` or `npm install -g claude-self-reflect`.
