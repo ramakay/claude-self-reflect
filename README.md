@@ -30,7 +30,7 @@ A memory layer sits underneath as plumbing. It is one Rust binary (about 138 MB)
 - [What we're working on](#what-were-working-on) — Measured numbers and open work
 - [The Architecture](#one-binary) — How CSR solves it
 - [The Pipeline](#the-pipeline) — Progressive enrichment
-- [The Paper](#the-paper) — The research behind the retrieval design (preprint)
+- [The Paper](#the-paper) — The research behind the retrieval design (two papers)
 - [btw, these too](#btw-these-too): Smaller features that ship with it
 - [Install](#install) — One-command install, consent-first activation
 - [What You'll Ask](#what-youll-ask) — Natural language, no syntax
@@ -92,12 +92,17 @@ Higher quality context. Better decisions. Fewer tokens.
 </picture>
 </a>
 
-CSR's retrieval design is documented in a research preprint, measured on the system's own development history:
+CSR's retrieval design is documented in two papers, measured on the system's own development history:
 
 > **Similarity Drowns Intent: Three-Trace Sagas and Reinstatement Recall for Provenance in Agentic Software Construction**
-> 2026 — [PDF](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf)
+> 2026, version 2 — [PDF](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf)
+>
+> **Evaluating a System That Records Its Own Sessions** (short version, 14 pages)
+> 2026 — [PDF](docs/plans/annaswamy-2026-evaluating-self-recording-agents.pdf)
 
-Ask a memory system "why did we drop Qdrant?" and cosine similarity returns a recording of you asking that question earlier, at 0.984 similarity. The decision itself scores lower than its own echoes. The paper measures this failure, the multi-hop walk built to counter it (+53% and +47% ground-truth session coverage over one-shot kNN on two corpora, pre-registered gates, cross-vendor judging), and a second finding that fell out of evaluation: a self-recording memory system ingests its own eval dialogue and drowns the answers it's being tested on. It also keeps its negative results — a pre-registered ratification-weighting hypothesis died at ρ≈0 and forbade an entire staleness design.
+Ask "why did we drop Qdrant?" and one-shot similarity search returns earlier recordings of the question itself; the decision ranks below its own echoes. The full paper measures that failure and the seed-conditioned walk built to counter it (+53% ground-truth session coverage over one-shot cosine kNN in a pre-registered spike). It also reports a failure that fell out of evaluation: a system that records its own sessions records its evaluation too. In a controlled test, five scripted re-ask cycles took about half of naive retrieval's top 10, and echo defenses removed 72% of that.
+
+It keeps its losses. In a later pre-registered benchmark, a simpler hybrid of dense and full-text search beat the walk on exact receipt lookup (recall@5 0.813 against 0.581 on 396 queries), and the two did not separate on sealed multi-hop questions. A ratification-weighting hypothesis died at ρ≈0. The short paper turns these results into seven evaluation controls; every number in it has a public receipt in [`csr-engine/eval-kit/`](csr-engine/eval-kit/) and `docs/plans/`.
 
 <br clear="both" />
 

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Slow hooks now stop at a deadline.** `session-start`, `precompact` and `post-tool-use` end after 55 seconds, and `session-briefing` after 145 seconds, with no output and exit 0, so Claude Code never reports them as killed by its hook timeout. One timing-log line records it. `CSR_HOOK_DEADLINE_SECS=<n>` changes the time. Thanks to Devin345458 (#325).
 - **A busy index lock no longer stops an engine from starting.** The startup cleanup of old index files now tries the lock once and skips the cleanup if another process holds it; that process cleans up when it writes. Before, startup waited 10 seconds and then failed. Thanks to Devin345458 (#323).
 - **Internal notes removed from the installers.** A leftover "forward-port" comment block is gone from `scripts/install.sh` and `installer/postinstall.js`. No behaviour change.
+- **The paper, version 2, and a short version.** `docs/plans/annaswamy-2026-similarity-drowns-intent.pdf` now matches the shipped 10.1 system and reports only results whose receipts are in the record, including the later T3 benchmark the walk lost. A 14-page short version, `docs/plans/annaswamy-2026-evaluating-self-recording-agents.pdf`, keeps to results with public receipts in `csr-engine/eval-kit/`. The README and site describe both. The T4 kit's JSON files no longer carry local machine paths.
 
 ## [10.1.0] - 2026-11-18
 
