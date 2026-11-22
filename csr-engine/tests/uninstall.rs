@@ -715,9 +715,39 @@ fn an_unreadable_daemon_lock_holds_the_uninstall_without_a_gui_domain() {
             text.contains("the daemon lock could not be read"),
             "the hold line says the lock could not be read"
         );
+        let finish = text
+            .lines()
+            .find(|l| l.contains("not finished:"))
+            .unwrap_or_default();
+        assert!(!finish.is_empty(), "the closing line is printed");
         assert!(
-            text.contains("not finished:"),
-            "the closing line is printed"
+            finish.contains(&lock_path.display().to_string()),
+            "the closing line names the lock file"
+        );
+        assert!(
+            finish.contains("chmod u+r"),
+            "the closing line says how to make the lock readable"
+        );
+        assert!(
+            !finish.contains("Stop the csr-engine daemon"),
+            "the closing line does not tell the user to stop a daemon"
+        );
+        assert!(
+            finish.ends_with(&format!(
+                "finish with: \"{}\" uninstall --yes --purge",
+                env!("CARGO_BIN_EXE_csr-engine")
+            )),
+            "the closing line ends with the rerun command"
+        );
+        // The way out the closing line names: with the lock readable, the same command finishes.
+        let again = s.run_env(
+            &["--yes", "--purge"],
+            &[("PRINT_CODE", "125"), ("PRINT_TEXT", NO_GUI_DOMAIN)],
+        );
+        assert_eq!(again.status.code(), Some(0), "the rerun finishes");
+        assert!(
+            !s.data().join("csr-engine.db").exists(),
+            "the rerun purges the data folder"
         );
     }
 }
