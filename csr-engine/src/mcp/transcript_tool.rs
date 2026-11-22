@@ -53,6 +53,7 @@ pub fn transcript(
         sidechains,
         include_system,
         result_chars,
+        None,
     )
 }
 
@@ -76,6 +77,7 @@ pub fn transcript_with_db(
     sidechains: bool,
     include_system: bool,
     result_chars: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<String> {
     use crate::transcript::{parse_turns_spec, RoleFilter, TranscriptRequest, ViewKind};
 
@@ -123,6 +125,7 @@ pub fn transcript_with_db(
         sidechains,
         include_system,
         result_chars,
+        offset: offset.unwrap_or(0),
     };
 
     Ok(crate::transcript::run_with_sources(

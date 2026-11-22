@@ -210,6 +210,10 @@ pub struct TranscriptParams {
     /// each tool call's input, to show (default 4000, max 200000). A cut ends
     /// with a note that names the byte total.
     pub result_chars: Option<usize>,
+    /// `slice` view only: start the FIRST turn's text at this character offset (Unicode
+    /// characters, default 0). A turn longer than one reply comes back in parts: a cut page
+    /// gives `resume_turns` plus `resume_offset` (JSON) or the `next:` call in its cut note (text).
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -932,6 +936,7 @@ impl CsrServer {
             p.sidechains.unwrap_or(false),
             p.include_system.unwrap_or(false),
             p.result_chars,
+            p.offset,
         );
         // Text-mode output is a hand-built pseudo-XML envelope
         // (`<transcript_slice>…</transcript_slice>`) around verbatim

@@ -6,7 +6,9 @@ use tracing_subscriber::EnvFilter;
 use csr_engine::engine;
 use csr_engine::mirror_cli::MirrorAction;
 
+mod assertions_cli;
 mod episodes_cli;
+use assertions_cli::AssertionsAction;
 use episodes_cli::EpisodesAction;
 
 #[derive(Parser, Debug)]
@@ -235,6 +237,10 @@ enum Commands {
         /// call's input, to show (default 4000, max 200000).
         #[arg(long)]
         result_chars: Option<usize>,
+
+        /// `slice` view only: start the first turn's text at this char offset
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
     /// The transcript mirror: scrubbed, zstd-compressed copies of every
     /// Claude Code transcript, kept in the data folder after the JSONL goes.
@@ -723,27 +729,6 @@ enum SymbolAction {
         /// `--file` still names the path and so the language
         #[arg(long)]
         stdin: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum AssertionsAction {
-    /// Rebuild every assertion from the decisions file and the ledgers (no model).
-    Build {
-        /// Frozen user-decisions JSON (a `decisions` array).
-        #[arg(long)]
-        decisions: PathBuf,
-        /// Also write the report JSON here.
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
-    /// Print assertion rows, newest first.
-    List {
-        /// user_decision, csr_resolve, witness or task.
-        #[arg(long)]
-        source: Option<String>,
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
     },
 }
 
@@ -1597,6 +1582,7 @@ async fn run(
         sidechains,
         include_system,
         result_chars,
+        offset,
     }) = args.command
     {
         use csr_engine::transcript::{parse_turns_spec, RoleFilter, TranscriptRequest, ViewKind};
@@ -1638,6 +1624,7 @@ async fn run(
             sidechains,
             include_system,
             result_chars,
+            offset,
         };
         let data_dir = args.db_path.parent().map(std::path::Path::to_path_buf);
         // Read-only: no migrations, no write, and no database is created just

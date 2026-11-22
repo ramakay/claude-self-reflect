@@ -160,9 +160,7 @@ pub fn render_view(
         ViewKind::Errors => {
             mark_mirror(parsed, render_errors(parsed, req)).render(req.budget_chars, req.json)
         }
-        ViewKind::Slice => {
-            mark_mirror(parsed, render_slice(parsed, req)).render(req.budget_chars, req.json)
-        }
+        ViewKind::Slice => render_slice(parsed, req),
         ViewKind::Grep => match render_grep(parsed, req) {
             Ok(view) => mark_mirror(parsed, view).render(req.budget_chars, req.json),
             Err(e) => {
@@ -551,6 +549,11 @@ impl ViewData {
     /// `enforce_hard_ceiling` on the ACTUAL final serialized string, which
     /// holds regardless of any estimation error above.
     fn render_json(&self, budget_chars: usize) -> String {
+        self.render_json_counted(budget_chars).0
+    }
+
+    /// [`Self::render_json`], and how many items the page holds.
+    fn render_json_counted(&self, budget_chars: usize) -> (String, usize) {
         let header_chars: usize = self.header_lines.iter().map(|h| h.chars().count()).sum();
         let mut acc = header_chars;
         let mut shown = 0usize;
@@ -583,6 +586,10 @@ impl ViewData {
                 let resume_turn = self.items[shown].turn;
                 obj.insert("remaining".into(), json!(remaining));
                 obj.insert("resume_turns".into(), json!(format!("{resume_turn}..")));
+                // A turn read in parts resumes inside its text.
+                if let Some(at) = self.items[shown].json.get("text_offset") {
+                    obj.insert("resume_offset".into(), at.clone());
+                }
             }
             serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or_default()
         };
@@ -603,8 +610,9 @@ impl ViewData {
                 }
             }
             rendered = build(lo);
+            shown = lo;
         }
-        enforce_hard_ceiling(rendered, budget_chars)
+        (enforce_hard_ceiling(rendered, budget_chars), shown)
     }
 }
 

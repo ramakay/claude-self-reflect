@@ -1,10 +1,21 @@
 //! The `slice` view of `csr_transcript` / `csr-engine transcript`, and the cut notes the list
 //! views share with it. Lives here so `query.rs` stays under the file-size cap.
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
-use super::{turn_in_range, xml_escape, RenderItem, ViewData};
+use super::{mark_mirror, turn_in_range, xml_escape, RenderItem, ViewData};
 use crate::transcript::{Entry, ParsedTranscript, Role, TranscriptRequest, DEFAULT_LAST_N};
+
+/// Why a result or input was cut to fewer chars than the request asked.
+#[derive(Clone, Copy, PartialEq)]
+enum Fit {
+    /// Cut only at the `result_chars` the request gave.
+    No,
+    /// Cut to keep the turn inside a `budget_chars` the caller can still raise.
+    Budget,
+    /// Cut to keep the turn inside the largest `budget_chars` the server accepts.
+    AtMax,
+}
 
 /// Smallest `budget_chars` at which a slice turn is fitted to the budget.
 /// Below it the generic rule stands: a turn that does not fit is not shown,
@@ -42,15 +53,24 @@ fn cap_chars(full: &str, limit: usize) -> (&str, bool) {
 
 /// The note that ends a cut result or input. `fitted` marks a cut made to
 /// keep the turn inside `budget_chars`, where a larger `result_chars` alone
-/// does not help. A `result_chars` the note names comes with the
+/// does not help; at the server's largest budget the note does not tell the
+/// caller to raise it. A `result_chars` the note names comes with the
 /// `budget_chars` that keeps the turn from being fitted down again, and is
 /// left out when no budget the server accepts would hold it.
-fn cut_note(total: &str, limit: usize, fitted: bool) -> String {
+fn cut_note(total: &str, limit: usize, fitted: Fit) -> String {
     let bytes = total.len();
-    if fitted {
-        return format!(
-            "… [cut: {bytes} bytes total, to fit budget_chars; raise budget_chars, or view=\"grep\" to see more]"
-        );
+    match fitted {
+        Fit::Budget => {
+            return format!(
+                "… [cut: {bytes} bytes total, to fit budget_chars; raise budget_chars, or view=\"grep\" to see more]"
+            )
+        }
+        Fit::AtMax => {
+            return format!(
+                "… [cut: {bytes} bytes total, to fit budget_chars; view=\"grep\" to see more]"
+            )
+        }
+        Fit::No => {}
     }
     let larger = total
         .chars()
@@ -86,7 +106,7 @@ fn slice_call_for(entry: &Entry, chars: usize) -> SliceCall {
     let want = chars.min(crate::transcript::MAX_RESULT_CHARS);
     // Without `result_chars` the slice shows `DEFAULT_RESULT_CHARS`.
     let need =
-        |limit: usize| budget_to_hold(slice_item_chars(&slice_item(entry, limit, false), false));
+        |limit: usize| budget_to_hold(slice_item_chars(&slice_item(entry, limit, Fit::No), false));
     if chars <= crate::transcript::MAX_RESULT_CHARS {
         let held = need(want.max(crate::transcript::DEFAULT_RESULT_CHARS));
         if held <= crate::transcript::DEFAULT_BUDGET_CHARS {
@@ -150,8 +170,7 @@ pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> Str
         )
     } else {
         format!(
-            "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\"{result}{budget} shows its first {} chars; view=\"grep\" finds the rest]",
-            call.result_chars
+            "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\" reads it in parts, each ending with the next call; view=\"grep\" finds a word in it]"
         )
     }
 }
@@ -176,7 +195,7 @@ fn input_is_lifted_only(input: &Value) -> bool {
 
 /// What the text view shows for one tool call: the lifted-field line when the
 /// input is only those fields, else the whole input as compact JSON.
-fn slice_tool_use_text(tu: &crate::transcript::ToolUse, limit: usize, fitted: bool) -> String {
+fn slice_tool_use_text(tu: &crate::transcript::ToolUse, limit: usize, fitted: Fit) -> String {
     let body = match &tu.input {
         Some(input) if !input_is_lifted_only(input) => input.to_string(),
         _ => super::raw_tool_use_fields(tu),
@@ -194,11 +213,7 @@ fn slice_tool_use_text(tu: &crate::transcript::ToolUse, limit: usize, fitted: bo
 }
 
 /// What the text view shows for one tool result.
-fn slice_tool_result_text(
-    tr: &crate::transcript::ToolResult,
-    limit: usize,
-    fitted: bool,
-) -> String {
+fn slice_tool_result_text(tr: &crate::transcript::ToolResult, limit: usize, fitted: Fit) -> String {
     let full = tr.full.as_deref().unwrap_or(&tr.preview);
     let (shown, cut) = cap_chars(full, limit);
     let tag = if tr.is_error { "error" } else { "ok" };
@@ -213,27 +228,34 @@ fn slice_tool_result_text(
     text
 }
 
-/// One slice turn, with its words, each tool result and each tool input cut to `limit` chars.
-/// A cut says so: a reply cut at a fixed 500 chars with no note once hid the line a caller asked for.
-fn slice_item(entry: &Entry, limit: usize, fitted: bool) -> RenderItem {
+/// The line that opens a slice turn, up to its words.
+fn turn_head(entry: &Entry) -> String {
     let ts = entry.timestamp.as_deref().unwrap_or("-");
-    let words = entry.text.trim();
-    let (shown, words_cut) = cap_chars(words, limit);
-    let mut text = format!(
-        "[turn {}] {} {ts}: {}",
-        entry.turn,
-        entry.role,
-        xml_escape(shown)
-    );
-    if words_cut {
-        text.push_str(&cut_note(words, limit, fitted));
-    }
+    format!("[turn {}] {} {ts}: ", entry.turn, entry.role)
+}
+
+/// The lines for a turn's tool calls and results, each cut to `limit` chars.
+fn tool_lines(entry: &Entry, limit: usize, fitted: Fit) -> String {
+    let mut text = String::new();
     for tu in &entry.tool_uses {
         text.push_str(&slice_tool_use_text(tu, limit, fitted));
     }
     for tr in &entry.tool_results {
         text.push_str(&slice_tool_result_text(tr, limit, fitted));
     }
+    text
+}
+
+/// One slice turn, with its words, each tool result and each tool input cut to `limit` chars.
+/// A cut says so: a reply cut at a fixed 500 chars with no note once hid the line a caller asked for.
+fn slice_item(entry: &Entry, limit: usize, fitted: Fit) -> RenderItem {
+    let words = entry.text.trim();
+    let (shown, words_cut) = cap_chars(words, limit);
+    let mut text = format!("{}{}", turn_head(entry), xml_escape(shown));
+    if words_cut {
+        text.push_str(&cut_note(words, limit, fitted));
+    }
+    text.push_str(&tool_lines(entry, limit, fitted));
 
     let tool_uses: Vec<Value> = entry
         .tool_uses
@@ -344,7 +366,150 @@ pub(crate) fn queued_duplicates(parsed: &ParsedTranscript) -> std::collections::
     hidden
 }
 
-pub(super) fn render_slice(parsed: &ParsedTranscript, req: &TranscriptRequest) -> ViewData {
+/// What the cut note of a turn read in parts can take, newline and counts included.
+const SLICE_PART_NOTE_CHARS: usize = 200;
+
+/// `n` with a comma between thousands, as the cut note states a turn's size.
+fn with_commas(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Chars `from..to` of `s`.
+fn char_range(s: &str, from: usize, to: usize) -> &str {
+    let byte = |n: usize| s.char_indices().nth(n).map_or(s.len(), |(i, _)| i);
+    &s[byte(from)..byte(to)]
+}
+
+/// How many chars `xml_escape` leaves of `c`.
+fn escaped_width(c: char) -> usize {
+    match c {
+        '&' => 5,
+        '<' | '>' => 4,
+        _ => 1,
+    }
+}
+
+/// How many chars `xml_escape` leaves of `s`.
+fn escaped_chars(s: &str) -> usize {
+    s.chars().map(escaped_width).sum()
+}
+
+/// True when no `budget_chars` the server accepts shows the whole text of the turn, so the
+/// turn can only be read in parts.
+fn text_needs_parts(entry: &Entry) -> bool {
+    let line = escaped_chars(entry.text.trim()) + turn_head(entry).chars().count() + 1;
+    budget_to_hold(line) > crate::transcript::MAX_BUDGET_CHARS
+}
+
+/// The slice item JSON for chars `start..end` of the turn's text. Part 0 keeps the turn's other
+/// fields (`normal`); a later part carries only the turn, its role and the text.
+fn json_text_part(entry: &Entry, normal: &Value, start: usize, end: usize) -> Value {
+    let total = entry.text.chars().count();
+    let (start, end) = (start.min(total), end.min(total));
+    let mut obj = Map::new();
+    if start == 0 {
+        if let Some(whole) = normal.as_object() {
+            obj = whole.clone();
+        }
+    } else {
+        obj.insert("turn".to_string(), json!(entry.turn));
+        obj.insert("role".to_string(), json!(entry.role.to_string()));
+    }
+    obj.insert(
+        "text".to_string(),
+        json!(char_range(&entry.text, start, end)),
+    );
+    obj.insert("text_offset".to_string(), json!(start));
+    obj.insert("text_chars_total".to_string(), json!(total));
+    if end < total {
+        obj.insert("text_cut".to_string(), json!(true));
+    }
+    Value::Object(obj)
+}
+
+/// The text-view item for chars `start..` of a turn read in parts: as many chars as fit under
+/// `cap`, and a note that names the next call when the rest does not fit. The turn's tool calls
+/// and results show with part 0 only. `None` when not even one char fits. The bool is true when
+/// the part ends before the turn does.
+fn text_part_item(
+    entry: &Entry,
+    start: usize,
+    cap: usize,
+    requested: usize,
+    fit: Fit,
+) -> Option<(RenderItem, bool)> {
+    let total = entry.text.chars().count();
+    let begin = start.min(total);
+    let head = turn_head(entry);
+    let (mut limit, mut kind) = (requested, Fit::No);
+    let mut tools = String::new();
+    loop {
+        if begin == 0 {
+            tools = tool_lines(entry, limit, kind);
+        }
+        let base = head.chars().count() + tools.chars().count() + 1 + SLICE_PART_NOTE_CHARS;
+        if base <= cap || limit <= SLICE_FIT_FLOOR_CHARS {
+            break;
+        }
+        limit = (limit / 2).max(SLICE_FIT_FLOOR_CHARS);
+        kind = fit;
+    }
+    let room = cap.checked_sub(head.chars().count() + tools.chars().count() + 1)?;
+    let rest = char_range(&entry.text, begin, total);
+    let turn = entry.turn;
+    let (body, ends_early) = if escaped_chars(rest) <= room {
+        let note = if start > 0 && rest.is_empty() {
+            format!(
+                "\n[offset {start} is at or past the end of turn {turn} ({} chars): nothing left in this turn]",
+                with_commas(total)
+            )
+        } else {
+            String::new()
+        };
+        (format!("{}{note}", xml_escape(rest)), false)
+    } else {
+        let room_text = room.checked_sub(SLICE_PART_NOTE_CHARS)?;
+        let mut used = 0;
+        let mut take = 0;
+        for c in rest.chars() {
+            let width = escaped_width(c);
+            if used + width > room_text {
+                break;
+            }
+            used += width;
+            take += 1;
+        }
+        if take == 0 {
+            return None;
+        }
+        let note = format!(
+            "\n[cut: turn {turn} has {} chars; next: turns=\"{turn}..\" offset={}]",
+            with_commas(total),
+            begin + take
+        );
+        (
+            format!("{}{note}", xml_escape(char_range(rest, 0, take))),
+            true,
+        )
+    };
+    let item = RenderItem {
+        turn,
+        text: format!("{head}{body}{tools}"),
+        json: Value::Null,
+    };
+    Some((item, ends_early))
+}
+
+/// The turns a slice request selects, in order.
+fn selected_entries<'a>(parsed: &'a ParsedTranscript, req: &TranscriptRequest) -> Vec<&'a Entry> {
     let duplicates = queued_duplicates(parsed);
     let filtered: Vec<&Entry> = parsed
         .entries
@@ -352,17 +517,27 @@ pub(super) fn render_slice(parsed: &ParsedTranscript, req: &TranscriptRequest) -
         .filter(|e| req.role.matches_role(e.role))
         .collect();
 
-    let selected: Vec<&&Entry> = if let Some((start, end)) = req.turns {
+    let selected: Vec<&Entry> = if let Some((start, end)) = req.turns {
         filtered
-            .iter()
+            .into_iter()
             .filter(|e| turn_in_range(e.turn, Some((start, end))))
             .collect()
     } else {
         let n = req.last.unwrap_or(DEFAULT_LAST_N);
         let skip = filtered.len().saturating_sub(n);
-        filtered.iter().skip(skip).collect()
+        filtered.into_iter().skip(skip).collect()
     };
+    selected
+        .into_iter()
+        // `last` addresses original turns, like FullScope::Last in the parser.
+        // Dedupe after that selection so we never pull in an older turn whose
+        // full tool payloads were intentionally released during parsing.
+        .filter(|e| req.include_system || !duplicates.contains(&e.turn))
+        .collect()
+}
 
+/// The view of `entries`. The request's `offset` starts the first turn's text part-way in.
+fn slice_view(entries: &[&Entry], req: &TranscriptRequest) -> ViewData {
     // A turn with many large results can pass the whole budget. It would then
     // be shown as nothing, and the resume hint would name the same turn, so a
     // caller on the default budget would loop. Halve the cut until the turn
@@ -371,25 +546,59 @@ pub(super) fn render_slice(parsed: &ParsedTranscript, req: &TranscriptRequest) -
     let requested = slice_result_limit(req);
     let fit_cap = (req.budget_chars >= SLICE_FIT_MIN_BUDGET_CHARS)
         .then(|| req.budget_chars - SLICE_FIT_RESERVE_CHARS);
+    let fit = if req.budget_chars >= crate::transcript::MAX_BUDGET_CHARS {
+        Fit::AtMax
+    } else {
+        Fit::Budget
+    };
 
-    let items: Vec<RenderItem> = selected
-        .into_iter()
-        // `last` addresses original turns, like FullScope::Last in the parser.
-        // Dedupe after that selection so we never pull in an older turn whose
-        // full tool payloads were intentionally released during parsing.
-        .filter(|e| req.include_system || !duplicates.contains(&e.turn))
-        .map(|entry| {
-            let mut limit = requested;
-            let mut item = slice_item(entry, limit, false);
-            if let Some(cap) = fit_cap {
-                while slice_item_chars(&item, req.json) > cap && limit > SLICE_FIT_FLOOR_CHARS {
-                    limit = (limit / 2).max(SLICE_FIT_FLOOR_CHARS);
-                    item = slice_item(entry, limit, true);
+    let mut items: Vec<RenderItem> = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let start = if i == 0 { req.offset } else { 0 };
+        if req.json && start > 0 {
+            let total = entry.text.chars().count();
+            items.push(RenderItem {
+                turn: entry.turn,
+                text: String::new(),
+                json: json_text_part(entry, &Value::Null, start, total),
+            });
+            continue;
+        }
+        if let (false, Some(cap)) = (req.json, fit_cap) {
+            if start > 0 || text_needs_parts(entry) {
+                if let Some((item, ends_early)) = text_part_item(entry, start, cap, requested, fit)
+                {
+                    items.push(item);
+                    if ends_early {
+                        // The note names the next call; nothing may follow the cut.
+                        break;
+                    }
+                    continue;
                 }
             }
-            item
-        })
-        .collect();
+        }
+        // In JSON the turn's own text is whole in the item, so a long text must not shrink the
+        // results beside it.
+        let text_chars = if req.json {
+            entry.text.chars().count()
+        } else {
+            0
+        };
+        let text_share = fit_cap
+            .filter(|cap| text_chars > *cap)
+            .map_or(0, |_| text_chars);
+        let mut limit = requested;
+        let mut item = slice_item(entry, limit, Fit::No);
+        if let Some(cap) = fit_cap {
+            while slice_item_chars(&item, req.json).saturating_sub(text_share) > cap
+                && limit > SLICE_FIT_FLOOR_CHARS
+            {
+                limit = (limit / 2).max(SLICE_FIT_FLOOR_CHARS);
+                item = slice_item(entry, limit, fit);
+            }
+        }
+        items.push(item);
+    }
 
     ViewData {
         view: "slice",
@@ -398,4 +607,57 @@ pub(super) fn render_slice(parsed: &ParsedTranscript, req: &TranscriptRequest) -
         items,
         empty_message: "(no turns in the requested range)".to_string(),
     }
+}
+
+/// The `slice` page. In JSON, a first item that does not fit the budget comes back as the
+/// largest part of its text that does, so a page always moves the reader forward.
+pub(super) fn render_slice(parsed: &ParsedTranscript, req: &TranscriptRequest) -> String {
+    let entries = selected_entries(parsed, req);
+    let mut view = mark_mirror(parsed, slice_view(&entries, req));
+    if !req.json {
+        return view.render(req.budget_chars, false);
+    }
+    let (page, shown) = view.render_json_counted(req.budget_chars);
+    match entries.first() {
+        Some(entry) if shown == 0 => split_first_item(&mut view, entry, req).unwrap_or(page),
+        _ => page,
+    }
+}
+
+/// The page whose first item holds the most chars of `entry`'s text that fit, then the rest of
+/// that turn as the item the resume fields name. `None` when no part of the text moves the reader on:
+/// the text is used up, or what the turn carries besides its text is itself too big.
+fn split_first_item(view: &mut ViewData, entry: &Entry, req: &TranscriptRequest) -> Option<String> {
+    let total = entry.text.chars().count();
+    let start = req.offset;
+    if start >= total {
+        return None;
+    }
+    let normal = view.items[0].json.clone();
+    let mut page_of = |n: usize| -> (String, usize) {
+        view.items[0].json = json_text_part(entry, &normal, start, start + n);
+        let rest = RenderItem {
+            turn: entry.turn,
+            text: String::new(),
+            json: json_text_part(entry, &normal, start + n, total),
+        };
+        view.items.insert(1, rest);
+        let page = view.render_json_counted(req.budget_chars);
+        view.items.remove(1);
+        page
+    };
+    // `n` chars always leave the rest of the text out, so the page moves on by `n`.
+    let (mut lo, mut hi) = (1, total - start - 1);
+    if hi == 0 || page_of(1).1 == 0 {
+        return None;
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if page_of(mid).1 > 0 {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(page_of(lo).0)
 }

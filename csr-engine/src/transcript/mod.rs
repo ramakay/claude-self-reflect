@@ -1437,6 +1437,10 @@ pub struct TranscriptRequest {
     /// input, to show. `None` means [`DEFAULT_RESULT_CHARS`]; the value is
     /// clamped to `1..=`[`MAX_RESULT_CHARS`].
     pub result_chars: Option<usize>,
+    /// `slice` view only: the first turn's text starts at this char (Unicode
+    /// scalar value) offset. A turn too long for one reply is read in parts,
+    /// each cut naming the `turns` and `offset` of the next.
+    pub offset: usize,
 }
 
 impl Default for TranscriptRequest {
@@ -1455,6 +1459,7 @@ impl Default for TranscriptRequest {
             sidechains: false,
             include_system: false,
             result_chars: None,
+            offset: 0,
         }
     }
 }
