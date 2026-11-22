@@ -945,7 +945,6 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 .noherdr-grid .shot-open img { height: auto; }
 .noherdr-link::after { content: " \2192"; }
 @media (max-width: 1000px) { .noherdr-grid { grid-template-columns: minmax(0, 1fr); } }
-.shot-grid { list-style: none; margin: 30px 0 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px 18px; }
 .shot { margin: 0; }
 .shot-open { display: block; width: 100%; padding: 0; border: 1px solid var(--paper-rule); background: #1e1e1e; cursor: zoom-in; aspect-ratio: 4 / 3; overflow: hidden; }
 .shot-open img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top center; }
@@ -958,8 +957,63 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 .shot-box-cap { margin: 10px 0 0; text-align: center; color: #eae5dc; font-size: 14px; }
 .shot-box form { display: flex; justify-content: flex-end; margin-bottom: 8px; }
 .shot-close { font: 600 14px/1 var(--sans); color: #eae5dc; background: transparent; border: 1px solid #6b665e; padding: 8px 12px; border-radius: 999px; cursor: pointer; }
-@media (max-width: 1000px) { .shot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 600px) { .shot-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* Meet the Companion: a stepped walkthrough over the pane mockups.
+   Without JS every stage shows with all its numbered badges; with JS (.is-live) one stage shows,
+   a spotlight dims the pane except the active callout, and badges appear one after another.
+   Callout boxes are percent of the image (--cx/--cy/--cw/--ch), radius in cqw of the pane. */
+.cw-alias { display: block; height: 0; }
+.cw { margin-top: 30px; }
+.cw-stage { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px 44px; align-items: start; }
+.cw-stage + .cw-stage { margin-top: 48px; }
+.cw-bar, .cw-ctl { display: none; }
+.cw-open { position: relative; aspect-ratio: auto; border-radius: 14px; background: #1c2a33; cursor: zoom-in; }
+.cw-open img { height: auto; }
+.cw-layer { position: absolute; inset: 0; container-type: inline-size; overflow: hidden; pointer-events: none; }
+.cw-spot { display: none; position: absolute; left: var(--cx); top: var(--cy); width: var(--cw); height: var(--ch); border-radius: var(--cr); box-shadow: 0 0 0 2px #ffb39c, 0 0 0 100vmax rgba(8, 11, 14, .66); transition: left .25s ease, top .25s ease, width .25s ease, height .25s ease, border-radius .25s ease; }
+.cw-mark { position: absolute; left: max(3px, calc(var(--cx) - 13px)); top: max(3px, calc(var(--cy) - 13px)); width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; background: var(--tl-lit); color: #fff; font: 700 14px/1 var(--sans); box-shadow: 0 0 0 2px rgba(255, 255, 255, .92), 0 2px 8px rgba(0, 0, 0, .35); transition: opacity .25s ease, transform .25s ease; }
+.cw-mark.is-end { left: calc(var(--cx) + var(--cw) + 8px); top: calc(var(--cy) + var(--ch) / 2 - 14px); }
+.cw-h { margin: 0 0 12px; font: 640 18px/1.3 var(--sans); }
+.cw-legend { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.cw-item { display: flex; gap: 12px; align-items: flex-start; width: 100%; padding: 10px 14px; text-align: left; font: 400 16px/1.45 var(--sans); color: var(--tl-ink); background: transparent; border: 1px solid transparent; border-radius: 12px; cursor: pointer; transition: opacity .25s ease, background-color .25s ease, border-color .25s ease; }
+.cw-item b { display: block; font-weight: 640; }
+.cw-num { flex: none; width: 26px; height: 26px; margin-top: 1px; display: grid; place-items: center; border-radius: 50%; background: var(--tl-lit); color: #fff; font: 700 13px/1 var(--sans); }
+.cw-item:focus-visible, .cw-btn:focus-visible, .cw-dot:focus-visible, .cw-open:focus-visible { outline: 2px solid var(--tl-lit); outline-offset: 3px; }
+.cw-vh, .cw.is-live .cw-fig figcaption, .cw.is-live .cw-h, .cw-now { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.cw.is-live { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); grid-template-areas: "pane bar" "pane side" "pane ctl"; grid-template-rows: auto auto 1fr; gap: 0 44px; align-items: start; }
+.cw.is-live .cw-stage { display: contents; }
+.cw.is-live .cw-stage:not(.is-on) { display: none; }
+.cw.is-live .cw-fig { grid-area: pane; position: relative; aspect-ratio: 704 / 776; }
+.cw.is-live .cw-side { grid-area: side; }
+.cw.is-live .cw-bar { grid-area: bar; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 14px; }
+.cw.is-live .cw-ctl { grid-area: ctl; display: flex; align-items: center; gap: 14px; margin-top: 18px; }
+.cw.is-live .cw-spot { display: block; }
+.cw.is-live .cw-mark { opacity: 0; transform: scale(.5); }
+.cw.is-live .cw-mark.is-past { opacity: .7; transform: scale(.78); }
+.cw.is-live .cw-mark.is-on { opacity: 1; transform: none; }
+.cw.is-live .cw-item { opacity: .5; }
+.cw.is-live .cw-item.is-past { opacity: .82; }
+.cw.is-live .cw-item.is-on { opacity: 1; background: var(--anatomy-card); border-color: var(--paper-rule); box-shadow: inset 4px 0 0 var(--tl-lit); }
+.cw-label { margin: 0; font-size: 15px; font-weight: 640; color: var(--paper-muted); }
+.cw-label-t { color: var(--tl-ink); }
+.cw-label-t::before { content: "\00b7\00a0"; color: var(--paper-muted); }
+.cw-dots { display: flex; gap: 2px; }
+.cw-dot { width: 30px; height: 30px; padding: 0; border: 0; background: transparent; cursor: pointer; display: grid; place-items: center; border-radius: 50%; }
+.cw-dot::before { content: ""; width: 10px; height: 10px; border-radius: 5px; background: var(--paper-rule); transition: width .25s ease, background-color .25s ease; }
+.cw-dot.is-past::before { background: var(--paper-muted); }
+.cw-dot[aria-current]::before { width: 22px; background: var(--tl-lit); }
+.cw-btn { min-height: 44px; padding: 0 20px; font: 600 15px/1 var(--sans); color: var(--tl-ink); background: transparent; border: 1px solid var(--tl-ink); border-radius: 999px; cursor: pointer; }
+.cw-next { color: var(--anatomy-page); background: var(--tl-ink); }
+.cw-btn[aria-disabled="true"] { opacity: .35; cursor: default; }
+.cw-count { font-size: 14px; color: var(--paper-muted); min-width: 4.5em; text-align: center; }
+@media (max-width: 1000px) { .cw.is-live { gap: 0 28px; } .cw-item { font-size: 15px; } }
+@media (max-width: 760px) {
+  .cw-stage { grid-template-columns: minmax(0, 1fr); }
+  .cw.is-live { grid-template-columns: minmax(0, 1fr); grid-template-areas: "bar" "pane" "ctl" "side"; grid-template-rows: auto; }
+  .cw.is-live .cw-ctl { margin: 14px 0 16px; justify-content: space-between; }
+  .cw-mark { width: 26px; height: 26px; font-size: 13px; }
+}
+@media (prefers-reduced-motion: reduce) { .cw-spot, .cw-mark, .cw-item, .cw-dot::before { transition: none; } }
 
 /* Transcript copy microchart */
 .mirror-chart { margin: 16px 0 0; max-width: 460px; }
@@ -1463,42 +1517,211 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
   </div>
 </section>
 
-<section class="sr-sec sr-shots" id="screenshots" aria-labelledby="shots-h">
-  <p class="story-kicker">The pane</p>
-  <h2 id="shots-h">What the pane shows.</h2>
-  <p class="story-lead"><mark class="sr-hl">Mockups in the pane's own fonts and colours, with a demo project.</mark> The real thing, from a live session, is in the herdr section above.</p>
-  <ul class="shot-grid">
-    <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: First session: the pane offers questions to try."><img src="assets/shots/mock-first.webp" alt="Mockup of the Self-Reflect pane. First session: the pane offers questions to try." width="704" height="776" loading="lazy" decoding="async" data-fit="contain"></button>
-      <figcaption>First session: the pane offers questions to try.</figcaption>
-    </figure></li>
-    <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: After a recall: where the work stands, and what CSR handed over."><img src="assets/shots/mock-recall.webp" alt="Mockup of the Self-Reflect pane. After a recall: where the work stands, and what CSR handed over." width="704" height="664" loading="lazy" decoding="async" data-fit="contain"></button>
-      <figcaption>After a recall: where the work stands, and what CSR handed over.</figcaption>
-    </figure></li>
-    <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: Lost and found: the question a session ended on."><img src="assets/shots/mock-lost.webp" alt="Mockup of the Self-Reflect pane. Lost and found: the question a session ended on." width="704" height="688" loading="lazy" decoding="async" data-fit="contain"></button>
-      <figcaption>Lost and found: the question a session ended on.</figcaption>
-    </figure></li>
-    <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: A new session: where you left off."><img src="assets/shots/mock-next.webp" alt="Mockup of the Self-Reflect pane. A new session: where you left off." width="704" height="686" loading="lazy" decoding="async" data-fit="contain"></button>
-      <figcaption>A new session: where you left off.</figcaption>
-    </figure></li>
-    <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: Usage pace and the context gauge."><img src="assets/shots/mock-pace.webp" alt="Mockup of the Self-Reflect pane. Usage pace and the context gauge." width="704" height="640" loading="lazy" decoding="async" data-fit="contain"></button>
-      <figcaption>Usage pace and the context gauge.</figcaption>
-    </figure></li>
-    <li><figure class="shot">
-      <button class="shot-open" type="button" aria-label="Enlarge: The same pane in its light theme."><img src="assets/shots/mock-light.webp" alt="Mockup of the Self-Reflect pane. The same pane in its light theme." width="704" height="776" loading="lazy" decoding="async" data-fit="contain"></button>
-      <figcaption>The same pane in its light theme.</figcaption>
-    </figure></li>
-  </ul>
+<section class="sr-sec sr-shots sr-companion" id="companion" aria-labelledby="shots-h">
+  <span class="cw-alias" id="screenshots" aria-hidden="true"></span>
+  <p class="story-kicker">The companion</p>
+  <h2 id="shots-h">Meet the Companion.</h2>
+  <p class="story-lead"><mark class="sr-hl">The companion changes as the work moves, so follow it through one project.</mark> Press Next or use the arrow keys. These are mockups in the pane's own fonts and colours, with a demo project; the real pane, from a live session, is in the herdr section above.</p>
+  <div class="cw" role="group" aria-label="Companion walkthrough, 5 stages">
+    <div class="cw-bar">
+      <p class="cw-label"><span class="cw-label-n">Stage 1 of 5</span> <span class="cw-label-t">First session</span></p>
+      <div class="cw-dots">
+        <button class="cw-dot" type="button" data-stage="0" aria-label="Stage 1: First session"></button>
+        <button class="cw-dot" type="button" data-stage="1" aria-label="Stage 2: After a recall"></button>
+        <button class="cw-dot" type="button" data-stage="2" aria-label="Stage 3: Session ends mid-question"></button>
+        <button class="cw-dot" type="button" data-stage="3" aria-label="Stage 4: Next session"></button>
+        <button class="cw-dot" type="button" data-stage="4" aria-label="Stage 5: Pace check"></button>
+      </div>
+    </div>
+    <div class="cw-stage" data-title="First session">
+      <figure class="shot cw-fig">
+        <button class="shot-open cw-open" type="button" aria-label="Enlarge: First session: nothing to recall yet, so the pane offers questions to try."><img src="assets/shots/mock-first.webp" alt="Mockup of the Self-Reflect pane. First session: nothing to recall yet, so the pane offers questions to try." width="704" height="776" loading="lazy" decoding="async"><span class="cw-layer" aria-hidden="true"><span class="cw-spot"></span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:2.32%;--cw:94.89%;--ch:18.81%;--cr:3.69cqw">1</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:23.20%;--cw:94.89%;--ch:36.34%;--cr:3.69cqw">2</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:63.14%;--cw:94.89%;--ch:11.34%;--cr:1.70cqw">3</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:74.48%;--cw:94.89%;--ch:11.08%;--cr:1.70cqw">4</span>
+          <span class="cw-mark is-end" style="--cx:1.14%;--cy:94.46%;--cw:50.00%;--ch:5.15%;--cr:0.85cqw">5</span>
+        </span></button>
+        <figcaption>Stage 1 of 5. First session: nothing to recall yet, so the pane offers questions to try.</figcaption>
+      </figure>
+      <div class="cw-side">
+        <h3 class="cw-h">Stage 1. First session</h3>
+        <ol class="cw-legend">
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">1</span><span class="cw-txt"><b>The dreamer</b> It looks as you work, then asks a what-if from your past sessions.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">2</span><span class="cw-txt"><b>Try a question</b> Three starter questions show what recall can find in this repo.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">3</span><span class="cw-txt"><b>Weekly use</b> Your plan&#x27;s use this week, and where it should land by the reset.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">4</span><span class="cw-txt"><b>Context: 18k</b> How full the context window is, split into summary and messages.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">5</span><span class="cw-txt"><b>Keys</b> i shows the figure, b swaps the theme, q closes the pane.</span></button></li>
+        </ol>
+      </div>
+    </div>
+    <div class="cw-stage" data-title="After a recall">
+      <figure class="shot cw-fig">
+        <button class="shot-open cw-open" type="button" aria-label="Enlarge: After a recall: where the work stands, and what Self-Reflect handed over."><img src="assets/shots/mock-recall.webp" alt="Mockup of the Self-Reflect pane. After a recall: where the work stands, and what Self-Reflect handed over." width="704" height="664" loading="lazy" decoding="async"><span class="cw-layer" aria-hidden="true"><span class="cw-spot"></span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:22.59%;--cw:94.89%;--ch:27.41%;--cr:3.69cqw">1</span>
+          <span class="cw-mark" style="--cx:71.88%;--cy:26.81%;--cw:24.15%;--ch:5.12%;--cr:1.14cqw">2</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:54.22%;--cw:94.89%;--ch:13.25%;--cr:1.70cqw">3</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:67.77%;--cw:94.89%;--ch:9.94%;--cr:1.70cqw">4</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:77.71%;--cw:94.89%;--ch:5.12%;--cr:1.70cqw">5</span>
+        </span></button>
+        <figcaption>Stage 2 of 5. After a recall: where the work stands, and what Self-Reflect handed over.</figcaption>
+      </figure>
+      <div class="cw-side">
+        <h3 class="cw-h">Stage 2. After a recall</h3>
+        <ol class="cw-legend">
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">1</span><span class="cw-txt"><b>Where the work stands</b> A short state of the work: what is true now, in plain words.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">2</span><span class="cw-txt"><b>Freshness</b> Each card says when it last refreshed, so you know how current it is.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">3</span><span class="cw-txt"><b>Context: 52k</b> The gauge now shows tools as well as messages.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">4</span><span class="cw-txt"><b>Handed over</b> Names what Self-Reflect gave Claude, and the session it came from.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">5</span><span class="cw-txt"><b>This session</b> Counts the recalls and compactions so far.</span></button></li>
+        </ol>
+      </div>
+    </div>
+    <div class="cw-stage" data-title="Session ends mid-question">
+      <figure class="shot cw-fig">
+        <button class="shot-open cw-open" type="button" aria-label="Enlarge: A session ends mid-question: Lost and found keeps the question."><img src="assets/shots/mock-lost.webp" alt="Mockup of the Self-Reflect pane. A session ends mid-question: Lost and found keeps the question." width="704" height="688" loading="lazy" decoding="async"><span class="cw-layer" aria-hidden="true"><span class="cw-spot"></span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:21.80%;--cw:94.89%;--ch:21.22%;--cr:3.69cqw">1</span>
+          <span class="cw-mark" style="--cx:71.02%;--cy:25.87%;--cw:25.00%;--ch:4.94%;--cr:1.14cqw">2</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:45.35%;--cw:94.89%;--ch:21.22%;--cr:3.69cqw">3</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:77.33%;--cw:94.89%;--ch:6.10%;--cr:1.70cqw">4</span>
+        </span></button>
+        <figcaption>Stage 3 of 5. A session ends mid-question: Lost and found keeps the question.</figcaption>
+      </figure>
+      <div class="cw-side">
+        <h3 class="cw-h">Stage 3. Session ends mid-question</h3>
+        <ol class="cw-legend">
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">1</span><span class="cw-txt"><b>Lost and found</b> The question a session ended on, kept so it does not get lost.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">2</span><span class="cw-txt"><b>Tap opens</b> A tap opens the handoff for that question.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">3</span><span class="cw-txt"><b>Story</b> The session&#x27;s goal in one line, and how far it got.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">4</span><span class="cw-txt"><b>Cache warm</b> How long the prompt cache stays warm, so you know how long a quick return can reuse it.</span></button></li>
+        </ol>
+      </div>
+    </div>
+    <div class="cw-stage" data-title="Next session">
+      <figure class="shot cw-fig">
+        <button class="shot-open cw-open" type="button" aria-label="Enlarge: The next session picks up where you left off."><img src="assets/shots/mock-next.webp" alt="Mockup of the Self-Reflect pane. The next session picks up where you left off." width="704" height="686" loading="lazy" decoding="async"><span class="cw-layer" aria-hidden="true"><span class="cw-spot"></span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:23.32%;--cw:94.89%;--ch:13.41%;--cr:1.70cqw">1</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:36.73%;--cw:94.89%;--ch:13.41%;--cr:1.70cqw">2</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:62.97%;--cw:94.89%;--ch:10.20%;--cr:1.70cqw">3</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:73.18%;--cw:94.89%;--ch:10.20%;--cr:1.70cqw">4</span>
+        </span></button>
+        <figcaption>Stage 4 of 5. The next session picks up where you left off.</figcaption>
+      </figure>
+      <div class="cw-side">
+        <h3 class="cw-h">Stage 4. Next session</h3>
+        <ol class="cw-legend">
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">1</span><span class="cw-txt"><b>Last time here</b> Your last ask in this folder, and how long ago it was.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">2</span><span class="cw-txt"><b>Earlier here</b> The goal of an earlier session in the same folder.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">3</span><span class="cw-txt"><b>Find a past fix</b> With history to draw on, the questions change: find where a bug was fixed before.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">4</span><span class="cw-txt"><b>Rejected approaches</b> Bring back the options you turned down, with the reasons.</span></button></li>
+        </ol>
+      </div>
+    </div>
+    <div class="cw-stage" data-title="Pace check">
+      <figure class="shot cw-fig">
+        <button class="shot-open cw-open" type="button" aria-label="Enlarge: Later in the week: usage pace, and whether Claude is on the same page."><img src="assets/shots/mock-pace.webp" alt="Mockup of the Self-Reflect pane. Later in the week: usage pace, and whether Claude is on the same page." width="704" height="640" loading="lazy" decoding="async"><span class="cw-layer" aria-hidden="true"><span class="cw-spot"></span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:4.38%;--cw:94.89%;--ch:14.38%;--cr:1.70cqw">1</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:18.75%;--cw:94.89%;--ch:13.44%;--cr:1.70cqw">2</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:32.19%;--cw:94.89%;--ch:18.12%;--cr:1.70cqw">3</span>
+          <span class="cw-mark" style="--cx:2.56%;--cy:54.69%;--cw:94.89%;--ch:22.81%;--cr:3.69cqw">4</span>
+        </span></button>
+        <figcaption>Stage 5 of 5. Later in the week: usage pace, and whether Claude is on the same page.</figcaption>
+      </figure>
+      <div class="cw-side">
+        <h3 class="cw-h">Stage 5. Pace check</h3>
+        <ol class="cw-legend">
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">1</span><span class="cw-txt"><b>Pace in words</b> One sentence says whether you reach the weekly reset with room to spare.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">2</span><span class="cw-txt"><b>Weekly: 11%</b> Use so far, the forecast at the reset, and when the reset comes.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">3</span><span class="cw-txt"><b>Context: 112k</b> Bigger now: summary, messages and tools, with the cache timer.</span></button></li>
+          <li><button class="cw-item" type="button"><span class="cw-num" aria-hidden="true">4</span><span class="cw-txt"><b>Same page?</b> The model&#x27;s read of how many of your asks Claude missed.</span></button></li>
+        </ol>
+      </div>
+    </div>
+    <div class="cw-ctl">
+      <button class="cw-btn cw-prev" type="button" aria-label="Previous callout">Previous</button>
+      <span class="cw-count" aria-hidden="true"></span>
+      <button class="cw-btn cw-next" type="button" aria-label="Next callout">Next</button>
+      <p class="cw-now" aria-live="polite"></p>
+    </div>
+  </div>
   <dialog class="shot-box" aria-label="Screenshot">
     <form method="dialog"><button class="shot-close" type="submit" aria-label="Close">Close</button></form>
     <img alt="">
     <p class="shot-box-cap"></p>
   </dialog>
 </section>
+<script>(() => {
+  // Meet the Companion: Next/Previous (buttons or Left/Right inside the walkthrough) step through
+  // each stage's callouts, then on to the next stage. The spotlight copies the active badge's box.
+  const root = document.querySelector('.cw');
+  if (!root) return;
+  const stages = [...root.querySelectorAll('.cw-stage')];
+  const dots = [...root.querySelectorAll('.cw-dot')];
+  const prev = root.querySelector('.cw-prev'), next = root.querySelector('.cw-next');
+  const count = root.querySelector('.cw-count'), now = root.querySelector('.cw-now');
+  const labelN = root.querySelector('.cw-label-n'), labelT = root.querySelector('.cw-label-t');
+  const marks = i => [...stages[i].querySelectorAll('.cw-mark')];
+  const items = i => [...stages[i].querySelectorAll('.cw-item')];
+  let s = 0, c = 0, speak = false;
+  const mark = (els, attr) => els.forEach((el, i) => {
+    el.classList.toggle('is-on', i === c);
+    el.classList.toggle('is-past', i < c);
+    if (attr) { if (i === c) el.setAttribute('aria-current', 'step'); else el.removeAttribute('aria-current'); }
+  });
+  function show() {
+    const m = marks(s), it = items(s), title = stages[s].dataset.title, n = stages.length;
+    stages.forEach((el, i) => el.classList.toggle('is-on', i === s));
+    dots.forEach((d, i) => {
+      d.classList.toggle('is-past', i < s);
+      if (i === s) d.setAttribute('aria-current', 'step'); else d.removeAttribute('aria-current');
+    });
+    mark(m, false);
+    mark(it, true);
+    stages[s].querySelector('.cw-spot').style.cssText = m[c].style.cssText;
+    labelN.textContent = `Stage ${s + 1} of ${n}`;
+    labelT.textContent = title;
+    count.textContent = `${c + 1} of ${m.length}`;
+    const endOfStage = c === m.length - 1, last = s === n - 1 && endOfStage;
+    prev.setAttribute('aria-disabled', String(s === 0 && c === 0));
+    next.textContent = last ? 'Start again' : endOfStage ? 'Next stage' : 'Next';
+    next.setAttribute('aria-label', last ? 'Start the walkthrough again' : endOfStage ? `Next stage: ${stages[s + 1].dataset.title}` : 'Next callout');
+    if (speak) now.textContent = `Stage ${s + 1} of ${n}, ${title}. Callout ${c + 1} of ${m.length}: ${it[c].querySelector('.cw-txt').textContent}`;
+  }
+  function step(d) {
+    speak = true;
+    const len = marks(s).length;
+    if (d > 0) {
+      if (c < len - 1) c++;
+      else if (s < stages.length - 1) { s++; c = 0; }
+      else { s = 0; c = 0; }
+    } else {
+      if (c > 0) c--;
+      else if (s > 0) { s--; c = marks(s).length - 1; }
+      else return;
+    }
+    show();
+  }
+  next.addEventListener('click', () => step(1));
+  prev.addEventListener('click', () => { if (prev.getAttribute('aria-disabled') !== 'true') step(-1); });
+  dots.forEach((d, i) => d.addEventListener('click', () => { speak = true; s = i; c = 0; show(); }));
+  stages.forEach((_, si) => items(si).forEach((it, i) => it.addEventListener('click', () => { speak = true; c = i; show(); })));
+  root.addEventListener('keydown', e => {
+    const d = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+    if (!d || e.altKey || e.metaKey || e.ctrlKey) return;
+    e.preventDefault();
+    step(d);
+  });
+  // Hidden stages never enter the viewport, so lazy images there would never load: load them all
+  // once the walkthrough comes near.
+  const imgs = [...root.querySelectorAll('img')];
+  const eager = () => imgs.forEach(i => { i.loading = 'eager'; });
+  if ('IntersectionObserver' in window) {
+    const io = new IntersectionObserver(es => { if (es.some(x => x.isIntersecting)) { eager(); io.disconnect(); } }, { rootMargin: '800px 0px' });
+    io.observe(root);
+  } else eager();
+  root.classList.add('is-live');
+  show();
+})();</script>
 
 <section class="sr-sec sr-noherdr" id="no-herdr" aria-labelledby="noherdr-h">
   <p class="story-kicker">No herdr?</p>
