@@ -101,11 +101,11 @@ pub struct GetRecentWorkParams {
 pub struct SearchByRecencyParams {
     /// Semantic search query
     pub query: String,
-    /// Natural language time like 'last week', 'yesterday'
+    /// Natural language time like 'last week', 'yesterday'. since and until narrow it.
     pub time_range: Option<String>,
-    /// ISO timestamp or relative time
+    /// ISO timestamp, date or relative time. Never earlier than the start of time_range.
     pub since: Option<String>,
-    /// ISO timestamp or relative time
+    /// ISO timestamp (to the second), date or relative time. No hit is dated after it, even inside time_range.
     pub until: Option<String>,
     /// Maximum number of results (default: 10)
     pub limit: Option<usize>,
