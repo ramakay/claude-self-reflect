@@ -151,7 +151,7 @@ pub fn run(args: &UninstallArgs, db_path: &Path) -> i32 {
     // Last: nothing after this may need the binary.
     ok &= binary_step(&home, apply, hold_data, &binaries, &mut out);
     if apply && hold_data {
-        out.push(finish_line(args, agents.hold));
+        out.push(finish_line(args, &home, agents.hold));
     }
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
@@ -190,7 +190,7 @@ pub fn run(args: &UninstallArgs, db_path: &Path) -> i32 {
 /// what to wait for, then the exact command that removes the rest. With no GUI domain and only a
 /// daemon outside launchd to wait for, `launchctl print` never says "cannot find the service", so
 /// the line names the daemon instead.
-fn finish_line(args: &UninstallArgs, hold: Option<Hold>) -> String {
+fn finish_line(args: &UninstallArgs, home: &Path, hold: Option<Hold>) -> String {
     let exe = std::env::current_exe()
         .map(|p| format!("\"{}\"", p.display()))
         .unwrap_or_else(|_| "csr-engine".to_string());
@@ -201,6 +201,15 @@ fn finish_line(args: &UninstallArgs, hold: Option<Hold>) -> String {
     } else {
         ""
     };
+    if let Some(Hold::UnreadableLock) = hold {
+        let lock = home.join(DATA_DIR).join("daemon.lock");
+        return format!(
+            "not finished: the daemon lock \"{}\" could not be read, so a daemon may still be \
+             running. Make that file readable (chmod u+r), or remove it once no csr-engine daemon \
+             runs, then finish with: {exe} uninstall --yes{purge}",
+            lock.display()
+        );
+    }
     if let Some(Hold::OutsideDaemon(pid)) = hold {
         let daemon = match pid {
             Some(pid) => format!("the csr-engine daemon (pid {pid})"),
@@ -925,16 +934,32 @@ fn launchd_state(job: &str, here: &str) -> Launchd {
 }
 
 /// No GUI domain, so launchd holds no agent. A daemon started outside launchd can still run:
-/// its lock tells. Returns the hold reason when one runs.
-fn daemon_outside_launchd(home: &Path) -> Option<(String, Option<u32>)> {
+/// its lock tells. Returns the report line and the hold when one runs. A lock that cannot be read
+/// counts as a daemon that may run: only a missing file or a free lock says there is none.
+fn daemon_outside_launchd(home: &Path) -> Option<(String, Hold)> {
+    use crate::daemon::{lock_file_probe, LockProbe};
     let lock = home.join(DATA_DIR).join("daemon.lock");
-    crate::daemon::lock_file_held(&lock).then(|| match daemon_lock_holder(home) {
-        Some(pid) => (
-            format!("a csr-engine daemon is running (pid {pid})"),
-            Some(pid),
-        ),
-        None => ("a csr-engine daemon is running".to_string(), None),
-    })
+    match lock_file_probe(&lock) {
+        LockProbe::Free => None,
+        LockProbe::Held => {
+            let pid = daemon_lock_holder(home);
+            let who = pid.map_or(String::new(), |pid| format!(" (pid {pid})"));
+            Some((
+                format!(
+                    "launch agent: a csr-engine daemon is running{who}; stop it, then run \
+                     uninstall again"
+                ),
+                Hold::OutsideDaemon(pid),
+            ))
+        }
+        LockProbe::Unreadable(why) => Some((
+            format!(
+                "launch agent: the daemon lock could not be read ({why}), so a csr-engine daemon \
+                 may be running; make it readable or remove it, then run uninstall again"
+            ),
+            Hold::UnreadableLock,
+        )),
+    }
 }
 
 /// True when launchd still runs a CSR daemon, or cannot be asked, so the data folder must stay.
@@ -970,11 +995,9 @@ fn daemon_still_loaded(home: &Path, agents: &mut Agents, out: &mut Vec<String>) 
                 held = true;
             }
             Launchd::NoGuiDomain => {
-                if let Some((why, pid)) = daemon_outside_launchd(home) {
-                    out.push(format!(
-                        "launch agent: {why}; stop it, then run uninstall again"
-                    ));
-                    agents.note_hold(Hold::OutsideDaemon(pid));
+                if let Some((line, kind)) = daemon_outside_launchd(home) {
+                    out.push(line);
+                    agents.note_hold(kind);
                     held = true;
                 }
             }
@@ -1010,6 +1033,9 @@ enum Hold {
     /// Only a daemon started outside launchd on an account with no GUI domain, with its pid when
     /// `daemon.lock` names one. `launchctl` cannot say anything useful there.
     OutsideDaemon(Option<u32>),
+    /// No GUI domain, and `daemon.lock` cannot be read, so a daemon may run. Stopping one cannot
+    /// clear this hold: the lock has to be made readable, or removed.
+    UnreadableLock,
 }
 
 impl Agents {
@@ -1018,6 +1044,7 @@ impl Agents {
         self.hold = Some(match (self.hold, kind) {
             (None, kind) => kind,
             (Some(Hold::OutsideDaemon(pid)), Hold::OutsideDaemon(_)) => Hold::OutsideDaemon(pid),
+            (Some(Hold::UnreadableLock), Hold::UnreadableLock) => Hold::UnreadableLock,
             _ => Hold::Launchd,
         });
     }
@@ -1141,11 +1168,9 @@ fn agent_step(home: &Path, apply: bool, out: &mut Vec<String>) -> Agents {
             Launchd::NoGuiDomain => {
                 delete_plist(&agent.path, &mut agents, out);
                 match daemon_outside_launchd(home) {
-                    Some((why, pid)) => {
-                        out.push(format!(
-                            "launch agent: {why}; stop it, then run uninstall again"
-                        ));
-                        hold(&mut agents, Hold::OutsideDaemon(pid));
+                    Some((line, kind)) => {
+                        out.push(line);
+                        hold(&mut agents, kind);
                     }
                     None => out.push(format!(
                         "launch agent: this account has no login session, so {} was not loaded \

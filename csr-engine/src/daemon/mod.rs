@@ -42,7 +42,7 @@ use crate::search::SearchEngine;
 use crate::storage::Storage;
 
 mod lock;
-pub(crate) use lock::lock_file_held;
+pub(crate) use lock::{lock_file_held, lock_file_probe, LockProbe};
 
 /// Conservative poll cadence for `codex_harness_strip_handle`'s loop: not
 /// idle, nothing to do, the batch just drained the backlog, or the run
