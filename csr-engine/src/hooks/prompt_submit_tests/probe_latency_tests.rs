@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 /// This guards against a scan, which is slow in every call of every round. It is not a guard on
 /// tail latency: it takes the best of up to three rounds, so a slowdown that shows in some rounds
 /// only would pass. The search is an in-memory lookup of one fixed query in one fixed index, so
-/// the scheduler is the only thing that differs between rounds.
+/// a round differs from the next by what the machine does around it (scheduling, caches, clock
+/// speed), not by the code under test.
 #[test]
 fn below_floor_probes_stay_under_five_ms_at_p95() {
     const COUNT: usize = 4096;
