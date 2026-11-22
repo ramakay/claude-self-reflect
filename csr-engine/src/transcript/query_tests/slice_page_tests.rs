@@ -782,7 +782,7 @@ fn write_text_and_result_fixture(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[test]
-fn a_list_hint_does_not_promise_parts_when_the_slice_would_not_page_the_text() {
+fn a_list_hint_for_a_turn_with_big_results_names_a_call_that_reads_all_of_its_text() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_text_and_result_fixture(dir.path());
     let parsed = transcript::parse_transcript(&path).unwrap();
@@ -790,12 +790,15 @@ fn a_list_hint_does_not_promise_parts_when_the_slice_would_not_page_the_text() {
     for view in [ViewKind::Prompts, ViewKind::YourAsks] {
         let out = transcript::run(dir.path(), &base_req(view, &path.to_string_lossy()));
         let hint = &out[out.find("[cut:").expect("the list cuts the turn")..];
-        assert!(!hint.contains("reads it in parts"), "no parts to read");
+        assert!(hint.contains("reads all of its text"));
         assert!(hint.contains("view=\"slice\" turns=\"1..1\""));
         assert!(hint.contains("view=\"grep\""));
-        // The call the hint names returns a preview with no offset, so it must not promise one.
-        let out = transcript::run(dir.path(), &slice_of_hint(&path, hint));
-        assert!(!out.contains("offset="));
+        // The call the hint names, and the cut notes it prints, lead to every char of the text.
+        let (joined, _) = walk_text_view(dir.path(), slice_of_hint(&path, hint));
+        assert!(
+            joined == "w".repeat(38_700),
+            "the named call reads all of the text"
+        );
     }
 }
 
@@ -814,23 +817,36 @@ fn write_one_turn_fixture(dir: &std::path::Path, chars: usize) -> std::path::Pat
 /// a cut note names the next `offset`, or the `result_chars` (and `budget_chars`) of the call
 /// that shows the turn whole. Returns the text read.
 fn read_text_view_in_full(dir: &std::path::Path, path: &std::path::Path) -> String {
-    let mut req = slice_req(path);
-    let (mut joined, mut took_whole_call) = (String::new(), false);
+    walk_text_view(dir, slice_req(path)).0
+}
+
+/// [`read_text_view_in_full`] from `req`, which also returns the words line of each page: the
+/// turn's text up to its first tool line, with the cut note of the words and none of a tool
+/// line's own. A page whose turn has tool lines is read by its words only.
+fn walk_text_view(dir: &std::path::Path, mut req: TranscriptRequest) -> (String, Vec<String>) {
+    let (mut joined, mut took_whole_call, mut lines) = (String::new(), false, Vec::new());
+    let unescape = |s: &str| {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    };
     for _ in 0..20 {
         let out = transcript::run(dir, &req);
         let body = &out[out.find("\n[turn 1] ").unwrap() + 1..];
         let body = &body[body.find(": ").unwrap() + 2..];
-        if let Some(c) = body.find("\n[cut: turn 1 has ") {
+        let words = &body[..body.find("\n  tool_").unwrap_or(body.len())];
+        lines.push(words.to_string());
+        if let Some(c) = words.find("\n[cut: turn 1 has ") {
             assert_eq!(req.offset, joined.chars().count(), "no gap and no repeat");
-            joined.push_str(&body[..c]);
-            req.offset = hint_number(&body[c..], "offset").expect("a part names its next offset");
-        } else if let Some(c) = body.find("… [cut: ") {
+            joined.push_str(&unescape(&words[..c]));
+            req.offset = hint_number(&words[c..], "offset").expect("a part names its next offset");
+        } else if let Some(c) = words.find("… [cut: ") {
             assert!(
                 !took_whole_call,
                 "the call a note names shows the turn whole"
             );
             took_whole_call = true;
-            let note = &body[c..];
+            let note = &words[c..];
             req.result_chars =
                 Some(hint_number(note, "result_chars").expect("a cut names a call that reads on"));
             if let Some(budget) = hint_number(note, "budget_chars") {
@@ -838,8 +854,8 @@ fn read_text_view_in_full(dir: &std::path::Path, path: &std::path::Path) -> Stri
             }
         } else {
             assert_eq!(req.offset, joined.chars().count(), "no gap and no repeat");
-            joined.push_str(body.strip_suffix('\n').unwrap_or(body));
-            return joined;
+            joined.push_str(&unescape(words.strip_suffix('\n').unwrap_or(words)));
+            return (joined, lines);
         }
     }
     panic!("the hints did not lead to the end of the turn");
@@ -900,5 +916,84 @@ fn a_reader_who_follows_the_hints_reads_a_turn_near_the_page_size_in_full() {
         let in_parts = listed.contains("reads it in parts");
         assert_eq!(in_parts, chars > 38_882, "the list view's advice");
         assert_eq!(listed.contains("shows it whole"), !in_parts);
+    }
+}
+
+// ─── The fit never cuts a turn's words without an offset. ───
+
+/// Turn 1 is a user turn of `text` and `results` tool results of `each` chars.
+fn write_words_and_results_fixture(
+    dir: &std::path::Path,
+    text: &str,
+    results: usize,
+    each: usize,
+) -> std::path::PathBuf {
+    let path = dir.join("words-and-results.jsonl");
+    let mut blocks = vec![json!({"type":"text","text":text})];
+    for i in 0..results {
+        blocks.push(
+            json!({"type":"tool_result","tool_use_id":format!("t{i}"),"content":"r".repeat(each)}),
+        );
+    }
+    let mut f = std::fs::File::create(&path).unwrap();
+    let line = json!({"type":"user","message":{"role":"user","content":blocks}});
+    writeln!(f, "{line}").unwrap();
+    path
+}
+
+#[test]
+fn a_reader_who_follows_the_hints_reads_all_the_text_of_a_turn_with_a_big_tool_result() {
+    let dir = tempfile::tempdir().unwrap();
+    // The text alone fits a page; the 20,000-char result beside it makes the fit cut the words.
+    for chars in [20_000, 32_000, 38_000] {
+        let want = format!("{}TAIL", "a".repeat(chars - 4));
+        let path = write_words_and_results_fixture(dir.path(), &want, 1, 20_000);
+        assert!(
+            read_text_view_in_full(dir.path(), &path) == want,
+            "the text view ends with the full text"
+        );
+        assert!(
+            read_json_view_in_full(dir.path(), &path) == want,
+            "the JSON view ends with the full text"
+        );
+    }
+}
+
+#[test]
+fn redaction_that_shrinks_a_turn_under_a_page_still_leaves_all_of_it_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    // 41 chars a copy; the scrub leaves 32. 949 copies are over one page raw (38,882 is the band
+    // edge above) and about 30,400 redacted.
+    let text = format!("{}TAIL", format!("{} ", made_up_secret()).repeat(949));
+    let want = crate::redact::redact_secrets(&text).into_owned();
+    assert!(text.chars().count() > 38_882, "the raw text needs parts");
+    assert!(
+        want.chars().count() < 38_000,
+        "the redacted text fits a page"
+    );
+    let path = write_words_and_results_fixture(dir.path(), &text, 1, 20_000);
+    assert!(
+        read_text_view_in_full(dir.path(), &path) == want,
+        "the text view ends with the redacted text"
+    );
+    assert!(
+        read_json_view_in_full(dir.path(), &path) == want,
+        "the JSON view ends with the redacted text"
+    );
+}
+
+#[test]
+fn words_beside_many_tool_results_are_read_in_parts_not_cut_without_an_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let want = format!("{}TAIL", "a".repeat(5_996));
+    let path = write_words_and_results_fixture(dir.path(), &want, 12, 6_000);
+    let (joined, lines) = walk_text_view(dir.path(), slice_req(&path));
+    assert!(joined == want, "the text view reaches all 6,000 chars");
+    assert!(lines.len() > 1, "the words are read in more than one page");
+    for line in &lines {
+        assert!(
+            !line.contains("raise budget_chars"),
+            "no words line says raise the budget"
+        );
     }
 }

@@ -173,10 +173,18 @@ pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> Str
             "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\" reads it in parts, each ending with the next call; view=\"grep\" finds a word in it]"
         )
     } else {
-        // The text fits one page, so the slice does not page it: the tool results are what is
-        // too big, and the call can only be cut to a prefix, with no offset to read on from.
+        // The text fits one page, and the tool results are what is too big. The largest budget
+        // with the whole text asked for reads all of it: the slice reads it in parts when the
+        // tool results beside it take the room.
+        let words = entry.text.trim().chars().count();
+        let result = if words > crate::transcript::DEFAULT_RESULT_CHARS {
+            format!(" result_chars={words}")
+        } else {
+            String::new()
+        };
         format!(
-            "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\"{result}{budget} shows the most of it one call can; view=\"grep\" finds a word in it]"
+            "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\"{result} budget_chars={} reads all of its text, in parts when the tool results beside it take the room; view=\"grep\" finds a word in it]",
+            crate::transcript::MAX_BUDGET_CHARS
         )
     }
 }
@@ -411,9 +419,13 @@ fn escaped_chars(s: &str) -> usize {
 /// True when no `budget_chars` the server accepts shows the whole text of the turn, so the
 /// turn can only be read in parts. The test is [`budget_to_hold`], the same estimate the hints
 /// use to name a call that shows a turn whole, and it must stay so: a turn is read in parts
-/// exactly when no whole-read call can be named. A looser test (the exact room a page keeps,
+/// when no whole-read call can be named. A looser test (the exact room a page keeps,
 /// a little more) would leave turns in between neither paged nor given a call that shows them
 /// whole, and their last chars would be out of reach.
+///
+/// There is a second case. A turn whose text fits a page is still read in parts when the fit
+/// would cut its words to make room for the tool lines beside them, because that cut names no
+/// offset. `slice_view` decides that case, not this test.
 fn text_needs_parts(entry: &Entry) -> bool {
     let line = escaped_chars(entry.text.trim()) + turn_head(entry).chars().count() + 1;
     budget_to_hold(line) > crate::transcript::MAX_BUDGET_CHARS
@@ -658,6 +670,20 @@ fn slice_view(entries: &[&Entry], req: &TranscriptRequest) -> ViewData {
             {
                 limit = (limit / 2).max(SLICE_FIT_FLOOR_CHARS);
                 item = slice_item(entry, limit, fit);
+            }
+        }
+        if let (false, Some(cap)) = (req.json, fit_cap) {
+            // The fit cut the words to make room for the tool lines beside them. That cut has no
+            // offset, so the rest of the words would be out of reach: read the turn in parts.
+            if limit < requested && entry.text.trim().chars().count() > limit {
+                if let Some((part, ends_early)) = text_part_item(entry, 0, cap, requested, fit, req)
+                {
+                    items.push(part);
+                    if ends_early {
+                        break;
+                    }
+                    continue;
+                }
             }
         }
         items.push(item);
