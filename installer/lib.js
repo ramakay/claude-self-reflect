@@ -490,3 +490,52 @@ export function activationCommand({ destPath, pathBinary }) {
   if (pathBinary && realPath(pathBinary) === realPath(destPath)) return BINARY_NAME;
   return shellQuote(destPath);
 }
+
+/** The install line that works for every install route, npm included. */
+export const MANUAL_INSTALL_COMMAND =
+  'curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh';
+
+/**
+ * The reason line of a failed install step, or ''. postinstall.js reports a
+ * failure as "Binary download failed: <reason>" or "Postinstall error: <reason>"
+ * on stderr; anything else (a crash, a signal) has no line worth quoting.
+ */
+export function installFailureReason(output) {
+  const plain = String(output || '').replace(/\x1b\[[0-9;]*m/g, '');
+  const match = plain.match(/(?:download failed|Postinstall error):\s*(.+)/);
+  return match ? match[1].trim() : '';
+}
+
+/**
+ * Make sure there is an engine to run.
+ *
+ * npm 11.20 and later do not run a package's postinstall until the person
+ * allows it, so a fresh `npm install -g` can leave no binary behind. The first
+ * command then runs the same install step postinstall would have run, once.
+ * Returns the binary path, or null after one short message that names the
+ * command to run by hand. A binary that is already there costs one `find` call
+ * and nothing else.
+ *
+ * find() returns a path or null. install() runs the install step and throws
+ * when it fails; the thrown error's stderr or message is the reason source.
+ */
+export function ensureEngineBinary({ find, install, say }) {
+  const present = find();
+  if (present) return present;
+
+  say('Self-Reflect: the engine is not installed yet (npm skipped the install script). Installing it now.');
+  let reason = '';
+  try {
+    install();
+  } catch (e) {
+    reason = installFailureReason(e && (e.stderr || e.message));
+  }
+
+  const installed = find();
+  if (installed) return installed;
+
+  say(`Self-Reflect could not install the engine${reason ? ` (${reason})` : ''}.`);
+  say('Run this command, then run your command again:');
+  say(`  ${MANUAL_INSTALL_COMMAND}`);
+  return null;
+}
