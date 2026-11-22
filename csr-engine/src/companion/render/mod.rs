@@ -3,6 +3,7 @@ pub mod cards;
 pub mod instrument;
 mod instrument_gfx;
 mod instrument_icons;
+mod instrument_mood;
 pub mod kitty;
 pub mod observation;
 pub mod pictures;
