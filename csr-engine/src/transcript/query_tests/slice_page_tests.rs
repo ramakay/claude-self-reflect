@@ -763,3 +763,38 @@ fn a_resume_hint_between_turns_keeps_the_requested_end_turn() {
     req.json = false;
     assert!(transcript::run(dir.path(), &req).contains("--turns 3.. to continue\n"));
 }
+
+// ─── A list view's hint says "in parts" only for a turn whose text the slice pages. ───
+
+/// Turn 1 is a user turn of 38,700 chars of text, which fits one page at the largest budget, and
+/// a tool result. The list views see the result's 400-char preview, which takes the whole turn
+/// past what any budget holds, though the text alone is not too long for one page.
+fn write_text_and_result_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("text-and-result.jsonl");
+    let blocks = vec![
+        json!({"type":"text","text":"w".repeat(38_700)}),
+        json!({"type":"tool_result","tool_use_id":"t0","content":"r".repeat(1_000)}),
+    ];
+    let mut f = std::fs::File::create(&path).unwrap();
+    let line = json!({"type":"user","message":{"role":"user","content":blocks}});
+    writeln!(f, "{line}").unwrap();
+    path
+}
+
+#[test]
+fn a_list_hint_does_not_promise_parts_when_the_slice_would_not_page_the_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_text_and_result_fixture(dir.path());
+    let parsed = transcript::parse_transcript(&path).unwrap();
+    assert_eq!(parsed.entries[0].text.chars().count(), 38_700);
+    for view in [ViewKind::Prompts, ViewKind::YourAsks] {
+        let out = transcript::run(dir.path(), &base_req(view, &path.to_string_lossy()));
+        let hint = &out[out.find("[cut:").expect("the list cuts the turn")..];
+        assert!(!hint.contains("reads it in parts"), "no parts to read");
+        assert!(hint.contains("view=\"slice\" turns=\"1..1\""));
+        assert!(hint.contains("view=\"grep\""));
+        // The call the hint names returns a preview with no offset, so it must not promise one.
+        let out = transcript::run(dir.path(), &slice_of_hint(&path, hint));
+        assert!(!out.contains("offset="));
+    }
+}

@@ -168,9 +168,15 @@ pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> Str
         format!(
             "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\"{result}{budget} shows it whole]"
         )
-    } else {
+    } else if text_needs_parts(entry) {
         format!(
             "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\" reads it in parts, each ending with the next call; view=\"grep\" finds a word in it]"
+        )
+    } else {
+        // The text fits one page, so the slice does not page it: the tool results are what is
+        // too big, and the call can only be cut to a prefix, with no offset to read on from.
+        format!(
+            "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\"{result}{budget} shows the most of it one call can; view=\"grep\" finds a word in it]"
         )
     }
 }
