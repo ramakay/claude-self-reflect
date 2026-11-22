@@ -1015,9 +1015,9 @@ fn words_beside_many_tool_results_are_read_in_parts_not_cut_without_an_offset() 
 #[test]
 fn a_list_hint_does_not_promise_all_the_text_when_tool_lines_leave_no_room() {
     let dir = tempfile::tempdir().unwrap();
-    // 600 chars of words are over the 500 chars the list views show. 300 results of 100 chars
-    // take about 39,900 chars of tool lines even at the 100-char floor, over the 39,200 a page
-    // holds at the largest budget, so no part of the words fits beside them.
+    // 600 chars of words are over what the two list views show (300 and 500 chars). 300 results
+    // of 100 chars take about 39,900 chars of tool lines even at the 100-char floor, over the
+    // 39,200 a page holds at the largest budget, so no part of the words fits beside them.
     // The same holds for words too long for any page: with no room for a part, the hint must
     // not say the slice reads them in parts.
     for words in [600, 50_000] {
@@ -1031,10 +1031,38 @@ fn a_list_hint_does_not_promise_all_the_text_when_tool_lines_leave_no_room() {
             assert!(!hint.contains("reads it in parts"));
             // No slice call is named: the plain one is not sure to show any part of the words.
             assert!(!hint.contains("view=\"slice\""));
-            assert!(hint.contains("its tool calls and results take a whole slice page"));
+            assert!(hint.contains("leave too little room for its words on a slice page"));
             assert!(hint.contains("view=\"grep\""));
         }
     }
+}
+
+#[test]
+fn a_list_hint_that_says_parts_names_a_budget_with_room_for_the_first_part() {
+    let dir = tempfile::tempdir().unwrap();
+    // 250 results of 100 chars are about 33,000 chars of tool lines. A part of the words fits
+    // beside them on a page of the largest budget (39,200 chars) and not on a page of the
+    // default one (29,200). The words are too long for any page, so the hint says parts.
+    let text = format!("{}TAIL", "w".repeat(49_996));
+    let path = write_words_and_results_fixture(dir.path(), &text, 250, 100);
+    for view in [ViewKind::Prompts, ViewKind::YourAsks] {
+        let out = transcript::run(dir.path(), &base_req(view, &path.to_string_lossy()));
+        let hint = &out[out.find("[cut:").expect("the list cuts the turn")..];
+        assert!(hint.contains("reads it in parts"));
+        // The call the hint names, and the cut notes it prints, lead to every char of the text.
+        let (joined, lines) = walk_text_view(dir.path(), slice_of_hint(&path, hint));
+        assert!(joined == text, "the named call reads all of the text");
+        assert!(lines.len() > 1, "the text is read in more than one part");
+    }
+    // The parts after the first carry no tool lines, so a note that names no budget still works.
+    let mut later = slice_req(&path);
+    later.offset = 1_000;
+    let page = transcript::run(dir.path(), &later);
+    assert!(
+        page.contains("\n[cut: turn 1 has "),
+        "a part with a next call"
+    );
+    assert!(!page.contains("\n  tool_"), "no tool lines past offset 0");
 }
 
 #[test]

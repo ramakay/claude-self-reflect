@@ -159,8 +159,8 @@ fn room_for_a_part(entry: &Entry) -> bool {
 }
 
 /// Up to `max` chars of a list view's turn text. A cut names the slice call that shows it whole, or,
-/// when no call can, the call that reads it in parts. A turn whose tool lines fill a slice page
-/// at the sizes the fit uses names no slice call: see [`room_for_a_part`].
+/// when no call can, the call that reads it in parts. A turn whose tool lines leave too little
+/// room on a slice page for a part of its words names no slice call: see [`room_for_a_part`].
 pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> String {
     let (shown, cut) = cap_chars(text, max);
     if !cut {
@@ -187,16 +187,20 @@ pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> Str
             "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\"{result}{budget} shows it whole]"
         )
     } else if !room_for_a_part(entry) {
-        // The tool lines take the page even at the floor the fit cuts them to, so a part of the
-        // words is not sure to fit beside them, whether the text is long or short. No slice call
-        // is named: the plain call for this turn may show nothing of it, or a prefix of its
-        // words with no offset to read on from.
+        // Even at the floor the fit cuts them to, the tool lines leave too little room on the
+        // largest page for the part note and a part of the words beside them, whether the text
+        // is long or short. No slice call is named: the plain call for this turn may show
+        // nothing of it, or a prefix of its words with no offset to read on from.
         format!(
-            "{shown}… [cut: {bytes} bytes total; its tool calls and results take a whole slice page; view=\"grep\" finds a word in it]"
+            "{shown}… [cut: {bytes} bytes total; its tool calls and results leave too little room for its words on a slice page; view=\"grep\" finds a word in it]"
         )
     } else if text_needs_parts(entry) {
+        // The largest budget is named because that is where `room_for_a_part` holds: tool lines
+        // that leave room for the first part there can leave none at the default budget. The
+        // parts after the first carry no tool lines, so their notes need no budget.
         format!(
-            "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\" reads it in parts, each ending with the next call; view=\"grep\" finds a word in it]"
+            "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\" budget_chars={} reads it in parts, each ending with the next call; view=\"grep\" finds a word in it]",
+            crate::transcript::MAX_BUDGET_CHARS
         )
     } else {
         // The text fits one page, and the tool results are what is too big. The largest budget
