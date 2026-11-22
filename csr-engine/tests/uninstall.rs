@@ -47,6 +47,8 @@ exit 0"#;
 
 /// `launchctl`: `print` answers from `FAKE_LOADED` (the plist the job was loaded from; empty means
 /// no such job) until `bootout` has run; `BOOTOUT_FAIL` and `PRINT_FAIL` make those calls fail.
+/// `PRINT_CODE` and `PRINT_TEXT` make `print` fail with that exit status and message (launchd's
+/// answer for a user with no GUI domain is 125, "Domain does not support specified action").
 /// `DAEMON_PID` is the job's process: `print` names it, and after `bootout` keeps the job loaded
 /// (launchd's "SIGTERMed" state) for as long as that process lives. A `print` after `bootout`
 /// that still finds the plist on disk logs `plist-present-after-bootout`.
@@ -54,6 +56,7 @@ const LAUNCHCTL_SHIM: &str = r#"echo "launchctl $*" >> "$CALLS"
 case "$1" in
 print)
   if [ -n "$PRINT_FAIL" ]; then echo "Operation not permitted" >&2; exit 1; fi
+  if [ -n "$PRINT_CODE" ]; then echo "$PRINT_TEXT" >&2; exit "$PRINT_CODE"; fi
   if [ -f "$STATE/booted" ] && [ -n "$FAKE_LOADED" ] && [ -f "$FAKE_LOADED" ]; then echo "plist-present-after-bootout" >> "$CALLS"; fi
   alive=
   if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then alive=1; fi
@@ -607,6 +610,78 @@ fn a_launchd_that_cannot_be_asked_is_not_read_as_not_running() {
         "{text}"
     );
     assert!(!s.calls().contains("bootout"), "{}", s.calls());
+}
+
+const NO_GUI_DOMAIN: &str = "Could not print domain: 125: Domain does not support specified action";
+
+/// An account with no GUI login (ssh only): launchd answers 125 for the gui domain. No agent can
+/// be loaded there, so the run finishes and says why nothing was unloaded.
+#[test]
+fn an_account_with_no_gui_domain_finishes_and_says_nothing_was_loaded() {
+    let s = Scratch::new();
+    let out = s.run_env(
+        &["--yes", "--purge"],
+        &[("PRINT_CODE", "125"), ("PRINT_TEXT", NO_GUI_DOMAIN)],
+    );
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!s.plist().exists(), "{text}");
+    assert!(!s.data().join("csr-engine.db").exists(), "{text}");
+    assert!(!s.calls().contains("bootout"), "{}", s.calls());
+    assert!(text.contains("nothing to unload"), "{text}");
+    assert!(!text.contains("not finished:"), "{text}");
+}
+
+/// Only that exit status with that text means "no domain": any other launchctl failure still
+/// holds the data, as before.
+#[test]
+fn another_launchctl_failure_still_holds_even_with_a_125_or_the_domain_text() {
+    for (code, text) in [
+        ("125", "Operation not permitted"),
+        ("1", NO_GUI_DOMAIN),
+        ("125", ""),
+    ] {
+        let s = Scratch::new();
+        let out = s.run_env(
+            &["--yes", "--purge"],
+            &[("PRINT_CODE", code), ("PRINT_TEXT", text)],
+        );
+        let shown = stdout(&out);
+        assert_eq!(out.status.code(), Some(1), "{code} {text}: {shown}");
+        assert!(
+            s.data().join("csr-engine.db").exists(),
+            "{code} {text}: {shown}"
+        );
+        assert!(shown.contains("could not tell whether"), "{shown}");
+    }
+}
+
+/// No GUI domain does not clear a daemon started outside launchd: its lock still holds the data.
+#[test]
+fn a_daemon_outside_launchd_still_holds_the_uninstall_without_a_gui_domain() {
+    use fs2::FileExt;
+    let s = Scratch::new();
+    let (pid, reaped) = daemon_standin("30", false);
+    let lock_path = s.data().join("daemon.lock");
+    std::fs::write(&lock_path, pid.to_string()).unwrap();
+    let lock = std::fs::File::open(&lock_path).unwrap();
+    lock.try_lock_exclusive().unwrap();
+    let out = s.run_env(
+        &["--yes", "--purge"],
+        &[("PRINT_CODE", "125"), ("PRINT_TEXT", NO_GUI_DOMAIN)],
+    );
+    let text = stdout(&out);
+    drop(lock);
+    // Only the stand-in this test started is stopped, by its exact pid.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    reaped.join().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(s.data().join("csr-engine.db").exists(), "{text}");
+    assert!(
+        text.contains(&format!("a csr-engine daemon is running (pid {pid})")),
+        "{text}"
+    );
+    assert!(text.contains("not finished:"), "{text}");
 }
 
 /// A stand-in daemon process this test starts, `/bin/sleep` by absolute path (or, with
