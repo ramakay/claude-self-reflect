@@ -179,9 +179,11 @@ A Claude Code plugin, `csr-companion`. It shows what Self-Reflect handed Claude,
 | Inside [herdr](https://herdr.dev) (`brew install herdr`) | A pane to the right of Claude with the full cards. Pictures in Ghostty, kitty, WezTerm or Warp; text cards in Terminal.app. | By itself at session start in a project folder; `/csr` opens it again |
 | A plain terminal, no herdr | A panel inside Claude Code with a smaller card set | By itself in a project folder in a window 144+ columns wide; narrower, type `/csr` |
 
-Setup installs one plugin for both and does not choose between them: the plugin checks for herdr at each session start and each `/csr`. To switch, start `claude` inside or outside herdr; no reinstall. `claude plugin disable csr-companion@claude-self-reflect` turns the whole companion off. Setup, checks and troubleshooting: [Choose your view](https://ramakay.github.io/claude-self-reflect/#/docs/companion-views).
+Setup installs one plugin for both and does not choose between them: the plugin checks for herdr at each session start and each `/csr`. To switch, start `claude` inside or outside herdr; no reinstall. `claude plugin disable csr-companion@claude-self-reflect` turns the whole companion off. Setup, checks and troubleshooting: [Choose your view](https://ramakay.github.io/claude-self-reflect/docs/#/docs/companion-views).
 
-How the companion runs, the cards it draws and how to build from source are in the [archive](docs/README-archive.md#install-details).
+The cards: Where the work stands, This session, Context, Agents, Monologue, Changes, What confused the agent (Same page? takes its place when the dreamer has a reading), Should be a skill / memory / tool, and CSR performance. What each one shows is in the [archive](docs/README-archive.md#the-companion-pane-cards).
+
+How the companion runs and how to build from source are in the [archive](docs/README-archive.md#install-details).
 
 ### Uninstall
 
