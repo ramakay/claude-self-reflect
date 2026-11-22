@@ -5963,21 +5963,21 @@ pub(crate) enum ConversationLookup {
     Ambiguous(Vec<(String, String)>),
 }
 
-/// Locate a conversation's JSONL file by id across `projects_dir`
-/// (optionally scoped to a project-name substring). Shared by
-/// `get_full_conversation` and `crate::transcript::resolve_session_path` so
-/// both surfaces agree on exactly one lookup rule: an exact stem match
-/// always wins outright; otherwise every distinct substring match is
-/// collected and, if more than one remains, the lookup is reported
-/// `Ambiguous` rather than picking whichever the filesystem enumerated
-/// first (`read_dir` order is not guaranteed and is not stable across
-/// machines).
+/// Locate a conversation's JSONL file by id across `projects_dir`, including a
+/// subagent's `<session>/subagents/agent-*.jsonl` (optionally scoped to a
+/// project-name substring). Shared by `get_full_conversation` and
+/// `crate::transcript::resolve_session_path` so both surfaces agree on exactly
+/// one lookup rule: an exact stem match always wins outright; otherwise every
+/// distinct substring match is collected and, if more than one remains, the
+/// lookup is reported `Ambiguous` rather than picking whichever the filesystem
+/// enumerated first (`read_dir` order is not guaranteed and is not stable
+/// across machines).
 pub(crate) fn find_conversation_file(
     projects_dir: &Path,
     conversation_id: &str,
     project: Option<&str>,
 ) -> ConversationLookup {
-    find_transcript_file(projects_dir, ".jsonl", conversation_id, project, false)
+    find_transcript_file(projects_dir, ".jsonl", conversation_id, project, true)
 }
 
 /// The same lookup over the transcript mirror's `<project>/<id>.jsonl.zst`
@@ -5998,7 +5998,7 @@ pub(crate) fn find_mirrored_conversation(
 
 /// `find_conversation_file`'s one rule, parameterized by the root to search and
 /// the file-name suffix that marks a transcript there. `nested` also looks in
-/// `<project>/<session>/subagents/agent-*` (the mirror archives those); a hit
+/// `<project>/<session>/subagents/agent-*` (live and mirrored alike); a hit
 /// there still reports its top-level project.
 fn find_transcript_file(
     projects_dir: &Path,
