@@ -486,8 +486,9 @@ fn json_text_part(entry: &Entry, normal: &Value, start: usize, end: usize) -> Va
 /// `cap`, and a note that names the next call, through the request's end turn, when the rest does
 /// not fit. The turn's tool calls
 /// and results show with part 0 only. The tool lines give way first: they are halved until the
-/// note and one char of text fit beside them. `None` at offset 0 means the tool lines, each at
-/// the [`SLICE_FIT_FLOOR_CHARS`] floor, leave no room for that. The bool is true when the part
+/// note and one char of text fit beside them. `None` at offset 0 means the page has no room for
+/// that beside the tool lines at the [`SLICE_FIT_FLOOR_CHARS`] floor: too many tool lines for the
+/// largest budget, or a budget too small for the note itself. The bool is true when the part
 /// ends before the turn does.
 fn text_part_item(
     entry: &Entry,
