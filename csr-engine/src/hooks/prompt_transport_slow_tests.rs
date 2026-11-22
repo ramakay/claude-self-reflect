@@ -50,6 +50,34 @@ async fn ask_as(dir: &Path, input: HookInput, budget: Duration) -> Socket {
     .await
 }
 
+/// Ask for a deliberately slow answer, up to three times, each time under its
+/// own prompt id, and stop at the first reply that is not `Socket::Slow`.
+///
+/// The daemon drops the stream of an answer that ends past its deadline (550 ms
+/// here), and the hook sees that as `Slow`. A delay of 250 ms leaves the real
+/// render about 300 ms, which a loaded machine can overrun. Noise only makes a
+/// render slower, so a render that is really broken (never answers, or always
+/// overruns) is `Slow` in every round and still fails. Returns the id of the
+/// last round and its reply.
+async fn ask_until_answered(
+    dir: &Path,
+    input: HookInput,
+    tag: &str,
+    budget: Duration,
+) -> (String, Socket) {
+    let mut last = (String::new(), Socket::Slow);
+    for round in 0..3 {
+        let id = format!("{tag}-{round}-{}", std::process::id());
+        let mut asked = input.clone();
+        asked.prompt_id = Some(id.clone());
+        last = (id, ask_as(dir, asked, budget).await);
+        if last.1 != Socket::Slow {
+            break;
+        }
+    }
+    last
+}
+
 /// The value of `key=` in a slow-answer line.
 fn field<'a>(line: &'a str, key: &str) -> &'a str {
     let start = line
@@ -71,12 +99,15 @@ async fn a_slow_answer_writes_one_line_of_step_times_and_a_fast_one_writes_none(
     ready(dir.path()).await;
     warm(dir.path()).await;
     let fast = format!("fast-{}", std::process::id());
-    let slow = format!("slow-{}", std::process::id());
     let budget = Duration::from_secs(2);
     let reply = ask_as(dir.path(), delayed(dir.path(), 0, &fast), budget).await;
     assert!(matches!(reply, Socket::Answered(..)), "{reply:?}");
-    let reply = ask_as(dir.path(), delayed(dir.path(), 250, &slow), budget).await;
-    assert!(matches!(reply, Socket::Answered(..)), "{reply:?}");
+    let (slow, reply) =
+        ask_until_answered(dir.path(), delayed(dir.path(), 250, ""), "slow", budget).await;
+    assert!(
+        matches!(reply, Socket::Answered(..)),
+        "the delayed answer was not delivered in three rounds"
+    );
 
     let lines = wait_for_slow_lines(&slow).await;
     assert_eq!(lines.len(), 1, "{lines:?}");
@@ -203,12 +234,13 @@ async fn a_full_render_times_its_steps_and_receipts_waiting_on_the_writer_are_no
     let budget = Duration::from_secs(2);
 
     // A slow content render: the line shows the embedding the render did.
-    let timed = format!("timed-{}", std::process::id());
     let mut slow = content.clone();
     slow.session_id = Some("render-delay-ms=250".into());
-    slow.prompt_id = Some(timed.clone());
-    let reply = ask_as(dir.path(), slow, budget).await;
-    assert!(matches!(reply, Socket::Answered(..)), "{reply:?}");
+    let (timed, reply) = ask_until_answered(dir.path(), slow, "timed", budget).await;
+    assert!(
+        matches!(reply, Socket::Answered(..)),
+        "the slow content render was not answered in three rounds"
+    );
     let lines = wait_for_slow_lines(&timed).await;
     assert_eq!(lines.len(), 1, "{lines:?}");
     eprintln!("slow content render: {}", lines[0]);
