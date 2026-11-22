@@ -1,4 +1,5 @@
 use super::*;
+use crate::transcript::query::slice::slice_result_limit;
 
 #[test]
 fn slice_last_n_returns_final_n_recognized_entries() {

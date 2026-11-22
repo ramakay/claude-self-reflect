@@ -12,6 +12,7 @@ pub mod synthetic;
 pub mod tasks;
 mod tool_guards;
 pub mod tools;
+mod transcript_tool;
 mod why_echo;
 
 use std::path::PathBuf;
