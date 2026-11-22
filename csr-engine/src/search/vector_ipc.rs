@@ -641,7 +641,7 @@ pub struct VectorProxy {
     /// The home whose `daemon.lock` says a daemon process exists (see
     /// [`Self::with_daemon_home`]); None waits out the backoff regardless.
     daemon_home: Option<PathBuf>,
-    /// The last backoff was skipped: no daemon process, no socket.
+    /// Read in `mark_down`, so on every failed call: no daemon process, no socket.
     absent: AtomicBool,
 }
 
@@ -754,6 +754,8 @@ impl VectorProxy {
 
     fn mark_down(&self, error: &anyhow::Error) {
         self.failures.fetch_add(1, Ordering::Relaxed);
+        self.absent
+            .store(!self.daemon_may_be_starting(), Ordering::Relaxed);
         let newly = self
             .down_since
             .lock()
@@ -778,9 +780,7 @@ impl VectorProxy {
 
     /// Re-ping the daemon with doubling backoff; `true` once it answers.
     fn await_daemon(&self, deadline: Instant) -> bool {
-        let starting = self.daemon_may_be_starting();
-        self.absent.store(!starting, Ordering::Relaxed);
-        if !starting {
+        if !self.daemon_may_be_starting() {
             return false;
         }
         let timings = self.timings();

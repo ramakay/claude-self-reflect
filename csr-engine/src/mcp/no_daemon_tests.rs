@@ -117,6 +117,67 @@ async fn a_daemon_holding_its_lock_is_still_waited_for() {
     );
 }
 
+/// The note follows what is there now, also for a search inside the down window, which skips the
+/// backoff and so never re-reads presence there. No daemon first, then a daemon taking its lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_starting_inside_the_down_window_reads_as_restarting() {
+    use fs2::FileExt;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (home, server, _proxy) = installed_agent(&tmp).await;
+    let first = text(server.reflect_on_past(Parameters(reflect())).await);
+    assert!(
+        first.contains("the daemon is not running"),
+        "the first answer does not say the daemon is not running"
+    );
+    let data = home.join(".claude-self-reflect");
+    std::fs::create_dir_all(&data).unwrap();
+    let lock = std::fs::File::create(data.join("daemon.lock")).unwrap();
+    lock.try_lock_exclusive().unwrap();
+    let started = Instant::now();
+    let second = text(server.reflect_on_past(Parameters(reflect())).await);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the search inside the down window waited"
+    );
+    assert!(
+        second.contains("daemon restarting"),
+        "the answer does not say the daemon is restarting"
+    );
+}
+
+/// The reverse: a daemon that was starting is gone by the next search inside the down window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_gone_inside_the_down_window_reads_as_not_running() {
+    use fs2::FileExt;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (home, server, proxy) = installed_agent(&tmp).await;
+    proxy.set_timings(crate::search::vector_ipc::ProxyTimings {
+        backoff_first: Duration::from_millis(20),
+        backoff_total: Duration::from_millis(300),
+        down_window: Duration::from_secs(30),
+    });
+    let data = home.join(".claude-self-reflect");
+    std::fs::create_dir_all(&data).unwrap();
+    let lock = std::fs::File::create(data.join("daemon.lock")).unwrap();
+    lock.try_lock_exclusive().unwrap();
+    let first = text(server.reflect_on_past(Parameters(reflect())).await);
+    assert!(
+        first.contains("daemon restarting"),
+        "the first answer does not say the daemon is restarting"
+    );
+    drop(lock);
+    let started = Instant::now();
+    let second = text(server.reflect_on_past(Parameters(reflect())).await);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the search inside the down window waited"
+    );
+    assert!(
+        second.contains("the daemon is not running"),
+        "the answer does not say the daemon is not running"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_socket_file_is_still_waited_for() {
     let tmp = tempfile::TempDir::new().unwrap();
