@@ -1290,7 +1290,12 @@ fn the_armed_state_names_the_pattern_and_how_to_recover() {
 fn the_real_machine_runs_git_with_the_command_s_variables_and_gives_up_on_a_hang() {
     let dir = std::env::temp_dir();
     let dir = dir.to_str().unwrap();
-    let ran = Real.git(
+    // The machine gives git 2 s (`GIT_TIME`); a machine loaded 60 deep takes longer than that to
+    // start a git (measured 80 of 240 runs, 2026-11-21), so the two real runs get 60 s: this test
+    // is about what git is asked and what comes back, not about how fast the machine is.
+    let room = std::time::Duration::from_secs(60);
+    let ran = git_within(
+        room,
         dir,
         &[],
         &[("GIT_CONFIG_COUNT".into(), "0".into())],
@@ -1298,9 +1303,29 @@ fn the_real_machine_runs_git_with_the_command_s_variables_and_gives_up_on_a_hang
     );
     let ran = ran.expect("git runs");
     assert_eq!(ran.exit, Some(0));
-    assert!(ran.out.starts_with("git version"), "{}", ran.out);
-    let bad = Real.git(dir, &[], &[], &["no-such-subcommand"]).unwrap();
+    assert!(ran.out.starts_with("git version"), "git says its version");
+    let bad = git_within(room, dir, &[], &[], &["no-such-subcommand"]).unwrap();
     assert_ne!(bad.exit, Some(0));
+}
+
+#[test]
+fn the_real_machine_gives_up_on_a_hung_git_and_does_not_wait_for_it() {
+    // A git whose alias sleeps 12 s (its stdout let go, so only the hung git is waited for), run by
+    // the machine with its own `GIT_TIME`. A loaded machine can only make the give-up come
+    // sooner, never turn it into an answer; the give-up took 2.0 s in 240 of 240 runs 64 at a time.
+    let dir = std::env::temp_dir();
+    let dir = dir.to_str().unwrap();
+    let hang = [
+        "-c".to_string(),
+        "alias.hang=!exec sleep 12 >/dev/null 2>&1".to_string(),
+    ];
+    let started = std::time::Instant::now();
+    let ran = Real.git(dir, &hang, &[], &["hang"]);
+    assert!(ran.is_none(), "a hung git is given up on");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the give-up does not wait out the hang"
+    );
 }
 
 #[tokio::test]

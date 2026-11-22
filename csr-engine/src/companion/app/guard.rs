@@ -127,42 +127,7 @@ impl Machine for Real {
         env: &[(String, String)],
         args: &[&str],
     ) -> Option<Ran> {
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(settings)
-            .args(args)
-            .envs(env.iter().map(|(name, value)| (name, value)))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let mut stdout = child.stdout.take()?;
-        let reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stdout.read_to_end(&mut bytes);
-            bytes
-        });
-        let started = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) if started.elapsed() < GIT_TIME => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-            }
-        };
-        let bytes = reader.join().ok()?;
-        Some(Ran {
-            exit: status?.code(),
-            out: String::from_utf8_lossy(&bytes).into_owned(),
-        })
+        git_within(GIT_TIME, dir, settings, env, args)
     }
 
     fn coach(&self, now: f64) -> Vec<Value> {
@@ -171,6 +136,53 @@ impl Machine for Real {
             _ => Vec::new(),
         }
     }
+}
+
+/// `Real.git` with the time it gives git as a parameter (the machine always gives `GIT_TIME`; the
+/// tests give a slow, loaded machine room and a hung git almost none).
+fn git_within(
+    time: Duration,
+    dir: &str,
+    settings: &[String],
+    env: &[(String, String)],
+    args: &[&str],
+) -> Option<Ran> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(settings)
+        .args(args)
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() < time => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let bytes = reader.join().ok()?;
+    Some(Ran {
+        exit: status?.code(),
+        out: String::from_utf8_lossy(&bytes).into_owned(),
+    })
 }
 
 /// Run `work` on a blocking thread; none when that thread died.
