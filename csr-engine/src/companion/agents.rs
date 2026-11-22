@@ -240,6 +240,14 @@ pub fn is_active(row: &Agent, now: f64) -> bool {
 pub fn stalled(row: &Agent, now: f64) -> bool {
     row.status == "running" && now - row.last_at / 1000. >= 600.
 }
+/// A started agent with no completion record that will not give one: it went quiet (stalled), or
+/// the harness ended it ("failed", "killed", "completed") with no result. Pending, running and
+/// other quiet-but-live rows still wait for an answer.
+pub fn no_answer(row: &Agent, now: f64) -> bool {
+    row.started.is_some()
+        && row.completion.is_none()
+        && (stalled(row, now) || matches!(row.status.as_str(), "failed" | "killed" | "completed"))
+}
 pub fn no_report(row: &Agent) -> bool {
     row.completion
         .as_ref()
@@ -802,6 +810,37 @@ mod tests {
         a.completion.as_mut().unwrap().answer = " Report. ".into();
         assert_eq!(reported(&a), "Report.");
         assert_eq!(recent_completion(&[a], 1800000001.), Some(1800000000.));
+    }
+    #[test]
+    fn test_a_started_agent_with_no_completion_that_cannot_answer_has_no_answer() {
+        let now = 1800000000.;
+        let at = |status: &str, quiet: f64| {
+            let mut raw = row("n1");
+            raw["status"] = status.into();
+            raw["last_at"] = ((now - quiet) as i64 * 1000).into();
+            row_of(&raw).unwrap()
+        };
+        assert!(!no_answer(&at("running", 599.), now));
+        assert!(no_answer(&at("running", 600.), now));
+        for status in ["failed", "killed", "completed"] {
+            assert!(no_answer(&at(status, 5.), now));
+        }
+        for status in ["pending", "running", "waiting", "idle", "unknown"] {
+            assert!(!no_answer(&at(status, 5.), now));
+        }
+        let mut done = at("failed", 5.);
+        done.completion = Some(Completion {
+            key: "k".into(),
+            turn_id: "t".into(),
+            at: now * 1000.,
+            reason: "error".into(),
+            answer: String::new(),
+            disposition: "skipped".into(),
+        });
+        assert!(!no_answer(&done, now));
+        let mut unstarted = at("killed", 5.);
+        unstarted.started = None;
+        assert!(!no_answer(&unstarted, now));
     }
     #[test]
     fn test_a_waiting_row_with_no_update_for_two_hours_is_no_longer_active() {

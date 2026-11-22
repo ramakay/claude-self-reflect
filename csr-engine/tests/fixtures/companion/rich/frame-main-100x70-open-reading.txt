@@ -54,7 +54,7 @@
 [48;2;18;20;23m[38;2;242;244;246m14 min ago · ↳ asked · Rebase the importer branch, awaiting your go. · waiting                      [0m
 [48;2;18;20;23m[38;2;242;244;246m15 min ago · ♻ made room · Compacted                                                                [0m
 [48;2;18;20;23m[38;2;242;244;246m18 min ago · ○ delegated · Compare two queue clients started                                        [0m
-[48;2;18;20;23m[38;2;242;244;246m20 min ago · ○ delegated · Check retry limits started                                               [0m
+[48;2;18;20;23m[38;2;242;244;246m20 min ago · ✗ no answer · Check retry limits started                                               [0m
 [48;2;18;20;23m[38;2;242;244;246m22 min ago · ○ delegated · Summarize the logs started                                               [0m
 [48;2;18;20;23m[38;2;242;244;246m25 min ago · ○ delegated · Port the export test started                                             [0m
 [48;2;18;20;23m[38;2;242;244;246m29 min ago · ↳ noted · Update the nightly schedule once the queue is ready. · handed                [0m

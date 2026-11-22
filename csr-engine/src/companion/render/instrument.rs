@@ -93,7 +93,7 @@ fn river_row(at: f64, kind: RiverKind, lead: &'static str, line: String) -> Rive
         thread: None,
     }
 }
-pub use super::instrument_mood::{mood, thread_mood};
+pub use super::instrument_mood::{mood, started_lead, thread_mood};
 /// A timeline row's time against `now`, in `tz`: "just now" under a minute, "N min ago" under an
 /// hour, "HH:MM" on the same local day, else "Mon D HH:MM".
 pub fn time_label_in<Tz: chrono::TimeZone>(at: f64, now: f64, tz: &Tz) -> String
@@ -463,7 +463,7 @@ impl Composition {
                 river.push(river_row(
                     start / 1000.,
                     RiverKind::Agent,
-                    "○ ",
+                    started_lead(agent, now),
                     format!("{} started", agent.description),
                 ));
             }
