@@ -77,6 +77,19 @@ pub(super) fn recency_window<'a>(
     Ok((start, end, named))
 }
 
+/// The start of the window as text that sorts at or before every stored form of
+/// that instant. It has no zone, and no fraction when its milliseconds are zero,
+/// so it is a prefix of `...mmmZ`, of `...Z` and of `...+00:00` alike. A start
+/// written `...000Z` sorts after `...+00:00` and drops the row at `since`.
+fn text_lower_bound(start: &Instant) -> String {
+    let format = if start.timestamp_subsec_millis() == 0 {
+        "%Y-%m-%dT%H:%M:%S"
+    } else {
+        "%Y-%m-%dT%H:%M:%S%.3f"
+    };
+    start.format(format).to_string()
+}
+
 /// Time-constrained semantic search.
 #[allow(clippy::too_many_arguments)]
 pub async fn search_by_recency(
@@ -95,9 +108,11 @@ pub async fn search_by_recency(
     let (start, end, named) = recency_window(time_range, since, until)?;
 
     // `get_chunk_ids_in_timerange` compares these with the stored timestamps as
-    // text. Claude Code rows are stored `...mmmZ`, so the bounds use that form: a
-    // `+00:00` bound sorts before `.000Z` and would drop a row at the `until` instant.
-    let start_str = start.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // text. Claude Code rows are stored `...mmmZ`; plans and Codex rollouts are
+    // stored `...+00:00`, with a fraction only when it is not zero. The end is
+    // written `...mmmZ`: a `+00:00` end sorts before `.000Z` and would drop a
+    // row at the `until` instant.
+    let start_str = text_lower_bound(&start);
     let end_str = end.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // The exact bounds searched, in the header, so a window that is not the one
     // the caller meant ("last month" is the previous calendar month) is seen.

@@ -316,6 +316,47 @@ async fn rows_stored_with_a_utc_offset_are_found_hours_from_the_bounds() {
     }
 }
 
+/// The same rows at the bounds themselves. The vector path compares text, and
+/// `+00:00` sorts before `.000Z`, so a start written `...000Z` drops the row at
+/// the `since` instant.
+#[tokio::test]
+async fn rows_stored_with_a_utc_offset_are_found_at_the_exact_bounds() {
+    let rig = rig(&[
+        ("alphaoffsetbeforesince", "2026-11-09T23:59:59.999+00:00"),
+        ("alphaoffsetatsince", "2026-11-10T00:00:00+00:00"),
+        ("alphaoffsetatuntil", "2026-11-10T01:47:00+00:00"),
+        ("alphaoffsetafteruntil", "2026-11-10T01:47:00.001+00:00"),
+    ]);
+    let since = Some("2026-11-10T00:00:00Z");
+    let until = Some("2026-11-10T01:47:00Z");
+    for out in both_paths(&rig, None, since, until).await {
+        assert!(out.contains("alphaoffsetatsince"));
+        assert!(out.contains("alphaoffsetatuntil"));
+        assert!(!out.contains("alphaoffsetbeforesince"));
+        assert!(!out.contains("alphaoffsetafteruntil"));
+    }
+}
+
+/// A `since` with milliseconds: the row at that instant is inside in both
+/// stored forms, and the row one millisecond before it is not.
+#[tokio::test]
+async fn a_since_with_milliseconds_is_inclusive_for_both_stored_forms() {
+    let rig = rig(&[
+        ("alphamsbeforeoffset", "2026-11-10T00:00:00.249+00:00"),
+        ("alphamsbeforezulu", "2026-11-10T00:00:00.249Z"),
+        ("alphamsatoffset", "2026-11-10T00:00:00.250+00:00"),
+        ("alphamsatzulu", "2026-11-10T00:00:00.250Z"),
+    ]);
+    let since = Some("2026-11-10T00:00:00.250Z");
+    let until = Some("2026-11-10T01:47:00Z");
+    for out in both_paths(&rig, None, since, until).await {
+        assert!(out.contains("alphamsatoffset"));
+        assert!(out.contains("alphamsatzulu"));
+        assert!(!out.contains("alphamsbeforeoffset"));
+        assert!(!out.contains("alphamsbeforezulu"));
+    }
+}
+
 #[tokio::test]
 async fn a_window_with_its_start_after_its_end_is_refused() {
     let rig = rig(&[("alphain", "2026-11-10T01:30:00.000Z")]);
