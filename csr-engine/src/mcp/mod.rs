@@ -381,7 +381,7 @@ impl CsrServer {
         }
         let keyword = fallback
             .await
-            .map(|text| format!("{}\n\n{text}", crate::search::vector_ipc::KEYWORD_ONLY_NOTE));
+            .map(|text| format!("{}\n\n{text}", proxy.note()));
         tool_result(keyword)
     }
 
@@ -1418,6 +1418,9 @@ mod code_map_tests;
 
 #[cfg(test)]
 mod query_validation_tests;
+
+#[cfg(test)]
+mod no_daemon_tests;
 
 #[cfg(test)]
 mod tool_boundary_tests;

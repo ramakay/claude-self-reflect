@@ -3,6 +3,59 @@
 //! [`super::daemon_configured_for_database`]). Split out of `vector_ipc.rs`.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use anyhow::Result;
+
+use super::{database_identity, heartbeat_path, ErrorCode, Reply, CONFIGURED_WITHIN};
+
+pub(super) fn daemon_configured_with(
+    db_path: &Path,
+    home: Option<&Path>,
+    disabled: bool,
+    enabled: bool,
+    ping: impl FnOnce(&Path) -> Result<Reply>,
+) -> bool {
+    if disabled {
+        return false;
+    }
+    if enabled
+        || home.is_some_and(|home| {
+            launchd_database(home).is_some_and(|configured| {
+                database_identity(&configured) == database_identity(db_path)
+            })
+        })
+    {
+        return true;
+    }
+    let Some(data_dir) = db_path.parent() else {
+        return false;
+    };
+    let fresh = std::fs::metadata(heartbeat_path(data_dir))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .map(|modified| {
+            SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default()
+        })
+        .is_some_and(|age| age < CONFIGURED_WITHIN);
+    fresh
+        && std::fs::read_to_string(heartbeat_path(data_dir))
+            .ok()
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+            .is_some_and(|body| {
+                body["database"].as_str() == Some(database_identity(db_path).as_str())
+            })
+        || matches!(
+            ping(db_path),
+            Ok(Reply::Pong
+                | Reply::Error {
+                    code: ErrorCode::Busy,
+                    ..
+                })
+        )
+}
 
 fn plist_skip_misc(input: &mut &str) -> Option<()> {
     loop {

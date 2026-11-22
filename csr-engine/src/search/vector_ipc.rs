@@ -29,7 +29,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(test)]
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -93,6 +95,9 @@ pub const PATH_IN_PROCESS: &str = "in-process";
 /// The line vector-backed tools put above keyword-only results.
 pub const KEYWORD_ONLY_NOTE: &str =
     "semantic search paused: daemon restarting — keyword (FTS) results only";
+/// The same line when no daemon process exists (see [`VectorProxy::note`]).
+pub const NO_DAEMON_NOTE: &str =
+    "semantic search unavailable: the daemon is not running (csr-engine setup starts it) — keyword (FTS) results only";
 
 pub fn socket_path(data_dir: &Path) -> PathBuf {
     data_dir.join("hook-ipc-v1").join("vector.sock")
@@ -190,55 +195,9 @@ fn database_identity(path: &Path) -> String {
 
 #[path = "vector_ipc_launchd.rs"]
 mod launchd;
+use launchd::daemon_configured_with;
+#[cfg(test)]
 use launchd::launchd_database;
-
-fn daemon_configured_with(
-    db_path: &Path,
-    home: Option<&Path>,
-    disabled: bool,
-    enabled: bool,
-    ping: impl FnOnce(&Path) -> Result<Reply>,
-) -> bool {
-    if disabled {
-        return false;
-    }
-    if enabled
-        || home.is_some_and(|home| {
-            launchd_database(home).is_some_and(|configured| {
-                database_identity(&configured) == database_identity(db_path)
-            })
-        })
-    {
-        return true;
-    }
-    let Some(data_dir) = db_path.parent() else {
-        return false;
-    };
-    let fresh = std::fs::metadata(heartbeat_path(data_dir))
-        .and_then(|meta| meta.modified())
-        .ok()
-        .map(|modified| {
-            SystemTime::now()
-                .duration_since(modified)
-                .unwrap_or_default()
-        })
-        .is_some_and(|age| age < CONFIGURED_WITHIN);
-    fresh
-        && std::fs::read_to_string(heartbeat_path(data_dir))
-            .ok()
-            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-            .is_some_and(|body| {
-                body["database"].as_str() == Some(database_identity(db_path).as_str())
-            })
-        || matches!(
-            ping(db_path),
-            Ok(Reply::Pong
-                | Reply::Error {
-                    code: ErrorCode::Busy,
-                    ..
-                })
-        )
-}
 
 #[derive(Serialize, Deserialize)]
 struct Request {
@@ -679,6 +638,11 @@ pub struct VectorProxy {
     timings: std::sync::Mutex<ProxyTimings>,
     /// The server's run record, rewritten with its current path.
     run_record: std::sync::Mutex<Option<PathBuf>>,
+    /// The home whose `daemon.lock` says a daemon process exists (see
+    /// [`Self::with_daemon_home`]); None waits out the backoff regardless.
+    daemon_home: Option<PathBuf>,
+    /// The last backoff was skipped: no daemon process, no socket.
+    absent: AtomicBool,
 }
 
 impl VectorProxy {
@@ -693,6 +657,35 @@ impl VectorProxy {
             sync_busy_since: std::sync::Mutex::new(None),
             timings: std::sync::Mutex::new(ProxyTimings::default()),
             run_record: std::sync::Mutex::new(None),
+            daemon_home: None,
+            absent: AtomicBool::new(false),
+        }
+    }
+
+    /// Wait out the backoff only while a daemon may be coming up: a process
+    /// holds `<home>/.claude-self-reflect/daemon.lock` (taken before the index
+    /// loads) or the vector socket exists. With neither, an installed launch
+    /// agent that never started a daemon would cost every first call
+    /// [`BACKOFF_TOTAL`] for nothing.
+    pub fn with_daemon_home(mut self, home: Option<&Path>) -> Self {
+        self.daemon_home = home.map(Path::to_path_buf);
+        self
+    }
+
+    fn daemon_may_be_starting(&self) -> bool {
+        self.daemon_home.as_ref().is_none_or(|home| {
+            self.client.socket.exists()
+                || crate::daemon::lock_file_held(&home.join(".claude-self-reflect/daemon.lock"))
+        })
+    }
+
+    /// The line to put above keyword-only answers: says plainly when no daemon
+    /// process exists, rather than that one is restarting.
+    pub fn note(&self) -> &'static str {
+        if self.absent.load(Ordering::Relaxed) {
+            NO_DAEMON_NOTE
+        } else {
+            KEYWORD_ONLY_NOTE
         }
     }
 
@@ -746,6 +739,7 @@ impl VectorProxy {
     }
 
     fn mark_up(&self) {
+        self.absent.store(false, Ordering::Relaxed);
         let first_reply = !self.answered.swap(true, Ordering::Relaxed);
         let was_down = self
             .down_since
@@ -784,6 +778,11 @@ impl VectorProxy {
 
     /// Re-ping the daemon with doubling backoff; `true` once it answers.
     fn await_daemon(&self, deadline: Instant) -> bool {
+        let starting = self.daemon_may_be_starting();
+        self.absent.store(!starting, Ordering::Relaxed);
+        if !starting {
+            return false;
+        }
         let timings = self.timings();
         let started = Instant::now();
         let mut delay = timings.backoff_first;
