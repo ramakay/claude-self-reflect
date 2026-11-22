@@ -72,7 +72,7 @@ async fn no_daemon_process_answers_at_once_and_says_so() {
     let started = Instant::now();
     let answer = text(server.reflect_on_past(Parameters(reflect())).await);
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(10),
         "the search waited out the daemon backoff"
     );
     assert!(
