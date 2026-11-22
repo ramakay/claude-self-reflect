@@ -508,6 +508,32 @@ fn text_part_item(
     Some((item, ends_early))
 }
 
+/// The least `budget_chars` at which [`text_part_item`] shows a part of `entry`'s text from
+/// `start`: the fit's header room, the turn line, and the room for the rest of the text, or for
+/// its cut note and first char when the rest is longer.
+fn part_budget(entry: &Entry, start: usize) -> usize {
+    let total = entry.text.chars().count();
+    let rest = char_range(&entry.text, start.min(total), total);
+    let first = rest.chars().next().map_or(0, escaped_width);
+    let room = escaped_chars(rest).min(SLICE_PART_NOTE_CHARS + first);
+    (SLICE_FIT_RESERVE_CHARS + turn_head(entry).chars().count() + 1 + room)
+        .max(SLICE_FIT_MIN_BUDGET_CHARS)
+}
+
+/// The note that stands for a first turn whose `offset` no part fits at this budget. Showing
+/// the turn from its first char instead would hand the reader its start twice.
+fn offset_note_item(entry: &Entry, start: usize, budget: usize) -> RenderItem {
+    let turn = entry.turn;
+    RenderItem {
+        turn,
+        text: format!(
+            "[offset {start} not applied: budget_chars {budget} is too small to read turn {turn} in parts; use budget_chars={} or more]",
+            part_budget(entry, start)
+        ),
+        json: Value::Null,
+    }
+}
+
 /// The turns a slice request selects, in order.
 fn selected_entries<'a>(parsed: &'a ParsedTranscript, req: &TranscriptRequest) -> Vec<&'a Entry> {
     let duplicates = queued_duplicates(parsed);
@@ -576,6 +602,11 @@ fn slice_view(entries: &[&Entry], req: &TranscriptRequest) -> ViewData {
                     continue;
                 }
             }
+        }
+        if !req.json && start > 0 {
+            // No part fits: the note stands for the turn, and nothing follows it.
+            items.push(offset_note_item(entry, start, req.budget_chars));
+            break;
         }
         // In JSON the turn's own text is whole in the item, so a long text must not shrink the
         // results beside it.
