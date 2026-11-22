@@ -766,7 +766,7 @@ fn a_resume_hint_between_turns_keeps_the_requested_end_turn() {
     assert!(transcript::run(dir.path(), &req).contains("--turns 3.. to continue\n"));
 }
 
-// ─── A list view's hint says "in parts" only for a turn whose text the slice pages. ───
+// ─── A list view's hint names the paging call only for a turn whose text the slice pages. ───
 
 /// Turn 1 is a user turn of 38,700 chars of text, which fits one page at the largest budget, and
 /// a tool result. The list views see the result's 400-char preview, which takes the whole turn
@@ -917,16 +917,17 @@ fn a_reader_who_follows_the_hints_reads_a_turn_near_the_page_size_in_full() {
             "the JSON view ends with the full text"
         );
     }
-    // The list views say the same thing: a call shows it whole, or it is read in parts.
+    // The list views say the same thing: a call shows it whole, or the hint names the call that
+    // reads it page by page.
     for chars in lengths {
         let path = write_one_turn_fixture(dir.path(), chars);
         let listed = transcript::run(
             dir.path(),
             &base_req(ViewKind::YourAsks, &path.to_string_lossy()),
         );
-        let in_parts = listed.contains("reads it in parts");
-        assert_eq!(in_parts, chars > 38_882, "the list view's advice");
-        assert_eq!(listed.contains("shows it whole"), !in_parts);
+        let paged = listed.contains("names the next call");
+        assert_eq!(paged, chars > 38_882, "the list view's advice");
+        assert_eq!(listed.contains("shows it whole"), !paged);
     }
 }
 
@@ -1019,7 +1020,7 @@ fn a_list_hint_does_not_promise_all_the_text_when_tool_lines_leave_no_room() {
     // of 100 chars take about 39,900 chars of tool lines even at the 100-char floor, over the
     // 39,200 a page holds at the largest budget, so no part of the words fits beside them.
     // The same holds for words too long for any page: with no room for a part, the hint must
-    // not say the slice reads them in parts.
+    // not name the call that reads them page by page.
     for words in [600, 50_000] {
         let text = "w".repeat(words);
         let path = write_words_and_results_fixture(dir.path(), &text, 300, 100);
@@ -1028,7 +1029,7 @@ fn a_list_hint_does_not_promise_all_the_text_when_tool_lines_leave_no_room() {
             let hint = &out[out.find("[cut:").expect("the list cuts the turn")..];
             let hint = &hint[..hint.find(']').map_or(hint.len(), |end| end + 1)];
             assert!(!hint.contains("reads all of its text"));
-            assert!(!hint.contains("reads it in parts"));
+            assert!(!hint.contains("names the next call"));
             // No slice call is named: the plain one is not sure to show any part of the words.
             assert!(!hint.contains("view=\"slice\""));
             assert!(hint.contains("leave too little room for its words on a slice page"));
@@ -1048,7 +1049,7 @@ fn a_list_hint_that_says_parts_names_a_budget_with_room_for_the_first_part() {
     for view in [ViewKind::Prompts, ViewKind::YourAsks] {
         let out = transcript::run(dir.path(), &base_req(view, &path.to_string_lossy()));
         let hint = &out[out.find("[cut:").expect("the list cuts the turn")..];
-        assert!(hint.contains("reads it in parts"));
+        assert!(hint.contains("names the next call"));
         // The call the hint names, and the cut notes it prints, lead to every char of the text.
         let (joined, lines) = walk_text_view(dir.path(), slice_of_hint(&path, hint));
         assert!(joined == text, "the named call reads all of the text");
