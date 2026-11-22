@@ -4266,7 +4266,6 @@ mod tests {
 
 #[cfg(test)]
 mod r4_daemon_audit_probes {
-
     use super::*;
     use std::time::Duration;
     #[tokio::test]
@@ -4275,6 +4274,7 @@ mod r4_daemon_audit_probes {
         let db = dir.path().join("db");
         let storage = Arc::new(Storage::open(&db).unwrap());
         let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        embeddings.warm().unwrap();
         let search = Arc::new(RwLock::new(SearchEngine::new(16)));
         for conv in ["stored", "deferred", "no-batch"] {
             storage
@@ -4352,7 +4352,6 @@ mod r4_daemon_audit_probes {
                 .await
                 .unwrap(),
         );
-
         let storage = Arc::new(Storage::open(&db).unwrap());
         let search = Arc::new(RwLock::new(SearchEngine::new(16)));
         // Recovery must preserve the batch id, and requeue only the id-less row.
@@ -4445,6 +4444,7 @@ mod r4_daemon_audit_probes {
         });
         let lock = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
         let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        embeddings.warm().unwrap();
         let search = Arc::new(RwLock::new(SearchEngine::new(16)));
         let shutdown = Arc::new(AtomicBool::new(false));
         let conversations = [(conv.into(), "r4.jsonl".into())];
