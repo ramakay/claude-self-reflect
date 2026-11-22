@@ -1506,6 +1506,20 @@ pub(crate) mod test_support {
             .map_or(0, |(_, count)| *count)
     }
 
+    /// Wait until the server takes a connection, not just until its socket file exists: the file
+    /// appears at bind(2), before listen(2), and a client that went on the file alone is refused.
+    /// The probe sends nothing; the server reads EOF at once and gives the slot back.
+    pub(crate) async fn wait_accepting(data_dir: &Path, server: &tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while std::os::unix::net::UnixStream::connect(socket_path(data_dir)).is_err() {
+                assert!(!server.is_finished(), "vector socket bind failed");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("vector socket became ready");
+    }
+
     pub(crate) struct TestDaemon {
         shutdown: Arc<AtomicBool>,
         handles: Vec<tokio::task::JoinHandle<()>>,
@@ -1540,13 +1554,7 @@ pub(crate) mod test_support {
                 shutdown.clone(),
                 nudge,
             );
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !socket_path(data_dir).exists() {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .unwrap();
+            wait_accepting(data_dir, &server).await;
             std::fs::write(data_dir.join("daemon.lock"), std::process::id().to_string()).unwrap();
             write_heartbeat(data_dir);
             Self {
@@ -2161,14 +2169,7 @@ mod tests {
             slots.clone(),
             RerankGate::production(),
         );
-        tokio::time::timeout(Duration::from_secs(60), async {
-            while !socket_path(tmp.path()).exists() {
-                assert!(!server.is_finished(), "vector socket bind failed");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("vector socket became ready");
+        wait_accepting(tmp.path(), &server).await;
         // Every search now blocks on the index lock.
         let held = search.write().await;
         let dir = tmp.path().to_path_buf();
@@ -2890,14 +2891,7 @@ mod tests {
                 scorer,
             },
         );
-        tokio::time::timeout(Duration::from_secs(60), async {
-            while !socket_path(tmp.path()).exists() {
-                assert!(!server.is_finished(), "vector socket bind failed");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("vector socket became ready");
+        wait_accepting(tmp.path(), &server).await;
         let dir = tmp.path().to_path_buf();
         let rerank_frame = frame(
             &serde_json::to_string(&Request {
