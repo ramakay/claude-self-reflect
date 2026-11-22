@@ -458,3 +458,114 @@ fn json_pages_of_a_session_with_no_oversize_turn_are_byte_identical_to_before() 
     assert!(whole.ends_with("\n  \"truncated\": false,\n  \"view\": \"slice\"\n}"));
     assert!(!whole.contains("text_offset") && !whole.contains("resume_offset"));
 }
+
+/// Turn 1 is short, turn 2 is "A" then 2,999 "b", turn 3 is short.
+fn write_medium_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("medium.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    let mut put = |v: Value| writeln!(f, "{v}").unwrap();
+    put(json!({"type":"user","message":{"role":"user","content":"first turn"}}));
+    put(
+        json!({"type":"user","message":{"role":"user","content":format!("A{}", "b".repeat(2_999))}}),
+    );
+    put(json!({"type":"user","message":{"role":"user","content":"last turn"}}));
+    drop(f);
+    path
+}
+
+fn text_page(
+    path: &std::path::Path,
+    dir: &std::path::Path,
+    budget: usize,
+    call: (usize, usize),
+) -> String {
+    transcript::run(dir, &page_req(path, false, budget, call))
+}
+
+#[test]
+fn a_text_offset_at_a_small_budget_never_shows_the_turn_from_its_first_char() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_medium_fixture(dir.path());
+    // Turn 2 at offset 5: budgets under 1,000 skip the fit; 1,000 leaves no room for a part.
+    for budget in [1_000, 999, 500] {
+        let out = text_page(&path, dir.path(), budget, (2, 5));
+        assert!(!out.contains("[turn 2] "), "no turn line from char 0");
+        assert!(!out.contains("Abbb"), "the turn text does not start over");
+        assert!(!out.contains("[turn 3] "), "nothing follows the note");
+        assert!(
+            out.contains(&format!(
+                "[offset 5 not applied: budget_chars {budget} is too small to read turn 2 in parts; use budget_chars=1019 or more]"
+            )),
+            "the note names the offset, the budget and the budget that works"
+        );
+    }
+    // A budget the note cannot fit in shows the page's own message and no turn text.
+    let out = text_page(&path, dir.path(), 100, (2, 5));
+    assert_eq!(
+        out,
+        "<transcript_slice>\n... 1 more turns; --turns 2.. to continue\n"
+    );
+    // Turn 1 on a budget the fit skips: its offset is not dropped either.
+    let out = text_page(&path, dir.path(), 500, (1, 4));
+    assert!(out.contains("[offset 4 not applied: budget_chars 500 "));
+    assert!(!out.contains("first turn"));
+}
+
+#[test]
+fn the_budget_a_note_names_shows_a_part_at_the_offset_and_one_less_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_medium_fixture(dir.path());
+    let note = text_page(&path, dir.path(), 1_000, (2, 5));
+    let named = hint_number(&note, "budget_chars").expect("the note names a budget");
+    assert_eq!(named, 1_019);
+    let (part, next) = text_part(&text_page(&path, dir.path(), named, (2, 5)), 2)
+        .expect("the named budget shows a part");
+    assert_eq!(part, "b");
+    assert_eq!(next, Some(6));
+    let short = text_page(&path, dir.path(), named - 1, (2, 5));
+    assert!(
+        short.contains("not applied"),
+        "one char less gives the note"
+    );
+    assert!(!short.contains("[turn 2] "));
+    // The big turn names its own budget the same way.
+    let dir = tempfile::tempdir().unwrap();
+    let (path, original) = write_oversize_fixture(dir.path());
+    let note = text_page(&path, dir.path(), 900, (2, 10));
+    let named = hint_number(&note, "budget_chars").unwrap();
+    let (part, next) = text_part(&text_page(&path, dir.path(), named, (2, 10)), 2).unwrap();
+    assert!(!part.is_empty() && next.is_some_and(|n| n > 10));
+    assert!(original
+        .chars()
+        .skip(10)
+        .collect::<String>()
+        .starts_with(&part));
+    assert!(text_page(&path, dir.path(), named - 1, (2, 10)).contains("not applied"));
+}
+
+#[test]
+fn a_text_offset_past_the_end_at_a_small_budget_does_not_show_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_medium_fixture(dir.path());
+    for budget in [1_000, 999, 500, 100] {
+        let out = text_page(&path, dir.path(), budget, (1, 999));
+        assert!(!out.contains("first turn"), "no turn text");
+        // At 1,000 the end note is a part that fits, and the later turns follow it as usual.
+        if out.contains("not applied") {
+            assert!(!out.contains("[turn 2] ") && !out.contains("[turn 3] "));
+        } else if budget >= 1_000 {
+            assert!(out.contains("nothing left in this turn]"));
+        }
+    }
+    let out = text_page(&path, dir.path(), 500, (2, 3_500));
+    assert!(!out.contains("Abbb") && !out.contains("[turn 3] "));
+}
+
+#[test]
+fn an_offset_of_zero_at_a_small_budget_still_shows_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_medium_fixture(dir.path());
+    let out = text_page(&path, dir.path(), 500, (1, 0));
+    assert!(out.contains("[turn 1] user -: first turn\n"));
+    assert!(!out.contains("not applied"));
+}
