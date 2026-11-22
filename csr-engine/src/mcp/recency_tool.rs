@@ -94,8 +94,11 @@ pub async fn search_by_recency(
     validate_page(0, limit)?;
     let (start, end, named) = recency_window(time_range, since, until)?;
 
-    let start_str = start.to_rfc3339();
-    let end_str = end.to_rfc3339();
+    // `get_chunk_ids_in_timerange` compares these with the stored timestamps as
+    // text. Claude Code rows are stored `...mmmZ`, so the bounds use that form: a
+    // `+00:00` bound sorts before `.000Z` and would drop a row at the `until` instant.
+    let start_str = start.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let end_str = end.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // The exact bounds searched, in the header, so a window that is not the one
     // the caller meant ("last month" is the previous calendar month) is seen.
     let time_desc = temporal::describe_window(named, &start, &end);

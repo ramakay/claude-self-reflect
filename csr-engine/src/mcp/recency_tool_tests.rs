@@ -247,6 +247,75 @@ async fn until_with_an_offset_is_honoured_to_the_instant() {
     assert_until_stops_at_0147("2026-11-10T03:47:00+02:00").await;
 }
 
+/// Both bounds are inclusive to the millisecond for a row stored in the form
+/// Claude Code writes (`...mmmZ`): the exact instant is in, one millisecond
+/// outside is out.
+#[tokio::test]
+async fn bounds_are_inclusive_to_the_millisecond_for_stored_rows() {
+    let rig = rig(&[
+        ("alphaedgebeforesince", "2026-11-09T23:59:59.999Z"),
+        ("alphaedgeatsince", "2026-11-10T00:00:00.000Z"),
+        ("alphaedgeatuntil", "2026-11-10T01:47:00.000Z"),
+        ("alphaedgeafteruntil", "2026-11-10T01:47:00.001Z"),
+    ]);
+    let since = Some("2026-11-10T00:00:00Z");
+    let until = Some("2026-11-10T01:47:00Z");
+    let [vector, keyword] = both_paths(&rig, None, since, until).await;
+    for out in [vector, keyword] {
+        assert!(out.contains("alphaedgeatsince"));
+        assert!(out.contains("alphaedgeatuntil"));
+        assert!(!out.contains("alphaedgebeforesince"));
+        assert!(!out.contains("alphaedgeafteruntil"));
+    }
+}
+
+/// A row at the exact `until` instant is inside on the vector path, whose bound
+/// is compared with the stored timestamp as text.
+#[tokio::test]
+async fn vector_path_row_at_the_exact_until_instant_is_inside() {
+    let rig = rig(&[("alphaedgeatuntil", "2026-11-10T01:47:00.000Z")]);
+    let out = vector_path(
+        &rig,
+        None,
+        Some("2026-11-10T00:00:00Z"),
+        Some("2026-11-10T01:47:00Z"),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("alphaedgeatuntil"));
+}
+
+/// The same on the keyword path, whose bound goes through `julianday`.
+#[tokio::test]
+async fn keyword_path_row_at_the_exact_until_instant_is_inside() {
+    let rig = rig(&[("alphaedgeatuntil", "2026-11-10T01:47:00.000Z")]);
+    let out = keyword_path(
+        &rig,
+        None,
+        Some("2026-11-10T00:00:00Z"),
+        Some("2026-11-10T01:47:00Z"),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("alphaedgeatuntil"));
+}
+
+/// A row stored with `+00:00` (plans and Codex rollouts) that lies hours from
+/// both bounds is still inside the window, and one hours past it is not.
+#[tokio::test]
+async fn rows_stored_with_a_utc_offset_are_found_hours_from_the_bounds() {
+    let rig = rig(&[
+        ("alphaoffsetin", "2026-11-10T06:00:00+00:00"),
+        ("alphaoffsetlater", "2026-11-10T18:00:00+00:00"),
+    ]);
+    let since = Some("2026-11-10T00:00:00Z");
+    let until = Some("2026-11-10T12:00:00Z");
+    for out in both_paths(&rig, None, since, until).await {
+        assert!(out.contains("alphaoffsetin"));
+        assert!(!out.contains("alphaoffsetlater"));
+    }
+}
+
 #[tokio::test]
 async fn a_window_with_its_start_after_its_end_is_refused() {
     let rig = rig(&[("alphain", "2026-11-10T01:30:00.000Z")]);
