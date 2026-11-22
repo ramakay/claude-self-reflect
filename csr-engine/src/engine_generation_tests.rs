@@ -283,6 +283,7 @@ fn a_lock_timeout_is_reported_by_the_caller_not_served_as_a_failed_generation() 
     let budget = std::time::Duration::from_millis(30);
     assert!(load_generation_served(true, &storage, &index_dir, 1, budget).is_none());
     drop(held);
+    crate::maintenance::wait_flock_free_for_test(&index_dir.join("index.lock"));
     let served = load_generation_served(true, &storage, &index_dir, 1, budget).unwrap();
     assert!(served.is_generation_served());
 }
@@ -593,6 +594,7 @@ fn the_zero_wait_exclusive_try_is_refused_at_once_while_the_lock_is_held() {
     assert!(lock_index(&probe, true, Duration::ZERO).is_err());
     assert!(started.elapsed() < Duration::from_millis(100));
     drop(holder);
+    crate::maintenance::wait_flock_free_for_test(&tmp.path().join("index.lock"));
     lock_index(&probe, true, Duration::ZERO).unwrap();
 }
 

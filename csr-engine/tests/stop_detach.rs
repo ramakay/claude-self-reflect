@@ -450,6 +450,26 @@ fn a_detached_stop_ends_with_the_rows_an_inline_stop_stores() {
     assert_eq!(got, want, "detached and inline Stop store the same rows");
 }
 
+/// Return once no process holds the flock on `path`. Closing a descriptor is not always the
+/// release: a process another test is spawning holds a copy of the open file description until
+/// its exec. Asks every 10 ms for at most 5 s; the probe is unlocked by hand before it returns.
+fn wait_flock_free(path: &Path) {
+    use fs2::FileExt;
+    let file = std::fs::File::open(path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if FileExt::try_lock_exclusive(&file).is_ok() {
+            FileExt::unlock(&file).unwrap();
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lock did not come free 5 s after its holder let go"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn a_burst_of_stops_while_a_worker_holds_the_lock_is_one_run_on_the_last_input() {
     let world = World::new();
@@ -477,6 +497,7 @@ fn a_burst_of_stops_while_a_worker_holds_the_lock_is_one_run_on_the_last_input()
         session.transcript("c").to_string_lossy().as_ref()
     );
     drop(held);
+    wait_flock_free(&dir.join("sid-burst.lock"));
 
     // The next worker (here run in the foreground) takes the one input that is left.
     let output = world

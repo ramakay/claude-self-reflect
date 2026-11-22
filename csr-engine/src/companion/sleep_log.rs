@@ -513,6 +513,7 @@ mod tests {
         let seen = lines(d.path(), "abc");
         assert_eq!(seen.len(), 1, "no line is written under another pane's cut");
         drop(held);
+        crate::maintenance::wait_flock_free_for_test(&lock);
         j.write(Decision::Wake, "third", None, Focus::Unknown, 1);
         assert_eq!(lines(d.path(), "abc").len(), 2);
     }
