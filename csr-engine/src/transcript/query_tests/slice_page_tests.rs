@@ -392,7 +392,9 @@ fn the_mcp_tool_passes_offset_through_and_keeps_its_reply_under_the_cap() {
 }
 
 /// The golden fixture's turns 1..9 as slice pages, written down from the build before paging
-/// (`6c339727`): a session with no oversize turn pages byte for byte as it did.
+/// (`6c339727`): a session with no oversize turn pages as it did, except that a cut page's
+/// continuation hint keeps the requested end turn (`3..9` and `2..9` where that build printed
+/// `3..` and `2..`, since `11fabcca`).
 fn golden_slice(json_form: bool, budget: usize) -> String {
     let dir = tempfile::tempdir().unwrap();
     let path = write_golden_fixture(dir.path());
@@ -404,7 +406,7 @@ fn golden_slice(json_form: bool, budget: usize) -> String {
 }
 
 #[test]
-fn text_pages_of_a_session_with_no_oversize_turn_are_byte_identical_to_before() {
+fn text_pages_of_a_session_with_no_oversize_turn_differ_from_before_only_in_the_bounded_hint() {
     let whole = r#"<transcript_slice>
 [turn 1] user 2026-08-10T10:00:00Z: Fix the &lt;script&gt;alert('x')&lt;/script&gt; injection bug in auth.rs
 [turn 2] assistant 2026-08-10T10:00:02Z: Reading the file first.
@@ -435,7 +437,7 @@ fn text_pages_of_a_session_with_no_oversize_turn_are_byte_identical_to_before() 
 }
 
 #[test]
-fn json_pages_of_a_session_with_no_oversize_turn_are_byte_identical_to_before() {
+fn json_pages_of_a_session_with_no_oversize_turn_differ_from_before_only_in_the_bounded_hint() {
     let cut = r#"{
   "items": [
     {
