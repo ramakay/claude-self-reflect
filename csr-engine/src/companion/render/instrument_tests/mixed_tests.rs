@@ -284,9 +284,20 @@ fn a_killed_agent_with_no_completion_reads_no_answer() {
 }
 
 #[test]
-fn a_completed_agent_with_no_completion_record_reads_no_answer() {
+fn a_completed_agent_with_no_completion_record_yet_still_reads_delegated() {
+    // The record may land a moment after the status: only the stall window turns it to no answer.
+    for quiet in [5., 599.] {
+        assert_eq!(
+            agent_timeline_rows("completed", quiet, false),
+            ["30 min ago · ○ delegated · Scan the repo started"]
+        );
+    }
+}
+
+#[test]
+fn a_completed_agent_quiet_for_600_seconds_with_no_completion_reads_no_answer() {
     assert_eq!(
-        agent_timeline_rows("completed", 5., false),
+        agent_timeline_rows("completed", 600., false),
         ["30 min ago · ✗ no answer · Scan the repo started"]
     );
 }

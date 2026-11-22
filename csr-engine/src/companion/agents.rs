@@ -237,16 +237,25 @@ pub fn is_active(row: &Agent, now: f64) -> bool {
         _ => false,
     }
 }
-pub fn stalled(row: &Agent, now: f64) -> bool {
-    row.status == "running" && now - row.last_at / 1000. >= 600.
+/// No event for the stall window (600 s): the one number every "gone quiet" rule shares.
+fn quiet(row: &Agent, now: f64) -> bool {
+    now - row.last_at / 1000. >= 600.
 }
-/// A started agent with no completion record that will not give one: it went quiet (stalled), or
-/// the harness ended it ("failed", "killed", "completed") with no result. Pending, running and
-/// other quiet-but-live rows still wait for an answer.
+pub fn stalled(row: &Agent, now: f64) -> bool {
+    row.status == "running" && quiet(row, now)
+}
+/// A started agent with no completion record that will not give one. "failed" and "killed" say so
+/// at once. "running" and "completed" say so only after the stall window with no event: the
+/// completion record may land a moment after the status, so a fresh "completed" row still waits.
+/// Every other status (pending, waiting, idle, unknown) still waits.
 pub fn no_answer(row: &Agent, now: f64) -> bool {
     row.started.is_some()
         && row.completion.is_none()
-        && (stalled(row, now) || matches!(row.status.as_str(), "failed" | "killed" | "completed"))
+        && match row.status.as_str() {
+            "failed" | "killed" => true,
+            "running" | "completed" => quiet(row, now),
+            _ => false,
+        }
 }
 pub fn no_report(row: &Agent) -> bool {
     row.completion
@@ -820,13 +829,18 @@ mod tests {
             raw["last_at"] = ((now - quiet) as i64 * 1000).into();
             row_of(&raw).unwrap()
         };
-        assert!(!no_answer(&at("running", 599.), now));
-        assert!(no_answer(&at("running", 600.), now));
-        for status in ["failed", "killed", "completed"] {
+        for status in ["running", "completed"] {
+            assert!(!no_answer(&at(status, 5.), now));
+            assert!(!no_answer(&at(status, 599.), now));
+            assert!(no_answer(&at(status, 600.), now));
+            assert!(no_answer(&at(status, 7200.), now));
+        }
+        for status in ["failed", "killed"] {
             assert!(no_answer(&at(status, 5.), now));
         }
-        for status in ["pending", "running", "waiting", "idle", "unknown"] {
+        for status in ["pending", "waiting", "idle", "unknown"] {
             assert!(!no_answer(&at(status, 5.), now));
+            assert!(!no_answer(&at(status, 7200.), now));
         }
         let mut done = at("failed", 5.);
         done.completion = Some(Completion {
