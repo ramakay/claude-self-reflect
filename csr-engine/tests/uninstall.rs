@@ -684,6 +684,82 @@ fn a_daemon_outside_launchd_still_holds_the_uninstall_without_a_gui_domain() {
     assert!(text.contains("not finished:"), "{text}");
 }
 
+/// The hold here is a daemon outside launchd on an account with no GUI domain, where `launchctl
+/// print` never says "cannot find the service". The closing line names the daemon, not launchctl,
+/// and keeps the exact rerun command. Both ways the hold is found: with the plist still on disk
+/// (the agent step) and without one (the check after it).
+#[test]
+fn the_closing_line_names_the_outside_daemon_not_launchctl_without_a_gui_domain() {
+    use fs2::FileExt;
+    for with_plist in [true, false] {
+        let s = Scratch::new();
+        if !with_plist {
+            std::fs::remove_file(s.plist()).unwrap();
+        }
+        let (pid, reaped) = daemon_standin("30", false);
+        let lock_path = s.data().join("daemon.lock");
+        std::fs::write(&lock_path, pid.to_string()).unwrap();
+        let lock = std::fs::File::open(&lock_path).unwrap();
+        lock.try_lock_exclusive().unwrap();
+        let out = s.run_env(
+            &["--yes", "--purge-mirror"],
+            &[("PRINT_CODE", "125"), ("PRINT_TEXT", NO_GUI_DOMAIN)],
+        );
+        let text = stdout(&out);
+        drop(lock);
+        // Only the stand-in this test started is stopped, by its exact pid.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        reaped.join().unwrap();
+        assert_eq!(out.status.code(), Some(1), "exit code");
+        let finish = text
+            .lines()
+            .find(|l| l.contains("not finished:"))
+            .unwrap_or_default();
+        assert!(!finish.is_empty(), "the closing line is printed");
+        assert!(
+            !finish.contains("launchctl"),
+            "the closing line does not name launchctl"
+        );
+        assert!(
+            finish.contains(&format!("the csr-engine daemon (pid {pid})")),
+            "the closing line names the daemon and its pid"
+        );
+        assert!(
+            finish.ends_with(&format!(
+                "finish with: \"{}\" uninstall --yes --purge-mirror",
+                env!("CARGO_BIN_EXE_csr-engine")
+            )),
+            "the closing line ends with the rerun command"
+        );
+    }
+}
+
+/// A job launchd still has keeps today's closing line, word for word.
+#[test]
+fn the_closing_line_for_a_launchd_hold_is_unchanged() {
+    let s = Scratch::new();
+    let out = s.run_env(
+        &["--yes", "--purge"],
+        &[
+            ("FAKE_LOADED", s.plist().to_str().unwrap()),
+            ("PRINT_FAIL", "1"),
+        ],
+    );
+    let text = stdout(&out);
+    let finish = text
+        .lines()
+        .find(|l| l.contains("not finished:"))
+        .unwrap_or_default();
+    let expected = format!(
+        "not finished: what the lines above keep stays until the daemon has stopped. Once \
+         `launchctl print gui/{}/{LABEL}` says it cannot find the service, finish with: \"{}\" \
+         uninstall --yes --purge",
+        unsafe { libc::getuid() },
+        env!("CARGO_BIN_EXE_csr-engine")
+    );
+    assert_eq!(finish.trim(), expected);
+}
+
 /// A stand-in daemon process this test starts, `/bin/sleep` by absolute path (or, with
 /// `ignore_term`, one that ignores SIGTERM). A thread reaps it, so it never lingers as a zombie
 /// that `kill -0` still finds; the handle returns how it ended.

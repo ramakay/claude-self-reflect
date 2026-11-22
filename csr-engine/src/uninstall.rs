@@ -122,12 +122,12 @@ pub fn run(args: &UninstallArgs, db_path: &Path) -> i32 {
     let plugin_gone = plugin_step(apply, &mut out);
     ok &= plugin_gone;
     ok &= residue::plugin_cache_step(&home, apply, plugin_gone, &mut out);
-    let agents = agent_step(&home, apply, &mut out);
+    let mut agents = agent_step(&home, apply, &mut out);
     ok &= agents.ok;
     // The plist is not the daemon: whatever happened to it (deleted by an earlier run, never
     // there, not ours), nothing is deleted while launchd runs a CSR daemon.
     let mut hold_data = agents.hold_data;
-    if apply && !hold_data && daemon_still_loaded(&home, &mut out) {
+    if apply && !hold_data && daemon_still_loaded(&home, &mut agents, &mut out) {
         hold_data = true;
         ok = false;
     }
@@ -151,7 +151,7 @@ pub fn run(args: &UninstallArgs, db_path: &Path) -> i32 {
     // Last: nothing after this may need the binary.
     ok &= binary_step(&home, apply, hold_data, &binaries, &mut out);
     if apply && hold_data {
-        out.push(finish_line(args));
+        out.push(finish_line(args, agents.hold));
     }
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
@@ -187,8 +187,10 @@ pub fn run(args: &UninstallArgs, db_path: &Path) -> i32 {
 }
 
 /// The last line of a run that left things behind because the daemon is not confirmed stopped:
-/// what to wait for, then the exact command that removes the rest.
-fn finish_line(args: &UninstallArgs) -> String {
+/// what to wait for, then the exact command that removes the rest. With no GUI domain and only a
+/// daemon outside launchd to wait for, `launchctl print` never says "cannot find the service", so
+/// the line names the daemon instead.
+fn finish_line(args: &UninstallArgs, hold: Option<Hold>) -> String {
     let exe = std::env::current_exe()
         .map(|p| format!("\"{}\"", p.display()))
         .unwrap_or_else(|_| "csr-engine".to_string());
@@ -199,6 +201,16 @@ fn finish_line(args: &UninstallArgs) -> String {
     } else {
         ""
     };
+    if let Some(Hold::OutsideDaemon(pid)) = hold {
+        let daemon = match pid {
+            Some(pid) => format!("the csr-engine daemon (pid {pid})"),
+            None => "the csr-engine daemon".to_string(),
+        };
+        return format!(
+            "not finished: what the lines above keep stays until the daemon has stopped. Stop \
+             {daemon}, then finish with: {exe} uninstall --yes{purge}"
+        );
+    }
     let job = format!("gui/{}/{DAEMON_LABEL}", unsafe { libc::getuid() });
     format!(
         "not finished: what the lines above keep stays until the daemon has stopped. Once \
@@ -914,11 +926,14 @@ fn launchd_state(job: &str, here: &str) -> Launchd {
 
 /// No GUI domain, so launchd holds no agent. A daemon started outside launchd can still run:
 /// its lock tells. Returns the hold reason when one runs.
-fn daemon_outside_launchd(home: &Path) -> Option<String> {
+fn daemon_outside_launchd(home: &Path) -> Option<(String, Option<u32>)> {
     let lock = home.join(DATA_DIR).join("daemon.lock");
     crate::daemon::lock_file_held(&lock).then(|| match daemon_lock_holder(home) {
-        Some(pid) => format!("a csr-engine daemon is running (pid {pid})"),
-        None => "a csr-engine daemon is running".to_string(),
+        Some(pid) => (
+            format!("a csr-engine daemon is running (pid {pid})"),
+            Some(pid),
+        ),
+        None => ("a csr-engine daemon is running".to_string(), None),
     })
 }
 
@@ -926,7 +941,7 @@ fn daemon_outside_launchd(home: &Path) -> Option<String> {
 /// Asks about the standard label and about every daemon plist still on disk (one that is not
 /// ours, or one the agent step left), whatever the plists say. With no plist on disk, a machine
 /// without `launchctl` has no launch agent and counts as clear.
-fn daemon_still_loaded(home: &Path, out: &mut Vec<String>) -> bool {
+fn daemon_still_loaded(home: &Path, agents: &mut Agents, out: &mut Vec<String>) -> bool {
     let mut labels: Vec<(String, Option<PathBuf>)> = vec![(DAEMON_LABEL.to_string(), None)];
     for agent in daemon_agents_on_disk(home) {
         match labels.iter_mut().find(|(l, _)| *l == agent.label) {
@@ -951,13 +966,15 @@ fn daemon_still_loaded(home: &Path, out: &mut Vec<String>) -> bool {
                     "launch agent: a job named {label} is still loaded in launchd; stop it with \
                      `launchctl bootout {job}`"
                 ));
+                agents.note_hold(Hold::Launchd);
                 held = true;
             }
             Launchd::NoGuiDomain => {
-                if let Some(why) = daemon_outside_launchd(home) {
+                if let Some((why, pid)) = daemon_outside_launchd(home) {
                     out.push(format!(
                         "launch agent: {why}; stop it, then run uninstall again"
                     ));
+                    agents.note_hold(Hold::OutsideDaemon(pid));
                     held = true;
                 }
             }
@@ -965,6 +982,7 @@ fn daemon_still_loaded(home: &Path, out: &mut Vec<String>) -> bool {
                 out.push(format!(
                     "launch agent: could not tell whether {label} is running ({why})"
                 ));
+                agents.note_hold(Hold::Launchd);
                 held = true;
             }
         }
@@ -980,6 +998,29 @@ struct Agents {
     hold_data: bool,
     /// The daemon pid this step sent SIGTERM, if it had to.
     signalled: Option<u32>,
+    /// What kept `hold_data` set, for the closing line. None while nothing holds.
+    hold: Option<Hold>,
+}
+
+/// What a held run waits for.
+#[derive(Clone, Copy)]
+enum Hold {
+    /// A job launchd has, or an answer from launchctl that cannot be read: `launchctl` tells.
+    Launchd,
+    /// Only a daemon started outside launchd on an account with no GUI domain, with its pid when
+    /// `daemon.lock` names one. `launchctl` cannot say anything useful there.
+    OutsideDaemon(Option<u32>),
+}
+
+impl Agents {
+    /// Record a hold. Two kinds of hold in one run read as `Launchd`, the broader line.
+    fn note_hold(&mut self, kind: Hold) {
+        self.hold = Some(match (self.hold, kind) {
+            (None, kind) => kind,
+            (Some(Hold::OutsideDaemon(pid)), Hold::OutsideDaemon(_)) => Hold::OutsideDaemon(pid),
+            _ => Hold::Launchd,
+        });
+    }
 }
 
 /// Ask launchd until it no longer has `job`, for at most `limit`. True when it is gone.
@@ -1044,6 +1085,7 @@ fn agent_step(home: &Path, apply: bool, out: &mut Vec<String>) -> Agents {
         ok: true,
         hold_data: false,
         signalled: None,
+        hold: None,
     };
     let found = daemon_agents_on_disk(home);
     if found.is_empty() {
@@ -1078,9 +1120,10 @@ fn agent_step(home: &Path, apply: bool, out: &mut Vec<String>) -> Agents {
         // daemon that keeps running by its label (`daemon_still_loaded`).
         let job = format!("gui/{}/{}", unsafe { libc::getuid() }, agent.label);
         let here = agent.path.to_string_lossy().into_owned();
-        let hold = |agents: &mut Agents| {
+        let hold = |agents: &mut Agents, kind: Hold| {
             agents.ok = false;
             agents.hold_data = true;
+            agents.note_hold(kind);
         };
         match launchd_state(&job, &here) {
             Launchd::NotLoaded => {
@@ -1092,17 +1135,17 @@ fn agent_step(home: &Path, apply: bool, out: &mut Vec<String>) -> Agents {
                      stop it with `launchctl bootout {job}` if it is yours",
                     agent.label
                 ));
-                hold(&mut agents);
+                hold(&mut agents, Hold::Launchd);
                 delete_plist(&agent.path, &mut agents, out);
             }
             Launchd::NoGuiDomain => {
                 delete_plist(&agent.path, &mut agents, out);
                 match daemon_outside_launchd(home) {
-                    Some(why) => {
+                    Some((why, pid)) => {
                         out.push(format!(
                             "launch agent: {why}; stop it, then run uninstall again"
                         ));
-                        hold(&mut agents);
+                        hold(&mut agents, Hold::OutsideDaemon(pid));
                     }
                     None => out.push(format!(
                         "launch agent: this account has no login session, so {} was not loaded \
@@ -1118,7 +1161,7 @@ fn agent_step(home: &Path, apply: bool, out: &mut Vec<String>) -> Agents {
                      it with `launchctl bootout {job}`",
                     agent.label
                 ));
-                hold(&mut agents);
+                hold(&mut agents, Hold::Launchd);
             }
             Launchd::LoadedHere(launchd_pid) => {
                 // The daemon's pid, recorded before the stop: launchd's and the lock's must agree.
@@ -1144,7 +1187,7 @@ fn agent_step(home: &Path, apply: bool, out: &mut Vec<String>) -> Agents {
                              bootout {job}`",
                             agent.label
                         ));
-                        hold(&mut agents);
+                        hold(&mut agents, Hold::Launchd);
                     }
                 }
             }
