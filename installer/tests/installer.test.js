@@ -230,11 +230,29 @@ describe('engine older than the package (the npm command, before it runs)', () =
     assert.equal(judge('10.2.0', '10.1.9'), null);
   });
 
-  test('the same version, a newer one, and a prerelease of the same numbers are left alone', () => {
+  test('the same version and a newer one are left alone', () => {
     assert.equal(judge('10.1.1', '10.1.1'), null);
     assert.equal(judge('10.1.2', '10.1.1'), null);
     assert.equal(judge('11.0.0', '10.1.1'), null);
-    assert.equal(judge('10.1.1-rc.1', '10.1.1'), null);
+    // Build metadata has no place in the order.
+    assert.equal(judge('10.1.1+build.7', '10.1.1'), null);
+    assert.equal(judge('10.1.1', '10.1.1+build.7'), null);
+  });
+
+  test('a prerelease is older than its release, and prereleases keep semver order', () => {
+    const older = (installed, wanted) => assert.deepEqual(judge(installed, wanted), { installed, wanted });
+    older('10.1.1-rc.1', '10.1.1');
+    older('10.1.1-rc.1', '10.1.1-rc.2');
+    older('10.1.1-rc.2', '10.1.1-rc.10'); // numbers, not text
+    older('10.1.1-alpha', '10.1.1-beta');
+    older('10.1.1-rc', '10.1.1-rc.1'); // fewer identifiers first
+    older('10.1.1-1', '10.1.1-rc'); // a number sorts before text
+    older('10.1.0', '10.1.1-rc.1');
+
+    assert.equal(judge('10.1.1', '10.1.1-rc.1'), null);
+    assert.equal(judge('10.1.1-rc.2', '10.1.1-rc.1'), null);
+    assert.equal(judge('10.1.1-rc.1', '10.1.1-rc.1'), null);
+    assert.equal(judge('10.1.2-rc.1', '10.1.1'), null);
   });
 
   test('an engine that cannot say its version counts as older', () => {

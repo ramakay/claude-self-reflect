@@ -201,7 +201,7 @@ describe('claude-self-reflect when postinstall never ran', () => {
 describe('claude-self-reflect after an upgrade whose postinstall never ran', () => {
   const OLD_ENGINE = fakeEngine(OLDER, 'OLD-ENGINE-RAN');
 
-  test('engine older than the package, install succeeds: updates once, then runs the new engine', () => {
+  test('setup, engine older than the package, install succeeds: updates once, then runs the new engine', () => {
     const r = runCli(sandbox(STUB_OK), ['setup'], { engine: OLD_ENGINE });
 
     assert.equal(r.status, 0, r.stderr);
@@ -215,58 +215,74 @@ describe('claude-self-reflect after an upgrade whose postinstall never ran', () 
     assert.equal(r.stdout, 'ENGINE-RAN setup\n');
   });
 
-  test('engine older, install fails: one message with the manual command, then the engine that is here', () => {
-    const r = runCli(sandbox(STUB_FAIL), ['status', '--compact'], { engine: OLD_ENGINE });
+  test('setup, engine older, install fails: one message with the manual command, then the engine that is here', () => {
+    const r = runCli(sandbox(STUB_FAIL), ['setup', '--no-companion'], { engine: OLD_ENGINE });
 
     assert.equal(r.status, 0, r.stderr);
     assert.equal(r.installs, 1);
-    assert.equal(r.stdout, 'OLD-ENGINE-RAN status --compact\n');
+    assert.equal(r.stdout, 'OLD-ENGINE-RAN setup --no-companion\n');
     assert.equal(r.stderr.split(CURL_LINE).length - 1, 1, 'the manual command appears exactly once');
     assert.match(r.stderr, /could not update the engine \(HTTP 404 for https:\/\/example\.invalid\/x\)/);
     assert.match(r.stderr, /This command runs with the engine that is here/);
     assert.doesNotMatch(r.stderr, /\n\s+at |node:internal|Error:/);
   });
 
-  test('engine older, install step does nothing: one attempt, then the engine that is here', () => {
+  test('setup, engine older, install step does nothing: one attempt, then the engine that is here', () => {
     const quiet = `
       import { appendFileSync } from 'node:fs';
       appendFileSync(process.env.STUB_CALLS, 'install\\n');
     `;
-    const r = runCli(sandbox(quiet), ['status'], { engine: OLD_ENGINE });
+    const r = runCli(sandbox(quiet), ['setup'], { engine: OLD_ENGINE });
 
     assert.equal(r.status, 0, r.stderr);
     assert.equal(r.installs, 1);
-    assert.equal(r.stdout, 'OLD-ENGINE-RAN status\n');
+    assert.equal(r.stdout, 'OLD-ENGINE-RAN setup\n');
     assert.equal(r.stderr.split(CURL_LINE).length - 1, 1);
   });
 
-  test('an engine with no --version flag counts as older', () => {
-    const r = runCli(sandbox(STUB_OK), ['status'], { engine: fakeEngine(null, 'OLD-ENGINE-RAN') });
+  test('setup: an engine with no --version flag counts as older', () => {
+    const r = runCli(sandbox(STUB_OK), ['setup'], { engine: fakeEngine(null, 'OLD-ENGINE-RAN') });
 
     assert.equal(r.status, 0, r.stderr);
     assert.equal(r.installs, 1);
     assert.match(r.stderr, /the engine here is an older build/);
-    assert.equal(r.stdout, 'ENGINE-RAN status\n');
+    assert.equal(r.stdout, 'ENGINE-RAN setup\n');
   });
 
-  test('engine newer than the package: left alone, no install step, no message', () => {
-    const r = runCli(sandbox(STUB_OK), ['status'], { engine: fakeEngine(NEWER, 'NEW-ENGINE-RAN') });
+  test('status, engine older: one line names the command to run, no install step, the engine that is here', () => {
+    // A command that only reads must not wait on a download or restart a daemon.
+    const r = runCli(sandbox(STUB_OK), ['status', '--compact'], { engine: OLD_ENGINE });
 
     assert.equal(r.status, 0, r.stderr);
     assert.equal(r.installs, 0);
-    assert.equal(r.stdout, 'NEW-ENGINE-RAN status\n');
-    assert.equal(r.stderr, '');
+    assert.equal(r.stdout, 'OLD-ENGINE-RAN status --compact\n');
+    assert.equal(
+      r.stderr,
+      `Self-Reflect: the engine here is ${OLDER} and this package is ${PKG_VERSION}. ` +
+        'To update the engine, run: claude-self-reflect setup\n'
+    );
   });
 
-  test('CSR_SKIP_BINARY_DOWNLOAD=1: an older engine is left alone', () => {
-    const r = runCli(sandbox(STUB_OK), ['status'], {
-      engine: OLD_ENGINE,
-      env: { CSR_SKIP_BINARY_DOWNLOAD: '1' },
-    });
+  test('setup, engine newer than the package: left alone, no install step, no message', () => {
+    const r = runCli(sandbox(STUB_OK), ['setup'], { engine: fakeEngine(NEWER, 'NEW-ENGINE-RAN') });
 
     assert.equal(r.status, 0, r.stderr);
     assert.equal(r.installs, 0);
-    assert.equal(r.stdout, 'OLD-ENGINE-RAN status\n');
+    assert.equal(r.stdout, 'NEW-ENGINE-RAN setup\n');
     assert.equal(r.stderr, '');
+  });
+
+  test('CSR_SKIP_BINARY_DOWNLOAD=1: an older engine is left alone, by setup and by status', () => {
+    for (const command of ['setup', 'status']) {
+      const r = runCli(sandbox(STUB_OK), [command], {
+        engine: OLD_ENGINE,
+        env: { CSR_SKIP_BINARY_DOWNLOAD: '1' },
+      });
+
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.installs, 0);
+      assert.equal(r.stdout, `OLD-ENGINE-RAN ${command}\n`);
+      assert.equal(r.stderr, '');
+    }
   });
 });

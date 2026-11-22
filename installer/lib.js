@@ -123,17 +123,54 @@ export function planInstall({ destPath, pkgVersion, probe = probeVersion }) {
   return { action: 'install', reason: 'different', installedVersion };
 }
 
-/** The three numbers of a version, or null. A prerelease or build suffix is not compared. */
-function versionNumbers(version) {
+/**
+ * A version as its three numbers and its prerelease identifiers, or null.
+ * `10.1.1-rc.2+build.7` is `{ numbers: [10, 1, 1], pre: ['rc', '2'] }`: build
+ * metadata has no place in the order.
+ */
+function versionParts(version) {
   const token = parseVersion(version);
   if (!token) return null;
   const parts = token.split('.');
-  return [Number(parts[0]), Number(parts[1]), parseInt(parts[2], 10)];
+  const rest = parts.slice(2).join('.');
+  let i = 0;
+  while (i < rest.length && rest[i] >= '0' && rest[i] <= '9') i += 1;
+  const suffix = rest.slice(i).split('+')[0];
+  return {
+    numbers: [Number(parts[0]), Number(parts[1]), Number(rest.slice(0, i))],
+    pre: suffix.startsWith('-') ? suffix.slice(1).split('.') : [],
+  };
+}
+
+/** Semver order of two versionParts values: negative when `a` is the older one. */
+function compareVersions(a, b) {
+  for (let i = 0; i < 3; i += 1) {
+    if (a.numbers[i] !== b.numbers[i]) return a.numbers[i] - b.numbers[i];
+  }
+  // A prerelease is older than the release with the same numbers.
+  if (a.pre.length === 0 || b.pre.length === 0) return b.pre.length - a.pre.length;
+
+  for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i += 1) {
+    const x = a.pre[i];
+    const y = b.pre[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x === y) continue;
+    const xNumber = DIGITS.test(x);
+    const yNumber = DIGITS.test(y);
+    if (xNumber && yNumber) {
+      if (Number(x) !== Number(y)) return Number(x) - Number(y);
+    } else if (xNumber !== yNumber) {
+      return xNumber ? -1 : 1;
+    } else {
+      return x < y ? -1 : 1;
+    }
+  }
+  return 0;
 }
 
 /**
- * What the npm command must replace before it runs a command: the engine this
- * package manages, when it is older than the package. Returns
+ * Whether the engine this package manages is older than the package. Returns
  * `{ installed, wanted }`, or null when there is nothing to do. `installed` is
  * null for an engine that cannot say its version, which every release up to
  * 9.5.7 cannot; that engine counts as older.
@@ -144,19 +181,16 @@ function versionNumbers(version) {
  * anywhere but `destPath` is the person's own copy and is never judged.
  */
 export function outdatedEngine({ binary, destPath, pkgVersion, probe = probeVersion }) {
-  const wanted = versionNumbers(pkgVersion);
+  const wanted = versionParts(pkgVersion);
   if (!wanted || realPath(binary) !== realPath(destPath)) return null;
 
   const installedVersion = probe(binary);
-  const installed = versionNumbers(installedVersion);
+  const installed = versionParts(installedVersion);
   if (!installed) return { installed: null, wanted: pkgVersion };
 
-  for (let i = 0; i < 3; i += 1) {
-    if (installed[i] !== wanted[i]) {
-      return installed[i] < wanted[i] ? { installed: installedVersion, wanted: pkgVersion } : null;
-    }
-  }
-  return null;
+  return compareVersions(installed, wanted) < 0
+    ? { installed: installedVersion, wanted: pkgVersion }
+    : null;
 }
 
 /**
@@ -552,10 +586,17 @@ export function installFailureReason(output) {
  * command to run by hand.
  *
  * An upgrade has the same gap: the new package arrives and the engine of the
- * release before it stays. When outdated() says the engine that is there is
- * older than the package, the install step runs once before the command. If it
- * does not bring the engine up to date, one message names the command to run by
- * hand and the command runs with the engine that is there.
+ * release before it stays. outdated() says when the engine that is there is
+ * older than the package. What happens then depends on `update`:
+ *
+ * - `update` true (setup, the upgrade step): the install step runs once before
+ *   the command. If it does not bring the engine up to date, one message names
+ *   the command to run by hand and the command runs with the engine that is
+ *   there.
+ * - `update` false (every other command): one line names the command that
+ *   updates the engine, and the command runs with the engine that is there. A
+ *   command that only reads never waits on a download, never repeats one, and
+ *   never restarts the daemon.
  *
  * A current engine costs one `find` call and one outdated() call.
  *
@@ -563,7 +604,7 @@ export function installFailureReason(output) {
  * when it fails; the thrown error's stderr or message is the reason source.
  * outdated(path) returns `{ installed, wanted }` (see outdatedEngine) or null.
  */
-export function ensureEngineBinary({ find, install, say, outdated = () => null }) {
+export function ensureEngineBinary({ find, install, say, outdated = () => null, update = false }) {
   const attempt = () => {
     try {
       install();
@@ -578,10 +619,14 @@ export function ensureEngineBinary({ find, install, say, outdated = () => null }
     const old = outdated(present);
     if (!old) return present;
 
-    say(
-      `Self-Reflect: the engine here is ${old.installed || 'an older build'} and this package is ` +
-        `${old.wanted}. Updating the engine now.`
-    );
+    const versions =
+      `the engine here is ${old.installed || 'an older build'} and this package is ${old.wanted}`;
+    if (!update) {
+      say(`Self-Reflect: ${versions}. To update the engine, run: claude-self-reflect setup`);
+      return present;
+    }
+
+    say(`Self-Reflect: ${versions}. Updating the engine now.`);
     const reason = attempt();
     const updated = find();
     if (updated && !outdated(updated)) return updated;

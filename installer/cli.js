@@ -85,6 +85,9 @@ function runEngine(args) {
     install: installEngine,
     say: (line) => console.error(line),
     outdated,
+    // Setup is the upgrade step, so it brings an older engine up to date first.
+    // Any other command says what to run and uses the engine that is there.
+    update: args[0] === 'setup',
   });
   if (!binary) process.exit(1);
 
