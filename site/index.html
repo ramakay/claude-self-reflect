@@ -1670,7 +1670,10 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
   });
   function show() {
     const m = marks(s), it = items(s), title = stages[s].dataset.title, n = stages.length;
+    // Focus inside a stage that is about to hide would drop to <body> and end arrow-key stepping.
+    const held = stages.findIndex(el => el.contains(document.activeElement));
     stages.forEach((el, i) => el.classList.toggle('is-on', i === s));
+    if (held !== -1 && held !== s) it[c].focus({ preventScroll: true });
     dots.forEach((d, i) => {
       d.classList.toggle('is-past', i < s);
       if (i === s) d.setAttribute('aria-current', 'step'); else d.removeAttribute('aria-current');
