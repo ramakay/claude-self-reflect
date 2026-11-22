@@ -180,6 +180,30 @@ pub(crate) fn release_for_test(lock: MaintenanceLock) {
     }
 }
 
+/// Return only once no process holds an flock on the file at `path`, for a test that has just
+/// dropped the guard of such a lock and is about to take it again in one attempt.
+///
+/// The cause is the one `release_for_test` describes: a process another test is spawning holds a
+/// copy of the open file description until its exec, so closing our descriptor is not always
+/// the release. This asks every 10 ms, for at most 5 s. The probe lock is unlocked by hand
+/// before it returns, so a child forked while the probe held it cannot keep it held.
+#[cfg(test)]
+pub(crate) fn wait_flock_free_for_test(path: &Path) {
+    let file = File::open(path).expect("lock file opens");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if FileExt::try_lock_exclusive(&file).is_ok() {
+            FileExt::unlock(&file).expect("probe lock unlocks");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lock did not come free 5 s after its holder let go"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Exclusive ownership of a maintenance run. Clones retain the same OS lock.
 /// The file is never removed or renamed, including on errors and process exit.
 #[derive(Debug, Clone)]
