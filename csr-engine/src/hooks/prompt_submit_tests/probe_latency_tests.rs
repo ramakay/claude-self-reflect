@@ -3,6 +3,11 @@ use std::time::{Duration, Instant};
 
 /// Limit-1 diagnostics must stay index lookups at realistic dimensions and
 /// population. A full scan over these vectors exceeds the hook's probe budget.
+///
+/// This guards against a scan, which is slow in every call of every round. It is not a guard on
+/// tail latency: it takes the best of up to three rounds, so a slowdown that shows in some rounds
+/// only would pass. The search is an in-memory lookup of one fixed query in one fixed index, so
+/// the scheduler is the only thing that differs between rounds.
 #[test]
 fn below_floor_probes_stay_under_five_ms_at_p95() {
     const COUNT: usize = 4096;
