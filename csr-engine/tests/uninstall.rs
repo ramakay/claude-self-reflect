@@ -684,6 +684,44 @@ fn a_daemon_outside_launchd_still_holds_the_uninstall_without_a_gui_domain() {
     assert!(text.contains("not finished:"), "{text}");
 }
 
+/// A lock file that cannot be read says nothing about a daemon, so it must not read as "none":
+/// the data folder stays and the hold line says the lock could not be read. Both ways the hold is
+/// found: with the plist still on disk (the agent step) and without one (the check after it).
+#[test]
+fn an_unreadable_daemon_lock_holds_the_uninstall_without_a_gui_domain() {
+    use std::os::unix::fs::PermissionsExt;
+    for with_plist in [true, false] {
+        let s = Scratch::new();
+        if !with_plist {
+            std::fs::remove_file(s.plist()).unwrap();
+        }
+        let lock_path = s.data().join("daemon.lock");
+        std::fs::write(&lock_path, "1").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::File::open(&lock_path).is_err();
+        let out = s.run_env(
+            &["--yes", "--purge"],
+            &[("PRINT_CODE", "125"), ("PRINT_TEXT", NO_GUI_DOMAIN)],
+        );
+        let text = stdout(&out);
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(unreadable, "the test made the lock unreadable");
+        assert_eq!(out.status.code(), Some(1), "exit code");
+        assert!(
+            s.data().join("csr-engine.db").exists(),
+            "the data folder stays"
+        );
+        assert!(
+            text.contains("the daemon lock could not be read"),
+            "the hold line says the lock could not be read"
+        );
+        assert!(
+            text.contains("not finished:"),
+            "the closing line is printed"
+        );
+    }
+}
+
 /// The hold here is a daemon outside launchd on an account with no GUI domain, where `launchctl
 /// print` never says "cannot find the service". The closing line names the daemon, not launchctl,
 /// and keeps the exact rerun command. Both ways the hold is found: with the plist still on disk

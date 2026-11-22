@@ -10,17 +10,37 @@ use anyhow::Result;
 /// trait: std's inherent `File::try_lock_shared` would win a method call and
 /// report a different error type.
 pub(crate) fn lock_file_held(path: &std::path::Path) -> bool {
+    matches!(lock_file_probe(path), LockProbe::Held)
+}
+
+/// What a probe of a lock file found.
+pub(crate) enum LockProbe {
+    /// No file, or a file nobody holds.
+    Free,
+    /// Another process holds it.
+    Held,
+    /// The file is there but could not be opened or probed (a permission change, say), so
+    /// whether a daemon holds it is unknown. The error, in words.
+    Unreadable(String),
+}
+
+/// `lock_file_held` that keeps an unreadable lock apart from a free one: only a missing file is
+/// `Free` without a probe. For callers that must not act while a daemon may be alive.
+pub(crate) fn lock_file_probe(path: &std::path::Path) -> LockProbe {
     use fs2::FileExt;
 
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LockProbe::Free,
+        Err(e) => return LockProbe::Unreadable(e.to_string()),
     };
     match FileExt::try_lock_shared(&file) {
         Ok(()) => {
             let _ = FileExt::unlock(&file);
-            false
+            LockProbe::Free
         }
-        Err(e) => e.kind() == fs2::lock_contended_error().kind(),
+        Err(e) if e.kind() == fs2::lock_contended_error().kind() => LockProbe::Held,
+        Err(e) => LockProbe::Unreadable(e.to_string()),
     }
 }
 

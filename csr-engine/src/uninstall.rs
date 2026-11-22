@@ -925,16 +925,27 @@ fn launchd_state(job: &str, here: &str) -> Launchd {
 }
 
 /// No GUI domain, so launchd holds no agent. A daemon started outside launchd can still run:
-/// its lock tells. Returns the hold reason when one runs.
+/// its lock tells. Returns the hold reason when one runs. A lock that cannot be read counts as a
+/// daemon that may run: only a missing file or a free lock says there is none.
 fn daemon_outside_launchd(home: &Path) -> Option<(String, Option<u32>)> {
+    use crate::daemon::{lock_file_probe, LockProbe};
     let lock = home.join(DATA_DIR).join("daemon.lock");
-    crate::daemon::lock_file_held(&lock).then(|| match daemon_lock_holder(home) {
-        Some(pid) => (
-            format!("a csr-engine daemon is running (pid {pid})"),
-            Some(pid),
-        ),
-        None => ("a csr-engine daemon is running".to_string(), None),
-    })
+    match lock_file_probe(&lock) {
+        LockProbe::Free => None,
+        LockProbe::Held => Some(match daemon_lock_holder(home) {
+            Some(pid) => (
+                format!("a csr-engine daemon is running (pid {pid})"),
+                Some(pid),
+            ),
+            None => ("a csr-engine daemon is running".to_string(), None),
+        }),
+        LockProbe::Unreadable(why) => Some((
+            format!(
+                "the daemon lock could not be read ({why}), so a csr-engine daemon may be running"
+            ),
+            None,
+        )),
+    }
 }
 
 /// True when launchd still runs a CSR daemon, or cannot be asked, so the data folder must stay.
