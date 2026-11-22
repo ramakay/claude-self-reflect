@@ -841,7 +841,16 @@ fn walk_text_view(dir: &std::path::Path, mut req: TranscriptRequest) -> (String,
         if let Some(c) = words.find("\n[cut: turn 1 has ") {
             assert_eq!(req.offset, joined.chars().count(), "no gap and no repeat");
             joined.push_str(&unescape(&words[..c]));
-            req.offset = hint_number(&words[c..], "offset").expect("a part names its next offset");
+            // The next request is the one the note prints: its `turns` and its `offset`.
+            let note = &words[c..];
+            let turns = note
+                .split("turns=\"")
+                .nth(1)
+                .and_then(|t| t.split('"').next())
+                .and_then(|t| t.split_once(".."))
+                .expect("a part names the turns of its next call");
+            req.turns = Some((turns.0.parse().unwrap(), turns.1.parse().ok()));
+            req.offset = hint_number(note, "offset").expect("a part names its next offset");
         } else if let Some(c) = words.find("… [cut: ") {
             assert!(
                 !took_whole_call,
@@ -991,11 +1000,55 @@ fn words_beside_many_tool_results_are_read_in_parts_not_cut_without_an_offset() 
     let path = write_words_and_results_fixture(dir.path(), &want, 12, 6_000);
     let (joined, lines) = walk_text_view(dir.path(), slice_req(&path));
     assert!(joined == want, "the text view reaches all 6,000 chars");
-    assert!(lines.len() > 1, "the words are read in more than one page");
+    assert!(
+        lines.iter().any(|l| l.contains("\n[cut: turn 1 has ")),
+        "the words are read in parts, by the note a part prints"
+    );
     for line in &lines {
         assert!(
             !line.contains("raise budget_chars"),
             "no words line says raise the budget"
         );
     }
+}
+
+#[test]
+fn a_list_hint_does_not_promise_all_the_text_when_tool_lines_leave_no_room() {
+    let dir = tempfile::tempdir().unwrap();
+    // 600 chars of words are over the 500 chars the list views show. 300 results of 100 chars
+    // take about 39,900 chars of tool lines even at the 100-char floor, over the 39,200 a page
+    // holds at the largest budget, so no part of the words fits beside them.
+    let text = "w".repeat(600);
+    let path = write_words_and_results_fixture(dir.path(), &text, 300, 100);
+    for view in [ViewKind::Prompts, ViewKind::YourAsks] {
+        let out = transcript::run(dir.path(), &base_req(view, &path.to_string_lossy()));
+        let hint = &out[out.find("[cut:").expect("the list cuts the turn")..];
+        assert!(!hint.contains("reads all of its text"));
+        assert!(hint.contains("shows the most of it one call can"));
+    }
+}
+
+#[test]
+fn words_stay_readable_whatever_room_one_tool_result_leaves() {
+    let dir = tempfile::tempdir().unwrap();
+    // 20,000 chars: the fit halves the limit to 10,000, which cuts the words, so a part is read.
+    // (With 6,000 chars the first halving, to 20,000, leaves the words whole and no part is read.)
+    let want = format!("{}TAIL", "a".repeat(19_996));
+    let mut failed = Vec::new();
+    // At n = 38,948 the turn line, the tool line, one newline and the note room come to exactly
+    // the 39,200 chars a page holds at the largest budget, with no room for one char of words.
+    for n in 38_600..=39_300 {
+        let path = write_words_and_results_fixture(dir.path(), &want, 1, n);
+        let mut req = slice_req(&path);
+        req.turns = Some((1, Some(1)));
+        req.result_chars = Some(40_000);
+        req.budget_chars = MAX_BUDGET_CHARS;
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            walk_text_view(dir.path(), req).0
+        }));
+        if !read.is_ok_and(|joined| joined == want) {
+            failed.push(n);
+        }
+    }
+    assert_eq!(failed, Vec::<usize>::new());
 }
