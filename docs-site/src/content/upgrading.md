@@ -46,11 +46,13 @@ Your JSONL conversation files are untouched. v8 re-imports from the same source.
 
 A new binary does not change what Claude Code or launchd already hold. After you install it (the install script, `npm install -g claude-self-reflect`, or a copy of the binary), do these steps:
 
-1. Run `csr-engine setup` again. It is safe to repeat. It registers hooks a newer build added (for example `PostCompact`) and rewrites the launch agent when its settings changed (for example `ProcessType Interactive`). It tells you what it changed.
+1. Run setup again: `claude-self-reflect setup` if you installed with npm, `csr-engine setup` otherwise. It is safe to repeat. It registers hooks a newer build added (for example `PostCompact`) and rewrites the launch agent when its settings changed (for example `ProcessType Interactive`). It tells you what it changed.
 2. Run `csr-engine status`. Two fields tell you whether the upgrade is complete:
    - `hooks_missing` lists hook events the build installs that `~/.claude/settings.json` lacks. `degraded` repeats the cause in words. `csr-engine hook install --apply` fixes just the hooks.
    - `stale_processes` lists every live process (the daemon, an MCP server, a companion pane) that still runs the older binary, and `mcp_binary_stale` turns true.
 3. Restart Claude Code sessions that were open during the upgrade. An open session keeps its old MCP server until it restarts. A dormant pane shows up in `stale_processes` until you restart it.
+
+With npm, use `claude-self-reflect setup` for step 1, not `csr-engine setup`. npm 11.20 and later do not run a package's install script until you allow it, so `npm install -g claude-self-reflect` alone can leave the old engine in place. From 10.1.1, `claude-self-reflect setup` compares the engine with the package version and downloads the new engine before it runs setup. If the download fails, it prints the reason and the command to run, and runs the engine that is there. `claude-self-reflect status` does not download; when the engine is older than the package, it says so in one line. `csr-engine --version` shows which engine you have.
 
 The daemon restarts on its own when its binary is replaced. Your data in `~/.claude-self-reflect/` and `~/.claude/projects/` is not touched.
 

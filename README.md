@@ -164,6 +164,8 @@ claude-self-reflect setup   # activation is a separate, explicit step
 
 By default `npm install` only downloads the checksummed binary — it does not touch `~/.claude` or index conversations. Activation happens when you run `claude-self-reflect setup`, or set `CSR_AUTO_SETUP=1` during install to opt in. That command runs the binary npm downloaded, so it works before `~/.local/bin` is on your PATH.
 
+npm 11.20 and later do not run a package's install script until you allow it. Then the first `claude-self-reflect` command downloads the binary, and after an upgrade `claude-self-reflect setup` replaces a binary that is older than the package. So after `npm install -g claude-self-reflect`, run `claude-self-reflect setup`, not `csr-engine setup`.
+
 On macOS, an npm upgrade that replaces the binary also restarts an already loaded daemon (`launchctl kickstart -k`), even without `CSR_AUTO_SETUP`. It does not touch `~/.claude`.
 
 </details>
