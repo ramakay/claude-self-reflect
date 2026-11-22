@@ -28,9 +28,10 @@ A memory layer sits underneath as plumbing. It is one Rust binary (about 138 MB)
 
 - [What it does](#what-it-does) — Claude reflecting on its own work
 - [What we're working on](#what-were-working-on) — Measured numbers and open work
+- [Help wanted](#help-wanted-what-needs-work) — Open questions, and a prompt to hand your agent
 - [The Architecture](#one-binary) — How CSR solves it
 - [The Pipeline](#the-pipeline) — Progressive enrichment
-- [The Paper](#the-paper) — The research behind the retrieval design (preprint)
+- [The Paper](#the-paper) — The research behind the retrieval design (two papers)
 - [btw, these too](#btw-these-too): Smaller features that ship with it
 - [Install](#install) — One-command install, consent-first activation
 - [What You'll Ask](#what-youll-ask) — Natural language, no syntax
@@ -92,12 +93,17 @@ Higher quality context. Better decisions. Fewer tokens.
 </picture>
 </a>
 
-CSR's retrieval design is documented in a research preprint, measured on the system's own development history:
+CSR's retrieval design is documented in two papers, measured on the system's own development history:
 
 > **Similarity Drowns Intent: Three-Trace Sagas and Reinstatement Recall for Provenance in Agentic Software Construction**
-> 2026 — [PDF](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf)
+> 2026, version 2 — [PDF](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf)
+>
+> **Evaluating a System That Records Its Own Sessions** (short version, 14 pages)
+> 2026 — [PDF](docs/plans/annaswamy-2026-evaluating-self-recording-agents.pdf)
 
-Ask a memory system "why did we drop Qdrant?" and cosine similarity returns a recording of you asking that question earlier, at 0.984 similarity. The decision itself scores lower than its own echoes. The paper measures this failure, the multi-hop walk built to counter it (+53% and +47% ground-truth session coverage over one-shot kNN on two corpora, pre-registered gates, cross-vendor judging), and a second finding that fell out of evaluation: a self-recording memory system ingests its own eval dialogue and drowns the answers it's being tested on. It also keeps its negative results — a pre-registered ratification-weighting hypothesis died at ρ≈0 and forbade an entire staleness design.
+Ask "why did we drop Qdrant?" and one-shot similarity search returns earlier recordings of the question itself; the decision ranks below its own echoes. The full paper measures that failure and the seed-conditioned walk built to counter it (+53% ground-truth session coverage over one-shot cosine kNN in a pre-registered spike). It also reports a failure that fell out of evaluation: a system that records its own sessions records its evaluation too. In a controlled test, five scripted re-ask cycles took about half of naive retrieval's top 10, and echo defenses removed 72% of that.
+
+It keeps its losses. In a later pre-registered benchmark, a simpler hybrid of dense and full-text search beat the walk on exact receipt lookup (recall@5 0.813 against 0.581 on 396 queries), and the two did not separate on sealed multi-hop questions. A ratification-weighting hypothesis died at ρ≈0. The short paper turns these results into seven evaluation controls; every number in it has a public receipt in [`csr-engine/eval-kit/`](csr-engine/eval-kit/) and `docs/plans/`.
 
 <br clear="both" />
 
@@ -283,6 +289,58 @@ These are engineering items with numbers, not promises. Seven items; "not measur
 - Now: not measured yet.
 - Target: each returns a non-empty answer with receipts on a 10-query test set.
 - Doing: write the test set, then deepen the three tools.
+
+### Help wanted: what needs work
+
+The papers say plainly what is not shown yet. These are the open questions where an outside run would help most. Open an [issue](https://github.com/ramakay/claude-self-reflect/issues) with a result, start a [discussion](https://github.com/ramakay/claude-self-reflect/discussions) with a suggestion, or send a pull request from a fork.
+
+| Open question | Where it stands | What would settle it |
+|---|---|---|
+| Does it hold on someone else's history? | Every result comes from one operator's corpus. | Rerun the T3 and T4 kits in [`csr-engine/eval-kit/`](csr-engine/eval-kit/) on another corpus and publish the queries, labels and scores. |
+| A public contamination fixture | E3 used one dose on a private corpus; only its spec is public (`eval-kit/e3/spec.md`). | A rerunnable fixture with several doses, paraphrased re-asks and matched controls. |
+| Recovery after compaction, in real use | Transcripts Claude Code deleted stay readable, but agents almost never call `csr_transcript` after a compaction. | A controlled resume study: the same task resumed with and without the recovery tool. |
+| Paraphrased questions | Verbatim recall is near ceiling; paraphrase recall is weak. | A fresh set of natural paraphrase queries and a ranking change that clears a stated bar. |
+| Staleness benchmark | T4 has no held-out tag with a change that was later restored. | Add that case to the T4 kit and rerun. |
+| Lost and found, Same page | Both are built; neither has a labelled accuracy set. | A small hand-labelled set and a score against it. |
+
+**A prompt to hand your coding agent.** Copy it, fill in the item, and run it in a throwaway environment.
+
+```text
+You are contributing an outside measurement to Self-Reflect
+(https://github.com/ramakay/claude-self-reflect). Work only in a throwaway
+environment: a Linux container, a VM, or a CI runner. Do not install it into
+my everyday account; on macOS, setup also installs a launch agent.
+
+1. Clone the repo. Read docs/plans/annaswamy-2026-evaluating-self-recording-agents.pdf,
+   csr-engine/eval-kit/README.md and the "Help wanted" table in README.md.
+   The item I want to work on: <ITEM FROM THE TABLE>.
+2. Corpus. Either my own Claude Code history (copy ~/.claude/projects into the
+   sandbox; never paste transcript text into any issue or PR), or public MIT-licensed
+   Claude Code transcripts from Hugging Face:
+     hf download armand0e/claude-fable-5-claude-code --repo-type dataset --local-dir "$SCRATCH/hf/fable"
+     hf download crispwisp/wisp-claude-code-sessions --repo-type dataset --local-dir "$SCRATCH/hf/wisp"
+   Put each session's .jsonl under "$SCRATCH/home/.claude/projects/<project-folder>/".
+   Both public sets were used to fine-tune the shipped reranker (see
+   csr-engine/assets/models/ettin-tuned-run2/NOTICE). Use them to try the harness
+   and for measurements that do not score retrieval. Do not use them, or any set
+   listed in that NOTICE, for a scored retrieval comparison: the reranker has seen them.
+3. Use the scratch home for every command from here on, including step 5. The
+   installer puts the binary in $HOME/.local/bin, so add it to PATH too:
+     export HOME="$SCRATCH/home" PATH="$SCRATCH/home/.local/bin:$PATH"
+     curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
+     csr-engine setup --no-companion
+     csr-engine status        # check the session and chunk counts match your corpus
+4. Before you measure, write down the question, the metric, the control and the bar
+   that would count as a pass. Commit that note first.
+5. Run the measurement in the same shell (the eval-kit scripts, `csr-engine eval --full`,
+   or `csr-engine bench`). Keep every command and its raw output.
+6. Report: the corpus (name and counts), the pre-registered bar, the result, what
+   failed, and the exact commands. A null or a loss is a useful result; say so plainly.
+   Never invent a number. Open it as an issue, or as a pull request from a fork if you
+   changed code or the kit.
+```
+
+Public datasets above: [armand0e/claude-fable-5-claude-code](https://huggingface.co/datasets/armand0e/claude-fable-5-claude-code) and [crispwisp/wisp-claude-code-sessions](https://huggingface.co/datasets/crispwisp/wisp-claude-code-sessions), both MIT. Both are small (under 1,000 sessions each), and the wisp set includes headless runs, so report human and headless counts separately. **Both were part of the reranker's fine-tuning data**, so a retrieval score measured on them would look better than it is. Scored retrieval comparisons need your own history or a set that is not in [the reranker's NOTICE](csr-engine/assets/models/ettin-tuned-run2/NOTICE).
 
 ---
 

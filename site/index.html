@@ -932,6 +932,13 @@ mark.sr-hl { color: var(--tl-ink); background: linear-gradient(104deg, rgba(255,
 .noherdr-info-t span { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; border: 1.5px solid currentColor; font: italic 600 13px/1 Georgia, serif; }
 .noherdr-info ul { margin: 0; padding-left: 18px; line-height: 1.55; }
 .noherdr-info li + li { margin-top: 6px; }
+.help-list { list-style: none; margin: 18px 0 22px; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; }
+.help-list li { border: 1px solid var(--paper-rule); border-left: 4px solid var(--tl-ink); border-radius: 12px; padding: 14px 18px; background: var(--anatomy-card); line-height: 1.5; }
+.help-list b { display: block; margin-bottom: 4px; }
+.help-prompt { position: relative; margin: 10px 0 16px; border: 1px solid var(--paper-rule); border-radius: 12px; background: var(--anatomy-page); }
+.help-prompt pre { margin: 0; padding: 18px 20px; max-height: 420px; overflow: auto; font: 13px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace; color: var(--tl-ink); white-space: pre-wrap; overflow-wrap: anywhere; }
+.help-prompt .sr-btn { position: absolute; top: 10px; right: 10px; }
+@media (max-width: 1000px) { .help-list { grid-template-columns: minmax(0, 1fr); } }
 .noherdr-link { display: inline-block; margin-top: 14px; font-weight: 600; color: var(--tl-ink); text-decoration: underline; text-underline-offset: 4px; }
 .noherdr-link:hover { color: var(--tl-lit); }
 .noherdr-grid .shot-open { aspect-ratio: auto; }
@@ -1289,10 +1296,10 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
     <a class="module-doc" href="docs/#/docs/features" aria-label="Read the docs · More than transcripts">Read the docs</a>
   </article><article class="sr-module module-wide" aria-labelledby="module-under-9">
     <h4 id="module-under-9">The Paper</h4>
-    <p>Similarity Drowns Intent examines how retrieval can find the sessions that answer a developer’s question.</p>
-    
-    <div class="module-receipt"><code>Similarity Drowns Intent · research preprint</code></div>
-    <a class="module-doc" href="https://github.com/ramakay/claude-self-reflect/blob/main/docs/plans/annaswamy-2026-similarity-drowns-intent.pdf" aria-label="Read the preprint (PDF) · The Paper">Read the preprint (PDF)</a>
+    <p>Similarity Drowns Intent examines how retrieval can find the sessions that answer a developer’s question. A short version covers how to evaluate a system that records its own sessions, including the benchmark the walk lost.</p>
+
+    <div class="module-receipt"><code>Similarity Drowns Intent · version 2</code><code>Short version · 14 pages</code></div>
+    <a class="module-doc" href="https://github.com/ramakay/claude-self-reflect#the-paper" aria-label="Read the papers · The Paper">Read the papers</a>
   </article></div>
     </section>
 </section>
@@ -1587,6 +1594,54 @@ Compact receipt: turns 1..214, source: mirror (scrubbed copy). Historical eviden
     <li class="rv"><b>Trust labels.</b> Model-written context carries a <code>[briefing: model-derived, trust=…]</code> label.</li>
     <li class="rv"><b>Local permissions.</b> Companion storage uses <code>0700</code> for directories and <code>0600</code> for files.</li>
   </ul>
+</section>
+
+<section class="sr-sec sr-help" id="help-wanted" aria-labelledby="help-h">
+  <p class="story-kicker">Help wanted</p>
+  <h2 id="help-h">What needs work.</h2>
+  <p class="story-lead"><mark class="sr-hl">Every result so far comes from one person's history. An outside run is the most useful thing you can send.</mark></p>
+  <ul class="help-list">
+    <li><b>Someone else's history.</b> Rerun the T3 and T4 kits in <code>csr-engine/eval-kit/</code> on another corpus and publish the queries, labels and scores.</li>
+    <li><b>A public contamination fixture.</b> E3 used one dose on a private corpus. A rerunnable fixture with several doses and paraphrased re-asks would let others test it.</li>
+    <li><b>Recovery after compaction, in real use.</b> Deleted transcripts stay readable, but agents rarely call <code>csr_transcript</code> after a compaction. Resume the same task with and without it.</li>
+    <li><b>Paraphrased questions.</b> Verbatim recall is near ceiling; paraphrase recall is weak. A fresh query set and a ranking change that clears a stated bar.</li>
+    <li><b>Staleness benchmark.</b> T4 needs a held-out tag with a change that was later restored.</li>
+    <li><b>Lost and found, Same page.</b> Both are built; neither has a labelled accuracy set yet.</li>
+  </ul>
+  <p class="rv">A prompt to hand your coding agent. Fill in the item and run it in a throwaway environment. No corpus of your own? It points at two public, MIT-licensed sets of Claude Code transcripts on Hugging Face. Both helped fine-tune the shipped reranker, so use them to try the harness, not to score retrieval.</p>
+  <div class="help-prompt"><pre id="sr-help-prompt">You are contributing an outside measurement to Self-Reflect
+(https://github.com/ramakay/claude-self-reflect). Work only in a throwaway
+environment: a Linux container, a VM, or a CI runner. Do not install it into
+my everyday account; on macOS, setup also installs a launch agent.
+
+1. Clone the repo. Read docs/plans/annaswamy-2026-evaluating-self-recording-agents.pdf,
+   csr-engine/eval-kit/README.md and the "Help wanted" table in README.md.
+   The item I want to work on: &lt;ITEM FROM THE LIST&gt;.
+2. Corpus. Either my own Claude Code history (copy ~/.claude/projects into the
+   sandbox; never paste transcript text into any issue or PR), or public MIT-licensed
+   Claude Code transcripts from Hugging Face:
+     hf download armand0e/claude-fable-5-claude-code --repo-type dataset --local-dir "$SCRATCH/hf/fable"
+     hf download crispwisp/wisp-claude-code-sessions --repo-type dataset --local-dir "$SCRATCH/hf/wisp"
+   Put each session's .jsonl under "$SCRATCH/home/.claude/projects/&lt;project-folder&gt;/".
+   Both public sets were used to fine-tune the shipped reranker (see
+   csr-engine/assets/models/ettin-tuned-run2/NOTICE). Use them to try the harness
+   and for measurements that do not score retrieval. Do not use them, or any set
+   listed in that NOTICE, for a scored retrieval comparison: the reranker has seen them.
+3. Use the scratch home for every command from here on, including step 5. The
+   installer puts the binary in $HOME/.local/bin, so add it to PATH too:
+     export HOME="$SCRATCH/home" PATH="$SCRATCH/home/.local/bin:$PATH"
+     curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
+     csr-engine setup --no-companion
+     csr-engine status        # check the session and chunk counts match your corpus
+4. Before you measure, write down the question, the metric, the control and the bar
+   that would count as a pass. Commit that note first.
+5. Run the measurement in the same shell (the eval-kit scripts, `csr-engine eval --full`,
+   or `csr-engine bench`). Keep every command and its raw output.
+6. Report: the corpus (name and counts), the pre-registered bar, the result, what
+   failed, and the exact commands. A null or a loss is a useful result; say so plainly.
+   Never invent a number. Open it as an issue, or as a pull request from a fork if you
+   changed code or the kit.</pre><button type="button" class="sr-btn" data-copy="sr-help-prompt">Copy</button></div>
+  <p class="rv"><a class="noherdr-link" href="https://github.com/ramakay/claude-self-reflect/issues">Open an issue</a> &nbsp; <a class="noherdr-link" href="https://github.com/ramakay/claude-self-reflect/discussions">Start a discussion</a></p>
 </section>
 
 <section class="sr-sec sr-install" id="install" aria-labelledby="in-h">
