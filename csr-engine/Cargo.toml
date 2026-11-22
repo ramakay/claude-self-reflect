@@ -1,6 +1,6 @@
 [package]
 name = "csr-engine"
-version = "10.1.0"
+version = "10.1.1"
 edition = "2021"
 description = "Self-Reflect: Rust MCP server with embedded vector search"
 license = "MIT"

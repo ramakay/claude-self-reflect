@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "csr-engine"
-version = "10.1.0"
+version = "10.1.1"
 dependencies = [
  "ab_glyph",
  "anyhow",
