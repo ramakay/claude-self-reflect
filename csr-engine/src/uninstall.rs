@@ -457,6 +457,7 @@ fn settings_step(home: &Path, apply: bool, out: &mut Vec<String>) -> bool {
 /// What a finished child printed.
 struct Run {
     success: bool,
+    code: Option<i32>,
     stdout: String,
     stderr: String,
 }
@@ -542,6 +543,7 @@ fn run_cmd_in(
     };
     Ok(Run {
         success: status.success(),
+        code: status.code(),
         stdout: text(out_rx),
         stderr: text(err_rx),
     })
@@ -870,9 +872,16 @@ enum Launchd {
     LoadedHere(Option<u32>),
     /// A job with this label, loaded from another file.
     LoadedElsewhere,
+    /// launchd has no GUI domain for this user (an account that never logged in at the screen,
+    /// such as an ssh-only one): no agent can be loaded there.
+    NoGuiDomain,
     /// launchd could not be asked, or did not answer clearly.
     Unknown(String),
 }
+
+/// `launchctl` exit status for a domain that does not exist for this user.
+const NO_DOMAIN_EXIT: i32 = 125;
+const NO_DOMAIN_TEXT: &str = "Domain does not support specified action";
 
 fn launchd_state(job: &str, here: &str) -> Launchd {
     match run_cmd("launchctl", &["print", job], Duration::from_secs(20)) {
@@ -895,8 +904,22 @@ fn launchd_state(job: &str, here: &str) -> Launchd {
             }
         }
         Ok(run) if run.says("Could not find service") => Launchd::NotLoaded,
+        // Both the exit status and the text, so no other launchctl failure reads as "no domain".
+        Ok(run) if run.code == Some(NO_DOMAIN_EXIT) && run.says(NO_DOMAIN_TEXT) => {
+            Launchd::NoGuiDomain
+        }
         Ok(run) => Launchd::Unknown(run.first_stderr_line()),
     }
+}
+
+/// No GUI domain, so launchd holds no agent. A daemon started outside launchd can still run:
+/// its lock tells. Returns the hold reason when one runs.
+fn daemon_outside_launchd(home: &Path) -> Option<String> {
+    let lock = home.join(DATA_DIR).join("daemon.lock");
+    crate::daemon::lock_file_held(&lock).then(|| match daemon_lock_holder(home) {
+        Some(pid) => format!("a csr-engine daemon is running (pid {pid})"),
+        None => "a csr-engine daemon is running".to_string(),
+    })
 }
 
 /// True when launchd still runs a CSR daemon, or cannot be asked, so the data folder must stay.
@@ -929,6 +952,14 @@ fn daemon_still_loaded(home: &Path, out: &mut Vec<String>) -> bool {
                      `launchctl bootout {job}`"
                 ));
                 held = true;
+            }
+            Launchd::NoGuiDomain => {
+                if let Some(why) = daemon_outside_launchd(home) {
+                    out.push(format!(
+                        "launch agent: {why}; stop it, then run uninstall again"
+                    ));
+                    held = true;
+                }
             }
             Launchd::Unknown(why) => {
                 out.push(format!(
@@ -1063,6 +1094,22 @@ fn agent_step(home: &Path, apply: bool, out: &mut Vec<String>) -> Agents {
                 ));
                 hold(&mut agents);
                 delete_plist(&agent.path, &mut agents, out);
+            }
+            Launchd::NoGuiDomain => {
+                delete_plist(&agent.path, &mut agents, out);
+                match daemon_outside_launchd(home) {
+                    Some(why) => {
+                        out.push(format!(
+                            "launch agent: {why}; stop it, then run uninstall again"
+                        ));
+                        hold(&mut agents);
+                    }
+                    None => out.push(format!(
+                        "launch agent: this account has no login session, so {} was not loaded \
+                         and there was nothing to unload",
+                        agent.label
+                    )),
+                }
             }
             Launchd::Unknown(why) => {
                 delete_plist(&agent.path, &mut agents, out);
