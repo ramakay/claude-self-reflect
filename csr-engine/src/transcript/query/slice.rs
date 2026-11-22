@@ -141,6 +141,23 @@ fn slice_call_for(entry: &Entry, chars: usize) -> SliceCall {
     }
 }
 
+/// True when the slice at the largest budget has room for a part of `entry`'s words beside its
+/// tool lines cut to the floor. It is the test [`text_part_item`] ends its halving on, with the
+/// same head, the same floor, the same note room and the same one-char room, so a hint that
+/// promises all of the text is promised only where a part can be shown.
+fn room_for_a_part(entry: &Entry) -> bool {
+    let cap = crate::transcript::MAX_BUDGET_CHARS - SLICE_FIT_RESERVE_CHARS;
+    let floor_tools = tool_lines(entry, SLICE_FIT_FLOOR_CHARS, Fit::AtMax)
+        .chars()
+        .count();
+    turn_head(entry).chars().count()
+        + floor_tools
+        + 1
+        + SLICE_PART_NOTE_CHARS
+        + SLICE_PART_MIN_TEXT_CHARS
+        <= cap
+}
+
 /// Up to `max` chars of a list view's turn text. A cut names the slice call that shows it whole, or,
 /// when no call can, how much of it the best call shows.
 pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> String {
@@ -172,11 +189,25 @@ pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> Str
         format!(
             "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\" reads it in parts, each ending with the next call; view=\"grep\" finds a word in it]"
         )
-    } else {
-        // The text fits one page, so the slice does not page it: the tool results are what is
-        // too big, and the call can only be cut to a prefix, with no offset to read on from.
+    } else if !room_for_a_part(entry) {
+        // The tool lines take the page even at the floor, so no part of the words fits beside
+        // them and the call can only be cut to a prefix, with no offset to read on from.
         format!(
             "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\"{result}{budget} shows the most of it one call can; view=\"grep\" finds a word in it]"
+        )
+    } else {
+        // The text fits one page, and the tool results are what is too big. The largest budget
+        // with the whole text asked for reads all of it: the slice reads it in parts when the
+        // tool results beside it take the room.
+        let words = entry.text.trim().chars().count();
+        let result = if words > crate::transcript::DEFAULT_RESULT_CHARS {
+            format!(" result_chars={words}")
+        } else {
+            String::new()
+        };
+        format!(
+            "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\"{result} budget_chars={} reads all of its text, in parts when the tool results beside it take the room; view=\"grep\" finds a word in it]",
+            crate::transcript::MAX_BUDGET_CHARS
         )
     }
 }
@@ -374,6 +405,8 @@ pub(crate) fn queued_duplicates(parsed: &ParsedTranscript) -> std::collections::
 
 /// What the cut note of a turn read in parts can take, newline and counts included.
 const SLICE_PART_NOTE_CHARS: usize = 200;
+/// Room a part keeps for the words themselves: one char at its widest escaped form (`&amp;`).
+const SLICE_PART_MIN_TEXT_CHARS: usize = 5;
 
 /// `n` with a comma between thousands, as the cut note states a turn's size.
 fn with_commas(n: usize) -> String {
@@ -411,9 +444,13 @@ fn escaped_chars(s: &str) -> usize {
 /// True when no `budget_chars` the server accepts shows the whole text of the turn, so the
 /// turn can only be read in parts. The test is [`budget_to_hold`], the same estimate the hints
 /// use to name a call that shows a turn whole, and it must stay so: a turn is read in parts
-/// exactly when no whole-read call can be named. A looser test (the exact room a page keeps,
+/// when no whole-read call can be named. A looser test (the exact room a page keeps,
 /// a little more) would leave turns in between neither paged nor given a call that shows them
 /// whole, and their last chars would be out of reach.
+///
+/// There is a second case. A turn whose text fits a page is still read in parts when the fit
+/// would cut its words to make room for the tool lines beside them, because that cut names no
+/// offset. `slice_view` decides that case, not this test.
 fn text_needs_parts(entry: &Entry) -> bool {
     let line = escaped_chars(entry.text.trim()) + turn_head(entry).chars().count() + 1;
     budget_to_hold(line) > crate::transcript::MAX_BUDGET_CHARS
@@ -448,8 +485,11 @@ fn json_text_part(entry: &Entry, normal: &Value, start: usize, end: usize) -> Va
 /// The text-view item for chars `start..` of a turn read in parts: as many chars as fit under
 /// `cap`, and a note that names the next call, through the request's end turn, when the rest does
 /// not fit. The turn's tool calls
-/// and results show with part 0 only. `None` when not even one char fits. The bool is true when
-/// the part ends before the turn does.
+/// and results show with part 0 only. The tool lines give way first: they are halved until the
+/// note and one char of text fit beside them. `None` at offset 0 means the page has no room for
+/// that beside the tool lines at the [`SLICE_FIT_FLOOR_CHARS`] floor: too many tool lines for the
+/// largest budget, or a budget too small for the note itself. The bool is true when the part
+/// ends before the turn does.
 fn text_part_item(
     entry: &Entry,
     start: usize,
@@ -468,7 +508,7 @@ fn text_part_item(
             tools = tool_lines(entry, limit, kind);
         }
         let base = head.chars().count() + tools.chars().count() + 1 + SLICE_PART_NOTE_CHARS;
-        if base <= cap || limit <= SLICE_FIT_FLOOR_CHARS {
+        if base + SLICE_PART_MIN_TEXT_CHARS <= cap || limit <= SLICE_FIT_FLOOR_CHARS {
             break;
         }
         limit = (limit / 2).max(SLICE_FIT_FLOOR_CHARS);
@@ -658,6 +698,20 @@ fn slice_view(entries: &[&Entry], req: &TranscriptRequest) -> ViewData {
             {
                 limit = (limit / 2).max(SLICE_FIT_FLOOR_CHARS);
                 item = slice_item(entry, limit, fit);
+            }
+        }
+        if let (false, Some(cap)) = (req.json, fit_cap) {
+            // The fit cut the words to make room for the tool lines beside them. That cut has no
+            // offset, so the rest of the words would be out of reach: read the turn in parts.
+            if limit < requested && entry.text.trim().chars().count() > limit {
+                if let Some((part, ends_early)) = text_part_item(entry, 0, cap, requested, fit, req)
+                {
+                    items.push(part);
+                    if ends_early {
+                        break;
+                    }
+                    continue;
+                }
             }
         }
         items.push(item);
