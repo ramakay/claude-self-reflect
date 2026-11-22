@@ -1029,7 +1029,7 @@ fn a_list_hint_does_not_promise_all_the_text_when_tool_lines_leave_no_room() {
             let hint = &hint[..hint.find(']').map_or(hint.len(), |end| end + 1)];
             assert!(!hint.contains("reads all of its text"));
             assert!(!hint.contains("reads it in parts"));
-            // No slice call is named: none shows the rest of the words.
+            // No slice call is named: the plain one is not sure to show any part of the words.
             assert!(!hint.contains("view=\"slice\""));
             assert!(hint.contains("its tool calls and results take a whole slice page"));
             assert!(hint.contains("view=\"grep\""));

@@ -160,7 +160,7 @@ fn room_for_a_part(entry: &Entry) -> bool {
 
 /// Up to `max` chars of a list view's turn text. A cut names the slice call that shows it whole, or,
 /// when no call can, the call that reads it in parts. A turn whose tool lines fill a slice page
-/// names no slice call, because none shows the rest of its words.
+/// at the sizes the fit uses names no slice call: see [`room_for_a_part`].
 pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> String {
     let (shown, cut) = cap_chars(text, max);
     if !cut {
@@ -187,9 +187,10 @@ pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> Str
             "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\"{result}{budget} shows it whole]"
         )
     } else if !room_for_a_part(entry) {
-        // The tool lines take the page even at the floor, so no part of the words fits beside
-        // them, whether the text is long or short. No slice call is named: the one this note
-        // named before showed nothing of the turn.
+        // The tool lines take the page even at the floor the fit cuts them to, so a part of the
+        // words is not sure to fit beside them, whether the text is long or short. No slice call
+        // is named: the plain call for this turn may show nothing of it, or a prefix of its
+        // words with no offset to read on from.
         format!(
             "{shown}… [cut: {bytes} bytes total; its tool calls and results take a whole slice page; view=\"grep\" finds a word in it]"
         )
