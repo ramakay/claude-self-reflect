@@ -798,3 +798,41 @@ fn a_list_hint_does_not_promise_parts_when_the_slice_would_not_page_the_text() {
         assert!(!out.contains("offset="));
     }
 }
+
+// ─── A text that fits one page is cut at result_chars; only a longer one is paged. ───
+
+/// Turn 1 is a user turn of `chars` ASCII chars, and nothing else.
+fn write_one_turn_fixture(dir: &std::path::Path, chars: usize) -> std::path::PathBuf {
+    let path = dir.join("one-turn.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    let line = json!({"type":"user","message":{"role":"user","content":"a".repeat(chars)}});
+    writeln!(f, "{line}").unwrap();
+    path
+}
+
+#[test]
+fn a_text_that_fits_the_largest_page_still_respects_result_chars() {
+    let dir = tempfile::tempdir().unwrap();
+    // "[turn 1] user -: " and a newline take 18 chars, so 39,000 fits the 39,200 a page keeps.
+    let path = write_one_turn_fixture(dir.path(), 39_000);
+    let mut req = slice_req(&path);
+    req.turns = Some((1, Some(1)));
+    req.budget_chars = MAX_BUDGET_CHARS;
+    req.result_chars = Some(100);
+    let out = transcript::run(dir.path(), &req);
+    assert!(out.chars().count() < 1_000, "a preview, not the turn");
+    assert!(out.contains("… [cut: 39000 bytes total;"));
+    assert!(!out.contains("offset="), "the text is not paged");
+    // Asked for in full, the turn comes back whole.
+    req.result_chars = Some(39_000);
+    let out = transcript::run(dir.path(), &req);
+    assert!(out.contains(&"a".repeat(39_000)) && !out.contains("[cut:"));
+    // A text over what a page keeps is paged whatever result_chars says.
+    let path = write_one_turn_fixture(dir.path(), 39_300);
+    let mut req = slice_req(&path);
+    req.turns = Some((1, Some(1)));
+    req.budget_chars = MAX_BUDGET_CHARS;
+    req.result_chars = Some(100);
+    let out = transcript::run(dir.path(), &req);
+    assert!(out.contains("next: turns=\"1..1\" offset="));
+}
