@@ -51,7 +51,8 @@ fn budget_cut_reports_remaining_count_and_exact_resume_turn() {
     // Resume turn must be a turn that was NOT rendered.
     let resume_marker = out.lines().last().unwrap().to_string();
     assert!(resume_marker.starts_with("... "));
-    assert!(resume_marker.ends_with(".. to continue"));
+    // The request ended at turn 9, so the resumed call does too.
+    assert!(resume_marker.ends_with("..9 to continue"));
 }
 
 #[test]
@@ -66,7 +67,7 @@ fn budget_cut_json_carries_truncated_remaining_and_resume_fields() {
     let v: Value = serde_json::from_str(&out).expect("must still be valid JSON when truncated");
     assert_eq!(v["truncated"], json!(true));
     assert!(v["remaining"].as_u64().unwrap() > 0);
-    assert!(v["resume_turns"].as_str().unwrap().ends_with(".."));
+    assert!(v["resume_turns"].as_str().unwrap().ends_with("..9"));
     // Items array itself must be non-empty and short (proves the cut, not a crash).
     assert!(!v["items"].as_array().unwrap().is_empty());
     assert!(v["items"].as_array().unwrap().len() < 9);

@@ -3,7 +3,7 @@
 
 use serde_json::{json, Map, Value};
 
-use super::{mark_mirror, turn_in_range, xml_escape, RenderItem, ViewData};
+use super::{mark_mirror, resume_turns, turn_in_range, xml_escape, RenderItem, ViewData};
 use crate::transcript::{Entry, ParsedTranscript, Role, TranscriptRequest, DEFAULT_LAST_N};
 
 /// Why a result or input was cut to fewer chars than the request asked.
@@ -168,9 +168,15 @@ pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> Str
         format!(
             "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\"{result}{budget} shows it whole]"
         )
-    } else {
+    } else if text_needs_parts(entry) {
         format!(
             "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\" reads it in parts, each ending with the next call; view=\"grep\" finds a word in it]"
+        )
+    } else {
+        // The text fits one page, so the slice does not page it: the tool results are what is
+        // too big, and the call can only be cut to a prefix, with no offset to read on from.
+        format!(
+            "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\"{result}{budget} shows the most of it one call can; view=\"grep\" finds a word in it]"
         )
     }
 }
@@ -403,7 +409,11 @@ fn escaped_chars(s: &str) -> usize {
 }
 
 /// True when no `budget_chars` the server accepts shows the whole text of the turn, so the
-/// turn can only be read in parts.
+/// turn can only be read in parts. The test is [`budget_to_hold`], the same estimate the hints
+/// use to name a call that shows a turn whole, and it must stay so: a turn is read in parts
+/// exactly when no whole-read call can be named. A looser test (the exact room a page keeps,
+/// a little more) would leave turns in between neither paged nor given a call that shows them
+/// whole, and their last chars would be out of reach.
 fn text_needs_parts(entry: &Entry) -> bool {
     let line = escaped_chars(entry.text.trim()) + turn_head(entry).chars().count() + 1;
     budget_to_hold(line) > crate::transcript::MAX_BUDGET_CHARS
@@ -436,7 +446,8 @@ fn json_text_part(entry: &Entry, normal: &Value, start: usize, end: usize) -> Va
 }
 
 /// The text-view item for chars `start..` of a turn read in parts: as many chars as fit under
-/// `cap`, and a note that names the next call when the rest does not fit. The turn's tool calls
+/// `cap`, and a note that names the next call, through the request's end turn, when the rest does
+/// not fit. The turn's tool calls
 /// and results show with part 0 only. `None` when not even one char fits. The bool is true when
 /// the part ends before the turn does.
 fn text_part_item(
@@ -445,6 +456,7 @@ fn text_part_item(
     cap: usize,
     requested: usize,
     fit: Fit,
+    req: &TranscriptRequest,
 ) -> Option<(RenderItem, bool)> {
     let total = entry.text.chars().count();
     let begin = start.min(total);
@@ -491,8 +503,9 @@ fn text_part_item(
             return None;
         }
         let note = format!(
-            "\n[cut: turn {turn} has {} chars; next: turns=\"{turn}..\" offset={}]",
+            "\n[cut: turn {turn} has {} chars; next: turns=\"{}\" offset={}]",
             with_commas(total),
+            resume_turns(turn, req),
             begin + take
         );
         (
@@ -562,6 +575,24 @@ fn selected_entries<'a>(parsed: &'a ParsedTranscript, req: &TranscriptRequest) -
         .collect()
 }
 
+/// A copy of each entry whose text holds a secret, with the text redacted; `None` for the rest.
+/// The slice cuts a turn's text at char offsets, and a secret cut in two parts matches no
+/// pattern in either, so the scrub runs before the cut, and every offset and total counts the
+/// redacted text. The reply is scrubbed again at the end.
+fn redacted_copies(entries: &[&Entry]) -> Vec<Option<Entry>> {
+    entries
+        .iter()
+        .map(|entry| match crate::redact::redact_secrets(&entry.text) {
+            std::borrow::Cow::Owned(text) => {
+                let mut copy = (*entry).clone();
+                copy.text = text;
+                Some(copy)
+            }
+            std::borrow::Cow::Borrowed(_) => None,
+        })
+        .collect()
+}
+
 /// The view of `entries`. The request's `offset` starts the first turn's text part-way in.
 fn slice_view(entries: &[&Entry], req: &TranscriptRequest) -> ViewData {
     // A turn with many large results can pass the whole budget. It would then
@@ -592,7 +623,8 @@ fn slice_view(entries: &[&Entry], req: &TranscriptRequest) -> ViewData {
         }
         if let (false, Some(cap)) = (req.json, fit_cap) {
             if start > 0 || text_needs_parts(entry) {
-                if let Some((item, ends_early)) = text_part_item(entry, start, cap, requested, fit)
+                if let Some((item, ends_early)) =
+                    text_part_item(entry, start, cap, requested, fit, req)
                 {
                     items.push(item);
                     if ends_early {
@@ -643,12 +675,18 @@ fn slice_view(entries: &[&Entry], req: &TranscriptRequest) -> ViewData {
 /// The `slice` page. In JSON, a first item that does not fit the budget comes back as the
 /// largest part of its text that does, so a page always moves the reader forward.
 pub(super) fn render_slice(parsed: &ParsedTranscript, req: &TranscriptRequest) -> String {
-    let entries = selected_entries(parsed, req);
+    let selected = selected_entries(parsed, req);
+    let copies = redacted_copies(&selected);
+    let entries: Vec<&Entry> = selected
+        .iter()
+        .zip(&copies)
+        .map(|(entry, copy)| copy.as_ref().unwrap_or(*entry))
+        .collect();
     let mut view = mark_mirror(parsed, slice_view(&entries, req));
     if !req.json {
-        return view.render(req.budget_chars, false);
+        return view.render(req);
     }
-    let (page, shown) = view.render_json_counted(req.budget_chars);
+    let (page, shown) = view.render_json_counted(req);
     match entries.first() {
         Some(entry) if shown == 0 => split_first_item(&mut view, entry, req).unwrap_or(page),
         _ => page,
@@ -673,7 +711,7 @@ fn split_first_item(view: &mut ViewData, entry: &Entry, req: &TranscriptRequest)
             json: json_text_part(entry, &normal, start + n, total),
         };
         view.items.insert(1, rest);
-        let page = view.render_json_counted(req.budget_chars);
+        let page = view.render_json_counted(req);
         view.items.remove(1);
         page
     };

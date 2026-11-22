@@ -429,7 +429,7 @@ fn text_pages_of_a_session_with_no_oversize_turn_are_byte_identical_to_before() 
 [turn 1] user 2026-08-10T10:00:00Z: Fix the &lt;script&gt;alert('x')&lt;/script&gt; injection bug in auth.rs
 [turn 2] assistant 2026-08-10T10:00:02Z: Reading the file first.
   tool_use: Read file_path=/repo/src/auth.rs
-... 7 more turns; --turns 3.. to continue
+... 7 more turns; --turns 3..9 to continue
 "#;
     assert_eq!(golden_slice(false, 250), cut);
 }
@@ -448,7 +448,7 @@ fn json_pages_of_a_session_with_no_oversize_turn_are_byte_identical_to_before() 
     }
   ],
   "remaining": 8,
-  "resume_turns": "2..",
+  "resume_turns": "2..9",
   "truncated": true,
   "view": "slice"
 }"#;
@@ -568,4 +568,337 @@ fn an_offset_of_zero_at_a_small_budget_still_shows_the_turn() {
     let out = text_page(&path, dir.path(), 500, (1, 0));
     assert!(out.contains("[turn 1] user -: first turn\n"));
     assert!(!out.contains("not applied"));
+}
+
+// ─── A secret in a turn's text must not leave in two parts that each match no pattern. ───
+
+/// A made-up token in the shape the redact tests use: `ghp_` and 36 letters and digits.
+fn made_up_secret() -> String {
+    format!("ghp_{}", "A1b2".repeat(9))
+}
+
+/// Turn 1 is short, turn 2 is a long text with the secret every 102 chars, so a cut at any
+/// budget lands inside one.
+fn write_secret_fixture(dir: &std::path::Path) -> (std::path::PathBuf, String) {
+    let path = dir.join("secret.jsonl");
+    let unit = format!("{} {} ", "x".repeat(60), made_up_secret());
+    let mut f = std::fs::File::create(&path).unwrap();
+    let mut put = |v: Value| writeln!(f, "{v}").unwrap();
+    put(json!({"type":"user","message":{"role":"user","content":"first turn"}}));
+    put(json!({"type":"user","message":{"role":"user","content":unit.repeat(800)}}));
+    drop(f);
+    let parsed = transcript::parse_transcript(&path).unwrap();
+    assert_eq!(parsed.entries[1].turn, 2);
+    (path, parsed.entries[1].text.clone())
+}
+
+/// Read turn 2 from `offset` to its end by following each page's own hint. Returns the text of
+/// each page and the `text_chars_total` the pages state, when the view states one.
+fn walk_turn_two(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    json_form: bool,
+    budget: usize,
+    offset: usize,
+) -> (Vec<String>, Option<usize>) {
+    let (mut pages, mut total, mut at) = (Vec::new(), None, offset);
+    for _ in 0..400 {
+        let out = transcript::run(dir, &page_req(path, json_form, budget, (2, at)));
+        let next = if json_form {
+            let v: Value = serde_json::from_str(&out).unwrap();
+            let item = &v["items"][0];
+            assert_eq!(item["text_offset"], json!(at));
+            total = item["text_chars_total"].as_u64().map(|n| n as usize);
+            pages.push(item["text"].as_str().unwrap().to_string());
+            v.get("resume_offset").map(|o| o.as_u64().unwrap() as usize)
+        } else {
+            let (part, next) = text_part(&out, 2).expect("turn 2 is on the page");
+            pages.push(part);
+            next
+        };
+        match next {
+            Some(n) => {
+                assert!(n > at, "a page moves the reader forward");
+                at = n;
+            }
+            None => return (pages, total),
+        }
+    }
+    panic!("still paging after 400 pages");
+}
+
+#[test]
+fn a_secret_cut_by_a_page_boundary_never_leaves_in_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, original) = write_secret_fixture(dir.path());
+    let redacted = crate::redact::redact_secrets(&original).into_owned();
+    assert!(
+        redacted != original,
+        "the fixture holds a secret the scrub matches"
+    );
+    let secret = made_up_secret();
+    let (head, tail) = (&secret[..12], &secret[secret.len() - 12..]);
+    for json_form in [true, false] {
+        for budget in [1_500, 3_000, 10_000, MAX_BUDGET_CHARS] {
+            for offset in [0, 7, 1_234] {
+                let (pages, total) = walk_turn_two(dir.path(), &path, json_form, budget, offset);
+                let joined = pages.concat();
+                assert!(
+                    joined == redacted.chars().skip(offset).collect::<String>(),
+                    "the pages join to the redacted text from the offset"
+                );
+                assert!(!joined.contains(&secret), "the join holds the secret");
+                assert!(
+                    matches!(
+                        crate::redact::redact_secrets(&joined),
+                        std::borrow::Cow::Borrowed(_)
+                    ),
+                    "the scrub finds nothing in the join"
+                );
+                assert!(pages.len() > 1, "the turn is read in parts");
+                for page in &pages {
+                    assert!(
+                        !page.contains(head) && !page.contains(tail),
+                        "a page holds a part of the secret"
+                    );
+                }
+                if json_form {
+                    assert_eq!(total, Some(redacted.chars().count()));
+                }
+            }
+        }
+    }
+}
+
+// ─── A hint that resumes a bounded request keeps the request's end turn. ───
+
+/// `page_req` for `turns="{call.0}..2"`.
+fn page_to_turn_two(
+    path: &std::path::Path,
+    json_form: bool,
+    budget: usize,
+    call: (usize, usize),
+) -> TranscriptRequest {
+    let mut req = page_req(path, json_form, budget, call);
+    req.turns = Some((call.0, Some(2)));
+    req
+}
+
+#[test]
+fn a_json_resume_hint_keeps_the_requested_end_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, original) = write_oversize_fixture(dir.path());
+    let (mut call, mut joined) = ((2, 0), String::new());
+    for _ in 0..50 {
+        let out = transcript::run(dir.path(), &page_to_turn_two(&path, true, 30_000, call));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        for item in v["items"].as_array().unwrap() {
+            assert_eq!(item["turn"], json!(2), "turn 3 is outside the request");
+            joined.push_str(item["text"].as_str().unwrap());
+        }
+        if v["truncated"] != json!(true) {
+            assert!(joined == original, "the parts join to the turn");
+            return;
+        }
+        assert_eq!(v["resume_turns"], json!("2..2"));
+        call = (2, v["resume_offset"].as_u64().unwrap() as usize);
+    }
+    panic!("still paging after 50 pages");
+}
+
+#[test]
+fn a_text_cut_note_keeps_the_requested_end_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, original) = write_oversize_fixture(dir.path());
+    let (mut call, mut joined) = ((2, 0), String::new());
+    for _ in 0..50 {
+        let out = transcript::run(dir.path(), &page_to_turn_two(&path, false, 30_000, call));
+        assert!(!out.contains("[turn 3] "), "turn 3 is outside the request");
+        let note = out.lines().find(|l| l.starts_with("[cut: turn 2 has "));
+        joined.push_str(&turn_two_text(&out));
+        let Some(note) = note else {
+            assert!(joined == original, "the parts join to the turn");
+            return;
+        };
+        assert!(
+            note.contains("next: turns=\"2..2\" offset="),
+            "the note keeps the end"
+        );
+        call = (2, hint_number(note, "offset").unwrap());
+    }
+    panic!("still paging after 50 pages");
+}
+
+/// The text a text page shows for turn 2, un-escaped, without its cut note.
+fn turn_two_text(page: &str) -> String {
+    let at = page.find("\n[turn 2] ").unwrap() + 1;
+    let body = &page[at..];
+    let body = &body[body.find(": ").unwrap() + 2..];
+    // A part may end in a newline of its own; the page's closing newline follows the last part only.
+    let raw = match body.find("\n[cut: turn ") {
+        Some(c) => &body[..c],
+        None => body.strip_suffix('\n').unwrap_or(body),
+    };
+    raw.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+#[test]
+fn a_resume_hint_between_turns_keeps_the_requested_end_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_golden_fixture(dir.path());
+    let mut req = base_req(ViewKind::Slice, &path.to_string_lossy());
+    req.budget_chars = 250;
+    req.turns = Some((1, Some(5)));
+    let text = transcript::run(dir.path(), &req);
+    assert!(text.contains("... 3 more turns; --turns 3..5 to continue\n"));
+    req.json = true;
+    let v: Value = serde_json::from_str(&transcript::run(dir.path(), &req)).unwrap();
+    assert_eq!(v["resume_turns"], json!("2..5"));
+    // A request with no end stays open-ended.
+    req.turns = Some((1, None));
+    let v: Value = serde_json::from_str(&transcript::run(dir.path(), &req)).unwrap();
+    assert_eq!(v["resume_turns"], json!("2.."));
+    req.json = false;
+    assert!(transcript::run(dir.path(), &req).contains("--turns 3.. to continue\n"));
+}
+
+// ─── A list view's hint says "in parts" only for a turn whose text the slice pages. ───
+
+/// Turn 1 is a user turn of 38,700 chars of text, which fits one page at the largest budget, and
+/// a tool result. The list views see the result's 400-char preview, which takes the whole turn
+/// past what any budget holds, though the text alone is not too long for one page.
+fn write_text_and_result_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("text-and-result.jsonl");
+    let blocks = vec![
+        json!({"type":"text","text":"w".repeat(38_700)}),
+        json!({"type":"tool_result","tool_use_id":"t0","content":"r".repeat(1_000)}),
+    ];
+    let mut f = std::fs::File::create(&path).unwrap();
+    let line = json!({"type":"user","message":{"role":"user","content":blocks}});
+    writeln!(f, "{line}").unwrap();
+    path
+}
+
+#[test]
+fn a_list_hint_does_not_promise_parts_when_the_slice_would_not_page_the_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_text_and_result_fixture(dir.path());
+    let parsed = transcript::parse_transcript(&path).unwrap();
+    assert_eq!(parsed.entries[0].text.chars().count(), 38_700);
+    for view in [ViewKind::Prompts, ViewKind::YourAsks] {
+        let out = transcript::run(dir.path(), &base_req(view, &path.to_string_lossy()));
+        let hint = &out[out.find("[cut:").expect("the list cuts the turn")..];
+        assert!(!hint.contains("reads it in parts"), "no parts to read");
+        assert!(hint.contains("view=\"slice\" turns=\"1..1\""));
+        assert!(hint.contains("view=\"grep\""));
+        // The call the hint names returns a preview with no offset, so it must not promise one.
+        let out = transcript::run(dir.path(), &slice_of_hint(&path, hint));
+        assert!(!out.contains("offset="));
+    }
+}
+
+// ─── A reader who follows only the hints reads every turn in full. ───
+
+/// Turn 1 is a user turn of `chars` ASCII chars, and nothing else.
+fn write_one_turn_fixture(dir: &std::path::Path, chars: usize) -> std::path::PathBuf {
+    let path = dir.join("one-turn.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    let line = json!({"type":"user","message":{"role":"user","content":"a".repeat(chars)}});
+    writeln!(f, "{line}").unwrap();
+    path
+}
+
+/// Read turn 1 in the text view from the default request, following only what the pages print:
+/// a cut note names the next `offset`, or the `result_chars` (and `budget_chars`) of the call
+/// that shows the turn whole. Returns the text read.
+fn read_text_view_in_full(dir: &std::path::Path, path: &std::path::Path) -> String {
+    let mut req = slice_req(path);
+    let (mut joined, mut took_whole_call) = (String::new(), false);
+    for _ in 0..20 {
+        let out = transcript::run(dir, &req);
+        let body = &out[out.find("\n[turn 1] ").unwrap() + 1..];
+        let body = &body[body.find(": ").unwrap() + 2..];
+        if let Some(c) = body.find("\n[cut: turn 1 has ") {
+            assert_eq!(req.offset, joined.chars().count(), "no gap and no repeat");
+            joined.push_str(&body[..c]);
+            req.offset = hint_number(&body[c..], "offset").expect("a part names its next offset");
+        } else if let Some(c) = body.find("… [cut: ") {
+            assert!(
+                !took_whole_call,
+                "the call a note names shows the turn whole"
+            );
+            took_whole_call = true;
+            let note = &body[c..];
+            req.result_chars =
+                Some(hint_number(note, "result_chars").expect("a cut names a call that reads on"));
+            if let Some(budget) = hint_number(note, "budget_chars") {
+                req.budget_chars = budget;
+            }
+        } else {
+            assert_eq!(req.offset, joined.chars().count(), "no gap and no repeat");
+            joined.push_str(body.strip_suffix('\n').unwrap_or(body));
+            return joined;
+        }
+    }
+    panic!("the hints did not lead to the end of the turn");
+}
+
+/// [`read_text_view_in_full`] for the JSON view, which follows `resume_turns` and `resume_offset`.
+fn read_json_view_in_full(dir: &std::path::Path, path: &std::path::Path) -> String {
+    let mut req = slice_req(path);
+    req.json = true;
+    let mut joined = String::new();
+    for _ in 0..20 {
+        let v: Value = serde_json::from_str(&transcript::run(dir, &req)).unwrap();
+        let item = &v["items"][0];
+        let at = item
+            .get("text_offset")
+            .map_or(0, |o| o.as_u64().unwrap() as usize);
+        assert_eq!(at, joined.chars().count(), "no gap and no repeat");
+        joined.push_str(item["text"].as_str().unwrap());
+        if v["truncated"] != json!(true) {
+            return joined;
+        }
+        assert_eq!(v["resume_turns"], json!("1.."));
+        req.offset = v["resume_offset"]
+            .as_u64()
+            .expect("a page names where to go on") as usize;
+    }
+    panic!("the hints did not lead to the end of the turn");
+}
+
+/// A turn is read in parts exactly when no call can show it whole: the text view's line for it
+/// ("[turn 1] user -: ", the text and a newline, 18 chars more than the text) is over 38,900. A
+/// turn in that band cannot be shown whole by any call, so a threshold that left it unpaged would
+/// leave its last chars out of reach.
+#[test]
+fn a_reader_who_follows_the_hints_reads_a_turn_near_the_page_size_in_full() {
+    let dir = tempfile::tempdir().unwrap();
+    // 38,882 chars is a line of 38,900 (not in the band); 39,182 is a line of 39,200 (its end).
+    let lengths = [38_000, 38_882, 38_883, 39_000, 39_182, 39_200, 40_500];
+    for chars in lengths {
+        let path = write_one_turn_fixture(dir.path(), chars);
+        let want = "a".repeat(chars);
+        assert!(
+            read_text_view_in_full(dir.path(), &path) == want,
+            "the text view ends with the full text"
+        );
+        assert!(
+            read_json_view_in_full(dir.path(), &path) == want,
+            "the JSON view ends with the full text"
+        );
+    }
+    // The list views say the same thing: a call shows it whole, or it is read in parts.
+    for chars in lengths {
+        let path = write_one_turn_fixture(dir.path(), chars);
+        let listed = transcript::run(
+            dir.path(),
+            &base_req(ViewKind::YourAsks, &path.to_string_lossy()),
+        );
+        let in_parts = listed.contains("reads it in parts");
+        assert_eq!(in_parts, chars > 38_882, "the list view's advice");
+        assert_eq!(listed.contains("shows it whole"), !in_parts);
+    }
 }

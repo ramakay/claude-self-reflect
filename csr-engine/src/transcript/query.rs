@@ -145,24 +145,14 @@ pub fn render_view(
             }
         }
         ViewKind::Stats => render_stats(parsed, path, project, req.json, req.budget_chars),
-        ViewKind::Prompts => {
-            mark_mirror(parsed, render_prompts(parsed, req)).render(req.budget_chars, req.json)
-        }
-        ViewKind::YourAsks => {
-            mark_mirror(parsed, render_yourasks(parsed, req)).render(req.budget_chars, req.json)
-        }
-        ViewKind::Tools => {
-            mark_mirror(parsed, render_tools(parsed, req)).render(req.budget_chars, req.json)
-        }
-        ViewKind::Files => {
-            mark_mirror(parsed, render_files(parsed, req)).render(req.budget_chars, req.json)
-        }
-        ViewKind::Errors => {
-            mark_mirror(parsed, render_errors(parsed, req)).render(req.budget_chars, req.json)
-        }
+        ViewKind::Prompts => mark_mirror(parsed, render_prompts(parsed, req)).render(req),
+        ViewKind::YourAsks => mark_mirror(parsed, render_yourasks(parsed, req)).render(req),
+        ViewKind::Tools => mark_mirror(parsed, render_tools(parsed, req)).render(req),
+        ViewKind::Files => mark_mirror(parsed, render_files(parsed, req)).render(req),
+        ViewKind::Errors => mark_mirror(parsed, render_errors(parsed, req)).render(req),
         ViewKind::Slice => render_slice(parsed, req),
         ViewKind::Grep => match render_grep(parsed, req) {
-            Ok(view) => mark_mirror(parsed, view).render(req.budget_chars, req.json),
+            Ok(view) => mark_mirror(parsed, view).render(req),
             Err(e) => {
                 if req.json {
                     json!({ "error": e }).to_string()
@@ -437,7 +427,7 @@ pub(crate) fn render_rebuilt(s: &RebuiltSession, req: &TranscriptRequest) -> Str
             )
         }
     };
-    view.render(req.budget_chars, req.json)
+    view.render(req)
 }
 
 // ─── Generic list-view renderer (prompts/tools/files/errors/slice/grep) ───
@@ -493,12 +483,21 @@ struct ViewData {
     empty_message: String,
 }
 
+/// The `turns` a continuation hint names to resume at `turn`: through the end the request gave,
+/// or open-ended when it gave none, so a resumed call never shows a turn the request left out.
+fn resume_turns(turn: usize, req: &TranscriptRequest) -> String {
+    match req.turns {
+        Some((_, Some(end))) => format!("{turn}..{end}"),
+        _ => format!("{turn}.."),
+    }
+}
+
 impl ViewData {
-    fn render(&self, budget_chars: usize, json: bool) -> String {
-        if json {
-            self.render_json(budget_chars)
+    fn render(&self, req: &TranscriptRequest) -> String {
+        if req.json {
+            self.render_json(req)
         } else {
-            self.render_text(budget_chars)
+            self.render_text(req)
         }
     }
 
@@ -507,7 +506,8 @@ impl ViewData {
     /// pathologically small budget (e.g. `budget_chars=1`) legitimately
     /// yields zero items, with the continuation line still present so the
     /// caller can still see how to resume (adversarial review finding 3).
-    fn render_text(&self, budget_chars: usize) -> String {
+    fn render_text(&self, req: &TranscriptRequest) -> String {
+        let budget_chars = req.budget_chars;
         let mut out = String::new();
         let mut char_count = 0usize;
         for h in &self.header_lines {
@@ -534,9 +534,9 @@ impl ViewData {
         }
         if shown < self.items.len() {
             let remaining = self.items.len() - shown;
-            let resume_turn = self.items[shown].turn;
+            let resume = resume_turns(self.items[shown].turn, req);
             out.push_str(&format!(
-                "... {remaining} more turns; --turns {resume_turn}.. to continue\n"
+                "... {remaining} more turns; --turns {resume} to continue\n"
             ));
         }
         enforce_hard_ceiling(out, budget_chars)
@@ -548,12 +548,13 @@ impl ViewData {
     /// the whole object on every candidate item). The authoritative bound is
     /// `enforce_hard_ceiling` on the ACTUAL final serialized string, which
     /// holds regardless of any estimation error above.
-    fn render_json(&self, budget_chars: usize) -> String {
-        self.render_json_counted(budget_chars).0
+    fn render_json(&self, req: &TranscriptRequest) -> String {
+        self.render_json_counted(req).0
     }
 
     /// [`Self::render_json`], and how many items the page holds.
-    fn render_json_counted(&self, budget_chars: usize) -> (String, usize) {
+    fn render_json_counted(&self, req: &TranscriptRequest) -> (String, usize) {
+        let budget_chars = req.budget_chars;
         let header_chars: usize = self.header_lines.iter().map(|h| h.chars().count()).sum();
         let mut acc = header_chars;
         let mut shown = 0usize;
@@ -585,7 +586,7 @@ impl ViewData {
                 let remaining = self.items.len() - shown;
                 let resume_turn = self.items[shown].turn;
                 obj.insert("remaining".into(), json!(remaining));
-                obj.insert("resume_turns".into(), json!(format!("{resume_turn}..")));
+                obj.insert("resume_turns".into(), json!(resume_turns(resume_turn, req)));
                 // A turn read in parts resumes inside its text.
                 if let Some(at) = self.items[shown].json.get("text_offset") {
                     obj.insert("resume_offset".into(), at.clone());
