@@ -562,6 +562,24 @@ fn selected_entries<'a>(parsed: &'a ParsedTranscript, req: &TranscriptRequest) -
         .collect()
 }
 
+/// A copy of each entry whose text holds a secret, with the text redacted; `None` for the rest.
+/// The slice cuts a turn's text at char offsets, and a secret cut in two parts matches no
+/// pattern in either, so the scrub runs before the cut, and every offset and total counts the
+/// redacted text. The reply is scrubbed again at the end.
+fn redacted_copies(entries: &[&Entry]) -> Vec<Option<Entry>> {
+    entries
+        .iter()
+        .map(|entry| match crate::redact::redact_secrets(&entry.text) {
+            std::borrow::Cow::Owned(text) => {
+                let mut copy = (*entry).clone();
+                copy.text = text;
+                Some(copy)
+            }
+            std::borrow::Cow::Borrowed(_) => None,
+        })
+        .collect()
+}
+
 /// The view of `entries`. The request's `offset` starts the first turn's text part-way in.
 fn slice_view(entries: &[&Entry], req: &TranscriptRequest) -> ViewData {
     // A turn with many large results can pass the whole budget. It would then
@@ -643,7 +661,13 @@ fn slice_view(entries: &[&Entry], req: &TranscriptRequest) -> ViewData {
 /// The `slice` page. In JSON, a first item that does not fit the budget comes back as the
 /// largest part of its text that does, so a page always moves the reader forward.
 pub(super) fn render_slice(parsed: &ParsedTranscript, req: &TranscriptRequest) -> String {
-    let entries = selected_entries(parsed, req);
+    let selected = selected_entries(parsed, req);
+    let copies = redacted_copies(&selected);
+    let entries: Vec<&Entry> = selected
+        .iter()
+        .zip(&copies)
+        .map(|(entry, copy)| copy.as_ref().unwrap_or(*entry))
+        .collect();
     let mut view = mark_mirror(parsed, slice_view(&entries, req));
     if !req.json {
         return view.render(req.budget_chars, false);

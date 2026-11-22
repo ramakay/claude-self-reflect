@@ -569,3 +569,103 @@ fn an_offset_of_zero_at_a_small_budget_still_shows_the_turn() {
     assert!(out.contains("[turn 1] user -: first turn\n"));
     assert!(!out.contains("not applied"));
 }
+
+// ─── A secret in a turn's text must not leave in two parts that each match no pattern. ───
+
+/// A made-up token in the shape the redact tests use: `ghp_` and 36 letters and digits.
+fn made_up_secret() -> String {
+    format!("ghp_{}", "A1b2".repeat(9))
+}
+
+/// Turn 1 is short, turn 2 is a long text with the secret every 102 chars, so a cut at any
+/// budget lands inside one.
+fn write_secret_fixture(dir: &std::path::Path) -> (std::path::PathBuf, String) {
+    let path = dir.join("secret.jsonl");
+    let unit = format!("{} {} ", "x".repeat(60), made_up_secret());
+    let mut f = std::fs::File::create(&path).unwrap();
+    let mut put = |v: Value| writeln!(f, "{v}").unwrap();
+    put(json!({"type":"user","message":{"role":"user","content":"first turn"}}));
+    put(json!({"type":"user","message":{"role":"user","content":unit.repeat(800)}}));
+    drop(f);
+    let parsed = transcript::parse_transcript(&path).unwrap();
+    assert_eq!(parsed.entries[1].turn, 2);
+    (path, parsed.entries[1].text.clone())
+}
+
+/// Read turn 2 from `offset` to its end by following each page's own hint. Returns the text of
+/// each page and the `text_chars_total` the pages state, when the view states one.
+fn walk_turn_two(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    json_form: bool,
+    budget: usize,
+    offset: usize,
+) -> (Vec<String>, Option<usize>) {
+    let (mut pages, mut total, mut at) = (Vec::new(), None, offset);
+    for _ in 0..400 {
+        let out = transcript::run(dir, &page_req(path, json_form, budget, (2, at)));
+        let next = if json_form {
+            let v: Value = serde_json::from_str(&out).unwrap();
+            let item = &v["items"][0];
+            assert_eq!(item["text_offset"], json!(at));
+            total = item["text_chars_total"].as_u64().map(|n| n as usize);
+            pages.push(item["text"].as_str().unwrap().to_string());
+            v.get("resume_offset").map(|o| o.as_u64().unwrap() as usize)
+        } else {
+            let (part, next) = text_part(&out, 2).expect("turn 2 is on the page");
+            pages.push(part);
+            next
+        };
+        match next {
+            Some(n) => {
+                assert!(n > at, "a page moves the reader forward");
+                at = n;
+            }
+            None => return (pages, total),
+        }
+    }
+    panic!("still paging after 400 pages");
+}
+
+#[test]
+fn a_secret_cut_by_a_page_boundary_never_leaves_in_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, original) = write_secret_fixture(dir.path());
+    let redacted = crate::redact::redact_secrets(&original).into_owned();
+    assert!(
+        redacted != original,
+        "the fixture holds a secret the scrub matches"
+    );
+    let secret = made_up_secret();
+    let (head, tail) = (&secret[..12], &secret[secret.len() - 12..]);
+    for json_form in [true, false] {
+        for budget in [1_500, 3_000, 10_000, MAX_BUDGET_CHARS] {
+            for offset in [0, 7, 1_234] {
+                let (pages, total) = walk_turn_two(dir.path(), &path, json_form, budget, offset);
+                let joined = pages.concat();
+                assert!(
+                    joined == redacted.chars().skip(offset).collect::<String>(),
+                    "the pages join to the redacted text from the offset"
+                );
+                assert!(!joined.contains(&secret), "the join holds the secret");
+                assert!(
+                    matches!(
+                        crate::redact::redact_secrets(&joined),
+                        std::borrow::Cow::Borrowed(_)
+                    ),
+                    "the scrub finds nothing in the join"
+                );
+                assert!(pages.len() > 1, "the turn is read in parts");
+                for page in &pages {
+                    assert!(
+                        !page.contains(head) && !page.contains(tail),
+                        "a page holds a part of the secret"
+                    );
+                }
+                if json_form {
+                    assert_eq!(total, Some(redacted.chars().count()));
+                }
+            }
+        }
+    }
+}
