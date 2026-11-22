@@ -408,13 +408,15 @@ fn escaped_chars(s: &str) -> usize {
     s.chars().map(escaped_width).sum()
 }
 
-/// True when the text of the turn is longer than the most one page fits, at the largest
-/// `budget_chars` the server accepts, so the turn can only be read in parts. A text that fits
-/// is cut at `result_chars` like any other. This is the room the fit keeps, not the estimate
-/// [`budget_to_hold`] makes for the budget a hint names, which also leaves room for the hint.
+/// True when no `budget_chars` the server accepts shows the whole text of the turn, so the
+/// turn can only be read in parts. The test is [`budget_to_hold`], the same estimate the hints
+/// use to name a call that shows a turn whole, and it must stay so: a turn is read in parts
+/// exactly when no whole-read call can be named. A looser test (the exact room a page keeps,
+/// a little more) would leave turns in between neither paged nor given a call that shows them
+/// whole, and their last chars would be out of reach.
 fn text_needs_parts(entry: &Entry) -> bool {
     let line = escaped_chars(entry.text.trim()) + turn_head(entry).chars().count() + 1;
-    line > crate::transcript::MAX_BUDGET_CHARS - SLICE_FIT_RESERVE_CHARS
+    budget_to_hold(line) > crate::transcript::MAX_BUDGET_CHARS
 }
 
 /// The slice item JSON for chars `start..end` of the turn's text. Part 0 keeps the turn's other
