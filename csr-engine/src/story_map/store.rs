@@ -1560,11 +1560,6 @@ mod tests {
 
     #[test]
     fn record_story_map_writes_rows_ledger_and_map() {
-        let _guard = crate::story_map::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("CSR_NO_STORY_MAP");
-
         let (engine, storage) = test_engine();
         seed_evo_row(
             &storage,
@@ -1615,11 +1610,6 @@ mod tests {
 
     #[test]
     fn record_story_map_twice_adds_no_second_row() {
-        let _guard = crate::story_map::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("CSR_NO_STORY_MAP");
-
         let (engine, storage) = test_engine();
         seed_evo_row(
             &storage,
@@ -1661,9 +1651,6 @@ mod tests {
 
     #[test]
     fn record_story_map_with_the_kill_switch_writes_nothing() {
-        let _guard = crate::story_map::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let (engine, storage) = test_engine();
         seed_evo_row(
             &storage,
@@ -1676,7 +1663,7 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("CSR_NO_STORY_MAP", "1");
+        let switch = crate::story_map::test_switch::on();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1690,7 +1677,7 @@ mod tests {
             "Haiku",
             vec![entry],
         ));
-        std::env::remove_var("CSR_NO_STORY_MAP");
+        drop(switch);
 
         let rows = storage
             .get_ledger_reflections_by_tag("narrative_shift", 10)
@@ -1703,11 +1690,6 @@ mod tests {
 
     #[test]
     fn record_story_map_with_no_shifts_leaves_the_old_map() {
-        let _guard = crate::story_map::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("CSR_NO_STORY_MAP");
-
         let (engine, storage) = test_engine();
         seed_evo_row(
             &storage,
