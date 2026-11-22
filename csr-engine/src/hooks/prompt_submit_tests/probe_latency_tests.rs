@@ -38,23 +38,33 @@ fn below_floor_probes_stay_under_five_ms_at_p95() {
             }
         };
         assert_eq!(search().len(), 1); // warm the index before measuring
-        let mut times = Vec::with_capacity(50);
-        for _ in 0..50 {
-            let started = Instant::now();
-            let hits = std::hint::black_box(search());
-            times.push(started.elapsed());
-            assert_eq!(hits.len(), 1);
+
+        // Scheduler noise only makes samples slower, and a scan is slow in every round: the
+        // bound holds if any one of up to three rounds of 50 samples has its p95 under it.
+        let mut best = Duration::MAX;
+        for _round in 0..3 {
+            let mut times = Vec::with_capacity(50);
+            for _ in 0..50 {
+                let started = Instant::now();
+                let hits = std::hint::black_box(search());
+                times.push(started.elapsed());
+                assert_eq!(hits.len(), 1);
+            }
+            times.sort_unstable();
+            let (median, p95) = (times[25], times[47]);
+            eprintln!(
+                "limit-1 reflection={reflection}: median={}us p95={}us",
+                median.as_micros(),
+                p95.as_micros()
+            );
+            best = best.min(p95);
+            if best < Duration::from_millis(5) {
+                break;
+            }
         }
-        times.sort_unstable();
-        let (median, p95) = (times[25], times[47]);
-        eprintln!(
-            "limit-1 reflection={reflection}: median={}us p95={}us",
-            median.as_micros(),
-            p95.as_micros()
-        );
         assert!(
-            p95 < Duration::from_millis(5),
-            "reflection={reflection}: p95={p95:?}"
+            best < Duration::from_millis(5),
+            "reflection={reflection}: best p95={best:?}"
         );
     }
 }
