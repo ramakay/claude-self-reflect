@@ -429,7 +429,7 @@ fn text_pages_of_a_session_with_no_oversize_turn_are_byte_identical_to_before() 
 [turn 1] user 2026-08-10T10:00:00Z: Fix the &lt;script&gt;alert('x')&lt;/script&gt; injection bug in auth.rs
 [turn 2] assistant 2026-08-10T10:00:02Z: Reading the file first.
   tool_use: Read file_path=/repo/src/auth.rs
-... 7 more turns; --turns 3.. to continue
+... 7 more turns; --turns 3..9 to continue
 "#;
     assert_eq!(golden_slice(false, 250), cut);
 }
@@ -448,7 +448,7 @@ fn json_pages_of_a_session_with_no_oversize_turn_are_byte_identical_to_before() 
     }
   ],
   "remaining": 8,
-  "resume_turns": "2..",
+  "resume_turns": "2..9",
   "truncated": true,
   "view": "slice"
 }"#;
@@ -668,4 +668,98 @@ fn a_secret_cut_by_a_page_boundary_never_leaves_in_parts() {
             }
         }
     }
+}
+
+// ─── A hint that resumes a bounded request keeps the request's end turn. ───
+
+/// `page_req` for `turns="{call.0}..2"`.
+fn page_to_turn_two(
+    path: &std::path::Path,
+    json_form: bool,
+    budget: usize,
+    call: (usize, usize),
+) -> TranscriptRequest {
+    let mut req = page_req(path, json_form, budget, call);
+    req.turns = Some((call.0, Some(2)));
+    req
+}
+
+#[test]
+fn a_json_resume_hint_keeps_the_requested_end_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, original) = write_oversize_fixture(dir.path());
+    let (mut call, mut joined) = ((2, 0), String::new());
+    for _ in 0..50 {
+        let out = transcript::run(dir.path(), &page_to_turn_two(&path, true, 30_000, call));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        for item in v["items"].as_array().unwrap() {
+            assert_eq!(item["turn"], json!(2), "turn 3 is outside the request");
+            joined.push_str(item["text"].as_str().unwrap());
+        }
+        if v["truncated"] != json!(true) {
+            assert!(joined == original, "the parts join to the turn");
+            return;
+        }
+        assert_eq!(v["resume_turns"], json!("2..2"));
+        call = (2, v["resume_offset"].as_u64().unwrap() as usize);
+    }
+    panic!("still paging after 50 pages");
+}
+
+#[test]
+fn a_text_cut_note_keeps_the_requested_end_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, original) = write_oversize_fixture(dir.path());
+    let (mut call, mut joined) = ((2, 0), String::new());
+    for _ in 0..50 {
+        let out = transcript::run(dir.path(), &page_to_turn_two(&path, false, 30_000, call));
+        assert!(!out.contains("[turn 3] "), "turn 3 is outside the request");
+        let note = out.lines().find(|l| l.starts_with("[cut: turn 2 has "));
+        joined.push_str(&turn_two_text(&out));
+        let Some(note) = note else {
+            assert!(joined == original, "the parts join to the turn");
+            return;
+        };
+        assert!(
+            note.contains("next: turns=\"2..2\" offset="),
+            "the note keeps the end"
+        );
+        call = (2, hint_number(note, "offset").unwrap());
+    }
+    panic!("still paging after 50 pages");
+}
+
+/// The text a text page shows for turn 2, un-escaped, without its cut note.
+fn turn_two_text(page: &str) -> String {
+    let at = page.find("\n[turn 2] ").unwrap() + 1;
+    let body = &page[at..];
+    let body = &body[body.find(": ").unwrap() + 2..];
+    // A part may end in a newline of its own; the page's closing newline follows the last part only.
+    let raw = match body.find("\n[cut: turn ") {
+        Some(c) => &body[..c],
+        None => body.strip_suffix('\n').unwrap_or(body),
+    };
+    raw.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+#[test]
+fn a_resume_hint_between_turns_keeps_the_requested_end_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_golden_fixture(dir.path());
+    let mut req = base_req(ViewKind::Slice, &path.to_string_lossy());
+    req.budget_chars = 250;
+    req.turns = Some((1, Some(5)));
+    let text = transcript::run(dir.path(), &req);
+    assert!(text.contains("... 3 more turns; --turns 3..5 to continue\n"));
+    req.json = true;
+    let v: Value = serde_json::from_str(&transcript::run(dir.path(), &req)).unwrap();
+    assert_eq!(v["resume_turns"], json!("2..5"));
+    // A request with no end stays open-ended.
+    req.turns = Some((1, None));
+    let v: Value = serde_json::from_str(&transcript::run(dir.path(), &req)).unwrap();
+    assert_eq!(v["resume_turns"], json!("2.."));
+    req.json = false;
+    assert!(transcript::run(dir.path(), &req).contains("--turns 3.. to continue\n"));
 }

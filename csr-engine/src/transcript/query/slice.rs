@@ -3,7 +3,7 @@
 
 use serde_json::{json, Map, Value};
 
-use super::{mark_mirror, turn_in_range, xml_escape, RenderItem, ViewData};
+use super::{mark_mirror, resume_turns, turn_in_range, xml_escape, RenderItem, ViewData};
 use crate::transcript::{Entry, ParsedTranscript, Role, TranscriptRequest, DEFAULT_LAST_N};
 
 /// Why a result or input was cut to fewer chars than the request asked.
@@ -436,7 +436,8 @@ fn json_text_part(entry: &Entry, normal: &Value, start: usize, end: usize) -> Va
 }
 
 /// The text-view item for chars `start..` of a turn read in parts: as many chars as fit under
-/// `cap`, and a note that names the next call when the rest does not fit. The turn's tool calls
+/// `cap`, and a note that names the next call, through the request's end turn, when the rest does
+/// not fit. The turn's tool calls
 /// and results show with part 0 only. `None` when not even one char fits. The bool is true when
 /// the part ends before the turn does.
 fn text_part_item(
@@ -445,6 +446,7 @@ fn text_part_item(
     cap: usize,
     requested: usize,
     fit: Fit,
+    req: &TranscriptRequest,
 ) -> Option<(RenderItem, bool)> {
     let total = entry.text.chars().count();
     let begin = start.min(total);
@@ -491,8 +493,9 @@ fn text_part_item(
             return None;
         }
         let note = format!(
-            "\n[cut: turn {turn} has {} chars; next: turns=\"{turn}..\" offset={}]",
+            "\n[cut: turn {turn} has {} chars; next: turns=\"{}\" offset={}]",
             with_commas(total),
+            resume_turns(turn, req),
             begin + take
         );
         (
@@ -610,7 +613,8 @@ fn slice_view(entries: &[&Entry], req: &TranscriptRequest) -> ViewData {
         }
         if let (false, Some(cap)) = (req.json, fit_cap) {
             if start > 0 || text_needs_parts(entry) {
-                if let Some((item, ends_early)) = text_part_item(entry, start, cap, requested, fit)
+                if let Some((item, ends_early)) =
+                    text_part_item(entry, start, cap, requested, fit, req)
                 {
                     items.push(item);
                     if ends_early {
@@ -670,9 +674,9 @@ pub(super) fn render_slice(parsed: &ParsedTranscript, req: &TranscriptRequest) -
         .collect();
     let mut view = mark_mirror(parsed, slice_view(&entries, req));
     if !req.json {
-        return view.render(req.budget_chars, false);
+        return view.render(req);
     }
-    let (page, shown) = view.render_json_counted(req.budget_chars);
+    let (page, shown) = view.render_json_counted(req);
     match entries.first() {
         Some(entry) if shown == 0 => split_first_item(&mut view, entry, req).unwrap_or(page),
         _ => page,
@@ -697,7 +701,7 @@ fn split_first_item(view: &mut ViewData, entry: &Entry, req: &TranscriptRequest)
             json: json_text_part(entry, &normal, start + n, total),
         };
         view.items.insert(1, rest);
-        let page = view.render_json_counted(req.budget_chars);
+        let page = view.render_json_counted(req);
         view.items.remove(1);
         page
     };
