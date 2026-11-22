@@ -820,7 +820,7 @@ pub(crate) async fn keyword_fallback(
     };
     let dates = window
         .as_ref()
-        .map(|(start, end)| (start.to_rfc3339(), end.to_rfc3339()));
+        .map(|(start, end, _)| (start.to_rfc3339(), end.to_rfc3339()));
     let mut results = keyword_candidates(
         storage,
         query,
@@ -845,11 +845,11 @@ pub(crate) async fn keyword_fallback(
             results.truncate(limit);
             Ok(format::format_search_insights(&results, query))
         }
-        KeywordTool::Recency { time_range, .. } => {
-            let (start, end) = window.expect("recency window resolved before FTS");
+        KeywordTool::Recency { .. } => {
+            let (start, end, named) = window.expect("recency window resolved before FTS");
             results.truncate(limit);
-            let desc = temporal::describe_window(time_range, &start, &end);
-            let hint = page::recency_hint(time_range, &start, &end, &results);
+            let desc = temporal::describe_window(named, &start, &end);
+            let hint = page::recency_hint(named, &start, &end, &results);
             Ok(format::format_recency_results_hinted(
                 &results,
                 query,
