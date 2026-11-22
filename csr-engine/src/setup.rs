@@ -3155,7 +3155,6 @@ mod tests {
     // ---- Codex registration, against a fake `codex` that keeps its entry in a file ----
 
     fn fake_codex(dir: &Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let d = dir.display();
         let script = format!(
             r#"#!/bin/sh
@@ -3175,8 +3174,7 @@ esac
 "#
         );
         let path = dir.join("codex");
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::exec_script::write_executable(&path, script);
         path
     }
 
@@ -3397,11 +3395,9 @@ esac
 
     #[test]
     fn codex_hang_is_stopped_and_named() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let codex = tmp.path().join("codex");
-        std::fs::write(&codex, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::exec_script::write_executable(&codex, "#!/bin/sh\nexec sleep 30\n");
         let outcome = register_codex_mcp(&codex, None, NEW_BIN, Duration::from_millis(300));
         let CodexMcpOutcome::Failed { reason, .. } = &outcome else {
             panic!("{outcome:?}");
@@ -3901,7 +3897,6 @@ esac
         /// `market` is what `marketplace list --json` prints; `plugin` is `absent`, `stale`
         /// (an older version, cached text that is not the relay) or `current`.
         fn new(market: &str, plugin: &str, update_refreshes: bool, refuses_add: bool) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let home = tempfile::tempdir().unwrap();
             let d = dir.path();
@@ -3971,8 +3966,7 @@ esac
                 d = d.display()
             );
             let bin = d.join("claude");
-            std::fs::write(&bin, script).unwrap();
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_script::write_executable(&bin, script);
             RelayFake { dir, home, bin }
         }
 
@@ -4561,19 +4555,16 @@ esac
 
     #[test]
     fn a_hanging_claude_is_stopped_at_the_timeout_and_only_that_child() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
         let pid = dir.path().join("pid");
         // `exec sleep` keeps the recorded pid equal to the process we spawned. The timeout
         // leaves a fresh script time to start and write its pid on a loaded machine.
-        std::fs::write(
+        crate::exec_script::write_executable(
             &bin,
             format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pid.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let started = Instant::now();
         let report = install_relay(&bin, home.path(), Path::new(ENGINE), Duration::from_secs(3));
         let waited = started.elapsed();

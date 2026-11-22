@@ -1355,10 +1355,8 @@ mod tests {
 #[cfg(test)]
 mod reload_regressions {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     fn script(path: &Path, text: &str) {
-        fs::write(path, text).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::exec_script::write_executable(path, text);
     }
     #[test]
     fn reload_requires_an_existing_stable_binary_and_successful_version_probe() {
@@ -1543,15 +1541,13 @@ mod failed_exec_tests {
 #[cfg(test)]
 mod probe_timeout_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     #[test]
     fn a_version_probe_that_hangs_is_stopped_after_five_seconds() {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("engine");
         let now = Instant::now();
         let mut reload = Reload::new(&path, now);
-        fs::write(&path, "#!/bin/sh\nexec /bin/sleep 10\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::exec_script::write_executable(&path, "#!/bin/sh\nexec /bin/sleep 10\n");
         assert!(!reload.poll(&path, now, false).unwrap());
         let started = Instant::now();
         let error = reload

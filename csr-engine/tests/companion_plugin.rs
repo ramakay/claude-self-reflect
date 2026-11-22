@@ -2,6 +2,9 @@
 //! installs from it. The first tests drive the real binary against a fake `claude`; the last
 //! two run the real Claude Code plugin CLI under a throwaway HOME and skip without it.
 
+#[path = "support/exec_script.rs"]
+mod exec_script;
+
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -64,9 +67,7 @@ esac
         d = dir.display(),
         market = marketplace_dir(home).display(),
     );
-    let bin = dir.join("claude");
-    fs::write(&bin, script).unwrap();
-    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    exec_script::write_executable(&dir.join("claude"), script);
 }
 
 fn text(bytes: &[u8]) -> String {

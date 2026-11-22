@@ -1,5 +1,7 @@
 //! Changes and phone navigation through the single surface, plus the retained Shift Map command
 //! and feedback backends. State goldens are generated through the current Rust Pane::frame.
+#[path = "support/exec_script.rs"]
+mod exec_script;
 use csr_engine::companion::{
     cli::PaneArgs, db::Db, hook_json, pane::Pane, paths::Paths, phone::Herdr,
 };
@@ -169,10 +171,8 @@ fn likes(paths: &Paths) -> Vec<Value> {
         .collect()
 }
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
-    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    exec_script::write_executable(&path, format!("#!/bin/sh\n{body}\n"));
     path
 }
 

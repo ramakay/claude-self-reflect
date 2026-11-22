@@ -12,6 +12,12 @@ pub mod embeddings;
 pub mod engine;
 pub mod episodes;
 pub mod eval;
+/// Test programs written without a write handle a parallel fork could copy (ETXTBSY).
+#[cfg(test)]
+#[path = "../tests/support/exec_script.rs"]
+pub(crate) mod exec_script;
+#[cfg(test)]
+mod exec_script_tests;
 pub mod extraction;
 pub mod format;
 pub mod governor;

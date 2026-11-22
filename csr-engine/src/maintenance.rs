@@ -722,7 +722,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn round4_ps_lookup_shares_preflight_deadline() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
         std::fs::write(&db, "").unwrap();
@@ -730,9 +729,7 @@ mod tests {
             ("lsof", "#!/bin/sh\n/bin/sleep 2\necho 4000000000\n"),
             ("ps", "#!/bin/sh\n/bin/sleep 5\necho late\n"),
         ] {
-            let path = dir.path().join(name);
-            std::fs::write(&path, body).unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_script::write_executable(&dir.path().join(name), body);
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
