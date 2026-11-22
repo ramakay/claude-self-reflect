@@ -159,8 +159,9 @@ fn room_for_a_part(entry: &Entry) -> bool {
 }
 
 /// Up to `max` chars of a list view's turn text. A cut names the slice call that shows it whole, or,
-/// when no call can, the call that reads it in parts. A turn whose tool lines leave too little
-/// room on a slice page for a part of its words names no slice call: see [`room_for_a_part`].
+/// when no call can, the call that reads it from its start, page by page. A turn whose tool lines
+/// leave too little room on a slice page for a part of its words names no slice call: see
+/// [`room_for_a_part`].
 pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> String {
     let (shown, cut) = cap_chars(text, max);
     if !cut {
@@ -197,9 +198,10 @@ pub(super) fn list_preview(text: &str, max: usize, entry: Option<&Entry>) -> Str
     } else if text_needs_parts(entry) {
         // The largest budget is named because that is where `room_for_a_part` holds: tool lines
         // that leave room for the first part there can leave none at the default budget. The
-        // parts after the first carry no tool lines, so their notes need no budget.
+        // pages after the first carry no tool lines, and their notes name no budget. The note
+        // does not say "in parts": a turn just over the whole-read limit fits this one page.
         format!(
-            "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\" budget_chars={} reads it in parts, each ending with the next call; view=\"grep\" finds a word in it]",
+            "{shown}… [cut: {bytes} bytes total; view=\"slice\" turns=\"{turn}..{turn}\" budget_chars={} reads it from the start; a page that ends before the turn does names the next call; view=\"grep\" finds a word in it]",
             crate::transcript::MAX_BUDGET_CHARS
         )
     } else {

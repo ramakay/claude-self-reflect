@@ -799,7 +799,10 @@ fn a_cut_asks_hint_does_not_say_whole_when_no_budget_holds_it() {
         !hint.contains("shows it whole"),
         "no call shows this turn whole"
     );
-    assert!(hint.contains("reads it in parts"), "the hint says parts");
+    assert!(
+        hint.contains("names the next call"),
+        "the hint names the paging call"
+    );
     assert!(hint.contains("view=\"grep\""), "the hint names grep");
     // The call it names reads the turn to its end through the cut notes, 90,000 chars in all.
     let (mut offset, mut seen) = (0, 0);
