@@ -12,7 +12,13 @@ import { readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
-import { ensureEngineBinary, findEngineBinary, whichBinary } from './lib.js';
+import {
+  BINARY_NAME,
+  ensureEngineBinary,
+  findEngineBinary,
+  outdatedEngine,
+  whichBinary,
+} from './lib.js';
 
 const commands = {
   setup: 'Import conversations, register MCP server, install hooks, install the csr-companion plugin',
@@ -31,8 +37,26 @@ const commands = {
  * done through install.sh or by hand.
  */
 function findBinary() {
-  const installDir = resolve(process.env.CSR_INSTALL_DIR || join(homedir(), '.local', 'bin'));
-  return findEngineBinary({ installDir, pathBinary: whichBinary() });
+  return findEngineBinary({ installDir: installDir(), pathBinary: whichBinary() });
+}
+
+function installDir() {
+  return resolve(process.env.CSR_INSTALL_DIR || join(homedir(), '.local', 'bin'));
+}
+
+/**
+ * The engine this package manages, when it is older than the package: an npm
+ * upgrade whose install script npm skipped leaves the engine of the release
+ * before it in place. CSR_SKIP_BINARY_DOWNLOAD=1 means the person manages the
+ * binary, as it does for postinstall, so nothing is compared.
+ */
+function outdated(binary) {
+  if (process.env.CSR_SKIP_BINARY_DOWNLOAD === '1') return null;
+  return outdatedEngine({
+    binary,
+    destPath: join(installDir(), BINARY_NAME),
+    pkgVersion: packageVersion(),
+  });
 }
 
 /**
@@ -40,12 +64,19 @@ function findBinary() {
  * the person allows it). Its progress goes to stderr so a command like
  * `claude-self-reflect status | jq` still gets clean stdout; its stderr is kept
  * for the failure reason.
+ *
+ * CSR_AUTO_SETUP is not passed on. With it, postinstall runs a bare `setup`
+ * after the install; here the command the person typed runs next, with its own
+ * arguments, and a `setup --no-companion` must not be preceded by a full setup.
  */
 function installEngine() {
   const postinstallPath = fileURLToPath(new URL('./postinstall.js', import.meta.url));
+  const env = { ...process.env };
+  delete env.CSR_AUTO_SETUP;
   const run = spawnSync(process.execPath, [postinstallPath], {
     encoding: 'utf8',
     stdio: ['ignore', 2, 'pipe'],
+    env,
   });
   if (run.status !== 0) {
     const err = new Error(`install step exited with ${run.status ?? run.signal}`);
@@ -60,6 +91,11 @@ function runEngine(args) {
     find: findBinary,
     install: installEngine,
     say: (line) => console.error(line),
+    outdated,
+    // Setup is the upgrade step, so it brings an older engine up to date first.
+    // Any other command, and a request for setup's help, says what to run and
+    // uses the engine that is there.
+    update: args[0] === 'setup' && !args.some((arg) => arg === '--help' || arg === '-h'),
   });
   if (!binary) process.exit(1);
 
