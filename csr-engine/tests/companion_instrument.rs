@@ -1,4 +1,6 @@
 //! The instrument states, through the real top frame and a rich private HOME.
+#[path = "support/exec_script.rs"]
+mod exec_script;
 #[path = "support/pane_home.rs"]
 mod pane_home;
 use csr_engine::companion::{cli::PaneArgs, pane::Pane, paths::Paths};
@@ -2375,23 +2377,20 @@ struct FakeHerdr {
 }
 impl FakeHerdr {
     fn new(argv0: &str) -> Self {
-        use std::os::unix::fs::PermissionsExt;
         static TURNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let turn = TURNS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let (log, who) = (dir.path().join("log"), dir.path().join("argv0"));
         fs::write(&who, argv0).unwrap();
         let script = dir.path().join("herdr");
-        fs::write(
+        exec_script::write_executable(
             &script,
             format!(
                 "#!/bin/sh\necho \"$@\" >> {log}\ncase \"$2\" in\nprocess-info)\n  who=$(cat {who})\n  printf '{{\"result\":{{\"process_info\":{{\"foreground_process_group_id\":7,\"foreground_processes\":[{{\"pid\":7,\"argv0\":\"%s\",\"argv\":[\"%s\"]}}]}}}}}}' \"$who\" \"$who\"\n  ;;\nesac\n",
                 log = log.display(),
                 who = who.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::env::set_var("HERDR_BIN_PATH", &script);
         std::env::remove_var("HERDR_PANE_ID");
         Self { dir, _turn: turn }

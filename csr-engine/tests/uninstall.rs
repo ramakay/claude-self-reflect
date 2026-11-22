@@ -5,6 +5,8 @@
 //! PATH.
 #![cfg(unix)]
 
+#[path = "support/exec_script.rs"]
+mod exec_script;
 #[path = "support/temp_home.rs"]
 mod temp_home;
 
@@ -141,9 +143,8 @@ fn write(path: &Path, text: &str) {
 }
 
 fn shim(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    write(path, &format!("#!/bin/sh\n{body}\n"));
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    exec_script::write_executable(path, format!("#!/bin/sh\n{body}\n"));
 }
 
 /// The settings a user has after `setup`: CSR's hooks, plus hooks that are not CSR's.
@@ -813,7 +814,7 @@ fn a_daemon_that_will_not_stop_keeps_binary_and_data_and_the_finish_is_printed()
         let s = Scratch::new();
         let local = s.home.join(".local/bin/csr-engine");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
-        std::fs::copy(env!("CARGO_BIN_EXE_csr-engine"), &local).unwrap();
+        exec_script::copy_executable(Path::new(env!("CARGO_BIN_EXE_csr-engine")), &local);
         let (pid, reaped) = daemon_standin("30", true);
         let lock_path = s.data().join("daemon.lock");
         std::fs::write(&lock_path, pid.to_string()).unwrap();
@@ -1248,7 +1249,7 @@ fn a_binary_in_local_bin_is_deleted_last_and_any_other_gets_its_rm_line() {
     let s = Scratch::new();
     let local = s.home.join(".local/bin/csr-engine");
     std::fs::create_dir_all(local.parent().unwrap()).unwrap();
-    std::fs::copy(built, &local).unwrap();
+    exec_script::copy_executable(built, &local);
     let plan = stdout(&s.run_program(&local, &["--dry-run"], &[]));
     assert!(
         plan.contains(&format!("binary: would delete {} last", local.display())),

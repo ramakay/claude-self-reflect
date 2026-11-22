@@ -644,9 +644,6 @@ mod tests {
 
     #[test]
     fn kill_switch_changes_nothing() {
-        let _guard = crate::story_map::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let storage = Storage::open_memory().unwrap();
         seed_ledger(&storage, "csr", &[("8a3f91c02b11e409", "risk")]);
         let dir = tempfile::tempdir().unwrap();
@@ -657,9 +654,9 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("CSR_NO_STORY_MAP", "1");
+        let switch = crate::story_map::test_switch::on();
         sync_likes(&storage, "csr", &path);
-        std::env::remove_var("CSR_NO_STORY_MAP");
+        drop(switch);
 
         assert!(storage.get_meta("story_kind_prefs:csr").unwrap().is_none());
         assert!(!load_ledger(&storage, "csr").entries[0].liked);
