@@ -4,9 +4,10 @@
  *
  * Hermetic: each case copies cli.js and lib.js into a throwaway directory next
  * to a stub postinstall.js, so no download happens. HOME and PATH are throwaway,
- * and the one hardcoded fallback in lib.js (/usr/local/bin) is repointed in the
- * copy, so a csr-engine installed on the machine running the tests cannot hide
- * the "binary absent" cases.
+ * the one hardcoded fallback in lib.js (/usr/local/bin) is repointed in the
+ * copy, and a `which` that finds nothing comes first on PATH, so a csr-engine
+ * installed on the machine running the tests cannot hide the "binary absent"
+ * cases.
  */
 
 import { strict as assert } from 'node:assert';
@@ -84,11 +85,22 @@ function sandbox(stubSource) {
   return { root, cli: join(dir, 'cli.js') };
 }
 
-function runCli(box, args, { withEngine } = {}) {
+function runCli(box, args, { withEngine, engineOnPath } = {}) {
   const home = tempDir('cli-home');
   const installDir = tempDir('cli-install');
   const bin = tempDir('cli-path');
   const calls = join(tempDir('cli-calls'), 'calls.log');
+  // PATH keeps /usr/bin and /bin for `sh`. The CLI asks `which` for an engine
+  // on PATH, so a `which` that finds nothing comes first: a csr-engine in
+  // /usr/bin or /bin cannot stand in for the absent one.
+  const which = join(bin, 'which');
+  writeFileSync(which, '#!/bin/sh\nexit 1\n');
+  chmodSync(which, 0o755);
+  if (engineOnPath) {
+    const stray = join(bin, 'csr-engine');
+    writeFileSync(stray, '#!/bin/sh\necho "STRAY-ENGINE-RAN $*"\n');
+    chmodSync(stray, 0o755);
+  }
   if (withEngine) {
     const engine = join(installDir, 'csr-engine');
     writeFileSync(engine, FAKE_ENGINE);
@@ -143,6 +155,17 @@ describe('claude-self-reflect when postinstall never ran', () => {
     assert.equal(r.status, 1);
     assert.equal(r.installs, 1);
     assert.equal(r.stderr.split(CURL_LINE).length - 1, 1);
+  });
+
+  test('a csr-engine elsewhere on PATH does not stand in for the absent engine here', () => {
+    // Guards the sandbox, not the CLI: with the machine's `which`, the stray
+    // engine is found, the install step is skipped, and the absent cases above
+    // test nothing.
+    const r = runCli(sandbox(STUB_OK), ['status'], { engineOnPath: true });
+
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.installs, 1);
+    assert.equal(r.stdout, 'ENGINE-RAN status\n');
   });
 
   test('binary present: the install step is never run', () => {
