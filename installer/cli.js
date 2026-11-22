@@ -7,12 +7,12 @@
  * the `claude-self-reflect` npm command and proxies to the binary.
  */
 
-import { spawn, execFileSync } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
-import { findEngineBinary, whichBinary } from './lib.js';
+import { ensureEngineBinary, findEngineBinary, whichBinary } from './lib.js';
 
 const commands = {
   setup: 'Import conversations, register MCP server, install hooks, install the csr-companion plugin',
@@ -35,23 +35,33 @@ function findBinary() {
   return findEngineBinary({ installDir, pathBinary: whichBinary() });
 }
 
-function runEngine(args) {
-  const binary = findBinary();
-  if (!binary) {
-    console.error('csr-engine binary not found. Attempting auto-download...');
-    try {
-      const postinstallPath = fileURLToPath(new URL('./postinstall.js', import.meta.url));
-      execFileSync(process.execPath, [postinstallPath], { stdio: 'inherit' });
-      const retryBinary = findBinary();
-      if (retryBinary) {
-        const child = spawn(retryBinary, args, { stdio: 'inherit' });
-        child.on('exit', (code) => process.exit(code || 0));
-        return;
-      }
-    } catch {}
-    console.error('Install manually: curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh');
-    process.exit(1);
+/**
+ * Run the install step npm should have run (npm 11.20+ skips postinstall until
+ * the person allows it). Its progress goes to stderr so a command like
+ * `claude-self-reflect status | jq` still gets clean stdout; its stderr is kept
+ * for the failure reason.
+ */
+function installEngine() {
+  const postinstallPath = fileURLToPath(new URL('./postinstall.js', import.meta.url));
+  const run = spawnSync(process.execPath, [postinstallPath], {
+    encoding: 'utf8',
+    stdio: ['ignore', 2, 'pipe'],
+  });
+  if (run.status !== 0) {
+    const err = new Error(`install step exited with ${run.status ?? run.signal}`);
+    err.stderr = run.stderr;
+    throw err;
   }
+  if (run.stderr) process.stderr.write(run.stderr);
+}
+
+function runEngine(args) {
+  const binary = ensureEngineBinary({
+    find: findBinary,
+    install: installEngine,
+    say: (line) => console.error(line),
+  });
+  if (!binary) process.exit(1);
 
   const child = spawn(binary, args, { stdio: 'inherit' });
   child.on('exit', (code) => process.exit(code || 0));
