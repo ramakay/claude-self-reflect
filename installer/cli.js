@@ -12,7 +12,13 @@ import { readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
-import { ensureEngineBinary, findEngineBinary, whichBinary } from './lib.js';
+import {
+  BINARY_NAME,
+  ensureEngineBinary,
+  findEngineBinary,
+  outdatedEngine,
+  whichBinary,
+} from './lib.js';
 
 const commands = {
   setup: 'Import conversations, register MCP server, install hooks, install the csr-companion plugin',
@@ -31,8 +37,26 @@ const commands = {
  * done through install.sh or by hand.
  */
 function findBinary() {
-  const installDir = resolve(process.env.CSR_INSTALL_DIR || join(homedir(), '.local', 'bin'));
-  return findEngineBinary({ installDir, pathBinary: whichBinary() });
+  return findEngineBinary({ installDir: installDir(), pathBinary: whichBinary() });
+}
+
+function installDir() {
+  return resolve(process.env.CSR_INSTALL_DIR || join(homedir(), '.local', 'bin'));
+}
+
+/**
+ * The engine this package manages, when it is older than the package: an npm
+ * upgrade whose install script npm skipped leaves the engine of the release
+ * before it in place. CSR_SKIP_BINARY_DOWNLOAD=1 means the person manages the
+ * binary, as it does for postinstall, so nothing is compared.
+ */
+function outdated(binary) {
+  if (process.env.CSR_SKIP_BINARY_DOWNLOAD === '1') return null;
+  return outdatedEngine({
+    binary,
+    destPath: join(installDir(), BINARY_NAME),
+    pkgVersion: packageVersion(),
+  });
 }
 
 /**
@@ -60,6 +84,7 @@ function runEngine(args) {
     find: findBinary,
     install: installEngine,
     say: (line) => console.error(line),
+    outdated,
   });
   if (!binary) process.exit(1);
 

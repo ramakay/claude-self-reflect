@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [10.1.1] - 2026-11-24
 
-Fixes from the first week of 10.1.0. Most came from two checks made after the release: reading 30 deleted sessions back through the shipped MCP server (28 of 30 came back whole), and an install on a clean account with no login session. There is no data migration. Upgrade as for any release (`npm install -g claude-self-reflect`, or run `scripts/install.sh` again), then restart Claude Code.
+Fixes from the first week of 10.1.0. Most came from two checks made after the release: reading 30 deleted sessions back through the shipped MCP server (28 of 30 came back whole), and an install on a clean account with no login session. There is no data migration. Upgrade as for any release (`npm install -g claude-self-reflect` then `claude-self-reflect setup`, or run `scripts/install.sh` again), then restart Claude Code.
 
 ### Transcript and search
 
@@ -22,6 +22,7 @@ Fixes from the first week of 10.1.0. Most came from two checks made after the re
 
 - **Uninstall finishes on an account that never logged in at the screen.** With no `gui/<uid>` launchd domain (an ssh-only account), `csr-engine uninstall` held with "could not tell whether com.ramakay.csr-engine.daemon is running" and could never finish. It now removes the plist, says there was no login session to unload from, and goes on. A daemon started outside launchd still holds the uninstall, and the message gives its pid (#338).
 - **The npm command installs the engine when npm skipped the install script.** If `npm install -g` did not run `postinstall` (npm 11.20 warns that the script is not covered by `allowScripts`), the first `claude-self-reflect` command installs the binary, with its progress on stderr. If that fails, it prints one message with the reason and the command to run (#339).
+- **The npm command updates the engine after an upgrade when npm skipped the install script.** Before, `npm install -g claude-self-reflect` over an earlier install left the old engine in place if npm did not run `postinstall`, and `claude-self-reflect setup` ran that old engine. The command now compares the engine in the install directory with the package version. When the engine is older, it runs the install step first, with its progress on stderr. If that fails, it prints one message with the reason and the command to run, then runs the engine that is there. A newer engine is left alone, and `CSR_SKIP_BINARY_DOWNLOAD=1` turns the comparison off (#347).
 - **The curl installer finds the latest release when the GitHub API refuses.** A shared address (a CI runner, an office NAT) can use up the anonymous API limit. The installer then reads the tag from the redirect of the releases page (#330).
 - **Internal notes removed from the installers.** A leftover "forward-port" comment block is gone from `scripts/install.sh` and `installer/postinstall.js`. No behaviour change.
 
