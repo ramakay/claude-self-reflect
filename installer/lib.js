@@ -125,8 +125,9 @@ export function planInstall({ destPath, pkgVersion, probe = probeVersion }) {
 
 /**
  * A version as its three numbers and its prerelease identifiers, or null.
- * `10.1.1-rc.2+build.7` is `{ numbers: [10, 1, 1], pre: ['rc', '2'] }`: build
- * metadata has no place in the order.
+ * `10.1.1-rc.2+build.7` is `{ numbers: ['10', '1', '1'], pre: ['rc', '2'] }`:
+ * build metadata has no place in the order. The numbers stay strings of digits,
+ * so the order is exact at any length (see compareDigits).
  */
 function versionParts(version) {
   const token = parseVersion(version);
@@ -137,15 +138,33 @@ function versionParts(version) {
   while (i < rest.length && rest[i] >= '0' && rest[i] <= '9') i += 1;
   const suffix = rest.slice(i).split('+')[0];
   return {
-    numbers: [Number(parts[0]), Number(parts[1]), Number(rest.slice(0, i))],
+    numbers: [parts[0], parts[1], rest.slice(0, i)],
     pre: suffix.startsWith('-') ? suffix.slice(1).split('.') : [],
   };
+}
+
+/**
+ * Order of two strings of digits as numbers. No conversion to a JavaScript
+ * number: past 2^53 two different values round to the same one.
+ */
+function compareDigits(x, y) {
+  const significant = (digits) => {
+    let i = 0;
+    while (i < digits.length - 1 && digits[i] === '0') i += 1;
+    return digits.slice(i);
+  };
+  const a = significant(x);
+  const b = significant(y);
+  if (a.length !== b.length) return a.length - b.length;
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
 }
 
 /** Semver order of two versionParts values: negative when `a` is the older one. */
 function compareVersions(a, b) {
   for (let i = 0; i < 3; i += 1) {
-    if (a.numbers[i] !== b.numbers[i]) return a.numbers[i] - b.numbers[i];
+    const order = compareDigits(a.numbers[i], b.numbers[i]);
+    if (order !== 0) return order;
   }
   // A prerelease is older than the release with the same numbers.
   if (a.pre.length === 0 || b.pre.length === 0) return b.pre.length - a.pre.length;
@@ -159,7 +178,8 @@ function compareVersions(a, b) {
     const xNumber = DIGITS.test(x);
     const yNumber = DIGITS.test(y);
     if (xNumber && yNumber) {
-      if (Number(x) !== Number(y)) return Number(x) - Number(y);
+      const order = compareDigits(x, y);
+      if (order !== 0) return order;
     } else if (xNumber !== yNumber) {
       return xNumber ? -1 : 1;
     } else {

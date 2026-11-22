@@ -136,10 +136,9 @@ function runCli(box, args, { engine, engineOnPath, env = {} } = {}) {
       ...env,
     },
   });
-  const installs = existsSync(calls)
-    ? readFileSync(calls, 'utf8').split('\n').filter(Boolean).length
-    : 0;
-  return { ...result, installs, installDir };
+  const callLog = existsSync(calls) ? readFileSync(calls, 'utf8') : '';
+  const installs = callLog.split('\n').filter(Boolean).length;
+  return { ...result, installs, callLog, installDir };
 }
 
 describe('claude-self-reflect when postinstall never ran', () => {
@@ -261,6 +260,47 @@ describe('claude-self-reflect after an upgrade whose postinstall never ran', () 
       `Self-Reflect: the engine here is ${OLDER} and this package is ${PKG_VERSION}. ` +
         'To update the engine, run: claude-self-reflect setup\n'
     );
+  });
+
+  test('setup --help, engine older: a request for help does not update the engine', () => {
+    for (const flag of ['--help', '-h']) {
+      const r = runCli(sandbox(STUB_OK), ['setup', flag], { engine: OLD_ENGINE });
+
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.installs, 0);
+      assert.equal(r.stdout, `OLD-ENGINE-RAN setup ${flag}\n`);
+      assert.match(r.stderr, /To update the engine, run: claude-self-reflect setup\n$/);
+    }
+  });
+
+  test('the install step is never told to run setup by itself', () => {
+    // With CSR_AUTO_SETUP=1, postinstall runs a bare `setup` after the install.
+    // The command typed here runs next with its own arguments, so the opt-in
+    // must not reach the install step: a `setup --no-companion` would get a
+    // full setup first.
+    const recorder = `
+      import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      appendFileSync(
+        process.env.STUB_CALLS,
+        'install auto=' + (process.env.CSR_AUTO_SETUP ?? 'unset') + '\\n'
+      );
+      mkdirSync(process.env.CSR_INSTALL_DIR, { recursive: true });
+      const dest = join(process.env.CSR_INSTALL_DIR, 'csr-engine');
+      writeFileSync(dest, ${JSON.stringify(FAKE_ENGINE)});
+      chmodSync(dest, 0o755);
+    `;
+    // An older engine, and no engine at all: both run the install step.
+    for (const engine of [OLD_ENGINE, undefined]) {
+      const r = runCli(sandbox(recorder), ['setup', '--no-companion'], {
+        engine,
+        env: { CSR_AUTO_SETUP: '1' },
+      });
+
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.callLog, 'install auto=unset\n');
+      assert.equal(r.stdout, 'ENGINE-RAN setup --no-companion\n');
+    }
   });
 
   test('setup, engine newer than the package: left alone, no install step, no message', () => {

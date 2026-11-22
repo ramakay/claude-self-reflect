@@ -249,6 +249,14 @@ describe('engine older than the package (the npm command, before it runs)', () =
     older('10.1.1-1', '10.1.1-rc'); // a number sorts before text
     older('10.1.0', '10.1.1-rc.1');
 
+    // Past 2^53 a JavaScript number rounds; the order must still be exact.
+    older('10.1.1-9007199254740992.1', '10.1.1-9007199254740993.0');
+    assert.equal(judge('10.1.1-9007199254740993.0', '10.1.1-9007199254740992.1'), null);
+    older('10.1.9007199254740992', '10.1.9007199254740993');
+    // Leading zeros do not change a number.
+    assert.equal(judge('10.01.1', '10.1.1'), null);
+    assert.equal(judge('10.1.1-rc.01', '10.1.1-rc.1'), null);
+
     assert.equal(judge('10.1.1', '10.1.1-rc.1'), null);
     assert.equal(judge('10.1.1-rc.2', '10.1.1-rc.1'), null);
     assert.equal(judge('10.1.1-rc.1', '10.1.1-rc.1'), null);

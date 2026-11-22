@@ -64,12 +64,19 @@ function outdated(binary) {
  * the person allows it). Its progress goes to stderr so a command like
  * `claude-self-reflect status | jq` still gets clean stdout; its stderr is kept
  * for the failure reason.
+ *
+ * CSR_AUTO_SETUP is not passed on. With it, postinstall runs a bare `setup`
+ * after the install; here the command the person typed runs next, with its own
+ * arguments, and a `setup --no-companion` must not be preceded by a full setup.
  */
 function installEngine() {
   const postinstallPath = fileURLToPath(new URL('./postinstall.js', import.meta.url));
+  const env = { ...process.env };
+  delete env.CSR_AUTO_SETUP;
   const run = spawnSync(process.execPath, [postinstallPath], {
     encoding: 'utf8',
     stdio: ['ignore', 2, 'pipe'],
+    env,
   });
   if (run.status !== 0) {
     const err = new Error(`install step exited with ${run.status ?? run.signal}`);
@@ -86,8 +93,9 @@ function runEngine(args) {
     say: (line) => console.error(line),
     outdated,
     // Setup is the upgrade step, so it brings an older engine up to date first.
-    // Any other command says what to run and uses the engine that is there.
-    update: args[0] === 'setup',
+    // Any other command, and a request for setup's help, says what to run and
+    // uses the engine that is there.
+    update: args[0] === 'setup' && !args.some((arg) => arg === '--help' || arg === '-h'),
   });
   if (!binary) process.exit(1);
 
