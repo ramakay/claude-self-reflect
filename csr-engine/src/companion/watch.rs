@@ -644,7 +644,10 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let mut pane = Pane::new(paths.clone(), args);
     pane.enable_cards();
     pane.herdr = super::phone::Herdr::from_env(&paths.home);
-    let signals = Signals::install();
+    // Declared before the pane's pipe, lock and pid file, so it is dropped after them: a SIGTERM
+    // that comes while they are being removed must still be caught, or it would end the process
+    // between the pipe's removal and the lock's and leave the lock behind.
+    let _signals = Signals::install();
     let sid = args.sid.as_deref().unwrap_or("");
     let mine = PidFile::new(&paths, sid)?;
     // The relay's wakes arrive here, where no pid is trusted: see `wake.rs`.
@@ -1179,7 +1182,11 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     beat.stop();
     std::panic::set_hook(hook);
     drop(terminal);
-    drop(signals);
+    // For the test of the end: the SIGTERM that comes just here, with the terminal given back and
+    // the pipe, lock and pid file still to remove.
+    if std::env::var_os("CSR_PANE_TEST_TERM_AT_END").is_some() {
+        unsafe { libc::raise(libc::SIGTERM) };
+    }
     result
 }
 /// Put `text` on the clipboard: an OSC 52 sequence for terminals that pass it on, and `pbcopy`

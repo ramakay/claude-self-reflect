@@ -280,6 +280,21 @@ fn sigterm_straight_after_the_hangup_ends_the_pane() {
     pane.left_nothing_behind();
 }
 
+/// A SIGTERM that comes while the pane is removing its pipe, lock and pid file is the same
+/// SIGTERM straight after the hangup, landing late: the seam raises it right at the end of the
+/// pane's loop, after the terminal is given back and before those are removed. It must not end
+/// the pane half way through the removal and leave the lock behind.
+#[test]
+fn sigterm_during_the_cleanup_leaves_nothing_behind() {
+    let mut pane = Pane::start_with(false, &[("CSR_PANE_TEST_TERM_AT_END", "1")]);
+    pane.close_terminal();
+    assert!(
+        pane.ends_within(Duration::from_secs(3)).is_some(),
+        "the pane outlived its terminal"
+    );
+    pane.left_nothing_behind();
+}
+
 #[test]
 fn sigterm_ends_a_pane_whose_terminal_is_gone() {
     let mut pane = Pane::start(false);
