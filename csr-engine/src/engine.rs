@@ -428,7 +428,7 @@ impl Engine {
             return Ok(None);
         };
         let storage = Arc::new(Storage::open(db_path)?);
-        let proxy = Arc::new(VectorProxy::new(client, storage.clone()));
+        let proxy = Arc::new(VectorProxy::new(client, storage.clone()).with_daemon_home(home));
         tracing::info!("daemon configured: MCP vector search and embedding go to the daemon");
         Ok(Some(Self {
             storage,
