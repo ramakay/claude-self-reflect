@@ -1018,13 +1018,22 @@ fn a_list_hint_does_not_promise_all_the_text_when_tool_lines_leave_no_room() {
     // 600 chars of words are over the 500 chars the list views show. 300 results of 100 chars
     // take about 39,900 chars of tool lines even at the 100-char floor, over the 39,200 a page
     // holds at the largest budget, so no part of the words fits beside them.
-    let text = "w".repeat(600);
-    let path = write_words_and_results_fixture(dir.path(), &text, 300, 100);
-    for view in [ViewKind::Prompts, ViewKind::YourAsks] {
-        let out = transcript::run(dir.path(), &base_req(view, &path.to_string_lossy()));
-        let hint = &out[out.find("[cut:").expect("the list cuts the turn")..];
-        assert!(!hint.contains("reads all of its text"));
-        assert!(hint.contains("shows the most of it one call can"));
+    // The same holds for words too long for any page: with no room for a part, the hint must
+    // not say the slice reads them in parts.
+    for words in [600, 50_000] {
+        let text = "w".repeat(words);
+        let path = write_words_and_results_fixture(dir.path(), &text, 300, 100);
+        for view in [ViewKind::Prompts, ViewKind::YourAsks] {
+            let out = transcript::run(dir.path(), &base_req(view, &path.to_string_lossy()));
+            let hint = &out[out.find("[cut:").expect("the list cuts the turn")..];
+            let hint = &hint[..hint.find(']').map_or(hint.len(), |end| end + 1)];
+            assert!(!hint.contains("reads all of its text"));
+            assert!(!hint.contains("reads it in parts"));
+            // No slice call is named: none shows the rest of the words.
+            assert!(!hint.contains("view=\"slice\""));
+            assert!(hint.contains("its tool calls and results take a whole slice page"));
+            assert!(hint.contains("view=\"grep\""));
+        }
     }
 }
 
