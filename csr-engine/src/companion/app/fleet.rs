@@ -165,9 +165,11 @@ async fn options(cx: &Ctx) -> Options {
     }
 }
 
-/// The switch is read on every call, never kept in `Fleet.options`, so it takes effect at once.
+/// Whether dreams are on, read on every call as the pace and the dreamer read it: the
+/// `CSR_NO_DREAMING` switch first, then the `/config` Dreams row as it is now. Neither is kept in
+/// `Fleet.options`, so a row the person turns off (or on) mid-session takes effect at once.
 async fn dreams_on(cx: &Ctx) -> bool {
-    !state::dreaming_switched_off(cx).await && options(cx).await.dreams
+    !state::dreaming_switched_off(cx).await && Options::of(&state::config_rows(cx).await).dreams
 }
 
 // ---------------------------------------------------------------- the state, in the store
