@@ -1,0 +1,9 @@
+# Triaged gitleaks findings in published history. One fingerprint per finding:
+# commit:path:rule:line. A new commit, path or line is not covered, so a new
+# leak still fails the scan. Value-shaped allowlists live in .gitleaks.toml.
+
+# jwt, csr-engine/src/companion/paste.rs, test `pasted_data_is_a_paste`:
+# the jwt.io sample header and payload ({"sub":"1234567890"}) with a cut
+# signature, a paste fixture. Never a credential. Same line in both commits.
+0b51dff8341993f01e2104ba5761d30ae128c9ef:csr-engine/src/companion/paste.rs:jwt:89
+36a35abfbf54e6217e6af1f74b392a7e13f1c54a:csr-engine/src/companion/paste.rs:jwt:110
