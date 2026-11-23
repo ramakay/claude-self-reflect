@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [10.1.2] - unreleased
+
+A fixes release. There is no data migration. Upgrade as for any release (`npm install -g claude-self-reflect` then `claude-self-reflect setup`, or run `scripts/install.sh` again), then restart Claude Code.
+
+### Companion
+
+- **`CSR_NO_DREAMING=1` now stops the companion's looks.** Before, it stopped only the daemon's dream cycle, and the pages said it stopped dreams. The companion's looks (the main schedule, an agent's completion look, the compaction carry-over and the prompts kept for the dreamer) were gated only by the Dreams row in `/config`. The variable now also stops them, and it wins over a Dreams row that is on. `1` or `true` in any case turns it on, the same rule the daemon uses. The companion reads the variable from the environment Claude Code runs in; an installed daemon sees it only after `claude-self-reflect setup` runs again with it set, and the setup text now says so.
+
+### Security
+
+- **`cookie` 0.18.3.** Clears RUSTSEC-2026-0594, where private cookie nonces can repeat in processes that fork. The private-cookie feature is off in this build, so this is a lockfile-only bump that clears `cargo audit`.
+- **The scheduled Security workflow passes again.** It scans the full history of every branch, and it had failed six weeks running. All 43 findings were triaged and none is a credential. The existing allowlist covered 41; the two left were the same sample JWT token (a cut-off signature) in a paste test, in two old commits. They are now ignored by fingerprint, so a new leak still fails the scan. The workflow can also be started by hand from the Actions tab.
+
+### Docs
+
+- **New page: "How the companion thinks."** It says how a companion look starts, what the model sees, what is checked, what it costs and how to turn it off.
+- **The switch lines match the code.** The features, privacy and troubleshooting pages and the setup text now say what `CSR_NO_DREAMING=1`, the Dreams row in `/config` and `CSR_NO_AI_NARRATIVES=1` each stop. `CSR_NO_AI_NARRATIVES=1` stops the dream model calls; the local dream cycle and the companion's looks keep running.
+
 ## [10.1.1] - 2026-11-24
 
 Fixes from the first week of 10.1.0. Most came from two checks made after the release: reading 30 deleted sessions back through the shipped MCP server (28 of 30 came back whole), and an install on a clean account with no login session. There is no data migration. Upgrade as for any release (`npm install -g claude-self-reflect` then `claude-self-reflect setup`, or run `scripts/install.sh` again), then restart Claude Code.
