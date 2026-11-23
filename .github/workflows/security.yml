@@ -6,6 +6,9 @@ on:
   pull_request:
   schedule:
     - cron: '0 2 * * 1'
+  # Run the full-history scan by hand: the scheduled scan and a pull request's scan
+  # differ, so a fix for the scheduled one could not be checked before Monday.
+  workflow_dispatch:
 
 permissions:
   contents: read
