@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [10.1.2] - unreleased
+## [10.1.2] - 2026-11-23
 
 A fixes release. There is no data migration. Upgrade as for any release (`npm install -g claude-self-reflect` then `claude-self-reflect setup`, or run `scripts/install.sh` again), then restart Claude Code.
 
@@ -25,7 +25,7 @@ A fixes release. There is no data migration. Upgrade as for any release (`npm in
 - **New page: "How the companion thinks."** It says how a companion look starts, what the model sees, what is checked, what it costs and how to turn it off.
 - **The switch lines match the code.** The features, privacy and troubleshooting pages and the setup text now say what `CSR_NO_DREAMING=1`, the Dreams row in `/config` and `CSR_NO_AI_NARRATIVES=1` each stop. `CSR_NO_AI_NARRATIVES=1` stops the dream model calls; the local dream cycle and the companion's looks keep running.
 
-## [10.1.1] - 2026-11-24
+## [10.1.1] - 2026-11-23
 
 Fixes from the first week of 10.1.0. Most came from two checks made after the release: reading 30 deleted sessions back through the shipped MCP server (28 of 30 came back whole), and an install on a clean account with no login session. There is no data migration. Upgrade as for any release (`npm install -g claude-self-reflect` then `claude-self-reflect setup`, or run `scripts/install.sh` again), then restart Claude Code.
 
