@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  EXPECTED_SHA256: ec656a84e123176bd9fa188ddac0e860a752e83365db182a1060b080d4c892ea
+  EXPECTED_SHA256: 80589a2af7671196416a1cfc56de2e0b9fac3a56a11bbc2968d4533c320f9667
   DAEMON_LABEL: com.ramakay.csr-engine.daemon
   # Branch whose scripts/install.sh the curl job runs. main is the README line; set a fix
   # branch here to test it before merge, and set it back after.
@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        path: [curl, npm]
+        path: [curl, npm, upgrade]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,6 +73,17 @@ jobs:
           set -o pipefail
           node --version; npm --version
           time npm install -g claude-self-reflect 2>&1 | tee install.log
+          time claude-self-reflect setup 2>&1 | tee -a install.log
+      # The 10.1.1 upgrade fix: npm skips the install script, and setup still brings the engine up to date.
+      - name: Install 10.1.0, then upgrade with the install script skipped
+        if: matrix.path == 'upgrade'
+        run: |
+          set -o pipefail
+          node --version; npm --version
+          npm install -g claude-self-reflect@10.1.0 2>&1 | tee install.log
+          claude-self-reflect setup 2>&1 | tee -a install.log
+          "$HOME/.local/bin/csr-engine" --version | tee -a install.log | grep -qx 'csr-engine 10.1.0'
+          npm install -g --ignore-scripts claude-self-reflect@latest 2>&1 | tee -a install.log
           time claude-self-reflect setup 2>&1 | tee -a install.log
       - name: Binary is the published one
         run: |
