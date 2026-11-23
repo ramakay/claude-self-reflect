@@ -86,6 +86,9 @@ pub fn dreamer_tag(c: &Composition) -> Option<&'static str> {
     match c.dream.state {
         Batch::Ready => None,
         _ if c.offer => None,
+        _ if c.offer_notice.as_deref() == Some(super::dreams::STOPPED) => {
+            Some(super::dreams::STOPPED_TAG)
+        }
         Batch::Dreaming => Some("Dreaming"),
         _ => Some("Looks as you work"),
     }

@@ -267,6 +267,30 @@ pub fn dreams_on_in(settings: &Value) -> bool {
             name.split('@').next() == Some("csr-companion") && c["options"]["dreams"] == false
         })
 }
+/// What every surface says while `CSR_NO_DREAMING` has stopped dreams. The variable wins over the
+/// `/config` Dreams row, whether the row is on or off.
+pub const STOPPED: &str = "Dreams are stopped. CSR_NO_DREAMING is set where Claude Code runs. \
+Unset it and start Claude Code again to dream.";
+/// The card title's short form: it keeps the variable's name.
+pub const STOPPED_TAG: &str = "Stopped by CSR_NO_DREAMING";
+/// Whether the app found `CSR_NO_DREAMING` set: it writes the fact into the session's usage file
+/// (`usage::measure`), and the pane's own process (herdr starts it, so its environment is not
+/// Claude Code's) reads it back as `claude_fields.dreams_stopped`.
+pub fn stopped(data: &Value) -> bool {
+    data["claude_fields"]["dreams_stopped"] == true
+}
+/// Whether the pane offers to turn dreams on: the row is off and the variable is not set. A press
+/// cannot help under the variable.
+pub fn offered(data: &Value) -> bool {
+    data["dreams_on"].as_bool() == Some(false) && !stopped(data)
+}
+/// The notice under the dreamer card: the stopped words under the variable, else the pane's own.
+pub fn offer_notice(data: &Value) -> Option<String> {
+    if stopped(data) {
+        return Some(STOPPED.to_owned());
+    }
+    data["offer_notice"].as_str().map(str::to_owned)
+}
 pub fn feed(dreams: &[Value], chapter: &Value, sid: &str) -> Value {
     let mine: Vec<_> = dreams
         .iter()

@@ -49,7 +49,21 @@ pub fn usage_fields(usage: &Value) -> Value {
         limits.insert(kind.to_owned(), Value::Object(window));
     }
     out.insert("rate_limits".into(), Value::Object(limits));
+    // Set only while `CSR_NO_DREAMING` stops dreams: the pane reads it as `dreams::stopped`.
+    if usage["dreamsStopped"] == true {
+        out.insert("dreams_stopped".into(), json!(true));
+    }
     Value::Object(out)
+}
+
+/// Whether the session's fresh usage file says `CSR_NO_DREAMING` has stopped dreams. It is the
+/// one field of [`kept_status`] that the status text needs, read without the transcript.
+pub fn dreams_stopped(paths: &Paths, sid: &str, now: f64) -> bool {
+    let usage = paths
+        .kept_file(super::usage::FOLDER, sid)
+        .map(|p| read_json(&p))
+        .unwrap_or(Value::Null);
+    usage["dreamsStopped"] == true && now - num(&usage["at"]) < KEPT_FOR
 }
 
 /// One session's masthead fields: its usage file when a fresh one exists, plus `prompt_cache`

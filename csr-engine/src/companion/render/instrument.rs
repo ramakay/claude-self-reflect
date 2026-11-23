@@ -350,7 +350,7 @@ impl Composition {
                 .is_none_or(|n| n <= 0.)
                 && array(&s["main"]).is_empty()
                 && array(&s["prompts"]).is_empty();
-        let offer = data["dreams_on"].as_bool() == Some(false);
+        let offer = dreams::offered(data);
         let state = if !top.is_null() {
             Batch::Ready
         } else if matches!(string(&look["outcome"]), "dreaming" | "started") {
@@ -574,7 +574,7 @@ impl Composition {
                 .filter(|_: &crate::companion::repo_recap::RepoRecap| empty_session),
             request_compactions: recent_request_compactions(s),
             offer,
-            offer_notice: data["offer_notice"].as_str().map(str::to_owned),
+            offer_notice: dreams::offer_notice(data),
             learnt: array(&data["learnt"])
                 .iter()
                 .filter_map(|v| {

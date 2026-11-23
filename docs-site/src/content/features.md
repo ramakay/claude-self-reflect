@@ -35,7 +35,7 @@ A separate learnt line lists what Self-Reflect stored for the previous session: 
 
 Dreaming runs in the background and is on by default. A dream checks old conclusions against your git history. When a conclusion no longer holds, search marks it `[stale anchor]` or `[evolved]` and cites the commit.
 
-- `CSR_NO_DREAMING=1` stops the daemon's dream cycle and the companion's looks, even when Dreams is on in `/config`. The Dreams row in `/config` stops the companion's looks only. The companion reads the variable from the environment Claude Code runs in. The daemon reads it from its launchd agent, and setup copies the `CSR_*` variables of the environment it runs in into that agent, so a variable you export in a running session does not reach the companion until Claude Code starts again, and it does not reach an installed daemon until you run setup again.
+- `CSR_NO_DREAMING=1` stops the daemon's dream cycle and the companion's looks, even when Dreams is on in `/config`. The Dreams row in `/config` stops the companion's looks only. With the variable set, the pane, `/csr dreams` and the status text say that dreams are stopped, with the row on or off. The companion reads the variable from the environment Claude Code runs in. The daemon reads it from its launchd agent, and setup copies the `CSR_*` variables of the environment it runs in into that agent, so a variable you export in a running session does not reach the companion until Claude Code starts again, and it does not reach an installed daemon until you run setup again.
 - `CSR_DREAM_INTERVAL_SECS` changes the six-hour default.
 - `csr-engine dreams` prints this week's dream for each project. `csr-engine dream` runs one cycle.
 

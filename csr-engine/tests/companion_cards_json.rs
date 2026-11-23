@@ -98,6 +98,25 @@ fn the_cards_ask_adds_the_contract_to_the_same_summary() {
     assert_eq!(cards, plain);
 }
 
+/// The status text reads the session's usage file: the app writes `dreamsStopped` there while
+/// `CSR_NO_DREAMING` is set where Claude Code runs.
+#[test]
+fn the_status_text_does_not_read_as_on_while_the_usage_file_says_stopped() {
+    let (_home, paths) = rich_home();
+    let status = |paths: &Paths| {
+        let got = contract::pane_json(paths, &json_args(&["--json"]), SID, NOW);
+        got["status"].as_str().unwrap().to_owned()
+    };
+    assert!(status(&paths).ends_with("4 dreams this week"));
+    let file = paths.keep.join("usage").join(format!("{SID}.json"));
+    let mut usage: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    usage["dreamsStopped"] = Value::Bool(true);
+    std::fs::write(&file, usage.to_string()).unwrap();
+    let stopped = status(&paths);
+    assert!(stopped.ends_with("dreams stopped by CSR_NO_DREAMING"));
+    assert!(!stopped.contains("dreams this week"));
+}
+
 #[test]
 fn cards_without_json_is_refused() {
     let (_home, paths) = rich_home();

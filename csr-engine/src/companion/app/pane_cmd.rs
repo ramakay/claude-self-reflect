@@ -27,7 +27,7 @@ mod tests;
 
 use super::{
     setup_walk,
-    state::{config_row, config_rows, update, Options},
+    state::{config_row, config_rows, dreaming_switched_off, update, Options},
 };
 use crate::companion::{
     relay::{
@@ -390,6 +390,9 @@ async fn dreams_on(cx: &Ctx) -> bool {
 }
 
 async fn dreams_say(cx: &Ctx) -> String {
+    if dreaming_switched_off(cx).await {
+        return crate::companion::dreams::STOPPED.to_string();
+    }
     let on = dreams_on(cx).await;
     dreams_text::dreams_text(cx, on)
 }
@@ -468,7 +471,8 @@ fn on_pane() -> Handler {
         let on = dreams_on(&cx).await;
         let turned = cx.kept(|s: &mut PaneState| s.turned_on);
         let cols = e["props"]["bodyColumns"].as_f64().unwrap_or(40.).max(0.) as usize;
-        let tree = pane::render(data.as_ref(), lasting.as_ref(), on, turned, cols);
+        let stopped = dreaming_switched_off(&cx).await;
+        let tree = pane::render(data.as_ref(), lasting.as_ref(), on, stopped, turned, cols);
         Ok(Reply::tree(tree))
     })
 }
