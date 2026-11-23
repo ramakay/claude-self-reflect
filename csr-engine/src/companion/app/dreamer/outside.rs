@@ -25,7 +25,8 @@ use std::{
     time::Duration,
 };
 
-/// A lease step, a brief and a `git cat-file` each get two seconds, as `process.run` did.
+/// A lease step and a `git cat-file` each get two seconds, as `process.run` did. The brief has no
+/// time limit: `Here::brief` waits for `brief_of` to finish.
 const STEP_LIMIT: Duration = Duration::from_secs(2);
 /// Where the lease files live, under the pane's folder (`LEASES` in the TypeScript companion).
 const LEASES: &str = "dreamer-lease";
@@ -133,6 +134,7 @@ impl Outside for Here {
         }
     }
 
+    /// The brief as a whole has no time limit: a blocking thread runs it and this awaits the end.
     async fn brief(&self, cwd: &str, session: &str, now: f64) -> Option<String> {
         let (cwd, session) = (cwd.to_string(), session.to_string());
         let work = tokio::task::spawn_blocking(move || brief_of(&cwd, &session, now));
