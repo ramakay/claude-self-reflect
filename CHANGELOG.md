@@ -14,6 +14,7 @@ A fixes release. There is no data migration. Upgrade as for any release (`npm in
 ### Companion
 
 - **`CSR_NO_DREAMING=1` now stops the companion's looks.** Before, it stopped only the daemon's dream cycle, and the pages said it stopped dreams. The companion's looks (the main schedule, an agent's completion look, the compaction carry-over and the prompts kept for the dreamer) were gated only by the Dreams row in `/config`. The variable now also stops them, and it wins over a Dreams row that is on. `1` or `true` in any case turns it on, the same rule the daemon uses. The companion reads the variable from the environment Claude Code runs in; an installed daemon sees it only after `claude-self-reflect setup` runs again with it set, and the setup text now says so.
+- **A Dreams row turned off in `/config` mid-session now stops the look for a finished agent.** Before, the part of the companion that watches agents asked `/config` once and kept the answer. A row you turned off (or on) after that read was ignored by the look for a finished agent until Claude Code started again, so an agent that reported could still start a look. The row is now read each time, as the main schedule already read it. A look that is already running is not cancelled.
 
 ### Security
 
