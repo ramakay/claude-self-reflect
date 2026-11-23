@@ -118,12 +118,15 @@ pub fn record_consent(storage: &Storage, granted: bool) -> Result<()> {
     )
 }
 
-/// `CSR_NO_DREAMING` kill switch — same "1"/"true" (case-insensitive) idiom
-/// as `crate::narrative::narratives_disabled`.
+/// `CSR_NO_DREAMING` kill switch: `1` or `true`, any case, no trim. A pure function of the value,
+/// so the companion (which reads env through its host) and the daemon share one rule.
+pub fn dreaming_disabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// The switch as the daemon's own environment has it.
 pub fn dreaming_disabled() -> bool {
-    std::env::var("CSR_NO_DREAMING")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    dreaming_disabled_from(std::env::var("CSR_NO_DREAMING").ok().as_deref())
 }
 
 /// Configured cadence interval: `CSR_DREAM_INTERVAL_SECS` override (must
@@ -1776,16 +1779,12 @@ mod tests {
 
     #[test]
     fn kill_switch_recognizes_1_and_true_case_insensitively() {
-        let _guard = env_guard();
-        std::env::set_var("CSR_NO_DREAMING", "1");
-        assert!(dreaming_disabled());
-        std::env::set_var("CSR_NO_DREAMING", "true");
-        assert!(dreaming_disabled());
-        std::env::set_var("CSR_NO_DREAMING", "TRUE");
-        assert!(dreaming_disabled());
-        std::env::set_var("CSR_NO_DREAMING", "0");
-        assert!(!dreaming_disabled());
-        std::env::remove_var("CSR_NO_DREAMING");
+        for on in ["1", "true", "TRUE", "True"] {
+            assert!(dreaming_disabled_from(Some(on)));
+        }
+        for off in [None, Some(""), Some("0"), Some("false"), Some(" 1")] {
+            assert!(!dreaming_disabled_from(off));
+        }
     }
 
     #[tokio::test]

@@ -35,7 +35,7 @@ use self::{
 use super::{
     fleet::{self, arm_completions, completions, DreamCall, Fleet},
     pace::{counted_chapter, fresh, install_keep, tokens_of},
-    state::{config_rows, is_person, update, Options},
+    state::{config_rows, dreaming_switched_off, is_person, update, Options},
 };
 use crate::companion::{
     relay::{
@@ -114,8 +114,9 @@ where
     host.detach(Box::new(move |host| Box::pin(work(Ctx { host, ..cx }))));
 }
 
+/// Dreams are on unless the person turned them off in `/config` or set `CSR_NO_DREAMING`.
 async fn dreams_on(cx: &Ctx) -> bool {
-    Options::of(&config_rows(cx).await).dreams
+    !dreaming_switched_off(cx).await && Options::of(&config_rows(cx).await).dreams
 }
 
 // ---------------------------------------------------------------- step

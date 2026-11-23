@@ -537,3 +537,6 @@ mod dream_tests;
 
 #[path = "tests/dream_fork_tests.rs"]
 mod dream_fork_tests;
+
+#[path = "tests/switch_tests.rs"]
+mod switch_tests;

@@ -165,8 +165,9 @@ async fn options(cx: &Ctx) -> Options {
     }
 }
 
+/// The switch is read on every call, never kept in `Fleet.options`, so it takes effect at once.
 async fn dreams_on(cx: &Ctx) -> bool {
-    options(cx).await.dreams
+    !state::dreaming_switched_off(cx).await && options(cx).await.dreams
 }
 
 // ---------------------------------------------------------------- the state, in the store
