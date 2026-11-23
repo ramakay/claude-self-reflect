@@ -864,3 +864,6 @@ mod view_tests;
 
 #[path = "query_tests/slice_tests.rs"]
 mod slice_tests;
+
+#[path = "query_tests/slice_page_tests.rs"]
+mod slice_page_tests;

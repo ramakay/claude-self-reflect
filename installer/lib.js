@@ -124,6 +124,96 @@ export function planInstall({ destPath, pkgVersion, probe = probeVersion }) {
 }
 
 /**
+ * A version as its three numbers and its prerelease identifiers, or null.
+ * `10.1.1-rc.2+build.7` is `{ numbers: ['10', '1', '1'], pre: ['rc', '2'] }`:
+ * build metadata has no place in the order. The numbers stay strings of digits,
+ * so the order is exact at any length (see compareDigits).
+ */
+function versionParts(version) {
+  const token = parseVersion(version);
+  if (!token) return null;
+  const parts = token.split('.');
+  const rest = parts.slice(2).join('.');
+  let i = 0;
+  while (i < rest.length && rest[i] >= '0' && rest[i] <= '9') i += 1;
+  const suffix = rest.slice(i).split('+')[0];
+  return {
+    numbers: [parts[0], parts[1], rest.slice(0, i)],
+    pre: suffix.startsWith('-') ? suffix.slice(1).split('.') : [],
+  };
+}
+
+/**
+ * Order of two strings of digits as numbers. No conversion to a JavaScript
+ * number: past 2^53 two different values round to the same one.
+ */
+function compareDigits(x, y) {
+  const significant = (digits) => {
+    let i = 0;
+    while (i < digits.length - 1 && digits[i] === '0') i += 1;
+    return digits.slice(i);
+  };
+  const a = significant(x);
+  const b = significant(y);
+  if (a.length !== b.length) return a.length - b.length;
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}
+
+/** Semver order of two versionParts values: negative when `a` is the older one. */
+function compareVersions(a, b) {
+  for (let i = 0; i < 3; i += 1) {
+    const order = compareDigits(a.numbers[i], b.numbers[i]);
+    if (order !== 0) return order;
+  }
+  // A prerelease is older than the release with the same numbers.
+  if (a.pre.length === 0 || b.pre.length === 0) return b.pre.length - a.pre.length;
+
+  for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i += 1) {
+    const x = a.pre[i];
+    const y = b.pre[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x === y) continue;
+    const xNumber = DIGITS.test(x);
+    const yNumber = DIGITS.test(y);
+    if (xNumber && yNumber) {
+      const order = compareDigits(x, y);
+      if (order !== 0) return order;
+    } else if (xNumber !== yNumber) {
+      return xNumber ? -1 : 1;
+    } else {
+      return x < y ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+/**
+ * Whether the engine this package manages is older than the package. Returns
+ * `{ installed, wanted }`, or null when there is nothing to do. `installed` is
+ * null for an engine that cannot say its version, which every release up to
+ * 9.5.7 cannot; that engine counts as older.
+ *
+ * Only an older engine counts. A newer one stays: the curl installer fetches the
+ * latest release, which can be ahead of the npm package, and a command that put
+ * the package's version back would undo that on every run. An engine found
+ * anywhere but `destPath` is the person's own copy and is never judged.
+ */
+export function outdatedEngine({ binary, destPath, pkgVersion, probe = probeVersion }) {
+  const wanted = versionParts(pkgVersion);
+  if (!wanted || realPath(binary) !== realPath(destPath)) return null;
+
+  const installedVersion = probe(binary);
+  const installed = versionParts(installedVersion);
+  if (!installed) return { installed: null, wanted: pkgVersion };
+
+  return compareVersions(installed, wanted) < 0
+    ? { installed: installedVersion, wanted: pkgVersion }
+    : null;
+}
+
+/**
  * Put `sourcePath` at `destPath` without ever writing through the destination.
  *
  * Copying straight onto the destination follows a symlink or hard link sitting
@@ -489,4 +579,95 @@ export function formatPendingActivation({ stale, destPath }) {
 export function activationCommand({ destPath, pathBinary }) {
   if (pathBinary && realPath(pathBinary) === realPath(destPath)) return BINARY_NAME;
   return shellQuote(destPath);
+}
+
+/** The install line that works for every install route, npm included. */
+export const MANUAL_INSTALL_COMMAND =
+  'curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh';
+
+/**
+ * The reason line of a failed install step, or ''. postinstall.js reports a
+ * failure as "Binary download failed: <reason>" or "Postinstall error: <reason>"
+ * on stderr; anything else (a crash, a signal) has no line worth quoting.
+ */
+export function installFailureReason(output) {
+  const plain = String(output || '').replace(/\x1b\[[0-9;]*m/g, '');
+  const match = plain.match(/(?:download failed|Postinstall error):\s*(.+)/);
+  return match ? match[1].trim() : '';
+}
+
+/**
+ * Make sure there is an engine to run.
+ *
+ * npm 11.20 and later do not run a package's postinstall until the person
+ * allows it, so a fresh `npm install -g` can leave no binary behind. The first
+ * command then runs the same install step postinstall would have run, once.
+ * Returns the binary path, or null after one short message that names the
+ * command to run by hand.
+ *
+ * An upgrade has the same gap: the new package arrives and the engine of the
+ * release before it stays. outdated() says when the engine that is there is
+ * older than the package. What happens then depends on `update`:
+ *
+ * - `update` true (setup, the upgrade step): the install step runs once before
+ *   the command. If it does not bring the engine up to date, one message names
+ *   the command to run by hand and the command runs with the engine that is
+ *   there.
+ * - `update` false (every other command): one line names the command that
+ *   updates the engine, and the command runs with the engine that is there. A
+ *   command that only reads never waits on a download, never repeats one, and
+ *   never restarts the daemon.
+ *
+ * A current engine costs one `find` call and one outdated() call.
+ *
+ * find() returns a path or null. install() runs the install step and throws
+ * when it fails; the thrown error's stderr or message is the reason source.
+ * outdated(path) returns `{ installed, wanted }` (see outdatedEngine) or null.
+ */
+export function ensureEngineBinary({ find, install, say, outdated = () => null, update = false }) {
+  const attempt = () => {
+    try {
+      install();
+      return '';
+    } catch (e) {
+      return installFailureReason(e && (e.stderr || e.message));
+    }
+  };
+
+  const present = find();
+  if (present) {
+    const old = outdated(present);
+    if (!old) return present;
+
+    const versions =
+      `the engine here is ${old.installed || 'an older build'} and this package is ${old.wanted}`;
+    if (!update) {
+      say(`Self-Reflect: ${versions}. To update the engine, run: claude-self-reflect setup`);
+      return present;
+    }
+
+    say(`Self-Reflect: ${versions}. Updating the engine now.`);
+    const reason = attempt();
+    const updated = find();
+    if (updated && !outdated(updated)) return updated;
+
+    say(
+      `Self-Reflect could not update the engine${reason ? ` (${reason})` : ''}. ` +
+        'This command runs with the engine that is here.'
+    );
+    say('To update it, run:');
+    say(`  ${MANUAL_INSTALL_COMMAND}`);
+    return updated || present;
+  }
+
+  say('Self-Reflect: the engine is not installed yet (npm skipped the install script). Installing it now.');
+  const reason = attempt();
+
+  const installed = find();
+  if (installed) return installed;
+
+  say(`Self-Reflect could not install the engine${reason ? ` (${reason})` : ''}.`);
+  say('Run this command, then run your command again:');
+  say(`  ${MANUAL_INSTALL_COMMAND}`);
+  return null;
 }

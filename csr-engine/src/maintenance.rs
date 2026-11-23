@@ -180,6 +180,30 @@ pub(crate) fn release_for_test(lock: MaintenanceLock) {
     }
 }
 
+/// Return only once no process holds an flock on the file at `path`, for a test that has just
+/// dropped the guard of such a lock and is about to take it again in one attempt.
+///
+/// The cause is the one `release_for_test` describes: a process another test is spawning holds a
+/// copy of the open file description until its exec, so closing our descriptor is not always
+/// the release. This asks every 10 ms, for at most 5 s. The probe lock is unlocked by hand
+/// before it returns, so a child forked while the probe held it cannot keep it held.
+#[cfg(test)]
+pub(crate) fn wait_flock_free_for_test(path: &Path) {
+    let file = File::open(path).expect("lock file opens");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if FileExt::try_lock_exclusive(&file).is_ok() {
+            FileExt::unlock(&file).expect("probe lock unlocks");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lock did not come free 5 s after its holder let go"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Exclusive ownership of a maintenance run. Clones retain the same OS lock.
 /// The file is never removed or renamed, including on errors and process exit.
 #[derive(Debug, Clone)]
@@ -722,7 +746,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn round4_ps_lookup_shares_preflight_deadline() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
         std::fs::write(&db, "").unwrap();
@@ -730,9 +753,7 @@ mod tests {
             ("lsof", "#!/bin/sh\n/bin/sleep 2\necho 4000000000\n"),
             ("ps", "#!/bin/sh\n/bin/sleep 5\necho late\n"),
         ] {
-            let path = dir.path().join(name);
-            std::fs::write(&path, body).unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_script::write_executable(&dir.path().join(name), body);
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([

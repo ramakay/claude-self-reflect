@@ -820,7 +820,7 @@ pub(crate) async fn keyword_fallback(
     };
     let dates = window
         .as_ref()
-        .map(|(start, end)| (start.to_rfc3339(), end.to_rfc3339()));
+        .map(|(start, end, _)| (start.to_rfc3339(), end.to_rfc3339()));
     let mut results = keyword_candidates(
         storage,
         query,
@@ -845,11 +845,11 @@ pub(crate) async fn keyword_fallback(
             results.truncate(limit);
             Ok(format::format_search_insights(&results, query))
         }
-        KeywordTool::Recency { time_range, .. } => {
-            let (start, end) = window.expect("recency window resolved before FTS");
+        KeywordTool::Recency { .. } => {
+            let (start, end, named) = window.expect("recency window resolved before FTS");
             results.truncate(limit);
-            let desc = temporal::describe_window(time_range, &start, &end);
-            let hint = page::recency_hint(time_range, &start, &end, &results);
+            let desc = temporal::describe_window(named, &start, &end);
+            let hint = page::recency_hint(named, &start, &end, &results);
             Ok(format::format_recency_results_hinted(
                 &results,
                 query,
@@ -4740,93 +4740,10 @@ pub async fn get_recent_work(
     Ok(format::format_recent_work(&chunks, group_by, &notes))
 }
 
-fn recency_window(
-    time_range: Option<&str>,
-    since: Option<&str>,
-    until: Option<&str>,
-) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
-    Ok(if let Some(tr) = time_range {
-        temporal::parse_time_expression(tr)?
-    } else if since.is_some() || until.is_some() {
-        let s = if let Some(s) = since {
-            temporal::parse_time_expression(s)?.0
-        } else {
-            chrono::Utc::now() - chrono::Duration::days(7)
-        };
-        let e = if let Some(u) = until {
-            temporal::parse_time_expression(u)?.1
-        } else {
-            chrono::Utc::now()
-        };
-        (s, e)
-    } else {
-        let now = chrono::Utc::now();
-        (now - chrono::Duration::days(7), now)
-    })
-}
-
-/// Time-constrained semantic search.
-#[allow(clippy::too_many_arguments)]
-pub async fn search_by_recency(
-    storage: &Arc<Storage>,
-    embeddings: &Arc<EmbeddingEngine>,
-    search: &Arc<RwLock<SearchEngine>>,
-    query: &str,
-    time_range: Option<&str>,
-    since: Option<&str>,
-    until: Option<&str>,
-    limit: usize,
-    min_score: f32,
-    project: Option<&str>,
-) -> Result<String> {
-    validate_page(0, limit)?;
-    let (start, end) = recency_window(time_range, since, until)?;
-
-    let start_str = start.to_rfc3339();
-    let end_str = end.to_rfc3339();
-    // The exact bounds searched, in the header, so a window that is not the one
-    // the caller meant ("last month" is the previous calendar month) is seen.
-    // `recency_window` reads `time_range` first, so it alone names the window.
-    let named = time_range;
-    let time_desc = temporal::describe_window(named, &start, &end);
-
-    // Get chunk IDs within time range, then do filtered HNSW search
-    let time_ids: HashSet<String> = storage
-        .get_chunk_ids_in_timerange(&start_str, &end_str, project)?
-        .into_iter()
-        .collect();
-
-    if time_ids.is_empty() {
-        let hint = page::recency_hint(named, &start, &end, &[]);
-        return Ok(format::format_recency_results_hinted(
-            &[],
-            query,
-            &time_desc,
-            hint.as_deref(),
-        ));
-    }
-
-    let query_vec = embed_query(embeddings, query).await?;
-    // Overfetch + partition over the full candidate set + single adaptive
-    // refetch + truncate — see `fetch_enrich_partition_adaptive`.
-    let enriched = {
-        let idx = search.read().await;
-        fetch_enrich_partition_adaptive(
-            storage,
-            |n| idx.search_chunks_filtered(&query_vec, n, min_score, &time_ids),
-            query,
-            limit,
-            consumption_mode_for_partition(validity_partition_enabled()),
-        )?
-    };
-    let hint = page::recency_hint(named, &start, &end, &enriched);
-    Ok(format::format_recency_results_hinted(
-        &enriched,
-        query,
-        &time_desc,
-        hint.as_deref(),
-    ))
-}
+#[path = "recency_tool.rs"]
+mod recency;
+use recency::recency_window;
+pub use recency::search_by_recency;
 
 #[path = "tools_timeline.rs"]
 mod timeline;
@@ -5963,21 +5880,21 @@ pub(crate) enum ConversationLookup {
     Ambiguous(Vec<(String, String)>),
 }
 
-/// Locate a conversation's JSONL file by id across `projects_dir`
-/// (optionally scoped to a project-name substring). Shared by
-/// `get_full_conversation` and `crate::transcript::resolve_session_path` so
-/// both surfaces agree on exactly one lookup rule: an exact stem match
-/// always wins outright; otherwise every distinct substring match is
-/// collected and, if more than one remains, the lookup is reported
-/// `Ambiguous` rather than picking whichever the filesystem enumerated
-/// first (`read_dir` order is not guaranteed and is not stable across
-/// machines).
+/// Locate a conversation's JSONL file by id across `projects_dir`, including a
+/// subagent's `<session>/subagents/agent-*.jsonl` (optionally scoped to a
+/// project-name substring). Shared by `get_full_conversation` and
+/// `crate::transcript::resolve_session_path` so both surfaces agree on exactly
+/// one lookup rule: an exact stem match always wins outright; otherwise every
+/// distinct substring match is collected and, if more than one remains, the
+/// lookup is reported `Ambiguous` rather than picking whichever the filesystem
+/// enumerated first (`read_dir` order is not guaranteed and is not stable
+/// across machines).
 pub(crate) fn find_conversation_file(
     projects_dir: &Path,
     conversation_id: &str,
     project: Option<&str>,
 ) -> ConversationLookup {
-    find_transcript_file(projects_dir, ".jsonl", conversation_id, project, false)
+    find_transcript_file(projects_dir, ".jsonl", conversation_id, project, true)
 }
 
 /// The same lookup over the transcript mirror's `<project>/<id>.jsonl.zst`
@@ -5998,7 +5915,7 @@ pub(crate) fn find_mirrored_conversation(
 
 /// `find_conversation_file`'s one rule, parameterized by the root to search and
 /// the file-name suffix that marks a transcript there. `nested` also looks in
-/// `<project>/<session>/subagents/agent-*` (the mirror archives those); a hit
+/// `<project>/<session>/subagents/agent-*` (live and mirrored alike); a hit
 /// there still reports its top-level project.
 fn find_transcript_file(
     projects_dir: &Path,
@@ -6216,137 +6133,12 @@ fn format_ambiguous_conversation(conversation_id: &str, candidates: &[(String, S
     )
 }
 
-/// Server-side cap on `csr_transcript`'s response, applied regardless of the
-/// caller's requested `budget_chars` — bounds a misbehaving/huge request
-/// against the MCP response size, matching the design doc's "token budget
-/// enforced server-side" (Option C rationale).
-const MCP_TRANSCRIPT_MAX_BUDGET_CHARS: usize = crate::transcript::MAX_BUDGET_CHARS;
-
 /// Bytes of rebuilt text `get_full_conversation` returns: under the 20 KB cap,
 /// room left for the closing envelope and the `csr_transcript` hint.
 const FULL_CONVERSATION_BUDGET_BYTES: usize = 18_000;
 
-/// Thin wrapper over [`crate::transcript::run`] for the `csr_transcript` MCP
-/// tool: validate the view/role/turns strings (never panics on a bad one —
-/// same fail-honest posture as the CLI, but returns the message as `Ok`
-/// content instead of exiting the process), clamp the budget, and dispatch
-/// through the exact same core the CLI uses.
-#[allow(clippy::too_many_arguments)]
-pub fn transcript(
-    projects_dir: &Path,
-    data_dir: Option<&Path>,
-    session: &str,
-    view: &str,
-    project: Option<&str>,
-    role: Option<&str>,
-    turns: Option<&str>,
-    last: Option<usize>,
-    grep: Option<&str>,
-    tool: Option<&str>,
-    json: bool,
-    budget_chars: Option<usize>,
-    sidechains: bool,
-    include_system: bool,
-    result_chars: Option<usize>,
-) -> Result<String> {
-    transcript_with_db(
-        projects_dir,
-        data_dir,
-        None,
-        session,
-        view,
-        project,
-        role,
-        turns,
-        last,
-        grep,
-        tool,
-        json,
-        budget_chars,
-        sidechains,
-        include_system,
-        result_chars,
-    )
-}
-
-/// [`transcript`], answering from the indexed chunks in `db` when the JSONL and
-/// the mirror copy are both gone.
-#[allow(clippy::too_many_arguments)]
-pub fn transcript_with_db(
-    projects_dir: &Path,
-    data_dir: Option<&Path>,
-    db: Option<&Storage>,
-    session: &str,
-    view: &str,
-    project: Option<&str>,
-    role: Option<&str>,
-    turns: Option<&str>,
-    last: Option<usize>,
-    grep: Option<&str>,
-    tool: Option<&str>,
-    json: bool,
-    budget_chars: Option<usize>,
-    sidechains: bool,
-    include_system: bool,
-    result_chars: Option<usize>,
-) -> Result<String> {
-    use crate::transcript::{parse_turns_spec, RoleFilter, TranscriptRequest, ViewKind};
-
-    let Some(view_kind) = ViewKind::parse(view) else {
-        return Ok(format!(
-            "<transcript_error>\n<error>unknown view '{view}' — expected one of: receipt, stats, prompts, yourasks, tools, files, errors, slice, grep</error>\n</transcript_error>"
-        ));
-    };
-    let role_filter = match role {
-        Some(r) => match RoleFilter::parse(r) {
-            Some(rf) => rf,
-            None => {
-                return Ok(format!(
-                    "<transcript_error>\n<error>unknown role '{r}' — expected one of: user, assistant, system, all</error>\n</transcript_error>"
-                ));
-            }
-        },
-        None => RoleFilter::All,
-    };
-    let parsed_turns = match turns {
-        Some(spec) => match parse_turns_spec(spec) {
-            Ok(range) => Some(range),
-            Err(e) => {
-                return Ok(format!(
-                    "<transcript_error>\n<error>{e}</error>\n</transcript_error>"
-                ));
-            }
-        },
-        None => None,
-    };
-
-    let req = TranscriptRequest {
-        session: session.to_string(),
-        view: view_kind,
-        project: project.map(str::to_string),
-        role: role_filter,
-        turns: parsed_turns,
-        last,
-        grep: grep.map(str::to_string),
-        tool: tool.map(str::to_string),
-        json,
-        budget_chars: budget_chars
-            .unwrap_or(crate::transcript::DEFAULT_BUDGET_CHARS)
-            .min(MCP_TRANSCRIPT_MAX_BUDGET_CHARS),
-        sidechains,
-        include_system,
-        result_chars,
-    };
-
-    Ok(crate::transcript::run_with_sources(
-        projects_dir,
-        data_dir,
-        db,
-        &req,
-    ))
-}
-
 pub use super::session_learnings::get_session_learnings;
+pub use super::transcript_tool::{transcript, transcript_with_db};
 
 // ─── Helpers ───
 

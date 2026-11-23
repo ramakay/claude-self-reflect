@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use super::*;
 use crate::story_map::ground::ground_shifts;
 use crate::story_map::store::{build_story_map, load_story_map, save_story_map};
+use crate::story_map::test_switch;
 use crate::story_map::{ShiftEntry, ShiftKind};
 
 #[allow(clippy::too_many_arguments)]
@@ -475,9 +476,6 @@ fn claim_is_ascii_and_at_most_72_chars() {
 
 #[test]
 fn kill_switch_returns_nothing() {
-    let _guard = crate::story_map::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     let storage = Storage::open_memory().unwrap();
     seed_evo_full(
         &storage,
@@ -492,9 +490,9 @@ fn kill_switch_returns_nothing() {
         "[]",
     );
 
-    std::env::set_var("CSR_NO_STORY_MAP", "1");
+    let switch = test_switch::on();
     let off = derive_receipt_shifts(&storage, "conv_1");
-    std::env::remove_var("CSR_NO_STORY_MAP");
+    drop(switch);
 
     assert!(off.is_empty());
     let on = derive_receipt_shifts(&storage, "conv_1");
@@ -1110,9 +1108,6 @@ fn swap_entries_ground_against_their_own_rows() {
 
 #[test]
 fn kill_switch_also_silences_swaps() {
-    let _guard = crate::story_map::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     let storage = Storage::open_memory().unwrap();
     seed_evo_swap(
         &storage,
@@ -1122,9 +1117,9 @@ fn kill_switch_also_silences_swaps() {
         NONE,
         NONE,
     );
-    std::env::set_var("CSR_NO_STORY_MAP", "1");
+    let switch = test_switch::on();
     let off = derive_receipt_shifts(&storage, "conv_1");
-    std::env::remove_var("CSR_NO_STORY_MAP");
+    drop(switch);
     assert!(off.is_empty());
     assert!(derive_receipt_shifts(&storage, "conv_1")
         .iter()

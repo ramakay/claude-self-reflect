@@ -1,4 +1,5 @@
 use super::*;
+use crate::transcript::query::slice::slice_result_limit;
 
 #[test]
 fn slice_last_n_returns_final_n_recognized_entries() {
@@ -50,7 +51,8 @@ fn budget_cut_reports_remaining_count_and_exact_resume_turn() {
     // Resume turn must be a turn that was NOT rendered.
     let resume_marker = out.lines().last().unwrap().to_string();
     assert!(resume_marker.starts_with("... "));
-    assert!(resume_marker.ends_with(".. to continue"));
+    // The request ended at turn 9, so the resumed call does too.
+    assert!(resume_marker.ends_with("..9 to continue"));
 }
 
 #[test]
@@ -65,7 +67,7 @@ fn budget_cut_json_carries_truncated_remaining_and_resume_fields() {
     let v: Value = serde_json::from_str(&out).expect("must still be valid JSON when truncated");
     assert_eq!(v["truncated"], json!(true));
     assert!(v["remaining"].as_u64().unwrap() > 0);
-    assert!(v["resume_turns"].as_str().unwrap().ends_with(".."));
+    assert!(v["resume_turns"].as_str().unwrap().ends_with("..9"));
     // Items array itself must be non-empty and short (proves the cut, not a crash).
     assert!(!v["items"].as_array().unwrap().is_empty());
     assert!(v["items"].as_array().unwrap().len() < 9);
@@ -787,30 +789,41 @@ fn a_cut_asks_hint_names_no_budget_when_the_default_holds_it() {
 #[test]
 fn a_cut_asks_hint_does_not_say_whole_when_no_budget_holds_it() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _) = write_long_ask_fixture(dir.path(), 90_000);
+    let (path, tail) = write_long_ask_fixture(dir.path(), 90_000);
     let listed = transcript::run(
         dir.path(),
         &base_req(ViewKind::YourAsks, &path.to_string_lossy()),
     );
     let hint = &listed[listed.find("[cut:").unwrap()..];
-    assert!(!hint.contains("shows it whole"), "got: {hint}");
-    assert!(hint.contains("shows its first"), "got: {hint}");
-    assert!(hint.contains("view=\"grep\""), "got: {hint}");
-    // The call it names shows exactly what it says, with no budget fit on top.
-    let first = hint_number(hint, "result_chars").unwrap();
-    let out = transcript::run(dir.path(), &slice_of_hint(&path, hint));
     assert!(
-        !out.contains("to fit budget_chars"),
-        "fitted down; hint: {hint}"
+        !hint.contains("shows it whole"),
+        "no call shows this turn whole"
     );
-    assert!(out.contains(&"a".repeat(first)), "hint: {hint}");
-    assert!(!out.contains(&"a".repeat(first + 1)), "hint: {hint}");
-    // That call's own note does not promise a whole turn either.
     assert!(
-        !out.contains("budget_chars="),
-        "got: {}",
-        &out[out.len() - 200..]
+        hint.contains("names the next call"),
+        "the hint names the paging call"
     );
+    assert!(hint.contains("view=\"grep\""), "the hint names grep");
+    // The call it names reads the turn to its end through the cut notes, 90,000 chars in all.
+    let (mut offset, mut seen) = (0, 0);
+    for _ in 0..10 {
+        let mut req = slice_of_hint(&path, hint);
+        req.offset = offset;
+        let out = transcript::run(dir.path(), &req);
+        let body = &out[out.find("[turn 1] ").unwrap()..];
+        let body = &body[body.find(": ").unwrap() + 2..];
+        let end = body
+            .find("\n[cut: turn 1 has ")
+            .unwrap_or(body.trim_end_matches('\n').len());
+        seen += body[..end].chars().count();
+        let Some(note) = out.find("\n[cut: turn 1 has ") else {
+            assert!(out.contains(&tail), "the last part holds the tail");
+            assert_eq!(seen, 90_000, "the parts add up to the turn");
+            return;
+        };
+        offset = hint_number(&out[note..], "offset").unwrap();
+    }
+    panic!("the cut notes did not reach the end of the turn");
 }
 
 #[test]

@@ -47,7 +47,10 @@ fn utc() {
 fn rich_home() -> (tempfile::TempDir, Paths) {
     utc();
     let rich = fixture().join("rich");
-    let d = tempfile::tempdir_in(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")).unwrap();
+    // A shared target dir (the build machine) leaves csr-engine/target absent; make it first.
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+    std::fs::create_dir_all(&base).unwrap();
+    let d = tempfile::tempdir_in(base).unwrap();
     let home = d.path().to_string_lossy().into_owned();
     copy_tree(&fixture().join("home"), d.path(), &home);
     copy_tree(&rich.join("home"), d.path(), &home);

@@ -525,7 +525,19 @@ mod tests {
         let err = try_build_lock(dir.path()).unwrap_err().to_string();
         assert!(err.contains("another generation build"), "{err}");
         drop(held);
-        assert!(try_build_lock(dir.path()).is_ok());
+        // A child process that another test starts can hold a copy of the
+        // lock's descriptor for an instant, so the lock may come free a moment
+        // after the drop. Ask again until it does, for at most 5 s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut taken = try_build_lock(dir.path()).is_ok();
+        while !taken && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            taken = try_build_lock(dir.path()).is_ok();
+        }
+        assert!(
+            taken,
+            "a second builder still could not take the lock 5 s after the first let go"
+        );
     }
 
     #[test]

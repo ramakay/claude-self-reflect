@@ -832,11 +832,6 @@ fn a_story_rewrite_never_finds_ledger_rows_in_prior_story() {
 
 #[test]
 fn a_story_rewrite_replaces_the_story_row_and_keeps_every_ledger_row() {
-    let _guard = crate::story_map::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("CSR_NO_STORY_MAP");
-
     let storage = std::sync::Arc::new(Storage::open_memory().unwrap());
     let embeddings = std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap());
     let search = std::sync::Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
@@ -941,11 +936,6 @@ fn a_story_rewrite_replaces_the_story_row_and_keeps_every_ledger_row() {
 /// Before and After sentences. A 4-field line in the same reply still lands.
 #[test]
 fn a_canned_five_field_reply_is_stored_with_before_and_after() {
-    let _guard = crate::story_map::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("CSR_NO_STORY_MAP");
-
     let prompt = build_prompt(&StoryContext {
         current_session_excerpt: String::new(),
         current_v3_enrichment: None,
@@ -1110,11 +1100,6 @@ fn test_sample_transcript_respects_char_cap() {
 
 #[test]
 fn prompts_ask_for_the_shifts_block_by_default() {
-    let _guard = crate::story_map::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("CSR_NO_STORY_MAP");
-
     let ctx = StoryContext {
         current_session_excerpt: "user: hello".to_string(),
         current_v3_enrichment: None,
@@ -1132,10 +1117,7 @@ fn prompts_ask_for_the_shifts_block_by_default() {
 
 #[test]
 fn kill_switch_leaves_both_prompts_byte_identical() {
-    let _guard = crate::story_map::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("CSR_NO_STORY_MAP", "1");
+    let switch = crate::story_map::test_switch::on();
 
     let ctx = StoryContext {
         current_session_excerpt: "user: hello".to_string(),
@@ -1146,7 +1128,7 @@ fn kill_switch_leaves_both_prompts_byte_identical() {
     let first_prompt = build_prompt(&ctx);
     let sum_prompt = summary_story_prompt("summary text", "tail text");
 
-    std::env::remove_var("CSR_NO_STORY_MAP");
+    drop(switch);
 
     assert!(!first_prompt.contains("@shifts"));
     assert!(first_prompt.ends_with("No preamble, no markdown headers."));

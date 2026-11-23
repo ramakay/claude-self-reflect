@@ -4,6 +4,8 @@
 //! reader takes a read of zero bytes for "nothing yet" and asks again at once, so a pane that
 //! only polls for events never comes back to its own loop: it burns a core and ignores signals.
 #![cfg(unix)]
+#[path = "support/exec_script.rs"]
+mod exec_script;
 use std::{
     fs,
     io::Read,
@@ -278,6 +280,21 @@ fn sigterm_straight_after_the_hangup_ends_the_pane() {
     pane.left_nothing_behind();
 }
 
+/// A SIGTERM that comes while the pane is removing its pipe, lock and pid file is the same
+/// SIGTERM straight after the hangup, landing late: the seam raises it right at the end of the
+/// pane's loop, after the terminal is given back and before those are removed. It must not end
+/// the pane half way through the removal and leave the lock behind.
+#[test]
+fn sigterm_during_the_cleanup_leaves_nothing_behind() {
+    let mut pane = Pane::start_with(false, &[("CSR_PANE_TEST_TERM_AT_END", "1")]);
+    pane.close_terminal();
+    assert!(
+        pane.ends_within(Duration::from_secs(3)).is_some(),
+        "the pane outlived its terminal"
+    );
+    pane.left_nothing_behind();
+}
+
 #[test]
 fn sigterm_ends_a_pane_whose_terminal_is_gone() {
     let mut pane = Pane::start(false);
@@ -370,7 +387,7 @@ fn running(pid: u32) -> String {
 fn a_reload_with_an_alarm_armed_leaves_the_new_engine_alive() {
     let mut pane = Pane::start_with(false, &[("CSR_PANE_TEST_ALARM", "1")]);
     let engine = pane.home.path().join("csr-engine-reloaded");
-    fs::copy(env!("CARGO_BIN_EXE_csr-engine"), &engine).unwrap();
+    exec_script::copy_executable(Path::new(env!("CARGO_BIN_EXE_csr-engine")), &engine);
     // Run the copy once and wait for it to exit before the pane is pointed at it: macOS scans a new
     // file the first time it runs (1.5 to 4.9 s on the dev laptop), and the pane gives its version
     // probe of the copy only 5 s.

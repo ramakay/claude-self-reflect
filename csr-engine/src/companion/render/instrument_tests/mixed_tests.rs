@@ -209,9 +209,105 @@ fn every_row_kind_has_its_mood_word() {
     assert_eq!(word(RiverKind::Commit, "~ "), "landed");
     assert_eq!(word(RiverKind::Agent, "○ "), "delegated");
     assert_eq!(word(RiverKind::Agent, "✓ "), "heard back");
+    assert_eq!(word(RiverKind::Agent, "✗ "), "no answer");
     assert_eq!(word(RiverKind::Write, "! "), "worried");
     assert_eq!(word(RiverKind::Commit, "! "), "worried");
     assert_eq!(word(RiverKind::Other, ""), "");
+}
+
+/// The Monologue page's text rows that name the "Scan the repo" agent, for one agent started 30
+/// min before a fixed `now`, quiet for `quiet` seconds, in `status`, with or without a completion.
+fn agent_timeline_rows(status: &str, quiet: f64, done: bool) -> Vec<String> {
+    let now = 1_800_000_000.;
+    let ms = |t: f64| (t * 1000.) as i64;
+    let completion = if done {
+        json!({"key":"k","turnId":"t","at":ms(now - 30.),"reason":"answer",
+            "answer":"Found it","disposition":"looked"})
+    } else {
+        Value::Null
+    };
+    let agent = json!({
+        "id":"a1","parent":null,"description":"Scan the repo","type":"Explore","model":null,
+        "status":status,"started":ms(now - 1800.),"first_seen":ms(now - 1800.),
+        "last_at":ms(now - quiet),"tools":3,"tokens":1200,"edits":[],"edits_omitted":0,
+        "overlaps":[],"overlaps_omitted":0,"last":"Reading","last_tool":"Read",
+        "current_turn":"turn-1","completion":completion,"listed":true,
+    });
+    let data = json!({"agents":{"agents":[agent],"omitted_agents":0,"at":ms(now)}});
+    let s = json!({"id":"tl","compacts":[],"main":[],"prompts":[]});
+    let c = Composition::build(&data, &s, now);
+    let open = Open {
+        threads: true,
+        ..Open::default()
+    };
+    page_text_rows(&c, 100, 40, open)
+        .into_iter()
+        .filter(|l| l.contains("Scan the repo"))
+        .collect()
+}
+
+#[test]
+fn a_running_agent_still_active_reads_delegated() {
+    assert_eq!(
+        agent_timeline_rows("running", 5., false),
+        ["30 min ago · ○ delegated · Scan the repo started"]
+    );
+}
+
+#[test]
+fn a_running_agent_quiet_for_600_seconds_reads_no_answer() {
+    assert_eq!(
+        agent_timeline_rows("running", 600., false),
+        ["30 min ago · ✗ no answer · Scan the repo started"]
+    );
+    // One second short of the stall threshold it is still delegated.
+    assert_eq!(
+        agent_timeline_rows("running", 599., false),
+        ["30 min ago · ○ delegated · Scan the repo started"]
+    );
+}
+
+#[test]
+fn a_failed_agent_with_no_completion_reads_no_answer() {
+    assert_eq!(
+        agent_timeline_rows("failed", 5., false),
+        ["30 min ago · ✗ no answer · Scan the repo started"]
+    );
+}
+
+#[test]
+fn a_killed_agent_with_no_completion_reads_no_answer() {
+    assert_eq!(
+        agent_timeline_rows("killed", 5., false),
+        ["30 min ago · ✗ no answer · Scan the repo started"]
+    );
+}
+
+#[test]
+fn a_completed_agent_with_no_completion_record_reads_delegated_at_any_age() {
+    // The agent list moves the status but never last_at, and the record lands later: a completed
+    // row's age says nothing about its answer.
+    for quiet in [5., 599., 600., 7200.] {
+        assert_eq!(
+            agent_timeline_rows("completed", quiet, false),
+            ["30 min ago · ○ delegated · Scan the repo started"]
+        );
+    }
+}
+
+#[test]
+fn a_completed_agent_with_a_completion_is_unchanged() {
+    let rows = agent_timeline_rows("completed", 5., true);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.contains(&"30 min ago · ○ delegated · Scan the repo started".to_string()));
+    assert!(rows.contains(&"just now · ✓ heard back · Scan the repo finished".to_string()));
+}
+
+#[test]
+fn a_failed_agent_that_did_complete_keeps_its_delegated_row() {
+    // Its completion record is its answer, even a failed one: no "no answer" while one exists.
+    let rows = agent_timeline_rows("failed", 5., true);
+    assert!(rows.contains(&"30 min ago · ○ delegated · Scan the repo started".to_string()));
 }
 
 #[test]

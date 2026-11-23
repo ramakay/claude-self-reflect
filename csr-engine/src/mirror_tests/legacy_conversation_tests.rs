@@ -606,6 +606,130 @@ fn archived_subagent_transcripts_are_found_in_the_mirror_by_id() {
     assert!(pointer.contains("ambiguous"), "got: {pointer}");
 }
 
+/// Put `text` as the one prompt of a mirror copy at `<mirror>/<rel>.jsonl.zst`.
+fn mirror_copy(rig: &Rig, rel: &str, text: &str) {
+    let path = transcripts_dir(&rig.data_dir).join(format!("{rel}.jsonl.zst"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, compress_frame(line(1, text).as_bytes()).unwrap()).unwrap();
+}
+
+/// Put `text` as the one prompt of a live JSONL at `<projects>/<rel>.jsonl`.
+fn live_copy(rig: &Rig, rel: &str, text: &str) {
+    let path = rig.projects.join(format!("{rel}.jsonl"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, line(1, text)).unwrap();
+}
+
+fn asks(rig: &Rig, session: &str) -> String {
+    crate::transcript::run_with_mirror(
+        &rig.projects,
+        Some(&rig.data_dir),
+        &crate::transcript::TranscriptRequest {
+            session: session.to_string(),
+            view: crate::transcript::ViewKind::YourAsks,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn a_live_subagent_file_is_read_before_its_mirror_copy() {
+    let rig = Rig::new();
+    live_copy(&rig, "-tmp-proj/sess-1/subagents/agent-c3d4", "live words");
+    mirror_copy(
+        &rig,
+        "-tmp-proj/sess-1/subagents/agent-c3d4",
+        "mirrored words",
+    );
+
+    let live = rig
+        .projects
+        .join("-tmp-proj/sess-1/subagents/agent-c3d4.jsonl");
+    for id in ["agent-c3d4", "c3d4", "agent-c3"] {
+        match crate::transcript::resolve_session_path(&rig.projects, Some(&rig.data_dir), id, None)
+        {
+            crate::mcp::tools::ConversationLookup::Found(path, project) => {
+                assert_eq!(path, live);
+                assert_eq!(project, "-tmp-proj");
+            }
+            _ => panic!("the id did not resolve to the live file"),
+        }
+        let out = asks(&rig, id);
+        assert!(out.contains("live words"), "the live words are missing");
+        assert!(!out.contains("mirrored words"), "the mirror was read");
+        assert!(!out.contains("is gone"), "the gone note was printed");
+        assert!(
+            !out.contains("transcript mirror"),
+            "the mirror note was printed"
+        );
+    }
+    let pointer = crate::mcp::tools::get_full_conversation(
+        &rig.projects,
+        Some(&rig.data_dir),
+        "agent-c3d4",
+        None,
+    );
+    assert!(
+        !pointer.contains("no longer exists"),
+        "the pointer says the original is gone"
+    );
+    assert!(
+        !pointer.contains("<mirror_path>"),
+        "the pointer names a mirror path"
+    );
+
+    // The same live id in a second project is still ambiguous.
+    live_copy(
+        &rig,
+        "-tmp-other/sess-2/subagents/agent-c3d4",
+        "other words",
+    );
+    let out = asks(&rig, "agent-c3d4");
+    assert!(out.contains("ambiguous"), "the lookup was not ambiguous");
+}
+
+#[test]
+fn a_subagent_with_no_live_file_is_read_from_the_mirror_with_the_note() {
+    let rig = Rig::new();
+    mirror_copy(
+        &rig,
+        "-tmp-proj/sess-1/subagents/agent-e5f6",
+        "mirrored words",
+    );
+    // A live file of another run must not capture the lookup.
+    live_copy(
+        &rig,
+        "-tmp-proj/sess-1/subagents/agent-0a0a",
+        "unrelated words",
+    );
+
+    let out = asks(&rig, "agent-e5f6");
+    assert!(out.contains("mirrored words"), "the mirror was not read");
+    assert!(
+        out.contains("the original JSONL is gone"),
+        "the gone note is missing"
+    );
+}
+
+#[test]
+fn a_main_thread_session_keeps_its_live_file_and_its_gone_note() {
+    let rig = Rig::new();
+    live_copy(&rig, "-tmp-proj/sess-live", "live words");
+    mirror_copy(&rig, "-tmp-proj/sess-live", "mirrored words");
+    mirror_copy(&rig, "-tmp-proj/sess-gone", "mirrored words");
+
+    let live = asks(&rig, "sess-live");
+    assert!(live.contains("live words"), "the live words are missing");
+    assert!(!live.contains("is gone"), "the gone note was printed");
+
+    let gone = asks(&rig, "sess-gone");
+    assert!(gone.contains("mirrored words"), "the mirror was not read");
+    assert!(
+        gone.contains("the original JSONL is gone"),
+        "the gone note is missing"
+    );
+}
+
 #[test]
 fn yourasks_reads_a_zstd_mirror_and_marks_the_source() {
     let rig = Rig::new();

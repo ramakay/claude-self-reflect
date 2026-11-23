@@ -12,6 +12,7 @@ pub mod synthetic;
 pub mod tasks;
 mod tool_guards;
 pub mod tools;
+mod transcript_tool;
 mod why_echo;
 
 use std::path::PathBuf;
@@ -100,11 +101,11 @@ pub struct GetRecentWorkParams {
 pub struct SearchByRecencyParams {
     /// Semantic search query
     pub query: String,
-    /// Natural language time like 'last week', 'yesterday'
+    /// Natural language time like 'last week', 'yesterday'. since and until narrow it.
     pub time_range: Option<String>,
-    /// ISO timestamp or relative time
+    /// ISO timestamp, date or relative time. Never earlier than the start of time_range.
     pub since: Option<String>,
-    /// ISO timestamp or relative time
+    /// ISO timestamp (to the second), date or relative time. No hit is dated after it, even inside time_range.
     pub until: Option<String>,
     /// Maximum number of results (default: 10)
     pub limit: Option<usize>,
@@ -209,6 +210,10 @@ pub struct TranscriptParams {
     /// each tool call's input, to show (default 4000, max 200000). A cut ends
     /// with a note that names the byte total.
     pub result_chars: Option<usize>,
+    /// `slice` view only: start the FIRST turn's text at this character offset (Unicode
+    /// characters, default 0). A turn longer than one reply comes back in parts: a cut page
+    /// gives `resume_turns` plus `resume_offset` (JSON) or the `next:` call in its cut note (text).
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -381,7 +386,7 @@ impl CsrServer {
         }
         let keyword = fallback
             .await
-            .map(|text| format!("{}\n\n{text}", crate::search::vector_ipc::KEYWORD_ONLY_NOTE));
+            .map(|text| format!("{}\n\n{text}", proxy.note()));
         tool_result(keyword)
     }
 
@@ -931,6 +936,7 @@ impl CsrServer {
             p.sidechains.unwrap_or(false),
             p.include_system.unwrap_or(false),
             p.result_chars,
+            p.offset,
         );
         // Text-mode output is a hand-built pseudo-XML envelope
         // (`<transcript_slice>…</transcript_slice>`) around verbatim
@@ -1418,6 +1424,9 @@ mod code_map_tests;
 
 #[cfg(test)]
 mod query_validation_tests;
+
+#[cfg(test)]
+mod no_daemon_tests;
 
 #[cfg(test)]
 mod tool_boundary_tests;

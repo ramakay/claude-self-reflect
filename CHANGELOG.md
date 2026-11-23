@@ -7,10 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [10.1.1] - 2026-11-24
+
+Fixes from the first week of 10.1.0. Most came from two checks made after the release: reading 30 deleted sessions back through the shipped MCP server (28 of 30 came back whole), and an install on a clean account with no login session. There is no data migration. Upgrade as for any release (`npm install -g claude-self-reflect` then `claude-self-reflect setup`, or run `scripts/install.sh` again), then restart Claude Code.
+
+### Transcript and search
+
+- **A turn longer than one reply can be read whole.** `csr_transcript` view `slice` takes a new optional `offset`, in characters. A turn over the 40,000-character reply cap now comes back in parts, and each cut page names the exact next call; JSON pages carry `text_cut`, `text_chars_total`, `text_offset` and `resume_offset`. Before, the JSON page came back empty and named the same turn again, so a reader looped, and the text page was cut with advice to raise a limit that was already at its maximum. The `prompts` and `yourasks` lists now say how to read a row they cut. Limit: a tool result too big for one reply is still cut, not paged (#342).
+- **`csr_transcript` reads a subagent run whose file is still on disk.** Before, it answered "the original JSONL is gone", because the lookup never searched the `subagents/` folders (#337).
+- **`search_by_recency` never returns a hit dated after `until`.** A `time_range` no longer makes `since` and `until` vanish: the tighter bound wins. An `until` given as a full timestamp is honoured to the second; before, the window ended at "now". A window that ends before it starts is an error that prints both bounds, and `until` alone, older than 7 days, now asks for `since` (#343).
+- **A search answers at once when no daemon runs.** On an account where the daemon never started, each MCP search waited 20 seconds for a socket that did not exist. The engine now waits only if a process holds the daemon lock or the socket file is there; otherwise it answers from the keyword index at once (#341).
+
+### Installer and uninstall
+
+- **Uninstall finishes on an account that never logged in at the screen.** With no `gui/<uid>` launchd domain (an ssh-only account), `csr-engine uninstall` held with "could not tell whether com.ramakay.csr-engine.daemon is running" and could never finish. It now removes the plist, says there was no login session to unload from, and goes on. A daemon started outside launchd still holds the uninstall, and the message gives its pid (#338).
+- **The npm command installs the engine when npm skipped the install script.** If `npm install -g` did not run `postinstall` (npm 11.20 warns that the script is not covered by `allowScripts`), the first `claude-self-reflect` command installs the binary, with its progress on stderr. If that fails, it prints one message with the reason and the command to run (#339).
+- **`claude-self-reflect setup` updates the engine after an upgrade when npm skipped the install script.** Before, `npm install -g claude-self-reflect` over an earlier install left the old engine in place if npm did not run `postinstall`, and `claude-self-reflect setup` ran that old engine. The npm command now compares the engine in the install directory with the package version. When the engine is older, `setup` runs the install step first, with its progress on stderr; if that fails, it prints one message with the reason and the command to run, then runs the engine that is there. `status` does not download: it prints one line that says to run `claude-self-reflect setup`. A newer engine is left alone, and `CSR_SKIP_BINARY_DOWNLOAD=1` turns the comparison off (#347).
+- **The curl installer finds the latest release when the GitHub API refuses.** A shared address (a CI runner, an office NAT) can use up the anonymous API limit. The installer then reads the tag from the redirect of the releases page (#330).
+- **Internal notes removed from the installers.** A leftover "forward-port" comment block is gone from `scripts/install.sh` and `installer/postinstall.js`. No behaviour change.
+
+### Hooks and startup
+
 - **Slow hooks now stop at a deadline.** `session-start`, `precompact` and `post-tool-use` end after 55 seconds, and `session-briefing` after 145 seconds, with no output and exit 0, so Claude Code never reports them as killed by its hook timeout. One timing-log line records it. `CSR_HOOK_DEADLINE_SECS=<n>` changes the time. Thanks to Devin345458 (#325).
 - **A busy index lock no longer stops an engine from starting.** The startup cleanup of old index files now tries the lock once and skips the cleanup if another process holds it; that process cleans up when it writes. Before, startup waited 10 seconds and then failed. Thanks to Devin345458 (#323).
-- **Internal notes removed from the installers.** A leftover "forward-port" comment block is gone from `scripts/install.sh` and `installer/postinstall.js`. No behaviour change.
+
+### Companion pane
+
+- **A delegated agent that will not answer reads "no answer".** In the Monologue timeline, an agent that failed, was killed, or has run with no event for 600 seconds now shows `✗ no answer` in place of `○ delegated`. Before, a stalled agent and a working one looked the same (#348).
+- **A pane that gets SIGTERM while it closes no longer leaves its lock file behind.** The pane dropped its signal handlers before it removed its pipe, lock and pid file; it now drops them last (#344).
+
+### Security
+
+- **`url` 2.5.9.** Clears RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on deeply nested `blob:` URLs. By a source search, neither the engine nor the crates that bring `url` in call `Url::origin()` (#349).
+
+### Docs and tests
+
 - **The paper, version 2, and a short version.** `docs/plans/annaswamy-2026-similarity-drowns-intent.pdf` now matches the shipped 10.1 system and reports only results whose receipts are in the record, including the later T3 benchmark the walk lost. A 14-page short version, `docs/plans/annaswamy-2026-evaluating-self-recording-agents.pdf`, keeps to results with public receipts in `csr-engine/eval-kit/`. The README and site describe both. The T4 kit's JSON files no longer carry local machine paths.
+- **Tests that failed at random on a loaded machine.** Ten tests no longer depend on timing or on state they share with other tests (#344). The same goes for the real-git guard test (#345) and the pane test homes (#346).
 
 ## [10.1.0] - 2026-11-18
 

@@ -31,9 +31,45 @@ pub mod store;
 /// Kill switch (`CSR_NO_STORY_MAP=1`): disables `@shifts` prompt requests,
 /// ledger writes, and Shift Map rendering.
 pub fn story_map_disabled() -> bool {
-    std::env::var("CSR_NO_STORY_MAP")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    #[cfg(test)]
+    if let Some(forced) = test_switch::forced() {
+        return forced;
+    }
+    kill_switch_in(|name| std::env::var(name).ok())
+}
+
+/// The kill switch as `env` answers for it.
+fn kill_switch_in(env: impl Fn(&str) -> Option<String>) -> bool {
+    env("CSR_NO_STORY_MAP").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// The kill switch for one test thread. Tests run side by side in one process, and the
+/// environment is the process's: a test that set `CSR_NO_STORY_MAP` there turned the switch on for
+/// every other test that happened to read it just then (`derive_receipt_shifts` returned nothing).
+#[cfg(test)]
+pub(crate) mod test_switch {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn forced() -> Option<bool> {
+        FORCED.with(Cell::get)
+    }
+
+    /// Holds the switch on for this thread until dropped.
+    pub(crate) struct On(Option<bool>);
+
+    pub(crate) fn on() -> On {
+        On(FORCED.with(|forced| forced.replace(Some(true))))
+    }
+
+    impl Drop for On {
+        fn drop(&mut self) {
+            FORCED.with(|forced| forced.set(self.0));
+        }
+    }
 }
 
 /// Kind of architecture shift entry.
@@ -478,9 +514,6 @@ pub fn finish_story_output(raw_full: &str, map_on: bool) -> (String, Vec<ShiftEn
 }
 
 #[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -674,16 +707,36 @@ mod tests {
 
     #[test]
     fn kill_switch_reads_env() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("CSR_NO_STORY_MAP");
+        // The environment is the process's, shared by every test: ask it through a stand-in.
+        let env = |value: Option<&'static str>| {
+            move |name: &str| {
+                (name == "CSR_NO_STORY_MAP")
+                    .then_some(value)
+                    .flatten()
+                    .map(str::to_string)
+            }
+        };
+        assert!(!kill_switch_in(env(None)));
+        assert!(kill_switch_in(env(Some("1"))));
+        assert!(kill_switch_in(env(Some("TRUE"))));
+        assert!(!kill_switch_in(env(Some("0"))));
+        // Only that one variable switches it off.
+        assert!(!kill_switch_in(
+            |name| (name != "CSR_NO_STORY_MAP").then(|| "1".to_string())
+        ));
+    }
+
+    #[test]
+    fn the_test_switch_is_this_threads_alone() {
+        let other = std::thread::spawn(|| {
+            let _on = test_switch::on();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            story_map_disabled()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!story_map_disabled());
-        std::env::set_var("CSR_NO_STORY_MAP", "1");
-        assert!(story_map_disabled());
-        std::env::set_var("CSR_NO_STORY_MAP", "TRUE");
-        assert!(story_map_disabled());
-        std::env::set_var("CSR_NO_STORY_MAP", "0");
+        assert!(other.join().unwrap());
         assert!(!story_map_disabled());
-        std::env::remove_var("CSR_NO_STORY_MAP");
     }
 
     #[test]

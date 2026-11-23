@@ -5,6 +5,8 @@
 //! PATH.
 #![cfg(unix)]
 
+#[path = "support/exec_script.rs"]
+mod exec_script;
 #[path = "support/temp_home.rs"]
 mod temp_home;
 
@@ -47,6 +49,8 @@ exit 0"#;
 
 /// `launchctl`: `print` answers from `FAKE_LOADED` (the plist the job was loaded from; empty means
 /// no such job) until `bootout` has run; `BOOTOUT_FAIL` and `PRINT_FAIL` make those calls fail.
+/// `PRINT_CODE` and `PRINT_TEXT` make `print` fail with that exit status and message (launchd's
+/// answer for a user with no GUI domain is 125, "Domain does not support specified action").
 /// `DAEMON_PID` is the job's process: `print` names it, and after `bootout` keeps the job loaded
 /// (launchd's "SIGTERMed" state) for as long as that process lives. A `print` after `bootout`
 /// that still finds the plist on disk logs `plist-present-after-bootout`.
@@ -54,6 +58,7 @@ const LAUNCHCTL_SHIM: &str = r#"echo "launchctl $*" >> "$CALLS"
 case "$1" in
 print)
   if [ -n "$PRINT_FAIL" ]; then echo "Operation not permitted" >&2; exit 1; fi
+  if [ -n "$PRINT_CODE" ]; then echo "$PRINT_TEXT" >&2; exit "$PRINT_CODE"; fi
   if [ -f "$STATE/booted" ] && [ -n "$FAKE_LOADED" ] && [ -f "$FAKE_LOADED" ]; then echo "plist-present-after-bootout" >> "$CALLS"; fi
   alive=
   if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then alive=1; fi
@@ -138,9 +143,8 @@ fn write(path: &Path, text: &str) {
 }
 
 fn shim(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    write(path, &format!("#!/bin/sh\n{body}\n"));
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    exec_script::write_executable(path, format!("#!/bin/sh\n{body}\n"));
 }
 
 /// The settings a user has after `setup`: CSR's hooks, plus hooks that are not CSR's.
@@ -609,6 +613,222 @@ fn a_launchd_that_cannot_be_asked_is_not_read_as_not_running() {
     assert!(!s.calls().contains("bootout"), "{}", s.calls());
 }
 
+const NO_GUI_DOMAIN: &str = "Could not print domain: 125: Domain does not support specified action";
+
+/// An account with no GUI login (ssh only): launchd answers 125 for the gui domain. No agent can
+/// be loaded there, so the run finishes and says why nothing was unloaded.
+#[test]
+fn an_account_with_no_gui_domain_finishes_and_says_nothing_was_loaded() {
+    let s = Scratch::new();
+    let out = s.run_env(
+        &["--yes", "--purge"],
+        &[("PRINT_CODE", "125"), ("PRINT_TEXT", NO_GUI_DOMAIN)],
+    );
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!s.plist().exists(), "{text}");
+    assert!(!s.data().join("csr-engine.db").exists(), "{text}");
+    assert!(!s.calls().contains("bootout"), "{}", s.calls());
+    assert!(text.contains("nothing to unload"), "{text}");
+    assert!(!text.contains("not finished:"), "{text}");
+}
+
+/// Only that exit status with that text means "no domain": any other launchctl failure still
+/// holds the data, as before.
+#[test]
+fn another_launchctl_failure_still_holds_even_with_a_125_or_the_domain_text() {
+    for (code, text) in [
+        ("125", "Operation not permitted"),
+        ("1", NO_GUI_DOMAIN),
+        ("125", ""),
+    ] {
+        let s = Scratch::new();
+        let out = s.run_env(
+            &["--yes", "--purge"],
+            &[("PRINT_CODE", code), ("PRINT_TEXT", text)],
+        );
+        let shown = stdout(&out);
+        assert_eq!(out.status.code(), Some(1), "{code} {text}: {shown}");
+        assert!(
+            s.data().join("csr-engine.db").exists(),
+            "{code} {text}: {shown}"
+        );
+        assert!(shown.contains("could not tell whether"), "{shown}");
+    }
+}
+
+/// No GUI domain does not clear a daemon started outside launchd: its lock still holds the data.
+#[test]
+fn a_daemon_outside_launchd_still_holds_the_uninstall_without_a_gui_domain() {
+    use fs2::FileExt;
+    let s = Scratch::new();
+    let (pid, reaped) = daemon_standin("30", false);
+    let lock_path = s.data().join("daemon.lock");
+    std::fs::write(&lock_path, pid.to_string()).unwrap();
+    let lock = std::fs::File::open(&lock_path).unwrap();
+    lock.try_lock_exclusive().unwrap();
+    let out = s.run_env(
+        &["--yes", "--purge"],
+        &[("PRINT_CODE", "125"), ("PRINT_TEXT", NO_GUI_DOMAIN)],
+    );
+    let text = stdout(&out);
+    drop(lock);
+    // Only the stand-in this test started is stopped, by its exact pid.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    reaped.join().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(s.data().join("csr-engine.db").exists(), "{text}");
+    assert!(
+        text.contains(&format!("a csr-engine daemon is running (pid {pid})")),
+        "{text}"
+    );
+    assert!(text.contains("not finished:"), "{text}");
+}
+
+/// A lock file that cannot be read says nothing about a daemon, so it must not read as "none":
+/// the data folder stays and the hold line says the lock could not be read. Both ways the hold is
+/// found: with the plist still on disk (the agent step) and without one (the check after it).
+#[test]
+fn an_unreadable_daemon_lock_holds_the_uninstall_without_a_gui_domain() {
+    use std::os::unix::fs::PermissionsExt;
+    for with_plist in [true, false] {
+        let s = Scratch::new();
+        if !with_plist {
+            std::fs::remove_file(s.plist()).unwrap();
+        }
+        let lock_path = s.data().join("daemon.lock");
+        std::fs::write(&lock_path, "1").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::File::open(&lock_path).is_err();
+        let out = s.run_env(
+            &["--yes", "--purge"],
+            &[("PRINT_CODE", "125"), ("PRINT_TEXT", NO_GUI_DOMAIN)],
+        );
+        let text = stdout(&out);
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(unreadable, "the test made the lock unreadable");
+        assert_eq!(out.status.code(), Some(1), "exit code");
+        assert!(
+            s.data().join("csr-engine.db").exists(),
+            "the data folder stays"
+        );
+        assert!(
+            text.contains("the daemon lock could not be read"),
+            "the hold line says the lock could not be read"
+        );
+        let finish = text
+            .lines()
+            .find(|l| l.contains("not finished:"))
+            .unwrap_or_default();
+        assert!(!finish.is_empty(), "the closing line is printed");
+        assert!(
+            finish.contains(&lock_path.display().to_string()),
+            "the closing line names the lock file"
+        );
+        assert!(
+            finish.contains("chmod u+r"),
+            "the closing line says how to make the lock readable"
+        );
+        assert!(
+            !finish.contains("Stop the csr-engine daemon"),
+            "the closing line does not tell the user to stop a daemon"
+        );
+        assert!(
+            finish.ends_with(&format!(
+                "finish with: \"{}\" uninstall --yes --purge",
+                env!("CARGO_BIN_EXE_csr-engine")
+            )),
+            "the closing line ends with the rerun command"
+        );
+        // The way out the closing line names: with the lock readable, the same command finishes.
+        let again = s.run_env(
+            &["--yes", "--purge"],
+            &[("PRINT_CODE", "125"), ("PRINT_TEXT", NO_GUI_DOMAIN)],
+        );
+        assert_eq!(again.status.code(), Some(0), "the rerun finishes");
+        assert!(
+            !s.data().join("csr-engine.db").exists(),
+            "the rerun purges the data folder"
+        );
+    }
+}
+
+/// The hold here is a daemon outside launchd on an account with no GUI domain, where `launchctl
+/// print` never says "cannot find the service". The closing line names the daemon, not launchctl,
+/// and keeps the exact rerun command. Both ways the hold is found: with the plist still on disk
+/// (the agent step) and without one (the check after it).
+#[test]
+fn the_closing_line_names_the_outside_daemon_not_launchctl_without_a_gui_domain() {
+    use fs2::FileExt;
+    for with_plist in [true, false] {
+        let s = Scratch::new();
+        if !with_plist {
+            std::fs::remove_file(s.plist()).unwrap();
+        }
+        let (pid, reaped) = daemon_standin("30", false);
+        let lock_path = s.data().join("daemon.lock");
+        std::fs::write(&lock_path, pid.to_string()).unwrap();
+        let lock = std::fs::File::open(&lock_path).unwrap();
+        lock.try_lock_exclusive().unwrap();
+        let out = s.run_env(
+            &["--yes", "--purge-mirror"],
+            &[("PRINT_CODE", "125"), ("PRINT_TEXT", NO_GUI_DOMAIN)],
+        );
+        let text = stdout(&out);
+        drop(lock);
+        // Only the stand-in this test started is stopped, by its exact pid.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        reaped.join().unwrap();
+        assert_eq!(out.status.code(), Some(1), "exit code");
+        let finish = text
+            .lines()
+            .find(|l| l.contains("not finished:"))
+            .unwrap_or_default();
+        assert!(!finish.is_empty(), "the closing line is printed");
+        assert!(
+            !finish.contains("launchctl"),
+            "the closing line does not name launchctl"
+        );
+        assert!(
+            finish.contains(&format!("the csr-engine daemon (pid {pid})")),
+            "the closing line names the daemon and its pid"
+        );
+        assert!(
+            finish.ends_with(&format!(
+                "finish with: \"{}\" uninstall --yes --purge-mirror",
+                env!("CARGO_BIN_EXE_csr-engine")
+            )),
+            "the closing line ends with the rerun command"
+        );
+    }
+}
+
+/// A job launchd still has keeps today's closing line, word for word.
+#[test]
+fn the_closing_line_for_a_launchd_hold_is_unchanged() {
+    let s = Scratch::new();
+    let out = s.run_env(
+        &["--yes", "--purge"],
+        &[
+            ("FAKE_LOADED", s.plist().to_str().unwrap()),
+            ("PRINT_FAIL", "1"),
+        ],
+    );
+    let text = stdout(&out);
+    let finish = text
+        .lines()
+        .find(|l| l.contains("not finished:"))
+        .unwrap_or_default();
+    let expected = format!(
+        "not finished: what the lines above keep stays until the daemon has stopped. Once \
+         `launchctl print gui/{}/{LABEL}` says it cannot find the service, finish with: \"{}\" \
+         uninstall --yes --purge",
+        unsafe { libc::getuid() },
+        env!("CARGO_BIN_EXE_csr-engine")
+    );
+    assert_eq!(finish.trim(), expected);
+}
+
 /// A stand-in daemon process this test starts, `/bin/sleep` by absolute path (or, with
 /// `ignore_term`, one that ignores SIGTERM). A thread reaps it, so it never lingers as a zombie
 /// that `kill -0` still finds; the handle returns how it ended.
@@ -738,7 +958,7 @@ fn a_daemon_that_will_not_stop_keeps_binary_and_data_and_the_finish_is_printed()
         let s = Scratch::new();
         let local = s.home.join(".local/bin/csr-engine");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
-        std::fs::copy(env!("CARGO_BIN_EXE_csr-engine"), &local).unwrap();
+        exec_script::copy_executable(Path::new(env!("CARGO_BIN_EXE_csr-engine")), &local);
         let (pid, reaped) = daemon_standin("30", true);
         let lock_path = s.data().join("daemon.lock");
         std::fs::write(&lock_path, pid.to_string()).unwrap();
@@ -1173,7 +1393,7 @@ fn a_binary_in_local_bin_is_deleted_last_and_any_other_gets_its_rm_line() {
     let s = Scratch::new();
     let local = s.home.join(".local/bin/csr-engine");
     std::fs::create_dir_all(local.parent().unwrap()).unwrap();
-    std::fs::copy(built, &local).unwrap();
+    exec_script::copy_executable(built, &local);
     let plan = stdout(&s.run_program(&local, &["--dry-run"], &[]));
     assert!(
         plan.contains(&format!("binary: would delete {} last", local.display())),

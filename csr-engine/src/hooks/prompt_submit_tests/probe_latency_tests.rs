@@ -3,6 +3,12 @@ use std::time::{Duration, Instant};
 
 /// Limit-1 diagnostics must stay index lookups at realistic dimensions and
 /// population. A full scan over these vectors exceeds the hook's probe budget.
+///
+/// This guards against a scan, which is slow in every call of every round. It is not a guard on
+/// tail latency: it takes the best of up to three rounds, so a slowdown that shows in some rounds
+/// only would pass. The search is an in-memory lookup of one fixed query in one fixed index, so
+/// a round differs from the next by what the machine does around it (scheduling, caches, clock
+/// speed), not by the code under test.
 #[test]
 fn below_floor_probes_stay_under_five_ms_at_p95() {
     const COUNT: usize = 4096;
@@ -38,23 +44,33 @@ fn below_floor_probes_stay_under_five_ms_at_p95() {
             }
         };
         assert_eq!(search().len(), 1); // warm the index before measuring
-        let mut times = Vec::with_capacity(50);
-        for _ in 0..50 {
-            let started = Instant::now();
-            let hits = std::hint::black_box(search());
-            times.push(started.elapsed());
-            assert_eq!(hits.len(), 1);
+
+        // Scheduler noise only makes samples slower, and a scan is slow in every round: the
+        // bound holds if any one of up to three rounds of 50 samples has its p95 under it.
+        let mut best = Duration::MAX;
+        for _round in 0..3 {
+            let mut times = Vec::with_capacity(50);
+            for _ in 0..50 {
+                let started = Instant::now();
+                let hits = std::hint::black_box(search());
+                times.push(started.elapsed());
+                assert_eq!(hits.len(), 1);
+            }
+            times.sort_unstable();
+            let (median, p95) = (times[25], times[47]);
+            eprintln!(
+                "limit-1 reflection={reflection}: median={}us p95={}us",
+                median.as_micros(),
+                p95.as_micros()
+            );
+            best = best.min(p95);
+            if best < Duration::from_millis(5) {
+                break;
+            }
         }
-        times.sort_unstable();
-        let (median, p95) = (times[25], times[47]);
-        eprintln!(
-            "limit-1 reflection={reflection}: median={}us p95={}us",
-            median.as_micros(),
-            p95.as_micros()
-        );
         assert!(
-            p95 < Duration::from_millis(5),
-            "reflection={reflection}: p95={p95:?}"
+            best < Duration::from_millis(5),
+            "reflection={reflection}: best p95={best:?}"
         );
     }
 }

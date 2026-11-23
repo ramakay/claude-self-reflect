@@ -497,7 +497,7 @@ csr-engine quality <file>      AST-based code quality analysis
 
 **From 9.5.8 (the last 9.x on npm):** with npm, run `npm install -g claude-self-reflect`, then `claude-self-reflect setup`. With the curl installer, run `scripts/install.sh` and answer yes at "Run setup now?"; where it cannot prompt, it prints the `csr-engine setup` command to run. Then restart Claude Code. Setup repoints the MCP registration at the new binary and adds the hooks 10.1.0 needs. Your data is not touched. The first daemon start rebuilds the vector index once, and MCP tools answer keyword-only until it publishes.
 
-**Within 10.x:** after you install a newer binary, run `csr-engine setup` again. It is safe to repeat. It registers hooks a newer build added (for example `PostCompact`) and rewrites the launch agent when its settings changed (for example `ProcessType Interactive`).
+**Within 10.x:** after you install a newer binary, run setup again: `claude-self-reflect setup` if you installed with npm, `csr-engine setup` otherwise. With npm, use that command: npm 11.20 and later do not run the install script until you allow it, and from 10.1.1 `claude-self-reflect setup` downloads the new engine itself when the one it finds is older than the package. It is safe to repeat. It registers hooks a newer build added (for example `PostCompact`) and rewrites the launch agent when its settings changed (for example `ProcessType Interactive`).
 
 Then run `csr-engine status`:
 

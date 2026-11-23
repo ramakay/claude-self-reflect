@@ -521,7 +521,7 @@ mod codemap_session_signal {
 
 #[cfg(unix)]
 mod prompt_process {
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, Write};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -603,6 +603,22 @@ mod prompt_process {
         .unwrap()
     }
 
+    /// `command` with the whole payload on stdin, from a file and not a pipe.
+    ///
+    /// The hook reads stdin to its end. macOS has no `pipe2`: std makes a pipe and marks it
+    /// close-on-exec afterwards, so a test on another thread that starts a process in between
+    /// gives that child the write end. Closing it here then ends nothing, and the hook waits
+    /// for that child to exit until its own deadline stops it with nothing printed (one release
+    /// gate, and 1 of 60 runs of this target). A file has no write end to leak.
+    fn fed(dir: &std::path::Path) -> Command {
+        let mut stdin = tempfile::tempfile().unwrap();
+        stdin.write_all(&payload(dir)).unwrap();
+        stdin.rewind().unwrap();
+        let mut command = command(dir);
+        command.stdin(stdin);
+        command
+    }
+
     #[test]
     fn cold_process_ignores_large_index_and_missing_database() {
         let dir = tempfile::tempdir().unwrap();
@@ -621,20 +637,13 @@ mod prompt_process {
                 .unwrap();
         }
         for _ in 0..5 {
-            let mut command = command(dir.path());
+            let mut command = fed(dir.path());
             let parent_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let started = Instant::now();
-            let mut child = command.spawn().unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(&payload(dir.path()))
-                .unwrap();
-            let output = child.wait_with_output().unwrap();
+            let output = command.spawn().unwrap().wait_with_output().unwrap();
             let wall = started.elapsed();
             assert!(output.status.success());
             assert!(output.stdout.is_empty(), "{:?}", output.stdout);
@@ -687,14 +696,7 @@ mod prompt_process {
                     .unwrap();
                 stream.write_all(&body).unwrap();
             });
-            let mut child = command(dir.path()).spawn().unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(&payload(dir.path()))
-                .unwrap();
-            let output = child.wait_with_output().unwrap();
+            let output = fed(dir.path()).spawn().unwrap().wait_with_output().unwrap();
             assert!(output.status.success());
             assert_eq!(
                 output.stdout,
@@ -702,7 +704,9 @@ mod prompt_process {
                     b"CSR PICKUP \xe2\x80\x94 exact bytes\nsecond line\n".as_slice()
                 } else {
                     b""
-                }
+                },
+                "valid={valid} stderr={}",
+                String::from_utf8_lossy(&output.stderr)
             );
             assert!(!dir.path().join("csr-engine.db").exists());
             peer.join().unwrap();
@@ -763,13 +767,7 @@ mod prompt_process {
         std::fs::create_dir(path.parent().unwrap()).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
         let started = Instant::now();
-        let mut child = command(dir.path()).spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&payload(dir.path()))
-            .unwrap();
+        let child = fed(dir.path()).spawn().unwrap();
         let _stream =
             accept_within(&listener, Duration::from_secs(10)).expect("the hook never connected");
         let output = child.wait_with_output().unwrap();
@@ -812,13 +810,7 @@ mod prompt_process {
             .unwrap()
             .as_nanos();
         let started = Instant::now();
-        let mut child = command(dir.path()).spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&payload(dir.path()))
-            .unwrap();
+        let mut child = fed(dir.path()).spawn().unwrap();
         // Intentionally do not drain stdout: wait_with_output would hide the
         // watchdog's stdio-cleanup deadlock. The 10s bound only catches a real
         // hang; the deadline itself is asserted below from the probes.

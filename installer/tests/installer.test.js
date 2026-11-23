@@ -39,6 +39,7 @@ import {
   formatStaleWarning,
   installBinary,
   isRunnableBinary,
+  outdatedEngine,
   parseVersion,
   planInstall,
   probeVersion,
@@ -210,6 +211,118 @@ describe('install decision (destination only)', () => {
     assert.equal(calls.length, 1, 'exactly one invocation');
     assert.equal(calls[0].file, dest, 'against the destination, not PATH');
     assert.deepEqual(calls[0].args, ['--version'], 'no status/setup/hook/eval, ever');
+  });
+});
+
+describe('engine older than the package (the npm command, before it runs)', () => {
+  const dest = '/opt/csr/bin/csr-engine';
+  const judge = (installed, pkgVersion) =>
+    outdatedEngine({ binary: dest, destPath: dest, pkgVersion, probe: () => installed });
+
+  test('an older engine is named with both versions', () => {
+    assert.deepEqual(judge('10.1.0', '10.1.1'), { installed: '10.1.0', wanted: '10.1.1' });
+  });
+
+  test('the numbers are compared as numbers, not as text', () => {
+    assert.deepEqual(judge('9.5.8', '10.1.1'), { installed: '9.5.8', wanted: '10.1.1' });
+    assert.deepEqual(judge('10.1.9', '10.1.10'), { installed: '10.1.9', wanted: '10.1.10' });
+    assert.equal(judge('10.1.10', '10.1.9'), null);
+    assert.equal(judge('10.2.0', '10.1.9'), null);
+  });
+
+  test('the same version and a newer one are left alone', () => {
+    assert.equal(judge('10.1.1', '10.1.1'), null);
+    assert.equal(judge('10.1.2', '10.1.1'), null);
+    assert.equal(judge('11.0.0', '10.1.1'), null);
+    // Build metadata has no place in the order.
+    assert.equal(judge('10.1.1+build.7', '10.1.1'), null);
+    assert.equal(judge('10.1.1', '10.1.1+build.7'), null);
+  });
+
+  test('a prerelease is older than its release, and prereleases keep semver order', () => {
+    const older = (installed, wanted) => assert.deepEqual(judge(installed, wanted), { installed, wanted });
+    older('10.1.1-rc.1', '10.1.1');
+    older('10.1.1-rc.1', '10.1.1-rc.2');
+    older('10.1.1-rc.2', '10.1.1-rc.10'); // numbers, not text
+    older('10.1.1-alpha', '10.1.1-beta');
+    older('10.1.1-rc', '10.1.1-rc.1'); // fewer identifiers first
+    older('10.1.1-1', '10.1.1-rc'); // a number sorts before text
+    older('10.1.0', '10.1.1-rc.1');
+
+    // Past 2^53 a JavaScript number rounds; the order must still be exact.
+    older('10.1.1-9007199254740992.1', '10.1.1-9007199254740993.0');
+    assert.equal(judge('10.1.1-9007199254740993.0', '10.1.1-9007199254740992.1'), null);
+    older('10.1.9007199254740992', '10.1.9007199254740993');
+    // Leading zeros do not change a number.
+    assert.equal(judge('10.01.1', '10.1.1'), null);
+    assert.equal(judge('10.1.1-rc.01', '10.1.1-rc.1'), null);
+
+    assert.equal(judge('10.1.1', '10.1.1-rc.1'), null);
+    assert.equal(judge('10.1.1-rc.2', '10.1.1-rc.1'), null);
+    assert.equal(judge('10.1.1-rc.1', '10.1.1-rc.1'), null);
+    assert.equal(judge('10.1.2-rc.1', '10.1.1'), null);
+  });
+
+  test('an engine that cannot say its version counts as older', () => {
+    assert.deepEqual(judge(null, '10.1.1'), { installed: null, wanted: '10.1.1' });
+  });
+
+  test('an engine anywhere else is not asked and not judged', () => {
+    let asked = 0;
+    const result = outdatedEngine({
+      binary: '/usr/local/bin/csr-engine',
+      destPath: dest,
+      pkgVersion: '10.1.1',
+      probe: () => {
+        asked += 1;
+        return '9.5.8';
+      },
+    });
+    assert.equal(result, null);
+    assert.equal(asked, 0);
+  });
+
+  test('a package version that cannot be read judges nothing', () => {
+    let asked = 0;
+    const probe = () => {
+      asked += 1;
+      return '9.5.8';
+    };
+    assert.equal(outdatedEngine({ binary: dest, destPath: dest, pkgVersion: '', probe }), null);
+    assert.equal(asked, 0);
+  });
+
+  test('the engine file is asked once, with exactly --version', () => {
+    const real = fakeBinary(tempDir('outdated'), 'csr-engine', '10.1.0');
+    const calls = [];
+    const exec = (file, args) => {
+      calls.push({ file, args });
+      return 'csr-engine 10.1.0\n';
+    };
+    const result = outdatedEngine({
+      binary: real,
+      destPath: real,
+      pkgVersion: '10.1.1',
+      probe: (p) => probeVersion(p, exec),
+    });
+
+    assert.deepEqual(result, { installed: '10.1.0', wanted: '10.1.1' });
+    assert.equal(calls.length, 1, 'exactly one invocation');
+    assert.equal(calls[0].file, real);
+    assert.deepEqual(calls[0].args, ['--version'], 'no status/setup/hook/eval, ever');
+  });
+
+  test('with no probe given, the engine file itself answers', () => {
+    const real = fakeBinary(tempDir('outdated-real'), 'csr-engine', '10.1.0');
+    assert.deepEqual(outdatedEngine({ binary: real, destPath: real, pkgVersion: '10.1.1' }), {
+      installed: '10.1.0',
+      wanted: '10.1.1',
+    });
+    const silent = fakeBinary(tempDir('outdated-silent'), 'csr-engine', null);
+    assert.deepEqual(outdatedEngine({ binary: silent, destPath: silent, pkgVersion: '10.1.1' }), {
+      installed: null,
+      wanted: '10.1.1',
+    });
   });
 });
 

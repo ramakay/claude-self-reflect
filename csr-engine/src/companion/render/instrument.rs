@@ -8,7 +8,7 @@ use super::{
     theme::{self, Theme, Tokens, ICON_GAP, S1, S2, S3, S4, S5},
 };
 use crate::companion::{
-    agents, array, dreams, masthead, num, pyfmt::short, string, truthy, value::InstrumentCost,
+    agents, array, dreams, masthead, num, pyfmt::short, string, value::InstrumentCost,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -93,31 +93,7 @@ fn river_row(at: f64, kind: RiverKind, lead: &'static str, line: String) -> Rive
         thread: None,
     }
 }
-/// A thread row's mood. "asked" only when the thread waits on the user; open or lost threads are
-/// "left open"; everything else (faded, carried, answered, handed) is "noted".
-pub fn thread_mood(thread: &Value) -> &'static str {
-    if truthy(&thread["waiting"]) {
-        "asked"
-    } else if matches!(string(&thread["state"]), "open" | "lost") {
-        "left open"
-    } else {
-        "noted"
-    }
-}
-/// The one word a timeline row says before its line. Fixed table, no model.
-pub fn mood(kind: RiverKind, lead: &str) -> &'static str {
-    match (kind, lead) {
-        (RiverKind::Write | RiverKind::Commit, "! ") => "worried",
-        (RiverKind::Prompt, _) => "asked",
-        (RiverKind::Dream, _) => "wondered",
-        (RiverKind::Compact, _) => "made room",
-        (RiverKind::Write, _) => "tinkered",
-        (RiverKind::Commit, _) => "landed",
-        (RiverKind::Agent, "✓ ") => "heard back",
-        (RiverKind::Agent, _) => "delegated",
-        (RiverKind::Other, _) => "",
-    }
-}
+pub use super::instrument_mood::{mood, started_lead, thread_mood};
 /// A timeline row's time against `now`, in `tz`: "just now" under a minute, "N min ago" under an
 /// hour, "HH:MM" on the same local day, else "Mon D HH:MM".
 pub fn time_label_in<Tz: chrono::TimeZone>(at: f64, now: f64, tz: &Tz) -> String
@@ -487,7 +463,7 @@ impl Composition {
                 river.push(river_row(
                     start / 1000.,
                     RiverKind::Agent,
-                    "○ ",
+                    started_lead(agent, now),
                     format!("{} started", agent.description),
                 ));
             }

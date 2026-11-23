@@ -666,6 +666,7 @@ mod tests {
         );
         assert!(has_pending(&dir, "s"), "the spool stays for the holder");
         drop(holder);
+        crate::maintenance::wait_flock_free_for_test(&lock_path(&dir, "s"));
         assert!(KeyLock::try_acquire(&dir, "s").is_some());
     }
 

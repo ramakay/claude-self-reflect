@@ -644,7 +644,10 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let mut pane = Pane::new(paths.clone(), args);
     pane.enable_cards();
     pane.herdr = super::phone::Herdr::from_env(&paths.home);
-    let signals = Signals::install();
+    // Declared before the pane's pipe, lock and pid file, so it is dropped after them: a SIGTERM
+    // that comes while they are being removed must still be caught, or it would end the process
+    // between the pipe's removal and the lock's and leave the lock behind.
+    let _signals = Signals::install();
     let sid = args.sid.as_deref().unwrap_or("");
     let mine = PidFile::new(&paths, sid)?;
     // The relay's wakes arrive here, where no pid is trusted: see `wake.rs`.
@@ -1179,7 +1182,11 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     beat.stop();
     std::panic::set_hook(hook);
     drop(terminal);
-    drop(signals);
+    // For the test of the end: the SIGTERM that comes just here, with the terminal given back and
+    // the pipe, lock and pid file still to remove.
+    if std::env::var_os("CSR_PANE_TEST_TERM_AT_END").is_some() {
+        unsafe { libc::raise(libc::SIGTERM) };
+    }
     result
 }
 /// Put `text` on the clipboard: an OSC 52 sequence for terminals that pass it on, and `pbcopy`
@@ -1355,10 +1362,8 @@ mod tests {
 #[cfg(test)]
 mod reload_regressions {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     fn script(path: &Path, text: &str) {
-        fs::write(path, text).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::exec_script::write_executable(path, text);
     }
     #[test]
     fn reload_requires_an_existing_stable_binary_and_successful_version_probe() {
@@ -1543,15 +1548,13 @@ mod failed_exec_tests {
 #[cfg(test)]
 mod probe_timeout_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     #[test]
     fn a_version_probe_that_hangs_is_stopped_after_five_seconds() {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("engine");
         let now = Instant::now();
         let mut reload = Reload::new(&path, now);
-        fs::write(&path, "#!/bin/sh\nexec /bin/sleep 10\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::exec_script::write_executable(&path, "#!/bin/sh\nexec /bin/sleep 10\n");
         assert!(!reload.poll(&path, now, false).unwrap());
         let started = Instant::now();
         let error = reload

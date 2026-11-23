@@ -1512,7 +1512,7 @@ mod maintenance_probes {
         assert!(!constructed);
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         assert!(!dir.path().join("index-v3").exists());
-        drop(owner);
+        crate::maintenance::release_for_test(owner);
         assert!(try_start(&db, "stop").is_some());
     }
 }
