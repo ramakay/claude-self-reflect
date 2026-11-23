@@ -111,7 +111,7 @@ Every look record in the dream log keeps how long the look took. A look whose fo
 
 ## You should know, and other plugins
 
-You should know is a separate plugin that also forks your session. When it forks, Self-Reflect can add its own facts to that fork's request: code a later commit changed, rules you set, corrections you typed, and lines you typed in past sessions. It adds them only to You should know's propose request, The facts are built at most once every 5 minutes for a session. Every propose request in that time gets them. Another plugin's fork is noted in the dream log and passes untouched. `CSR_NO_YSK_BRIEF=1` turns the addition off.
+You should know is a separate plugin that also forks your session. When it forks, Self-Reflect can add its own facts to that fork's request: code a later commit changed, rules you set, corrections you typed, and lines you typed in past sessions. It adds them only to You should know's propose request. The facts are built at most once every 5 minutes for a session. Every propose request in that time gets them. Another plugin's fork is noted in the dream log and passes untouched. `CSR_NO_YSK_BRIEF=1` turns the addition off.
 
 ## Where this lives in the source
 
