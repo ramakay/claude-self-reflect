@@ -111,6 +111,33 @@ fn over_a_dream_that_is_up_the_picture_keeps_the_stopped_words_whole() {
 }
 
 #[test]
+fn a_picture_with_no_room_left_keeps_the_start_of_the_stopped_words_and_opens_the_rest() {
+    use csr_engine::companion::render::{instrument::draw, theme::Theme};
+    // An empty session whose repo recap alone overfills the pane: the dreamer card keeps one
+    // meta row, the last room a pane has.
+    let recap: Vec<String> = (0..100).map(|n| format!("Recap line {n}.")).collect();
+    let data = json!({
+        "dreams_on": false,
+        "dreams": [],
+        "chapter": null,
+        "claude_fields": { "dreams_stopped": true },
+        "repo_recap": { "session": "old", "at": NOW - 3600., "age": "1h",
+            "text": recap.join("\n") },
+    });
+    let c = Composition::build(&data, &json!({ "id": "s" }), NOW);
+    let (_, metrics) = draw(&c, 35 * 16, 29 * 34, Theme::Dark, Open::default(), false).unwrap();
+    let runs: Vec<_> = metrics.text_runs.iter().map(|r| r.4.as_str()).collect();
+    let words = runs.join(" ");
+    assert!(words.contains("Stopped by CSR_NO_DREAMING"), "{words}");
+    // The one row starts the words. It is not the mark alone.
+    assert!(words.contains(WORDS), "{words}");
+    // The row is cut, and a click on it opens every step.
+    let cut = metrics.cuts.iter().find(|cut| cut.full.contains(WORDS));
+    let full = &cut.expect("the cut row opens the words in full").full;
+    assert!(full.contains("Turn them on there too."), "{full}");
+}
+
+#[test]
 fn a_notice_that_only_starts_like_the_stopped_words_is_not_one() {
     use csr_engine::companion::dreams::{says_stopped, status_words, stopped_words};
     let other = "Dreams are stopped. Example";
@@ -123,6 +150,20 @@ fn a_notice_that_only_starts_like_the_stopped_words_is_not_one() {
         assert!(!status_words(&words, false).contains("Dreams are stopped."));
         assert_eq!(status_words(&words, true), words);
     }
+}
+
+#[test]
+fn a_cut_meta_row_keeps_the_stopped_words_only_where_the_status_is_in_it() {
+    use csr_engine::companion::dreams::{cut_part, stopped_words};
+    let stopped = Some(stopped_words(false));
+    // The card with no dream up holds its status in the meta rows: the words stay, to be cut.
+    assert_eq!(cut_part(&stopped, "the status", true), "the status");
+    // A dream that is up draws its status elsewhere, so its cut meta row ends in the mark.
+    assert_eq!(cut_part(&stopped, "the status", false), "…");
+    // Any other notice, and no notice, give way to the mark as before.
+    let failed_press = Some("Couldn't turn dreams on here".to_owned());
+    assert_eq!(cut_part(&failed_press, "s", true), "…");
+    assert_eq!(cut_part(&None, "No open what-if yet.", true), "…");
 }
 
 #[test]

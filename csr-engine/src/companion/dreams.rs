@@ -317,6 +317,18 @@ pub fn meta_parts(
     let parts = status.split(" · ").filter(|p| !p.is_empty());
     parts.map(str::to_owned).collect()
 }
+/// What the last part of the picture's one kept meta row reads when a pane with no room left drops
+/// the rows under it. The stopped words go back to one part: the row shows what fits of them and
+/// ends in "…", and a click on it opens them in full. Any other part gives way to the mark alone.
+/// So does every part of a card whose status is not in its meta rows (`in_meta` false: a dream
+/// that is up draws its status under the answers).
+pub fn cut_part(notice: &Option<String>, status: &str, in_meta: bool) -> String {
+    if in_meta && says_stopped(notice) {
+        status.to_owned()
+    } else {
+        "…".into()
+    }
+}
 /// Whether the app found `CSR_NO_DREAMING` set: it writes the fact into the session's usage file
 /// (`usage::measure`), and the pane's own process (herdr starts it, so its environment is not
 /// Claude Code's) reads it back as `claude_fields.dreams_stopped`.

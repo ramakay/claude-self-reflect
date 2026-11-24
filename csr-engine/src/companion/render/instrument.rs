@@ -4015,7 +4015,7 @@ pub fn draw(
         if meta_rows.len() > 1 {
             meta_rows.truncate(1);
             if let Some(last) = meta_rows.last_mut().and_then(|row| row.last_mut()) {
-                *last = "…".into();
+                *last = dreams::cut_part(&c.offer_notice, &status, compact_hero);
             }
         }
     }
