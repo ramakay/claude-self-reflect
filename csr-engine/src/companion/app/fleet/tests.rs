@@ -742,3 +742,6 @@ mod mixed_tests;
 
 #[path = "tests/completion_tests.rs"]
 mod completion_tests;
+
+#[path = "tests/switch_tests.rs"]
+mod switch_tests;

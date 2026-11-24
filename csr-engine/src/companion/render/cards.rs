@@ -1582,7 +1582,7 @@ fn cache_card_of(cache: &Value) -> Option<Card> {
 /// The dreams this session has: the open dream's words (else the latest), how many asks are
 /// left, the count, and how many wait unread.
 pub fn dream_facts(data: &Value, sid: &str) -> Option<Card> {
-    if data["dreams_on"] == false {
+    if data["dreams_on"] == false || dreams::stopped(data) {
         return None;
     }
     let mine: Vec<&Value> = array(&data["dreams"])

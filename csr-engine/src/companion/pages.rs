@@ -215,7 +215,9 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
             }
         }
     }
-    let right = if data["dreams_on"] == false {
+    let right = if dreams::stopped(data) {
+        "stopped".into()
+    } else if data["dreams_on"] == false {
         "off".into()
     } else if fed["left"] == 0 {
         "0 left · next compact".into()

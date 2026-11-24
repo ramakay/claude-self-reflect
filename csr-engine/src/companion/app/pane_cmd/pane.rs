@@ -443,6 +443,7 @@ pub fn render(
     data: Option<&Value>,
     lasting: Option<&Value>,
     dreams_on: bool,
+    stopped: bool,
     turned: Option<TurnedOn>,
     cols: usize,
 ) -> Value {
@@ -480,7 +481,16 @@ pub fn render(
     let counts = column(false, counts);
 
     let mut offer = None;
-    let dreams = if !dreams_on && turned != Some(TurnedOn::On) {
+    // `CSR_NO_DREAMING` wins over the row: no offer, since a press cannot help.
+    let dreams = if stopped {
+        card(
+            cols,
+            &DREAMS,
+            "Dreams are stopped",
+            crate::companion::dreams::STOPPED_TAG,
+            vec![item(crate::companion::dreams::stopped_words(dreams_on)).color(QUIET)],
+        )
+    } else if !dreams_on && turned != Some(TurnedOn::On) {
         let (dreams, press) = dreams_offer(cols, data, turned);
         offer = Some(press);
         dreams

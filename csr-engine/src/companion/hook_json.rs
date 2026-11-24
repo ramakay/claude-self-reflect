@@ -222,7 +222,9 @@ pub fn pane_json_in(
     out.status = Some(format!(
         "☾ CSR remembered {}× this session · {}",
         out.recalled,
-        if on {
+        if super::sources::dreams_stopped(paths, sid, now) {
+            "dreams stopped by CSR_NO_DREAMING".into()
+        } else if on {
             format!(
                 "{} {} this week",
                 out.dreams_7d,

@@ -6,9 +6,10 @@
 //! are kept, and only the fields the event carries.
 
 use super::{
+    app::state::dreaming_switched_off,
     paths::{valid_id, Paths},
     private,
-    relay::dispatch::{handler, Handler, Reply},
+    relay::dispatch::{handler, Ctx, Handler, Reply},
 };
 use anyhow::{bail, Result};
 use serde_json::{json, Map, Value};
@@ -18,11 +19,24 @@ use std::path::{Path, PathBuf};
 pub const FOLDER: &str = "usage";
 
 /// The fields of a `session.measure` event that the masthead reads.
-const KEPT: [&str; 3] = ["context", "rateLimits", "cost"];
+const KEPT: [&str; 4] = ["context", "rateLimits", "cost", "dreamsStopped"];
+
+/// The event with `dreamsStopped: true` added while `CSR_NO_DREAMING` is set where Claude Code
+/// runs. The terminal pane is another process and cannot see that variable, so the usage file
+/// carries it. Unset, the event is left as it came.
+async fn flagged(cx: &Ctx, mut event: Value) -> Value {
+    if dreaming_switched_off(cx).await {
+        if let Some(fields) = event.as_object_mut() {
+            fields.insert("dreamsStopped".into(), json!(true));
+        }
+    }
+    event
+}
 
 /// The `measure` handler: it writes under the real keep, found from `HOME` when the event comes.
 pub fn measure() -> Handler {
     handler(|cx, e| async move {
+        let e = flagged(&cx, e).await;
         write(&Paths::from_env().keep, &cx.sid, &e, cx.clock.now() / 1000.)?;
         Ok(Reply::none())
     })
@@ -33,6 +47,7 @@ pub fn measure_in(keep: PathBuf) -> Handler {
     handler(move |cx, e| {
         let keep = keep.clone();
         async move {
+            let e = flagged(&cx, e).await;
             write(&keep, &cx.sid, &e, cx.clock.now() / 1000.)?;
             Ok(Reply::none())
         }

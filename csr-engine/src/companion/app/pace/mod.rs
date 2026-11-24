@@ -47,7 +47,7 @@
 //! - The sweep reads the sessions that have a chapter with a read-only query of the store's own
 //!   file: `Store` has no call that lists sessions.
 
-use super::state::{config_rows, is_person, k, Options};
+use super::state::{config_rows, dreaming_switched_off, is_person, k, Options};
 use crate::companion::{
     db::Db,
     dreams,
@@ -835,9 +835,9 @@ pub fn sweep_sessions(cx: &Ctx) -> Result<()> {
 
 // ---------------------------------------------------------------- the entries
 
-/// Whether dreams are on: unless the person turned them off in `/config`.
+/// Whether dreams are on: unless the person turned them off in `/config` or set `CSR_NO_DREAMING`.
 async fn dreams_on(cx: &Ctx) -> bool {
-    Options::of(&config_rows(cx).await).dreams
+    !dreaming_switched_off(cx).await && Options::of(&config_rows(cx).await).dreams
 }
 
 fn has_agent(e: &Value) -> bool {

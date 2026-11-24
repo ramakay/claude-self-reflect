@@ -35,7 +35,7 @@ A separate learnt line lists what Self-Reflect stored for the previous session: 
 
 Dreaming runs in the background and is on by default. A dream checks old conclusions against your git history. When a conclusion no longer holds, search marks it `[stale anchor]` or `[evolved]` and cites the commit.
 
-- `CSR_NO_DREAMING=1` turns dreams off.
+- `CSR_NO_DREAMING=1` stops the daemon's dream cycle and the companion's looks, even when Dreams is on in `/config`. The Dreams row in `/config` stops the companion's looks only. With the variable set, the panes, `/csr dreams` and the status text say that dreams are stopped, with the row on or off. The terminal pane and the status text say it from the session's first usage report on. The companion reads the variable from the environment Claude Code runs in. The daemon reads it from its launchd agent, and setup copies the `CSR_*` variables of the environment it runs in into that agent, so a variable you export in a running session does not reach the companion until Claude Code starts again, and it does not reach an installed daemon until you run setup again.
 - `CSR_DREAM_INTERVAL_SECS` changes the six-hour default.
 - `csr-engine dreams` prints this week's dream for each project. `csr-engine dream` runs one cycle.
 
@@ -58,7 +58,7 @@ The recap states a clause only when it has evidence for it. Dream notes in searc
 
 ## Companion pane
 
-The companion plugin shows what Self-Reflect handed Claude and which code changed since your past sessions. It needs Claude Code 2.1.296 or later. Inside the [herdr](https://herdr.dev) terminal multiplexer it is a pane beside the session that opens by itself. Without herdr it is a panel inside Claude Code that you open with `/csr`. `csr-engine setup` installs the plugin after you confirm. `csr-engine setup --no-companion` skips it. See [Choose your view](#/docs/companion-views).
+The companion plugin shows what Self-Reflect handed Claude and which code changed since your past sessions. It needs Claude Code 2.1.296 or later. Inside the [herdr](https://herdr.dev) terminal multiplexer it is a pane beside the session that opens by itself. Without herdr it is a panel inside Claude Code that you open with `/csr`. `csr-engine setup` installs the plugin after you confirm. `csr-engine setup --no-companion` skips it. See [Choose your view](#/docs/companion-views). For what starts a dream look, what it costs and how to stop it, see [How the companion thinks](#/docs/how-the-companion-thinks).
 
 ## MCP tools and hooks
 
@@ -68,9 +68,9 @@ Sixteen MCP tools: search, activity, and storage. See [MCP Tools](#/docs/mcp-too
 
 | Variable | Effect |
 |----------|--------|
-| `CSR_NO_DREAMING=1` | No dreams |
+| `CSR_NO_DREAMING=1` | No daemon dream cycle and no companion looks (the `/config` Dreams row stops the looks only) |
 | `CSR_NO_RECAP=1` | No recap paragraph |
-| `CSR_NO_AI_NARRATIVES=1` | No `claude -p` narratives, briefings or dreams |
+| `CSR_NO_AI_NARRATIVES=1` | No `claude -p` narratives or briefings, and no model calls for dreams (dream threads, strategy dreams, backfill). The local dream cycle and the companion's looks keep running |
 | `CSR_NO_CODEMAP=1` | No code map |
 | `CSR_NO_DAEMON=1` | Setup does not install or start the daemon |
 

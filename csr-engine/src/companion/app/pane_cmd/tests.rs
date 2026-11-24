@@ -862,3 +862,70 @@ fn the_table_gives_pane_cmd_its_two_starts_the_command_the_pane_and_the_dreams_p
     assert_eq!(t.features("pane"), ["pane_cmd"]);
     assert_eq!(t.features(PRESS), ["pane_cmd"]);
 }
+
+const STOPPED_WORDS: &str = "Dreams are stopped. CSR_NO_DREAMING is set where Claude Code runs. \
+Unset it and start Claude Code again to dream.";
+
+/// The `/config` row is `row`, and `env.get` answers `CSR_NO_DREAMING=1` (no process env is set).
+fn world_stopped(row: bool) -> World {
+    let mut world = world(row, false);
+    let answers: std::collections::VecDeque<Result<Value, String>> =
+        (0..60).map(|_| Ok(json!("1"))).collect();
+    world.script.insert("env.get".into(), answers);
+    world
+}
+
+#[tokio::test]
+async fn csr_dreams_says_stopped_under_the_variable_with_the_row_on_or_off() {
+    for row in [true, false] {
+        let r = rig_with(world_stopped(row), Fake::new(false, Some(shifts())));
+        let said = r.csr("dreams").await;
+        assert!(said.starts_with(STOPPED_WORDS));
+        // With the row off too, unsetting the variable is not enough, and the words say so.
+        assert_eq!(said == STOPPED_WORDS, row);
+        assert_eq!(said.contains("also off in /config"), !row);
+    }
+}
+
+#[tokio::test]
+async fn the_pane_says_stopped_under_the_variable_and_offers_no_press() {
+    for row in [true, false] {
+        let r = rig_with(world_stopped(row), Fake::new(false, Some(quiet())));
+        r.started().await;
+        let pane = r.pane().await;
+        // The card wraps its words into rows, and each row ends in its edge mark: read the
+        // words as one run.
+        let said = all_texts(&pane).join(" ").replace('█', " ");
+        let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(said.contains("Dreams are stopped"));
+        assert!(said.contains(STOPPED_WORDS));
+        assert_eq!(said.contains("also off in /config"), !row, "{said}");
+        assert!(!said.contains("Dreams are on"));
+        assert!(!said.contains("Dreams are off"));
+        assert!(button_labels(&pane).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_measure_under_the_variable_writes_the_stopped_flag_for_the_terminal_pane() {
+    use crate::companion::usage::measure_in;
+    let event = json!({ "context": { "window": 200000, "tokens": 1000 } });
+    let flag = |world: World| {
+        let event = event.clone();
+        async move {
+            let fx = fixture_in(world, "sess-1");
+            let d = tempfile::tempdir().unwrap();
+            let keep = d.path().join("csr-companion");
+            measure_in(keep.clone())(fx.cx.clone(), event.clone())
+                .await
+                .unwrap();
+            let bytes = std::fs::read(keep.join("usage").join("sess-1.json")).unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        }
+    };
+    assert_eq!(flag(world_stopped(true)).await["dreamsStopped"], true);
+    assert!(flag(world(true, false))
+        .await
+        .get("dreamsStopped")
+        .is_none());
+}

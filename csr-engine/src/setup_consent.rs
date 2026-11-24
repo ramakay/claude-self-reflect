@@ -180,7 +180,7 @@ fn consent_step(
     };
     match (granted, basis) {
         (true, Basis::Installer) => eprintln!(
-            "  Dreaming: on (you agreed at the installer prompt). CSR_NO_DREAMING=1 turns it off."
+            "  Dreaming: on (you agreed at the installer prompt). CSR_NO_DREAMING=1 turns it off; an installed daemon sees it only after setup runs again with it set."
         ),
         (false, Basis::Installer) => eprintln!(
             "  Dreaming: off (you declined at the installer prompt); the daemon will not run night passes."
@@ -197,7 +197,7 @@ fn consent_step(
     dream_cadence::record_consent(storage, granted)?;
     if !matches!(basis, Basis::Installer | Basis::Kept) {
         if granted {
-            eprintln!("  Dreaming enabled. Turn it off any time with CSR_NO_DREAMING=1.");
+            eprintln!("  Dreaming enabled. Turn it off with CSR_NO_DREAMING=1; an installed daemon sees it only after setup runs again with it set.");
         } else {
             eprintln!("  Dreaming declined; the daemon will not run night passes.");
         }

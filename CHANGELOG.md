@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [10.1.1] - 2026-11-24
+## [10.1.2] - 2026-11-23
+
+A fixes release. There is no data migration. Upgrade as for any release (`npm install -g claude-self-reflect` then `claude-self-reflect setup`, or run `scripts/install.sh` again), then restart Claude Code.
+
+### Companion
+
+- **`CSR_NO_DREAMING=1` now stops the companion's looks.** Before, it stopped only the daemon's dream cycle, and the pages said it stopped dreams. The companion's looks (the main schedule, an agent's completion look, the compaction carry-over and the prompts kept for the dreamer) were gated only by the Dreams row in `/config`. The variable now also stops them, and it wins over a Dreams row that is on. `1` or `true` in any case turns it on, the same rule the daemon uses. The companion reads the variable from the environment Claude Code runs in; an installed daemon sees it only after `claude-self-reflect setup` runs again with it set, and the setup text now says so.
+- **The panes, `/csr dreams` and the status text now say when `CSR_NO_DREAMING` has stopped dreams.** Before, with the variable set and the Dreams row on they read as on, and with the row off the panes offered a press that could not help. `/csr dreams` and the Claude Code pane now say "Dreams are stopped. CSR_NO_DREAMING is set where Claude Code runs. Unset it and start Claude Code again to dream." The terminal pane tags its dreamer card "Stopped by CSR_NO_DREAMING" and gives the same steps under the tag, wrapped onto rows. When the Dreams row is off too, each of them adds that dreams are also off in `/config`. The status text ends with "dreams stopped by CSR_NO_DREAMING". The terminal pane and the status text learn it from a flag in the session's usage file, from the session's first usage report on. With the variable unset and no such flag, nothing changes.
+- **A Dreams row turned off in `/config` mid-session now stops the look for a finished agent.** Before, the part of the companion that watches agents asked `/config` once and kept the answer. A row you turned off (or on) after that read was ignored by the look for a finished agent until Claude Code started again, so an agent that reported could still start a look. The row is now read each time, as the main schedule already read it. A look that is already running is not cancelled.
+
+### Security
+
+- **`cookie` 0.18.3.** Clears RUSTSEC-2026-0594, where private cookie nonces can repeat in processes that fork. The private-cookie feature is off in this build, so this is a lockfile-only bump that clears `cargo audit`.
+- **The scheduled Security workflow passes again.** It scans the full history of every branch, and it had failed six weeks running. All 43 findings were triaged and none is a credential. The existing allowlist covered 41; the two left were the same sample JWT token (a cut-off signature) in a paste test, in two old commits. They are now ignored by fingerprint, so a new leak still fails the scan. The workflow can also be started by hand from the Actions tab.
+
+### Docs
+
+- **New page: "How the companion thinks."** It says how a companion look starts, what the model sees, what is checked, what it costs and how to turn it off.
+- **The switch lines match the code.** The features, privacy and troubleshooting pages and the setup text now say what `CSR_NO_DREAMING=1`, the Dreams row in `/config` and `CSR_NO_AI_NARRATIVES=1` each stop. `CSR_NO_AI_NARRATIVES=1` stops the dream model calls; the local dream cycle and the companion's looks keep running.
+
+## [10.1.1] - 2026-11-23
 
 Fixes from the first week of 10.1.0. Most came from two checks made after the release: reading 30 deleted sessions back through the shipped MCP server (28 of 30 came back whole), and an install on a clean account with no login session. There is no data migration. Upgrade as for any release (`npm install -g claude-self-reflect` then `claude-self-reflect setup`, or run `scripts/install.sh` again), then restart Claude Code.
 

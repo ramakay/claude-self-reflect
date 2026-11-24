@@ -350,7 +350,7 @@ impl Composition {
                 .is_none_or(|n| n <= 0.)
                 && array(&s["main"]).is_empty()
                 && array(&s["prompts"]).is_empty();
-        let offer = data["dreams_on"].as_bool() == Some(false);
+        let offer = dreams::offered(data);
         let state = if !top.is_null() {
             Batch::Ready
         } else if matches!(string(&look["outcome"]), "dreaming" | "started") {
@@ -574,7 +574,7 @@ impl Composition {
                 .filter(|_: &crate::companion::repo_recap::RepoRecap| empty_session),
             request_compactions: recent_request_compactions(s),
             offer,
-            offer_notice: data["offer_notice"].as_str().map(str::to_owned),
+            offer_notice: dreams::offer_notice(data),
             learnt: array(&data["learnt"])
                 .iter()
                 .filter_map(|v| {
@@ -687,11 +687,10 @@ impl Composition {
         observation::detail(self.items(at.card), at)
     }
     pub fn question(&self) -> String {
-        if self.offer {
-            return "Turn dreams on.".into();
-        }
         match self.dream.state {
+            _ if self.offer => "Turn dreams on.".into(),
             Batch::Ready => string(&self.dream.top["line"]).into(),
+            _ if dreams::says_stopped(&self.offer_notice) => dreams::STOPPED_HEAD.into(),
             Batch::Dreaming => "Dreaming.".into(),
             Batch::Nothing | Batch::Empty => "The dreamer looks as you work.".into(),
         }
@@ -994,7 +993,7 @@ fn age_span(seconds: f64) -> String {
 }
 pub(crate) fn status_line(c: &Composition) -> String {
     if let Some(notice) = &c.offer_notice {
-        return notice.clone();
+        return dreams::status_words(notice, c.dream.state == Batch::Ready);
     }
     // Offer CTA owns the enable instruction; status stays empty while the offer is up.
     if c.offer {
@@ -3430,12 +3429,8 @@ pub fn draw(
         .map(str::to_owned)
         .collect();
     if compact_hero {
-        parts.extend(
-            status
-                .split(" · ")
-                .filter(|p| !p.is_empty())
-                .map(str::to_owned),
-        );
+        let wrap = |s: &str| f.wrap(s, hcap, IW);
+        parts.extend(dreams::meta_parts(&c.offer_notice, &status, wrap));
         if parts.is_empty() {
             parts.push("It asks a what-if from your past sessions.".into());
         }
@@ -4020,7 +4015,7 @@ pub fn draw(
         if meta_rows.len() > 1 {
             meta_rows.truncate(1);
             if let Some(last) = meta_rows.last_mut().and_then(|row| row.last_mut()) {
-                *last = "…".into();
+                *last = dreams::cut_part(&c.offer_notice, &status, compact_hero);
             }
         }
     }

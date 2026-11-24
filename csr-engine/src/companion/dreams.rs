@@ -267,6 +267,86 @@ pub fn dreams_on_in(settings: &Value) -> bool {
             name.split('@').next() == Some("csr-companion") && c["options"]["dreams"] == false
         })
 }
+/// What every surface says while `CSR_NO_DREAMING` has stopped dreams. The variable wins over the
+/// `/config` Dreams row, whether the row is on or off.
+pub const STOPPED: &str = "Dreams are stopped. CSR_NO_DREAMING is set where Claude Code runs. \
+Unset it and start Claude Code again to dream.";
+/// The start of [`STOPPED`]: the terminal pane's headline while stopped.
+pub const STOPPED_HEAD: &str = "Dreams are stopped.";
+/// Added when the `/config` row is off as well: unsetting the variable alone starts no dream.
+const ROW_OFF_TOO: &str = " Dreams are also off in /config. Turn them on there too.";
+/// The card title's short form: it keeps the variable's name.
+pub const STOPPED_TAG: &str = "Stopped by CSR_NO_DREAMING";
+/// [`STOPPED`], and what else to do when the `/config` Dreams row is off too.
+pub fn stopped_words(row_on: bool) -> String {
+    if row_on {
+        STOPPED.to_owned()
+    } else {
+        format!("{STOPPED}{ROW_OFF_TOO}")
+    }
+}
+/// Whether `notice` is exactly [`stopped_words`], for the row on or off. A notice that only starts
+/// the same way is not.
+fn is_stopped_words(notice: &str) -> bool {
+    notice == STOPPED || notice.strip_prefix(STOPPED) == Some(ROW_OFF_TOO)
+}
+/// Whether a pane notice is the stopped words.
+pub fn says_stopped(notice: &Option<String>) -> bool {
+    notice.as_deref().is_some_and(is_stopped_words)
+}
+/// The status line for a notice. The stopped words lose their head, which the headline or the
+/// card's tag already says. Over a dream that is up (`dream_up`) the headline is the dream's
+/// question and the card has no tag, so they stay whole. So does any other notice.
+pub fn status_words(notice: &str, dream_up: bool) -> String {
+    match notice.strip_prefix(STOPPED_HEAD) {
+        Some(rest) if !dream_up && is_stopped_words(notice) => rest.trim_start().to_owned(),
+        _ => notice.to_owned(),
+    }
+}
+/// The parts a status gives the meta row of the terminal pane's picture. The stopped words name
+/// every step to take, so `wrap` breaks them into rows and none is cut off. Any other status
+/// splits at its dots, and a part that is too wide for its row is cut.
+pub fn meta_parts(
+    notice: &Option<String>,
+    status: &str,
+    wrap: impl Fn(&str) -> Vec<String>,
+) -> Vec<String> {
+    if says_stopped(notice) {
+        return wrap(status);
+    }
+    let parts = status.split(" · ").filter(|p| !p.is_empty());
+    parts.map(str::to_owned).collect()
+}
+/// What the last part of the picture's one kept meta row reads when a pane with no room left drops
+/// the rows under it. The stopped words go back to one part: the row shows what fits of them and
+/// ends in "…", and a click on it opens them in full. Any other part gives way to the mark alone.
+/// So does every part of a card whose status is not in its meta rows (`in_meta` false: a dream
+/// that is up draws its status under the answers).
+pub fn cut_part(notice: &Option<String>, status: &str, in_meta: bool) -> String {
+    if in_meta && says_stopped(notice) {
+        status.to_owned()
+    } else {
+        "…".into()
+    }
+}
+/// Whether the app found `CSR_NO_DREAMING` set: it writes the fact into the session's usage file
+/// (`usage::measure`), and the pane's own process (herdr starts it, so its environment is not
+/// Claude Code's) reads it back as `claude_fields.dreams_stopped`.
+pub fn stopped(data: &Value) -> bool {
+    data["claude_fields"]["dreams_stopped"] == true
+}
+/// Whether the pane offers to turn dreams on: the row is off and the variable is not set. A press
+/// cannot help under the variable.
+pub fn offered(data: &Value) -> bool {
+    data["dreams_on"].as_bool() == Some(false) && !stopped(data)
+}
+/// The notice under the dreamer card: the stopped words under the variable, else the pane's own.
+pub fn offer_notice(data: &Value) -> Option<String> {
+    if stopped(data) {
+        return Some(stopped_words(data["dreams_on"].as_bool() != Some(false)));
+    }
+    data["offer_notice"].as_str().map(str::to_owned)
+}
 pub fn feed(dreams: &[Value], chapter: &Value, sid: &str) -> Value {
     let mine: Vec<_> = dreams
         .iter()

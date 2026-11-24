@@ -17,6 +17,7 @@ export const navigation = [
     icon: 'Zap',
     items: [
       { label: 'Architecture', href: '/docs/architecture' },
+      { label: 'How the companion thinks', href: '/docs/how-the-companion-thinks' },
       { label: 'Session hooks', href: '/docs/hooks' },
       { label: 'Search & Retrieval', href: '/docs/search' },
       { label: 'Enrichment Pipeline', href: '/docs/enrichment' },
@@ -67,6 +68,7 @@ import reportCard from './report-card.md?raw'
 import installation from './installation.md?raw'
 import quickstart from './quickstart.md?raw'
 import companionViews from './companion-views.md?raw'
+import howTheCompanionThinks from './how-the-companion-thinks.md?raw'
 import architecture from './architecture.md?raw'
 import hooks from './hooks.md?raw'
 import search from './search.md?raw'
@@ -92,6 +94,7 @@ export const pages = {
   '/docs/companion-views': { title: 'Choose your view: herdr pane or in-Claude panel', description: 'Where the companion shows, how to set up each view, how to switch, and how to turn it off.', content: stripFrontmatter(companionViews), path: '/docs/companion-views' },
   '/docs/whats-new': { title: 'What\'s new in 10.1', description: 'The 10.1.0 release in short: recap, dreaming, more sources, code map, companion.', content: stripFrontmatter(whatsNew), path: '/docs/whats-new' },
   '/docs/architecture': { title: 'Architecture', description: 'How CSR works — single binary, five components, zero services.', content: stripFrontmatter(architecture), path: '/docs/architecture' },
+  '/docs/how-the-companion-thinks': { title: 'How the companion thinks', description: 'What starts a dream look, what the model sees, what is checked, what it costs, and how to turn it off.', content: stripFrontmatter(howTheCompanionThinks), path: '/docs/how-the-companion-thinks' },
   '/docs/hooks': { title: 'Session hooks', description: 'Eight hooks on seven events: they inject context when Claude needs it and capture the rest.', content: stripFrontmatter(hooks), path: '/docs/hooks' },
   '/docs/search': { title: 'Search & Retrieval', description: 'How CSR finds relevant context: hybrid search, cross-encoder re-ranking, project scope.', content: stripFrontmatter(search), path: '/docs/search' },
   '/docs/enrichment': { title: 'Enrichment Pipeline', description: 'Three layers of progressive enrichment.', content: stripFrontmatter(enrichment), path: '/docs/enrichment' },

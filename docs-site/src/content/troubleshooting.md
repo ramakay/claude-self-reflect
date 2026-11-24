@@ -60,7 +60,7 @@ launchctl kickstart -k gui/$(id -u)/com.ramakay.csr-engine.daemon
 For a daemon you started by hand, stop it and start `csr-engine daemon` again from a shell that no longer has the key. To run a daemon with the Batch API narrator off whatever the environment holds, start it with `csr-engine daemon --no-ai`.
 3. Restart Claude Code, so it starts its MCP servers again without the key.
 
-`CSR_NO_AI_NARRATIVES=1` stops the briefing, the story calls, ratification and the dream commands. It does not stop the Batch API narrator. Companion Dreams is a separate switch: turn off Dreams in `/config`.
+`CSR_NO_AI_NARRATIVES=1` stops the briefing, the story calls, ratification and the model calls of the dream commands. Their local stages still run. It does not stop the Batch API narrator. Companion Dreams is a separate switch: turn off Dreams in `/config`, or set `CSR_NO_DREAMING=1` in the environment Claude Code runs in.
 
 ## Companion
 

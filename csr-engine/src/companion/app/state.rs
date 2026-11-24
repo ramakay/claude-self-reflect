@@ -10,6 +10,7 @@
 //! `setup:seen:<step>`) is the machine's row, `(MACHINE, key)`.
 
 use crate::companion::{relay::dispatch::Ctx, store::MACHINE};
+use crate::daemon::dream_cadence::dreaming_disabled_from;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::sync::Mutex;
@@ -125,6 +126,19 @@ pub async fn config_rows(cx: &Ctx) -> Vec<Value> {
         Ok(Value::Array(rows)) => rows,
         _ => Vec::new(),
     }
+}
+
+/// Whether `CSR_NO_DREAMING` is set (the daemon's rule: `1` or `true`, any case). It stops the
+/// looks as the `/config` Dreams row off does, and wins over a row that is on. Read through the
+/// host on every call, from this process's own environment: `env.get` is answered in place, with
+/// no trip to the relay, and a host with no answer reads as not set.
+pub async fn dreaming_switched_off(cx: &Ctx) -> bool {
+    let said = cx
+        .host
+        .call("env.get", vec![json!("CSR_NO_DREAMING")])
+        .await;
+    let value = said.ok().and_then(|value| value.as_str().map(String::from));
+    dreaming_disabled_from(value.as_deref())
 }
 
 /// Whether `key` is this plugin's row `name`: `csr-companion.name`, or `csr-companion@<where>.name`
