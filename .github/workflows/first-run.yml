@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  EXPECTED_SHA256: 80589a2af7671196416a1cfc56de2e0b9fac3a56a11bbc2968d4533c320f9667
+  EXPECTED_SHA256: c30eb90980e65382ddf0f8629ee4bf992c6cf71606d7ae79dad3d9d2b6bf991c
   DAEMON_LABEL: com.ramakay.csr-engine.daemon
   # Branch whose scripts/install.sh the curl job runs. main is the README line; set a fix
   # branch here to test it before merge, and set it back after.
