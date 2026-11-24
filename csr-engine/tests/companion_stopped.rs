@@ -74,6 +74,57 @@ fn the_dreamer_card_says_stopped_with_the_row_on_or_off_and_offers_nothing() {
     }
 }
 
+/// Every run of words the picture of a live-size pane drew (35 columns by 30 rows), in order.
+fn picture_words(data: &Value) -> String {
+    use csr_engine::companion::render::{instrument::draw, theme::Theme};
+    let session = json!({ "id": "s", "main": [1], "prompts": [1] });
+    let c = Composition::build(data, &session, NOW);
+    let (_, metrics) = draw(&c, 35 * 16, 29 * 34, Theme::Dark, Open::default(), false).unwrap();
+    let runs: Vec<_> = metrics.text_runs.iter().map(|r| r.4.as_str()).collect();
+    runs.join(" ")
+}
+
+#[test]
+fn the_picture_shows_every_step_of_the_stopped_words_and_cuts_none() {
+    for row_on in [true, false] {
+        let words = picture_words(&data(row_on, true));
+        assert!(words.contains("Stopped by CSR_NO_DREAMING"), "{words}");
+        assert!(words.contains(WORDS), "{words}");
+        // The step to take is whole, not lost to an ellipsis.
+        let step = "Unset it and start Claude Code again to dream.";
+        assert!(words.contains(step), "{words}");
+        // With the row off too, the second step shows as well.
+        let too = "Dreams are also off in /config. Turn them on there too.";
+        assert_eq!(words.contains(too), !row_on, "{words}");
+    }
+}
+
+#[test]
+fn over_a_dream_that_is_up_the_picture_keeps_the_stopped_words_whole() {
+    let mut up = data(true, true);
+    up["dreams"][0].as_object_mut().unwrap().remove("answer");
+    let words = picture_words(&up);
+    // The headline is the dream's question and the card has no tag, so the notice says it all.
+    assert!(words.contains("Is it a leak?"), "{words}");
+    let whole = "Dreams are stopped. CSR_NO_DREAMING is set";
+    assert!(words.contains(whole), "{words}");
+}
+
+#[test]
+fn a_notice_that_only_starts_like_the_stopped_words_is_not_one() {
+    use csr_engine::companion::dreams::{says_stopped, status_words, stopped_words};
+    let other = "Dreams are stopped. Example";
+    assert!(!says_stopped(&Some(other.into())));
+    assert_eq!(status_words(other, false), other);
+    for row_on in [true, false] {
+        let words = stopped_words(row_on);
+        assert!(says_stopped(&Some(words.clone())));
+        // Under the headline or the tag the head is not said twice. Over a dream it stays.
+        assert!(!status_words(&words, false).contains("Dreams are stopped."));
+        assert_eq!(status_words(&words, true), words);
+    }
+}
+
 #[test]
 fn the_dreams_left_line_is_gone_while_stopped_and_back_when_not() {
     assert!(dream_facts(&data(true, true), "s").is_none());

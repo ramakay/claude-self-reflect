@@ -285,18 +285,37 @@ pub fn stopped_words(row_on: bool) -> String {
         format!("{STOPPED}{ROW_OFF_TOO}")
     }
 }
+/// Whether `notice` is exactly [`stopped_words`], for the row on or off. A notice that only starts
+/// the same way is not.
+fn is_stopped_words(notice: &str) -> bool {
+    notice == STOPPED || notice.strip_prefix(STOPPED) == Some(ROW_OFF_TOO)
+}
 /// Whether a pane notice is the stopped words.
 pub fn says_stopped(notice: &Option<String>) -> bool {
-    notice
-        .as_deref()
-        .is_some_and(|n| n.starts_with(STOPPED_HEAD))
+    notice.as_deref().is_some_and(is_stopped_words)
 }
-/// A stopped notice without its head, which the headline already says. Any other notice whole.
-pub fn after_head(notice: &str) -> String {
+/// The status line for a notice. The stopped words lose their head, which the headline or the
+/// card's tag already says. Over a dream that is up (`dream_up`) the headline is the dream's
+/// question and the card has no tag, so they stay whole. So does any other notice.
+pub fn status_words(notice: &str, dream_up: bool) -> String {
     match notice.strip_prefix(STOPPED_HEAD) {
-        Some(rest) => rest.trim_start().to_owned(),
-        None => notice.to_owned(),
+        Some(rest) if !dream_up && is_stopped_words(notice) => rest.trim_start().to_owned(),
+        _ => notice.to_owned(),
     }
+}
+/// The parts a status gives the meta row of the terminal pane's picture. The stopped words name
+/// every step to take, so `wrap` breaks them into rows and none is cut off. Any other status
+/// splits at its dots, and a part that is too wide for its row is cut.
+pub fn meta_parts(
+    notice: &Option<String>,
+    status: &str,
+    wrap: impl Fn(&str) -> Vec<String>,
+) -> Vec<String> {
+    if says_stopped(notice) {
+        return wrap(status);
+    }
+    let parts = status.split(" · ").filter(|p| !p.is_empty());
+    parts.map(str::to_owned).collect()
 }
 /// Whether the app found `CSR_NO_DREAMING` set: it writes the fact into the session's usage file
 /// (`usage::measure`), and the pane's own process (herdr starts it, so its environment is not

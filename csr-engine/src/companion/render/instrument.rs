@@ -993,7 +993,7 @@ fn age_span(seconds: f64) -> String {
 }
 pub(crate) fn status_line(c: &Composition) -> String {
     if let Some(notice) = &c.offer_notice {
-        return dreams::after_head(notice);
+        return dreams::status_words(notice, c.dream.state == Batch::Ready);
     }
     // Offer CTA owns the enable instruction; status stays empty while the offer is up.
     if c.offer {
@@ -3429,12 +3429,8 @@ pub fn draw(
         .map(str::to_owned)
         .collect();
     if compact_hero {
-        parts.extend(
-            status
-                .split(" · ")
-                .filter(|p| !p.is_empty())
-                .map(str::to_owned),
-        );
+        let wrap = |s: &str| f.wrap(s, hcap, IW);
+        parts.extend(dreams::meta_parts(&c.offer_notice, &status, wrap));
         if parts.is_empty() {
             parts.push("It asks a what-if from your past sessions.".into());
         }
