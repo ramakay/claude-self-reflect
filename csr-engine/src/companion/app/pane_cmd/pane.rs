@@ -488,7 +488,7 @@ pub fn render(
             &DREAMS,
             "Dreams are stopped",
             crate::companion::dreams::STOPPED_TAG,
-            vec![item(crate::companion::dreams::STOPPED).color(QUIET)],
+            vec![item(crate::companion::dreams::stopped_words(dreams_on)).color(QUIET)],
         )
     } else if !dreams_on && turned != Some(TurnedOn::On) {
         let (dreams, press) = dreams_offer(cols, data, turned);

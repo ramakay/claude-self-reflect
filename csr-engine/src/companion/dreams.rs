@@ -271,8 +271,33 @@ pub fn dreams_on_in(settings: &Value) -> bool {
 /// `/config` Dreams row, whether the row is on or off.
 pub const STOPPED: &str = "Dreams are stopped. CSR_NO_DREAMING is set where Claude Code runs. \
 Unset it and start Claude Code again to dream.";
+/// The start of [`STOPPED`]: the terminal pane's headline while stopped.
+pub const STOPPED_HEAD: &str = "Dreams are stopped.";
+/// Added when the `/config` row is off as well: unsetting the variable alone starts no dream.
+const ROW_OFF_TOO: &str = " Dreams are also off in /config. Turn them on there too.";
 /// The card title's short form: it keeps the variable's name.
 pub const STOPPED_TAG: &str = "Stopped by CSR_NO_DREAMING";
+/// [`STOPPED`], and what else to do when the `/config` Dreams row is off too.
+pub fn stopped_words(row_on: bool) -> String {
+    if row_on {
+        STOPPED.to_owned()
+    } else {
+        format!("{STOPPED}{ROW_OFF_TOO}")
+    }
+}
+/// Whether a pane notice is the stopped words.
+pub fn says_stopped(notice: &Option<String>) -> bool {
+    notice
+        .as_deref()
+        .is_some_and(|n| n.starts_with(STOPPED_HEAD))
+}
+/// A stopped notice without its head, which the headline already says. Any other notice whole.
+pub fn after_head(notice: &str) -> String {
+    match notice.strip_prefix(STOPPED_HEAD) {
+        Some(rest) => rest.trim_start().to_owned(),
+        None => notice.to_owned(),
+    }
+}
 /// Whether the app found `CSR_NO_DREAMING` set: it writes the fact into the session's usage file
 /// (`usage::measure`), and the pane's own process (herdr starts it, so its environment is not
 /// Claude Code's) reads it back as `claude_fields.dreams_stopped`.
@@ -287,7 +312,7 @@ pub fn offered(data: &Value) -> bool {
 /// The notice under the dreamer card: the stopped words under the variable, else the pane's own.
 pub fn offer_notice(data: &Value) -> Option<String> {
     if stopped(data) {
-        return Some(STOPPED.to_owned());
+        return Some(stopped_words(data["dreams_on"].as_bool() != Some(false)));
     }
     data["offer_notice"].as_str().map(str::to_owned)
 }

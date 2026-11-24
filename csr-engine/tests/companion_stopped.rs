@@ -64,6 +64,11 @@ fn the_dreamer_card_says_stopped_with_the_row_on_or_off_and_offers_nothing() {
     for row_on in [true, false] {
         let rows = rows_of(&data(row_on, true));
         assert!(rows.contains(WORDS));
+        // The headline says it once, and no line says the dreamer is at work.
+        assert_eq!(rows.matches("Dreams are stopped.").count(), 1);
+        assert!(!rows.contains("looks as you work"));
+        // With the row off too, unsetting the variable is not enough, and the words say so.
+        assert_eq!(rows.contains("also off in /config"), !row_on);
         assert!(!rows.contains("Press 1 to turn dreams on"));
         assert!(!rows.contains("Dreams are off"));
     }

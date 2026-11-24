@@ -879,7 +879,11 @@ fn world_stopped(row: bool) -> World {
 async fn csr_dreams_says_stopped_under_the_variable_with_the_row_on_or_off() {
     for row in [true, false] {
         let r = rig_with(world_stopped(row), Fake::new(false, Some(shifts())));
-        assert_eq!(r.csr("dreams").await, STOPPED_WORDS);
+        let said = r.csr("dreams").await;
+        assert!(said.starts_with(STOPPED_WORDS));
+        // With the row off too, unsetting the variable is not enough, and the words say so.
+        assert_eq!(said == STOPPED_WORDS, row);
+        assert_eq!(said.contains("also off in /config"), !row);
     }
 }
 
@@ -889,9 +893,13 @@ async fn the_pane_says_stopped_under_the_variable_and_offers_no_press() {
         let r = rig_with(world_stopped(row), Fake::new(false, Some(quiet())));
         r.started().await;
         let pane = r.pane().await;
-        let said = all_texts(&pane).join(" ");
+        // The card wraps its words into rows, and each row ends in its edge mark: read the
+        // words as one run.
+        let said = all_texts(&pane).join(" ").replace('█', " ");
+        let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(said.contains("Dreams are stopped"));
         assert!(said.contains(STOPPED_WORDS));
+        assert_eq!(said.contains("also off in /config"), !row, "{said}");
         assert!(!said.contains("Dreams are on"));
         assert!(!said.contains("Dreams are off"));
         assert!(button_labels(&pane).is_empty());

@@ -390,10 +390,10 @@ async fn dreams_on(cx: &Ctx) -> bool {
 }
 
 async fn dreams_say(cx: &Ctx) -> String {
-    if dreaming_switched_off(cx).await {
-        return crate::companion::dreams::STOPPED.to_string();
-    }
     let on = dreams_on(cx).await;
+    if dreaming_switched_off(cx).await {
+        return crate::companion::dreams::stopped_words(on);
+    }
     dreams_text::dreams_text(cx, on)
 }
 

@@ -687,11 +687,10 @@ impl Composition {
         observation::detail(self.items(at.card), at)
     }
     pub fn question(&self) -> String {
-        if self.offer {
-            return "Turn dreams on.".into();
-        }
         match self.dream.state {
+            _ if self.offer => "Turn dreams on.".into(),
             Batch::Ready => string(&self.dream.top["line"]).into(),
+            _ if dreams::says_stopped(&self.offer_notice) => dreams::STOPPED_HEAD.into(),
             Batch::Dreaming => "Dreaming.".into(),
             Batch::Nothing | Batch::Empty => "The dreamer looks as you work.".into(),
         }
@@ -994,7 +993,7 @@ fn age_span(seconds: f64) -> String {
 }
 pub(crate) fn status_line(c: &Composition) -> String {
     if let Some(notice) = &c.offer_notice {
-        return notice.clone();
+        return dreams::after_head(notice);
     }
     // Offer CTA owns the enable instruction; status stays empty while the offer is up.
     if c.offer {
