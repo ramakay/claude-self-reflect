@@ -712,7 +712,7 @@ impl Pane {
             "story": story,
             "claude_fields": kept["fields"],
             "claude_at": kept["at"],
-            "limits": limits,
+            "limits": super::agy::with(limits, &self.paths, now),
             "forecast": forecast,
             "rings": self.rings,
             "sts": masthead::csr_status_at(&self.paths, now),

@@ -126,8 +126,15 @@ pub struct Limit {
     pub line: String,
 }
 
-/// The limits card's windows: the forecast's, or with no outlook the bare quotas, with no pace.
+/// The limits card's windows: Claude's, then the Antigravity CLI's when it has a reading (agy.rs).
 pub fn limits(c: &Composition) -> Vec<Limit> {
+    let mut out = claude_limits(c);
+    out.extend(super::agy::limits(&c.figure["agy"], c.now));
+    out
+}
+
+/// Claude's windows: the forecast's, or with no outlook the bare quotas, with no pace.
+fn claude_limits(c: &Composition) -> Vec<Limit> {
     let g = &c.figure;
     if let Some(windows) = g["outlook"]["windows"].as_array() {
         return windows

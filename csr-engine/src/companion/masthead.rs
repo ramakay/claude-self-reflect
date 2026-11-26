@@ -430,7 +430,7 @@ pub fn gauges(
         (Some(n), Some(size)) => super::breakdown::figure(&s["breakdown"], n, size),
         _ => Value::Null,
     };
-    json!({
+    let mut g = json!({
         "ctx": {
             "tokens": tokens,
             "size": size,
@@ -466,7 +466,13 @@ pub fn gauges(
             })
         },
         "compacting": null,
-    })
+    });
+    // The Antigravity CLI's reading rides with the account's windows (agy.rs) and is the
+    // account's, so it is kept whichever windows the session's own figures supplied.
+    if limits["agy"].is_object() {
+        g["agy"] = limits["agy"].clone();
+    }
+    g
 }
 /// A usage file as `usage::measure` writes it.
 #[cfg(test)]
