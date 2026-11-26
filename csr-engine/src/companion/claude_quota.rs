@@ -15,14 +15,30 @@
 //!   it succeeds.
 //! * The cache (`<keep>/claude-usage.json`) holds the model names, percents and reset times only.
 //!
+//! # Off unless asked for
+//!
+//! Reading another app's login and calling an endpoint Anthropic does not document is a choice
+//! the person makes, not a default: nothing is read, fetched or drawn until `<keep>/SWITCH` says
+//! `"on": true`. Setup asks once (`setup_consent.rs`, default no) and writes the answer there.
+//! `CSR_NO_CLAUDE_QUOTA=1` turns it off even then.
+//!
 //! One fetch per `REFRESH` across every pane (the stamp claim agy.rs uses), off the frame.
-//! `CSR_NO_CLAUDE_QUOTA=1` turns it off. A reading older than `SHOWN_FOR` is not drawn.
+//! A reading older than `SHOWN_FOR` is not drawn.
 use super::contract::{sev_for, Limit};
 use super::paths::Paths;
 use serde_json::{json, Value};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 pub const FILE: &str = "claude-usage.json";
+/// The person's answer: `{"on": bool, "at": ms, "from": "setup"}`. No file is off.
+pub const SWITCH: &str = "model-limits.json";
+
+/// Whether the person turned model limits on, and `CSR_NO_CLAUDE_QUOTA` does not stop them.
+pub fn on(keep: &Path) -> bool {
+    !std::env::var_os("CSR_NO_CLAUDE_QUOTA").is_some_and(|v| !v.is_empty() && v != "0")
+        && super::paths::read_json(&keep.join(SWITCH))["on"] == true
+}
 const STAMP: &str = "claude-usage.asking";
 /// Seconds between fetches.
 const REFRESH: f64 = 300.;
@@ -36,7 +52,7 @@ const ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage?skip_spend=1";
 /// that keeps nothing (a `--png`, `--json` or `--frame` export): it reads, never fetches.
 pub fn with(limits: Value, paths: &Paths, now: f64, ask: bool) -> Value {
     let mut limits = super::agy::with(limits, paths, now, ask);
-    if std::env::var_os("CSR_NO_CLAUDE_QUOTA").is_some_and(|v| !v.is_empty() && v != "0") {
+    if !on(&paths.keep) {
         return limits;
     }
     let kept = super::paths::read_json(&paths.keep.join(FILE));
@@ -349,6 +365,14 @@ mod tests {
         );
         let r = reading(&body(), NOW - 60.);
         std::fs::write(paths.keep.join(FILE), r.to_string()).unwrap();
+        assert_eq!(
+            with(json!({}), &paths, NOW, false),
+            json!({}),
+            "off until the person turns it on"
+        );
+        std::fs::write(paths.keep.join(SWITCH), r#"{"on": false}"#).unwrap();
+        assert_eq!(with(json!({}), &paths, NOW, false), json!({}), "said no");
+        std::fs::write(paths.keep.join(SWITCH), r#"{"on": true}"#).unwrap();
         let got = with(
             json!({"seven_day": {"used_percentage": 77}}),
             &paths,

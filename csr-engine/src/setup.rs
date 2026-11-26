@@ -296,7 +296,7 @@ pub async fn handle(
     // ON by default, with a per-night token estimate computed from the corpus
     // that was just imported — i.e. from real numbers, shown BEFORE the
     // question is asked.
-    dreaming_consent_step(eng.storage())?;
+    consent::consent_steps(eng.storage())?;
 
     // Step 8: the background daemon. Last, so it never races the import above
     // for the database. Dreams are on by default and only the daemon runs them.
@@ -1237,7 +1237,6 @@ fn next_steps(report: Option<&RelayReport>) -> String {
 
 #[path = "setup_consent.rs"]
 pub(crate) mod consent;
-use consent::dreaming_consent_step;
 
 /// The MCP server name we own in Claude Code's user-scope config.
 const MCP_SERVER_NAME: &str = "claude-self-reflect";
