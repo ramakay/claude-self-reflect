@@ -199,6 +199,10 @@ pub(super) fn draw(
     let mut y = top + h + S1 + drow();
     if group_row(ls) {
         for (i, (name, left, right)) in spans.iter().enumerate() {
+            // A one-column group is already named under its column.
+            if ls.iter().filter(|l| &l.group == name).count() == 1 {
+                continue;
+            }
             // Centred under its columns, as wide as the halfway points to its neighbours allow.
             let mid = (left + right) / 2.;
             let lo = if i > 0 {
