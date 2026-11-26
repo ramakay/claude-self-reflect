@@ -467,10 +467,13 @@ pub fn gauges(
         },
         "compacting": null,
     });
-    // The Antigravity CLI's reading rides with the account's windows (agy.rs) and is the
-    // account's, so it is kept whichever windows the session's own figures supplied.
-    if limits["agy"].is_object() {
-        g["agy"] = limits["agy"].clone();
+    // The Antigravity CLI's reading (agy.rs) and Claude's per-model weekly shares (claude_quota.rs)
+    // ride with the account's windows and are the account's, so they are kept whichever windows
+    // the session's own figures supplied.
+    for key in ["agy", "scoped"] {
+        if limits[key].is_object() || limits[key].is_array() {
+            g[key] = limits[key].clone();
+        }
     }
     g
 }

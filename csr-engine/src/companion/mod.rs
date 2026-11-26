@@ -7,6 +7,7 @@ pub mod breakdown;
 pub mod brief;
 pub mod card;
 pub mod carry;
+pub mod claude_quota;
 pub mod cli;
 pub mod coach;
 pub mod codex_runs;

@@ -822,9 +822,16 @@ fn the_dashboard_reads_top_to_bottom_in_words_at_every_size_and_theme() {
                         .starts_with("Early · last week peaked at 71%"),
                     "{at}"
                 );
+                // Each window is a column of the limits chart, side by side, left to right.
+                for pair in d.limits.windows(2) {
+                    assert!(
+                        pair[0].bar.0 + pair[0].bar.2 < pair[1].bar.0,
+                        "{at}: {pair:?}"
+                    );
+                }
                 for l in &d.limits {
                     let (bx, by, bw, bh) = l.bar;
-                    assert!(bw > 200. && bh >= 6., "{at}: {l:?}");
+                    assert!(bh >= 24. && (12. ..=46.).contains(&bw), "{at}: {l:?}");
                     assert!(bx >= IX && bx + bw <= IX + IW + 0.01, "{at}: {l:?}");
                     assert!((0. ..=1.).contains(&l.fill), "{at}: {l:?}");
                     assert!(by > m.figure_region.0 && by < m.figure_region.0 + m.figure_region.1);

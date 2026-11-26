@@ -30,15 +30,16 @@ const STAMP_STALE: f64 = 120.;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `limits` (the account's Claude windows) with the newest agy reading under `"agy"`, when there
-/// is one fresh enough to draw. Asks agy again, off the frame, when the reading is due.
-pub fn with(mut limits: Value, paths: &Paths, now: f64) -> Value {
+/// is one fresh enough to draw. Asks agy again, off the frame, when the reading is due and `ask`
+/// (a pane that keeps nothing, an export, only reads).
+pub fn with(mut limits: Value, paths: &Paths, now: f64, ask: bool) -> Value {
     if std::env::var_os("CSR_NO_AGY").is_some_and(|v| !v.is_empty() && v != "0") {
         return limits;
     }
     let file = paths.keep.join(FILE);
     let kept = super::paths::read_json(&file);
     let at = kept["at"].as_f64();
-    if at.is_none_or(|at| now - at >= REFRESH || now < at) {
+    if ask && at.is_none_or(|at| now - at >= REFRESH || now < at) {
         ask_later(paths, now);
     }
     if at.is_some_and(|at| now - at < SHOWN_FOR && now >= at - 60.) && kept["groups"].is_array() {
@@ -93,7 +94,7 @@ fn ask_later(paths: &Paths, now: f64) {
 }
 
 /// Takes the stamp file, or a stale one; false while another reader holds a fresh one.
-fn claim(stamp: &Path, now: f64) -> bool {
+pub(super) fn claim(stamp: &Path, now: f64) -> bool {
     let open = || {
         std::fs::OpenOptions::new()
             .write(true)
@@ -151,7 +152,7 @@ fn read_agy(bin: &Path, keep: &Path) -> Option<Value> {
     Some(reading(&usage, credits.as_ref(), now_secs()))
 }
 
-fn now_secs() -> f64 {
+pub(super) fn now_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0., |d| d.as_secs_f64())
@@ -179,7 +180,15 @@ pub fn reading(usage: &Value, credits: Option<&Value>, at: f64) -> Value {
                     }))
                 })
                 .collect();
-            json!({"name": super::string(&g["name"]), "buckets": buckets})
+            // "Models within this group: A, B, C": the group's models share its limits.
+            let models: Vec<&str> = super::string(&g["description"])
+                .split_once(':')
+                .map_or("", |(_, list)| list)
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty() && !m.starts_with("Orchestrator"))
+                .collect();
+            json!({"name": super::string(&g["name"]), "buckets": buckets, "models": models})
         })
         .collect();
     json!({
@@ -189,67 +198,75 @@ pub fn reading(usage: &Value, credits: Option<&Value>, at: f64) -> Value {
     })
 }
 
-/// The bars the limits card draws for a reading: one per group in use (a bucket below full or
-/// with a reset still ahead), showing the bucket with the least left. A bucket whose reset has
-/// passed is not drawn: it has refilled since the reading.
+/// The columns the limits chart draws for a reading: each group's 5 Hour and Weekly windows, an
+/// unused group too (at 0, so the chart shows every quota the plan has). A bucket whose reset
+/// has passed has refilled since the reading: it reads as full. The group's one line under the
+/// chart rides on its tightest window and names the models that share the group's limits.
 pub fn limits(agy: &Value, now: f64) -> Vec<Limit> {
-    let credits = agy["credits"].as_f64().filter(|n| *n > 0.);
+    let credit = agy["credits"]
+        .as_f64()
+        .filter(|n| *n > 0.)
+        .map(|n| format!(" · {n:.0} AI credits"))
+        .unwrap_or_default();
     let mut out = vec![];
     for g in super::array(&agy["groups"]) {
-        let buckets: Vec<(&str, f64, Option<f64>)> = super::array(&g["buckets"])
-            .iter()
-            .filter_map(|b| {
-                Some((
-                    b["window"].as_str()?,
-                    b["left"].as_f64()?,
-                    b["resets"].as_f64(),
-                ))
-            })
-            .filter(|(_, _, resets)| resets.is_none_or(|r| r > now))
-            .collect();
-        if !buckets
-            .iter()
-            .any(|(_, left, resets)| *left < 1. || resets.is_some())
-        {
-            continue;
-        }
-        let Some(&(window, left, resets)) = buckets.iter().min_by(|a, b| {
-            a.1.total_cmp(&b.1)
-                .then_with(|| (a.0 != "weekly").cmp(&(b.0 != "weekly")))
-        }) else {
-            continue;
-        };
-        let used = ((1. - left) * 100.).clamp(0., 100.);
-        let code = if window == "weekly" { "7D" } else { "5H" };
         let group = match super::string(&g["name"]) {
             "Gemini Models" => "Gemini",
             "Claude and GPT models" => "Claude/GPT",
             other => other,
         };
-        let reset = resets
-            .map(|r| format!(" · resets in {}", super::forecast::until(r - now)))
-            .unwrap_or_default();
-        let credit = credits
-            .map(|n| format!(" · {n:.0} AI credits"))
-            .unwrap_or_default();
-        out.push(Limit {
-            code: format!("AGY{code}"),
-            name: format!("agy {code}"),
-            used,
-            sev: if used >= 90. {
-                "red"
-            } else if used >= 75. {
-                "amber"
-            } else {
-                "ok"
-            }
-            .to_owned(),
-            tick: None,
-            line: format!(
-                "agy {group} · {}% left{reset}{credit}",
-                (left * 100.).round() as i64
-            ),
-        });
+        let buckets = super::array(&g["buckets"]);
+        let mut cols: Vec<(Limit, Option<f64>)> = vec![];
+        for (window, label, code) in [("5h", "5 Hour", "5H"), ("weekly", "Weekly", "7D")] {
+            let Some(b) = buckets.iter().find(|b| b["window"] == window) else {
+                continue;
+            };
+            let resets = b["resets"].as_f64();
+            let left = match resets {
+                Some(r) if r <= now => 1.,
+                _ => b["left"].as_f64().unwrap_or(1.),
+            };
+            let used = ((1. - left) * 100.).clamp(0., 100.);
+            let limit = Limit {
+                code: format!("AGY-{}-{code}", group.to_uppercase()),
+                name: format!("agy {group} {code}"),
+                used,
+                sev: super::contract::sev_for(used),
+                group: format!("agy {group}"),
+                label: label.into(),
+                ..Limit::default()
+            };
+            cols.push((limit, resets.filter(|r| *r > now)));
+        }
+        let models = super::array(&g["models"])
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let models = if models.is_empty() {
+            models
+        } else {
+            format!(" · {models}")
+        };
+        let Some(tight) =
+            (0..cols.len()).max_by(|a, b| cols[*a].0.used.total_cmp(&cols[*b].0.used))
+        else {
+            continue;
+        };
+        let (limit, resets) = &mut cols[tight];
+        limit.line = if limit.used <= 0. && resets.is_none() {
+            format!("agy {group} · unused{credit}{models}")
+        } else {
+            let reset = resets
+                .map(|r| format!(" · resets in {}", super::forecast::until(r - now)))
+                .unwrap_or_default();
+            format!(
+                "agy {group} · {}% left in {}{reset}{credit}{models}",
+                (100. - limit.used).round() as i64,
+                limit.label
+            )
+        };
+        out.extend(cols.into_iter().map(|(l, _)| l));
     }
     out
 }
@@ -263,7 +280,9 @@ mod tests {
 
     fn usage() -> Value {
         json!({"groups": [
-            {"name": "Gemini Models", "buckets": [
+            {"name": "Gemini Models",
+             "description": "Models within this group: Gemini 4 Neon, Orchestrator (Neon), Gemini 3.8 Flash",
+             "buckets": [
                 {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.8484677,
                  "reset_time": "2026-11-30T20:05:37Z"},
                 {"id": "gemini-5h", "window": "5h", "remaining_fraction": 1,
@@ -283,41 +302,68 @@ mod tests {
         assert!(r["groups"][0]["buckets"][0]["resets"].as_f64().unwrap() > NOW);
         assert_eq!(r["groups"][1]["buckets"][0]["resets"], Value::Null);
         assert_eq!(r["credits"], 0.);
-    }
-
-    #[test]
-    fn a_group_in_use_gets_one_bar_for_its_tightest_window() {
-        let r = reading(&usage(), None, NOW);
-        let bars = limits(&r, NOW);
-        assert_eq!(bars.len(), 1, "the unused Claude/GPT group draws no bar");
-        assert_eq!(bars[0].name, "agy 7D");
-        assert_eq!(bars[0].used.round(), 15.);
-        assert_eq!(bars[0].sev, "ok");
-        assert!(bars[0]
-            .line
-            .starts_with("agy Gemini · 85% left · resets in "));
-        assert!(
-            !bars[0].line.contains("credits"),
-            "a zero balance is not shown"
+        assert_eq!(
+            r["groups"][0]["models"],
+            json!(["Gemini 4 Neon", "Gemini 3.8 Flash"])
         );
     }
 
     #[test]
-    fn a_lower_five_hour_window_wins_and_credits_show_when_above_zero() {
-        let mut u = usage();
-        u["groups"][0]["buckets"][1]["remaining_fraction"] = json!(0.05);
-        let r = reading(&u, Some(&json!({"remaining_credits": 120})), NOW);
-        let bars = limits(&r, NOW);
-        assert_eq!(bars[0].name, "agy 5H");
-        assert_eq!(bars[0].sev, "red");
-        assert!(bars[0].line.contains("5% left"));
-        assert!(bars[0].line.ends_with(" · 120 AI credits"));
+    fn every_group_gets_a_column_per_window_and_one_line_on_its_tightest() {
+        let r = reading(&usage(), None, NOW);
+        let cols = limits(&r, NOW);
+        let codes: Vec<_> = cols.iter().map(|l| l.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            [
+                "AGY-GEMINI-5H",
+                "AGY-GEMINI-7D",
+                "AGY-CLAUDE/GPT-5H",
+                "AGY-CLAUDE/GPT-7D"
+            ]
+        );
+        assert_eq!(cols[1].group, "agy Gemini");
+        assert_eq!(cols[1].label, "Weekly");
+        assert_eq!(cols[1].used.round(), 15.);
+        assert_eq!(cols[1].sev, "ok");
+        assert_eq!(
+            cols[0].line, "",
+            "the group's line rides on its tightest window"
+        );
+        assert!(cols[1]
+            .line
+            .starts_with("agy Gemini · 85% left in Weekly · resets in "));
+        assert!(cols[1].line.ends_with(" · Gemini 4 Neon, Gemini 3.8 Flash"));
+        assert!(
+            !cols[1].line.contains("credits"),
+            "a zero balance is not shown"
+        );
+        assert_eq!(cols[3].used, 0.);
+        assert_eq!(cols[3].line, "agy Claude/GPT · unused");
     }
 
     #[test]
-    fn a_bucket_past_its_reset_is_not_drawn() {
+    fn a_lower_five_hour_window_carries_the_line_and_credits_show_when_above_zero() {
+        let mut u = usage();
+        u["groups"][0]["buckets"][1]["remaining_fraction"] = json!(0.05);
+        let r = reading(&u, Some(&json!({"remaining_credits": 120})), NOW);
+        let cols = limits(&r, NOW);
+        assert_eq!(cols[0].sev, "red");
+        assert!(
+            cols[0].line.contains("5% left in 5 Hour"),
+            "{}",
+            cols[0].line
+        );
+        assert!(cols[0].line.contains(" · 120 AI credits"));
+        assert_eq!(cols[1].line, "");
+    }
+
+    #[test]
+    fn a_bucket_past_its_reset_reads_as_refilled() {
         let r = reading(&usage(), None, NOW);
-        assert!(limits(&r, NOW + 30. * 86400.).is_empty());
+        let cols = limits(&r, NOW + 30. * 86400.);
+        assert!(cols.iter().all(|l| l.used == 0.));
+        assert!(cols[1].line.starts_with("agy Gemini · unused"));
     }
 
     #[test]
@@ -325,13 +371,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path().to_path_buf());
         std::fs::create_dir_all(&paths.keep).unwrap();
-        assert_eq!(with(json!({}), &paths, NOW), json!({}), "no file, no key");
+        assert_eq!(
+            with(json!({}), &paths, NOW, false),
+            json!({}),
+            "no file, no key"
+        );
         let r = reading(&usage(), None, NOW - 60.);
         std::fs::write(paths.keep.join(FILE), r.to_string()).unwrap();
-        let got = with(json!({"five_hour": {"used_percentage": 3}}), &paths, NOW);
+        let got = with(
+            json!({"five_hour": {"used_percentage": 3}}),
+            &paths,
+            NOW,
+            false,
+        );
         assert_eq!(got["five_hour"]["used_percentage"], 3);
         assert_eq!(got["agy"]["groups"][0]["name"], "Gemini Models");
-        assert_eq!(with(json!({}), &paths, NOW + SHOWN_FOR), json!({}));
+        assert_eq!(with(json!({}), &paths, NOW + SHOWN_FOR, false), json!({}));
     }
 
     #[test]

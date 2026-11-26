@@ -5862,39 +5862,6 @@ fn figure(
 // tokens per turn. The older ring layouts stay for a card too short to hold it.
 // ---------------------------------------------------------------------------------------------
 const DASH_HEAD_LINE: f32 = theme::TITLE_LINE;
-fn dash_label_w() -> f32 {
-    theme::pick(82.0, 62.0)
-}
-fn dash_pct_w() -> f32 {
-    theme::pick(52.0, 40.0)
-}
-fn dash_limit_pitch_full() -> f32 {
-    theme::pick(45.0, 36.0)
-}
-/// A limit's pitch when the Context card is lean and the limit is not a warning: its bar alone.
-fn dash_limit_lean() -> f32 {
-    theme::pick(27.0, 36.0)
-}
-/// A limit row's pitch: the bar and its words, or the bar alone for a limit that is fine while the
-/// card is lean.
-fn dash_limit_pitch(sev: &str, lean: bool) -> f32 {
-    if lean && sev == "ok" {
-        dash_limit_lean()
-    } else {
-        dash_limit_pitch_full()
-    }
-}
-/// The severity of the Codex weekly limit's bar.
-fn dash_codex_sev(used: f64) -> &'static str {
-    if used >= 90. {
-        "red"
-    } else if used >= 75. {
-        "amber"
-    } else {
-        "ok"
-    }
-}
-const DASH_BAR_H: f32 = 8.;
 const DASH_ROW: f32 = 14.;
 /// The Context card's rows are drawn at the rows' scale (`theme::ROW_*`): its row pitch, its row
 /// names and its lead lines, and a name's line.
@@ -6283,9 +6250,8 @@ struct DashPlan {
     /// The API credit row, wrapped, and whether it warns.
     credit: Vec<String>,
     credit_warns: bool,
-    /// (code, name, used percent, state, tick percent, line) of each window.
-    limits: Vec<(String, String, f64, String, Option<f64>, String)>,
-    codex: Option<(f64, String)>,
+    /// Every quota window, as the limits chart draws it (limits_chart.rs).
+    limits: Vec<crate::companion::contract::Limit>,
     ctx: Option<(f64, f64, &'static str)>,
     /// Claude Code's auto-compact buffer at the window's end, when its window is known.
     buffer: Option<f64>,
@@ -6808,13 +6774,9 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
             )
         })
         .unwrap_or_default();
-    // The windows (a figure with no outlook still shows its windows, with no pace) and the Codex
-    // bar are worded once (contract.rs), for this pane and any other.
-    let limits: Vec<_> = crate::companion::contract::limits(c)
-        .into_iter()
-        .map(|l| (l.code, l.name, l.used, l.sev, l.tick, l.line))
-        .collect();
-    let codex = crate::companion::contract::codex(c);
+    // The windows (a figure with no outlook still shows its windows, with no pace), the Codex
+    // week and agy's are worded once (contract.rs), for this pane and any other.
+    let limits = crate::companion::contract::limits(c);
     let ctx_state = match string(&g["ctx"]["sev"]) {
         "red" => "red",
         "amber" => "amber",
@@ -6879,7 +6841,6 @@ fn dash_plan(f: &Fonts, c: &Composition, t: &Tokens) -> Option<DashPlan> {
         credit,
         credit_warns: credit_head.is_some(),
         limits,
-        codex,
         ctx: tokens
             .zip(size)
             .map(|(tokens, size)| (tokens, size, ctx_state)),
@@ -6926,10 +6887,7 @@ fn dash_heights_with(
     } else {
         p.head.len().min(if lean { 1 } else { 2 }) as f32 * theme::row_title_line() + S2
     };
-    let limits = (p.limits.iter().map(|l| l.3.as_str()))
-        .chain(p.codex.iter().map(|(n, _)| dash_codex_sev(*n)))
-        .map(|sev| dash_limit_pitch(sev, lean))
-        .sum::<f32>()
+    let limits = limits_chart::height(&p.limits, lean)
         + if p.credit.is_empty() || !credit {
             0.
         } else {
@@ -7184,74 +7142,10 @@ fn draw_dashboard(
         dash.headline = Some((p.head.join(" "), p.head_sev.clone()));
         at += head_h + gap;
     }
-    // B. the limits
+    // B. the limits: every quota window as a column, grouped by whose it is (limits_chart.rs).
     let name_st = sans(dash_name(), t.medium);
     let caption = sans(theme::row_caption_size(), t.regular);
-    let bar_x = IX + dash_label_w();
-    let bar_w = IW - dash_label_w() - dash_pct_w();
-    let mut bars: Vec<(String, String, f64, String, Option<f64>, String)> = p.limits.clone();
-    if let Some((n, line)) = &p.codex {
-        bars.push((
-            "CX".into(),
-            "Codex 7D".into(),
-            *n,
-            dash_codex_sev(*n).into(),
-            None,
-            line.clone(),
-        ));
-    }
-    for (code, name, used, sev, tick, line) in &bars {
-        let ink = dash_sev_ink(sev, t);
-        let base = at + f.cap(name_st);
-        c.text(f, name, IX, base, name_st, t.ink, A::L);
-        let bar_y = at + f.cap(name_st) / 2. - DASH_BAR_H / 2.;
-        c.rrect(bar_x, bar_y, bar_w, DASH_BAR_H, 3., t.track);
-        let fill = (used / 100.).clamp(0., 1.) as f32;
-        if *used > 0. {
-            c.rrect(bar_x, bar_y, (bar_w * fill).max(4.), DASH_BAR_H, 3., ink);
-        }
-        let tick_frac = tick.map(|n| (n / 100.).clamp(0., 1.) as f32);
-        if let Some(frac) = tick_frac {
-            let tx = (bar_x + bar_w * frac).min(bar_x + bar_w - 1.);
-            c.rect(tx - 1., bar_y - 3., 2., DASH_BAR_H + 6., t.quiet);
-        }
-        c.text(
-            f,
-            &format!("{}%", used.round() as i64),
-            IX + IW,
-            base,
-            sans(dash_name(), t.bold),
-            ink,
-            A::R,
-        );
-        let line_ink = if sev == "red" && line.starts_with("On pace to run out") {
-            t.risk
-        } else {
-            t.quiet
-        };
-        if !(p.lean && sev == "ok") {
-            single(
-                c,
-                f,
-                line,
-                IX,
-                at + dash_name_line() + 1. + f.cap(caption),
-                IW,
-                theme::row_caption_size(),
-                line_ink,
-                t,
-            );
-        }
-        dash.limits.push(DashLimit {
-            code: code.clone(),
-            name: name.clone(),
-            bar: (bar_x, bar_y, bar_w, DASH_BAR_H),
-            fill,
-            tick: tick_frac,
-            line: line.clone(),
-        });
-        at += dash_limit_pitch(sev, p.lean);
-    }
+    at = limits_chart::draw(c, f, t, &p.limits, p.lean, at, &mut dash.limits);
     // The API credit, under the bars it sits with: a warning once it runs out within days.
     if !p.credit.is_empty() {
         let ink = if p.credit_warns { t.amber } else { t.quiet };
@@ -8192,6 +8086,8 @@ pub fn strip(
     Some(c.pm)
 }
 
+#[path = "limits_chart.rs"]
+mod limits_chart;
 #[cfg(test)]
 #[path = "instrument_tests.rs"]
 mod tests;
