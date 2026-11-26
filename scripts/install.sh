@@ -32,7 +32,9 @@
 #                        for tests and automation)
 #
 # Answering yes at the "Run setup now?" prompt also gives setup its consent for
-# dreams (CSR_DREAMS_CONSENT=yes), so setup does not ask a second time.
+# dreams (CSR_DREAMS_CONSENT=yes), so setup does not ask a second time. On
+# macOS a yes is followed by the model limits question (default no), passed to
+# setup as CSR_MODEL_LIMITS_CONSENT=yes|no.
 
 set -e
 
@@ -828,6 +830,8 @@ build, so the engine cannot be built for this platform either."
     # covers the dreams and `claude -p` disclosure printed with it, so setup is
     # told not to ask again. CSR_AUTO_SETUP never sets it.
     PROMPTED_YES=no
+    # The model limits answer from the prompt below; empty when not asked.
+    MODEL_LIMITS=""
     TTY_DEV="${CSR_TTY:-/dev/tty}"
     if [ "${CSR_SKIP_SETUP:-}" = "1" ]; then
         RUN_SETUP=no
@@ -852,9 +856,12 @@ build, so the engine cannot be built for this platform either."
             printf '  \033[1mRun setup now? [Y/n]\033[0m '
         } >> "$TTY_DEV"
         answer=""
+        # One descriptor for both questions, so a file standing in for the
+        # terminal gives its second line to the second question.
+        exec 3< "$TTY_DEV"
         # A failed read is not consent — only a successful (possibly empty)
         # response may select the yes-default.
-        if read -r answer < "$TTY_DEV"; then
+        if read -r answer <&3; then
             case "$answer" in
                 [Nn]*) RUN_SETUP=no ;;
                 *)     RUN_SETUP=yes; PROMPTED_YES=yes ;;
@@ -862,6 +869,28 @@ build, so the engine cannot be built for this platform either."
         else
             RUN_SETUP=no
         fi
+        # Model limits read Claude Code's login token from the Keychain, so
+        # they stay off unless the person says yes. `curl | sh` gives setup no
+        # terminal to ask on, so the question is asked here. Not asked again
+        # once an answer is on file.
+        if [ "$PROMPTED_YES" = "yes" ] && [ "$(uname -s)" = "Darwin" ] \
+            && [ ! -e "$HOME/.claude-self-reflect/csr-companion/model-limits.json" ]; then
+            {
+                printf "\n  Optional: the pane can show each Claude model's own weekly limit\n"
+                printf "  (Fable's share), as /usage does. To read it, CSR takes Claude Code's\n"
+                printf "  login token from your Keychain and asks Anthropic's usage endpoint\n"
+                printf '  every 5 minutes. The token is never stored or logged.\n\n'
+                printf '  \033[1mShow model limits? [y/N]\033[0m '
+            } >> "$TTY_DEV"
+            limits=""
+            # Anything but an explicit yes, a failed read included, is no.
+            read -r limits <&3 || limits=""
+            case "$limits" in
+                [Yy]|[Yy][Ee][Ss]) MODEL_LIMITS=yes ;;
+                *)                 MODEL_LIMITS=no ;;
+            esac
+        fi
+        exec 3<&-
     fi
 
     if [ "$RUN_SETUP" = "yes" ]; then
@@ -906,6 +935,10 @@ build, so the engine cannot be built for this platform either."
 # agent, and these describe this install, not the daemon.
 run_setup() (
     unset CSR_VERSION CSR_TARBALL CSR_RELEASE_BASE_URL CSR_CHECKSUMS CSR_TTY
+    if [ -n "$MODEL_LIMITS" ]; then
+        CSR_MODEL_LIMITS_CONSENT="$MODEL_LIMITS"
+        export CSR_MODEL_LIMITS_CONSENT
+    fi
     if [ "$PROMPTED_YES" = "yes" ]; then
         CSR_DREAMS_CONSENT=yes "${INSTALL_DIR}/${BINARY_NAME}" setup
     else

@@ -105,6 +105,7 @@ function buildRelease({ setupWrites, setupRecordsEnv } = {}) {
     body +=
       '  setup)\n' +
       '    printf "consent=%s\\n" "${CSR_DREAMS_CONSENT-<unset>}" > "$HOME/setup-env.txt"\n' +
+      '    printf "limits=%s\\n" "${CSR_MODEL_LIMITS_CONSENT-<unset>}" > "$HOME/setup-limits.txt"\n' +
       // The installer's own variables, which setup would copy into the launch agent.
       '    env | grep -E "^CSR_(VERSION|TARBALL|RELEASE_BASE_URL|CHECKSUMS|TTY)=" > "$HOME/setup-installer-env.txt"\n' +
       '    echo "=== Setup Complete ===" ;;\n';
@@ -210,6 +211,7 @@ function runInstall({ dirs, installDir, extraEnv = {}, pathPrefix = [], args = [
     'CSR_RELEASE_BASE_URL',
     'CSR_CHECKSUMS',
     'CSR_DREAMS_CONSENT',
+    'CSR_MODEL_LIMITS_CONSENT',
     'CSR_TTY',
   ]) {
     delete env[name];
@@ -932,6 +934,55 @@ describe('install.sh: consent pass-through to setup', { skip: !HAVE_SH && 'no /b
     assert.equal(result.status, 0, result.stderr);
     assert.doesNotMatch(result.stdout, /Run setup now/, 'no prompt under CSR_AUTO_SETUP');
     assert.equal(recorded(dirs), 'consent=<unset>');
+  });
+
+  const DARWIN = spawnSync('uname', ['-s'], { encoding: 'utf8' }).stdout.trim() === 'Darwin';
+  function limits(dirs) {
+    return readFileSync(join(dirs.home, 'setup-limits.txt'), 'utf8').trim();
+  }
+
+  for (const [label, answer, want] of [
+    ['y', 'y\ny\n', 'limits=yes'],
+    ['an empty answer (the no default)', 'y\n\n', 'limits=no'],
+    ['no second answer at all', 'y\n', 'limits=no'],
+  ]) {
+    test(`on macOS, ${label} at the model limits question reaches setup as ${want}`, { skip: !DARWIN && 'macOS only' }, () => {
+      const { dirs } = buildRelease({ setupRecordsEnv: true });
+      const tty = answerFile(answer);
+
+      const result = runInstall({ dirs, extraEnv: { CSR_TTY: tty } });
+
+      assert.equal(result.status, 0, result.stderr + result.stdout);
+      assert.match(readFileSync(tty, 'utf8'), /Show model limits\? \[y\/N\]/);
+      assert.match(readFileSync(tty, 'utf8'), /Keychain/);
+      assert.equal(recorded(dirs), 'consent=yes');
+      assert.equal(limits(dirs), want);
+    });
+  }
+
+  test('an answer already on file is not asked again', { skip: !DARWIN && 'macOS only' }, () => {
+    const { dirs } = buildRelease({ setupRecordsEnv: true });
+    const keep = join(dirs.home, '.claude-self-reflect', 'csr-companion');
+    mkdirSync(keep, { recursive: true });
+    writeFileSync(join(keep, 'model-limits.json'), '{"on": false}');
+    const tty = answerFile('y\ny\n');
+
+    const result = runInstall({ dirs, extraEnv: { CSR_TTY: tty } });
+
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.doesNotMatch(readFileSync(tty, 'utf8'), /Show model limits/);
+    assert.equal(limits(dirs), 'limits=<unset>');
+  });
+
+  test('CSR_AUTO_SETUP=1 asks no model limits question', () => {
+    const { dirs } = buildRelease({ setupRecordsEnv: true });
+    const tty = answerFile('y\ny\n');
+
+    const result = runInstall({ dirs, extraEnv: { CSR_AUTO_SETUP: '1', CSR_TTY: tty } });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(readFileSync(tty, 'utf8'), /Show model limits/);
+    assert.equal(limits(dirs), 'limits=<unset>');
   });
 
   test('the prompt text says that yes also turns on dreams', () => {

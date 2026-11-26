@@ -2175,13 +2175,13 @@ pub(crate) fn daemon_lock_holder(home: &Path) -> Option<u32> {
 /// own configuration and must never be written back into a plist.
 const LAUNCHD_INJECTED_ENV: [&str; 2] = ["XPC_SERVICE_NAME", "OSLogRateLimit"];
 
-/// `CSR_*` variables that describe the setup run, not the daemon: the installer's consent
-/// answer and install folder included. Kept out of the agent, and dropped from one that has them.
-const SETUP_ONLY_ENV: [&str; 5] = [
+/// `CSR_*` variables of one setup run (installer answers, install folder): never in the agent.
+const SETUP_ONLY_ENV: [&str; 6] = [
     "CSR_AUTO_SETUP",
     "CSR_SKIP_SETUP",
     "CSR_NO_DAEMON",
     "CSR_DREAMS_CONSENT",
+    "CSR_MODEL_LIMITS_CONSENT",
     "CSR_INSTALL_DIR",
 ];
 
