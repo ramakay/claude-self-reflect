@@ -115,19 +115,56 @@ pub fn headline(c: &Composition) -> Option<(String, String)> {
     head
 }
 
-/// One limit window as the limits card draws it.
-#[derive(Clone, Debug, PartialEq)]
+/// One limit window as the limits card draws it: a column of its group's chart.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Limit {
     pub code: String,
     pub name: String,
     pub used: f64,
     pub sev: String,
     pub tick: Option<f64>,
+    /// The words under the chart; empty when the group's other column already says it.
     pub line: String,
+    /// The chart's group ("Claude", "Codex", "agy Gemini") and the column's own short label.
+    pub group: String,
+    pub label: String,
+    /// Named parts of `used`, stacked from the bottom (a model's share of the week).
+    pub parts: Vec<(String, f64)>,
 }
 
-/// The limits card's windows: the forecast's, or with no outlook the bare quotas, with no pace.
+/// A window's state from its percent used: red from 90, amber from 75.
+pub fn sev_for(used: f64) -> String {
+    if used >= 90. {
+        "red"
+    } else if used >= 75. {
+        "amber"
+    } else {
+        "ok"
+    }
+    .to_owned()
+}
+
+/// The limits card's windows: Claude's (with each model's own weekly share, claude_quota.rs), the
+/// Codex week, then the Antigravity CLI's groups when it has a reading (agy.rs).
 pub fn limits(c: &Composition) -> Vec<Limit> {
+    let mut out = claude_limits(c);
+    super::claude_quota::fold(&mut out, &c.figure["scoped"], c.now);
+    out.extend(codex(c).map(|(n, line)| Limit {
+        code: "CX".into(),
+        name: "Codex 7D".into(),
+        used: n,
+        sev: sev_for(n),
+        line,
+        group: "Codex".into(),
+        label: "Weekly".into(),
+        ..Limit::default()
+    }));
+    out.extend(super::agy::limits(&c.figure["agy"], c.now));
+    out
+}
+
+/// Claude's windows: the forecast's, or with no outlook the bare quotas, with no pace.
+fn claude_limits(c: &Composition) -> Vec<Limit> {
     let g = &c.figure;
     if let Some(windows) = g["outlook"]["windows"].as_array() {
         return windows
@@ -139,6 +176,9 @@ pub fn limits(c: &Composition) -> Vec<Limit> {
                 sev: string(&w["sev"]).to_owned(),
                 tick: w["tick"].as_f64(),
                 line: string(&w["line"]).to_owned(),
+                group: "Claude".into(),
+                label: string(&w["name"]).to_owned(),
+                parts: vec![],
             })
             .collect();
     }
@@ -155,25 +195,21 @@ pub fn limits(c: &Composition) -> Vec<Limit> {
                 .as_f64()
                 .map(|at| format!(" · resets in {}", super::forecast::until(at - c.now)))
                 .unwrap_or_default();
+            let name = if q["code"] == "5H" {
+                "5 Hour"
+            } else {
+                "Weekly"
+            };
             Limit {
                 code: string(&q["code"]).to_owned(),
-                name: if q["code"] == "5H" {
-                    "5 Hour"
-                } else {
-                    "Weekly"
-                }
-                .to_owned(),
+                name: name.to_owned(),
                 used,
-                sev: if used >= 90. {
-                    "red"
-                } else if used >= 75. {
-                    "amber"
-                } else {
-                    "ok"
-                }
-                .to_owned(),
+                sev: sev_for(used),
                 tick: None,
                 line: format!("{}% used{left}", used.round() as i64),
+                group: "Claude".into(),
+                label: name.to_owned(),
+                parts: vec![],
             }
         })
         .collect()
@@ -359,13 +395,13 @@ fn story(c: &Composition) -> Option<Card> {
 }
 
 fn limits_card(c: &Composition) -> Option<Card> {
+    // Every window, the Codex week among them (`limits`).
     let windows = limits(c);
-    let codex = codex(c);
     let head = headline(c);
-    if windows.is_empty() && codex.is_none() && head.is_none() {
+    if windows.is_empty() && head.is_none() {
         return None;
     }
-    let mut rows: Vec<Row> = windows
+    let rows: Vec<Row> = windows
         .iter()
         .map(|w| Row {
             label: w.name.clone(),
@@ -374,26 +410,11 @@ fn limits_card(c: &Composition) -> Option<Card> {
             tone: w.sev.clone(),
         })
         .collect();
-    let mut lines: Vec<Line> = windows
+    let lines: Vec<Line> = windows
         .iter()
+        .filter(|w| !w.line.is_empty())
         .map(|w| line(w.line.clone(), "caption"))
         .collect();
-    if let Some((n, words)) = codex {
-        rows.push(Row {
-            label: "Codex 7D".into(),
-            value: (n / 100.).clamp(0., 1.),
-            text: format!("{n:.0}%"),
-            tone: if n >= 90. {
-                "red"
-            } else if n >= 75. {
-                "amber"
-            } else {
-                "ok"
-            }
-            .into(),
-        });
-        lines.push(line(words, "caption"));
-    }
     let (title, tone) = head.map_or((String::new(), None), |(t, s)| (t, Some(s)));
     Some(Card {
         id: "limits",

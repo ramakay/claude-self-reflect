@@ -82,6 +82,7 @@ fn setup_only_variables_are_not_written_into_the_agent() {
             ("CSR_SKIP_SETUP", "1"),
             ("CSR_NO_DAEMON", "0"),
             ("CSR_DREAMS_CONSENT", "yes"),
+            ("CSR_MODEL_LIMITS_CONSENT", "yes"),
             ("CSR_INSTALL_DIR", "/Users/x/.local/bin"),
             ("CSR_BUILD_GIT_SHA", "abc"),
             ("HOME", "/Users/x"),

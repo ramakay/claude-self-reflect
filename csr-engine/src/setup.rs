@@ -296,7 +296,7 @@ pub async fn handle(
     // ON by default, with a per-night token estimate computed from the corpus
     // that was just imported — i.e. from real numbers, shown BEFORE the
     // question is asked.
-    dreaming_consent_step(eng.storage())?;
+    consent::consent_steps(eng.storage())?;
 
     // Step 8: the background daemon. Last, so it never races the import above
     // for the database. Dreams are on by default and only the daemon runs them.
@@ -1237,7 +1237,6 @@ fn next_steps(report: Option<&RelayReport>) -> String {
 
 #[path = "setup_consent.rs"]
 pub(crate) mod consent;
-use consent::dreaming_consent_step;
 
 /// The MCP server name we own in Claude Code's user-scope config.
 const MCP_SERVER_NAME: &str = "claude-self-reflect";
@@ -2176,13 +2175,13 @@ pub(crate) fn daemon_lock_holder(home: &Path) -> Option<u32> {
 /// own configuration and must never be written back into a plist.
 const LAUNCHD_INJECTED_ENV: [&str; 2] = ["XPC_SERVICE_NAME", "OSLogRateLimit"];
 
-/// `CSR_*` variables that describe the setup run, not the daemon: the installer's consent
-/// answer and install folder included. Kept out of the agent, and dropped from one that has them.
-const SETUP_ONLY_ENV: [&str; 5] = [
+/// `CSR_*` variables of one setup run (installer answers, install folder): never in the agent.
+const SETUP_ONLY_ENV: [&str; 6] = [
     "CSR_AUTO_SETUP",
     "CSR_SKIP_SETUP",
     "CSR_NO_DAEMON",
     "CSR_DREAMS_CONSENT",
+    "CSR_MODEL_LIMITS_CONSENT",
     "CSR_INSTALL_DIR",
 ];
 

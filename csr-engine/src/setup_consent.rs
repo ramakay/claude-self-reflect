@@ -213,6 +213,86 @@ fn consent_step(
     Ok(granted)
 }
 
+/// Step 7's two questions: dreaming, then the pane's model limits.
+pub(super) fn consent_steps(storage: &Storage) -> Result<()> {
+    dreaming_consent_step(storage)?;
+    if cfg!(target_os = "macos") {
+        model_limits_step(
+            &crate::companion::private::default_root(),
+            parse_preset(std::env::var("CSR_MODEL_LIMITS_CONSENT").ok().as_deref()),
+            interactive(),
+            &mut ask_yes_default_no,
+        );
+    }
+    Ok(())
+}
+
+/// Asks once whether the pane may show Claude's per-model weekly limits (Fable's share), which
+/// means reading Claude Code's login token from the Keychain (`companion/claude_quota.rs`).
+/// Off unless a person says yes. `curl | sh` gives setup no terminal, so `install.sh` asks the
+/// question itself and passes the answer as `CSR_MODEL_LIMITS_CONSENT`. An answer already on
+/// file is kept, never asked again. Returns the answer now on file, if any. A switch that cannot
+/// be written never fails setup.
+fn model_limits_step(
+    keep: &std::path::Path,
+    preset: Preset,
+    interactive: bool,
+    ask: &mut dyn FnMut(&str) -> bool,
+) -> Option<bool> {
+    use crate::companion::claude_quota::SWITCH;
+    let file = keep.join(SWITCH);
+    eprintln!("      Model limits on the pane (optional)");
+    if let Some(on) = crate::companion::paths::read_json(&file)["on"].as_bool() {
+        eprintln!(
+            "  Model limits: {} (answered before). Delete {} and run setup again to change it.",
+            if on { "on" } else { "off" },
+            file.display()
+        );
+        return Some(on);
+    }
+    let (on, from) = match preset {
+        Preset::Yes => (true, "installer"),
+        Preset::No => (false, "installer"),
+        Preset::Unset if !interactive => {
+            eprintln!("  Model limits: off. Run `csr-engine setup` in a terminal to be asked.");
+            return None;
+        }
+        Preset::Unset => {
+            eprintln!(
+                "  The pane can show each Claude model's own weekly limit (Fable's share), as /usage does."
+            );
+            eprintln!(
+                "  To read it, CSR takes Claude Code's login token from your Keychain and asks"
+            );
+            eprintln!(
+                "  Anthropic's usage endpoint every 5 minutes. The token is never stored or logged."
+            );
+            (ask("  Show model limits? [y/N] "), "setup")
+        }
+    };
+    let answer = json!({ "on": on, "at": now_ms(), "from": from });
+    let written =
+        std::fs::create_dir_all(keep).and_then(|()| std::fs::write(&file, answer.to_string()));
+    match written {
+        Ok(()) if on => eprintln!("  Model limits: on. CSR_NO_CLAUDE_QUOTA=1 turns them off."),
+        Ok(()) => eprintln!("  Model limits: off."),
+        Err(error) => eprintln!("  Warning: could not record the model limits answer: {error}"),
+    }
+    Some(on)
+}
+
+/// Read one line; only an explicit "y"/"yes" says yes.
+fn ask_yes_default_no(prompt: &str) -> bool {
+    eprint!("{prompt}");
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 /// The per-night estimate for `tier`, from the corpus's measured candidate
 /// count and the configured cadence/budget.
 fn night_estimate(storage: &Storage, tier: EffortTier) -> NightEstimate {
@@ -435,6 +515,55 @@ mod tests {
         let granted = consent_step(&storage, &store, plan(Preset::Yes, false), &mut |_| true);
         assert!(granted.unwrap(), "the decision still stands");
         assert!(!dream_cadence::consent_declined(&storage));
+    }
+
+    // ── the model limits question ──
+
+    #[test]
+    fn model_limits_are_off_unless_a_person_says_yes() {
+        use crate::companion::claude_quota::{on, SWITCH};
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("csr-companion");
+        let never = &mut |_: &str| -> bool { panic!("asked") };
+        let unset = Preset::Unset;
+        assert_eq!(model_limits_step(&keep, unset, false, never), None);
+        assert!(!keep.join(SWITCH).exists(), "no one asked, nothing written");
+        assert!(!on(&keep));
+
+        let mut asked = 0;
+        let got = model_limits_step(&keep, unset, true, &mut |_| {
+            asked += 1;
+            false
+        });
+        assert_eq!((got, asked), (Some(false), 1));
+        assert!(!on(&keep));
+        assert_eq!(
+            model_limits_step(&keep, Preset::Yes, true, never),
+            Some(false),
+            "an answer on file is not asked again, and an installer yes does not undo it"
+        );
+
+        std::fs::remove_file(keep.join(SWITCH)).unwrap();
+        assert_eq!(
+            model_limits_step(&keep, unset, true, &mut |_| true),
+            Some(true)
+        );
+        assert!(on(&keep));
+    }
+
+    /// `curl | sh` leaves setup without a terminal: the installer's answer is the person's.
+    #[test]
+    fn the_installer_answer_is_recorded_without_asking() {
+        use crate::companion::claude_quota::{on, SWITCH};
+        let never = &mut |_: &str| -> bool { panic!("asked") };
+        for (preset, want) in [(Preset::Yes, true), (Preset::No, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let keep = dir.path().join("csr-companion");
+            assert_eq!(model_limits_step(&keep, preset, false, never), Some(want));
+            assert_eq!(on(&keep), want);
+            let file = crate::companion::paths::read_json(&keep.join(SWITCH));
+            assert_eq!(file["from"], "installer");
+        }
     }
 
     // ── what the step moved out of setup.rs ──

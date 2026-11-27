@@ -425,7 +425,8 @@ fn the_rows_of_the_base_view_are_a_third_bigger_and_stay_inside_the_frame() {
                 ("Self-Reflect's dreamer", ROW_TITLE_SIZE, "dreamer title"),
                 ("Claude's spend counter", ROW_BODY_SIZE, "list row"),
                 ("Context", 15., "Context row"),
-                ("Weekly", 15., "Context row"),
+                // A column of the limits chart, its label and its line: caption rows.
+                ("Weekly", ROW_CAPTION_SIZE, "Context caption"),
                 ("this turn", ROW_CAPTION_SIZE, "Context caption"),
                 ("turns 53, 2", ROW_CAPTION_SIZE, "list caption"),
             ] {
